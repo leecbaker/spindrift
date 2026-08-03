@@ -7,7 +7,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         available_outer_width: f32,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
     ) -> Option<f32> {
@@ -85,10 +85,11 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         available_outer_width: f32,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
     ) -> f32 {
+        let containment = used_property_containment(element, style);
         let mut used_style = self.style_with_current_used_lengths(style);
         let box_metrics = apply_used_box_metrics(
             &mut used_style,
@@ -96,6 +97,28 @@ impl<'a> LayoutBuilder<'a> {
         );
         let style = &used_style;
         let horizontal_extras = box_metrics.horizontal_non_content_length();
+        let vertical_extras = box_metrics.vertical_non_content_length();
+        // Descendant percentage heights resolve from this box's definite
+        // content block-size while it is being estimated. Keep the parent's
+        // basis separately: this box's own min/max constraints still resolve
+        // against its containing block, never against itself.
+        // <https://www.w3.org/TR/css-sizing-3/#percentage-sizing>
+        let containing_block_size_basis = self
+            .definite_block_size_stack
+            .last()
+            .cloned()
+            .unwrap_or_else(PercentageBasis::indefinite);
+        let definite_content_height = used_content_box_size_with_basis(
+            style.box_values.height.value().clone(),
+            style.box_sizing,
+            containing_block_size_basis,
+            vertical_extras,
+        );
+        self.definite_block_size_stack
+            .push(block_size_percentage_basis_from_points(
+                definite_content_height.map(SemanticLengthExt::points),
+                BlockSizeBasisSource::ContainingBlock,
+            ));
         let intrinsic_sizes = (needs_intrinsic_width_contribution(style.box_values.width.clone())
             || needs_intrinsic_width_contribution(style.box_values.min_width.clone())
             || needs_intrinsic_width_contribution(style.box_values.max_width.clone()))
@@ -155,7 +178,7 @@ impl<'a> LayoutBuilder<'a> {
         }
         .max(style.font_size);
 
-        let establishes_multicol = style.column_count.is_some()
+        let establishes_multicol = matches!(style.column_count, css::ColumnCount::Count(_))
             || matches!(style.column_width, css::ComputedColumnWidth::Length(_))
             || matches!(style.column_height, css::ComputedColumnHeight::Length(_));
         if establishes_multicol
@@ -174,10 +197,9 @@ impl<'a> LayoutBuilder<'a> {
             // distributed among columns, and makes an ancestor fragmentainer
             // manufacture visual-overflow columns.
             // <https://www.w3.org/TR/css-multicol-1/#the-multi-column-model>
-            if style.contain.size {
+            if containment.size {
                 content_height = 0.0;
             }
-            let vertical_extras = box_metrics.vertical_non_content_length();
             content_height = constrain_content_height(
                 style,
                 content_box_pt(
@@ -193,13 +215,15 @@ impl<'a> LayoutBuilder<'a> {
             )
             .points();
             let borders = used_border_widths(style);
-            return style.margin.top
+            let outer_height = style.margin.top
                 + borders.top
                 + style.padding.top
                 + content_height
                 + style.padding.bottom
                 + borders.bottom
                 + style.margin.bottom;
+            self.definite_block_size_stack.pop();
+            return outer_height;
         }
 
         let mut content_height = 0.0;
@@ -249,7 +273,7 @@ impl<'a> LayoutBuilder<'a> {
                 // <https://www.w3.org/TR/CSS22/visudet.html#root-height>
                 if child_style.display.is_none()
                     || matches!(child_style.position, Position::Absolute | Position::Fixed)
-                    || child_style.running_element_name.is_some()
+                    || child_style.position.is_running()
                 {
                     continue;
                 }
@@ -267,7 +291,9 @@ impl<'a> LayoutBuilder<'a> {
                     continue;
                 }
                 if (child_style.display.is_block_level()
-                    || is_document_canvas_element(element)
+                    || self
+                        .document_canvas_overflow
+                        .is_document_canvas_flow_element(element)
                     || is_replaced_element(child_element))
                     && let Some(child_height) = self.estimate_element_height(
                         child_element,
@@ -294,7 +320,11 @@ impl<'a> LayoutBuilder<'a> {
                 stylesheets,
                 &mut self.font_system,
             );
-            let text = if is_document_canvas_element(element) || has_direct_flow_child {
+            let text = if self
+                .document_canvas_overflow
+                .is_document_canvas_flow_element(element)
+                || has_direct_flow_child
+            {
                 // CSS 2.2 lays direct block-flow children in block formatting
                 // context; their descendant text must not also contribute as a
                 // direct anonymous inline line in the parent estimate.
@@ -339,7 +369,7 @@ impl<'a> LayoutBuilder<'a> {
                     );
                     if child_style.display.is_none()
                         || matches!(child_style.position, Position::Absolute | Position::Fixed)
-                        || child_style.running_element_name.is_some()
+                        || child_style.position.is_running()
                     {
                         continue;
                     }
@@ -357,7 +387,9 @@ impl<'a> LayoutBuilder<'a> {
                         continue;
                     }
                     if (child_style.display.is_block_level()
-                        || is_document_canvas_element(element)
+                        || self
+                            .document_canvas_overflow
+                            .is_document_canvas_flow_element(element)
                         || is_replaced_element(child_element))
                         && let Some(child_height) = self.estimate_element_height(
                             child_element,
@@ -373,7 +405,7 @@ impl<'a> LayoutBuilder<'a> {
             }
         }
         content_height = content_height.max(-estimated_float_bottom);
-        if style.contain.size {
+        if containment.size {
             // CSS size containment contributes the intrinsic size of an empty
             // principal box while descendants are laid out only after that
             // used size has been fixed.
@@ -393,15 +425,20 @@ impl<'a> LayoutBuilder<'a> {
         }
 
         let height_depends_on_intrinsic_content =
-            needs_intrinsic_height_contribution(style.box_values.height.clone())
+            needs_intrinsic_height_contribution(style.box_values.height.value().clone())
                 || needs_intrinsic_height_contribution(style.box_values.min_height.clone())
                 || needs_intrinsic_height_contribution(style.box_values.max_height.clone());
+        // Height constraints resolve percentages against the containing
+        // block's block-size, not the inline width used to estimate this
+        // formatting context.  An auto-height containing block deliberately
+        // contributes an indefinite basis, leaving only a fixed calc term.
+        // <https://www.w3.org/TR/css-sizing-3/#percentage-sizing>
+        let block_size_percentage_basis = containing_block_size_basis;
         if !has_auto_height(style)
-            || used_min_height(style, PercentageBasis::definite(layout_pt(content_width))).is_some()
-            || used_max_height(style, PercentageBasis::definite(layout_pt(content_width))).is_some()
+            || used_min_height(style, block_size_percentage_basis).is_some()
+            || used_max_height(style, block_size_percentage_basis).is_some()
             || height_depends_on_intrinsic_content
         {
-            let vertical_extras = box_metrics.vertical_non_content_length();
             let requested_content_height =
                 used_content_box_height_or_auto(style, layout_pt(content_height), vertical_extras)
                     .map(SemanticLengthExt::points)
@@ -412,7 +449,7 @@ impl<'a> LayoutBuilder<'a> {
                     content_box_pt(requested_content_height),
                     content_box_pt(content_height),
                     content_box_pt(content_height),
-                    PercentageBasis::definite(content_box_pt(content_width)),
+                    block_size_percentage_basis,
                     vertical_extras,
                 )
                 .points()
@@ -420,26 +457,28 @@ impl<'a> LayoutBuilder<'a> {
                 constrain_content_height(
                     style,
                     content_box_pt(requested_content_height),
-                    PercentageBasis::definite(layout_pt(content_width)),
+                    block_size_percentage_basis,
                 )
                 .points()
             };
         }
 
         let borders = used_border_widths(style);
-        style.margin.top
+        let outer_height = style.margin.top
             + borders.top
             + style.padding.top
             + content_height
             + style.padding.bottom
             + borders.bottom
-            + style.margin.bottom
+            + style.margin.bottom;
+        self.definite_block_size_stack.pop();
+        outer_height
     }
 
     fn estimate_anonymous_block_height(
         &mut self,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         content_width: f32,
         child_boxes: &[box_tree::FormattingBox<'_>],
     ) -> f32 {
@@ -475,7 +514,7 @@ impl<'a> LayoutBuilder<'a> {
             };
             if child_style.display.is_none()
                 || matches!(child_style.position, Position::Absolute | Position::Fixed)
-                || child_style.running_element_name.is_some()
+                || child_style.position.is_running()
             {
                 continue;
             }
@@ -494,7 +533,9 @@ impl<'a> LayoutBuilder<'a> {
             }
             if child_style.display.is_block_level()
                 || is_replaced_element(child_element)
-                || is_document_canvas_element(child_element)
+                || self
+                    .document_canvas_overflow
+                    .is_document_canvas_flow_element(child_element)
             {
                 if let Some(child_height) = self.estimate_element_height(
                     child_element,
@@ -527,7 +568,7 @@ impl<'a> LayoutBuilder<'a> {
         float_context: &mut FloatContext,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         containing_width: f32,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
     ) -> Option<f32> {

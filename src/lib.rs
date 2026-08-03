@@ -20,18 +20,16 @@ mod timing;
 mod units;
 
 pub(crate) use css::CssColor;
-pub use css::{Css, ForcedColorPalette, ForcedColorsMode, MediaType};
-pub use document::{
-    Bookmark, BookmarkState, Document, DocumentMetadata, FontEmbeddingMode, LinkAnnotation, Page,
-    PaintStrokeWidth, PdfCompression, PdfOptions, PdfProfile,
-};
-pub(crate) use document::{
-    DocumentFont, PaintOperation, PaintPoint, PaintRect, RenderedGlyph, RenderedImage,
-    RenderedLine, RenderedPath, RenderedPathCommand, RenderedPathFillRule, RenderedRect,
-    RenderedRoundedRect, RenderedStroke, RenderedTextMatrix, RenderedTextRun,
+pub use css::{
+    ColorSchemePreference, Css, CssViewportSize, ForcedColorPalette, ForcedColorsMode,
+    MediaEnvironment, MediaType,
 };
 #[cfg(test)]
-pub(crate) use document::{PaintSize, RenderedCornerRadius, RenderedRoundedRectRadii};
+pub(crate) use document::PaintStrokeWidth;
+pub use document::{
+    Bookmark, BookmarkState, Document, DocumentMetadata, FontEmbeddingMode, LinkAnnotation, Page,
+    PdfCompression, PdfOptions, PdfProfile,
+};
 pub use error::{Error, Result};
 pub use html::{Html, InputSyntax};
 pub use layout::{PageMargins, PageSize, RenderOptions};

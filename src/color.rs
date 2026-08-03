@@ -637,7 +637,9 @@ pub(crate) fn convert_samples(
     }
     if source_space == CssColorSpace::XyzD50 || target_space == CssColorSpace::XyzD50 {
         return samples
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|sample| {
                 let color = CssColor::in_space(
                     source_space,

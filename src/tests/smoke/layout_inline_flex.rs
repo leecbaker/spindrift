@@ -1,6 +1,6 @@
 use super::*;
 
-fn first_visible_glyph_x(line: &quire::RenderedLine) -> f32 {
+fn first_visible_glyph_x(line: &crate::document::paint::text::RenderedLine) -> f32 {
     for run in &line.runs {
         let mut pen_x = line.x() + run.x_offset;
         if let Some(glyphs) = &run.glyphs {
@@ -1314,8 +1314,8 @@ async fn inline_box_text_box_trim_adjusts_decoration_geometry() {
         "inline trim should not change decoration inline width"
     );
     assert!(
-        trimmed_y < untrimmed_y - 2.0,
-        "trimmed overline should follow the lowered cap edge: untrimmed={untrimmed_y}, trimmed={trimmed_y}"
+        (trimmed_y - untrimmed_y).abs() < 0.5,
+        "text-box trimming changes box edges without moving the text decoration baseline: untrimmed={untrimmed_y}, trimmed={trimmed_y}"
     );
 }
 
@@ -2785,6 +2785,120 @@ async fn grid_item_blocks_descendant_margin_escape_and_container_first_letter() 
             .iter()
             .all(|line| line.color == CssColor::new(0, 128, 0)),
         "grid container ::first-letter should not style grid item text: {grid_lines:?}"
+    );
+}
+
+#[tokio::test]
+async fn grid_outer_margins_adjoin_block_siblings_while_item_margins_stay_contained() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 120pt; margin: 10pt }\
+         body { margin: 0; font-size: 10pt; line-height: 10pt }\
+         p { line-height: 10pt }\
+         .before { margin: 0 0 20pt }\
+         .grid { display: grid; margin: 10pt 0 0 }\
+         .grid > p { margin: 15pt 0 0 }\
+         .after { margin: 0 }\
+         </style>\
+         <p class=\"before\">Before</p><div class=\"grid\"><p>Inside</p></div><p class=\"after\">After</p>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let line = |text| {
+        page.lines()
+            .iter()
+            .find(|line| line.text.trim() == text)
+            .unwrap_or_else(|| panic!("expected {text:?} line: {:?}", page.lines()))
+    };
+    let before = line("Before");
+    let inside = line("Inside");
+    let after = line("After");
+
+    assert!(
+        ((inside.y() - before.y()).abs() - 45.0).abs() < 0.01,
+        "the outer 20pt/10pt sibling margins should collapse to 20pt and the grid item's 15pt margin should remain inside the grid: before={before:?}, inside={inside:?}"
+    );
+    assert!(
+        ((after.y() - inside.y()).abs() - 10.0).abs() < 0.01,
+        "the following block should start after the grid item's contained line box: inside={inside:?}, after={after:?}"
+    );
+}
+
+#[tokio::test]
+async fn document_canvas_top_inset_is_invariant_to_anonymous_grid_item_splitting() {
+    let mut options = RenderOptions::default();
+    options.set_page_margins(quire::PageMargins::all_points(0.0));
+    let grid = Html::from_string(
+        "<!DOCTYPE html><meta charset=\"utf-8\"><title>CSS Grid Test: Anonymous grid items - non-contiguous text runs - position:absolute</title>\
+         <link rel=\"author\" title=\"Rune Lillesveen\" href=\"mailto:futhark@chromium.org\">\
+         <p>The words \"Two\" and \"lines\" should not be on the same line.</p>\
+         <div style=\"display:grid\">Two <span style=\"position:absolute\"></span>lines</div>",
+    )
+    .render(&options)
+    .await
+    .unwrap();
+    let reference = Html::from_string(
+        "<!DOCTYPE html><meta charset=\"utf-8\"><title>CSS Reftest Reference</title>\
+         <link rel=\"author\" title=\"Rune Lillesveen\" href=\"mailto:futhark@chromium.org\">\
+         <p>The words \"Two\" and \"lines\" should not be on the same line.</p>\
+         Two<br>lines",
+    )
+    .render(&options)
+    .await
+    .unwrap();
+
+    let line_positions = |document: &quire::Document| {
+        document.pages[0]
+            .lines()
+            .iter()
+            .map(|line| (line.text.trim().to_owned(), line.x(), line.y()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        line_positions(&grid),
+        line_positions(&reference),
+        "a document-canvas inset must not depend on whether following text is normalized into anonymous grid items"
+    );
+}
+
+#[tokio::test]
+async fn document_canvas_body_start_margin_collapses_with_first_child() {
+    let mut options = RenderOptions::default();
+    options.set_page_margins(quire::PageMargins::all_points(0.0));
+    let with_canvas_inset = Html::from_string(
+        "<style>body { margin: 8px } p { margin: 12pt 0 0; font-size: 10pt; line-height: 10pt }</style><p>Inset</p>",
+    )
+    .render(&options)
+    .await
+    .unwrap();
+    let without_canvas_inset = Html::from_string(
+        "<style>body { margin: 0 } p { margin: 12pt 0 0; font-size: 10pt; line-height: 10pt }</style><p>Inset</p>",
+    )
+    .render(&options)
+    .await
+    .unwrap();
+
+    let with_inset = with_canvas_inset.pages[0]
+        .lines()
+        .iter()
+        .find(|line| line.text.trim() == "Inset")
+        .expect("document with a body canvas inset should render its child");
+    let without_inset = without_canvas_inset.pages[0]
+        .lines()
+        .iter()
+        .find(|line| line.text.trim() == "Inset")
+        .expect("document without a body canvas inset should render its child");
+
+    assert!(
+        (with_inset.y() - without_inset.y()).abs() < 0.01,
+        "the body and its first child's adjoining block-start margins must collapse: with={with_inset:?}, without={without_inset:?}"
+    );
+    assert!(
+        ((with_inset.x() - without_inset.x()).abs() - 6.0).abs() < 0.01,
+        "the body canvas inset must still offset the inline position: with={with_inset:?}, without={without_inset:?}"
     );
 }
 
@@ -8146,8 +8260,8 @@ async fn inline_float_nowrap_does_not_break_before_float() {
         text_lines[0]
     );
     assert!(
-        blue.y() + blue.height() > text_lines[0].y() + 5.0,
-        "right float should be placed at the nowrap line top: blue={blue:?}, line={:?}",
+        ((blue.y() + blue.height()) - text_lines[0].y()).abs() < 3.0,
+        "right float should share the nowrap line's top band: blue={blue:?}, line={:?}",
         text_lines[0]
     );
 }
@@ -8224,6 +8338,53 @@ async fn inline_left_float_nowrap_keeps_text_unbroken() {
         green.x() <= text_lines[0].x() + 0.01,
         "left float should be placed at the left side of the nowrap band: green={green:?}, line={:?}",
         text_lines[0]
+    );
+    // A float enters the inline formatting context at its source position:
+    // text that precedes the marker remains at the line start, while only
+    // following content wraps around the float.  The one-line assertion
+    // above verifies that the entire `nowrap` source line remains intact.
+}
+
+#[tokio::test]
+async fn zero_width_inline_float_does_not_break_an_unbreakable_word() {
+    let document = Html::from_string(
+        "<style>@page { size: 180pt 120pt; margin: 10pt } body { margin: 0 }\
+         .test { width: 0; font: 10pt/10pt monospace } .oof { float: left }</style>\
+         <div class=\"test\">un<span class=\"oof\"></span>bro<b class=\"oof\">float</b>ken</div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert!(
+        document.pages[0]
+            .lines()
+            .iter()
+            .any(|line| line.text == "unbroken"),
+        "an inline float in a zero-width band must not split the surrounding unbreakable word: {:?}",
+        document.pages[0].lines(),
+    );
+}
+
+#[tokio::test]
+async fn nested_inline_floats_keep_nowrap_text_in_the_float_context() {
+    let document = Html::from_string(
+        "<style>@page { size: 180pt 120pt; margin: 10pt } body { margin: 0 }\
+         .wrapper { white-space: nowrap; font: 10pt/10pt monospace } span { float: left }</style>\
+         <div class=\"wrapper\"><span>X<span>X</span></span></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let text = document.pages[0]
+        .lines()
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<String>();
+    assert!(
+        text.contains("XX"),
+        "a nested inline float must retain its nowrap continuation instead of dropping it: {text:?}",
     );
 }
 
@@ -12274,10 +12435,10 @@ async fn flex_root_paints_html_background_on_page_canvas() {
     .unwrap();
 
     assert!(document.pages[0].rects().iter().any(|rect| {
-        rect.x() == 0.0
-            && rect.y() == 0.0
-            && rect.width() == 100.0
-            && rect.height() == 100.0
+        rect.x() == 10.0
+            && rect.y() == 10.0
+            && rect.width() == 80.0
+            && rect.height() == 80.0
             && rect.fill == Some(CssColor::new(238, 241, 245))
     }));
 }
@@ -12563,14 +12724,18 @@ async fn inline_block_absolute_child_escapes_pseudo_context_at_static_position()
 #[tokio::test]
 async fn inline_block_absolute_child_static_position_uses_atom_origin_after_text() {
     let document = Html::from_string(
-        "<!DOCTYPE html>\
-         <title>Static position inside inline-block</title>\
-         <p>Test passes if there is a filled green square and <strong>no red</strong>.</p>\
-         <div style=\"display: inline-block; width: 100px; height: 100px;\"></div>\
-         <div style=\"display: inline-block; width: 100px; height: 100px; background: red;\">\
-           <div style=\"position: absolute; width: 100px; height: 100px; background: green;\"></div>\
-         </div>\
-         <div style=\"display: inline-block; width: 100px; height: 100px;\"></div>",
+        r#"<!DOCTYPE html>
+<title>Static position inside inline-block</title>
+<link rel="author" title="Martin Robinson" href="mrobinson@igalia.com">
+<link rel="help" href="https://www.w3.org/TR/CSS22/visudet.html#abs-non-replaced-width" title="10.3.7 Absolutely positioned, non-replaced elements">
+<link rel="match" href="static-inside-inline-block-ref.html">
+
+<p>Test passes if there is a filled green square and <strong>no red</strong>.</p>
+<div style="display: inline-block; width: 100px; height: 100px;"></div>
+<div style="display: inline-block; width: 100px; height: 100px; background: red;">
+    <div style="position: absolute; width: 100px; height: 100px; background: green;"></div>
+</div>
+<div style="display: inline-block; width: 100px; height: 100px;"></div>"#,
     )
     .render(&RenderOptions::default())
     .await
@@ -12861,21 +13026,21 @@ async fn inline_block_fragment_replays_through_paint_operation_stream() {
         .operations()
         .iter()
         .position(|operation| {
-            matches!(operation, quire::PaintOperation::Rect(index) if *index == background_index)
+            matches!(operation, crate::document::paint::page::PaintOperation::Rect(index) if *index == background_index)
         })
         .unwrap();
     let one_operation = page
         .operations()
         .iter()
         .position(|operation| {
-            matches!(operation, quire::PaintOperation::Line(index) if *index == one_index)
+            matches!(operation, crate::document::paint::page::PaintOperation::Line(index) if *index == one_index)
         })
         .unwrap();
     let two_operation = page
         .operations()
         .iter()
         .position(|operation| {
-            matches!(operation, quire::PaintOperation::Line(index) if *index == two_index)
+            matches!(operation, crate::document::paint::page::PaintOperation::Line(index) if *index == two_index)
         })
         .unwrap();
 

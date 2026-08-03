@@ -1,5 +1,207 @@
 use super::*;
-use crate::units::IntoLayoutLength;
+
+/// The first and last named-page values represented by a durable table
+/// fragment.
+///
+/// CSS Paged Media selects page contexts at class-A boundaries, including
+/// table rows and row groups. The table fragment is the post-fixup source of
+/// that sequence, unlike the table root's ordinary formatting children.
+/// <https://www.w3.org/TR/css-page-3/#using-named-pages>
+/// <https://www.w3.org/TR/css-break-3/#possible-breaks>
+#[derive(Clone, Debug)]
+pub(in crate::layout) struct TablePageBoundarySummary {
+    pub(in crate::layout) sources: PageBoundaryValues,
+    pub(in crate::layout) resolved: ResolvedPageBoundaryValues,
+}
+
+impl TablePageBoundarySummary {
+    fn from_style(style: &ComputedStyle, inherited_page_name: Option<&str>) -> Self {
+        Self {
+            sources: PageBoundaryValues::from_style(style),
+            resolved: ResolvedPageBoundaryValues::uniform(
+                style
+                    .page
+                    .effective_name(inherited_page_name.map(str::to_string)),
+            ),
+        }
+    }
+}
+
+/// Returns the named-page boundary summary for a table wrapper.
+///
+/// Top captions precede the grid, bottom captions follow it, and rows use the
+/// header/body/footer visual order that table layout uses. Repeated row
+/// fragments are intentionally absent: only source rows establish boundaries.
+pub(in crate::layout) fn table_page_boundary_summary(
+    fragment: &box_tree::TableFragment<'_>,
+    table_style: &ComputedStyle,
+    inherited_page_name: Option<&str>,
+) -> TablePageBoundarySummary {
+    let mut summary = TablePageBoundarySummary::from_style(table_style, inherited_page_name);
+    let table_page_name = summary.resolved.start.clone();
+    let mut participants = Vec::new();
+
+    for caption in fragment.captions.iter().filter(|caption| {
+        caption
+            .style
+            .as_deref()
+            .is_some_and(|style| style.caption_side == CaptionSide::Top)
+    }) {
+        participants.push(table_caption_page_boundary_summary(
+            caption,
+            table_style,
+            table_page_name.as_deref(),
+        ));
+    }
+
+    let rows = table_rows_from_fragment(fragment);
+    let row_group_ends = table_row_group_end_indices(&rows);
+    for (row_index, row) in rows.iter().enumerate() {
+        participants.push(table_row_page_boundary_summary(
+            row,
+            row_index,
+            row_group_ends[row_index],
+            table_style,
+            table_page_name.as_deref(),
+        ));
+    }
+
+    for caption in fragment.captions.iter().filter(|caption| {
+        caption
+            .style
+            .as_deref()
+            .is_some_and(|style| style.caption_side == CaptionSide::Bottom)
+    }) {
+        participants.push(table_caption_page_boundary_summary(
+            caption,
+            table_style,
+            table_page_name.as_deref(),
+        ));
+    }
+
+    let mut participants = participants.into_iter().filter(|participant| {
+        participant.sources.start != PageBoundaryValue::Inapplicable
+            && participant.sources.end != PageBoundaryValue::Inapplicable
+    });
+    let Some(first) = participants.next() else {
+        return summary;
+    };
+    if first.sources.start.overrides_parent_summary() {
+        summary.sources.start = first.sources.start.clone();
+        summary.resolved.start = first.resolved.start.clone();
+    }
+    let last = participants.next_back().unwrap_or(first);
+    if last.sources.end.overrides_parent_summary() {
+        summary.sources.end = last.sources.end;
+        summary.resolved.end = last.resolved.end;
+    }
+    summary
+}
+
+fn table_caption_page_boundary_summary(
+    caption: &box_tree::FrozenTableFragmentCaption<'_>,
+    table_style: &ComputedStyle,
+    inherited_page_name: Option<&str>,
+) -> TablePageBoundarySummary {
+    let style = caption.style.as_deref().unwrap_or(table_style);
+    if !style_is_in_normal_flow(style) || style.display.is_none() {
+        return TablePageBoundarySummary {
+            sources: PageBoundaryValues::inapplicable(),
+            resolved: ResolvedPageBoundaryValues::inapplicable(),
+        };
+    }
+    TablePageBoundarySummary {
+        sources: page_value_sources_from_style_and_children(style, &caption.children),
+        resolved: resolved_page_boundary_values_from_style_and_children(
+            style,
+            &caption.children,
+            inherited_page_name,
+        ),
+    }
+}
+
+fn table_row_page_boundary_summary(
+    row: &TableRow<'_>,
+    row_index: usize,
+    row_group_end: usize,
+    table_style: &ComputedStyle,
+    inherited_page_name: Option<&str>,
+) -> TablePageBoundarySummary {
+    let row_style = row.style.as_deref().unwrap_or(table_style);
+    if !style_is_in_normal_flow(row_style) || row_style.display.is_none() {
+        return TablePageBoundarySummary {
+            sources: PageBoundaryValues::inapplicable(),
+            resolved: ResolvedPageBoundaryValues::inapplicable(),
+        };
+    }
+    let mut summary = TablePageBoundarySummary::from_style(row_style, inherited_page_name);
+    let own_page_name = summary.resolved.start.clone();
+    if row_style.page.is_specified() {
+        return summary;
+    }
+
+    let mut first_cell = None;
+    let mut last_cell = None;
+    let mut continuing_rowspan = None;
+    for cell in &row.cells {
+        let cell_style = cell.style.as_deref().unwrap_or(row_style);
+        if !style_is_in_normal_flow(cell_style) || cell_style.display.is_none() {
+            continue;
+        }
+        let children = cell.children.as_deref().unwrap_or_default();
+        let sources = page_value_sources_from_style_and_children(cell_style, children);
+        let resolved = resolved_page_boundary_values_from_style_and_children(
+            cell_style,
+            children,
+            own_page_name.as_deref(),
+        );
+        if sources.end.overrides_parent_summary()
+            && cell
+                .element
+                .is_some_and(|element| html_table_rowspan(element, row_index, row_group_end) > 1)
+        {
+            continuing_rowspan = Some((resolved.end.clone(), sources.end.clone()));
+        }
+        if first_cell.is_none() {
+            first_cell = Some((resolved.start.clone(), sources.start.clone()));
+        }
+        last_cell = Some((resolved.end, sources.end));
+    }
+    if let Some((start, source)) = first_cell
+        && source.overrides_parent_summary()
+    {
+        summary.sources.start = source;
+        summary.resolved.start = start;
+    }
+    if let Some((end, source)) = last_cell
+        && source.overrides_parent_summary()
+    {
+        summary.sources.end = source;
+        summary.resolved.end = end;
+    }
+    if summary.resolved.end == own_page_name
+        && let Some((end, source)) = continuing_rowspan
+    {
+        summary.sources.end = source;
+        summary.resolved.end = end;
+    }
+    if summary.resolved.start == own_page_name
+        && let Some(group) = row.row_groups.last()
+    {
+        let group_style = group.style.as_deref().unwrap_or(table_style);
+        if group_style.page.is_specified() {
+            let group_summary =
+                TablePageBoundarySummary::from_style(group_style, inherited_page_name);
+            summary.sources.start = group_summary.sources.start.clone();
+            summary.resolved.start = group_summary.resolved.start.clone();
+            if summary.resolved.end == own_page_name {
+                summary.sources.end = group_summary.sources.end;
+                summary.resolved.end = group_summary.resolved.end;
+            }
+        }
+    }
+    summary
+}
 
 pub(super) fn table_metrics(element: &Element, style: &ComputedStyle) -> TableMetrics {
     if style.border_collapse == css::BorderCollapse::Collapse {
@@ -9,8 +211,8 @@ pub(super) fn table_metrics(element: &Element, style: &ComputedStyle) -> TableMe
         };
     }
 
-    let spacing = if style.border_spacing_explicit {
-        style.border_spacing.clone()
+    let spacing = if style.border_spacing.is_author_declared() {
+        style.border_spacing.value().clone()
     } else if is_html_table_element(element) {
         element
             .attrs
@@ -20,7 +222,7 @@ pub(super) fn table_metrics(element: &Element, style: &ComputedStyle) -> TableMe
                 let spacing = spacing.max(0.0) * style.effective_zoom.factor();
                 css::BorderSpacing::from_lengths(spacing, spacing)
             })
-            .unwrap_or(style.border_spacing.clone())
+            .unwrap_or_else(|| style.border_spacing.value().clone())
     } else {
         // CSS Tables initial `border-spacing` is zero. The embedded HTML UA
         // stylesheet gives real `table` elements 2px spacing for compatibility,
@@ -86,7 +288,7 @@ fn table_fragment_cell_is_running(cell: &box_tree::TableFragmentCell<'_>) -> boo
         && cell
             .style
             .as_ref()
-            .is_some_and(|style| style.running_element_name.is_some())
+            .is_some_and(|style| style.position.is_running())
 }
 
 /// Apply CSS table row-group visual ordering before grid construction.
@@ -386,18 +588,12 @@ pub(super) fn apply_table_cellpadding(style: &mut ComputedStyle, table_cellpaddi
 pub(super) fn apply_table_cell_used_padding(
     style: &mut ComputedStyle,
     table_cellpadding: Option<f32>,
-    inline_basis: PercentageBasis<LogicalInlineContentSize>,
+    inline_basis: LogicalInlinePercentageBasis,
 ) {
     apply_table_cellpadding(style, table_cellpadding);
-    // CSS percentage padding resolves against the containing block's logical
-    // inline content box. `used_padding_edges` is the legacy layout-length
-    // boundary, so erase only the axis/box-model marker after that invariant
-    // has been recorded in the input type.
-    style.padding = used_padding_edges(
-        style,
-        inline_basis.map_value(|size| size.content_box_length().into_layout_length()),
-    )
-    .to_css_edges();
+    // Keep the containing block's logical-inline marker through used-value
+    // resolution; table-cell padding is physical only after this boundary.
+    style.padding = used_padding_edges_for_logical_inline_basis(style, inline_basis).to_css_edges();
 }
 
 /// Collect the inline textual content used by anonymous and real table cells.
@@ -531,15 +727,21 @@ pub(super) fn table_cell_formatting_child_outer_height(
 
 fn table_cell_block_child_height(child: &box_tree::FormattingBox<'_>) -> LayoutLength {
     match child {
-        box_tree::FormattingBox::Block(box_) => {
-            table_cell_element_outer_height(&box_.core.style, &box_.core.children)
-        }
-        box_tree::FormattingBox::Table(box_) => {
-            table_cell_element_outer_height(&box_.core.style, &box_.core.children)
-        }
-        box_tree::FormattingBox::Flex(box_) => {
-            table_cell_element_outer_height(&box_.core.style, &box_.core.children)
-        }
+        box_tree::FormattingBox::Block(box_) => table_cell_element_outer_height(
+            box_.core.element,
+            &box_.core.style,
+            &box_.core.children,
+        ),
+        box_tree::FormattingBox::Table(box_) => table_cell_element_outer_height(
+            box_.core.element,
+            &box_.core.style,
+            &box_.core.children,
+        ),
+        box_tree::FormattingBox::Flex(box_) => table_cell_element_outer_height(
+            box_.core.element,
+            &box_.core.style,
+            &box_.core.children,
+        ),
         box_tree::FormattingBox::AnonymousBlock(box_) => {
             table_cell_formatting_children_block_height(&box_.children)
         }
@@ -579,10 +781,12 @@ fn table_cell_inline_level_outer_height(
             (height > 0.0).then_some(layout_pt(height))
         }
         box_tree::FormattingBox::AtomicInline(box_) => Some(table_cell_atomic_inline_outer_height(
+            box_.core.element,
             &box_.core.style,
             &box_.core.children,
         )),
         box_tree::FormattingBox::Replaced(box_) => Some(table_cell_atomic_inline_outer_height(
+            box_.core.element,
             &box_.core.style,
             &box_.core.children,
         )),
@@ -603,20 +807,22 @@ fn table_cell_inline_level_outer_height(
 /// <https://www.w3.org/TR/css-inline-3/#atomic-inline> and
 /// <https://www.w3.org/TR/css-sizing-3/#box-sizing>.
 fn table_cell_atomic_inline_outer_height(
+    element: &Element,
     style: &ComputedStyle,
     children: &[box_tree::FormattingBox<'_>],
 ) -> LayoutLength {
     if matches!(style.position, Position::Absolute | Position::Fixed) {
         return layout_pt(0.0);
     }
-    let nested_height = if style.contain.size {
+    let containment = used_property_containment(element, style);
+    let nested_height = if containment.size {
         0.0
     } else {
         table_cell_formatting_children_block_height(children).points()
     };
     let vertical_non_content =
         non_content_pt(style.padding.top + style.padding.bottom) + table_vertical_borders(style);
-    let preferred_content_height = if style.contain.size {
+    let preferred_content_height = if containment.size {
         0.0
     } else {
         nested_height.max(style.line_height)
@@ -628,7 +834,7 @@ fn table_cell_atomic_inline_outer_height(
     )
     .map(SemanticLengthExt::points)
     .unwrap_or(preferred_content_height);
-    if !style.contain.size {
+    if !containment.size {
         content_height = content_height.max(nested_height);
     }
     layout_pt(
@@ -638,13 +844,15 @@ fn table_cell_atomic_inline_outer_height(
 }
 
 fn table_cell_element_outer_height(
+    element: &Element,
     style: &ComputedStyle,
     children: &[box_tree::FormattingBox<'_>],
 ) -> LayoutLength {
     if matches!(style.position, Position::Absolute | Position::Fixed) {
         return layout_pt(0.0);
     }
-    let nested_height = if style.contain.size {
+    let containment = used_property_containment(element, style);
+    let nested_height = if containment.size {
         0.0
     } else {
         table_cell_formatting_children_block_height(children).points()
@@ -655,7 +863,7 @@ fn table_cell_element_outer_height(
         used_content_box_height_or_auto(style, layout_pt(nested_height), vertical_non_content)
             .map(SemanticLengthExt::points)
             .unwrap_or(nested_height);
-    if !style.contain.size {
+    if !containment.size {
         content_height = content_height.max(nested_height);
     }
     layout_pt(

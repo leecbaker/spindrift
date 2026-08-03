@@ -250,7 +250,7 @@ pub(in crate::layout) fn vertical_text_cluster_is_upright(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::RenderedGlyphKind;
+    use crate::document::paint::text::RenderedGlyphKind;
 
     fn upright_glyph(text: &str, advance: f32, vertical_origin: f32) -> RenderedGlyph {
         RenderedGlyph {

@@ -6,7 +6,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         fragment: &box_tree::TableFragment<'_>,
     ) {
         // Keep the source style inside `TableUsedStyle` for reconstructed
@@ -64,11 +64,24 @@ impl<'a> LayoutBuilder<'a> {
                 })
             })
             .flatten();
-        let available_table_width = active_float_band_width
-            .unwrap_or_else(|| containing_inline_span.width())
-            - style.margin.left
-            - style.margin.right;
-        let mut table_width = used_table_width(style, available_table_width);
+        // Tables are sized in their logical inline axis.  In vertical writing
+        // modes the physical page-area width is the block span, so using it
+        // here constrains a table to one column's physical width instead of
+        // the containing block's inline size.
+        let available_table_inline_size = active_float_band_width.unwrap_or_else(|| {
+            if style.writing_mode == WritingMode::HorizontalTb {
+                containing_inline_span.width()
+            } else {
+                self.current_content_logical_inline_size()
+            }
+        });
+        let inline_margins = if style.writing_mode == WritingMode::HorizontalTb {
+            style.margin.left + style.margin.right
+        } else {
+            style.margin.top + style.margin.bottom
+        };
+        let available_table_width = available_table_inline_size - inline_margins;
+        let mut table_width = used_table_width(style, available_table_width, None);
         let table_cellpadding = element
             .attrs
             .get("cellpadding")
@@ -84,7 +97,8 @@ impl<'a> LayoutBuilder<'a> {
                 table_width,
                 table_metrics,
                 relative_offset,
-                is_document_canvas_element(element),
+                self.document_canvas_overflow
+                    .is_document_canvas_flow_element(element),
                 wrapper_border_box_block_size,
             );
             return;
@@ -108,6 +122,13 @@ impl<'a> LayoutBuilder<'a> {
                     grid.column_count,
                 )
             });
+        table_width = used_table_width(
+            style,
+            available_table_width,
+            collapsed_geometry
+                .as_ref()
+                .map(|geometry| geometry.outer_insets),
+        );
         self.resolve_table_used_content_width(
             rows,
             &grid,
@@ -132,9 +153,6 @@ impl<'a> LayoutBuilder<'a> {
             table_metrics.clone(),
             collapsed_geometry.as_ref(),
         );
-        if let Some(geometry) = &collapsed_geometry {
-            table_width.border_widths = geometry.outer_insets;
-        }
         let used_table_width = column_plan.total_width();
         let provisional_caption_width =
             PhysicalContentWidth::new(content_box_pt(used_table_width.points()));
@@ -265,15 +283,15 @@ impl<'a> LayoutBuilder<'a> {
             bottom_caption_height,
         );
         self.cursor_y -= style.margin.top;
-        // The generic BFC prebreak heuristic assumes that a box's physical
-        // vertical extent is an indivisible block-flow unit. An orthogonal
-        // table grid instead owns row fragmentation in its logical block
-        // axis, so moving the entire projected wrapper would bypass its row
-        // break opportunities.
+        // An orthogonal table owns fragmentation along its logical block
+        // axis. Its physical height is not an indivisible block-flow extent,
+        // so applying the wrapper prebreak heuristic here would move an
+        // otherwise fitting vertical table to a new page.
         // <https://drafts.csswg.org/css-tables-3/#table-layout>
         // <https://www.w3.org/TR/css-break-3/#breaks-between>
         if !style.writing_mode.has_vertical_lines() {
-            self.prebreak_bfc_margin_box_if_needed(
+            self.prebreak_table_wrapper_if_needed(
+                fragmentainer_kind,
                 margin_box_pt(table_collision_height),
                 style.margin.top,
             );
@@ -323,6 +341,7 @@ impl<'a> LayoutBuilder<'a> {
         // <https://www.w3.org/TR/css-contain-1/#containment-paint>
         let table_wrapper_paint_checkpoint = self.current_page.paint_checkpoint();
         let table_wrapper_paint_page_index = self.pages.len();
+        let paint_containment_applies = paint_containment_applies_to_element(element, style);
         let top_caption_paint_checkpoint = self.current_page.paint_checkpoint();
         let top_caption_paint_page_index = self.pages.len();
         let top_caption_clip = PageTopRect::new(
@@ -331,7 +350,7 @@ impl<'a> LayoutBuilder<'a> {
             physical_grid_width.points() + table_width.padding.left + table_width.padding.right,
             top_caption_height,
         );
-        let top_caption_clip_active = if style.contain.paint {
+        let top_caption_clip_active = if paint_containment_applies {
             self.push_overflow_clip(top_caption_clip.overflow_clip());
             true
         } else {
@@ -352,7 +371,9 @@ impl<'a> LayoutBuilder<'a> {
             table_vertical_edge_spacing(&planned_row_occupancy, table_metrics.clone());
         self.cursor_y -= table_edge_spacing;
 
-        let table_is_document_canvas = is_document_canvas_element(element);
+        let table_is_document_canvas = self
+            .document_canvas_overflow
+            .is_document_canvas_flow_element(element);
         let table_structure_paint_checkpoint = self.current_page.paint_checkpoint();
         let table_structure_paint_page_index = self.pages.len();
         let table_paint_box = TableWrapperPaintBox {
@@ -366,7 +387,8 @@ impl<'a> LayoutBuilder<'a> {
             table_width,
             table_metrics: table_metrics.clone(),
         };
-        if style.contain.paint && self.pages.len() == top_caption_paint_page_index {
+        let source_grid_placement = table_paint_box.clone().grid_placement();
+        if paint_containment_applies && self.pages.len() == top_caption_paint_page_index {
             let fragment = self
                 .current_page
                 .paint_tree_fragment_since(&top_caption_paint_checkpoint);
@@ -409,6 +431,7 @@ impl<'a> LayoutBuilder<'a> {
             mut table_body_fragment,
             forced_break_after_table_rows,
             current_fragment_repeat_policy,
+            continuation_inline_offset,
         ) = self.layout_table_body_rows(TableBodyRowsInput {
             fragmentainer_kind,
             rows,
@@ -417,6 +440,7 @@ impl<'a> LayoutBuilder<'a> {
             style,
             stylesheets,
             table_x,
+            source_grid_placement,
             logical_inline_extent: used_table_width,
             physical_grid_width,
             table_cellpadding,
@@ -437,6 +461,7 @@ impl<'a> LayoutBuilder<'a> {
             row_group_break_before: &row_group_break_before,
             row_group_break_after: &row_group_break_after,
         });
+        let table_x = continuation_inline_offset.resolve(self.content_left);
         let table_body_commit_context = TableBodyFragmentCommitContext {
             rows,
             grid: &grid,
@@ -444,6 +469,7 @@ impl<'a> LayoutBuilder<'a> {
             style,
             stylesheets,
             table_x,
+            continuation_inline_offset,
             logical_inline_extent: used_table_width,
             physical_grid_width,
             table_cellpadding,
@@ -477,7 +503,7 @@ impl<'a> LayoutBuilder<'a> {
             physical_grid_width.points() + table_width.padding.left + table_width.padding.right,
             bottom_caption_height,
         );
-        let bottom_caption_clip_active = if style.contain.paint {
+        let bottom_caption_clip_active = if paint_containment_applies {
             self.push_overflow_clip(bottom_caption_clip.overflow_clip());
             true
         } else {
@@ -492,7 +518,7 @@ impl<'a> LayoutBuilder<'a> {
             CaptionSide::Bottom,
         );
         self.pop_overflow_clip(bottom_caption_clip_active);
-        if style.contain.paint && self.pages.len() == bottom_caption_paint_page_index {
+        if paint_containment_applies && self.pages.len() == bottom_caption_paint_page_index {
             let fragment = self
                 .current_page
                 .paint_tree_fragment_since(&bottom_caption_paint_checkpoint);
@@ -501,7 +527,7 @@ impl<'a> LayoutBuilder<'a> {
             self.current_page
                 .replace_paint_tree_since_with_fragment(&bottom_caption_paint_checkpoint, fragment);
         }
-        if style.contain.paint && self.pages.len() == table_wrapper_paint_page_index {
+        if paint_containment_applies && self.pages.len() == table_wrapper_paint_page_index {
             // The canonical paint tree retains caption ordering and scopes
             // while the wrapper is promoted into its containment context.
             let fragment = self
@@ -550,6 +576,56 @@ impl<'a> LayoutBuilder<'a> {
             FragmentBreakContext::for_standalone_box(style)
                 .forced_break_after_or_in(fragmentainer_kind, forced_break_after_table_rows),
         );
+    }
+}
+
+impl<'a> LayoutBuilder<'a> {
+    /// Move a fragmentable table wrapper before it paints captions or grid
+    /// content when its opening margin box overflows the active fragmentainer.
+    ///
+    /// A table wrapper can split internally, so the generic BFC prebreak
+    /// helper cannot be used here: it only advances page fragmentainers and
+    /// rejects a box taller than a page. Tables in multicolumn flow instead
+    /// need the ordinary fragmentainer advance gate before their top captions
+    /// establish a fragment-local table origin. Once the wrapper begins in the
+    /// selected destination, row layout remains free to fragment normally.
+    ///
+    /// <https://drafts.csswg.org/css-tables/#table-fragmentation>
+    /// <https://www.w3.org/TR/css-break-3/#unforced-breaks>
+    fn prebreak_table_wrapper_if_needed(
+        &mut self,
+        fragmentainer_kind: FragmentainerKind,
+        margin_box_height: MarginBoxLength,
+        reapplied_margin_top: f32,
+    ) {
+        const EPSILON: f32 = 0.01;
+
+        let overflows = margin_box_height.points() > EPSILON
+            && self.cursor_y - margin_box_height.points() < self.page_bottom() - EPSILON;
+        let can_advance = self.fragmentainer_materializes_cursor(fragmentainer_kind)
+            && self.out_of_flow_prebreak_suppression_depth == 0
+            && self.current_page_has_content()
+            // A prebreak never creates an empty opening fragmentainer. This
+            // applies to columns as well as pages: the table body owns later
+            // row fragmentation once its opening wrapper starts at a column
+            // edge.
+            && !self.cursor_is_at_page_top();
+        let should_advance = FragmentAdvanceDecision::choose(FragmentAdvanceInput {
+            break_is_applicable: true,
+            overflows,
+            can_advance,
+        })
+        .should_advance;
+        if should_advance
+            && self
+                .materialize_table_fragmentainer_advance(
+                    fragmentainer_kind,
+                    FragmentainerAdvance::Unforced,
+                )
+                .is_some()
+        {
+            self.cursor_y -= reapplied_margin_top;
+        }
     }
 }
 

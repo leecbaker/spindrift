@@ -1,7 +1,8 @@
 use super::system::span_boundary_needs_join_control;
 use crate::CssColor;
-use crate::css::WritingMode;
-use crate::document::{PaintDisplacement, RenderedLine};
+use crate::css::{ComputedLineHeight, WritingMode};
+use crate::document::paint::geometry::PaintDisplacement;
+use crate::document::paint::text::{RenderedGlyph, RenderedGlyphKind, RenderedLine};
 
 #[test]
 fn rendered_line_alignment_reverses_the_stored_glyph_origin_adjustment() {
@@ -53,6 +54,26 @@ fn arabic_visual_ranges_are_emitted_in_reverse_cluster_order() {
             .all(|range| range.direction == ResolvedBidiDirection::Rtl)
     );
 }
+
+#[test]
+fn rtl_flag_emoji_visual_range_precedes_the_hebrew_run() {
+    let mut style = ComputedStyle::initial();
+    style.direction = Direction::Rtl;
+    style.font_size = 32.0;
+    style.line_height = 38.4;
+    let text = "לום🇱🇮";
+    let mut system = FontSystem::new();
+
+    let visual_text = system
+        .visual_ranges_for_unwrapped_text(text, &style)
+        .into_iter()
+        .map(|range| &text[range.range])
+        .collect::<String>();
+
+    // The RTL run's individual source clusters are also in visual order, so
+    // their source scalars appear reversed in this presentation sequence.
+    assert_eq!(visual_text, "🇱🇮םול");
+}
 use super::*;
 use crate::css::{
     ComputedLengthPercentage, Css, FontFeatureSetting, FontFeatureSettings, FontPalette,
@@ -60,6 +81,7 @@ use crate::css::{
     parse_stylesheet,
 };
 use crate::units::{LayoutLength, SemanticLengthExt, layout_pt};
+use std::rc::Rc;
 
 async fn feature_probe_font_system() -> (FontSystem, ComputedStyle) {
     let stylesheet = parse_stylesheet(
@@ -87,8 +109,8 @@ async fn feature_probe_font_system() -> (FontSystem, ComputedStyle) {
 fn used_line_height_preserves_layout_length_type() {
     let mut system = FontSystem::new();
     let mut style = ComputedStyle::initial();
-    style.line_height_is_normal = false;
     style.line_height = 18.0;
+    style.line_height_value = ComputedLineHeight::from_points(18.0);
 
     let line_height: LayoutLength = system.used_line_height(&style);
 
@@ -208,6 +230,53 @@ async fn font_neutral_cgj_does_not_change_visible_glyph_selection() {
     // <https://www.unicode.org/reports/tr44/#Default_Ignorable_Code_Point>
     assert_eq!(with_cgj, plain);
     assert_eq!(styled_with_cgj, styled_plain);
+}
+
+#[test]
+fn styled_zero_width_space_between_different_styles_keeps_source_text() {
+    let mut system = FontSystem::new();
+    let mut pre = ComputedStyle::initial();
+    pre.font_family = FontFamily::Monospace;
+    pre.font_size = 12.0;
+    pre.line_height = 14.4;
+    pre.white_space = WhiteSpace::Pre;
+    let mut normal = pre.clone();
+    normal.white_space = WhiteSpace::Normal;
+
+    let runs = system.shape_styled_text_runs_with_parley(&[
+        StyledTextSpan {
+            text: "X",
+            style: &pre,
+        },
+        StyledTextSpan {
+            text: "\u{200b}",
+            style: &normal,
+        },
+        StyledTextSpan {
+            text: "X",
+            style: &pre,
+        },
+    ]);
+
+    assert!(
+        !runs.is_empty(),
+        "a font-neutral U+200B must not create an empty Parley style range"
+    );
+    assert_eq!(
+        runs.iter().map(|run| run.text.as_ref()).collect::<String>(),
+        "XX",
+        "U+200B stays outside Parley's styled line-breaking buffer"
+    );
+    assert!(
+        runs.iter()
+            .flat_map(|run| &run.glyph_source_ranges)
+            .any(|range| range.as_ref().is_some_and(|range| range == &(0..1)))
+    );
+    assert!(
+        runs.iter()
+            .flat_map(|run| &run.glyph_source_ranges)
+            .any(|range| range.as_ref().is_some_and(|range| range == &(4..5)))
+    );
 }
 
 #[test]
@@ -381,6 +450,22 @@ fn rtl_base_direction_marks_neutral_punctuation_as_an_rtl_visual_slice() {
         text.get(visual_range.range.clone()) == Some(">")
             && visual_range.direction == ResolvedBidiDirection::Rtl
     }));
+}
+
+#[test]
+fn isolate_controls_keep_the_outer_bidi_sequence_neutral() {
+    let mut system = FontSystem::new();
+    let mut style = ComputedStyle::initial();
+    style.direction = Direction::Rtl;
+    let text = "a - \u{2066}[1]\u{2069}...";
+
+    let visual_text = system
+        .visual_ranges_for_unwrapped_text(text, &style)
+        .into_iter()
+        .map(|range| text_without_bidi_format_controls(&text[range.range]).into_owned())
+        .collect::<String>();
+
+    assert_eq!(visual_text, "...[1] - a");
 }
 
 #[tokio::test]
@@ -596,6 +681,32 @@ async fn font_variant_emoji_selectors_do_not_leak_to_emitted_text() {
 }
 
 #[tokio::test]
+async fn emoji_selectors_choose_distinct_generic_serif_faces() {
+    let mut system = FontSystem::new();
+    let mut style = ComputedStyle::initial();
+    style.font_family = FontFamily::Serif;
+    style.font_size = 40.0;
+    style.line_height = 80.0;
+    let text_source = system.emoji_presentation_family_source("\u{263a}\u{fe0e}", &style);
+    let emoji_source = system.emoji_presentation_family_source("\u{263a}\u{fe0f}", &style);
+
+    let text_face = system
+        .shape_text_runs_with_parley("\u{263a}\u{fe0e}", &style)
+        .into_iter()
+        .find_map(|run| run.font_id)
+        .expect("text-presentation serif face");
+    let emoji_face = system
+        .shape_text_runs_with_parley("\u{263a}\u{fe0f}", &style)
+        .into_iter()
+        .find_map(|run| run.font_id)
+        .expect("emoji-presentation fallback face");
+    assert_ne!(
+        text_face, emoji_face,
+        "variation selectors must select distinct text and emoji presentation faces: text_source={text_source:?}, emoji_source={emoji_source:?}"
+    );
+}
+
+#[tokio::test]
 async fn numeric_font_size_adjust_changes_used_shaping_size() {
     let (mut system, style) = feature_probe_font_system().await;
     let normal_width = system.measure_text("xxxx", &style);
@@ -638,10 +749,73 @@ async fn font_size_adjust_from_font_uses_first_available_font_ratio() {
 }
 
 #[tokio::test]
+async fn font_size_adjust_from_font_keeps_its_primary_metric_across_unicode_range_fallback() {
+    let stylesheet = parse_stylesheet(
+        &Css::from_string(
+            r#"@font-face {
+                font-family: SpaceOnlyAhem;
+                src: url("tests/fixtures/wpt/css/css-fonts/Ahem.ttf");
+                unicode-range: U+0020;
+            }"#,
+        )
+        .with_base_path(".")
+        .expect("current directory should be a valid file URL"),
+    );
+    let mut system = FontSystem::start_loading()
+        .load_stylesheet_fonts(&[stylesheet])
+        .finish()
+        .await;
+    let mut from_font = ComputedStyle::initial();
+    from_font.font_size = 50.0;
+    from_font.line_height = 50.0;
+    from_font.font_family = FontFamily::List(vec![
+        FontFamily::Names(vec!["SpaceOnlyAhem".to_string()]),
+        FontFamily::Serif,
+    ]);
+    from_font.font_size_adjust = FontSizeAdjust::Value {
+        metric: FontSizeAdjustMetric::ExHeight,
+        value: FontSizeAdjustValue::FromFont,
+    };
+    let primary = system
+        .resolve_metric_font_for_style(&from_font)
+        .expect("space-only primary face");
+    assert_eq!(
+        system
+            .document_fonts
+            .get(primary)
+            .expect("primary font")
+            .family,
+        "SpaceOnlyAhem"
+    );
+    let mut explicit = from_font.clone();
+    explicit.font_size_adjust = FontSizeAdjust::Value {
+        metric: FontSizeAdjustMetric::ExHeight,
+        // Ahem's fallback x-height is 0.8em; use its known local metric as
+        // the explicit control for the `from-font` primary-face path.
+        value: FontSizeAdjustValue::Number(0.8),
+    };
+
+    let from_font_run = system
+        .shape_text_runs_with_parley("foobar", &from_font)
+        .into_iter()
+        .next()
+        .expect("range-fallback run");
+    let explicit_run = system
+        .shape_text_runs_with_parley("foobar", &explicit)
+        .into_iter()
+        .next()
+        .expect("explicit-aspect run");
+    assert!(
+        (from_font_run.font_size - explicit_run.font_size).abs() < 0.01,
+        "from-font must retain the primary face's aspect value after Unicode-range fallback: from-font={from_font_run:?}, explicit={explicit_run:?}"
+    );
+}
+
+#[tokio::test]
 async fn font_size_adjust_keeps_explicit_line_height_computed_size() {
     let (mut system, mut style) = feature_probe_font_system().await;
     style.line_height = 20.0;
-    style.line_height_is_normal = false;
+    style.line_height_value = ComputedLineHeight::from_points(20.0);
     style.font_size_adjust = FontSizeAdjust::Value {
         metric: FontSizeAdjustMetric::ExHeight,
         value: FontSizeAdjustValue::Number(0.9),
@@ -655,7 +829,7 @@ async fn font_size_adjust_keeps_explicit_line_height_computed_size() {
 }
 
 #[tokio::test]
-async fn same_face_bold_request_gets_synthesized_document_font_label() {
+async fn same_face_bold_request_does_not_infer_synthesis_without_fontique_match() {
     let mut system = FontSystem::new();
     let mut normal = ComputedStyle::initial();
     normal.font_family = FontFamily::SansSerif;
@@ -705,8 +879,130 @@ async fn same_face_bold_request_gets_synthesized_document_font_label() {
     assert_eq!(normal_font.family, family_label);
     assert_eq!(bold_font.family, family_label);
     assert_ne!(normal_id, bold_id);
-    assert_ne!(normal_font.post_script_name, bold_font.post_script_name);
-    assert!(bold_font.post_script_name.contains("Bold"));
+    assert_eq!(normal_font.post_script_name, bold_font.post_script_name);
+    assert!(!normal_font.synthesis.embolden);
+    assert!(
+        !bold_font.synthesis.embolden,
+        "a bold request alone is not evidence that Fontique selected faux bold"
+    );
+}
+
+#[test]
+fn source_slice_preserves_metadata_and_leaves_the_source_runs_unchanged() {
+    fn glyph(
+        unicode: &str,
+        advance: f32,
+        source_range: std::ops::Range<usize>,
+    ) -> ShapedInlineGlyph {
+        ShapedInlineGlyph {
+            rendered: RenderedGlyph {
+                kind: RenderedGlyphKind::Paint(1),
+                x_advance: advance,
+                nominal_x_advance: advance,
+                x_offset: 0.0,
+                y_offset: 0.0,
+                unicode: unicode.into(),
+            },
+            paints: true,
+            source_range: Some(source_range),
+        }
+    }
+
+    let source = ShapedInlineLine {
+        text: Rc::from("abcd"),
+        width: 99.0,
+        offset: 7.0,
+        aligned_by_parley: true,
+        line_height: 18.0,
+        baseline_adjustment: 3.0,
+        runs: vec![
+            ShapedInlineRun {
+                text: Rc::from("ab"),
+                x_offset: 1.0,
+                font_size: 12.0,
+                font_id: Some(4),
+                font_palette: FontPalette::Normal,
+                glyphs: vec![glyph("a", 2.0, 0..1), glyph("b", 3.0, 1..2)],
+                paints: true,
+            },
+            ShapedInlineRun {
+                text: Rc::from("cd"),
+                x_offset: 6.0,
+                font_size: 14.0,
+                font_id: Some(5),
+                font_palette: FontPalette::Named("accent".into()),
+                glyphs: vec![glyph("c", 4.0, 2..3), glyph("d", 5.0, 3..4)],
+                paints: true,
+            },
+        ],
+    };
+    let original = source.clone();
+
+    let slice = source
+        .source_slice(1..3)
+        .expect("range covers complete clusters");
+    assert_eq!(
+        source.source_range_advance_width(1..3),
+        Some(slice.advance_width()),
+        "measurement-only source ranges must match durable source slices"
+    );
+
+    assert_eq!(source, original, "slicing must not mutate the source shape");
+    assert_eq!(slice.text.as_ref(), "bc");
+    assert_eq!(slice.offset, source.offset);
+    assert_eq!(slice.aligned_by_parley, source.aligned_by_parley);
+    assert_eq!(slice.line_height, source.line_height);
+    assert_eq!(slice.baseline_adjustment, source.baseline_adjustment);
+    assert_eq!(slice.width, slice.advance_width());
+    assert_eq!(slice.runs.len(), 2);
+    assert_eq!(slice.runs[0].text.as_ref(), "b");
+    assert_eq!(slice.runs[1].text.as_ref(), "c");
+    assert_eq!(slice.runs[0].glyphs[0].source_range, Some(0..1));
+    assert_eq!(slice.runs[1].glyphs[0].source_range, Some(1..2));
+    assert_eq!(slice.runs[0].font_id, Some(4));
+    assert_eq!(slice.runs[1].font_id, Some(5));
+    assert_eq!(
+        slice.runs[1].font_palette,
+        FontPalette::Named("accent".into())
+    );
+}
+
+#[test]
+fn rendered_runs_preserve_ligature_source_text_with_actual_text() {
+    let glyph = |unicode: &str| ShapedInlineGlyph {
+        rendered: RenderedGlyph {
+            kind: RenderedGlyphKind::Paint(42),
+            x_advance: 7.0,
+            nominal_x_advance: 7.0,
+            x_offset: 0.0,
+            y_offset: 0.0,
+            unicode: unicode.to_owned(),
+        },
+        paints: true,
+        source_range: None,
+    };
+    let ligature = ShapedInlineRun {
+        text: Rc::from("fi"),
+        x_offset: 0.0,
+        font_size: 12.0,
+        font_id: Some(0),
+        font_palette: FontPalette::Normal,
+        // HarfBuzz can attach the fi glyph to its first source cluster.
+        glyphs: vec![glyph("f")],
+        paints: true,
+    };
+    let faithful = ShapedInlineRun {
+        text: Rc::from("fit"),
+        x_offset: 0.0,
+        font_size: 12.0,
+        font_id: Some(0),
+        font_palette: FontPalette::Normal,
+        glyphs: vec![glyph("f"), glyph("i"), glyph("t")],
+        paints: true,
+    };
+
+    assert_eq!(ligature.rendered_run().actual_text.as_deref(), Some("fi"));
+    assert_eq!(faithful.rendered_run().actual_text, None);
 }
 
 #[tokio::test]
@@ -1287,6 +1583,63 @@ async fn styled_tatweel_fragment_shapes_adjacent_arabic_letter() {
 }
 
 #[tokio::test]
+async fn styled_zwnj_fragment_suppresses_arabic_joining_with_a_different_font() {
+    let stylesheet = parse_stylesheet(
+        &Css::from_string(
+            r#"@font-face {
+                font-family: AlreqNaskh;
+                src: url("tests/resources/fonts/NotoNaskhArabic-regular.woff2");
+            }
+            @font-face {
+                font-family: AlreqJoinControls;
+                src: url("tests/resources/fonts/noto-sans-v8-latin-regular.woff");
+            }"#,
+        )
+        .with_base_path(".")
+        .expect("current directory should be a valid file URL"),
+    );
+    let mut arabic = ComputedStyle::initial();
+    arabic.font_family = FontFamily::Names(vec!["AlreqNaskh".to_string()]);
+    arabic.font_size = 20.0;
+    arabic.line_height = 24.0;
+    arabic.direction = Direction::Rtl;
+    let mut join_control = arabic.clone();
+    join_control.font_family = FontFamily::Names(vec!["AlreqJoinControls".to_string()]);
+    join_control.line_height = 0.0;
+    let mut system = FontSystem::start_loading()
+        .load_stylesheet_fonts(&[stylesheet])
+        .finish()
+        .await;
+
+    let expected = shaped_glyph_ids(&mut system, "\u{0640}\u{fe8d}", &arabic);
+    let shaped = system.shape_styled_text_runs_with_parley(&[
+        StyledTextSpan {
+            text: "\u{0640}",
+            style: &arabic,
+        },
+        StyledTextSpan {
+            text: "\u{200c}",
+            style: &join_control,
+        },
+        StyledTextSpan {
+            text: "\u{0627}",
+            style: &arabic,
+        },
+    ]);
+    let actual = shaped
+        .into_iter()
+        .flat_map(|run| run.glyphs)
+        .filter(|glyph| glyph.x_advance != 0.0)
+        .map(|glyph| glyph.painted_id().expect("paintable glyph"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        actual, expected,
+        "explicit ZWNJ must preserve no-join shaping"
+    );
+}
+
+#[tokio::test]
 async fn explicit_join_control_suppresses_synthetic_boundary_joiner() {
     assert!(!span_boundary_needs_join_control("ـ\u{200c}", "ا"));
     assert!(!span_boundary_needs_join_control("ـ", "\u{200c}ا"));
@@ -1569,6 +1922,112 @@ async fn measured_keep_all_retains_hyphen_boundaries() {
 }
 
 #[tokio::test]
+async fn normal_thai_named_entities_remain_one_complex_context_unit() {
+    let mut style = ComputedStyle::initial();
+    style.language = Some("th".to_string());
+    let text = "กรุงเทพคือสวยงาม";
+
+    assert_eq!(
+        measured_break_opportunities(text, &style),
+        vec!["กรุงเทพ".len(), "กรุงเทพคือ".len(), text.len()]
+    );
+}
+
+#[tokio::test]
+async fn auto_phrase_uses_icu_word_boundaries_for_known_languages() {
+    let mut style = ComputedStyle::initial();
+    style.word_break = CssWordBreak::AutoPhrase;
+    style.language = Some("ja".to_string());
+    let text = "東京へ行きましょう。";
+
+    let auto_phrase = measured_break_opportunities(text, &style);
+    style.word_break = CssWordBreak::Normal;
+    let normal = measured_break_opportunities(text, &style);
+    let icu_word_boundaries = WordSegmenter::new_auto(WordBreakInvariantOptions::default())
+        .segment_str(text)
+        .collect::<Vec<_>>();
+
+    assert!(
+        auto_phrase.len() < normal.len(),
+        "{auto_phrase:?} vs {normal:?}"
+    );
+    assert_eq!(auto_phrase, vec!["東京へ".len(), text.len()]);
+    assert!(auto_phrase.iter().all(|position| {
+        *position == text.len()
+            || !keep_all_suppresses_break_between(
+                text[..*position].chars().next_back().unwrap(),
+                text[*position..].chars().next().unwrap(),
+            )
+            || icu_word_boundaries.binary_search(position).is_ok()
+    }));
+}
+
+#[tokio::test]
+async fn auto_phrase_falls_back_to_normal_without_a_known_language() {
+    let text = "東京へ行きましょう。";
+    let mut auto_phrase = ComputedStyle::initial();
+    auto_phrase.word_break = CssWordBreak::AutoPhrase;
+    let normal = ComputedStyle::initial();
+
+    assert_eq!(
+        measured_break_opportunities(text, &auto_phrase),
+        measured_break_opportunities(text, &normal)
+    );
+}
+
+#[tokio::test]
+async fn auto_phrase_uses_kham_thai_named_entity_boundaries() {
+    let text = "กรุงเทพคือสวยงาม";
+    let mut style = ComputedStyle::initial();
+    style.word_break = CssWordBreak::AutoPhrase;
+    style.language = Some("th".to_string());
+    let breaks = measured_break_opportunities(text, &style);
+    let mut expected = phrase_boundaries(text, AutoPhraseLanguage::Thai)
+        .expect("declared Thai has Kham phrase analysis")
+        .boundary_offsets()
+        .to_vec();
+    expected.push(text.len());
+    assert_eq!(breaks, expected);
+}
+
+#[tokio::test]
+async fn auto_phrase_keeps_gl_wj_and_zwj_boundaries_protected() {
+    let mut style = ComputedStyle::initial();
+    style.word_break = CssWordBreak::AutoPhrase;
+    style.language = Some("ja".to_string());
+
+    for text in [
+        "東京\u{00a0}へ\u{00a0}行きましょう。",
+        "東京\u{2060}へ\u{2060}行きましょう。",
+        "東京\u{200d}へ\u{200d}行きましょう。",
+    ] {
+        let breaks = measured_break_opportunities(text, &style);
+        for (offset, character) in text.char_indices() {
+            if matches!(character, '\u{00a0}' | '\u{2060}' | '\u{200d}') {
+                assert!(!breaks.contains(&offset), "{text:?}: {breaks:?}");
+                assert!(
+                    !breaks.contains(&(offset + character.len_utf8())),
+                    "{text:?}: {breaks:?}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn auto_phrase_suppresses_authored_soft_hyphens() {
+    let mut style = ComputedStyle::initial();
+    style.word_break = CssWordBreak::AutoPhrase;
+    style.language = Some("en".to_string());
+    let text = "con\u{00ad}sid\u{00ad}eration";
+
+    assert_eq!(
+        text_with_hyphenation_controls(text, &style),
+        "consideration"
+    );
+}
+
+#[tokio::test]
 async fn measured_manual_suppresses_thai_dictionary_breaks() {
     let mut style = ComputedStyle::initial();
     style.word_break = CssWordBreak::Manual;
@@ -1786,6 +2245,31 @@ fn shaped_terminal_tracking_is_removed_from_the_glyph_advance() {
         (shaped.advance_width() - (tracked_width - 10.0)).abs() < 0.01,
         "terminal tracking must be removed from the durable glyph artifact"
     );
+}
+
+#[test]
+fn untracked_inline_shaping_suppresses_backend_letter_spacing() {
+    let mut system = FontSystem::new();
+    let mut tracked = ComputedStyle::initial();
+    tracked.font_family = FontFamily::Monospace;
+    tracked.font_size = 12.0;
+    tracked.letter_spacing = ComputedLengthPercentage::from_points(10.0);
+    let mut untracked = tracked.clone();
+    untracked.letter_spacing = ComputedLengthPercentage::ZERO;
+
+    for text in ["ab", "\u{200b}\u{200c}\u{200d}\u{feff}\u{200e}\u{2066}xx"] {
+        let actual = system
+            .shape_untracked_inline_line(text, &tracked, tracked.line_height)
+            .expect("untracked inline text shapes");
+        let expected = system
+            .shape_unwrapped_line(text, &untracked, untracked.line_height)
+            .expect("zero-spacing text shapes");
+
+        assert!(
+            (actual.advance_width() - expected.advance_width()).abs() < 0.01,
+            "untracked shaping must match a style whose used letter spacing is zero for {text:?}"
+        );
+    }
 }
 
 #[test]

@@ -193,10 +193,10 @@ pub(super) fn push_parley_text_spacing_default_with_context(
     builder: &mut parley::RangedBuilder<'_, FontPalette>,
     text: &str,
     style: &ComputedStyle,
+    requested_letter_spacing: f32,
     context: Option<&FontFeatureContext>,
 ) {
-    let used_letter_spacing =
-        used_letter_spacing_for_text(text, style.used_letter_spacing().points());
+    let used_letter_spacing = used_letter_spacing_for_text(text, requested_letter_spacing);
     let vertical_form_ranges = vertical_form_feature_ranges(text, style);
     let default_feature_policy = FontFeaturePolicy::for_text(text.len(), &vertical_form_ranges);
     builder.push_default(StyleProperty::LetterSpacing(used_letter_spacing));
@@ -223,10 +223,10 @@ pub(super) fn push_parley_text_spacing_range_with_context(
     text: &str,
     style: &ComputedStyle,
     range: Range<usize>,
+    requested_letter_spacing: f32,
     context: Option<&FontFeatureContext>,
 ) {
-    let used_letter_spacing =
-        used_letter_spacing_for_text(text, style.used_letter_spacing().points());
+    let used_letter_spacing = used_letter_spacing_for_text(text, requested_letter_spacing);
     let vertical_form_ranges = vertical_form_feature_ranges(text, style);
     let default_feature_policy = FontFeaturePolicy::for_text(text.len(), &vertical_form_ranges);
     builder.push(
@@ -794,20 +794,39 @@ fn push_parley_font_feature(features: &mut Vec<ParleyFontFeature>, tag: [u8; 4],
 }
 
 fn parley_language(style: &ComputedStyle) -> Option<ParleyLanguage> {
+    if let Some(tag) = style.font_language_override.opentype_tag() {
+        // Parley currently stores only the BCP-47 language/script/region
+        // prefix, so it cannot retain HarfBuzz's `x-hbot` private-use
+        // override. Translate the OpenType systems whose BCP-47 primary tags
+        // differ, then pass that locale through to HarfBuzz. This still
+        // intentionally replaces the shaping locale only, leaving `lang` to
+        // drive CSS casing, hyphenation, and fallback.
+        // <https://drafts.csswg.org/css-fonts-4/#font-language-override-prop>
+        let tag = std::str::from_utf8(&tag).ok()?.trim_end();
+        let locale = match tag {
+            // OpenType language-system tags are not ISO 639-3 tags. In
+            // particular, `trk` identifies the Turkic macro-language in BCP
+            // 47, while the OpenType `TRK ` system is Turkish.
+            "TRK" => "tr",
+            "DEU" => "de",
+            _ => return tag.to_ascii_lowercase().parse().ok(),
+        };
+        return locale.parse().ok();
+    }
     style.language.as_deref().and_then(|language| {
         let language = language.replace('_', "-");
         language.parse().ok()
     })
 }
 
-pub(super) fn parley_word_break(word_break: CssWordBreak) -> ParleyWordBreak {
-    match word_break {
-        CssWordBreak::Normal => ParleyWordBreak::Normal,
-        CssWordBreak::BreakAll => ParleyWordBreak::BreakAll,
-        CssWordBreak::KeepAll => ParleyWordBreak::KeepAll,
-        CssWordBreak::Manual => ParleyWordBreak::Normal,
-        CssWordBreak::BreakWord => ParleyWordBreak::Normal,
-    }
+pub(super) fn parley_word_break(_word_break: CssWordBreak) -> ParleyWordBreak {
+    // Quire's inline opportunity graph owns CSS Text line breaking. Parley is
+    // used only for unwrapped shaping here; forwarding a CSS `word-break`
+    // value would change Parley's internal cluster boundaries and therefore
+    // perturb otherwise identical glyph metrics without participating in line
+    // selection. Keep the shaping backend neutral.
+    // <https://drafts.csswg.org/css-text-4/#word-break-property>
+    ParleyWordBreak::Normal
 }
 
 pub(super) fn parley_overflow_wrap(overflow_wrap: CssOverflowWrap) -> ParleyOverflowWrap {
@@ -1161,7 +1180,7 @@ pub(super) fn sanitize_pdf_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::css::{FontFeatureSetting, FontFeatureSettings, WritingMode};
+    use crate::css::{FontFeatureSetting, FontFeatureSettings, FontLanguageOverride, WritingMode};
 
     fn vertical_range_texts<'a>(text: &'a str, style: &ComputedStyle) -> Vec<&'a str> {
         vertical_form_feature_ranges(text, style)
@@ -1178,6 +1197,31 @@ mod tests {
                 .map(|feature| feature.value),
             ParleyFontFeatures::Source(_) => None,
         }
+    }
+
+    #[test]
+    fn parley_shaping_keeps_css_word_break_neutral() {
+        for word_break in [
+            CssWordBreak::Normal,
+            CssWordBreak::BreakAll,
+            CssWordBreak::KeepAll,
+            CssWordBreak::AutoPhrase,
+            CssWordBreak::Manual,
+            CssWordBreak::BreakWord,
+        ] {
+            assert_eq!(parley_word_break(word_break), ParleyWordBreak::Normal);
+        }
+    }
+
+    #[test]
+    fn font_language_override_replaces_only_the_shaping_locale() {
+        let mut style = ComputedStyle::initial();
+        style.language = Some("tr".to_string());
+        style.font_language_override = FontLanguageOverride::OpenType(*b"DEU ");
+        assert_eq!(parley_language(&style).unwrap().as_str(), "de");
+        style.font_language_override = FontLanguageOverride::OpenType(*b"TRK ");
+        assert_eq!(parley_language(&style).unwrap().as_str(), "tr");
+        assert_eq!(style.language.as_deref(), Some("tr"));
     }
 
     #[test]

@@ -92,7 +92,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         width_inputs: BlockContentWidthInputs,
     ) -> PhysicalContentWidth {
@@ -110,7 +110,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         width_inputs: BlockContentWidthInputs,
     ) -> ResolvedBlockPhysicalContentWidth {
@@ -308,7 +308,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         available_outer_width: f32,
     ) -> BlockIntrinsicContentSizes {
@@ -352,7 +352,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         available_outer_width: f32,
     ) -> (f32, f32) {
@@ -369,7 +369,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         available_outer_width: f32,
     ) -> (f32, f32) {
@@ -422,6 +422,18 @@ impl<'a> LayoutBuilder<'a> {
         // include its block descendants.
         // <https://www.w3.org/TR/css-sizing-3/#intrinsic-contribution> and
         // <https://www.w3.org/TR/css-grid-1/#intrinsic-sizes>.
+        let built_child_boxes;
+        let child_boxes = match child_boxes {
+            Some(child_boxes) => Some(child_boxes),
+            None => {
+                built_child_boxes = self.build_frozen_child_boxes_with_current_ancestors(
+                    element,
+                    stylesheets,
+                    style,
+                );
+                Some(built_child_boxes.as_slice())
+            }
+        };
         if let Some(child_boxes) = child_boxes {
             let mut block_child_min = 0.0_f32;
             let mut block_child_max = 0.0_f32;
@@ -688,12 +700,12 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         min_inline: f32,
         available_outer_width: f32,
     ) -> (f32, f32) {
-        if style.contain.size {
+        if used_property_containment(element, style).size {
             let height = style
                 .contain_intrinsic_size
                 .height
@@ -735,7 +747,11 @@ impl<'a> LayoutBuilder<'a> {
         let min_block = self.inline_items_logical_block_size(
             items.clone(),
             style,
-            min_inline.max(style.font_size).max(1.0),
+            // A zero font size produces no text advance or inline strut.
+            // Intrinsic measurement must keep that zero available span rather
+            // than manufacturing one pixel (or one em) of text contribution.
+            // <https://drafts.csswg.org/css-fonts-4/#font-size-prop>
+            min_inline.max(0.0),
         );
         let max_block = self.inline_items_logical_block_size(items, style, f32::MAX);
         if element.tag.eq_ignore_ascii_case("html") {
@@ -774,7 +790,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         _element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         available_outer_width: f32,
     ) -> f32 {
@@ -782,7 +798,7 @@ impl<'a> LayoutBuilder<'a> {
             return 0.0;
         };
         let parent_logical_inline_measure = used_content_box_size(
-            style.box_values.height.clone(),
+            style.box_values.height.value().clone(),
             style.box_sizing,
             PercentageBasis::definite(content_box_pt(available_outer_width)),
             intrinsic_box_metrics(style).vertical_non_content_length(),
@@ -864,7 +880,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         min_inline: f32,
         available_outer_width: f32,
@@ -875,15 +891,18 @@ impl<'a> LayoutBuilder<'a> {
         );
         intrinsic_style.box_values.min_width = css::ComputedLengthPercentageOrAuto::Auto;
         intrinsic_style.box_values.max_width = css::ComputedLengthPercentageOrAuto::Auto;
-        intrinsic_style.box_values.height = css::ComputedLengthPercentageOrAuto::Auto;
+        intrinsic_style
+            .box_values
+            .height
+            .replace_with_used(css::ComputedLengthPercentageOrAuto::Auto);
         intrinsic_style.box_values.min_height = css::ComputedLengthPercentageOrAuto::Auto;
         intrinsic_style.box_values.max_height = css::ComputedLengthPercentageOrAuto::Auto;
 
         let mut used_style = self.style_with_current_used_lengths(&intrinsic_style);
         let inline_basis = available_outer_width.max(min_inline).max(0.0);
-        let box_metrics = apply_used_box_metrics(
+        let box_metrics = apply_used_box_metrics_for_logical_inline_basis(
             &mut used_style,
-            PercentageBasis::definite(layout_pt(inline_basis)),
+            PercentageBasis::definite(LogicalInlineContentSize::new(content_box_pt(inline_basis))),
         );
         let outer_height = self.estimate_block_like_height(
             element,
@@ -915,14 +934,47 @@ impl<'a> LayoutBuilder<'a> {
             0.0,
             0.0,
         );
-        sequence.total_height().max(0.0)
+        // A baseline-aligned atomic inline's block-start margin moves the
+        // whole line in the logical block direction.  Auto block sizing must
+        // use that placed line extent, rather than treating every line as if
+        // it started at the content edge.  This matters particularly for a
+        // vertical `vertical-rl` block: the shift is physical-leftward and
+        // must not make overflow at the logical block start widen the box.
+        // Paint applies the identical per-line placement in
+        // `prepare_inline_line_fragment`.
+        // <https://drafts.csswg.org/css-inline-3/#line-layout>
+        let mut block_cursor = 0.0;
+        let mut block_end = 0.0_f32;
+        for record in &sequence.records {
+            block_cursor += record.block_before;
+            let line_block_start_margin = record
+                .fragment
+                .as_ref()
+                .map(|fragment| {
+                    fragment
+                        .items()
+                        .iter()
+                        .filter_map(|item| match item.item.as_ref() {
+                            InlineLineItem::Atom(atom) => {
+                                Some(inline_atom_logical_block_start_margin(atom, style))
+                            }
+                            InlineLineItem::Fragment(_) | InlineLineItem::Float(_) => None,
+                        })
+                        .fold(0.0_f32, f32::max)
+                })
+                .unwrap_or(0.0);
+            let line_height = record.height();
+            block_end = block_end.max(block_cursor + line_height - line_block_start_margin);
+            block_cursor += line_height;
+        }
+        block_end.max(0.0)
     }
 
     pub(in crate::layout) fn block_layout_geometry(
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
     ) -> BlockLayoutGeometry {
         let containing_inline_size = (self.content_right - self.content_left).max(0.0);
@@ -977,21 +1029,40 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         constraint: BlockLayoutInlineConstraint,
     ) -> BlockLayoutGeometry {
         let containing_inline_span = constraint.containing_inline_span;
-        let percentage_basis = constraint.percentage_basis.map_value(|size| {
-            crate::units::IntoLayoutLength::into_layout_length(size.content_box_length())
-        });
+        let percentage_basis = constraint.percentage_basis;
         let physical_width_percentage_basis = constraint.physical_width_percentage_basis.points();
         let containing_inline_size = containing_inline_span.width();
         let mut used_style = self.style_with_current_used_lengths(style);
-        let box_metrics = apply_used_box_metrics(&mut used_style, percentage_basis);
+        let box_metrics =
+            apply_used_box_metrics_for_logical_inline_basis(&mut used_style, percentage_basis);
         let relative_offset = self.normal_flow_relative_position_offset(&used_style);
+        let has_indefinite_orthogonal_containing_width =
+            crate::layout::block::writing_modes_are_orthogonal(
+                self.containing_block_writing_mode,
+                used_style.writing_mode,
+            ) && !self
+                .current_child_available_space()
+                .physical_width_is_definite;
+        // An auto-sized vertical containing block has an indefinite physical
+        // width while its horizontal child is being sized.  The child's auto
+        // inline measure therefore uses the Writing Modes fallback, rather
+        // than the parent's eventual content-derived zero width.  This is an
+        // available-space constraint only: it does not make percentages
+        // definite.
+        // <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
+        let auto_inline_constraint =
+            if has_indefinite_orthogonal_containing_width && has_auto_width(&used_style) {
+                physical_width_percentage_basis
+            } else {
+                containing_inline_size
+            };
         let available_outer_width =
-            normal_flow_block_available_outer_width(&used_style, layout_pt(containing_inline_size));
+            normal_flow_block_available_outer_width(&used_style, layout_pt(auto_inline_constraint));
         // Intrinsic sizing normally treats a percentage-dependent width as
         // auto until its containing-block basis is known. At this layout
         // boundary the physical width basis is known separately from the
@@ -1019,7 +1090,7 @@ impl<'a> LayoutBuilder<'a> {
             .value()
             .unwrap_or_else(|| layout_pt(0.0));
         let height_depends_on_intrinsic_content =
-            needs_intrinsic_height_contribution(used_style.box_values.height.clone())
+            needs_intrinsic_height_contribution(used_style.box_values.height.value().clone())
                 || needs_intrinsic_height_contribution(used_style.box_values.min_height.clone())
                 || needs_intrinsic_height_contribution(used_style.box_values.max_height.clone());
         // An `auto`-basis calc-size on the dependent block axis can be made
@@ -1047,25 +1118,36 @@ impl<'a> LayoutBuilder<'a> {
                 .map(SemanticLengthExt::points)
             })
             .flatten();
-        let intrinsic_sizes =
-            (needs_intrinsic_width_contribution(used_style.box_values.width.clone())
-                || needs_intrinsic_width_contribution(used_style.box_values.min_width.clone())
-                || needs_intrinsic_width_contribution(used_style.box_values.max_width.clone())
-                || (used_style.box_values.width.is_auto()
-                    && used_style.box_values.min_width.is_auto()
-                    && used_style
-                        .aspect_ratio
-                        .preferred_ratio_for_non_replaced(false)
-                        .is_some()))
-            .then(|| {
-                self.block_intrinsic_content_sizes(
-                    element,
-                    &used_style,
-                    stylesheets,
-                    child_boxes,
-                    available_outer_width.points(),
-                )
-            });
+        // At this normal-flow layout boundary the physical-width percentage
+        // basis is already definite.  Percentages need intrinsic fallback
+        // only during an intrinsic query with an indefinite containing block;
+        // treating ordinary `width`/`min-width: 0%` as such a query forces
+        // every block descendant through min/max-content measurement.
+        // <https://www.w3.org/TR/css-sizing-3/#percentage-sizing>
+        let width_needs_intrinsic_sizes = |value: &css::ComputedLengthPercentageOrAuto| {
+            !matches!(
+                value,
+                css::ComputedLengthPercentageOrAuto::LengthPercentage(_)
+            ) && needs_intrinsic_width_contribution(value.clone())
+        };
+        let intrinsic_sizes = (width_needs_intrinsic_sizes(&used_style.box_values.width)
+            || width_needs_intrinsic_sizes(&used_style.box_values.min_width)
+            || width_needs_intrinsic_sizes(&used_style.box_values.max_width)
+            || (used_style.box_values.width.is_auto()
+                && used_style.box_values.min_width.is_auto()
+                && used_style
+                    .aspect_ratio
+                    .preferred_ratio_for_non_replaced(false)
+                    .is_some()))
+        .then(|| {
+            self.block_intrinsic_content_sizes(
+                element,
+                &used_style,
+                stylesheets,
+                child_boxes,
+                available_outer_width.points(),
+            )
+        });
         let width_resolution = if let Some(auto_border_box_width) = constraint
             .auto_border_box_width
             .filter(|_| has_auto_width(&used_style))
@@ -1320,7 +1402,7 @@ impl<'a> LayoutBuilder<'a> {
             outer_inline_span.left_x() + border_edges.left.points() + used_style.padding.left;
         let content_inline_span = PageInlineSpan::new(inner_x, content_width.points());
         BlockLayoutGeometry {
-            style: used_style,
+            style: used_style.into_computed(),
             relative_offset,
             border_edges,
             vertical_non_content: vertical_extras,
@@ -1344,7 +1426,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         content_width: PhysicalContentWidth,
         definite_content_height: Option<PhysicalContentHeight>,
@@ -1412,6 +1494,18 @@ impl<'a> LayoutBuilder<'a> {
             let stretch_fit = own_inline_constraint
                 .map(|constraint| containing_stretch_fit.min(constraint))
                 .unwrap_or(containing_stretch_fit);
+            // DOM-backed blocks normally defer formatting-box construction to
+            // final layout. Orthogonal fit-content sizing needs the same
+            // atomic-inline classification as that final pass, however: a
+            // durable table box records table structure independently of its
+            // outer `display`, and a raw DOM probe would otherwise lose an
+            // `inline-table` entirely.
+            // <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-auto>
+            // <https://drafts.csswg.org/css-display-3/#valdef-display-inline-table>
+            let owned_child_boxes = child_boxes.is_none().then(|| {
+                self.build_frozen_child_boxes_with_current_ancestors(element, stylesheets, style)
+            });
+            let child_boxes = child_boxes.or(owned_child_boxes.as_deref());
             let (min_content, max_content) =
                 if child_boxes.is_some_and(has_non_inline_formatting_box) {
                     // Inline collection deliberately omits block children. For a

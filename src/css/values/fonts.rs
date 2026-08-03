@@ -1,4 +1,5 @@
 use super::*;
+use crate::css::component_values::split_css_component_values;
 
 /// Parse a CSS `<counter-style>` value.
 ///
@@ -845,6 +846,32 @@ pub(crate) fn parse_font_variant_position(value: &str) -> Option<FontVariantPosi
     }
 }
 
+/// Parse the CSS `font-language-override` longhand.
+///
+/// The serialized CSS form uses three-letter tags such as `"TRK"`; OpenType
+/// represents those as a space-padded four-byte tag.  Four printable ASCII
+/// bytes are accepted as-is, while an invalid string invalidates the
+/// declaration.
+/// <https://drafts.csswg.org/css-fonts-4/#font-language-override-prop>
+pub(crate) fn parse_font_language_override(value: &str) -> Option<FontLanguageOverride> {
+    let value = trim_css_value(value);
+    if value.eq_ignore_ascii_case("normal") {
+        return Some(FontLanguageOverride::Normal);
+    }
+    let (tag, tail) = parse_css_string_token(value)?;
+    if !tail.trim().is_empty() || !(3..=4).contains(&tag.len()) || !tag.is_ascii() {
+        return None;
+    }
+    let mut normalized = [b' '; 4];
+    for (slot, byte) in normalized.iter_mut().zip(tag.bytes()) {
+        if !byte.is_ascii_graphic() {
+            return None;
+        }
+        *slot = byte.to_ascii_uppercase();
+    }
+    Some(FontLanguageOverride::OpenType(normalized))
+}
+
 pub(crate) fn parse_font_variant_caps(value: &str) -> Option<FontVariantCaps> {
     match trim_css_value(value).to_ascii_lowercase().as_str() {
         "normal" => Some(FontVariantCaps::Normal),
@@ -946,10 +973,9 @@ pub(crate) fn parse_font_variant_alternates(value: &str) -> Option<FontVariantAl
             push_unique_alternate_name(&mut swash, name)?;
         } else if let Some(name) = parse_font_feature_value_function(token, "ornaments") {
             push_unique_alternate_name(&mut ornaments, name)?;
-        } else if let Some(name) = parse_font_feature_value_function(token, "annotation") {
-            push_unique_alternate_name(&mut annotation, name)?;
         } else {
-            return None;
+            let name = parse_font_feature_value_function(token, "annotation")?;
+            push_unique_alternate_name(&mut annotation, name)?;
         }
     }
     let has_values = historical_forms

@@ -77,76 +77,16 @@ impl<'a> LayoutBuilder<'a> {
             padding_left,
             link_target,
         );
-        let auto_fill_max_height = (content_height.is_none()
-            && style.column_fill == css::ColumnFill::Auto)
-            .then(|| {
-                used_max_height(style, PercentageBasis::definite(layout_pt(available_width)))
-                    .map(SemanticLengthExt::points)
-            })
-            .flatten();
-        let repeated_block_end_decoration =
-            if style.box_decoration_break == css::BoxDecorationBreak::Clone {
-                style.padding.bottom + used_border_widths(style).bottom
-            } else {
-                0.0
-            };
-        let remaining_parent_height =
-            (self.cursor_y - self.page_bottom() - repeated_block_end_decoration)
-                .max(css::CSS_PX_TO_PT);
-        let balanced_height = sequence.balanced_multicolumn_height(column_count, style);
-        let sequential_auto_height = sequence.total_height().max(style.line_height);
-        let natural_column_height = content_height
-            .or(auto_fill_max_height)
-            .unwrap_or(match style.column_fill {
-                css::ColumnFill::Auto => sequential_auto_height,
-                css::ColumnFill::Balance | css::ColumnFill::BalanceAll => balanced_height,
-            });
-        let fragmented_by_parent = self.active_fragmentainer_kind() == FragmentainerKind::Column
-            && natural_column_height > remaining_parent_height + 0.01;
-        let definite_fragment_height = content_height.map(|height| {
-            if fragmented_by_parent {
-                height.min(remaining_parent_height)
-            } else {
-                height
-            }
-        });
-        let unconstrained_column_height = match style.column_fill {
-            css::ColumnFill::Auto => definite_fragment_height
-                .or(auto_fill_max_height)
-                .unwrap_or(sequential_auto_height),
-            css::ColumnFill::Balance | css::ColumnFill::BalanceAll => definite_fragment_height
-                .map(|limit| balanced_height.min(limit))
-                .unwrap_or(balanced_height),
-        };
-        let column_height = if fragmented_by_parent {
-            unconstrained_column_height.min(remaining_parent_height)
-        } else {
-            unconstrained_column_height
-        }
-        .max(style.line_height.min(remaining_parent_height));
-        let used_column_set_height = if let Some(height) = definite_fragment_height {
-            height
-        } else if let Some(max_height) = auto_fill_max_height {
-            sequence
-                .total_height()
-                .min(max_height)
-                .max(style.line_height)
-        } else {
-            column_height
-        };
-        self.paint_inline_line_sequence_multicolumn(
+        let plan = self.plan_multicolumn_inline_layout(
             &sequence,
             style,
-            inline_layout::MulticolumnInlinePaintGeometry {
-                column_count,
-                column_gap: gap,
-                column_width,
-                column_height,
-                used_column_set_height,
-                wrap_column_rows: fragmented_by_parent,
-                shrink_final_row: content_height.is_none(),
-            },
+            column_count,
+            gap,
+            column_width,
+            available_width,
+            content_height,
         );
+        self.paint_inline_line_sequence_multicolumn(&sequence, style, plan);
         true
     }
 
@@ -179,7 +119,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         padding_left: f32,
         padding_right: f32,
         link_target: Option<&str>,

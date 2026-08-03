@@ -19,6 +19,83 @@ pub(in crate::layout) fn evaluate_bookmark_label(
     output
 }
 
+impl<'a> LayoutBuilder<'a> {
+    /// Resolves a same-document target reference against the preceding fresh
+    /// layout pass. The text is inserted before inline line selection, so it
+    /// participates in ordinary wrapping and pagination rather than paint
+    /// replay. CSS Generated Content Level 3 defines target values from the
+    /// target end of a link: <https://www.w3.org/TR/css-content-3/#cross-references>.
+    pub(in crate::layout) fn resolve_generated_target_counter(
+        &self,
+        origin: &Element,
+        target: &TargetReference,
+        name: &str,
+        style: Option<ListStyleType>,
+    ) -> Option<String> {
+        let anchor = self.target_anchor_for_reference(origin, target)?;
+        let value = if name.eq_ignore_ascii_case("page") {
+            i32::try_from(anchor.page_index.saturating_add(1)).unwrap_or(i32::MAX)
+        } else if name.eq_ignore_ascii_case("pages") {
+            i32::try_from(self.target_references.total_pages).unwrap_or(i32::MAX)
+        } else {
+            anchor.counters.get(name)?.last().copied()?
+        };
+        list::counter_text(
+            style.unwrap_or(ListStyleType::Decimal),
+            value,
+            &self.counter_styles,
+        )
+    }
+
+    pub(in crate::layout) fn resolve_generated_target_text(
+        &self,
+        origin: &Element,
+        target: &TargetReference,
+        keyword: css::NamedStringTargetTextKeyword,
+    ) -> Option<String> {
+        let anchor = self.target_anchor_for_reference(origin, target)?;
+        Some(match keyword {
+            css::NamedStringTargetTextKeyword::Content => anchor.text.content,
+            css::NamedStringTargetTextKeyword::Before => anchor.text.before,
+            css::NamedStringTargetTextKeyword::After => anchor.text.after,
+            css::NamedStringTargetTextKeyword::FirstLetter => anchor
+                .text
+                .content
+                .chars()
+                .next()
+                .map(|character| character.to_string())
+                .unwrap_or_default(),
+        })
+    }
+
+    fn target_anchor_for_reference(
+        &self,
+        origin: &Element,
+        target: &TargetReference,
+    ) -> Option<TargetAnchor> {
+        let target = match target {
+            TargetReference::Fragment(_) => target.literal_fragment_id()?.to_string(),
+            TargetReference::Attribute(name) => origin
+                .attrs
+                .get(name)
+                .and_then(|value| value.strip_prefix('#'))
+                .filter(|value| !value.is_empty())?
+                .to_string(),
+        };
+        self.target_references
+            .anchors
+            .get(&target)
+            .cloned()
+            .or_else(|| {
+                Some(TargetAnchor {
+                    page_index: *self.page_anchors.get(&target)?,
+                    text: self.page_anchor_text.get(&target)?.clone(),
+                    counters: self.page_anchor_counters.get(&target)?.clone(),
+                })
+            })
+    }
+}
+
 pub(in crate::layout) fn evaluate_generated_content_text(
     element: &Element,
     content: &[GeneratedContentPart],
@@ -303,16 +380,7 @@ impl<'a> LayoutBuilder<'a> {
         parent_style: &ComputedStyle,
     ) -> f32 {
         let own_block_size = inline_atom_logical_block_size(atom, parent_style);
-        let own_baseline = match parent_style.writing_mode {
-            WritingMode::HorizontalTb => atom.style().margin.top + atom.baseline_offset,
-            WritingMode::VerticalRl
-            | WritingMode::VerticalLr
-            | WritingMode::SidewaysRl
-            | WritingMode::SidewaysLr => {
-                inline_atom_logical_block_start_margin(atom, parent_style)
-                    + inline_atom_logical_border_block_size(atom, parent_style)
-            }
-        };
+        let own_baseline = inline_atom_logical_margin_box_baseline_offset(atom, parent_style);
         self.vertical_align_baseline_shift_for_box(
             atom.style(),
             parent_style,
@@ -420,6 +488,52 @@ pub(in crate::layout) fn transform_text_with_state(
     transform_text_inner(text, style, Some(state))
 }
 
+/// Apply CSS's permitted small-caps synthesis when the selected face has no
+/// matching OpenType caps feature. Compatibility ligatures and U+00DF are
+/// expanded even when the face has the feature: those source glyphs commonly
+/// lack a caps alternate and must receive tracking between their expansion.
+/// <https://drafts.csswg.org/css-fonts-4/#font-variant-caps-prop>
+pub(in crate::layout) fn synthesize_missing_font_caps_text(
+    font_system: &mut FontSystem,
+    text: &str,
+    style: &ComputedStyle,
+) -> String {
+    if !style.font_synthesis.small_caps
+        || !matches!(
+            style.font_variant_caps,
+            crate::css::FontVariantCaps::SmallCaps
+                | crate::css::FontVariantCaps::AllSmallCaps
+                | crate::css::FontVariantCaps::PetiteCaps
+                | crate::css::FontVariantCaps::AllPetiteCaps
+        )
+    {
+        return text.to_owned();
+    }
+    let synthesize_all = !font_system.selected_font_supports_caps_feature(style);
+    let has_unsupported_compatibility_form = text
+        .chars()
+        .any(|character| character == '\u{00df}' || matches!(character, '\u{fb00}'..='\u{fb06}'));
+    if !synthesize_all && !has_unsupported_compatibility_form {
+        return text.to_owned();
+    }
+    let language = case_mapping_language(style.language.as_deref());
+    let mapper = CaseMapper::new();
+    text.chars()
+        .map(|character| {
+            if synthesize_all
+                || character == '\u{00df}'
+                || matches!(character, '\u{fb00}'..='\u{fb06}')
+            {
+                mapper
+                    .uppercase_to_string(&character.to_string(), &language)
+                    .into_owned()
+            } else {
+                character.to_string()
+            }
+        })
+        .collect()
+}
+
 /// Applies CSS `text-transform` for independent text contexts.
 ///
 /// CSS Text Level 3 defines the case-transform values for generated visual
@@ -437,21 +551,25 @@ pub(in crate::layout) fn transform_text_inner(
 ) -> String {
     let mut fallback_state = TextTransformState::default();
     let state = state.unwrap_or(&mut fallback_state);
-    let mut text = match style.text_transform.case {
-        TextTransformCase::None => {
-            map_text_transform_characters(text, state, |character, _| character.to_string())
+    let mut text = match style.text_transform.case() {
+        None => map_text_transform_characters(text, state, |character, _| character.to_string()),
+        Some(TextTransformCase::Uppercase) => {
+            uppercase_text(text, style.language.as_deref(), state)
         }
-        TextTransformCase::Uppercase => uppercase_text(text, style.language.as_deref(), state),
-        TextTransformCase::Lowercase => lowercase_text(text, style.language.as_deref(), state),
-        TextTransformCase::Capitalize => capitalize_text(text, style.language.as_deref(), state),
+        Some(TextTransformCase::Lowercase) => {
+            lowercase_text(text, style.language.as_deref(), state)
+        }
+        Some(TextTransformCase::Capitalize) => {
+            capitalize_text(text, style.language.as_deref(), state)
+        }
     };
-    if style.text_transform.full_width {
+    if style.text_transform.applies_full_width() {
         text = full_width_text(&text);
     }
-    if style.text_transform.full_size_kana {
+    if style.text_transform.applies_full_size_kana() {
         text = full_size_kana_text(&text);
     }
-    if style.text_transform.math_auto {
+    if style.text_transform.applies_math_auto() {
         text = math_auto_text(&text);
     }
     text

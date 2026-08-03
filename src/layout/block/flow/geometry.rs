@@ -1,4 +1,5 @@
 use super::*;
+use crate::layout::block::float::FLOAT_EPSILON;
 
 pub(in crate::layout) fn writing_modes_are_orthogonal(a: WritingMode, b: WritingMode) -> bool {
     WritingModeAxes::new(a, Direction::Ltr).swaps_physical_axes()
@@ -32,6 +33,7 @@ pub(in crate::layout) fn child_available_space_for_formatting_context(
     let mut space = ChildAvailableSpace::new(
         style.writing_mode,
         content_width,
+        !style.writing_mode.has_vertical_lines() || !style.box_values.width.is_auto(),
         definite_content_height,
         inherited_orthogonal_available_height.value(),
     )
@@ -241,7 +243,7 @@ pub(in crate::layout) fn block_end_margin_collapse_survives_height_constraints(
     .map(SemanticLengthExt::points)
     .unwrap_or_else(|| content_height_without_child_margin.points());
     let height_depends_on_intrinsic_content =
-        needs_intrinsic_height_contribution(style.box_values.height.clone())
+        needs_intrinsic_height_contribution(style.box_values.height.value().clone())
             || needs_intrinsic_height_contribution(style.box_values.min_height.clone())
             || needs_intrinsic_height_contribution(style.box_values.max_height.clone());
     let constrained_height = if height_depends_on_intrinsic_content {
@@ -298,7 +300,7 @@ pub(in crate::layout) struct BlockLayoutInlineConstraint {
     /// to the containing flow, not the child's writing mode: an orthogonal
     /// child's percentage margins still resolve against its containing
     /// block's inline size.
-    pub(in crate::layout) percentage_basis: PercentageBasis<LogicalInlineContentSize>,
+    pub(in crate::layout) percentage_basis: LogicalInlinePercentageBasis,
     /// Containing-block physical width used by the physical `width` property.
     ///
     /// These two bases differ for orthogonal flows: CSS Box percentages keep
@@ -323,6 +325,45 @@ impl BlockLayoutGeometry {
 
     pub(in crate::layout) fn content_logical_inline_size(&self) -> LogicalInlineContentSize {
         self.content_logical_inline_size
+    }
+
+    /// Form the normal-flow border-box candidate used to avoid earlier float
+    /// margin boxes.
+    ///
+    /// Relative positioning affects paint, not normal-flow float collision, so
+    /// this is the sole conversion that removes the relative inline offset.
+    /// A negative physical margin may legally let the corresponding border-box
+    /// edge overflow its containing inline span:
+    /// <https://www.w3.org/TR/CSS22/visuren.html#floats>.
+    pub(in crate::layout) fn float_avoidance_candidate(
+        &self,
+        border_box_block_size: BorderBoxLength,
+    ) -> FloatAvoidanceCandidate {
+        let (inline_start_containment, inline_end_containment) = match self.style.direction {
+            Direction::Ltr => (
+                (self.style.margin.left < -FLOAT_EPSILON)
+                    .then_some(FloatAvoidanceInlineContainment::PermittedNegativeMarginOverflow),
+                (self.style.margin.right < -FLOAT_EPSILON)
+                    .then_some(FloatAvoidanceInlineContainment::PermittedNegativeMarginOverflow),
+            ),
+            Direction::Rtl => (
+                (self.style.margin.right < -FLOAT_EPSILON)
+                    .then_some(FloatAvoidanceInlineContainment::PermittedNegativeMarginOverflow),
+                (self.style.margin.left < -FLOAT_EPSILON)
+                    .then_some(FloatAvoidanceInlineContainment::PermittedNegativeMarginOverflow),
+            ),
+        };
+        FloatAvoidanceCandidate {
+            normal_flow_border_box_inline_span: PageInlineSpan::new(
+                self.outer_inline.span().left_x() - self.relative_offset.x(),
+                self.outer_inline.span().width(),
+            ),
+            normal_flow_border_box_block_size: border_box_block_size,
+            inline_start_containment: inline_start_containment
+                .unwrap_or(FloatAvoidanceInlineContainment::Required),
+            inline_end_containment: inline_end_containment
+                .unwrap_or(FloatAvoidanceInlineContainment::Required),
+        }
     }
 
     /// Return the final block border box in block formatting coordinates.

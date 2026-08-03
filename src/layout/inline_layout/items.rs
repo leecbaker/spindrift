@@ -94,6 +94,43 @@ fn text_combine_upright_text_has_bidi_controls(text: &str) -> bool {
     })
 }
 
+/// Whether an item can create a later in-flow line in the surrounding clamp
+/// stream. Floats and static-position placeholders are source-order layout
+/// participants but do not themselves make a clamp overflow boundary.
+fn inline_item_can_continue_line_clamp(item: &InlineItem) -> bool {
+    match item {
+        InlineItem::Word(_) | InlineItem::Break(_) => true,
+        InlineItem::Atom(atom) => {
+            !matches!(atom.content(), InlineAtomContent::StaticPositionPlaceholder)
+        }
+        InlineItem::Float(_) | InlineItem::PageScopeStart(_) | InlineItem::PageScopeEnd => false,
+    }
+}
+
+fn inline_items_have_later_line_clamp_source(items: &[InlineItem]) -> bool {
+    items.iter().any(inline_item_can_continue_line_clamp)
+}
+
+fn inline_context_with_later_line_clamp_source(
+    mut context: InlineParagraphContext<'_>,
+    has_later_source: bool,
+) -> InlineParagraphContext<'_> {
+    if has_later_source {
+        context.clamp_continuation = css::ClampContinuation::LaterInFlowContent;
+    }
+    context
+}
+
+/// Preserve an ancestor traversal's source-order continuation when the
+/// computed style crosses the layout-style/zoom boundary.  The continuation
+/// is a layout-only property of `UsedLineClamp`, not a cascaded declaration.
+fn clamp_continuation_for_style(style: &ComputedStyle) -> css::ClampContinuation {
+    style
+        .used_line_clamp
+        .as_ref()
+        .map_or(css::ClampContinuation::None, |clamp| clamp.continuation)
+}
+
 impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn begin_clamp_line_slot_capture(&mut self) {
         self.clamp_line_slot_captures.push(0);
@@ -118,7 +155,7 @@ impl<'a> LayoutBuilder<'a> {
         available_width: f32,
         padding_left: f32,
         hanging_indent: f32,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
     ) -> InlineLayoutOutcome {
         self.layout_inline_items_with_first_formatted_line_policy(
             items,
@@ -129,6 +166,62 @@ impl<'a> LayoutBuilder<'a> {
             stylesheets,
             true,
         )
+    }
+
+    /// Lay out a simple vertical inline stream and retain the selected line
+    /// sequence for its block formatting context caller.
+    ///
+    /// An inside list marker participates in the first line just like the
+    /// principal inline content.  Keeping this selected sequence lets the
+    /// caller use the same logical-inline measurement for vertical block
+    /// geometry that this method paints, rather than re-collecting generated
+    /// marker content and text after layout.
+    /// <https://drafts.csswg.org/css-lists-3/#marker-position>
+    /// <https://drafts.csswg.org/css-writing-modes-4/#vertical-layout>
+    pub(in crate::layout) fn try_layout_committed_vertical_inline_sequence(
+        &mut self,
+        items: &mut Vec<InlineItem>,
+        block_style: &ComputedStyle,
+        available_width: f32,
+        padding_left: f32,
+        hanging_indent: f32,
+        stylesheets: &Stylesheets<'_>,
+    ) -> Option<InlineLineSequence> {
+        if !matches!(
+            block_style.writing_mode,
+            WritingMode::VerticalRl | WritingMode::VerticalLr
+        ) || !items
+            .iter()
+            .all(|item| matches!(item, InlineItem::Word(_) | InlineItem::Atom(_)))
+        {
+            return None;
+        }
+
+        // Keep the item preparation and paragraph context in lockstep with
+        // `layout_inline_items_with_first_formatted_line_policy`. The narrow
+        // item set above excludes boundaries and floats, whose page and flow
+        // effects require that general path.
+        let used_block_style = css::LayoutStyle::from_computed(block_style).into_zoomed();
+        let block_style = &used_block_style;
+        self.prepare_inline_items_for_layout(items);
+        let context = InlineParagraphContext {
+            block_style,
+            line_clamp: used_line_clamp_for_style(block_style),
+            clamp_continuation: clamp_continuation_for_style(block_style),
+            stylesheets,
+            initial_first_formatted_line: true,
+            available_width,
+            padding_left,
+            hanging_indent,
+            hanging_punctuation_reserve: last_hanging_punctuation_width_for_inline_items(
+                &mut self.font_system,
+                items,
+                block_style,
+            ),
+        };
+        let sequence = self.collect_inline_line_sequence_for_items(items, context);
+        self.paint_inline_line_sequence(&sequence, block_style);
+        Some(sequence)
     }
 
     /// Lay out one anonymous inline run with its originating block's
@@ -146,15 +239,14 @@ impl<'a> LayoutBuilder<'a> {
         available_width: f32,
         padding_left: f32,
         hanging_indent: f32,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         initial_first_formatted_line: bool,
     ) -> InlineLayoutOutcome {
         // Inline line boxes consume the block's line-height and indentation
         // directly. Materialize their used CSS `zoom` scale at this boundary;
         // run styles have the same idempotent conversion when they are shaped.
         // <https://drafts.csswg.org/css-viewport/#zoom-property>
-        let mut used_block_style = block_style.clone();
-        used_block_style.apply_effective_zoom();
+        let used_block_style = css::LayoutStyle::from_computed(block_style).into_zoomed();
         let block_style = &used_block_style;
         if initial_first_formatted_line
             && block_style
@@ -173,12 +265,11 @@ impl<'a> LayoutBuilder<'a> {
         {
             self.clear_initial_letter_exclusions_for_new_initial(block_style);
         }
-        normalize_inline_whitespace_items(&mut items);
-        self.form_text_combine_upright_atoms(&mut items);
-        insert_text_autospace_items(&mut self.font_system, &mut items);
-        trim_inline_item_edges(&mut items);
+        self.prepare_inline_items_for_layout(&mut items);
         let context = InlineParagraphContext {
             block_style,
+            line_clamp: used_line_clamp_for_style(block_style),
+            clamp_continuation: clamp_continuation_for_style(block_style),
             stylesheets,
             initial_first_formatted_line,
             available_width,
@@ -190,8 +281,14 @@ impl<'a> LayoutBuilder<'a> {
                 block_style,
             ),
         };
-        if !self.current_text_box_line_trim().is_empty()
-            || inline_items_can_fragment_as_collected_lines(&items)
+        // A pre-collected line sequence has no page-group transition model.
+        // Named inline page scopes must go through the boundary-aware
+        // paragraph path below, which flushes before both entering and leaving
+        // each scope.
+        // <https://www.w3.org/TR/css-page-3/#using-named-pages>
+        if !inline_items_have_page_scope(&items)
+            && (!self.current_text_box_line_trim().is_empty()
+                || inline_items_can_fragment_as_collected_lines(&items))
         {
             let sequence = self.collect_inline_line_sequence_for_items(&items, context);
             self.paint_inline_line_sequence(&sequence, block_style);
@@ -203,14 +300,23 @@ impl<'a> LayoutBuilder<'a> {
         let mut next_paragraph_starts_after_forced_break = false;
         let mut page_scopes = Vec::new();
         let mut plaintext_direction_state = None;
-        for item in items {
+        for (item_index, item) in items.iter().cloned().enumerate() {
+            // This direct layout path also splits the shared source stream at
+            // preserved breaks. Carry source that follows the boundary into
+            // the terminal-line selector just as the collected-line path
+            // does; otherwise a final `white-space: pre` line commits before
+            // it can reserve the block ellipsis.
+            let context_before_boundary = inline_context_with_later_line_clamp_source(
+                context,
+                inline_items_have_later_line_clamp_source(&items[item_index + 1..]),
+            );
             match inline_item_boundary_role(&item) {
                 InlineBoundaryRole::ForcedBreak => {
                     let clear = inline_break_clear(&item);
                     let force_empty_line = clear == Clear::None;
                     let paragraph_outcome = self.flush_inline_item_paragraph(
                         &mut paragraph,
-                        context,
+                        context_before_boundary,
                         line_index,
                         force_empty_line,
                         next_paragraph_starts_after_forced_break,
@@ -229,7 +335,7 @@ impl<'a> LayoutBuilder<'a> {
                     let flushed_paragraph = !paragraph.is_empty();
                     let paragraph_outcome = self.flush_inline_item_paragraph(
                         &mut paragraph,
-                        context,
+                        context_before_boundary,
                         line_index,
                         false,
                         next_paragraph_starts_after_forced_break,
@@ -247,7 +353,7 @@ impl<'a> LayoutBuilder<'a> {
                     let flushed_paragraph = !paragraph.is_empty();
                     let paragraph_outcome = self.flush_inline_item_paragraph(
                         &mut paragraph,
-                        context,
+                        context_before_boundary,
                         line_index,
                         false,
                         next_paragraph_starts_after_forced_break,
@@ -301,10 +407,7 @@ impl<'a> LayoutBuilder<'a> {
         padding_left: f32,
         hanging_indent: f32,
     ) -> InlineLineSequence {
-        normalize_inline_whitespace_items(&mut items);
-        self.form_text_combine_upright_atoms(&mut items);
-        insert_text_autospace_items(&mut self.font_system, &mut items);
-        trim_inline_item_edges(&mut items);
+        self.prepare_inline_items_for_layout(&mut items);
         if block_style.writing_mode == WritingMode::HorizontalTb
             && block_style
                 .first_letter_style
@@ -319,7 +422,9 @@ impl<'a> LayoutBuilder<'a> {
         }
         let context = InlineParagraphContext {
             block_style,
-            stylesheets: &[],
+            line_clamp: used_line_clamp_for_style(block_style),
+            clamp_continuation: css::ClampContinuation::None,
+            stylesheets: &css::EMPTY_STYLESHEETS,
             initial_first_formatted_line: true,
             available_width,
             padding_left,
@@ -499,6 +604,14 @@ impl<'a> LayoutBuilder<'a> {
         *items = output;
     }
 
+    /// Apply the shared CSS Text preprocessing before line selection.
+    fn prepare_inline_items_for_layout(&mut self, items: &mut Vec<InlineItem>) {
+        normalize_inline_whitespace_items(items);
+        self.form_text_combine_upright_atoms(items);
+        insert_text_autospace_items(&mut self.font_system, items);
+        trim_inline_item_edges(items);
+    }
+
     fn collect_inline_line_sequence_for_items(
         &mut self,
         items: &[InlineItem],
@@ -514,7 +627,16 @@ impl<'a> LayoutBuilder<'a> {
             starts_after_preserved_segment_break: false,
             has_flow_side_effects: false,
         };
-        for item in items {
+        for (item_index, item) in items.iter().enumerate() {
+            // The collector splits one block's inline stream at preserved
+            // breaks, floats, and page-scope boundaries. Let a paragraph
+            // that reaches the terminal slot see real later source before it
+            // is selected, so the final source range can be refit with the
+            // marker reservation rather than patched after paint.
+            let context_before_boundary = inline_context_with_later_line_clamp_source(
+                context,
+                inline_items_have_later_line_clamp_source(&items[item_index + 1..]),
+            );
             match inline_item_boundary_role(item) {
                 InlineBoundaryRole::ForcedBreak => {
                     let clear = inline_break_clear(item);
@@ -522,7 +644,7 @@ impl<'a> LayoutBuilder<'a> {
                     let record_count_before_break = records.len();
                     cursor = self.collect_inline_paragraph_lines(
                         &mut paragraph,
-                        context,
+                        context_before_boundary,
                         cursor,
                         force_empty_line,
                         &mut records,
@@ -549,7 +671,7 @@ impl<'a> LayoutBuilder<'a> {
                 role if role == InlineBoundaryRole::Float || role.is_page_scope() => {
                     let next_cursor = self.collect_inline_paragraph_lines(
                         &mut paragraph,
-                        context,
+                        context_before_boundary,
                         cursor,
                         false,
                         &mut records,
@@ -1047,64 +1169,36 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         sequence: &InlineLineSequence,
         block_style: &ComputedStyle,
-        geometry: MulticolumnInlinePaintGeometry,
+        plan: MulticolumnInlineLayoutPlan,
     ) {
         self.record_clamp_line_slots(sequence.layout_outcome().clamp_line_slots);
         let saved_content_left = self.content_left;
         let saved_content_right = self.content_right;
-        let mut column_block_top = self.cursor_y;
-        let mut painted = 0usize;
         let mut plaintext_direction_state = None;
         let context = sequence.context(block_style);
         let mut rule_paint_point = self
             .current_page
             .paint_band_insertion_point(PaintBand::InFlowBlock);
 
-        loop {
-            let balanced_row_height = matches!(
-                block_style.column_fill,
-                css::ColumnFill::Balance | css::ColumnFill::BalanceAll
-            )
-            .then(|| {
-                sequence.balanced_multicolumn_height_from(
-                    painted,
-                    geometry.column_count,
-                    block_style,
-                )
-            })
-            .filter(|height| *height <= geometry.column_height + 0.01);
-            let row_column_height = balanced_row_height.unwrap_or(geometry.column_height);
-            let mut painted_column_count = 0usize;
-            for column_index in 0..geometry.column_count {
-                if painted >= sequence.records.len() {
-                    break;
-                }
+        for (row_index, row) in plan.rows.iter().enumerate() {
+            let geometry = plan.geometry;
+            let column_block_top = self.cursor_y;
+            for (column_index, fragment) in row.columns.iter().enumerate() {
                 let column_left = saved_content_left
                     + (geometry.column_width + geometry.column_gap) * column_index as f32;
                 self.content_left = column_left;
                 self.content_right = column_left + geometry.column_width;
                 self.cursor_y = column_block_top;
-                let fragment_count = sequence
-                    .fragment_break_selection(
-                        painted,
-                        row_column_height,
-                        true,
-                        block_style.orphans,
-                        block_style.widows,
-                    )
-                    .line_count()
-                    .unwrap_or(0);
-                if fragment_count == 0 {
-                    continue;
-                }
-                painted_column_count = column_index + 1;
                 let mut stack = InlineLineStackCursor::new(
                     block_style,
                     self.content_left,
                     self.content_right,
                     self.cursor_y,
                 );
-                let fragment_records = sequence.fragment_records_for_paint(painted, fragment_count);
+                let fragment_records = sequence.fragment_records_for_paint(
+                    fragment.range.start_index,
+                    fragment.range.record_count(),
+                );
                 for line in &fragment_records {
                     stack.advance(line.block_before);
                     stack.apply(self);
@@ -1117,18 +1211,9 @@ impl<'a> LayoutBuilder<'a> {
                     );
                     stack.advance(line.height());
                 }
-                painted += fragment_count;
             }
 
-            let used_row_height = if geometry.shrink_final_row
-                && painted >= sequence.records.len()
-                && let Some(balanced_height) = balanced_row_height
-            {
-                balanced_height
-            } else {
-                geometry.used_column_set_height
-            };
-            let column_block_bottom = column_block_top - used_row_height;
+            let column_block_bottom = column_block_top - row.block_extent.points();
             let rule_primitives = multicol_gap_decoration_primitives(
                 block_style,
                 saved_content_left,
@@ -1136,22 +1221,18 @@ impl<'a> LayoutBuilder<'a> {
                 column_block_bottom,
                 geometry.column_width,
                 geometry.column_gap,
-                multicol_decorated_column_count(
-                    block_style,
-                    painted_column_count.max(1),
-                    geometry.column_count,
-                ),
+                row.decorated_column_count,
             );
             self.current_page
                 .insert_primitives_at_paint_band_point(rule_paint_point, rule_primitives);
             self.cursor_y = column_block_bottom;
-            if painted >= sequence.records.len() || !geometry.wrap_column_rows {
-                break;
+            if row_index + 1 == plan.rows.len() {
+                continue;
             }
+            debug_assert!(geometry.wrap_column_rows);
             self.content_left = saved_content_left;
             self.content_right = saved_content_right;
             self.push_page();
-            column_block_top = self.cursor_y;
             rule_paint_point = self
                 .current_page
                 .paint_band_insertion_point(PaintBand::InFlowBlock);
@@ -1220,13 +1301,28 @@ impl<'a> LayoutBuilder<'a> {
                 stack.advance(line.block_before);
                 stack.apply(self);
                 self.apply_line_block_start_trim_for_paint(line, block_style.writing_mode);
-                if !marker_painted {
+                if !marker_painted && !self.outside_marker_anchor_is_pending(marker) {
+                    let formatted_line_block_start = PageTopBlockPosition::new(self.cursor_y);
+                    let fallback_baseline_offset =
+                        self.inline_box_text_line_layout_baseline_offset(block_style);
+                    let line_baseline_offset = line
+                        .fragment
+                        .as_ref()
+                        .map_or(fallback_baseline_offset, |fragment| {
+                            fragment.metrics.baseline_offset
+                        });
                     self.paint_outside_marker(
                         marker,
                         block_style,
-                        content_inline_start,
-                        content_inline_end,
-                        self.cursor_y,
+                        OutsideMarkerAnchor {
+                            content_inline_span: PageInlineSpan::from_edges(
+                                content_inline_start,
+                                content_inline_end,
+                            ),
+                            formatted_line_block_start,
+                            alphabetic_baseline: formatted_line_block_start
+                                .toward_block_end(layout_pt(line_baseline_offset)),
+                        },
                     );
                     marker_painted = true;
                 }
@@ -1621,6 +1717,7 @@ impl<'a> LayoutBuilder<'a> {
         {
             self.push_page();
         }
+        self.commit_inline_line_footnote_calls(line);
         let mut paint_context = context;
         let mut paint_line = line.clone();
         let suppress_float_adjust = line
@@ -1688,6 +1785,25 @@ impl<'a> LayoutBuilder<'a> {
         }
     }
 
+    /// Record calls only after pagination has accepted their selected line.
+    ///
+    /// A selected line can be replayed by tables, slices, and fragmentation
+    /// retries. `handle_footnote_call` deduplicates each pass, so every
+    /// committed source call contributes one reservation/body while intrinsic
+    /// and graph construction remain side-effect free.
+    fn commit_inline_line_footnote_calls(&mut self, line: &InlineLineRecord) {
+        let Some(fragment) = &line.fragment else {
+            return;
+        };
+        for item in fragment.items() {
+            if let InlineLineItem::Fragment(fragment) = &item.item
+                && let Some(element) = fragment.source().footnote_call()
+            {
+                self.handle_footnote_call(element);
+            }
+        }
+    }
+
     /// Record the baseline of a real in-flow line box, even if it paints nothing.
     ///
     /// CSS 2.2 makes an inline-block's baseline the baseline of its last
@@ -1713,6 +1829,10 @@ impl<'a> LayoutBuilder<'a> {
             return;
         };
         self.last_in_flow_line_baseline_y = Some(self.cursor_y - baseline_offset);
+        self.anchor_pending_outside_markers_to_in_flow_line(
+            PageTopBlockPosition::new(self.cursor_y),
+            layout_pt(baseline_offset),
+        );
     }
 
     /// Prepare one graph-selected line record for painting.
@@ -1801,10 +1921,24 @@ impl<'a> LayoutBuilder<'a> {
         // inline box for painting. In particular, an inline background must
         // cover an ideographic space that hangs past the selected line edge.
         // <https://www.w3.org/TR/css-text-3/#white-space-phase-2>
+        let mut bidi_scope_continuations = line_box.bidi_scope_continuations.clone();
+        if line_direction == Direction::Rtl && line_box.edge_effects.retained_break_spaces_end {
+            // UAX #9 rule L1 would otherwise reset a selected trailing U+0020
+            // to the paragraph level, moving it to the physical left of the
+            // retained LTR run. CSS Text keeps this logical line-end space at
+            // the visual inline start, with its normal `break-spaces` advance.
+            // The virtual LRM affects ordering only; the selected source item
+            // remains the one painted, decorated, and exposed for extraction.
+            // <https://www.w3.org/TR/css-text-3/#valdef-white-space-break-spaces>
+            // <https://www.unicode.org/reports/tr9/#L1>
+            bidi_scope_continuations
+                .trailing_line_edge_context
+                .push('\u{200e}');
+        }
         let mut line_items = self.visual_ordered_mixed_inline_line_items(
             line_box.items(),
             block_style,
-            &line_box.bidi_scope_continuations,
+            &bidi_scope_continuations,
         );
         debug_assert!(line_box.edge_effects.source_effects.iter().all(|effect| {
             line_box
@@ -1989,6 +2123,28 @@ impl<'a> LayoutBuilder<'a> {
 mod tests {
     use super::*;
 
+    fn line_record(is_phantom: bool, is_forced_empty: bool) -> InlineLineRecord {
+        InlineLineRecord {
+            paragraph_index: 0,
+            block_line_index: 0,
+            paragraph_line_index: 0,
+            fragment: None,
+            is_phantom,
+            is_first_formatted_line: false,
+            is_last_line_in_paragraph: false,
+            is_forced_empty,
+            starts_after_preserved_segment_break: false,
+            clear_after: Clear::None,
+            block_before: 0.0,
+            block_start_trim: 0.0,
+            block_end_trim: 0.0,
+            paragraph_last_hanging_width: 0.0,
+            used_indent: 0.0,
+            available_width: 100.0,
+            line_height: 10.0,
+        }
+    }
+
     #[test]
     fn inline_layout_outcome_accumulates_clamp_slots_across_paragraphs() {
         let mut outcome = InlineLayoutOutcome {
@@ -2006,6 +2162,115 @@ mod tests {
 
         assert_eq!(outcome.next_line_index, 3);
         assert_eq!(outcome.clamp_line_slots, 3);
+    }
+
+    #[test]
+    fn transparent_inline_records_do_not_create_fragmentation_lines() {
+        let sequence = InlineLineSequence {
+            // A collapsed space bracketed by zero-width inline scope markers
+            // remains in source order, followed by a real forced empty line.
+            records: vec![line_record(true, false), line_record(false, true)],
+            ..InlineLineSequence::default()
+        };
+
+        assert!(!sequence.records[0].participates_in_widows_orphans());
+        assert!(sequence.records[1].participates_in_widows_orphans());
+        let fragment = sequence
+            .fragment_break_selection(0, 0.0, false, 1, 1)
+            .selected_fragment()
+            .expect("transparent record should remain part of the selected source range");
+        assert_eq!(fragment.range.start_index, 0);
+        assert_eq!(fragment.range.record_count(), 1);
+        assert_eq!(fragment.in_flow_line_count, 0);
+        assert_eq!(
+            fragment.constraint_outcome,
+            InlineFragmentConstraintOutcome::Rule3Satisfied
+        );
+    }
+
+    fn ordinary_line_sequence(line_count: usize) -> InlineLineSequence {
+        InlineLineSequence {
+            records: (0..line_count).map(|_| line_record(false, false)).collect(),
+            ..InlineLineSequence::default()
+        }
+    }
+
+    fn four_column_geometry() -> MulticolumnInlinePaintGeometry {
+        MulticolumnInlinePaintGeometry {
+            column_count: 4,
+            column_gap: 10.0,
+            column_width: 20.0,
+            column_height: 40.0,
+            used_column_set_height: 40.0,
+            wrap_column_rows: false,
+            shrink_final_row: false,
+        }
+    }
+
+    #[test]
+    fn multicolumn_row_plan_commits_widow_legal_fragments_and_one_extent() {
+        let sequence = ordinary_line_sequence(9);
+        let mut style = ComputedStyle::initial();
+        style.orphans = 1;
+        style.widows = 3;
+
+        let rows = sequence.multicolumn_inline_row_plans(40.0, four_column_geometry(), &style);
+
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(
+            row.block_extent,
+            MulticolumnRowBlockExtent::new(layout_pt(40.0))
+        );
+        assert_eq!(row.decorated_column_count, 3);
+        assert_eq!(
+            row.columns
+                .iter()
+                .map(|fragment| (fragment.range.start_index, fragment.range.record_count()))
+                .collect::<Vec<_>>(),
+            vec![(0, 4), (4, 2), (6, 3)]
+        );
+        assert_eq!(
+            row.columns
+                .iter()
+                .map(|fragment| fragment.block_extent)
+                .collect::<Vec<_>>(),
+            vec![
+                MulticolumnColumnFragmentBlockExtent::new(layout_pt(40.0)),
+                MulticolumnColumnFragmentBlockExtent::new(layout_pt(20.0)),
+                MulticolumnColumnFragmentBlockExtent::new(layout_pt(30.0)),
+            ]
+        );
+        // Rules deliberately take the single row extent above, never these
+        // unequal source-fragment extents. Their distinct types prevent that
+        // substitution at the paint adapter.
+        assert!(row.columns.iter().all(|fragment| {
+            fragment.constraint_outcome == InlineFragmentConstraintOutcome::Rule3Satisfied
+        }));
+    }
+
+    #[test]
+    fn multicolumn_row_plan_records_rule_three_relaxation_for_progress() {
+        let sequence = ordinary_line_sequence(9);
+        let mut style = ComputedStyle::initial();
+        style.orphans = 3;
+        style.widows = 3;
+
+        let rows = sequence.multicolumn_inline_row_plans(40.0, four_column_geometry(), &style);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0]
+                .columns
+                .iter()
+                .map(|fragment| (fragment.range.start_index, fragment.range.record_count()))
+                .collect::<Vec<_>>(),
+            vec![(0, 4), (4, 3), (7, 2)]
+        );
+        assert_eq!(
+            rows[0].columns[1].constraint_outcome,
+            InlineFragmentConstraintOutcome::Rule3RelaxedForProgress
+        );
     }
 }
 
@@ -2027,6 +2292,214 @@ pub(in crate::layout) struct MulticolumnInlinePaintGeometry {
     /// Let the final row of an auto-height fragmented multicol shrink to its
     /// balanced content height instead of occupying the outer fragment limit.
     pub(in crate::layout) shrink_final_row: bool,
+}
+
+/// A non-negative block-axis extent shared by every column box in one
+/// multi-column row.
+///
+/// CSS Multi-column requires column boxes in the same multicol line to have
+/// one column height. Keeping that extent distinct from an individual line
+/// fragment's consumed height prevents a later paint pass from shrinking a
+/// column rule to a suffix of the row.
+/// <https://www.w3.org/TR/css-multicol-1/#the-multi-column-model>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct MulticolumnRowBlockExtent(LayoutLength);
+
+impl MulticolumnRowBlockExtent {
+    fn new(value: LayoutLength) -> Self {
+        debug_assert!(value.get().is_finite() && value.get() >= 0.0);
+        Self(value)
+    }
+
+    fn points(self) -> f32 {
+        self.0.get()
+    }
+}
+
+/// A non-negative block-axis extent consumed by one selected line fragment.
+///
+/// This is deliberately distinct from [`MulticolumnRowBlockExtent`]: it
+/// describes source content, while a row extent describes the shared column
+/// box and its rule geometry.
+/// <https://www.w3.org/TR/css-multicol-1/#the-multi-column-model>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct MulticolumnColumnFragmentBlockExtent(LayoutLength);
+
+impl MulticolumnColumnFragmentBlockExtent {
+    fn new(value: LayoutLength) -> Self {
+        debug_assert!(value.get().is_finite() && value.get() >= 0.0);
+        Self(value)
+    }
+}
+
+/// An ordered, non-empty range of collected inline-line records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) struct InlineLineRecordRange {
+    pub(in crate::layout) start_index: usize,
+    end_index: usize,
+}
+
+impl InlineLineRecordRange {
+    fn new(start_index: usize, end_index: usize, record_limit: usize) -> Self {
+        debug_assert!(start_index < end_index);
+        debug_assert!(end_index <= record_limit);
+        Self {
+            start_index,
+            end_index,
+        }
+    }
+
+    fn record_count(self) -> usize {
+        self.end_index - self.start_index
+    }
+}
+
+/// Whether a selected class-B break retained CSS Fragmentation rule 3.
+///
+/// A relaxed selection is only produced after the planner cannot prevent
+/// overflow with a legal class-B break, as required by the ordered fallback
+/// in CSS Fragmentation.
+/// <https://www.w3.org/TR/css-break-3/#unforced-breaks>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) enum InlineFragmentConstraintOutcome {
+    Rule3Satisfied,
+    Rule3RelaxedForProgress,
+}
+
+/// One committed inline-line fragment inside a column box.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct InlineLineFragmentPlan {
+    pub(in crate::layout) range: InlineLineRecordRange,
+    pub(in crate::layout) in_flow_line_count: usize,
+    pub(in crate::layout) constraint_outcome: InlineFragmentConstraintOutcome,
+    pub(in crate::layout) block_extent: MulticolumnColumnFragmentBlockExtent,
+}
+
+/// One committed row of anonymous column boxes for an inline-only multicol.
+///
+/// The row owns both the selected content fragments and their shared column
+/// block extent. Its decoration count is likewise selected once so paint does
+/// not infer row geometry from whichever column happened to be painted last.
+/// <https://www.w3.org/TR/css-multicol-1/#the-multi-column-model>
+#[derive(Debug, Clone, PartialEq)]
+pub(in crate::layout) struct MulticolumnInlineRowPlan {
+    pub(in crate::layout) columns: Vec<InlineLineFragmentPlan>,
+    pub(in crate::layout) block_extent: MulticolumnRowBlockExtent,
+    pub(in crate::layout) decorated_column_count: usize,
+}
+
+/// Committed inline multicolumn rows and their paint geometry.
+///
+/// The line sequence is measured once to select every needed row, its column
+/// fragments, and the principal box's used block extent. Painting consumes
+/// these decisions instead of independently rebalancing the same source
+/// records.
+/// <https://www.w3.org/TR/css-multicol-1/#filling-columns>
+#[derive(Debug, Clone)]
+pub(in crate::layout) struct MulticolumnInlineLayoutPlan {
+    pub(in crate::layout) geometry: MulticolumnInlinePaintGeometry,
+    pub(in crate::layout) rows: Vec<MulticolumnInlineRowPlan>,
+}
+
+impl<'a> LayoutBuilder<'a> {
+    /// Resolve the used geometry for a collected inline multicolumn sequence.
+    ///
+    /// This is the sole authority for the first row's balanced height and the
+    /// auto-height principal box's used block extent.  A definite CSS height
+    /// remains a fragmentainer constraint; an automatic height is established
+    /// by the selected column row itself.
+    /// <https://www.w3.org/TR/css-multicol-1/#filling-columns>
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::layout) fn plan_multicolumn_inline_layout(
+        &self,
+        sequence: &InlineLineSequence,
+        style: &ComputedStyle,
+        column_count: usize,
+        column_gap: f32,
+        column_width: f32,
+        available_width: f32,
+        content_height: Option<f32>,
+    ) -> MulticolumnInlineLayoutPlan {
+        let auto_fill_max_height = (content_height.is_none()
+            && style.column_fill == css::ColumnFill::Auto)
+            .then(|| {
+                used_max_height(style, PercentageBasis::definite(layout_pt(available_width)))
+                    .map(SemanticLengthExt::points)
+            })
+            .flatten();
+        let repeated_block_end_decoration =
+            if style.box_decoration_break == css::BoxDecorationBreak::Clone {
+                style.padding.bottom + used_border_widths(style).bottom
+            } else {
+                0.0
+            };
+        let remaining_parent_height =
+            (self.cursor_y - self.page_bottom() - repeated_block_end_decoration)
+                .max(css::CSS_PX_TO_PT);
+        let balanced_height = sequence.balanced_multicolumn_height(column_count, style);
+        let sequential_auto_height = sequence.total_height().max(style.line_height);
+        let natural_column_height = content_height
+            .or(auto_fill_max_height)
+            .unwrap_or(match style.column_fill {
+                css::ColumnFill::Auto => sequential_auto_height,
+                css::ColumnFill::Balance | css::ColumnFill::BalanceAll => balanced_height,
+            });
+        let fragmented_by_parent = self.active_fragmentainer_kind() == FragmentainerKind::Column
+            && natural_column_height > remaining_parent_height + 0.01;
+        let definite_fragment_height = content_height.map(|height| {
+            if fragmented_by_parent {
+                height.min(remaining_parent_height)
+            } else {
+                height
+            }
+        });
+        let unconstrained_column_height = match style.column_fill {
+            css::ColumnFill::Auto => definite_fragment_height
+                .or(auto_fill_max_height)
+                .unwrap_or(sequential_auto_height),
+            css::ColumnFill::Balance | css::ColumnFill::BalanceAll => definite_fragment_height
+                .map(|limit| balanced_height.min(limit))
+                .unwrap_or(balanced_height),
+        };
+        let column_height = if fragmented_by_parent {
+            unconstrained_column_height.min(remaining_parent_height)
+        } else {
+            unconstrained_column_height
+        }
+        .max(style.line_height.min(remaining_parent_height));
+        let first_row_height = matches!(
+            style.column_fill,
+            css::ColumnFill::Balance | css::ColumnFill::BalanceAll
+        )
+        .then_some(balanced_height)
+        .filter(|height| *height <= column_height + 0.01)
+        .unwrap_or(column_height);
+        let used_column_set_height = if let Some(height) = definite_fragment_height {
+            height
+        } else if let Some(max_height) = auto_fill_max_height {
+            sequence
+                .total_height()
+                .min(max_height)
+                .max(style.line_height)
+        } else {
+            // An auto-height balanced set ends at the selected row, not at a
+            // provisional fragmentainer capacity.
+            first_row_height
+        };
+        let geometry = MulticolumnInlinePaintGeometry {
+            column_count,
+            column_gap,
+            column_width,
+            column_height,
+            used_column_set_height,
+            wrap_column_rows: fragmented_by_parent,
+            shrink_final_row: content_height.is_none(),
+        };
+        MulticolumnInlineLayoutPlan {
+            rows: sequence.multicolumn_inline_row_plans(first_row_height, geometry, style),
+            geometry,
+        }
+    }
 }
 
 /// Graph-selected inline line records for a block container.
@@ -2176,7 +2649,9 @@ impl InlineLineSequence {
     ) -> InlineParagraphContext<'a> {
         InlineParagraphContext {
             block_style,
-            stylesheets: &[],
+            line_clamp: used_line_clamp_for_style(block_style),
+            clamp_continuation: css::ClampContinuation::None,
+            stylesheets: &css::EMPTY_STYLESHEETS,
             initial_first_formatted_line: true,
             available_width: self.available_width,
             padding_left: self.padding_left,
@@ -2486,6 +2961,85 @@ impl InlineLineSequence {
         line.block_advance()
     }
 
+    /// Commit the line fragments and shared block extent for every row that
+    /// this inline multicolumn pass will paint.
+    ///
+    /// The plan is deliberately formed before any row paints: CSS
+    /// Fragmentation's class-B decision and CSS Multi-column's common column
+    /// height are one layout decision, not independent paint-time estimates.
+    /// <https://www.w3.org/TR/css-break-3/#unforced-breaks>
+    /// <https://www.w3.org/TR/css-multicol-1/#the-multi-column-model>
+    fn multicolumn_inline_row_plans(
+        &self,
+        first_row_fit_height: f32,
+        geometry: MulticolumnInlinePaintGeometry,
+        block_style: &ComputedStyle,
+    ) -> Vec<MulticolumnInlineRowPlan> {
+        let mut rows = Vec::new();
+        let mut next_start_index = 0;
+        while next_start_index < self.records.len() {
+            let row_fit_height = if rows.is_empty() {
+                first_row_fit_height
+            } else {
+                matches!(
+                    block_style.column_fill,
+                    css::ColumnFill::Balance | css::ColumnFill::BalanceAll
+                )
+                .then(|| {
+                    self.balanced_multicolumn_height_from(
+                        next_start_index,
+                        geometry.column_count,
+                        block_style,
+                    )
+                })
+                .filter(|height| *height <= geometry.column_height + 0.01)
+                .unwrap_or(geometry.column_height)
+            };
+            let mut columns = Vec::with_capacity(geometry.column_count);
+            for _ in 0..geometry.column_count {
+                if next_start_index >= self.records.len() {
+                    break;
+                }
+                // Rule 3 is relaxed only when this finite column cannot make
+                // progress otherwise. The selection records that fact rather
+                // than making the paint path infer it from a zero count.
+                let fragment = self
+                    .fragment_break_selection(
+                        next_start_index,
+                        row_fit_height,
+                        true,
+                        block_style.orphans,
+                        block_style.widows,
+                    )
+                    .selected_fragment()
+                    .expect("a nonempty multicolumn row must select progress");
+                debug_assert_eq!(fragment.range.start_index, next_start_index);
+                next_start_index = fragment.range.end_index;
+                columns.push(fragment);
+            }
+            debug_assert!(!columns.is_empty());
+            let is_final_row = next_start_index >= self.records.len();
+            let block_extent = if geometry.shrink_final_row && is_final_row {
+                row_fit_height
+            } else {
+                geometry.used_column_set_height
+            };
+            rows.push(MulticolumnInlineRowPlan {
+                decorated_column_count: multicol_decorated_column_count(
+                    block_style,
+                    columns.len(),
+                    geometry.column_count,
+                ),
+                columns,
+                block_extent: MulticolumnRowBlockExtent::new(layout_pt(block_extent)),
+            });
+            if is_final_row || !geometry.wrap_column_rows {
+                break;
+            }
+        }
+        rows
+    }
+
     fn multicolumn_height_paints_all_lines_from(
         &self,
         start_index: usize,
@@ -2601,13 +3155,21 @@ impl InlineLineSequence {
 
         if fitting == 0 {
             return if allow_unavoidable_relaxation {
-                InlineFragmentBreakSelection::Relaxed(1)
+                self.selected_fragment(
+                    start_index,
+                    1,
+                    InlineFragmentConstraintOutcome::Rule3RelaxedForProgress,
+                )
             } else {
                 InlineFragmentBreakSelection::NoRoom
             };
         }
         if fitting >= remaining_record_count {
-            return InlineFragmentBreakSelection::Lines(remaining_record_count);
+            return self.selected_fragment(
+                start_index,
+                remaining_record_count,
+                InlineFragmentConstraintOutcome::Rule3Satisfied,
+            );
         }
 
         // CSS Fragmentation 3 defines `orphans` and `widows` as constraints on
@@ -2625,7 +3187,11 @@ impl InlineLineSequence {
             .filter(|record| record.participates_in_widows_orphans())
             .count();
         if fitting_line_count == 0 || remaining_total == 0 {
-            return InlineFragmentBreakSelection::Lines(fitting);
+            return self.selected_fragment(
+                start_index,
+                fitting,
+                InlineFragmentConstraintOutcome::Rule3Satisfied,
+            );
         }
         let orphans = orphans.max(1);
         let widows = widows.max(1);
@@ -2634,41 +3200,81 @@ impl InlineLineSequence {
         // treating one satisfied orphan line as permission to strand a widow.
         if remaining_total <= orphans || remaining_total <= widows {
             return if allow_unavoidable_relaxation {
-                InlineFragmentBreakSelection::Relaxed(fitting)
+                self.selected_fragment(
+                    start_index,
+                    fitting,
+                    InlineFragmentConstraintOutcome::Rule3RelaxedForProgress,
+                )
             } else {
                 InlineFragmentBreakSelection::KeepTogether
             };
         }
         if fitting_line_count < orphans {
             return if allow_unavoidable_relaxation {
-                InlineFragmentBreakSelection::Relaxed(fitting)
+                self.selected_fragment(
+                    start_index,
+                    fitting,
+                    InlineFragmentConstraintOutcome::Rule3RelaxedForProgress,
+                )
             } else {
                 InlineFragmentBreakSelection::KeepTogether
             };
         }
         let remaining_after_fitting = remaining_total - fitting_line_count;
         if remaining_after_fitting >= widows {
-            return InlineFragmentBreakSelection::Lines(fitting);
+            return self.selected_fragment(
+                start_index,
+                fitting,
+                InlineFragmentConstraintOutcome::Rule3Satisfied,
+            );
         }
 
         let preferred = remaining_total.saturating_sub(widows);
         if preferred >= orphans {
-            return InlineFragmentBreakSelection::Lines(self.record_count_through_in_flow_lines(
+            return self.selected_fragment(
                 start_index,
-                fitting,
-                preferred.min(fitting_line_count),
-            ));
+                self.record_count_through_in_flow_lines(
+                    start_index,
+                    fitting,
+                    preferred.min(fitting_line_count),
+                ),
+                InlineFragmentConstraintOutcome::Rule3Satisfied,
+            );
         }
 
         // The source block is large enough for both requirements, but this
         // particular continuation cannot satisfy them simultaneously. Keep
         // the required preceding lines and leave as many following lines as
         // possible, which is CSS Fragmentation's unforced-break relaxation.
-        InlineFragmentBreakSelection::Relaxed(self.record_count_through_in_flow_lines(
+        self.selected_fragment(
             start_index,
-            fitting,
-            orphans,
-        ))
+            self.record_count_through_in_flow_lines(start_index, fitting, orphans),
+            InlineFragmentConstraintOutcome::Rule3RelaxedForProgress,
+        )
+    }
+
+    fn selected_fragment(
+        &self,
+        start_index: usize,
+        record_count: usize,
+        constraint_outcome: InlineFragmentConstraintOutcome,
+    ) -> InlineFragmentBreakSelection {
+        let end_index = start_index
+            .saturating_add(record_count)
+            .min(self.records.len());
+        debug_assert!(start_index < end_index);
+        let in_flow_line_count = self.records[start_index..end_index]
+            .iter()
+            .filter(|record| record.participates_in_widows_orphans())
+            .count();
+        InlineFragmentBreakSelection::Selected(InlineLineFragmentPlan {
+            range: InlineLineRecordRange::new(start_index, end_index, self.records.len()),
+            in_flow_line_count,
+            constraint_outcome,
+            block_extent: MulticolumnColumnFragmentBlockExtent::new(layout_pt(
+                self.fragment_height(start_index, record_count),
+            )),
+        })
     }
 
     /// Include trailing float-only records after the selected in-flow line.
@@ -2709,19 +3315,25 @@ impl InlineLineSequence {
 /// `KeepTogether` is deliberately distinct from zero lines: balancing needs
 /// to reject that column height, while actual layout may advance to another
 /// fragmentainer before it is forced to relax the constraint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::layout) enum InlineFragmentBreakSelection {
     NoLines,
     NoRoom,
-    Lines(usize),
     KeepTogether,
-    Relaxed(usize),
+    Selected(InlineLineFragmentPlan),
 }
 
 impl InlineFragmentBreakSelection {
     pub(in crate::layout) fn line_count(self) -> Option<usize> {
         match self {
-            Self::Lines(count) | Self::Relaxed(count) => Some(count),
+            Self::Selected(fragment) => Some(fragment.range.record_count()),
+            Self::NoLines | Self::NoRoom | Self::KeepTogether => None,
+        }
+    }
+
+    fn selected_fragment(self) -> Option<InlineLineFragmentPlan> {
+        match self {
+            Self::Selected(fragment) => Some(fragment),
             Self::NoLines | Self::NoRoom | Self::KeepTogether => None,
         }
     }
@@ -2791,10 +3403,15 @@ impl InlineLineRecord {
     }
 
     fn participates_in_widows_orphans(&self) -> bool {
-        // A float-only source record contributes no in-flow line box. A
-        // mixed line that also contains text remains an in-flow line and is
-        // therefore counted normally.
-        !self.is_phantom || !self.has_inline_layout_effects()
+        // CSS Fragmentation counts the line boxes generated by in-flow
+        // content.  A transparent record can still carry source-order paint
+        // metadata (for example, a collapsed space between two zero-width
+        // inline scope edges), but CSS Inline does not let it manufacture a
+        // line box.  Preserved whitespace and forced empty lines are marked
+        // non-phantom when records are collected, so they continue to count.
+        // <https://drafts.csswg.org/css-inline/#invisible-line-boxes>
+        // <https://www.w3.org/TR/css-break-3/#widows-orphans>
+        !self.is_phantom
     }
 
     /// Whether this line carries an atomic formatting context whose paint was
@@ -2882,8 +3499,10 @@ fn inline_atom_is_phantom(atom: &InlineAtom) -> bool {
         | InlineAtomContent::Canvas
         | InlineAtomContent::Iframe(_)
         | InlineAtomContent::Image(_)
+        | InlineAtomContent::Gradient { .. }
         | InlineAtomContent::Svg { .. }
         | InlineAtomContent::InlineBox { .. }
+        | InlineAtomContent::Ruby { .. }
         | InlineAtomContent::TextCombineUpright { .. }
         | InlineAtomContent::InlineFragment { .. } => false,
     }
@@ -2902,6 +3521,15 @@ fn inline_items_can_fragment_as_collected_lines(items: &[InlineItem]) -> bool {
                 InlineItem::PageScopeStart(_) | InlineItem::PageScopeEnd
             )
         })
+}
+
+fn inline_items_have_page_scope(items: &[InlineItem]) -> bool {
+    items.iter().any(|item| {
+        matches!(
+            item,
+            InlineItem::PageScopeStart(_) | InlineItem::PageScopeEnd
+        )
+    })
 }
 
 fn inline_break_clear(item: &InlineItem) -> Clear {

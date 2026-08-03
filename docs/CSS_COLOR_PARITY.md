@@ -14,16 +14,22 @@
 - Ordinary PDFs emit vector paints and CSS gradients in generated ICCBased
   color spaces. A direct paint that is representable in sRGB is canonically
   emitted as tagged 8-bit sRGB; every other direct paint is converted to the
-  fixed Display-P3 ordinary-PDF output condition. A same-space gradient stays
-  in its authored CSS space; mixed-space gradients resolve through D50 XYZ.
+  fixed Display-P3 ordinary-PDF output condition. PDF resource planning uses
+  that final direct-paint condition, so every named color space selected by a
+  content stream is declared as an ICCBased page resource. Each native
+  gradient selects one final PDF RGB condition for every stop and its shading
+  dictionary: sRGB when all stops fit, otherwise Display-P3. CSS interpolation
+  still resolves through its selected CSS space before that PDF boundary.
   PCS-derived direct paint takes sRGB when it fits and otherwise Display-P3,
   without intermediate sRGB clipping. PDF/A converts vector paint and
   generated gradients to tagged sRGB, supplies an sRGB OutputIntent, and
   retains only the required sRGB ICC resource.
 - Embedded RGB ICC profiles in PNG and JPEG images are retained as ICCBased
-  image spaces in ordinary PDFs. PDF/A transforms those decoded samples to its
-  tagged sRGB output condition; missing, invalid, and non-RGB source profiles
-  use the explicit sRGB input boundary.
+  image spaces in ordinary PDFs. Fully opaque, uniform decoded samples can
+  use that same calibrated page color space as a vector fill; PDF/A transforms
+  decoded samples to its tagged sRGB output condition before the same
+  promotion decision. Missing, invalid, and non-RGB source profiles use the
+  explicit sRGB input boundary.
 - moxcms is used at ICC boundaries: embedded-profile parsing and validation,
   embedded-raster transforms, and generated ICC bytes. CSS predefined-space
   conversion uses the CSS Color 4 matrices and transfer functions directly,
@@ -42,7 +48,11 @@
   matrices, LCH/OKLCH polar syntax, predefined RGB matrices and signed
   transfer curves, HSL/HWB grammar, missing-component replacement, polar hue
   interpolation, alpha premultiplication, and output gamut policy. Palette's
-  generic spaces do not encode those CSS parsing and output rules.
+  generic spaces do not encode those CSS parsing and output rules. Generated
+  gradient raster fallbacks retain their interpolation calculation through
+  sampling, then choose one RGB image encoding for the whole tile (sRGB when
+  representable, otherwise Display-P3); D50 PCS coordinates are never emitted
+  directly as three-component PDF image samples.
 - moxcms remains limited to ICC work: parsing/validating profiles,
   embedded-profile raster transforms, and ICC byte generation. It is not used
   for CSS predefined-space conversion, where ICC rendering intents and

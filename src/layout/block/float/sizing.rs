@@ -78,7 +78,7 @@ pub(in crate::layout) fn freeze_float_replay_height(
             + used_border_widths(style).bottom,
     );
     let content_height = used_content_box_size_with_basis(
-        style.box_values.height.clone(),
+        style.box_values.height.value().clone(),
         style.box_sizing,
         containing_block_height,
         vertical_non_content,
@@ -89,8 +89,10 @@ pub(in crate::layout) fn freeze_float_replay_height(
             content_box_to_border_box_length(content_height, vertical_non_content).points()
         }
     };
-    style.box_values.height = css::ComputedLengthPercentageOrAuto::LengthPercentage(
-        css::ComputedLengthPercentage::from_points(replay_height.max(0.0)),
+    style.box_values.height.replace_with_used(
+        css::ComputedLengthPercentageOrAuto::LengthPercentage(
+            css::ComputedLengthPercentage::from_points(replay_height.max(0.0)),
+        ),
     );
     Some(content_height)
 }
@@ -115,7 +117,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         containing_width: f32,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
@@ -135,7 +137,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         containing_width: f32,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
@@ -195,7 +197,7 @@ impl<'a> LayoutBuilder<'a> {
         // <https://www.w3.org/TR/css-sizing-3/#intrinsic-sizes>
         // <https://www.w3.org/TR/css-sizing-3/#percentage-sizing>
         let intrinsic_height_basis = used_content_box_size_with_basis(
-            style.box_values.height.clone(),
+            style.box_values.height.value().clone(),
             style.box_sizing,
             self.definite_block_size_stack
                 .last()
@@ -349,7 +351,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         inline_size: ResolvedFloatInlineSize,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
@@ -412,7 +414,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         placed_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         inline_size: ResolvedFloatInlineSize,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
@@ -530,7 +532,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         inline_size: ResolvedFloatInlineSize,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
     ) -> MarginBoxLength {

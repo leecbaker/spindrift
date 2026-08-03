@@ -34,8 +34,63 @@ absolute-positioned fragments before its first text line.
 `margin-boxes/alignment-001-print.html` also now matches after the current
 margin-box alignment work.
 
+On 2026-07-30, an isolated fresh `quire-wpt` run exercised all fourteen CSS
+Page fixtures from the root-cause group with the release binary:
+
+- 14 passed;
+- 0 failed.
+
+The run artifacts are under `/private/tmp/quire-wpt-css-page-pictured-final/`
+for this working session. The former CLI compatibility mismatch is resolved:
+Quire accepts the harness's `--presentational-hints` option.
+
+The corresponding fresh full `css/css-page/` reftest run exercised 226
+non-script tests with the same isolated Quire configuration:
+
+- 116 passed;
+- 110 failed.
+
+This run is a fresh harness baseline, not directly comparable with the
+2026-07-18 multi-engine/development setup above. Its artifacts are under
+`/private/tmp/quire-wpt-css-page-full-final/` for this working session.
+
+On 2026-08-01, fresh exact `quire-wpt evaluate-test` runs rendered
+`fixedpos-001-print.html`, `fixedpos-002-print.html`, and
+`fixedpos-004-print.html` as raster-exact matches.
+
+On 2026-08-01, fresh exact `quire-wpt evaluate-test` runs rendered the six
+CSS2 `page-break-inside: avoid` pagination fixtures as matches:
+`float-page-break-inside-avoid-3-print.html` and
+`rowgroup-page-break-inside-avoid-{1,2,3,4,5}-print.html`. The table cases
+cover separated-border row-group fit decisions and repeated header/footer
+fragment chrome; broader cloned-decoration and complex nested-fragmentation
+limitations remain tracked in `SPEC_DIVERGENCES.md`.
+
+On 2026-08-03, fresh exact `quire-wpt evaluate-test` runs rendered
+`monolithic-overflow-005-print.html` and `monolithic-overflow-006-print.html`
+as matches. Size-contained definite-height flex items now retain a single
+monolithic source canvas across page continuations, including the wrapped
+structure in `006`.
+
 ## Implemented foundations
 
+- Page-rule resolution keeps the caller-supplied initial page box immutable;
+  each materialized page resolves its own `@page` geometry. Propagated
+  root/body backgrounds now paint the used page area rather than page margins.
+  Transparent absolute paint retains its resolved destination-page ownership,
+  while a positive absolute span is retained for viewport-fixed replay after
+  the complete document has been laid out, independent of source order. This
+  matches `basic-pagination-003`, both `page-left-right` cases,
+  `page-margin-auto`, `page-size-001/006/009`, and
+  `fixedpos-001/002/004` in direct local rendering. `page-size-009` verifies
+  that `vw`/`vh` retain the immutable initial viewport after a named-page
+  transition, while used page geometry remains destination-specific.
+- Root page continuations now transition on the principal writing mode's
+  logical block axis rather than assuming physical Y. This resolves the
+  vertical root progression exercised by `page-margin-003`.
+- Flex final-fragment handoff rebases following normal flow to the finalized
+  destination page context. A flex item's visual fragment span no longer
+  rounds its used block size up to a full final page.
 - On 2026-07-28, a fresh local run of all 53
   `css/css-page/page-name-*-print.html` reftests rendered 53 matches and no
   mismatches. Named-page selection now resolves used start/end values before
@@ -46,12 +101,14 @@ margin-box alignment work.
   into their parent scope.
 - Formatting-tree propagation resolves each descendant's `page:auto` against
   its nearest non-auto ancestor before its start/end values are compared at a
-  class-A boundary. The same immutable used-value model is used for ordinary
-  block flow and table rows; output-page selection is no longer used as that
+  class-A boundary. Table wrappers derive those endpoints from their durable
+  caption/row fragment in visual order, while repeated headers and footers do
+  not create source boundaries; output-page selection is never used as the
   ancestor lookup.
-- Leading direct inline content remains in the initial `page:auto` group when
-  a later block descendant selects a named page, preserving the class-A page
-  break between those two groups.
+- Inline `page` declarations do not create page groups. Leading direct inline
+  content remains in the initial `page:auto` group when a later block
+  descendant selects a named page, preserving the class-A page break between
+  those groups.
 - Page-local canvas insets are tracked while root/body fragments are laid out,
   preventing a page transition from carrying the first page's canvas offset
   into later named pages.
@@ -60,6 +117,10 @@ margin-box alignment work.
   now takes its fallback block basis from that logical page extent.
 - Deferred float paint materializes every destination page and marks a page
   containing deferred paint as a real fragmentainer.
+- An auto-height independent formatting context now materializes every
+  page/column fragment needed to contain its internal floats. Paintless float
+  continuations retain page-local exclusion geometry, so later cleared floats
+  and the BFC's final used height advance through the same fragmentainers.
 - A cleared, `break-inside: avoid` float now freezes its definite percentage
   block size before isolated replay and defers its destination-page paint.
   Its following in-flow siblings consequently remain in their source
@@ -71,26 +132,28 @@ margin-box alignment work.
 - Absolutely positioned replay retains every captured painted fragment. A
   background-only slice must not be discarded merely because it contains no
   text baseline.
+- Forced `left`/`right`/`recto`/`verso` breaks retain any intervening blank
+  page needed to place a following fragment on the requested spread side, but
+  trailing blank pages with no following fragment are omitted during document
+  finalization.
 
 ## Remaining renderer clusters
 
 The outstanding raw failures are architectural clusters, not per-test
 exceptions:
 
-- Vertical and sideways root flows still paginate through the physical Y axis.
-  Their logical block progression must select a new physical page fragment,
-  which affects the four body-background writing-mode cases and orthogonal
-  named-page cases.
-- Page geometry is not yet fully staged as immutable initial viewport geometry
-  followed by each destination page's used box. This affects page size,
-  orientation, page-rule specificity, logical page margins, and print media
-  queries.
+- Remaining vertical/sideways root-flow work is limited to complex nested
+  body-background and orthogonal named-page combinations; ordinary root
+  continuation now transitions through the logical block fragmentainer.
+- Remaining page-geometry work concerns complex orientation, specificity, and
+  print-media-query combinations. Initial viewport units and destination-page
+  used geometry are now distinct.
 - Canvas/page background propagation still needs page-fragment-local image
   positioning and physical writing-mode mapping.
-- Monolithic table, inline, and positioned/fixed overflow need the common
-  page-fragment disposition model. The positioned cases must preserve the
-  renderer's A4 default while their WPT viewport assumptions remain explicit
-  harness policy, rather than adding test-specific renderer behavior.
+- Complex monolithic flex/table replay still needs exact continuation-edge
+  ownership for nested inline, transformed, and mixed-writing-mode content.
+  Positioned/fixed page-span materialization now uses destination-page-aware
+  paths.
 
 The three documented CSS Page margin-box `writing-mode` compatibility ratios
 remain runner-only reporting. They are not renderer parity and no additional

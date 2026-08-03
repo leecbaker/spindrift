@@ -32,18 +32,22 @@ impl<'a> LayoutBuilder<'a> {
         parent_layout: &GridLayout,
         children: &[GridChild<'_>],
         items: &[GridItemLayout],
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         inner_x: f32,
         cursor: GridFragmentCursor,
     ) {
         for mut item_fragment in fragment_record.item_fragments(items) {
             let child = &children[item_fragment.item_index];
+            let baseline_resolution = parent_layout
+                .baseline_resolutions
+                .get(item_fragment.item_index);
             item_fragment.metadata =
                 self.grid_item_fragment_metadata(&item_fragment, inner_x, cursor);
             if item_fragment.requires_split_replay() {
                 self.replay_split_grid_item_fragment(
                     child,
                     &item_fragment,
+                    baseline_resolution,
                     stylesheets,
                     inner_x,
                     cursor,
@@ -58,6 +62,7 @@ impl<'a> LayoutBuilder<'a> {
                         cursor,
                         Some(&mut item_fragment.metadata),
                         None,
+                        baseline_resolution,
                     );
                 };
                 if let Some(area) = item_fragment.original.area
@@ -94,7 +99,8 @@ impl<'a> LayoutBuilder<'a> {
         parent_layout: &GridLayout,
         child: &GridChild<'_>,
         item: &GridItemLayout,
-        stylesheets: &[Stylesheet],
+        baseline_resolution: Option<&GridBaselineResolution>,
+        stylesheets: &Stylesheets<'_>,
         inner_x: f32,
         content_top: PageTopBlockPosition,
     ) {
@@ -107,6 +113,7 @@ impl<'a> LayoutBuilder<'a> {
                 GridFragmentCursor::new(content_top, GridFragmentBlockOffset::new(0.0)),
                 None,
                 None,
+                baseline_resolution,
             );
         };
         if let Some(area) = item.area
@@ -128,11 +135,12 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         child: &GridChild<'_>,
         item: &GridItemLayout,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         inner_x: f32,
         cursor: GridFragmentCursor,
         metadata: Option<&mut FragmentPageMetadata>,
         materialized_style: Option<&ComputedStyle>,
+        baseline_resolution: Option<&GridBaselineResolution>,
     ) {
         let item_width = item.width().max(0.0);
         let item_height = item.height().max(0.0);
@@ -141,7 +149,15 @@ impl<'a> LayoutBuilder<'a> {
         let placed_style = if let Some(style) = materialized_style {
             style
         } else {
-            owned_placed_style = grid_placed_item_style(&child.style, item_width, item_height);
+            let fallback_style = baseline_resolution.and_then(|resolution| {
+                grid_baseline_content_fallback_style(&child.style, *resolution)
+            });
+            owned_placed_style = grid_placed_item_style(
+                fallback_style.as_ref().unwrap_or(&child.style),
+                item,
+                item_width,
+                item_height,
+            );
             &owned_placed_style
         };
         let item_paint_checkpoint = self.current_page.paint_checkpoint();
@@ -237,7 +253,8 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         child: &GridChild<'_>,
         item_fragment: &GridItemFragment,
-        stylesheets: &[Stylesheet],
+        baseline_resolution: Option<&GridBaselineResolution>,
+        stylesheets: &Stylesheets<'_>,
         inner_x: f32,
         cursor: GridFragmentCursor,
     ) {
@@ -250,7 +267,14 @@ impl<'a> LayoutBuilder<'a> {
             return;
         }
 
-        let placed_style = grid_placed_item_style(&child.style, item_width, item_height);
+        let fallback_style = baseline_resolution
+            .and_then(|resolution| grid_baseline_content_fallback_style(&child.style, *resolution));
+        let placed_style = grid_placed_item_style(
+            fallback_style.as_ref().unwrap_or(&child.style),
+            item,
+            item_width,
+            item_height,
+        );
         let slice_border_box = visible
             .page_top_rect(cursor.grid_container_origin(inner_x))
             .paint_clip();
@@ -280,7 +304,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         child: &GridChild<'_>,
         placed_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         context: SplitGridItemPaintContext,
     ) {
         let item_width = context.item_width.points();
@@ -356,11 +380,19 @@ impl<'a> LayoutBuilder<'a> {
 
 fn grid_placed_item_style(
     child_style: &ComputedStyle,
+    item: &GridItemLayout,
     item_width: f32,
     item_height: f32,
 ) -> ComputedStyle {
     let mut placed_style =
         replayed_item_fragmentation_base_style(child_style, ReplayedItemFragmentationPolicy::Grid);
+    if let Some(metrics) = item.used_box_metrics() {
+        // The Taffy placement is already the border-box origin after applying
+        // grid-area margins, so replay must keep those margins suppressed.
+        // Padding, however, participates in the replayed item's used
+        // border-box geometry and must use the same resolved edges as Taffy.
+        placed_style.padding = metrics.padding.to_css_edges();
+    }
     set_style_used_width(&mut placed_style, item_width);
     set_style_used_height(&mut placed_style, item_height);
     // Both used axes are already definite. Replaying them through additional
@@ -369,4 +401,38 @@ fn grid_placed_item_style(
     // <https://www.w3.org/TR/css-grid-1/#grid-item-sizing>
     placed_style.box_sizing = BoxSizing::BorderBox;
     placed_style
+}
+
+/// Materialize the Grid baseline fallback for a grid item's own content.
+///
+/// A cyclic baseline request is replaced before the item's formatting context
+/// is replayed. This keeps its used content alignment equal to an authored
+/// `start`/`end` fallback rather than merely excluding it from the grid's
+/// measured sharing group:
+/// <https://www.w3.org/TR/css-grid-1/#row-align> and
+/// <https://www.w3.org/TR/css-align-3/#baseline-align-content>.
+fn grid_baseline_content_fallback_style(
+    child_style: &ComputedStyle,
+    resolution: GridBaselineResolution,
+) -> Option<ComputedStyle> {
+    let row_fallback = resolution.content_alignment_fallback(GridAxis::Row);
+    let column_fallback = resolution.content_alignment_fallback(GridAxis::Column);
+    if row_fallback.is_none() && column_fallback.is_none() {
+        return None;
+    }
+
+    let mut fallback_style = child_style.clone();
+    if let Some(baseline_set) = row_fallback {
+        fallback_style.align_content = css::AlignContent::safe(match baseline_set {
+            GridBaselineSet::First => css::ContentAlignmentKeyword::Start,
+            GridBaselineSet::Last => css::ContentAlignmentKeyword::End,
+        });
+    }
+    if let Some(baseline_set) = column_fallback {
+        fallback_style.justify_content = css::JustifyContent::safe(match baseline_set {
+            GridBaselineSet::First => css::ContentAlignmentKeyword::Start,
+            GridBaselineSet::Last => css::ContentAlignmentKeyword::End,
+        });
+    }
+    Some(fallback_style)
 }

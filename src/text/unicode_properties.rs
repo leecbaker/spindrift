@@ -135,8 +135,13 @@ pub(crate) fn content_writing_system(language: Option<&str>) -> ContentWritingSy
     let Some(language) = language else {
         return ContentWritingSystem::Unknown;
     };
-    let normalized = language.trim().replace('_', "-");
-    let Ok(identifier) = normalized.parse::<LanguageIdentifier>() else {
+    let language = language.trim();
+    // BCP 47 uses `-` separators, but accept underscore-separated tags for
+    // compatibility. Keep standard tags borrowed so resolving a break policy
+    // does not allocate on every inline fragment.
+    let normalized = language.contains('_').then(|| language.replace('_', "-"));
+    let language = normalized.as_deref().unwrap_or(language);
+    let Ok(identifier) = language.parse::<LanguageIdentifier>() else {
         return ContentWritingSystem::Unknown;
     };
     if let Some(script) = identifier.script {
@@ -251,6 +256,21 @@ pub(crate) fn character_is_mandatory_line_break(character: char) -> bool {
         line_break_class(character),
         LineBreak::MandatoryBreak | LineBreak::NextLine
     )
+}
+
+/// Return whether a character suppresses CSS Text's otherwise mandatory soft
+/// wrap opportunity adjacent to an atomic inline.
+///
+/// CSS Text makes replaced elements and other atomic inlines breakable on both
+/// sides, including next to U+00A0 NO-BREAK SPACE. The remaining `GL`, `WJ`,
+/// and `ZWJ` line-break classes retain their non-breaking behavior.
+/// <https://www.w3.org/TR/css-text-3/#line-break-details>
+pub(crate) fn character_blocks_atomic_inline_break(character: char) -> bool {
+    character != '\u{00a0}'
+        && matches!(
+            line_break_class(character),
+            LineBreak::Glue | LineBreak::WordJoiner | LineBreak::ZWJ
+        )
 }
 
 /// Neighboring text and writing-system context used to transform a collapsible
@@ -588,6 +608,49 @@ pub(crate) fn character_is_unicode_punctuation(character: char) -> bool {
     GeneralCategoryGroup::Punctuation.contains(general_category(character))
 }
 
+/// Return whether a character can be the typographic initial selected by
+/// `::first-letter`.
+///
+/// CSS Pseudo-Elements selects the first typographic character unit whose
+/// base character is in Unicode's Letter, Number, or Symbol categories.
+/// Keeping this classification beside the general-category helpers prevents
+/// first-letter selection from drifting from the Unicode data used elsewhere
+/// in text layout:
+/// <https://www.w3.org/TR/css-pseudo-4/#first-letter-pseudo>.
+pub(crate) fn character_is_unicode_first_letter_base(character: char) -> bool {
+    character_is_unicode_alphanumeric(character) || character_is_unicode_symbol(character)
+}
+
+/// Return whether a character is associated space around `::first-letter`
+/// punctuation.
+///
+/// CSS Pseudo-Elements includes `Zs` characters, except U+3000 IDEOGRAPHIC
+/// SPACE, between associated punctuation and the typographic initial. The
+/// caller decides whether that space is actually attached to preceding or
+/// following punctuation:
+/// <https://www.w3.org/TR/css-pseudo-4/#first-letter-pseudo>.
+pub(crate) fn character_is_first_letter_associated_space(character: char) -> bool {
+    character != '\u{3000}'
+        && matches!(general_category(character), GeneralCategory::SpaceSeparator)
+}
+
+/// Return whether punctuation can be associated after a `::first-letter`
+/// typographic initial.
+///
+/// Opening and dash punctuation terminate the suffix; all other Unicode `P*`
+/// punctuation remains part of the first-letter text:
+/// <https://www.w3.org/TR/css-pseudo-4/#first-letter-pseudo>.
+pub(crate) fn character_is_first_letter_suffix_punctuation(character: char) -> bool {
+    matches!(
+        general_category(character),
+        GeneralCategory::ClosePunctuation
+            | GeneralCategory::ConnectorPunctuation
+            | GeneralCategory::FinalPunctuation
+            | GeneralCategory::InitialPunctuation
+            | GeneralCategory::OtherPunctuation
+    )
+}
+
 /// Return whether a character belongs to a Unicode symbol category.
 ///
 /// CSS Text Decoration's `text-emphasis-skip: symbols` is defined in terms of
@@ -620,6 +683,23 @@ pub(crate) fn character_is_unicode_mark(character: char) -> bool {
 pub(crate) fn character_is_autospace_ideograph(character: char) -> bool {
     line_break_class(character) == LineBreak::Ideographic
         && GeneralCategoryGroup::Letter.contains(general_category(character))
+}
+
+/// Return whether a scalar is eligible for the UA's default ruby
+/// inter-character distribution.
+///
+/// CSS Ruby's `text-justify: ruby` distributes between adjacent CJK
+/// characters, but not adjacent Latin or Bopomofo characters. Unicode East
+/// Asian Width supplies the CJK-wide classification without maintaining
+/// brittle script ranges in the ruby formatter.
+/// <https://drafts.csswg.org/css-ruby-1/#ruby-align-property>
+pub(crate) fn character_is_ruby_justification_eligible(character: char) -> bool {
+    matches!(
+        EAST_ASIAN_WIDTHS
+            .get_or_init(CodePointMapData::<EastAsianWidth>::new)
+            .get(character),
+        EastAsianWidth::Fullwidth | EastAsianWidth::Wide
+    )
 }
 
 /// Return whether a character is a non-ideographic letter for autospace.
@@ -946,6 +1026,22 @@ mod tests {
         assert_eq!(
             content_writing_system(Some("ja-Latn")),
             ContentWritingSystem::Other
+        );
+        assert_eq!(
+            content_writing_system(Some("ja_Hang")),
+            ContentWritingSystem::Korean
+        );
+        assert_eq!(
+            content_writing_system(Some("en_Hrkt")),
+            ContentWritingSystem::Japanese
+        );
+        assert_eq!(
+            content_writing_system(Some("ko_Hani")),
+            ContentWritingSystem::Chinese
+        );
+        assert_eq!(
+            content_writing_system(Some("  ja-Hang  ")),
+            ContentWritingSystem::Korean
         );
     }
 

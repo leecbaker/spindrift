@@ -168,6 +168,7 @@ pub(super) fn timed_embedded_font_plans_with_profile<'a>(
         EmbeddedFontPlans {
             fonts,
             document_font_to_embedded_font,
+            document_font_synthesis: document.fonts.iter().map(|font| font.synthesis).collect(),
         },
         PdfFontPlanTimings {
             used_glyph_collection,
@@ -437,13 +438,13 @@ fn used_glyphs_for_painted_text(document: &Document) -> Vec<BTreeMap<u16, String
 fn collect_context_used_glyphs(
     page: &Page,
     document_font_count: usize,
-    context: &crate::document::PaintStackingContext,
+    context: &crate::document::paint::stacking::PaintStackingContext,
     used_glyphs: &mut [BTreeMap<u16, String>],
 ) {
-    for band in crate::document::PaintBand::ORDER {
+    for band in crate::document::paint::display_list::PaintBand::ORDER {
         for item in &context.bands.bands[band.index()] {
             match item {
-                crate::document::PaintDisplayItem::Operation(operation) => {
+                crate::document::paint::display_list::PaintDisplayItem::Operation(operation) => {
                     collect_operation_used_glyphs(
                         page,
                         document_font_count,
@@ -451,14 +452,16 @@ fn collect_context_used_glyphs(
                         used_glyphs,
                     );
                 }
-                crate::document::PaintDisplayItem::StackingContext(context) => {
+                crate::document::paint::display_list::PaintDisplayItem::StackingContext(
+                    context,
+                ) => {
                     collect_context_used_glyphs(page, document_font_count, context, used_glyphs);
                 }
-                crate::document::PaintDisplayItem::EffectScope(scope) => {
+                crate::document::paint::display_list::PaintDisplayItem::EffectScope(scope) => {
                     collect_effect_scope_used_glyphs(page, document_font_count, scope, used_glyphs);
                 }
-                crate::document::PaintDisplayItem::Primitive(_)
-                | crate::document::PaintDisplayItem::Link(_) => {}
+                crate::document::paint::display_list::PaintDisplayItem::Primitive(_)
+                | crate::document::paint::display_list::PaintDisplayItem::Link(_) => {}
             }
         }
     }
@@ -467,22 +470,22 @@ fn collect_context_used_glyphs(
 fn collect_effect_scope_used_glyphs(
     page: &Page,
     document_font_count: usize,
-    scope: &crate::document::PaintEffectScope,
+    scope: &crate::document::paint::effects::PaintEffectScope,
     used_glyphs: &mut [BTreeMap<u16, String>],
 ) {
     for item in &scope.items {
         match item {
-            crate::document::PaintDisplayItem::Operation(operation) => {
+            crate::document::paint::display_list::PaintDisplayItem::Operation(operation) => {
                 collect_operation_used_glyphs(page, document_font_count, operation, used_glyphs);
             }
-            crate::document::PaintDisplayItem::StackingContext(context) => {
+            crate::document::paint::display_list::PaintDisplayItem::StackingContext(context) => {
                 collect_context_used_glyphs(page, document_font_count, context, used_glyphs);
             }
-            crate::document::PaintDisplayItem::EffectScope(scope) => {
+            crate::document::paint::display_list::PaintDisplayItem::EffectScope(scope) => {
                 collect_effect_scope_used_glyphs(page, document_font_count, scope, used_glyphs);
             }
-            crate::document::PaintDisplayItem::Primitive(_)
-            | crate::document::PaintDisplayItem::Link(_) => {}
+            crate::document::paint::display_list::PaintDisplayItem::Primitive(_)
+            | crate::document::paint::display_list::PaintDisplayItem::Link(_) => {}
         }
     }
 }
@@ -490,13 +493,20 @@ fn collect_effect_scope_used_glyphs(
 fn collect_operation_used_glyphs(
     page: &Page,
     document_font_count: usize,
-    operation: &crate::PaintOperation,
+    operation: &crate::document::paint::page::PaintOperation,
     used_glyphs: &mut [BTreeMap<u16, String>],
 ) {
-    let crate::PaintOperation::Line(index) = operation else {
-        return;
+    let line_index = match operation {
+        crate::document::paint::page::PaintOperation::Line(index) => *index,
+        crate::document::paint::page::PaintOperation::OpaqueTextCoverage(index) => {
+            let Some(coverage) = page.opaque_text_coverages.get(*index) else {
+                return;
+            };
+            coverage.line_index
+        }
+        _ => return,
     };
-    let Some(line) = page.lines.get(*index) else {
+    let Some(line) = page.lines.get(line_index) else {
         return;
     };
     if !line.color.is_visible() {

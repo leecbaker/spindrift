@@ -1,4 +1,5 @@
 use super::*;
+use crate::document::paint::geometry::AxisSelectivePaintClip;
 use crate::layout::flex::compute::{effective_align_self, flex_item_has_auto_cross_margin};
 
 /// Treat auto margins as zero for an abspos flex static-position probe.
@@ -27,6 +28,31 @@ pub(in crate::layout::flex) fn zero_auto_margins_for_static_flex_probe(style: &m
         style.box_values.margin.bottom = zero;
         style.margin.bottom = 0.0;
     }
+}
+
+/// Resolve distributed `justify-content` values for the hypothetical sole
+/// flex item used to establish an absolutely positioned child's static
+/// rectangle.
+///
+/// The static-position algorithm lays out exactly one hypothetical item.
+/// CSS Box Alignment's fallback alignment for that item maps `space-between`
+/// and `stretch` to start, and `space-around` and `space-evenly` to center.
+/// Resolve that fallback before crossing the Taffy adapter, whose distributed
+/// alignment does not model this flex static-position special case.
+/// <https://www.w3.org/TR/css-flexbox-1/#abspos-items>
+/// <https://www.w3.org/TR/css-align-3/#distribution-fallback>
+pub(in crate::layout::flex) fn resolve_static_flex_probe_justify_content(
+    style: &mut ComputedStyle,
+) {
+    style.justify_content.keyword = match style.justify_content.keyword {
+        css::ContentAlignmentKeyword::Stretch | css::ContentAlignmentKeyword::SpaceBetween => {
+            css::ContentAlignmentKeyword::FlexStart
+        }
+        css::ContentAlignmentKeyword::SpaceAround | css::ContentAlignmentKeyword::SpaceEvenly => {
+            css::ContentAlignmentKeyword::Center
+        }
+        keyword => keyword,
+    };
 }
 
 /// Resolves the definite main-axis size made available to flex line wrapping.
@@ -193,34 +219,6 @@ pub(in crate::layout::flex) fn single_line_row_fragmented_cross_size(
     .ceil()
     .max(1.0);
     Some(FlexCrossSize::new(
-        first_fragment_capacity.points()
-            + continuation_count * continuation_fragment_capacity.points(),
-    ))
-}
-
-/// Resolve the fragmentable main-axis source span of an automatic single-line
-/// column flex container.
-///
-/// A column flex item that crosses a fragmentainer boundary gains the trailing
-/// continuation space in the flex container's source sequence. Consequently,
-/// an auto-height single-line column container ends at the final occupied
-/// fragmentainer boundary, rather than at the unfragmented content tail.
-/// <https://www.w3.org/TR/css-flexbox-1/#pagination>
-pub(in crate::layout::flex) fn single_line_column_fragmented_main_size(
-    source_main_size: FlexFragmentBlockSize,
-    first_fragment_capacity: FlexFragmentBlockSize,
-    continuation_fragment_capacity: FlexFragmentBlockSize,
-) -> Option<FlexFragmentBlockSize> {
-    if source_main_size.points() <= first_fragment_capacity.points() + 0.01
-        || continuation_fragment_capacity.points() <= 0.01
-    {
-        return None;
-    }
-    let continuation_count = ((source_main_size.points() - first_fragment_capacity.points())
-        / continuation_fragment_capacity.points())
-    .ceil()
-    .max(1.0);
-    Some(FlexFragmentBlockSize::new(
         first_fragment_capacity.points()
             + continuation_count * continuation_fragment_capacity.points(),
     ))
@@ -712,6 +710,22 @@ pub(in crate::layout::flex) fn flex_fragment_from_break_unit(
                     (slice_end - item_block_start).min(source_bounds.height().points()),
                 ),
             };
+            // The selected interval, rather than the source box's current
+            // height, identifies descendant-overflow replay. Column
+            // fragmentation can materialize a continuation after the flex
+            // item has already had its source extent projected into the
+            // enclosing break unit, making the two heights equal. A slice
+            // that reaches beyond the frozen used border box is nevertheless
+            // still part of the one descendant source canvas and must replay
+            // from its committed source offset.
+            // <https://www.w3.org/TR/css-flexbox-1/#pagination>
+            // <https://www.w3.org/TR/css-break-3/#box-splitting>
+            let replay_origin =
+                if content_slice.block_end.points() > used_bounds.height().points() + 0.01 {
+                    FlexItemReplayOrigin::SourceSlice
+                } else {
+                    FlexItemReplayOrigin::ChildFragment
+                };
             // Descendant overflow can outlive the flex item's used border
             // box. Preserve its source content range, but project box
             // decoration independently onto the used border box so a
@@ -744,7 +758,13 @@ pub(in crate::layout::flex) fn flex_fragment_from_break_unit(
                 decoration_slice,
                 continuation: FlexItemContinuation {
                     source_content_slice: content_slice,
+                    // Materialization commits this from the selected source
+                    // slice and frozen used border-box origin. The planner
+                    // deliberately has no child style, so it must not infer
+                    // the replay offset from flex direction here.
+                    source_canvas_block_start: FlexFragmentBlockOffset::new(0.0),
                     decoration_slice,
+                    replay_origin,
                     first_fragmentainer_capacity: FlexFragmentBlockSize::new(
                         context.first_fragmentainer_capacity.points(),
                     ),
@@ -753,6 +773,7 @@ pub(in crate::layout::flex) fn flex_fragment_from_break_unit(
                     ),
                     fragmentainer_index: context.page_index,
                     continuation_ordinal: 0,
+                    child_fragment_ordinal: None,
                 },
                 metadata: FragmentPageMetadata::empty(context.page_index),
             })
@@ -854,7 +875,7 @@ pub(in crate::layout::flex) fn flex_container_page_fragment_bounds(
 pub(in crate::layout::flex) fn flex_container_page_contents_overflow_clip(
     plan: &FlexFragmentPlan,
     page_index: usize,
-) -> Option<PaintClip> {
+) -> Option<AxisSelectivePaintClip> {
     plan.materialized_fragments
         .iter()
         .filter(|fragment| fragment.page_index == page_index)
@@ -862,13 +883,21 @@ pub(in crate::layout::flex) fn flex_container_page_contents_overflow_clip(
         .fold(None, |clip, fragment_clip| {
             Some(match clip {
                 Some(clip) => {
-                    let left = clip.x().min(fragment_clip.x());
-                    let bottom = clip.y().min(fragment_clip.y());
-                    let right =
-                        (clip.x() + clip.width()).max(fragment_clip.x() + fragment_clip.width());
-                    let top =
-                        (clip.y() + clip.height()).max(fragment_clip.y() + fragment_clip.height());
-                    PaintClip::new(left, bottom, right - left, top - bottom)
+                    debug_assert_eq!(clip.clips_x(), fragment_clip.clips_x());
+                    debug_assert_eq!(clip.clips_y(), fragment_clip.clips_y());
+                    let clip_bounds = clip.bounds();
+                    let fragment_bounds = fragment_clip.bounds();
+                    let left = clip_bounds.x().min(fragment_bounds.x());
+                    let bottom = clip_bounds.y().min(fragment_bounds.y());
+                    let right = (clip_bounds.x() + clip_bounds.width())
+                        .max(fragment_bounds.x() + fragment_bounds.width());
+                    let top = (clip_bounds.y() + clip_bounds.height())
+                        .max(fragment_bounds.y() + fragment_bounds.height());
+                    AxisSelectivePaintClip::new(
+                        PaintClip::new(left, bottom, right - left, top - bottom),
+                        clip.clips_x(),
+                        clip.clips_y(),
+                    )
                 }
                 None => fragment_clip,
             })
@@ -1511,6 +1540,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sole_item_static_probe_resolves_distributed_justify_content_fallbacks() {
+        let cases = [
+            (
+                css::ContentAlignmentKeyword::SpaceBetween,
+                css::ContentAlignmentKeyword::FlexStart,
+            ),
+            (
+                css::ContentAlignmentKeyword::Stretch,
+                css::ContentAlignmentKeyword::FlexStart,
+            ),
+            (
+                css::ContentAlignmentKeyword::SpaceAround,
+                css::ContentAlignmentKeyword::Center,
+            ),
+            (
+                css::ContentAlignmentKeyword::SpaceEvenly,
+                css::ContentAlignmentKeyword::Center,
+            ),
+        ];
+
+        for (authored, expected) in cases {
+            let mut style = ComputedStyle::initial();
+            style.justify_content.keyword = authored;
+            resolve_static_flex_probe_justify_content(&mut style);
+            assert_eq!(style.justify_content.keyword, expected);
+        }
+    }
+
+    #[test]
     fn flex_prebreak_recognizes_a_margin_box_at_page_top() {
         assert!(!should_move_flex_container_to_next_page(
             PageTopBlockPosition::new(980.0),
@@ -1719,7 +1777,7 @@ mod tests {
     fn definite_flex_container_height_transfers_content_box_aspect_ratio() {
         let mut style = ComputedStyle::initial();
         style.box_sizing = BoxSizing::ContentBox;
-        style.aspect_ratio = css::AspectRatio::from_ratio(2.0);
+        style.aspect_ratio = css::AspectRatio::from_ratio(2.0).unwrap();
 
         let height = definite_flex_container_content_height(
             &style,
@@ -1737,7 +1795,7 @@ mod tests {
     fn definite_flex_container_height_transfers_border_box_aspect_ratio() {
         let mut style = ComputedStyle::initial();
         style.box_sizing = BoxSizing::BorderBox;
-        style.aspect_ratio = css::AspectRatio::from_ratio(2.0);
+        style.aspect_ratio = css::AspectRatio::from_ratio(2.0).unwrap();
 
         let height = definite_flex_container_content_height(
             &style,
@@ -1767,8 +1825,8 @@ mod tests {
             Some(explicit_height)
         );
 
-        let mut invalid_ratio_style = ComputedStyle::initial();
-        invalid_ratio_style.aspect_ratio = css::AspectRatio::from_ratio(f32::NAN);
+        let invalid_ratio_style = ComputedStyle::initial();
+        assert!(css::AspectRatio::from_ratio(f32::NAN).is_none());
         assert_eq!(
             definite_flex_container_content_height(
                 &invalid_ratio_style,

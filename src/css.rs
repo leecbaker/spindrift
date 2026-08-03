@@ -1,5 +1,5 @@
 mod cascade;
-mod component_values;
+pub(crate) mod component_values;
 mod html_form_state;
 mod page;
 mod parse;
@@ -12,9 +12,11 @@ pub(crate) use html_form_state::auto_directionality_input_value;
 pub(crate) use values::{CrossOriginRequestMode, RequestUrlModifiers};
 
 pub(crate) use cascade::anonymous_block_style;
+pub(crate) use cascade::anonymous_text_style;
 pub(crate) use cascade::apply_declarations;
 pub(crate) use cascade::apply_pseudo_rules_with_parent_ch_advance;
 pub(crate) use cascade::declarations_affect_same_property;
+pub(crate) use cascade::default_display_is_block_level_for_tag;
 pub(crate) use cascade::default_style_for_tag;
 pub(crate) use cascade::origin_importance_rank;
 pub(crate) use cascade::parse_background_image;
@@ -25,6 +27,7 @@ pub(crate) use cascade::{
     parse_individual_rotate, parse_individual_scale, parse_individual_translate,
     parse_object_view_box, parse_transform, parse_transform_box, parse_transform_origin,
 };
+pub(crate) use component_values::trim_css_value;
 #[cfg(test)]
 pub(crate) use page::page_margins_from;
 #[cfg(test)]
@@ -52,8 +55,8 @@ pub(crate) use parse::{custom_property_value_is_valid, is_custom_property_name};
 pub(crate) use types::CssColorSpace;
 pub(crate) use types::*;
 pub use types::{
-    Css, CssColor, CssViewportSize, ForcedColorPalette, ForcedColorsMode, MediaEnvironment,
-    MediaType,
+    ColorSchemePreference, Css, CssColor, CssViewportSize, ForcedColorPalette, ForcedColorsMode,
+    MediaEnvironment, MediaType,
 };
 pub(crate) use ua::html_document_important_user_agent_stylesheet;
 #[cfg(test)]
@@ -64,8 +67,9 @@ pub(crate) use ua::html5_user_agent_source;
 pub(crate) use ua::html5_user_agent_stylesheet;
 pub(crate) use values::normalize_css_comments;
 pub(crate) use values::{
-    CSS_PX_TO_PT, fallback_ch_advance_for_style, parse_font_palette, parse_font_synthesis,
-    parse_font_synthesis_subproperty, parse_list_style_type, trim_css_value,
+    CSS_PX_TO_PT, fallback_ch_advance_for_style, parse_color_from_currentcolor_in_scheme,
+    parse_font_palette, parse_font_synthesis, parse_font_synthesis_subproperty,
+    parse_list_style_type,
 };
 pub(crate) use values::{color_to_predefined_rgb, color_to_xyz_d50, parse_color_from_currentcolor};
 

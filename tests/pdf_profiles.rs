@@ -113,6 +113,90 @@ async fn ordinary_pdf_retains_display_p3_vector_paint_as_iccbased() {
 }
 
 #[tokio::test]
+async fn ordinary_pdf_plans_final_p3_resources_for_wide_oklab_paint() {
+    let options = PdfOptions {
+        profile: PdfProfile::Pdf,
+        compression: PdfCompression::Uncompressed,
+        ..PdfOptions::default()
+    };
+    let pdf = Html::from_string(
+        "<style>@page { size: 100pt 100pt; margin: 0 } body { margin: 0 } \
+         div { width: 100pt; height: 100pt; background: oklab(1 .5 .2) }</style><div></div>",
+    )
+    .write_pdf_bytes(&RenderOptions::default(), &options)
+    .await
+    .unwrap();
+    let text = String::from_utf8_lossy(&pdf);
+
+    assert!(text.contains("/CSDisplayP3 [/ICCBased"), "{text}");
+    assert!(text.contains("/CSDisplayP3 cs"), "{text}");
+    assert!(!text.contains("/CSXYZD50"), "{text}");
+}
+
+#[tokio::test]
+async fn ordinary_pdf_declares_the_final_p3_resource_for_wide_xyz_direct_paint() {
+    let options = PdfOptions {
+        profile: PdfProfile::Pdf,
+        compression: PdfCompression::Uncompressed,
+        ..PdfOptions::default()
+    };
+
+    // CSS Color 4's `xyz` alias is D65. These are all the XYZ encodings of
+    // Display-P3 green, which is outside sRGB but exactly representable by the
+    // final ordinary-PDF Display-P3 paint condition.
+    // <https://www.w3.org/TR/css-color-4/#predefined>
+    for (space, components) in [
+        ("xyz", "0.26567 0.69174 0.04511"),
+        ("xyz-d50", "0.29194 0.692236 0.041884"),
+        ("xyz-d65", "0.26567 0.69174 0.04511"),
+    ] {
+        let pdf = Html::from_string(format!(
+            "<!DOCTYPE html><style>\
+             .test {{ background-color: red; width: 12em; height: 12em; }}
+             .test {{ background-color: color({space} {components}); }} /* wide P3 green */</style>\
+             <body><p>XYZ direct paint</p><div class=\"test\"></div></body>"
+        ))
+        .write_pdf_bytes(&RenderOptions::default(), &options)
+        .await
+        .unwrap();
+        let text = String::from_utf8_lossy(&pdf);
+
+        assert!(
+            text.contains("/CSDisplayP3 [/ICCBased"),
+            "{space} must declare its final Display-P3 color-space resource: {text}"
+        );
+        assert!(
+            text.contains("/CSDisplayP3 cs"),
+            "{space} must select the declared Display-P3 resource for direct paint: {text}"
+        );
+        assert!(
+            !text.contains("/CSXYZD50"),
+            "{space} direct paint must not plan a D50 XYZ resource: {text}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn ordinary_pdf_keeps_in_gamut_oklab_paint_in_srgb() {
+    let options = PdfOptions {
+        profile: PdfProfile::Pdf,
+        compression: PdfCompression::Uncompressed,
+        ..PdfOptions::default()
+    };
+    let pdf = Html::from_string(
+        "<style>@page { size: 100pt 100pt; margin: 0 } body { margin: 0 } \
+         div { width: 100pt; height: 100pt; background: oklab(51.975% -.1403 .10768) }</style><div></div>",
+    )
+    .write_pdf_bytes(&RenderOptions::default(), &options)
+    .await
+    .unwrap();
+    let text = String::from_utf8_lossy(&pdf);
+
+    assert!(text.contains("/CSsRGB cs"), "{text}");
+    assert!(!text.contains("/CSDisplayP3"), "{text}");
+}
+
+#[tokio::test]
 async fn pdfa_vector_paint_uses_tagged_srgb_output_intent() {
     let options = PdfOptions {
         profile: PdfProfile::PdfA2B,
@@ -120,7 +204,7 @@ async fn pdfa_vector_paint_uses_tagged_srgb_output_intent() {
         ..PdfOptions::default()
     };
     let pdf = Html::from_string(
-        "<style>p { color: color(display-p3 1 .2 0); border: 2pt solid color(display-p3 0 1 .2); background: color(display-p3 .1 .2 1) }</style><p>P3</p>",
+        "<style>p { color: color(display-p3 1 .2 0); border: 2pt solid color(display-p3 0 1 .2); background: oklab(1 .5 .2) }</style><p>P3</p>",
     )
     .write_pdf_bytes(&RenderOptions::default(), &options)
     .await
@@ -134,7 +218,7 @@ async fn pdfa_vector_paint_uses_tagged_srgb_output_intent() {
 }
 
 #[tokio::test]
-async fn ordinary_pdf_gradients_use_managed_iccbased_spaces() {
+async fn ordinary_pdf_gradients_use_managed_rgb_iccbased_spaces() {
     let options = PdfOptions {
         profile: PdfProfile::Pdf,
         compression: PdfCompression::Uncompressed,
@@ -152,10 +236,40 @@ async fn ordinary_pdf_gradients_use_managed_iccbased_spaces() {
     .unwrap();
     let text = String::from_utf8_lossy(&pdf);
 
-    assert!(text.contains("/CSXYZD50"), "{text}");
+    assert!(text.contains("/CSDisplayP3"), "{text}");
     assert!(text.contains("/ICCBased"), "{text}");
     assert!(text.contains("/SMask"), "{text}");
     assert!(!text.contains("/DeviceRGB"), "{text}");
+}
+
+#[tokio::test]
+async fn ordinary_pdf_wide_pcs_gradient_uses_its_p3_profile_for_the_shading() {
+    let options = PdfOptions {
+        profile: PdfProfile::Pdf,
+        compression: PdfCompression::Uncompressed,
+        ..PdfOptions::default()
+    };
+    let pdf = Html::from_string(
+        "<style>@page { size: 120pt 40pt; margin: 0 } body { margin: 0 } \
+         div { width: 120pt; height: 40pt; background: linear-gradient(in xyz-d50, oklab(1 .5 .2), oklab(.9 .5 .2)) }</style><div></div>",
+    )
+    .write_pdf_bytes(&RenderOptions::default(), &options)
+    .await
+    .unwrap();
+    let text = String::from_utf8_lossy(&pdf);
+    let profile_reference = text
+        .split("/CSDisplayP3 [/ICCBased ")
+        .nth(1)
+        .and_then(|suffix| suffix.split_once(" R"))
+        .map(|(reference, _)| format!("{reference} R"))
+        .expect("Display-P3 page resource");
+
+    assert!(text.contains("/ShadingType 2"), "{text}");
+    assert!(
+        text.contains(&format!("/ColorSpace [/ICCBased {profile_reference}]")),
+        "the shading must use the same ICC profile as its Display-P3 output: {text}"
+    );
+    assert!(!text.contains("/CSXYZD50"), "{text}");
 }
 
 #[tokio::test]
@@ -176,13 +290,13 @@ async fn pdfa_raster_gradient_uses_only_tagged_srgb() {
     assert!(text.contains("/OutputIntents"), "{text}");
     assert!(text.contains("/CSsRGB"), "{text}");
     assert!(text.contains("/Subtype /Image"), "{text}");
-    assert!(text.contains("/CssColorSpace [/ICCBased"), "{text}");
+    assert!(text.contains("/ColorSpace [/ICCBased"), "{text}");
     assert!(!text.contains("/DeviceRGB"), "{text}");
     assert!(!text.contains("CSDisplayP3"), "{text}");
 }
 
 #[tokio::test]
-async fn ordinary_pdf_conic_gradient_uses_its_interpolation_raster_tag() {
+async fn ordinary_pdf_conic_gradient_uses_its_rgb_raster_output_tag() {
     let options = PdfOptions {
         profile: PdfProfile::Pdf,
         compression: PdfCompression::Uncompressed,
@@ -195,24 +309,24 @@ async fn ordinary_pdf_conic_gradient_uses_its_interpolation_raster_tag() {
     .await
     .unwrap();
     let text = String::from_utf8_lossy(&pdf);
-    let interpolation_reference = text
-        .split("/CSXYZD50 [/ICCBased ")
+    let raster_output_reference = text
+        .split("/CSDisplayP3 [/ICCBased ")
         .nth(1)
         .and_then(|suffix| suffix.split_once(" R"))
         .map(|(reference, _)| format!("{reference} R"))
-        .expect("interpolation color-space page resource");
+        .expect("raster output color-space page resource");
 
     assert!(text.contains("/Subtype /Image"), "{text}");
     assert!(
         text.contains(&format!(
-            "/CssColorSpace [/ICCBased {interpolation_reference}]"
+            "/ColorSpace [/ICCBased {raster_output_reference}]"
         )),
-        "the conic image must refer to its interpolation ICC profile: {text}"
+        "the conic image must refer to its RGB output ICC profile: {text}"
     );
 }
 
 #[tokio::test]
-async fn ordinary_pdf_generated_gradient_uses_its_interpolation_raster_tag() {
+async fn ordinary_pdf_generated_gradient_uses_its_rgb_raster_output_tag() {
     let options = PdfOptions {
         profile: PdfProfile::Pdf,
         compression: PdfCompression::Uncompressed,
@@ -225,24 +339,24 @@ async fn ordinary_pdf_generated_gradient_uses_its_interpolation_raster_tag() {
     .await
     .unwrap();
     let text = String::from_utf8_lossy(&pdf);
-    let interpolation_reference = text
-        .split("/CSXYZD50 [/ICCBased ")
+    let raster_output_reference = text
+        .split("/CSDisplayP3 [/ICCBased ")
         .nth(1)
         .and_then(|suffix| suffix.split_once(" R"))
         .map(|(reference, _)| format!("{reference} R"))
-        .expect("interpolation color-space page resource");
+        .expect("raster output color-space page resource");
 
     assert!(text.contains("/Subtype /Image"), "{text}");
     assert!(
         text.contains(&format!(
-            "/CssColorSpace [/ICCBased {interpolation_reference}]"
+            "/ColorSpace [/ICCBased {raster_output_reference}]"
         )),
-        "the generated image must refer to its interpolation ICC profile: {text}"
+        "the generated image must refer to its RGB output ICC profile: {text}"
     );
 }
 
 #[tokio::test]
-async fn ordinary_pdf_preserves_an_embedded_raster_rgb_profile_once() {
+async fn ordinary_pdf_promotes_an_embedded_uniform_raster_profile_once() {
     let profile = wide_gamut_profile();
     let image = tagged_png_data_url(&profile);
     let options = PdfOptions {
@@ -251,26 +365,27 @@ async fn ordinary_pdf_preserves_an_embedded_raster_rgb_profile_once() {
         ..PdfOptions::default()
     };
     let pdf = Html::from_string(format!(
-        "<style>body {{ margin: 0; background: url({image}) repeat; }} img {{ width: 20pt; height: 20pt; }}</style><img src=\"{image}\">"
+        "<style>img {{ width: 20pt; height: 20pt; }}</style><img src=\"{image}\">"
     ))
     .write_pdf_bytes(&RenderOptions::default(), &options)
     .await
     .unwrap();
     let text = String::from_utf8_lossy(&pdf);
 
-    assert!(text.contains("/Subtype /Image"), "{text}");
-    assert!(text.contains("/CssColorSpace [/ICCBased"), "{text}");
+    assert!(!text.contains("/Subtype /Image"), "{text}");
+    assert!(text.contains("/CSEmbeddedRgb1 [/ICCBased"), "{text}");
+    assert!(text.contains("/CSEmbeddedRgb1 cs"), "{text}");
     assert_eq!(
         pdf.windows(profile.len())
             .filter(|window| *window == profile.as_slice())
             .count(),
         1,
-        "one exact embedded profile is reused by all image XObjects"
+        "the source ICC profile is embedded exactly once for the calibrated fill"
     );
 }
 
 #[tokio::test]
-async fn pdfa_raster_image_converts_embedded_profiles_to_srgb() {
+async fn pdfa_uniform_image_converts_embedded_profiles_to_tagged_srgb_fill() {
     let profile = wide_gamut_profile();
     let image = tagged_png_data_url(&profile);
     let options = PdfOptions {
@@ -285,8 +400,8 @@ async fn pdfa_raster_image_converts_embedded_profiles_to_srgb() {
     let text = String::from_utf8_lossy(&pdf);
 
     assert!(text.contains("/OutputIntents"), "{text}");
-    assert!(text.contains("/Subtype /Image"), "{text}");
-    assert!(text.contains("/CssColorSpace [/ICCBased"), "{text}");
+    assert!(!text.contains("/Subtype /Image"), "{text}");
+    assert!(text.contains("/CSsRGB cs"), "{text}");
     assert!(
         !pdf.windows(profile.len())
             .any(|window| window == profile.as_slice()),

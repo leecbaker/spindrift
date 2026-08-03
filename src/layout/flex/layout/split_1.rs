@@ -42,10 +42,15 @@ impl FlexDescendantPercentageHeightBasis {
 /// <https://www.w3.org/TR/css-flexbox-1/#abspos-items>.
 pub(in crate::layout::flex) struct PositionedFlexStaticContext<'a> {
     pub(in crate::layout::flex) container_style: &'a ComputedStyle,
-    pub(in crate::layout::flex) stylesheets: &'a [Stylesheet],
+    pub(in crate::layout::flex) stylesheets: &'a Stylesheets<'a>,
     pub(in crate::layout::flex) available: FlexAvailableSpace,
     /// Physical page-inline span of the flex container's content box.
     pub(in crate::layout::flex) inner_inline_span: PageInlineSpan,
+    /// Used physical content-box height of the flex container. This remains
+    /// available even when the height was not a definite percentage basis for
+    /// the flex sizing algorithm, because the abspos static rectangle uses
+    /// the final cross-axis content edges.
+    pub(in crate::layout::flex) content_height: PhysicalContentHeight,
     pub(in crate::layout::flex) content_top: PageTopBlockPosition,
     /// Source block offset of the temporary fragmentainer currently owning a
     /// deferred positioned child. Static flex geometry is initially expressed
@@ -298,11 +303,9 @@ pub(in crate::layout::flex) struct SplitFlexItemPaintContext {
     /// produced by the materialized flex fragment plan, rather than guessed
     /// from a page-sized source offset during painting.
     pub(in crate::layout::flex) continuation: FlexItemContinuation,
-    /// Whether this fragment preserves the item’s source coordinate system.
-    /// Row flex lines and wrapped column lines use a contiguous source slice,
-    /// while a single-line column continuation retains its main-axis replay
-    /// path until it has explicit fragment-local relayout state.
-    pub(in crate::layout::flex) replay_source_slice_offset: bool,
+    /// Selects the coordinate system from which this committed continuation
+    /// replays its child formatting context.
+    pub(in crate::layout::flex) replay_origin: FlexItemReplayOrigin,
     /// Descendant paint overflow extends the flex source interval without
     /// becoming a child formatting-context continuation. Such a child keeps
     /// one source paint tree while flex clips it across its own fragments.
@@ -409,24 +412,40 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         child: &StyledChild<'_>,
         placed_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         percentage_height_basis: FlexPercentageBasis,
-    ) {
+    ) -> Option<InFlowFragmentEnd> {
         self.with_replayed_flex_item_percentage_height_basis(percentage_height_basis, |layout| {
             if child.style.display.is_table() {
                 layout.layout_formatting_context_item_contents(child, placed_style, stylesheets);
-                return;
+                return layout.last_block_layout_outcome.in_flow_child_fragment_end;
             }
+            let fragmentainer_kind = layout.active_fragmentainer_kind();
+            let child_has_forced_fragment_break =
+                child.element_parts().is_some_and(|(_, _, boxes)| {
+                    boxes.is_some_and(|boxes| {
+                        flex_item_contents_have_forced_break_in(boxes, fragmentainer_kind)
+                    })
+                });
             // The flex container owns fragmentation at flex-line/item
             // boundaries. Replaying a final, unsplit item through ordinary
             // block flow must therefore keep its descendants in the assigned
             // item fragment rather than letting a descendant manufacture an
             // independent page break before the item's used height is applied.
+            // A forced descendant break is different: CSS Fragmentation must
+            // consume it in the child's formatting context, even when the
+            // flex item itself has not crossed a flex boundary. Its resulting
+            // page fragments are then retained by the enclosing flex layout.
             // <https://drafts.csswg.org/css-flexbox-1/#pagination>
-            layout.fragmentation_suppression_depth += 1;
+            if !child_has_forced_fragment_break {
+                layout.fragmentation_suppression_depth += 1;
+            }
             layout.layout_formatting_context_item_contents(child, placed_style, stylesheets);
-            layout.fragmentation_suppression_depth -= 1;
-        });
+            if !child_has_forced_fragment_break {
+                layout.fragmentation_suppression_depth -= 1;
+            }
+            layout.last_block_layout_outcome.in_flow_child_fragment_end
+        })
     }
 
     /// Lay out a nested continuation source for a split flex item.
@@ -441,7 +460,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         child: &StyledChild<'_>,
         placed_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         percentage_height_basis: FlexPercentageBasis,
     ) {
         self.with_replayed_flex_item_percentage_height_basis(percentage_height_basis, |layout| {
@@ -570,7 +589,6 @@ impl FlexUnitPrebreakDecision {
                     || (input.fragmentainer_kind == FragmentainerKind::Column
                         && input.current_fragmentainer.available_block_size().points()
                             <= css::CSS_PX_TO_PT + 0.01)),
-            avoid_break,
             can_advance: input.can_advance,
         })
         .should_advance
@@ -697,7 +715,8 @@ fn flex_container_shrink_to_fit_max_content_width(
         || !style.box_values.width.is_auto()
         || style.flex_wrap == FlexWrap::NoWrap
         || !physical_flex_direction(style).is_column_axis()
-        || (style.flex_wrap.balances_lines() && style.flex_line_count.is_some())
+        || (style.flex_wrap.balances_lines()
+            && matches!(style.flex_line_count, css::FlexLineCount::Count(_)))
     {
         return max_content;
     }
@@ -791,7 +810,7 @@ mod tests {
         );
 
         let height = used_length_percentage_or_auto_with_basis(
-            placed.box_values.height,
+            placed.box_values.height.value().clone(),
             PercentageBasis::<ContentBoxLength>::indefinite(),
         )
         .expect("the replayed physical main size is definite");

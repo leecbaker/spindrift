@@ -60,7 +60,11 @@ pub(super) fn intrinsic_content_box_width_keyword(
     horizontal_non_content: NonContentLength,
 ) -> Option<ContentBoxLength> {
     let min_content = min_content.points().max(0.0);
-    let max_content = max_content.points().max(min_content).max(0.0);
+    // `text-indent` may give an unwrapped first line a signed fixed offset,
+    // so its max-content contribution can be smaller than the longest
+    // unbreakable min-content segment. Preserve that CSS Sizing result for
+    // shrink-to-fit instead of normalizing it away.
+    let max_content = max_content.points().max(0.0);
     match value {
         css::ComputedLengthPercentageOrAuto::MinContent => Some(content_box_pt(min_content)),
         css::ComputedLengthPercentageOrAuto::MaxContent => Some(content_box_pt(max_content)),
@@ -169,7 +173,12 @@ pub(super) fn content_box_width_from_intrinsic(
     }
 
     let min_content = min_content.points().max(0.0);
-    let max_content = max_content.points().max(min_content).max(0.0);
+    // An applicable negative fixed `text-indent` shifts the first unwrapped
+    // line, so its max-content contribution may be below the longest
+    // unbreakable min-content segment. Do not normalize that signed result
+    // before the shrink-to-fit equation consumes it.
+    // <https://www.w3.org/TR/css-sizing-3/#intrinsic-sizes>
+    let max_content = max_content.points().max(0.0);
     match (&style.box_values.width, auto_width) {
         // During intrinsic sizing a percentage-dependent width has no
         // definite containing-block basis, so it follows the property's
@@ -180,7 +189,7 @@ pub(super) fn content_box_width_from_intrinsic(
         (css::ComputedLengthPercentageOrAuto::Auto, IntrinsicAutoWidth::ShrinkToFit) => {
             shrink_to_fit_width(
                 content_box_pt(min_content.max(0.0)),
-                content_box_pt(max_content.max(min_content).max(0.0)),
+                content_box_pt(max_content.max(0.0)),
                 content_box_pt(
                     (available_outer_width.points() - horizontal_non_content.points()).max(0.0),
                 ),
@@ -191,7 +200,7 @@ pub(super) fn content_box_width_from_intrinsic(
             IntrinsicAutoWidth::ShrinkToFit,
         ) if value.needs_percentage_basis() => shrink_to_fit_width(
             content_box_pt(min_content.max(0.0)),
-            content_box_pt(max_content.max(min_content).max(0.0)),
+            content_box_pt(max_content.max(0.0)),
             content_box_pt(
                 (available_outer_width.points() - horizontal_non_content.points()).max(0.0),
             ),

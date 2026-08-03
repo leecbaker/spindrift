@@ -18,12 +18,14 @@ impl PositionedContainingBlockMode {
     /// Select containment positioning effects from the used principal-box
     /// containment, rather than directly from the authored shorthand.
     pub(in crate::layout) fn for_element(element: &Element, style: &ComputedStyle) -> Option<Self> {
-        if layout_containment_applies_to_element(element, style)
-            || paint_containment_applies_to_element(element, style)
+        if used_property_containment(element, style).establishes_fixed_position_containing_block()
             || style.has_transform()
         {
             Some(Self::FixedAndAbsolute)
-        } else if matches!(style.position, Position::Relative | Position::Sticky) {
+        } else if matches!(
+            style.position,
+            Position::Relative | Position::Absolute | Position::Fixed | Position::Sticky
+        ) {
             Some(Self::AbsoluteOnly)
         } else {
             None
@@ -33,7 +35,10 @@ impl PositionedContainingBlockMode {
     pub(in crate::layout) fn for_style(style: &ComputedStyle) -> Option<Self> {
         if style.contain.layout || style.contain.paint || style.has_transform() {
             Some(Self::FixedAndAbsolute)
-        } else if matches!(style.position, Position::Relative | Position::Sticky) {
+        } else if matches!(
+            style.position,
+            Position::Relative | Position::Absolute | Position::Fixed | Position::Sticky
+        ) {
             Some(Self::AbsoluteOnly)
         } else {
             None
@@ -62,8 +67,7 @@ pub(in crate::layout) struct PositionedChildStaticRect {
     right: f32,
     top: f32,
     containing_block: Option<ContainingBlock>,
-    grid_alignment: Option<GridAbsposStaticAlignment>,
-    flex_alignment: Option<FlexAbsposStaticAlignment>,
+    static_alignment: Option<AbsposStaticAlignment>,
 }
 
 /// An out-of-flow flex descendant measured while a multicolumn container owns
@@ -420,8 +424,7 @@ impl PositionedChildStaticRect {
             right,
             top,
             containing_block: None,
-            grid_alignment: None,
-            flex_alignment: None,
+            static_alignment: None,
         }
     }
 
@@ -436,24 +439,40 @@ impl PositionedChildStaticRect {
             right,
             top,
             containing_block: Some(containing_block),
-            grid_alignment: None,
-            flex_alignment: None,
+            static_alignment: None,
         }
     }
 
-    pub(in crate::layout) fn with_grid_alignment(
+    pub(in crate::layout) fn with_static_alignment(
         mut self,
-        grid_alignment: GridAbsposStaticAlignment,
+        static_alignment: AbsposStaticAlignment,
     ) -> Self {
-        self.grid_alignment = Some(grid_alignment);
+        self.static_alignment = Some(static_alignment);
         self
     }
 
-    pub(in crate::layout) fn with_flex_alignment(
+    /// Replace selected physical edges of the static-position rectangle while
+    /// retaining its independently resolved containing block.
+    ///
+    /// Grid's automatic placement lines may lie on the opposite padding edge
+    /// of an explicit line outside the explicit grid. The geometric area is
+    /// normalized for the containing block, but the static corner must retain
+    /// that explicit logical edge. CSS Grid §9.1 defines these separately.
+    pub(in crate::layout) fn with_static_physical_edges(
         mut self,
-        flex_alignment: FlexAbsposStaticAlignment,
+        left: Option<f32>,
+        right: Option<f32>,
+        top: Option<f32>,
     ) -> Self {
-        self.flex_alignment = Some(flex_alignment);
+        if let Some(left) = left {
+            self.left = left;
+        }
+        if let Some(right) = right {
+            self.right = right;
+        }
+        if let Some(top) = top {
+            self.top = top;
+        }
         self
     }
 
@@ -590,9 +609,10 @@ impl<'a> LayoutBuilder<'a> {
                 .source_static_rect
                 .translated(child.fragment.local_to_page_translation);
             let _owning_fragmentainer = child.fragment.owning_fragmentainer_index;
+            let stylesheets = self.stylesheets;
             let child_boxes = self.build_frozen_child_boxes_with_current_ancestors(
                 &child.element,
-                self.stylesheets,
+                &stylesheets,
                 &child.style,
             );
             let replay_child = FormattingContextChild {
@@ -630,9 +650,10 @@ impl<'a> LayoutBuilder<'a> {
                             candidate.source_block_start.points(),
                         ))
                     };
+                    let stylesheets = self.stylesheets;
                     self.layout_positioned_formatting_context_child(
                         &replay_child,
-                        self.stylesheets,
+                        &stylesheets,
                         candidate_static_rect,
                     );
                     let source_layers = self.positioned_layers.split_off(positioned_layer_start);
@@ -676,9 +697,10 @@ impl<'a> LayoutBuilder<'a> {
                         self.push_positioned_containing_block(mode, containing_block)
                     });
             let positioned_layer_start = self.positioned_layers.len();
+            let stylesheets = self.stylesheets;
             self.layout_positioned_formatting_context_child(
                 &replay_child,
-                self.stylesheets,
+                &stylesheets,
                 static_rect,
             );
             if child.fragment.has_unresolved_candidates() {
@@ -771,6 +793,43 @@ impl<'a> LayoutBuilder<'a> {
         );
     }
 
+    /// Replace the geometry of the innermost positioned containing block
+    /// after its auto-sized principal flow has committed.
+    ///
+    /// Atomic formatting contexts initially need a containing block while
+    /// collecting descendants, but their final padding-box height is only
+    /// known after principal-flow layout.  Updating both stacks together
+    /// keeps fixed descendants viewport-owned for `AbsoluteOnly` scopes.
+    /// <https://www.w3.org/TR/css-position-3/#def-cb>
+    pub(in crate::layout) fn finalize_positioned_containing_block(
+        &mut self,
+        scope: PositionedContainingBlockScope,
+        containing_block: ContainingBlock,
+    ) {
+        debug_assert_eq!(
+            self.containing_blocks.len(),
+            scope.containing_blocks_depth + 1,
+            "positioned containing-block scopes must be finalized in nesting order",
+        );
+        *self
+            .containing_blocks
+            .last_mut()
+            .expect("positioned containing-block scope has one absolute stack entry") =
+            containing_block;
+        if scope.mode.establishes_fixed_containing_block() {
+            debug_assert_eq!(
+                self.fixed_containing_blocks.len(),
+                scope.fixed_containing_blocks_depth + 1,
+                "fixed containing-block scope must match absolute scope",
+            );
+            *self
+                .fixed_containing_blocks
+                .last_mut()
+                .expect("fixed containing-block scope has one fixed stack entry") =
+                containing_block;
+        }
+    }
+
     /// Replay an absolutely positioned flex/grid child from a precomputed
     /// static-position rectangle.
     ///
@@ -782,7 +841,7 @@ impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn layout_positioned_formatting_context_child(
         &mut self,
         child: &FormattingContextChild<'_>,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         static_rect: PositionedChildStaticRect,
     ) {
         let previous_left = self.content_left;
@@ -805,12 +864,8 @@ impl<'a> LayoutBuilder<'a> {
             static_rect.top,
             true,
         );
-        let static_position = match static_rect.grid_alignment {
-            Some(grid_alignment) => static_position.with_grid_alignment(grid_alignment),
-            None => static_position,
-        };
-        self.absolute_static_position = Some(match static_rect.flex_alignment {
-            Some(flex_alignment) => static_position.with_flex_alignment(flex_alignment),
+        self.absolute_static_position = Some(match static_rect.static_alignment {
+            Some(static_alignment) => static_position.with_static_alignment(static_alignment),
             None => static_position,
         });
 
@@ -844,11 +899,12 @@ impl<'a> LayoutBuilder<'a> {
 mod tests {
     use super::*;
 
-    fn test_layout_builder<'a>(
+    fn test_layout_builder<'a, Collection: crate::css::StylesheetCollection + ?Sized>(
         options: &'a RenderOptions,
-        stylesheets: &'a [Stylesheet],
+        stylesheets: &'a Collection,
         resource_cache: &'a ResourceCache,
     ) -> LayoutBuilder<'a> {
+        let stylesheets = crate::css::StylesheetCollection::stylesheet_view(stylesheets);
         LayoutBuilder::new(LayoutBuilderConfig {
             options,
             stylesheets,
@@ -859,6 +915,7 @@ mod tests {
             iframe_viewport: None,
             page_progression_direction: Direction::Ltr,
             page_counter_initial_values: HashMap::new(),
+            target_references: crate::layout::TargetReferenceSnapshot::default(),
             font_system: FontSystem::new(),
         })
     }
@@ -869,6 +926,18 @@ mod tests {
         assert_eq!(PositionedContainingBlockMode::for_style(&style), None);
 
         style.position = Position::Relative;
+        assert_eq!(
+            PositionedContainingBlockMode::for_style(&style),
+            Some(PositionedContainingBlockMode::AbsoluteOnly),
+        );
+
+        style.position = Position::Absolute;
+        assert_eq!(
+            PositionedContainingBlockMode::for_style(&style),
+            Some(PositionedContainingBlockMode::AbsoluteOnly),
+        );
+
+        style.position = Position::Fixed;
         assert_eq!(
             PositionedContainingBlockMode::for_style(&style),
             Some(PositionedContainingBlockMode::AbsoluteOnly),

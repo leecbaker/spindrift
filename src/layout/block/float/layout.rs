@@ -25,7 +25,7 @@ impl<'a> LayoutBuilder<'a> {
         child_style: &ComputedStyle,
         child_children: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         run: &mut FloatRunState,
     ) -> bool {
         if child_style.float == Float::None
@@ -34,12 +34,10 @@ impl<'a> LayoutBuilder<'a> {
         {
             return false;
         }
-
-        let mut placed_style = child_style.clone();
+        let mut placed_style = self.style_with_current_used_lengths(child_style);
         if placed_style.display.is_inline_level() {
             placed_style.display = placed_style.display.blockified();
         }
-        self.resolve_style_current_viewport_lengths(&mut placed_style);
         let specified_side = placed_style.float;
         let float_id = self.next_float_id();
         // Reserve the float's tree order before replaying its descendants.
@@ -63,8 +61,7 @@ impl<'a> LayoutBuilder<'a> {
         // final replay so speculative layout cannot create a page transition.
         // <https://www.w3.org/TR/css-break-3/#possible-breaks> and
         // <https://www.w3.org/TR/css-page-3/#using-named-pages>
-        placed_style.page_name_specified = false;
-        placed_style.page_name = None;
+        placed_style.page = css::PageAssignment::Unspecified;
         if placed_style.display.is_flow() {
             placed_style.display.inner = DisplayInner::FlowRoot;
         }
@@ -81,9 +78,9 @@ impl<'a> LayoutBuilder<'a> {
         let child_children = child_children.or(built_child_children.as_deref());
 
         let containing_inline_size = (self.content_right - self.content_left).max(0.0);
-        apply_used_box_metrics(
+        apply_used_box_metrics_for_logical_inline_basis(
             &mut placed_style,
-            PercentageBasis::definite(layout_pt(containing_inline_size)),
+            self.current_content_logical_inline_percentage_basis(),
         );
         let _ = freeze_float_replay_height(
             &mut placed_style,
@@ -379,6 +376,7 @@ impl<'a> LayoutBuilder<'a> {
             paint_page_index,
             float_margin_box,
         );
+        float_shape.outer_inline_extent = inline_size.margin_box_width;
         float_shape.placement = Some(logical_placement);
         float_shape.area = resolve_float_area(
             &placed_style,
@@ -389,6 +387,7 @@ impl<'a> LayoutBuilder<'a> {
             self.root_url,
         );
         let mut recorded_float_shape = false;
+        let mut unpainted_float_fragment_shapes = Vec::new();
         let fragmented_float = deferred_to_next_page || self.pages.len() != paint_page_index;
         let captures_positioned_descendants = StackingContextPolicy::for_atomic(&placed_style, PaintBand::Float, float_bounds)
                 .captures_positioned_descendants
@@ -424,11 +423,13 @@ impl<'a> LayoutBuilder<'a> {
                 float_side,
                 paint_source_order,
                 logical_placement,
+                inline_size.margin_box_width,
                 float_bounds,
                 &replay_style,
                 replaced_element_kind(child_element).is_some(),
                 fragment,
                 child_contexts,
+                false,
             ) {
                 // The durable exclusion is registered from the paint
                 // fragment on the ordinary (non-fragmented) path as well as
@@ -461,16 +462,72 @@ impl<'a> LayoutBuilder<'a> {
                     float_side,
                     paint_source_order,
                     logical_placement,
+                    inline_size.margin_box_width,
                     float_bounds,
                     &replay_style,
                     replaced_element_kind(child_element).is_some(),
                     fragment,
                     child_contexts,
+                    true,
                 ) {
                     float_fragments.push(float_fragment);
                 }
             }
             float_fragments.sort_by_key(|fragment| (fragment.page_index, fragment.source_order));
+            // A fragmented float with no paint (for example, an empty box
+            // whose used height comes from an authored `height`) still owns a
+            // page-local exclusion in every fragmentainer it crosses. Later
+            // floats must clear those continuations and an auto-height BFC
+            // must include their final fragment even though there is no paint
+            // tree from which `FloatPaintFragment` can be built.
+            // <https://www.w3.org/TR/CSS22/visuren.html#flow-control>
+            // <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+            if float_fragments.is_empty() {
+                let mut remaining_block_size = float_margin_box.height();
+                for fragment_page_index in paint_page_index..=self.pages.len() {
+                    let fragment_context = if fragment_page_index == paint_page_index {
+                        layout_snapshot.current_page_context
+                    } else {
+                        self.fragmentainer_override
+                            .map(|override_| {
+                                override_.context_for_fragmentainer(fragment_page_index)
+                            })
+                            .unwrap_or(self.current_page_context)
+                    };
+                    let fragment_top = if fragment_page_index == paint_page_index {
+                        float_margin_box.top_y()
+                    } else {
+                        fragment_context.top()
+                    };
+                    let fragment_block_size = remaining_block_size
+                        .min((fragment_top - fragment_context.bottom()).max(0.0));
+                    if fragment_block_size <= FLOAT_EPSILON {
+                        continue;
+                    }
+                    let fragment_rect = PageTopRect::new(
+                        float_margin_box.x(),
+                        fragment_top,
+                        float_margin_box.width(),
+                        fragment_block_size,
+                    );
+                    let mut fragment_shape = float_shape.clone();
+                    fragment_shape.fragment_index = unpainted_float_fragment_shapes.len();
+                    fragment_shape.starts_on_previous_page = fragment_page_index > paint_page_index;
+                    fragment_shape.continues_on_next_page =
+                        remaining_block_size > fragment_block_size + FLOAT_EPSILON;
+                    fragment_shape.page_index = fragment_page_index;
+                    fragment_shape.rect = fragment_rect;
+                    fragment_shape.placement = Some(
+                        logical_placement
+                            .with_margin_box(logical_placement.containing, fragment_rect)
+                            .on_page(fragment_page_index),
+                    );
+                    fragment_shape.area = float_shape.area.clone().with_margin_clip(fragment_rect);
+                    unpainted_float_fragment_shapes.push(fragment_shape);
+                    remaining_block_size -= fragment_block_size;
+                }
+                debug_assert!(remaining_block_size <= FLOAT_EPSILON);
+            }
             let fragment_count = float_fragments.len();
             for (index, fragment) in float_fragments.iter_mut().enumerate() {
                 fragment.fragment_index = index;
@@ -543,7 +600,13 @@ impl<'a> LayoutBuilder<'a> {
                 || has_positioned_descendants
                 || has_out_of_flow_descendants)
         {
-            self.push_float_shape(float_shape, run);
+            if unpainted_float_fragment_shapes.is_empty() {
+                self.push_float_shape(float_shape, run);
+            } else {
+                for fragment_shape in unpainted_float_fragment_shapes {
+                    self.push_float_shape(fragment_shape, run);
+                }
+            }
         }
 
         self.content_left = previous_left;

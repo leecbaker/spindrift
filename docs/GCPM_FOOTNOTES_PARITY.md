@@ -14,7 +14,10 @@ Paged Media Level 3:
 - `@page { @footnote { … } }` is a dedicated page-area rule, independently
   cascaded from the sixteen CSS Paged Media margin boxes.
 - Footnote bodies are measured, page assignments are iterated to a fixed
-  point, then the final flow reserves the resulting page-local area.
+  point, then the final flow reserves the resulting page-local area. A call
+  becomes page-owned only when its graph-selected inline line commits, so
+  intrinsic sizing and table probes cannot reserve a footnote on the wrong
+  page.
 - The footnote area's margins, backgrounds, borders, background images, and
   padding are applied once per page area; its bottom margin edge is anchored
   to the page-area bottom. The generated marker is rendered through the
@@ -24,8 +27,9 @@ Paged Media Level 3:
 
 Focused coverage currently includes CSS parsing for the GCPM properties and
 page-area rule plus a box-tree regression for detachment and call/marker
-counter events. A local PDF smoke document verifies one call, one marker, and
-one body on a single page.
+counter events. Local PDF smoke documents verify one call, one marker, and one
+body on a single page, a call that crosses to its selected page, and the
+Taiwanese-numerals table's one-page footnote layout.
 
 ## Remaining divergence
 

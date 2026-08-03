@@ -30,12 +30,12 @@ enum PageContentPart {
         style: Option<ListStyleType>,
     },
     TargetCounter {
-        target: String,
+        target: css::TargetReference,
         name: String,
         style: Option<ListStyleType>,
     },
     TargetText {
-        target: String,
+        target: css::TargetReference,
         keyword: TargetTextKeyword,
     },
     NamedString {
@@ -74,12 +74,12 @@ pub(super) enum PageMarginContentItem {
         style: Option<ListStyleType>,
     },
     TargetCounter {
-        target: String,
+        target: css::TargetReference,
         name: String,
         style: Option<ListStyleType>,
     },
     TargetText {
-        target: String,
+        target: css::TargetReference,
         keyword: css::NamedStringTargetTextKeyword,
     },
 }
@@ -141,6 +141,7 @@ pub(super) struct PageContentResolveContext<'a> {
     pub counter_styles: &'a HashMap<String, CounterStyleRule>,
     pub page_counters: &'a HashMap<String, i32>,
     pub page_counters_by_page: &'a [HashMap<String, i32>],
+    pub image_set_resolution_dppx: f32,
 }
 
 /// Resolves a page-margin `content` value to paintable generated-content parts.
@@ -176,12 +177,15 @@ pub(super) fn resolve_page_content_parts(
                 }
             }
             PageContentPart::Image { image } => {
+                let mut image =
+                    page_content_image_with_context_urls(image, context.base_url, context.root_url);
+                let image = if image.select_image_set(context.image_set_resolution_dppx) {
+                    css::ComputedImage::image(image)
+                } else {
+                    css::ComputedImage::Invalid
+                };
                 output.push(PageMarginContentItem::Inline(GeneratedContentPart::Image {
-                    image: css::ComputedImage::image(page_content_image_with_context_urls(
-                        image,
-                        context.base_url,
-                        context.root_url,
-                    )),
+                    image,
                 }))
             }
             PageContentPart::Quote(quote) => output.push(PageMarginContentItem::Inline(
@@ -423,24 +427,41 @@ fn page_content_image_with_context_urls(
     base_url: Option<&url::Url>,
     root_url: Option<&url::Url>,
 ) -> BackgroundImage {
-    let mut selected = &mut image;
-    while let BackgroundImage::ImageSet { image, .. } = selected {
-        selected = image;
-    }
-    if let BackgroundImage::Url {
-        base_url: image_base_url,
-        root_url: image_root_url,
-        ..
-    } = selected
-    {
-        if image_base_url.is_none() {
-            *image_base_url = base_url.cloned();
-        }
-        if image_root_url.is_none() {
-            *image_root_url = root_url.cloned();
-        }
-    }
+    apply_page_content_image_urls(&mut image, base_url, root_url);
     image
+}
+
+fn apply_page_content_image_urls(
+    image: &mut BackgroundImage,
+    base_url: Option<&url::Url>,
+    root_url: Option<&url::Url>,
+) {
+    match image {
+        BackgroundImage::ImageSet(set) => {
+            for option in &mut set.options {
+                apply_page_content_image_urls(&mut option.image, base_url, root_url);
+            }
+        }
+        BackgroundImage::SelectedImageSet { image, .. } => {
+            apply_page_content_image_urls(image, base_url, root_url)
+        }
+        BackgroundImage::Url {
+            base_url: image_base_url,
+            root_url: image_root_url,
+            ..
+        } => {
+            if image_base_url.is_none() {
+                *image_base_url = base_url.cloned();
+            }
+            if image_root_url.is_none() {
+                *image_root_url = root_url.cloned();
+            }
+        }
+        BackgroundImage::LinearGradient(_)
+        | BackgroundImage::RadialGradient(_)
+        | BackgroundImage::ConicGradient(_)
+        | BackgroundImage::CssColor(_) => {}
+    }
 }
 
 fn format_page_counter_value(
@@ -462,7 +483,7 @@ fn format_page_counter_i32(
 }
 
 fn resolve_target_counter_value(
-    target: &str,
+    target: &css::TargetReference,
     name: &str,
     style: Option<ListStyleType>,
     page_anchors: &HashMap<String, usize>,
@@ -479,7 +500,7 @@ fn resolve_target_counter_value(
     if !name.eq_ignore_ascii_case("page") {
         return None;
     }
-    let target = target.strip_prefix('#').unwrap_or(target);
+    let target = target.literal_fragment_id()?;
     let page_index = *page_anchors.get(target)?;
     Some(format_page_counter_value(
         page_index + 1,
@@ -489,11 +510,11 @@ fn resolve_target_counter_value(
 }
 
 fn resolve_target_text_value(
-    target: &str,
+    target: &css::TargetReference,
     keyword: TargetTextKeyword,
     page_anchor_text: &HashMap<String, AnchorText>,
 ) -> Option<String> {
-    let target = target.strip_prefix('#').unwrap_or(target);
+    let target = target.literal_fragment_id()?;
     let text = page_anchor_text.get(target)?;
     Some(match keyword {
         TargetTextKeyword::Content => text.content.clone(),
@@ -509,7 +530,7 @@ fn resolve_target_text_value(
 }
 
 fn resolve_named_string_target_text_value(
-    target: &str,
+    target: &css::TargetReference,
     keyword: css::NamedStringTargetTextKeyword,
     page_anchor_text: &HashMap<String, AnchorText>,
 ) -> Option<String> {
@@ -586,17 +607,22 @@ fn parse_page_image_token(value: &str) -> Option<(BackgroundImage, &str)> {
             tail,
         ));
     }
-    for name in [
+    let (name, arguments, tail) = crate::css::component_values::css_leading_function(value)?;
+    if [
+        "image-set",
+        "-webkit-image-set",
+        "image",
         "linear-gradient",
         "repeating-linear-gradient",
         "radial-gradient",
         "repeating-radial-gradient",
-    ] {
-        let Some(body) = strip_ascii_function(value, name) else {
-            continue;
-        };
-        let (argument, tail) = split_balanced_function_argument(body)?;
-        let image_text = format!("{name}({argument})");
+        "conic-gradient",
+        "repeating-conic-gradient",
+    ]
+    .iter()
+    .any(|known| name.eq_ignore_ascii_case(known))
+    {
+        let image_text = format!("{name}({arguments})");
         let image = css::parse_background_image(&image_text, None, None)?;
         return Some((image, tail));
     }
@@ -819,23 +845,25 @@ fn parse_target_text_keyword(value: &str) -> Option<TargetTextKeyword> {
     }
 }
 
-fn parse_target_reference(value: &str) -> Option<String> {
+fn parse_target_reference(value: &str) -> Option<css::TargetReference> {
     if let Some((text, tail)) = parse_css_string_token(value)
         && tail.trim().is_empty()
     {
-        return Some(text);
+        return Some(css::TargetReference::Fragment(text));
     }
     if let Some(after_open) = strip_ascii_function(value, "url") {
         let (argument, tail) = split_balanced_function_argument(after_open)?;
         if !tail.trim().is_empty() {
             return None;
         }
-        return Some(strip_css_string_quotes(argument.trim()));
+        return Some(css::TargetReference::Fragment(strip_css_string_quotes(
+            argument.trim(),
+        )));
     }
     value
         .strip_prefix('#')
         .filter(|target| !target.trim().is_empty())
-        .map(|target| format!("#{target}"))
+        .map(|target| css::TargetReference::Fragment(format!("#{target}")))
 }
 
 fn parse_named_assignment_arguments(argument: &str) -> Option<(String, String)> {
@@ -1090,7 +1118,7 @@ mod tests {
         assert_eq!(
             parse_page_content(r#"target-counter(url(#chapter), page, lower-roman)"#).unwrap(),
             vec![PageContentPart::TargetCounter {
-                target: "#chapter".to_string(),
+                target: css::TargetReference::Fragment("#chapter".to_string()),
                 name: "page".to_string(),
                 style: Some(ListStyleType::Named("lower-roman".to_string())),
             }]
@@ -1098,7 +1126,7 @@ mod tests {
         assert_eq!(
             parse_page_content(r##"target-text("#chapter", before)"##).unwrap(),
             vec![PageContentPart::TargetText {
-                target: "#chapter".to_string(),
+                target: css::TargetReference::Fragment("#chapter".to_string()),
                 keyword: TargetTextKeyword::Before,
             }]
         );

@@ -1,5 +1,6 @@
 use super::*;
 use crate::css::ContainerType;
+use crate::layout::inline_collect::TextDecorationPropagationContext;
 use crate::layout::inline_layout::InlineLayoutOutcome;
 
 /// Continuation-local containing-block state, separate from the page selected
@@ -77,11 +78,7 @@ impl<'a> LayoutBuilder<'a> {
         // `PageBoundaryValue::Auto` preserves the authored distinction at the
         // class-A boundary.
         // <https://www.w3.org/TR/css-page-3/#using-named-pages>
-        let used = if style.page_name_specified {
-            style.page_name.clone().or(inherited)
-        } else {
-            inherited
-        };
+        let used = style.page.effective_name(inherited);
         self.page_value_scope_stack.push(used);
     }
 
@@ -104,7 +101,12 @@ impl<'a> LayoutBuilder<'a> {
                 .last()
                 .cloned()
                 .flatten()
-                .or_else(|| parent_style.page_name.clone()),
+                .or_else(|| {
+                    parent_style
+                        .page
+                        .specified_name()
+                        .map(|name| name.as_str().to_string())
+                }),
         }
     }
 
@@ -122,7 +124,12 @@ impl<'a> LayoutBuilder<'a> {
             .last()
             .cloned()
             .flatten()
-            .or_else(|| parent_style.page_name.clone())
+            .or_else(|| {
+                parent_style
+                    .page
+                    .specified_name()
+                    .map(|name| name.as_str().to_string())
+            })
     }
 
     /// Suppresses element-entry named-page scopes while preserving sibling switches.
@@ -179,11 +186,22 @@ impl<'a> LayoutBuilder<'a> {
         // https://www.w3.org/TR/css-page-3/#using-named-pages
         // A named-page boundary is a class-A break between normal-flow boxes.
         // Prior out-of-flow paint (for example a float) remains on the current
-        // page but does not establish a preceding page group that the next
-        // in-flow box must break away from.
+        // page but does not by itself establish a preceding page group that
+        // the next in-flow box must break away from. Conversely, once a named
+        // page has been selected, its out-of-flow paint materializes that page
+        // context and it must be committed before a later class-A transition.
+        // This keeps page-type selection separate from normal-flow geometry:
+        // `page` applies to Class-A boxes even when their only paint is an
+        // absolutely positioned descendant.
         // <https://www.w3.org/TR/css-break-3/#possible-breaks>
         // <https://www.w3.org/TR/css-page-3/#using-named-pages>
-        let materialized_destination = self.current_page_has_named_page_flow_content;
+        // The page context records whether the source page was selected as a
+        // named page independently of normal-flow occupancy. In particular,
+        // positioned descendants are laid out after their source's page-value
+        // boundaries have been determined, so their paint cannot be used to
+        // decide whether that named page must be committed.
+        let materialized_destination = self.current_page_has_named_page_flow_content
+            || self.current_page_selected_name.is_some();
         let replacing_committed_empty_page =
             !materialized_destination && !self.current_page_has_content() && !self.pages.is_empty();
         let empty_page_selected_by_named_boundary = replacing_committed_empty_page
@@ -230,7 +248,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         run_in_children: &[box_tree::FormattingBox<'_>],
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
@@ -261,7 +279,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         run_in_children: &[box_tree::FormattingBox<'_>],
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
@@ -348,7 +366,7 @@ impl<'a> LayoutBuilder<'a> {
         layout_kind: ElementLayoutKind,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         run_in_children: &[box_tree::FormattingBox<'_>],
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
@@ -494,7 +512,7 @@ impl<'a> LayoutBuilder<'a> {
         layout_kind: ElementLayoutKind,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         run_in_children: &[box_tree::FormattingBox<'_>],
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
@@ -557,8 +575,7 @@ impl<'a> LayoutBuilder<'a> {
                 .cloned()
                 .map(|layer| layer.context.with_links(layer.links))
                 .collect::<Vec<_>>();
-            if style.contain.paint
-                && property_containment_applies_to_element(element, style)
+            if paint_containment_applies_to_element(element, style)
                 && !child_contexts.is_empty()
                 && let Some(overflow_clip) = fragment.top_level_contents_overflow_clip()
             {
@@ -689,12 +706,12 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
     ) {
         if self.absolute_static_position.is_none()
-            && style.abspos_static_source_was_inline_level
+            && style.abspos_static_source.is_inline_level()
             && let Some(static_baseline_y) = self.current_page.lines.last().map(|line| line.y())
         {
             self.layout_positioned_block_with_inline_static_position(
@@ -720,7 +737,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         style: &ComputedStyle,
         children: &[box_tree::FormattingBox<'_>],
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         marker: Option<&ListMarker>,
     ) -> bool {
         self.layout_anonymous_block_with_first_line_policy(
@@ -738,7 +755,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         style: &ComputedStyle,
         children: &[box_tree::FormattingBox<'_>],
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         marker: Option<&ListMarker>,
         allow_typographic_first_line: bool,
         initial_first_formatted_line: bool,
@@ -767,7 +784,9 @@ impl<'a> LayoutBuilder<'a> {
             // early float down and erase the CSS 2.2 distinction between
             // floats that occur before and after prior inline content.
             // <https://drafts.csswg.org/css-text-3/#white-space-phase-2>
-            if !trim_css_collapsible_whitespace(&text).is_empty() {
+            if !style.white_space.collapses_spaces()
+                || !trim_css_collapsible_whitespace(&text).is_empty()
+            {
                 let outcome = self.layout_text_block(&text, style, 0.0, 0.0, None);
                 return outcome;
             }
@@ -776,17 +795,16 @@ impl<'a> LayoutBuilder<'a> {
         let mut items = Vec::new();
         if let Some(marker) = marker
             && marker.paints_outside()
+            && !self.outside_marker_anchor_is_pending(marker)
         {
             if self.cursor_y - style.font_size < self.page_bottom() {
                 self.push_page();
             }
-            self.paint_outside_marker(
-                marker,
+            let anchor = self.outside_marker_fallback_anchor(
                 style,
-                self.content_left,
-                self.content_right,
-                self.cursor_y,
+                PageInlineSpan::from_edges(self.content_left, self.content_right),
             );
+            self.paint_outside_marker(marker, style, anchor);
         }
         if block_bidi_scope_needs_inline_controls(style) {
             self.push_bidi_scope_start(style, None, 0.0, InlineVisualOffset::zero(), &mut items);
@@ -830,7 +848,7 @@ impl<'a> LayoutBuilder<'a> {
             0.0,
             InlineVisualOffset::zero(),
             style,
-            style.text_decoration.clone(),
+            style.text_decoration_layers.clone(),
             &mut items,
         );
         if let Some(marker) = marker
@@ -884,16 +902,27 @@ impl<'a> LayoutBuilder<'a> {
         InlineLayoutOutcome::default()
     }
 
-    pub(in crate::layout) fn layout_inline_split_block_context(
+    pub(in crate::layout) fn layout_inline_split_block_context_with_parent_decoration(
         &mut self,
         context: &box_tree::InlineSplitBlockContextBox<'_>,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
+        parent_style: Option<&ComputedStyle>,
     ) {
+        let used_context_style = parent_style
+            .map(|style| {
+                TextDecorationPropagationContext::from_style(style)
+                    .used_child_style(&context.core.style)
+            })
+            .unwrap_or_else(|| (*context.core.style).clone());
         let scope = self.begin_inline_split_block_paint_scope();
         self.with_inline_split_block_relative_layout_scope(Some(context), |layout| {
             for child in &context.core.children {
                 let prior_line_baseline = layout.last_in_flow_line_baseline_y;
-                layout.layout_formatting_box(child, stylesheets);
+                layout.layout_formatting_box_with_parent_decoration(
+                    child,
+                    stylesheets,
+                    Some(&used_context_style),
+                );
                 if child.element_parts().is_some_and(|(element, _, style, _)| {
                     layout_containment_applies_to_element(element, style)
                         && !matches!(style.position, Position::Absolute | Position::Fixed)
@@ -981,7 +1010,7 @@ impl<'a> LayoutBuilder<'a> {
         child_style: &ComputedStyle,
         child_children: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         run: &mut FloatRunState,
         split_inline_block_offset: Option<f32>,
     ) -> bool {
@@ -1181,7 +1210,10 @@ impl<'a> LayoutBuilder<'a> {
                     })
             })
             .flatten();
-        if !self.current_page_has_content() && !self.current_page_has_named_page_flow_content {
+        if !self.current_page_has_content()
+            && !self.current_page_has_named_page_flow_content
+            && self.current_page_selected_name.is_none()
+        {
             // CSS Fragmentation allows a box fragment to be split across
             // fragmentainers, but a carried fragment offset must not make a
             // fresh empty page permanently unfillable. If a break is requested
@@ -1214,6 +1246,7 @@ impl<'a> LayoutBuilder<'a> {
                 self.page_running_elements
                     .push(std::mem::take(&mut self.current_page_running_elements));
                 self.apply_page_context(context, offsets);
+                self.current_page_selected_name = None;
                 self.truncate_page_start_margins = true;
                 self.apply_pending_fragments_for_current_page();
                 return;
@@ -1222,6 +1255,7 @@ impl<'a> LayoutBuilder<'a> {
             self.current_page_has_flow_content = false;
             self.current_page_has_named_page_flow_content = false;
             self.apply_page_context(context, offsets);
+            self.current_page_selected_name = None;
             self.truncate_page_start_margins = true;
             self.apply_pending_fragments_for_current_page();
             return;
@@ -1265,6 +1299,7 @@ impl<'a> LayoutBuilder<'a> {
         self.page_running_elements
             .push(std::mem::take(&mut self.current_page_running_elements));
         self.apply_page_context(next_context, offsets);
+        self.current_page_selected_name = None;
         self.truncate_page_start_margins = true;
         self.apply_pending_fragments_for_current_page();
     }
@@ -1324,62 +1359,23 @@ impl<'a> LayoutBuilder<'a> {
         }
     }
 
-    /// Capture the continuation state used by an in-flow page break.
-    ///
-    /// Unlike an isolated float replay, an ordinary block continuation starts
-    /// after the root/body canvas's fragment-start decorations. It therefore
-    /// retains only the nested formatting context's local insets, exactly as
-    /// [`Self::push_page`] does for normal-flow pagination.
-    /// <https://www.w3.org/TR/css-break-3/#box-splitting>
-    pub(in crate::layout) fn page_break_continuation_context(&self) -> FragmentContinuationContext {
-        let mut continuation = self.fragment_continuation_context();
-        let actual_local_offsets = continuation.local_offsets;
-        let canvas_inline_insets = self.document_canvas_fragment_insets.iter().fold(
-            FragmentOffsets::ZERO,
-            |total, inset| FragmentOffsets {
-                left: total.left + inset.left,
-                right: total.right + inset.right,
-                top: total.top,
-            },
-        );
-        continuation.local_offsets = self.current_fragment_offsets_for_page_break();
-        // A retry enters below the already-open root/body canvas, whereas a
-        // normal page break re-enters that canvas before laying out its next
-        // in-flow child. Account for that canvas fragment's inline
-        // translation so both paths select the same page-local origin.
-        if actual_local_offsets.left < 0.0 || actual_local_offsets.right < 0.0 {
-            // A preceding table/body fragment has already re-entered the
-            // canvas. Replaying its negative local inset verbatim keeps later
-            // fragments at the same physical origin instead of drifting by
-            // one body margin on every page.
-            continuation.local_offsets = actual_local_offsets;
-        } else {
-            continuation.local_offsets.left -= canvas_inline_insets.left;
-            continuation.local_offsets.right -= canvas_inline_insets.right;
-        }
-        continuation
-    }
-
     /// Capture an in-flow block retry's page continuation.
     ///
     /// Unlike table-row slices, a nested block retry re-enters each fragment's
-    /// root/body canvas. Its local inline offset therefore applies the canvas
-    /// fragment translation on every destination page.
+    /// root/body canvas. Its local offsets must therefore retain the complete
+    /// ordinary page-break continuation origin, including the canvas's inline
+    /// insets, so replay starts at the same position as normal in-flow page
+    /// continuation.
+    /// <https://www.w3.org/TR/css-break-3/#box-splitting>
     pub(in crate::layout) fn block_page_break_continuation_context(
         &self,
     ) -> FragmentContinuationContext {
         let mut continuation = self.fragment_continuation_context();
-        let canvas_inline_insets = self.document_canvas_fragment_insets.iter().fold(
-            FragmentOffsets::ZERO,
-            |total, inset| FragmentOffsets {
-                left: total.left + inset.left,
-                right: total.right + inset.right,
-                top: total.top,
-            },
-        );
+        // `current_fragment_offsets_for_page_break` already restores the
+        // document-canvas inline insets needed by a real page continuation.
+        // Subtracting them here a second time shifts retried avoided blocks
+        // outside the propagated root/body canvas on their destination page.
         continuation.local_offsets = self.current_fragment_offsets_for_page_break();
-        continuation.local_offsets.left -= canvas_inline_insets.left;
-        continuation.local_offsets.right -= canvas_inline_insets.right;
         continuation
     }
 
@@ -1404,7 +1400,14 @@ impl<'a> LayoutBuilder<'a> {
                 && (self.current_page_context.right() - self.content_right - canvas.right).abs()
                     <= 0.01;
         if root_flow_width {
-            let mut continuation = self.page_break_continuation_context();
+            // The deferred float is replayed in isolation after its parent
+            // flow has remained on the source page. Unlike an ordinary
+            // in-flow page break, no root/body layout pass will re-enter the
+            // document canvas before the float is placed. Preserve the
+            // actual root-flow insets here so the destination margin box has
+            // the same containing block as an equivalent forced-break block.
+            // <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+            let mut continuation = self.fragment_continuation_context();
             // Float exclusion rectangles are page-local. A root-flow float
             // moved to a fresh page must not be placed beside a float from
             // the preceding page.
@@ -1464,6 +1467,7 @@ impl<'a> LayoutBuilder<'a> {
 
         self.current_page = page_for_context(destination);
         self.apply_page_context(destination, continuation.local_offsets);
+        self.current_page_selected_name = None;
     }
 
     /// Captures the active formatting-context insets from the current page area.
@@ -1500,9 +1504,10 @@ impl<'a> LayoutBuilder<'a> {
 
     /// Captures fragment insets for an actual page break.
     ///
-    /// The next fragment keeps horizontal containing-block insets, but starts
-    /// at the block-start edge of the new fragmentainer. CSS Fragmentation's
-    /// initial `box-decoration-break: slice` behavior does not clone ancestor
+    /// The next fragment keeps inline containing-block insets, including the
+    /// root/body canvas's inline margins, but starts at the block-start edge
+    /// of the new fragmentainer. CSS Fragmentation's initial
+    /// `box-decoration-break: slice` behavior does not clone ancestor
     /// block-start margin, border, or padding into continuation fragments:
     /// <https://www.w3.org/TR/css-break-3/#box-splitting> and
     /// <https://www.w3.org/TR/css-backgrounds-3/#box-decoration-break>.
@@ -1525,7 +1530,39 @@ impl<'a> LayoutBuilder<'a> {
             };
         }
         let mut offsets = self.current_fragment_offsets();
-        offsets.top = 0.0;
+        // `current_fragment_offsets` removes active document-canvas insets
+        // so an isolated fragment replay can reconstruct its own canvas. A
+        // real root-flow page continuation instead re-enters that canvas on
+        // the destination page, so retain its logical-inline insets here.
+        // Otherwise an ordinary body margin disappears after the first page
+        // even though the page area itself changes correctly.
+        // <https://www.w3.org/TR/css-break-3/#box-splitting>
+        // <https://www.w3.org/TR/css-backgrounds-3/#special-backgrounds>
+        let canvas = self.document_canvas_fragment_insets.iter().fold(
+            FragmentOffsets::ZERO,
+            |total, inset| FragmentOffsets {
+                left: total.left + inset.left,
+                right: total.right + inset.right,
+                top: total.top + inset.top,
+            },
+        );
+        offsets.left += canvas.left;
+        offsets.right += canvas.right;
+        if self.principal_flow.writing_mode.has_vertical_lines() {
+            // In a vertical principal flow the physical horizontal axis is
+            // logical block progression. A page continuation restarts that
+            // axis at the destination page's block-start edge, while the
+            // vertical physical axis remains the logical inline coordinate.
+            // Treating `top` as the universal continuation axis retained an
+            // exhausted horizontal root cursor and overlaid every following
+            // block on the first sheet.
+            // <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+            // <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+            offsets.left = 0.0;
+            offsets.right = 0.0;
+        } else {
+            offsets.top = 0.0;
+        }
         offsets
     }
 
@@ -1586,6 +1623,7 @@ impl<'a> LayoutBuilder<'a> {
         let page_available_space = ChildAvailableSpace::new(
             active_page_writing_mode,
             PhysicalContentWidth::new(content_box_pt(next_context.area_width())),
+            true,
             Some(PhysicalContentHeight::new(content_box_pt(
                 next_context.area_height(),
             ))),
@@ -1684,6 +1722,7 @@ impl<'a> LayoutBuilder<'a> {
             let context = self.resolved_page_context(page_number, false);
             self.current_page = page_for_context(context);
             self.apply_page_context(context, offsets);
+            self.current_page_selected_name = None;
         }
         // At a forced break, adjoining margins before the break are
         // truncated, but margins after the break are preserved. The box that
@@ -1708,12 +1747,7 @@ impl<'a> LayoutBuilder<'a> {
         if !fragmentainer_kind.is_forced_break(forced_break) {
             return;
         }
-        if self.fragmentation_suppression_depth > 0
-            || self
-                .forced_break_containment_scopes
-                .last()
-                .is_some_and(|scope| *scope == self.fragmentainer_override)
-        {
+        if self.fragmentation_suppression_depth > 0 {
             return;
         }
         if self
@@ -1875,6 +1909,25 @@ impl<'a> LayoutBuilder<'a> {
             .unwrap_or_else(|| (self.content_right - self.content_left).max(0.0))
     }
 
+    /// Return the active containing block's logical inline content-box size.
+    ///
+    /// The stack is still scalar while legacy inline collection is migrated,
+    /// but consumers resolving CSS percentage edges must cross through this
+    /// typed boundary rather than treating the value as a physical width.
+    pub(in crate::layout) fn current_content_logical_inline_content_size(
+        &self,
+    ) -> LogicalInlineContentSize {
+        LogicalInlineContentSize::new(content_box_pt(self.current_content_logical_inline_size()))
+    }
+
+    /// Return the active containing block's definite logical inline basis for
+    /// CSS edge-percentage resolution.
+    pub(in crate::layout) fn current_content_logical_inline_percentage_basis(
+        &self,
+    ) -> LogicalInlinePercentageBasis {
+        PercentageBasis::definite(self.current_content_logical_inline_content_size())
+    }
+
     pub(in crate::layout) fn page_child_available_space(&self) -> ChildAvailableSpace {
         ChildAvailableSpace::new(
             // The initial containing block takes the principal writing mode
@@ -1884,6 +1937,7 @@ impl<'a> LayoutBuilder<'a> {
             // https://www.w3.org/TR/css-writing-modes-4/#principal-flow
             self.initial_containing_block_writing_mode,
             PhysicalContentWidth::new(content_box_pt(self.page_area_width())),
+            true,
             Some(PhysicalContentHeight::new(content_box_pt(
                 self.page_area_height(),
             ))),
@@ -2028,6 +2082,7 @@ impl<'a> LayoutBuilder<'a> {
         let context = self.resolved_page_context(page_number, false);
         self.current_page = page_for_context(context);
         self.apply_page_context(context, offsets);
+        self.current_page_selected_name = self.current_page_name.clone();
         // A first in-flow box can select a named page before it emits any
         // content. CSS viewport units use that first actual page's initial
         // containing block, not the renderer's provisional default page.
@@ -2062,6 +2117,7 @@ impl<'a> LayoutBuilder<'a> {
             self.resolved_page_context_for_name(self.pages.len() + 1, false, page_name.as_deref());
         self.current_page = page_for_context(context);
         self.apply_page_context(context, offsets);
+        self.current_page_selected_name = self.current_page_name.clone();
     }
 
     pub(in crate::layout) fn has_renderable_content(&self) -> bool {

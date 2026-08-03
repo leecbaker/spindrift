@@ -1,10 +1,12 @@
 use super::*;
 use crate::CssColor;
+use crate::css::component_values::decode_css_escapes;
+use crate::css::component_values::{find_ascii_case_insensitive, find_matching_brace};
 use crate::css::values::{
-    decode_css_escapes, parse_computed_length_percentage, parse_font_feature_settings,
-    parse_font_variant, parse_font_variant_alternates, parse_font_variant_caps,
-    parse_font_variant_east_asian, parse_font_variant_ligatures, parse_font_variant_numeric,
-    parse_font_variant_position, parse_font_variation_settings,
+    parse_computed_length_percentage, parse_font_feature_settings, parse_font_variant,
+    parse_font_variant_alternates, parse_font_variant_caps, parse_font_variant_east_asian,
+    parse_font_variant_ligatures, parse_font_variant_numeric, parse_font_variant_position,
+    parse_font_variation_settings,
 };
 use crate::css::{
     FontFeatureSettings, FontFeatureValue, FontFeatureValues, FontFeatureValuesBlock, FontPalette,
@@ -29,7 +31,7 @@ pub(super) fn parse_font_faces(css: &Css) -> Vec<CssFontFace> {
             break;
         };
         let open = font_face_start + "@font-face".len() + open_offset;
-        let Some(close) = find_matching_brace(rest, open) else {
+        let Some(close) = find_matching_brace(rest, open, false) else {
             break;
         };
         if let Some(face) =
@@ -411,7 +413,7 @@ fn collect_font_feature_values_rules(
             rest = &after_name[semicolon_offset.unwrap() + 1..];
             continue;
         };
-        let Some(close) = find_matching_brace(after_name, open_offset) else {
+        let Some(close) = find_matching_brace(after_name, open_offset, false) else {
             break;
         };
         let prelude = after_name[..open_offset].trim();
@@ -540,7 +542,7 @@ fn collect_font_palette_values(
             rest = &after_name[semicolon_offset.expect("known semicolon") + 1..];
             continue;
         }
-        let Some(close) = find_matching_brace(after_name, open_offset) else {
+        let Some(close) = find_matching_brace(after_name, open_offset, false) else {
             break;
         };
         let prelude = after_name[..open_offset].trim();
@@ -639,7 +641,7 @@ fn parse_font_feature_values_block(values: &mut FontFeatureValues, family: &str,
         else {
             break;
         };
-        let Some(close) = find_matching_brace(after_name, open_offset) else {
+        let Some(close) = find_matching_brace(after_name, open_offset, false) else {
             break;
         };
         parse_font_feature_values_declarations(

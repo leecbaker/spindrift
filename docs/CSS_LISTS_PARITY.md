@@ -7,8 +7,11 @@ Quire currently passes **138 of 145 (95.2%)** runnable
 ## Implemented counter model
 
 - Counter values use clamped typed arithmetic.
-- `counter-reset` supports forward and `reversed()` counter creation, including
-  omitted reversed starts resolved from the logical source-order event tree.
+- `counter-reset` supports forward and `reversed()` counter creation. Counter
+  membership follows CSS tree-order inheritance (parent or preceding-sibling
+  membership with preceding-element values), so an omitted reversed start
+  includes mutations in following siblings and descendants until a same-named
+  sibling counter shadows that instance.
 - Reset, increment, and set ordering follows CSS Lists; duplicate increments
   compound and duplicate resets/sets retain declaration-order semantics.
 - The logical counter plan excludes boxes suppressed by `display: none`, gives

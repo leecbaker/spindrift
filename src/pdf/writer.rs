@@ -28,16 +28,12 @@ pub(crate) fn write_document(
     let image_plan = timings.measure("deduplicating and preparing PDF image resources", || {
         deduplicate_images(document)
     });
-    let used_css_spaces = document
-        .pages
-        .iter()
-        .flat_map(Page::used_css_color_spaces)
-        .chain(image_plan.built_in_color_spaces(&document.image_store))
-        .collect::<std::collections::HashSet<_>>();
+    let vector_paint_colors = document.pages.iter().flat_map(Page::vector_paint_colors);
     let color_plan = PdfColorPlan::new(
         profile,
         allocator.peek_id(),
-        used_css_spaces,
+        vector_paint_colors,
+        image_plan.built_in_color_spaces(&document.image_store),
         image_plan.embedded_rgb_profiles(&document.image_store),
     )?;
     allocator.reserve_ids(color_plan.object_count());
@@ -96,7 +92,9 @@ pub(crate) fn write_document(
             let unique_image_ids = prepared_images
                 .iter()
                 .map(|image| match image {
-                    PreparedImageResource::SolidFill(_) => None,
+                    PreparedImageResource::Transparent | PreparedImageResource::SolidFill(_) => {
+                        None
+                    }
                     PreparedImageResource::Raster(_) => {
                         let image_id = PdfImageObjectId(allocator.alloc_id());
                         // Alpha is only known after decoding encoded sources. Reserve
@@ -133,16 +131,26 @@ pub(crate) fn write_document(
                     .iter()
                     .zip(tile_indexes)
                     .enumerate()
-                    .map(
-                        |(pattern_index, (pattern, tile_index))| PageImagePatternPlan {
-                            id: allocator.alloc_id(),
-                            name: format!("P{}", pattern_index + 1),
-                            tile_image_id: unique_image_ids[tile_index.0]
-                                .expect("image-pattern sources cannot use solid-fill emission")
-                                .image_id,
-                            pattern: pattern.clone(),
-                        },
-                    )
+                    .filter_map(|(pattern_index, (pattern, tile_index))| {
+                        let tile_image_id = unique_image_ids[tile_index.0].map(|ids| ids.image_id);
+                        match (&prepared_images[tile_index.0], tile_image_id) {
+                            (PreparedImageResource::Transparent, None) => None,
+                            (PreparedImageResource::Raster(_), Some(tile_image_id)) => {
+                                Some(PageImagePatternPlan {
+                                    id: allocator.alloc_id(),
+                                    name: format!("P{}", pattern_index + 1),
+                                    tile_image_id,
+                                    pattern: pattern.clone(),
+                                })
+                            }
+                            (PreparedImageResource::SolidFill(_), None) => {
+                                unreachable!("image patterns cannot use solid-fill emission")
+                            }
+                            _ => {
+                                unreachable!("image resource IDs match their paint representation")
+                            }
+                        }
+                    })
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>()
@@ -161,9 +169,10 @@ pub(crate) fn write_document(
                         page,
                         &embedded_font_plans,
                         &mut next_dynamic_object_id,
-                        color_plan.mode(),
+                        &color_plan,
                         &prepared_images,
                         &image_plan.page_image_unique_indexes[page_index],
+                        &image_plan.page_pattern_tile_unique_indexes[page_index],
                     );
                     allocator.advance_to(next_dynamic_object_id);
                     render
@@ -487,10 +496,12 @@ fn write_pages_and_content(
     compression: crate::PdfCompression,
 ) {
     for (index, page) in document.pages.iter().enumerate() {
-        let media_box = crate::document::paint_rect_to_pdf(crate::document::PaintRect::new(
-            crate::document::PaintPoint::new(0.0, 0.0),
-            page.paint_size(),
-        ));
+        let media_box = crate::document::paint::geometry::paint_rect_to_pdf(
+            crate::document::paint::geometry::PaintRect::new(
+                crate::document::paint::geometry::PaintPoint::new(0.0, 0.0),
+                page.paint_size(),
+            ),
+        );
         let mut page_writer = pdf.page(pdf_ref(page_ids[index]));
         page_writer
             .parent(pdf_ref(pages_id))
@@ -893,9 +904,22 @@ fn write_gradient_patterns(
         .iter()
         .flat_map(|render| &render.gradient_patterns)
     {
+        let output_space = color_plan.gradient_output_space(&plan.gradient);
         if let Some(periodic) = &plan.gradient.periodic {
-            write_periodic_gradient_color_function(pdf, plan.function_ids[0], periodic, color_plan);
-            write_gradient_shading_pattern(pdf, plan, color_plan, plan.function_ids[0]);
+            write_periodic_gradient_color_function(
+                pdf,
+                plan.function_ids[0],
+                periodic,
+                color_plan,
+                output_space,
+            );
+            write_gradient_shading_pattern(
+                pdf,
+                plan,
+                color_plan,
+                plan.function_ids[0],
+                output_space,
+            );
             if let Some(alpha) = &plan.alpha {
                 write_periodic_gradient_alpha_pattern(pdf, plan, alpha, periodic);
             }
@@ -914,8 +938,8 @@ fn write_gradient_patterns(
             )
         };
         for (interval, id) in plan.gradient.stops.windows(2).zip(interval_ids) {
-            let from = color_plan.output_color(interval[0].color);
-            let to = color_plan.output_color(interval[1].color);
+            let from = color_plan.gradient_color(interval[0].color, output_space);
+            let to = color_plan.gradient_color(interval[1].color, output_space);
             if (from.alpha() - to.alpha()).abs() > 0.0001 {
                 write_premultiplied_gradient_color_function(
                     pdf,
@@ -949,7 +973,7 @@ fn write_gradient_patterns(
         } else {
             interval_ids[0]
         };
-        write_gradient_shading_pattern(pdf, plan, color_plan, function_id);
+        write_gradient_shading_pattern(pdf, plan, color_plan, function_id, output_space);
         if let Some(alpha) = &plan.alpha {
             write_gradient_alpha_pattern(pdf, plan, alpha);
         }
@@ -1059,8 +1083,11 @@ fn write_gradient_patterns(
         if stream.uses_flate() {
             writer.filter(Filter::FlateDecode);
         }
-        let translation = crate::document::PaintTransform::translate(
-            crate::document::PaintTranslation::new(pattern.origin.x, pattern.origin.y),
+        let translation = crate::document::paint::geometry::PaintTransform::translate(
+            crate::document::paint::geometry::PaintTranslation::new(
+                pattern.origin.x,
+                pattern.origin.y,
+            ),
         );
         let matrix = pattern.transform.multiply(translation);
         writer
@@ -1096,21 +1123,22 @@ fn write_gradient_shading_pattern(
     plan: &GradientPatternPlan,
     color_plan: &PdfColorPlan,
     function_id: usize,
+    output_space: crate::css::CssColorSpace,
 ) {
     let mut pattern = pdf.shading_pattern(pdf_ref(plan.id));
     pattern.matrix(plan.gradient.transform.pdf_components());
     let mut shading = pattern.function_shading();
-    shading.color_space().icc_based(pdf_ref(
-        color_plan.profile_object_id(plan.gradient.color_space),
-    ));
+    shading
+        .color_space()
+        .icc_based(pdf_ref(color_plan.profile_object_id(output_space)));
     shading.function(pdf_ref(function_id)).extend([true, true]);
     match &plan.gradient.kind {
-        crate::document::RenderedGradientKind::Linear { start, end } => {
+        crate::document::paint::paths::RenderedGradientKind::Linear { start, end } => {
             shading
                 .shading_type(FunctionShadingType::Axial)
                 .coords([start.x, start.y, end.x, end.y]);
         }
-        crate::document::RenderedGradientKind::Radial {
+        crate::document::paint::paths::RenderedGradientKind::Radial {
             start_center,
             start_radius,
             end_center,
@@ -1184,8 +1212,9 @@ fn write_premultiplied_gradient_color_function(
 fn write_periodic_gradient_color_function(
     pdf: &mut Pdf,
     id: usize,
-    periodic: &crate::document::RenderedPeriodicGradient,
+    periodic: &crate::document::paint::paths::RenderedPeriodicGradient,
     color_plan: &PdfColorPlan,
+    output_space: crate::css::CssColorSpace,
 ) {
     let stops = periodic
         .stops
@@ -1193,7 +1222,7 @@ fn write_periodic_gradient_color_function(
         .map(|stop| PdfPeriodicGradientStop {
             offset: stop.offset,
             interpolation_exponent: stop.interpolation_exponent,
-            color: color_plan.output_color(stop.color),
+            color: color_plan.gradient_color(stop.color, output_space),
         })
         .collect::<Vec<_>>();
     let code = periodic_gradient_pdf_function_code(periodic, &stops);
@@ -1210,7 +1239,7 @@ struct PdfPeriodicGradientStop {
 }
 
 fn periodic_gradient_pdf_function_code(
-    periodic: &crate::document::RenderedPeriodicGradient,
+    periodic: &crate::document::paint::paths::RenderedPeriodicGradient,
     stops: &[PdfPeriodicGradientStop],
 ) -> String {
     fn interval_code(left: &PdfPeriodicGradientStop, right: &PdfPeriodicGradientStop) -> String {
@@ -1264,13 +1293,13 @@ fn periodic_gradient_pdf_function_code(
 }
 
 fn periodic_gradient_function_code(
-    periodic: &crate::document::RenderedPeriodicGradient,
-    stops: &[crate::document::RenderedGradientStop],
+    periodic: &crate::document::paint::paths::RenderedPeriodicGradient,
+    stops: &[crate::document::paint::paths::RenderedGradientStop],
     alpha_only: bool,
 ) -> String {
     fn interval_code(
-        left: &crate::document::RenderedGradientStop,
-        right: &crate::document::RenderedGradientStop,
+        left: &crate::document::paint::paths::RenderedGradientStop,
+        right: &crate::document::paint::paths::RenderedGradientStop,
         alpha_only: bool,
     ) -> String {
         let span = right.offset - left.offset;
@@ -1341,7 +1370,7 @@ fn write_periodic_gradient_alpha_pattern(
     pdf: &mut Pdf,
     plan: &GradientPatternPlan,
     alpha: &GradientAlphaPlan,
-    periodic: &crate::document::RenderedPeriodicGradient,
+    periodic: &crate::document::paint::paths::RenderedPeriodicGradient,
 ) {
     let code = periodic_gradient_function_code(periodic, &periodic.stops, true);
     pdf.post_script_function(pdf_ref(alpha.function_ids[0]), code.as_bytes())
@@ -1355,12 +1384,12 @@ fn write_periodic_gradient_alpha_pattern(
         .function(pdf_ref(alpha.function_ids[0]))
         .extend([true, true]);
     match &plan.gradient.kind {
-        crate::document::RenderedGradientKind::Linear { start, end } => {
+        crate::document::paint::paths::RenderedGradientKind::Linear { start, end } => {
             shading
                 .shading_type(FunctionShadingType::Axial)
                 .coords([start.x, start.y, end.x, end.y]);
         }
-        crate::document::RenderedGradientKind::Radial {
+        crate::document::paint::paths::RenderedGradientKind::Radial {
             start_center,
             start_radius,
             end_center,
@@ -1422,12 +1451,12 @@ fn write_gradient_alpha_pattern(
     shading.color_space().device_gray();
     shading.function(pdf_ref(function_id)).extend([true, true]);
     match &plan.gradient.kind {
-        crate::document::RenderedGradientKind::Linear { start, end } => {
+        crate::document::paint::paths::RenderedGradientKind::Linear { start, end } => {
             shading
                 .shading_type(FunctionShadingType::Axial)
                 .coords([start.x, start.y, end.x, end.y]);
         }
-        crate::document::RenderedGradientKind::Radial {
+        crate::document::paint::paths::RenderedGradientKind::Radial {
             start_center,
             start_radius,
             end_center,
@@ -1627,7 +1656,7 @@ fn write_annotations(pdf: &mut Pdf, document: &Document, page_annotation_ids: &[
         for (link_index, link) in page.links.iter().enumerate() {
             let mut annotation =
                 pdf.annotation(pdf_ref(page_annotation_ids[page_index][link_index]));
-            let rect = crate::document::paint_rect_to_pdf(link.paint_rect());
+            let rect = crate::document::paint::geometry::paint_rect_to_pdf(link.paint_rect());
             annotation
                 .subtype(AnnotationType::Link)
                 .rect(Rect::new(
@@ -1685,7 +1714,7 @@ fn write_outlines(pdf: &mut Pdf, plan: &OutlinePlan, page_ids: &[usize], documen
         if let Some(id) = node.last_child_id {
             item.last(pdf_ref(id));
         }
-        let target = crate::document::paint_point_to_pdf(node.bookmark.target());
+        let target = crate::document::paint::geometry::paint_point_to_pdf(node.bookmark.target());
         item.dest()
             .page(pdf_ref(page_id))
             .xyz(target.x, target.y, Some(0.0));
@@ -1938,16 +1967,16 @@ impl PdfFileIdentifierHash {
         self.write_optional_f32(metrics.missing_width);
     }
 
-    fn write_gradient(&mut self, gradient: &crate::document::RenderedGradient) {
+    fn write_gradient(&mut self, gradient: &crate::document::paint::paths::RenderedGradient) {
         match &gradient.kind {
-            crate::document::RenderedGradientKind::Linear { start, end } => {
+            crate::document::paint::paths::RenderedGradientKind::Linear { start, end } => {
                 self.write_u8(1);
                 self.write_f32(start.x);
                 self.write_f32(start.y);
                 self.write_f32(end.x);
                 self.write_f32(end.y);
             }
-            crate::document::RenderedGradientKind::Radial {
+            crate::document::paint::paths::RenderedGradientKind::Radial {
                 start_center,
                 start_radius,
                 end_center,

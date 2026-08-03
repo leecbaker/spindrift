@@ -72,7 +72,7 @@ impl Css {
         })
     }
 
-    /// Loads an author stylesheet from a local-file, HTTP, or HTTPS URL.
+    /// Loads an author stylesheet from a local-file, HTTP(S), or `data:` URL.
     ///
     /// ```no_run
     /// # async fn load() -> Result<(), Box<dyn std::error::Error>> {
@@ -112,22 +112,66 @@ impl Css {
         url: Url,
         fetcher: &crate::resource::ResourceFetcher,
     ) -> crate::Result<Self> {
+        let (stylesheet, _) = Self::load_url_with_fetcher(url, fetcher).await?;
+        Ok(stylesheet)
+    }
+
+    /// Loads a stylesheet that was referenced by HTML or CSS syntax.
+    ///
+    /// A `data:` URL has explicit response MIME metadata. HTML linked
+    /// stylesheet processing accepts it only when that metadata is `text/css`;
+    /// a different MIME type is a successfully fetched but inapplicable style
+    /// resource, not a document-fetch failure.
+    /// <https://html.spec.whatwg.org/multipage/links.html#link-type-stylesheet>
+    pub(crate) async fn from_link_url_with_fetcher(
+        url: Url,
+        fetcher: &crate::resource::ResourceFetcher,
+    ) -> crate::Result<Option<Self>> {
+        let is_data_url = url.scheme() == "data";
+        let (stylesheet, content_type) = Self::load_url_with_fetcher(url, fetcher).await?;
+        if is_data_url && !content_type.as_deref().is_some_and(is_css_mime_type) {
+            log::debug!(
+                "ignoring data stylesheet {} with non-CSS MIME type {:?}",
+                stylesheet
+                    .base_url()
+                    .expect("loaded stylesheet has a base URL"),
+                content_type
+            );
+            return Ok(None);
+        }
+        Ok(Some(stylesheet))
+    }
+
+    async fn load_url_with_fetcher(
+        url: Url,
+        fetcher: &crate::resource::ResourceFetcher,
+    ) -> crate::Result<(Self, Option<String>)> {
         if crate::resource::fetch_url(&url).is_none() {
             return Err(crate::Error::InvalidInput(format!(
                 "unsupported URL for stylesheet input: {url}"
             )));
         }
-        let (source, final_url) = fetcher.read_to_string(&url).await?;
-        Ok(Self {
-            source,
-            origin: StylesheetOrigin::Author,
-            base_url: Some(final_url),
-            root_url: None,
-            layer_order_prefix: Vec::new(),
-            import_layer_name: None,
-            specificity_override: None,
-            resource_policy: fetcher.policy(),
-        })
+        let fetched = fetcher.fetch(&url).await?;
+        let source = String::from_utf8(fetched.bytes).map_err(|error| {
+            crate::Error::InvalidInput(format!(
+                "resource {} is not UTF-8: {error}",
+                fetched.final_url
+            ))
+        })?;
+        let content_type = fetched.content_type;
+        Ok((
+            Self {
+                source,
+                origin: StylesheetOrigin::Author,
+                base_url: Some(fetched.final_url),
+                root_url: None,
+                layer_order_prefix: Vec::new(),
+                import_layer_name: None,
+                specificity_override: None,
+                resource_policy: fetcher.policy(),
+            },
+            content_type,
+        ))
     }
 
     pub(crate) fn source(&self) -> &str {
@@ -287,14 +331,20 @@ impl Css {
                 self.layer_order_prefix(),
             ) {
                 if seen.insert(import.url.clone()) {
-                    match Css::from_url_with_fetcher(import.url.clone(), fetcher).await {
-                        Ok(stylesheet) => {
+                    match Css::from_link_url_with_fetcher(import.url.clone(), fetcher).await {
+                        Ok(Some(stylesheet)) => {
                             stylesheet
                                 .with_origin(self.origin)
                                 .with_root_url(self.root_url.clone())
                                 .with_layer_context(import.layer_order_prefix, import.layer_name)
                                 .collect_with_imports(fetcher, seen, stylesheets)
                                 .await?;
+                        }
+                        Ok(None) => {
+                            log::debug!(
+                                "ignoring imported stylesheet {} with non-CSS MIME type",
+                                import.url
+                            );
                         }
                         Err(error) if fetcher.allows_fetch_errors() => {
                             log::debug!(
@@ -310,6 +360,14 @@ impl Css {
             Ok(())
         })
     }
+}
+
+fn is_css_mime_type(content_type: &str) -> bool {
+    content_type
+        .split_once(';')
+        .map_or(content_type, |(essence, _)| essence)
+        .trim()
+        .eq_ignore_ascii_case("text/css")
 }
 
 #[derive(Debug)]

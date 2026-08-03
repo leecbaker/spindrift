@@ -11,29 +11,48 @@ pub(in crate::css) fn next_element_signature_opaque_id() -> Rc<usize> {
 /// CSS Sizing Level 4 defines `aspect-ratio` as `auto || <ratio>`, where the
 /// ratio is width divided by height:
 /// <https://www.w3.org/TR/css-sizing-4/#aspect-ratio>.
+/// A finite, strictly positive CSS aspect ratio.
+///
+/// The parser validates both ratio components before division; this wrapper
+/// keeps manually constructed computed styles from reintroducing a zero, NaN,
+/// or infinite ratio after that boundary.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct AspectRatio {
-    pub(crate) auto: bool,
-    pub(crate) ratio: Option<f32>,
+pub(crate) struct CssRatio(f32);
+
+impl CssRatio {
+    pub(crate) fn new(value: f32) -> Option<Self> {
+        (value.is_finite() && value > 0.0).then_some(Self(value))
+    }
+
+    pub(crate) const fn value(self) -> f32 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum AspectRatio {
+    Auto,
+    Ratio(CssRatio),
+    AutoWithFallback(CssRatio),
 }
 
 impl AspectRatio {
-    pub(crate) const AUTO: Self = Self {
-        auto: true,
-        ratio: None,
-    };
+    pub(crate) const AUTO: Self = Self::Auto;
 
-    pub(crate) fn from_ratio(ratio: f32) -> Self {
-        Self {
-            auto: false,
-            ratio: Some(ratio),
-        }
+    pub(crate) fn from_ratio(ratio: f32) -> Option<Self> {
+        CssRatio::new(ratio).map(Self::Ratio)
     }
 
-    pub(crate) fn auto_with_ratio(ratio: f32) -> Self {
-        Self {
-            auto: true,
-            ratio: Some(ratio),
+    pub(crate) fn auto_with_ratio(ratio: f32) -> Option<Self> {
+        CssRatio::new(ratio).map(Self::AutoWithFallback)
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn specified(self) -> (bool, Option<f32>) {
+        match self {
+            Self::Auto => (true, None),
+            Self::Ratio(ratio) => (false, Some(ratio.value())),
+            Self::AutoWithFallback(ratio) => (true, Some(ratio.value())),
         }
     }
 
@@ -44,10 +63,10 @@ impl AspectRatio {
     /// preferred aspect ratio:
     /// <https://www.w3.org/TR/css-sizing-4/#aspect-ratio>.
     pub(crate) fn preferred_ratio_for_non_replaced(self, is_replaced: bool) -> Option<f32> {
-        if self.auto && is_replaced {
-            None
-        } else {
-            self.ratio
+        match self {
+            Self::Auto if is_replaced => None,
+            Self::Auto => None,
+            Self::Ratio(ratio) | Self::AutoWithFallback(ratio) => Some(ratio.value()),
         }
     }
 
@@ -58,7 +77,7 @@ impl AspectRatio {
     /// by contrast, uses the box selected by `box-sizing`.
     /// <https://drafts.csswg.org/css-sizing-4/#aspect-ratio>
     pub(crate) const fn uses_content_box_for_non_replaced(self) -> bool {
-        self.auto && self.ratio.is_some()
+        matches!(self, Self::AutoWithFallback(_))
     }
 
     /// Returns the preferred ratio after resolving replaced-element fallback.
@@ -73,39 +92,77 @@ impl AspectRatio {
         is_replaced: bool,
         natural_ratio: Option<f32>,
     ) -> Option<f32> {
-        let natural_ratio = natural_ratio.filter(|ratio| *ratio > 0.0);
-        let specified_ratio = self.ratio.filter(|ratio| *ratio > 0.0);
-        if !is_replaced {
-            return specified_ratio;
-        }
-        if self.auto {
-            natural_ratio.or(specified_ratio)
-        } else {
-            specified_ratio
+        let natural_ratio = natural_ratio.filter(|ratio| ratio.is_finite() && *ratio > 0.0);
+        match self {
+            Self::Auto => is_replaced.then_some(natural_ratio).flatten(),
+            Self::Ratio(ratio) => Some(ratio.value()),
+            Self::AutoWithFallback(ratio) if is_replaced => natural_ratio.or(Some(ratio.value())),
+            Self::AutoWithFallback(ratio) => Some(ratio.value()),
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TextTransform {
-    pub(crate) case: TextTransformCase,
-    pub(crate) full_width: bool,
-    pub(crate) full_size_kana: bool,
-    pub(crate) math_auto: bool,
+pub(crate) enum TextTransform {
+    None,
+    MathAuto,
+    Keywords(TextTransformKeywords),
 }
 
 impl TextTransform {
-    pub(crate) const NONE: Self = Self {
-        case: TextTransformCase::None,
-        full_width: false,
-        full_size_kana: false,
-        math_auto: false,
-    };
+    pub(crate) const NONE: Self = Self::None;
+
+    pub(crate) const fn case(self) -> Option<TextTransformCase> {
+        match self {
+            Self::Keywords(keywords) => keywords.case,
+            Self::None | Self::MathAuto => None,
+        }
+    }
+
+    pub(crate) const fn applies_full_width(self) -> bool {
+        matches!(self, Self::Keywords(keywords) if keywords.full_width)
+    }
+
+    pub(crate) const fn applies_full_size_kana(self) -> bool {
+        matches!(self, Self::Keywords(keywords) if keywords.full_size_kana)
+    }
+
+    pub(crate) const fn applies_math_auto(self) -> bool {
+        matches!(self, Self::MathAuto)
+    }
+}
+
+/// The non-`math-auto` keyword set for CSS `text-transform`.
+///
+/// Its constructor rejects the empty set so that `TextTransform::None`
+/// remains the sole representation of the initial value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TextTransformKeywords {
+    case: Option<TextTransformCase>,
+    full_width: bool,
+    full_size_kana: bool,
+}
+
+impl TextTransformKeywords {
+    pub(crate) const fn new(
+        case: Option<TextTransformCase>,
+        full_width: bool,
+        full_size_kana: bool,
+    ) -> Option<Self> {
+        if case.is_some() || full_width || full_size_kana {
+            Some(Self {
+                case,
+                full_width,
+                full_size_kana,
+            })
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TextTransformCase {
-    None,
     Uppercase,
     Lowercase,
     Capitalize,
@@ -223,6 +280,31 @@ impl Content {
 pub(crate) type GeneratedContent = Vec<GeneratedContentPart>;
 pub(crate) type GeneratedAltText = Vec<GeneratedAltTextPart>;
 
+/// A same-document target used by generated-content cross references.
+///
+/// CSS Generated Content Level 3 permits a literal URL as well as an
+/// originating-element attribute such as `attr(href)`. Keeping the latter
+/// unevaluated until layout is necessary because a tree-abiding pseudo-element
+/// has no independent DOM attributes:
+/// <https://www.w3.org/TR/css-content-3/#cross-references>.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum TargetReference {
+    Fragment(String),
+    Attribute(String),
+}
+
+impl TargetReference {
+    /// Returns the same-document fragment identifier for a literal target.
+    /// Attribute targets need their originating element and are resolved by
+    /// layout instead.
+    pub(crate) fn literal_fragment_id(&self) -> Option<&str> {
+        match self {
+            Self::Fragment(target) => target.strip_prefix('#').filter(|target| !target.is_empty()),
+            Self::Attribute(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum GeneratedContentPart {
     Text(String),
@@ -241,12 +323,12 @@ pub(crate) enum GeneratedContentPart {
         style: Option<ListStyleType>,
     },
     TargetCounter {
-        target: String,
+        target: TargetReference,
         name: String,
         style: Option<ListStyleType>,
     },
     TargetText {
-        target: String,
+        target: TargetReference,
         keyword: NamedStringTargetTextKeyword,
     },
     Image {
@@ -334,13 +416,38 @@ impl Quotes {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Computed CSS `position`, including GCPM running elements.
+/// <https://www.w3.org/TR/css-position-3/#position-property>
+/// <https://www.w3.org/TR/css-gcpm-3/#running-elements>
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Position {
     Static,
     Relative,
     Absolute,
     Fixed,
     Sticky,
+    Running(RunningElementName),
+}
+
+impl Position {
+    pub(crate) const fn is_running(&self) -> bool {
+        matches!(self, Self::Running(_))
+    }
+
+    pub(crate) const fn is_out_of_flow_positioned(&self) -> bool {
+        matches!(self, Self::Absolute | Self::Fixed)
+    }
+
+    pub(crate) const fn is_in_flow_positioned(&self) -> bool {
+        matches!(self, Self::Relative | Self::Sticky)
+    }
+
+    pub(crate) const fn is_normal_flow(&self) -> bool {
+        matches!(
+            self,
+            Self::Static | Self::Relative | Self::Sticky | Self::Running(_)
+        )
+    }
 }
 
 /// Computed `isolation`.
@@ -1252,9 +1359,9 @@ impl TransformOrigin {
     /// <https://www.w3.org/TR/css-transforms-1/#transform-origin-property>
     pub(crate) fn resolve_against_paint_rect(
         self,
-        border_box: crate::PaintRect,
-    ) -> crate::PaintPoint {
-        crate::PaintPoint::new(
+        border_box: crate::document::paint::geometry::PaintRect,
+    ) -> crate::document::paint::geometry::PaintPoint {
+        crate::document::paint::geometry::PaintPoint::new(
             border_box.origin.x
                 + self
                     .x
@@ -1277,8 +1384,8 @@ impl TransformOrigin {
     /// Resolve the complete three-dimensional origin in paint coordinates.
     pub(crate) fn resolve_3d_against_paint_rect(
         self,
-        border_box: crate::PaintRect,
-    ) -> euclid::Point3D<f32, crate::document::PaintSpace> {
+        border_box: crate::document::paint::geometry::PaintRect,
+    ) -> euclid::Point3D<f32, crate::document::paint::geometry::PaintSpace> {
         let z = self
             .z
             .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(0.0)))
@@ -1453,12 +1560,12 @@ pub(crate) enum NamedStringPart {
         style: Option<ListStyleType>,
     },
     TargetCounter {
-        target: String,
+        target: TargetReference,
         name: String,
         style: Option<ListStyleType>,
     },
     TargetText {
-        target: String,
+        target: TargetReference,
         keyword: NamedStringTargetTextKeyword,
     },
 }

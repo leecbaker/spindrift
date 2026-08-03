@@ -210,11 +210,12 @@ mod tests {
         ComputedLineHeight, CssEdges,
     };
 
-    fn test_layout_builder<'a>(
+    fn test_layout_builder<'a, Collection: crate::css::StylesheetCollection + ?Sized>(
         options: &'a RenderOptions,
-        stylesheets: &'a [Stylesheet],
+        stylesheets: &'a Collection,
         resource_cache: &'a ResourceCache,
     ) -> LayoutBuilder<'a> {
+        let stylesheets = crate::css::StylesheetCollection::stylesheet_view(stylesheets);
         LayoutBuilder::new(LayoutBuilderConfig {
             options,
             stylesheets,
@@ -227,6 +228,7 @@ mod tests {
             iframe_viewport: None,
             page_progression_direction: Direction::Ltr,
             page_counter_initial_values: HashMap::new(),
+            target_references: crate::layout::TargetReferenceSnapshot::default(),
             font_system: FontSystem::new(),
         })
     }
@@ -379,7 +381,7 @@ mod tests {
     }
 
     #[test]
-    fn viewport_units_use_the_destination_page_context_after_a_named_transition() {
+    fn viewport_units_use_the_immutable_initial_context_after_a_named_transition() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -399,8 +401,10 @@ mod tests {
                 width: ComputedLengthPercentageOrAuto::LengthPercentage(
                     ComputedLengthPercentage::from_vw(100.0),
                 ),
-                height: ComputedLengthPercentageOrAuto::LengthPercentage(
-                    ComputedLengthPercentage::from_vh(100.0),
+                height: css::PhysicalHeight::from_computed(
+                    ComputedLengthPercentageOrAuto::LengthPercentage(
+                        ComputedLengthPercentage::from_vh(100.0),
+                    ),
                 ),
                 ..ComputedBoxValues::initial()
             },
@@ -408,15 +412,16 @@ mod tests {
         };
 
         let resolved = builder.style_with_current_viewport_lengths(&style);
-        let ComputedLengthPercentageOrAuto::LengthPercentage(width) = resolved.box_values.width
+        let ComputedLengthPercentageOrAuto::LengthPercentage(width) = &resolved.box_values.width
         else {
             panic!("expected viewport-resolved width");
         };
-        let ComputedLengthPercentageOrAuto::LengthPercentage(height) = resolved.box_values.height
+        let ComputedLengthPercentageOrAuto::LengthPercentage(height) =
+            resolved.box_values.height.value()
         else {
             panic!("expected viewport-resolved height");
         };
-        assert_eq!(width.length_points(), destination.area_width());
-        assert_eq!(height.length_points(), destination.area_height());
+        assert_eq!(width.length_points(), initial.area_width());
+        assert_eq!(height.length_points(), initial.area_height());
     }
 }

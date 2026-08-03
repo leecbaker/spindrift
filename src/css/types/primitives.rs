@@ -1,5 +1,6 @@
 use super::*;
 use crate::units::{LayoutLength, LayoutSize, layout_pt};
+use std::collections::HashMap;
 
 /// The output medium used when evaluating CSS Media Queries.
 ///
@@ -211,6 +212,7 @@ pub(crate) enum ForcedColorAdjust {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CssViewportSpace {}
 
+/// A viewport size expressed in CSS pixels.
 pub type CssViewportSize = euclid::Size2D<f32, CssViewportSpace>;
 
 /// Physical and logical viewport bases for resolving CSS viewport units.
@@ -323,7 +325,7 @@ impl ContainerLengthBasis {
     }
 }
 
-/// Used element-font bases for resolving `em` and `ch` components.
+/// Used parent-font metrics for resolving font-relative `font-size` terms.
 ///
 /// CSS Values resolves `em` against the element's used font size and `ch`
 /// against the selected font's zero-glyph advance:
@@ -332,14 +334,42 @@ impl ContainerLengthBasis {
 pub(crate) struct FontRelativeLengthBasis {
     font_size: LayoutLength,
     ch_advance: LayoutLength,
+    x_height: LayoutLength,
+    cap_height: LayoutLength,
+    ic_advance: LayoutLength,
 }
 
 impl FontRelativeLengthBasis {
-    pub(crate) const fn new(font_size: LayoutLength, ch_advance: LayoutLength) -> Self {
+    pub(crate) fn new(font_size: LayoutLength, ch_advance: LayoutLength) -> Self {
         Self {
             font_size,
             ch_advance,
+            // CSS Values defines these fallbacks when the parent selected
+            // font has no corresponding metric.
+            x_height: layout_pt(font_size.points() * 0.5),
+            cap_height: layout_pt(font_size.points() * 0.7),
+            ic_advance: font_size,
         }
+    }
+
+    /// Replaces fallback metrics with the parent selected font's used metrics.
+    pub(crate) const fn with_selected_font_metrics(
+        mut self,
+        x_height: LayoutLength,
+        cap_height: LayoutLength,
+        ic_advance: LayoutLength,
+    ) -> Self {
+        self.x_height = x_height;
+        self.cap_height = cap_height;
+        self.ic_advance = ic_advance;
+        self
+    }
+
+    /// Replaces the parent's fallback zero-glyph advance when a descendant
+    /// needs its selected-font `ch` metric.
+    pub(crate) const fn with_ch_advance(mut self, ch_advance: LayoutLength) -> Self {
+        self.ch_advance = ch_advance;
+        self
     }
 
     pub(crate) const fn font_size(self) -> LayoutLength {
@@ -348,6 +378,18 @@ impl FontRelativeLengthBasis {
 
     pub(crate) const fn ch_advance(self) -> LayoutLength {
         self.ch_advance
+    }
+
+    pub(crate) const fn x_height(self) -> LayoutLength {
+        self.x_height
+    }
+
+    pub(crate) const fn cap_height(self) -> LayoutLength {
+        self.cap_height
+    }
+
+    pub(crate) const fn ic_advance(self) -> LayoutLength {
+        self.ic_advance
     }
 }
 
@@ -375,24 +417,89 @@ pub(crate) struct RootFontMetricLengthBasis {
 /// <https://www.w3.org/TR/mediaqueries-4/#media-features>.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MediaEnvironment {
+    /// Rendering target selected for media queries.
     pub media_type: MediaType,
+    /// Immutable viewport dimensions used by media queries.
     pub viewport: CssViewportSize,
+    /// Device resolution in dots per CSS pixel.
     pub resolution_dppx: f32,
+    /// Forced-colors rendering state.
     pub forced_colors: ForcedColorsMode,
+    /// The user's preferred color scheme. This is distinct from the UA's
+    /// fallback scheme when the author has not declared support.
+    pub color_scheme_preference: ColorSchemePreference,
+}
+
+/// User preference consulted when resolving CSS Color Adjustment's used color
+/// scheme. `None` is intentionally the default: in that case the first
+/// author-supported scheme wins.
+/// <https://www.w3.org/TR/css-color-adjust-1/#color-scheme-preference>
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ColorSchemePreference {
+    /// The user has not expressed a preference; the first supported scheme wins.
+    #[default]
+    None,
+    /// Prefer a light scheme when the author supports it.
+    Light,
+    /// Prefer a dark scheme when the author supports it.
+    Dark,
+    /// Require light unless the author explicitly used `only`.
+    OverrideLight,
+    /// Require dark unless the author explicitly used `only`.
+    OverrideDark,
+}
+
+/// One of the color schemes whose rendering behavior Quire implements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UsedColorScheme {
+    Light,
+    Dark,
+}
+
+impl ColorSchemePreference {
+    pub(crate) const fn preferred(self) -> Option<UsedColorScheme> {
+        match self {
+            Self::None => None,
+            Self::Light | Self::OverrideLight => Some(UsedColorScheme::Light),
+            Self::Dark | Self::OverrideDark => Some(UsedColorScheme::Dark),
+        }
+    }
+
+    pub(crate) const fn is_override(self) -> bool {
+        matches!(self, Self::OverrideLight | Self::OverrideDark)
+    }
 }
 
 impl MediaEnvironment {
+    /// Creates a media-query environment with no color-scheme preference.
     pub const fn new(media_type: MediaType, viewport: CssViewportSize) -> Self {
         Self {
             media_type,
             viewport,
             resolution_dppx: 1.0,
             forced_colors: ForcedColorsMode::Inactive,
+            color_scheme_preference: ColorSchemePreference::None,
         }
     }
 
+    /// Sets the device density exposed to resolution media queries.
+    pub const fn with_resolution_dppx(mut self, resolution_dppx: f32) -> Self {
+        self.resolution_dppx = resolution_dppx;
+        self
+    }
+
+    /// Sets the forced-colors mode exposed to CSS Color Adjustment.
     pub const fn with_forced_colors(mut self, forced_colors: ForcedColorsMode) -> Self {
         self.forced_colors = forced_colors;
+        self
+    }
+
+    /// Sets the user preference used for `color-scheme` and `light-dark()`.
+    pub const fn with_color_scheme_preference(
+        mut self,
+        color_scheme_preference: ColorSchemePreference,
+    ) -> Self {
+        self.color_scheme_preference = color_scheme_preference;
         self
     }
 }
@@ -425,6 +532,28 @@ mod tests {
         assert_eq!(vertical.vb(100.0), layout_pt(300.0));
         assert_eq!(sideways.vi(100.0), layout_pt(200.0));
         assert_eq!(sideways.vb(100.0), layout_pt(300.0));
+    }
+
+    #[test]
+    fn color_scheme_preference_builder_preserves_preference_and_override() {
+        let light = ColorSchemePreference::Light;
+        let dark = ColorSchemePreference::Dark;
+        let override_light = ColorSchemePreference::OverrideLight;
+        let override_dark = ColorSchemePreference::OverrideDark;
+
+        assert_eq!(light.preferred(), Some(UsedColorScheme::Light));
+        assert_eq!(dark.preferred(), Some(UsedColorScheme::Dark));
+        assert_eq!(override_light.preferred(), Some(UsedColorScheme::Light));
+        assert_eq!(override_dark.preferred(), Some(UsedColorScheme::Dark));
+        assert!(!light.is_override());
+        assert!(!dark.is_override());
+        assert!(override_light.is_override());
+        assert!(override_dark.is_override());
+
+        let environment =
+            MediaEnvironment::new(MediaType::Screen, CssViewportSize::new(800.0, 600.0))
+                .with_color_scheme_preference(override_dark);
+        assert_eq!(environment.color_scheme_preference, override_dark);
     }
 }
 
@@ -823,6 +952,7 @@ pub(crate) struct Stylesheet {
     /// stylesheet. Cascade-time used-value adjustment reads the same immutable
     /// input as its nested `@media` rules.
     pub forced_colors: ForcedColorsMode,
+    pub color_scheme_preference: ColorSchemePreference,
     /// Whether this is Quire's built-in HTML presentational-hints sheet.
     ///
     /// Static selector-expressible hints live in the stylesheet itself, while
@@ -872,12 +1002,249 @@ pub(crate) struct Stylesheet {
     pub first_line_rules: Vec<StyleRule>,
     pub first_letter_rules: Vec<StyleRule>,
     pub page_rules: Vec<PageRule>,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub page_declarations: Declarations,
     pub first_page_declarations: Declarations,
     pub font_faces: Vec<CssFontFace>,
     pub font_feature_values: FontFeatureValues,
     pub font_palette_values: FontPaletteValues,
     pub counter_styles: Vec<CounterStyleRule>,
+    /// Active `@property` rules in source order for this stylesheet.
+    pub property_registrations: Vec<PropertyRegistrationRule>,
+}
+
+/// Parsed legacy body margins supplied by the immediate container frame.
+///
+/// The HTML rendering rules use these only after the child body's own
+/// `marginwidth`/`marginheight` and `leftmargin`/`topmargin` attributes have
+/// been considered. Keeping the axes paired prevents a frame's horizontal
+/// hint from being mistaken for a vertical one at the cascade boundary:
+/// <https://html.spec.whatwg.org/multipage/rendering.html#the-page>.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct HtmlContainerFrameBodyMargins {
+    pub(crate) horizontal: Option<i32>,
+    pub(crate) vertical: Option<i32>,
+}
+
+impl HtmlContainerFrameBodyMargins {
+    pub(crate) fn from_iframe_attributes(attrs: &HashMap<String, String>) -> Self {
+        Self {
+            horizontal: attrs
+                .get("marginwidth")
+                .and_then(|value| parse_html_non_negative_integer(value)),
+            vertical: attrs
+                .get("marginheight")
+                .and_then(|value| parse_html_non_negative_integer(value)),
+        }
+    }
+}
+
+/// Parse HTML's non-negative-integer microsyntax.
+///
+/// This follows HTML's integer parser, including leading ASCII whitespace,
+/// optional `+`, and trailing unparsed input. The resulting invariant is used
+/// by presentational hints that map a legacy integer to a CSS pixel length:
+/// <https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#rules-for-parsing-non-negative-integers>.
+pub(crate) fn parse_html_non_negative_integer(value: &str) -> Option<i32> {
+    let value = value.trim_start_matches(is_html_space);
+    let (sign, rest) = match value.as_bytes().first().copied() {
+        Some(b'+') => (1, &value[1..]),
+        Some(b'-') => (-1, &value[1..]),
+        _ => (1, value),
+    };
+    let digit_len = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digit_len == 0 {
+        return None;
+    }
+    let integer = rest[..digit_len].parse::<i32>().ok()? * sign;
+    (integer >= 0).then_some(integer)
+}
+
+fn is_html_space(character: char) -> bool {
+    matches!(character, ' ' | '\t' | '\n' | '\u{0c}' | '\r')
+}
+
+/// Ordered stylesheets used to cascade one document.
+///
+/// The HTML user-agent stylesheets are process-wide immutable data, whereas
+/// presentational hints and author stylesheets belong to one document. Keeping
+/// the two storage classes distinct lets layout borrow the built-in sheets
+/// without cloning their parsed selector and declaration trees.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Stylesheets<'a> {
+    user_agent: Option<&'static Stylesheet>,
+    html_important: Option<&'static Stylesheet>,
+    document: &'a [Stylesheet],
+    /// Legacy physical body margins supplied by the immediate embedding frame.
+    ///
+    /// HTML's rendering rules allow a child document's body to fall back to
+    /// its container frame's `marginwidth` and `marginheight` attributes.
+    /// This is document-scoped cascade input rather than an iframe layout
+    /// metric: the values become zero-specificity author-origin declarations
+    /// only when cascading the child HTML body.
+    /// <https://html.spec.whatwg.org/multipage/rendering.html#the-page>
+    html_container_frame_body_margins: Option<HtmlContainerFrameBodyMargins>,
+    /// Static-rendering input used for CSS Images `image-set()` negotiation.
+    image_set_resolution_dppx: f32,
+    // Direct cascade tests occasionally model a user-origin sheet without
+    // manufacturing an owned document stylesheet. Keep that test fixture out
+    // of production layout state.
+    #[cfg(test)]
+    borrowed: &'a [&'a Stylesheet],
+}
+
+pub(crate) static EMPTY_STYLESHEETS: Stylesheets<'static> = Stylesheets::document_only(&[]);
+
+/// Inputs that can be viewed as an ordered stylesheet collection.
+///
+/// Layout carries [`Stylesheets`] so the process-wide UA sheets stay borrowed.
+/// This trait keeps low-level unit tests and isolated CSS callers ergonomic when
+/// they intentionally provide only document-owned stylesheets.
+pub(crate) trait StylesheetCollection {
+    fn stylesheet_view(&self) -> Stylesheets<'_>;
+}
+
+impl StylesheetCollection for Stylesheets<'_> {
+    fn stylesheet_view(&self) -> Stylesheets<'_> {
+        *self
+    }
+}
+
+impl StylesheetCollection for [Stylesheet] {
+    fn stylesheet_view(&self) -> Stylesheets<'_> {
+        Stylesheets::document_only(self)
+    }
+}
+
+impl StylesheetCollection for Vec<Stylesheet> {
+    fn stylesheet_view(&self) -> Stylesheets<'_> {
+        Stylesheets::document_only(self)
+    }
+}
+
+impl<const LENGTH: usize> StylesheetCollection for [Stylesheet; LENGTH] {
+    fn stylesheet_view(&self) -> Stylesheets<'_> {
+        Stylesheets::document_only(self)
+    }
+}
+
+impl<'a> Stylesheets<'a> {
+    pub(crate) const fn document_only(document: &'a [Stylesheet]) -> Self {
+        Self {
+            user_agent: None,
+            html_important: None,
+            document,
+            html_container_frame_body_margins: None,
+            image_set_resolution_dppx: 1.0,
+            #[cfg(test)]
+            borrowed: &[],
+        }
+    }
+
+    pub(crate) const fn for_document(
+        user_agent: &'static Stylesheet,
+        html_important: Option<&'static Stylesheet>,
+        document: &'a [Stylesheet],
+    ) -> Self {
+        Self {
+            user_agent: Some(user_agent),
+            html_important,
+            document,
+            html_container_frame_body_margins: None,
+            image_set_resolution_dppx: 1.0,
+            #[cfg(test)]
+            borrowed: &[],
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn borrowed(stylesheets: &'a [&'a Stylesheet]) -> Self {
+        Self {
+            user_agent: None,
+            html_important: None,
+            document: &[],
+            html_container_frame_body_margins: None,
+            image_set_resolution_dppx: 1.0,
+            borrowed: stylesheets,
+        }
+    }
+
+    /// Attach the immediate embedding frame's legacy body-margin values.
+    ///
+    /// The context is deliberately copied with the stylesheet view, so a
+    /// nested document cannot accidentally observe its grandparent frame.
+    pub(crate) const fn with_html_container_frame_body_margins(
+        mut self,
+        margins: Option<HtmlContainerFrameBodyMargins>,
+    ) -> Self {
+        self.html_container_frame_body_margins = margins;
+        self
+    }
+
+    /// Attach the static device density used to choose image-set candidates.
+    pub(crate) const fn with_image_set_resolution_dppx(mut self, resolution_dppx: f32) -> Self {
+        self.image_set_resolution_dppx = resolution_dppx;
+        self
+    }
+
+    pub(crate) const fn image_set_resolution_dppx(self) -> f32 {
+        self.image_set_resolution_dppx
+    }
+
+    pub(crate) const fn html_container_frame_body_margins(
+        self,
+    ) -> Option<HtmlContainerFrameBodyMargins> {
+        self.html_container_frame_body_margins
+    }
+
+    pub(crate) fn iter(&self) -> impl DoubleEndedIterator<Item = &Stylesheet> + Clone {
+        let stylesheets = self
+            .user_agent
+            .iter()
+            .copied()
+            .chain(self.html_important.iter().copied())
+            .chain(self.document.iter());
+        #[cfg(test)]
+        {
+            stylesheets.chain(self.borrowed.iter().copied())
+        }
+        #[cfg(not(test))]
+        {
+            stylesheets
+        }
+    }
+
+    pub(crate) const fn len(&self) -> usize {
+        let len = self.user_agent.is_some() as usize
+            + self.html_important.is_some() as usize
+            + self.document.len();
+        #[cfg(not(test))]
+        {
+            len
+        }
+        #[cfg(test)]
+        {
+            len + self.borrowed.len()
+        }
+    }
+
+    pub(crate) fn get(&self, index: usize) -> Option<&Stylesheet> {
+        self.iter().nth(index)
+    }
+
+    pub(crate) fn color_scheme_preference(self) -> ColorSchemePreference {
+        self.iter()
+            .rev()
+            .find_map(|stylesheet| {
+                (stylesheet.color_scheme_preference != ColorSchemePreference::None)
+                    .then_some(stylesheet.color_scheme_preference)
+            })
+            .unwrap_or(ColorSchemePreference::None)
+    }
+
+    pub(crate) fn registered_custom_properties(self) -> RegisteredCustomProperties {
+        RegisteredCustomProperties::from_rules(self.iter())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

@@ -153,7 +153,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         parent_style: &ComputedStyle,
         children: &[GridChild<'_>],
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         preliminary: &GridLayout,
     ) -> Vec<SubgridContribution> {
         let mut contributions = Vec::new();
@@ -207,7 +207,7 @@ impl<'a> LayoutBuilder<'a> {
         child: &GridChild<'_>,
         context: ResolvedSubgridContext,
         projection: ContributionProjection,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         child_width: f32,
         child_height: f32,
         contributions: &mut Vec<SubgridContribution>,

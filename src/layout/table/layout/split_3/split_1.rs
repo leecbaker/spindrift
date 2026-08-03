@@ -12,7 +12,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         fragment: &box_tree::TableFragment<'_>,
         available_outer_width: f32,
     ) -> (f32, f32) {
@@ -20,7 +20,6 @@ impl<'a> LayoutBuilder<'a> {
         let rows = input.rows.as_slice();
         let available_table_width =
             (available_outer_width - style.margin.left - style.margin.right).max(style.font_size);
-        let table_width = used_table_width(style, available_table_width);
         if rows.is_empty() {
             // An empty grid has zero intrinsic column width. A preferred
             // table `width` is resolved later as a preferred/flex main size,
@@ -48,6 +47,13 @@ impl<'a> LayoutBuilder<'a> {
                     grid.column_count,
                 )
             });
+        let table_width = used_table_width(
+            style,
+            available_table_width,
+            collapsed_geometry
+                .as_ref()
+                .map(|geometry| geometry.outer_insets),
+        );
         let measures = self.table_column_measures(
             rows,
             &grid,
@@ -76,7 +82,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         fragment: &box_tree::TableFragment<'_>,
         available_outer_width: f32,
     ) -> (f32, f32) {
@@ -103,7 +109,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         fragment: &box_tree::TableFragment<'_>,
         available_outer_width: f32,
     ) -> (f32, f32) {
@@ -129,11 +135,66 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         fragment: &box_tree::TableFragment<'_>,
         available_outer_width: f32,
         resolve_percentage: bool,
     ) -> (f32, f32) {
+        let available_table_width =
+            (available_outer_width - style.margin.left - style.margin.right).max(style.font_size);
+        let input = TableLayoutInput::from_fragment(fragment);
+        let rows = input.rows.as_slice();
+        let collapsed_outer_insets =
+            if style.border_collapse == css::BorderCollapse::Collapse && !rows.is_empty() {
+                let grid = table_grid(rows);
+                Some(
+                    self.collapsed_table_geometry(
+                        rows,
+                        &grid,
+                        style,
+                        stylesheets,
+                        &input.columns,
+                        grid.column_count,
+                    )
+                    .outer_insets,
+                )
+            } else {
+                None
+            };
+        let table_width = used_table_width(style, available_table_width, collapsed_outer_insets);
+        let horizontal_non_content = table_horizontal_non_content_width(table_width);
+        let percentage_basis = resolve_percentage
+            .then(|| content_box_pt(available_table_width))
+            .map(PercentageBasis::definite)
+            .unwrap_or_else(PercentageBasis::indefinite);
+        let authored_width = used_content_box_width_or_auto_with_basis(
+            style,
+            percentage_basis,
+            non_content_pt(horizontal_non_content),
+        )
+        .map(SemanticLengthExt::points);
+
+        // A fixed-layout table with an authored, resolvable inline size does
+        // not derive its used width from cell min/max-content contributions.
+        // Those contributions belong to the automatic table-layout algorithm;
+        // the fixed algorithm establishes tracks from columns and the first
+        // row after the wrapper width has been resolved.  Avoiding a full
+        // grid measurement here is also essential because this method is an
+        // intrinsic probe made by the parent before the table fragment is
+        // accepted for layout.
+        // <https://www.w3.org/TR/CSS22/tables.html#fixed-table-layout>
+        if style.table_layout == TableLayout::Fixed
+            && let Some(width) = authored_width
+        {
+            let width = constrain_content_width(
+                style,
+                content_box_pt(width),
+                PercentageBasis::definite(layout_pt(available_table_width.max(style.font_size))),
+            )
+            .points();
+            return (width, width);
+        }
+
         let (min_content, max_content) = self.table_intrinsic_widths_from_fragment(
             element,
             style,
@@ -141,38 +202,27 @@ impl<'a> LayoutBuilder<'a> {
             fragment,
             available_outer_width,
         );
-        let available_table_width =
-            (available_outer_width - style.margin.left - style.margin.right).max(style.font_size);
-        let table_width = used_table_width(style, available_table_width);
-        let horizontal_non_content = table_horizontal_non_content_width(style, table_width);
-        let percentage_basis = resolve_percentage
-            .then(|| content_box_pt(available_table_width))
-            .map(PercentageBasis::definite)
-            .unwrap_or_else(PercentageBasis::indefinite);
-        let resolved_width = used_content_box_width_or_auto_with_basis(
-            style,
-            percentage_basis,
-            non_content_pt(horizontal_non_content),
-        )
-        .map(SemanticLengthExt::points)
-        .or_else(|| {
-            intrinsic::intrinsic_content_box_width_keyword(
-                table_root_inline_size(style),
-                content_box_pt(min_content),
-                content_box_pt(max_content),
-                layout_pt(available_table_width),
-                non_content_pt(horizontal_non_content),
-            )
-            .map(SemanticLengthExt::points)
-        })
-        .map(|width| {
-            constrain_content_width(
-                style,
-                content_box_pt(width),
-                PercentageBasis::definite(layout_pt(available_table_width.max(style.font_size))),
-            )
-            .points()
-        });
+        let resolved_width = authored_width
+            .or_else(|| {
+                intrinsic::intrinsic_content_box_width_keyword(
+                    table_root_inline_size(style),
+                    content_box_pt(min_content),
+                    content_box_pt(max_content),
+                    layout_pt(available_table_width),
+                    non_content_pt(horizontal_non_content),
+                )
+                .map(SemanticLengthExt::points)
+            })
+            .map(|width| {
+                constrain_content_width(
+                    style,
+                    content_box_pt(width),
+                    PercentageBasis::definite(layout_pt(
+                        available_table_width.max(style.font_size),
+                    )),
+                )
+                .points()
+            });
 
         if let Some(width) = resolved_width {
             let width = table_content_width_clamped_to_min_content(
@@ -197,7 +247,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         fragment: &box_tree::TableFragment<'_>,
         available_outer_width: f32,
     ) -> (f32, f32) {
@@ -219,8 +269,27 @@ impl<'a> LayoutBuilder<'a> {
         );
         let available_table_width =
             (available_outer_width - style.margin.left - style.margin.right).max(style.font_size);
-        let table_width = used_table_width(style, available_table_width);
-        let horizontal_extras = table_horizontal_non_content_width(style, table_width)
+        let input = TableLayoutInput::from_fragment(fragment);
+        let rows = input.rows.as_slice();
+        let collapsed_outer_insets =
+            if style.border_collapse == css::BorderCollapse::Collapse && !rows.is_empty() {
+                let grid = table_grid(rows);
+                Some(
+                    self.collapsed_table_geometry(
+                        rows,
+                        &grid,
+                        style,
+                        stylesheets,
+                        &input.columns,
+                        grid.column_count,
+                    )
+                    .outer_insets,
+                )
+            } else {
+                None
+            };
+        let table_width = used_table_width(style, available_table_width, collapsed_outer_insets);
+        let horizontal_extras = table_horizontal_non_content_width(table_width)
             + style.margin.left
             + style.margin.right;
         (
@@ -243,7 +312,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         fragment: &box_tree::TableFragment<'_>,
         available_outer_width: f32,
     ) -> (f32, f32) {
@@ -251,7 +320,7 @@ impl<'a> LayoutBuilder<'a> {
         let rows = input.rows.as_slice();
         let available_table_width =
             (available_outer_width - style.margin.left - style.margin.right).max(style.font_size);
-        let mut table_width = used_table_width(style, available_table_width);
+        let mut table_width = used_table_width(style, available_table_width, None);
         if rows.is_empty() {
             let content = used_empty_table_grid_width(style, available_table_width, table_width);
             let physical_width = table_width.wrapper_border_box_width(content).points()
@@ -277,6 +346,13 @@ impl<'a> LayoutBuilder<'a> {
                     grid.column_count,
                 )
             });
+        table_width = used_table_width(
+            style,
+            available_table_width,
+            collapsed_geometry
+                .as_ref()
+                .map(|geometry| geometry.outer_insets),
+        );
         self.resolve_table_used_content_width(
             rows,
             &grid,
@@ -301,9 +377,6 @@ impl<'a> LayoutBuilder<'a> {
             table_metrics.clone(),
             collapsed_geometry.as_ref(),
         );
-        if let Some(geometry) = &collapsed_geometry {
-            table_width.border_widths = geometry.outer_insets;
-        }
         let table_used_style = self.table_used_style(style);
         let context = TableGridLayoutContext {
             rows,
@@ -340,7 +413,7 @@ impl<'a> LayoutBuilder<'a> {
         style: &ComputedStyle,
         children: &[box_tree::FormattingBox<'_>],
         fragment: &box_tree::TableFragment<'_>,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         baseline_shift: f32,
         link_target: Option<String>,
     ) -> Option<InlineAtom> {
@@ -376,7 +449,6 @@ impl<'a> LayoutBuilder<'a> {
         let available_width =
             (self.content_right - self.content_left - style.margin.left - style.margin.right)
                 .max(style.font_size);
-        let mut table_width = used_table_width(style, available_width);
         let table_cellpadding = element
             .attrs
             .get("cellpadding")
@@ -393,6 +465,13 @@ impl<'a> LayoutBuilder<'a> {
                     grid.column_count,
                 )
             });
+        let mut table_width = used_table_width(
+            style,
+            available_width,
+            collapsed_geometry
+                .as_ref()
+                .map(|geometry| geometry.outer_insets),
+        );
         self.resolve_table_used_content_width(
             rows,
             &grid,
@@ -505,7 +584,16 @@ impl<'a> LayoutBuilder<'a> {
         self.restore(measurement_snapshot);
         let snapshot = self.snapshot();
         let mut table_style = style.clone();
+        // The outer inline-table wrapper is represented by `atom_style` and
+        // `InlineSize` below.  Its margins must therefore be removed from the
+        // isolated table fragment in every writing mode; otherwise the
+        // captured fragment would paint them in addition to the outer atom.
+        // Keep the resolved and raw forms synchronized, because table layout
+        // may resolve the latter after this capture point.
+        // <https://www.w3.org/TR/CSS22/tables.html#table-display>
         table_style.margin = css::Edges::ZERO;
+        table_style.box_values.margin =
+            css::CssEdges::all(css::ComputedLengthPercentageOrAuto::ZERO);
         // `content_width` is the table grid's logical inline span.  CSS
         // `width` and `height` remain physical properties, so an isolated
         // vertical inline-table must freeze `height` here.  Freezing `width`
@@ -564,7 +652,7 @@ impl<'a> LayoutBuilder<'a> {
         // recovering it from emitted PDF text positions: paint-time glyph
         // adjustments are not part of the table-grid geometry.
         // <https://www.w3.org/TR/CSS22/tables.html#table-display>
-        let baseline_offset = if style.contain.layout {
+        let baseline_offset = if used_property_containment(element, style).layout {
             // Layout-contained atomic boxes expose no internal baseline and
             // therefore synthesize one from their block-end border edge.
             // <https://www.w3.org/TR/css-contain-1/#containment-layout>
@@ -589,14 +677,14 @@ impl<'a> LayoutBuilder<'a> {
         self.ancestors.truncate(ancestor_depth);
 
         let mut atom_style = style.clone();
-        atom_style.background_color = None;
+        atom_style.background_color = css::BackgroundColor::TRANSPARENT;
         atom_style.border_width = 0.0;
         atom_style.border_widths = css::Edges::ZERO;
         atom_style.border_width_values = css::CssEdges::all(css::ComputedLengthPercentage::ZERO);
         atom_style.border_styles = css::BorderStyles::NONE;
         atom_style.padding = css::Edges::ZERO;
 
-        Some(InlineAtom::new(
+        let atom = InlineAtom::new(
             InlineAtomContent::InlineFragment {
                 fragment: Box::new(fragment),
                 table_cell_context,
@@ -611,17 +699,31 @@ impl<'a> LayoutBuilder<'a> {
             baseline_shift,
             link_target,
             None,
-        ))
+        );
+        Some(if used_property_containment(element, style).layout {
+            atom.with_synthesized_border_box_block_end_baseline()
+        } else {
+            // CSS 2.2 performs inline-table baseline alignment against the
+            // table box, not the inline-level wrapper box. The outer margins
+            // remain in `InlineSize` for line geometry and replay, but the
+            // first-row baseline must not be shifted through them again.
+            // <https://www.w3.org/TR/CSS22/tables.html#table-display>
+            atom.with_exported_table_box_baseline()
+        })
     }
 
     pub(crate) fn estimate_table_height(
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         available_outer_width: f32,
         fragment: &box_tree::TableFragment<'_>,
     ) -> f32 {
+        let estimate_key = (element.id, available_outer_width.to_bits());
+        if let Some(&height) = self.speculative_table_height_estimates.get(&estimate_key) {
+            return height;
+        }
         let input = TableLayoutInput::from_fragment(fragment);
         let rows = input.rows.as_slice();
         let captions = input.captions.as_slice();
@@ -629,15 +731,18 @@ impl<'a> LayoutBuilder<'a> {
 
         let available_table_width =
             (available_outer_width - style.margin.left - style.margin.right).max(style.font_size);
-        let table_width = used_table_width(style, available_table_width);
+        let mut table_width = used_table_width(style, available_table_width, None);
         if rows.is_empty() {
-            return self.estimate_empty_table_height(
+            let height = self.estimate_empty_table_height(
                 captions,
                 style,
                 stylesheets,
                 available_table_width,
                 table_width,
             );
+            self.speculative_table_height_estimates
+                .insert(estimate_key, height);
+            return height;
         }
         let grid = table_grid(rows);
         let table_cellpadding = element
@@ -656,6 +761,30 @@ impl<'a> LayoutBuilder<'a> {
                     grid.column_count,
                 )
             });
+        table_width = used_table_width(
+            style,
+            available_table_width,
+            collapsed_geometry
+                .as_ref()
+                .map(|geometry| geometry.outer_insets),
+        );
+        // A height estimate participates in selecting a fragmentation
+        // boundary, so it must use the same resolved wrapper width as the
+        // accepted table layout. Collapsed outer borders can change the
+        // grid's content span.
+        // <https://drafts.csswg.org/css-tables-3/#table-layout>
+        self.resolve_table_used_content_width(
+            rows,
+            &grid,
+            style,
+            stylesheets,
+            columns,
+            available_table_width,
+            table_cellpadding,
+            table_metrics.clone(),
+            collapsed_geometry.as_ref(),
+            &mut table_width,
+        );
         let column_plan = self.table_column_plan(
             rows,
             &grid,
@@ -701,6 +830,9 @@ impl<'a> LayoutBuilder<'a> {
             PhysicalContentWidth::new(table_width.content_width),
             CaptionSide::Bottom,
         );
-        total + style.margin.bottom
+        let height = total + style.margin.bottom;
+        self.speculative_table_height_estimates
+            .insert(estimate_key, height);
+        height
     }
 }

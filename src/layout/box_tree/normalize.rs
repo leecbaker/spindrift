@@ -20,6 +20,7 @@ pub(crate) fn normalize_block_container_children<'a>(
         return children;
     }
     let children = normalize_run_in_children(children, parent_style);
+    let children = inlinify_ruby_internal_block_children(children);
     let mut children = split_block_in_inline_children(children);
     trim_block_container_line_boundary_whitespace(&mut children);
 
@@ -47,6 +48,106 @@ pub(crate) fn normalize_block_container_children<'a>(
     }
     flush_anonymous_block(&mut normalized, &mut inline_run, parent_style);
     normalized
+}
+
+/// Inlinify direct in-flow block children of ruby layout-internal boxes before
+/// the generic inline/block split pass sees them.
+///
+/// CSS Ruby defines this transformation as part of anonymous ruby box
+/// generation.  Applying it before CSS Display's ordinary inline split is
+/// essential: otherwise `display:ruby` would be split into ordinary block
+/// fragments and lose its paired base/annotation structure.
+/// <https://drafts.csswg.org/css-ruby-1/#anon-gen-inlinize>
+/// <https://drafts.csswg.org/css-display-3/#inlinify>
+fn inlinify_ruby_internal_block_children<'a>(
+    children: Vec<MutableFormattingBox<'a>>,
+) -> Vec<MutableFormattingBox<'a>> {
+    children
+        .into_iter()
+        .map(inlinify_ruby_internal_block_child)
+        .collect()
+}
+
+fn inlinify_ruby_internal_block_child<'a>(
+    mut child: MutableFormattingBox<'a>,
+) -> MutableFormattingBox<'a> {
+    let is_ruby_role = child.element_parts().is_some_and(|(_, _, style, _)| {
+        style.display.is_ruby() || style.display.is_ruby_internal()
+    });
+    if is_ruby_role {
+        let children = match &mut child {
+            MutableFormattingBox::Inline(box_) => &mut box_.core.children,
+            MutableFormattingBox::Block(box_) => &mut box_.core.children,
+            MutableFormattingBox::AtomicInline(box_) => &mut box_.core.children,
+            MutableFormattingBox::Table(box_) => &mut box_.core.children,
+            MutableFormattingBox::Flex(box_) => &mut box_.core.children,
+            MutableFormattingBox::Replaced(box_) => &mut box_.core.children,
+            MutableFormattingBox::InlineSplitBlockContext(box_) => &mut box_.core.children,
+            MutableFormattingBox::AnonymousBlock(box_) => &mut box_.children,
+            MutableFormattingBox::Text(_) => unreachable!("text boxes cannot have ruby roles"),
+        };
+        *children = std::mem::take(children)
+            .into_iter()
+            .map(|child| {
+                let child = inlinify_ruby_internal_block_child(child);
+                if !is_out_of_flow_box(&child) && !is_floated_box(&child) {
+                    inlinify_ruby_block_child(child)
+                } else {
+                    child
+                }
+            })
+            .collect();
+        return child;
+    }
+
+    match &mut child {
+        MutableFormattingBox::Inline(box_) => {
+            box_.core.children =
+                inlinify_ruby_internal_block_children(std::mem::take(&mut box_.core.children));
+        }
+        MutableFormattingBox::Block(box_) => {
+            box_.core.children =
+                inlinify_ruby_internal_block_children(std::mem::take(&mut box_.core.children));
+        }
+        MutableFormattingBox::AtomicInline(box_) => {
+            box_.core.children =
+                inlinify_ruby_internal_block_children(std::mem::take(&mut box_.core.children));
+        }
+        MutableFormattingBox::Table(box_) => {
+            box_.core.children =
+                inlinify_ruby_internal_block_children(std::mem::take(&mut box_.core.children));
+        }
+        MutableFormattingBox::Flex(box_) => {
+            box_.core.children =
+                inlinify_ruby_internal_block_children(std::mem::take(&mut box_.core.children));
+        }
+        MutableFormattingBox::Replaced(box_) => {
+            box_.core.children =
+                inlinify_ruby_internal_block_children(std::mem::take(&mut box_.core.children));
+        }
+        MutableFormattingBox::InlineSplitBlockContext(box_) => {
+            box_.core.children =
+                inlinify_ruby_internal_block_children(std::mem::take(&mut box_.core.children));
+        }
+        MutableFormattingBox::AnonymousBlock(box_) => {
+            box_.children =
+                inlinify_ruby_internal_block_children(std::mem::take(&mut box_.children));
+        }
+        MutableFormattingBox::Text(_) => {}
+    }
+    child
+}
+
+fn inlinify_ruby_block_child<'a>(child: MutableFormattingBox<'a>) -> MutableFormattingBox<'a> {
+    let MutableFormattingBox::Block(mut box_) = child else {
+        return child;
+    };
+    box_.core.style.display = Display::new(DisplayOuter::Inline, DisplayInner::FlowRoot);
+    MutableFormattingBox::AtomicInline(MutableAtomicInlineBox {
+        core: box_.core,
+        marker: box_.marker,
+        table_fragment: None,
+    })
 }
 
 /// Trim collapsible whitespace at block-container line boundaries.
@@ -137,7 +238,15 @@ fn normalize_run_in_children<'a>(
                 || is_run_in_box(child)
         }) {
             let child = input.next().expect("peeked child");
-            sequence.push(inlinified_run_in_box(child));
+            // Whitespace and out-of-flow siblings travel with the run-in
+            // sequence, but only a run-in itself is inlinified. In
+            // particular, an absolutely positioned block retains its own
+            // principal box and static-position semantics.
+            sequence.push(if is_run_in_box(&child) {
+                inlinified_run_in_box(child)
+            } else {
+                child
+            });
         }
 
         if let Some(next) = input.peek()
@@ -170,43 +279,57 @@ fn is_run_in_box(box_: &MutableFormattingBox<'_>) -> bool {
     style.display.is_run_in() && !is_out_of_flow_box(box_)
 }
 
-fn inlinified_run_in_box(mut box_: MutableFormattingBox<'_>) -> MutableFormattingBox<'_> {
-    inlinify_run_in_box(&mut box_);
-    box_
+fn inlinified_run_in_box(box_: MutableFormattingBox<'_>) -> MutableFormattingBox<'_> {
+    inlinify_run_in_box(box_)
 }
 
-fn inlinify_run_in_box(box_: &mut MutableFormattingBox<'_>) {
+fn inlinify_run_in_box(box_: MutableFormattingBox<'_>) -> MutableFormattingBox<'_> {
     match box_ {
-        MutableFormattingBox::Block(box_) => {
+        MutableFormattingBox::Block(mut box_) => {
             box_.core.style.display = box_.core.style.display.run_in_inlinified();
-            for child in &mut box_.run_in_children {
-                inlinify_run_in_box(child);
-            }
+            // A run-in's own preceding run-ins belong to the same inline
+            // sequence after the box is inlinified.  Preserve that source
+            // order before converting the block-specific representation into
+            // an actual inline formatting box; inline collection deliberately
+            // ignores ordinary block variants.
+            // <https://drafts.csswg.org/css-display-3/#run-in-layout>
+            let mut children = std::mem::take(&mut box_.run_in_children);
+            children.append(&mut box_.core.children);
+            inlinify_run_in_children(&mut children);
+            box_.core.children = children;
+            MutableFormattingBox::Inline(MutableInlineBox {
+                core: box_.core,
+                marker: box_.marker,
+                fragment_edges: InlineBoxFragmentEdges::ALL,
+            })
+        }
+        MutableFormattingBox::Inline(mut box_) => {
+            box_.core.style.display = box_.core.style.display.run_in_inlinified();
             inlinify_run_in_children(&mut box_.core.children);
+            MutableFormattingBox::Inline(box_)
         }
-        MutableFormattingBox::Inline(box_) => {
+        MutableFormattingBox::InlineSplitBlockContext(mut box_) => {
+            inlinify_run_in_children(&mut box_.core.children);
+            MutableFormattingBox::InlineSplitBlockContext(box_)
+        }
+        MutableFormattingBox::AtomicInline(mut box_) => {
             box_.core.style.display = box_.core.style.display.run_in_inlinified();
             inlinify_run_in_children(&mut box_.core.children);
+            MutableFormattingBox::AtomicInline(box_)
         }
-        MutableFormattingBox::InlineSplitBlockContext(box_) => {
-            for child in &mut box_.core.children {
-                inlinify_run_in_box(child);
-            }
-        }
-        MutableFormattingBox::AtomicInline(box_) => {
+        MutableFormattingBox::Table(mut box_) => {
             box_.core.style.display = box_.core.style.display.run_in_inlinified();
-            inlinify_run_in_children(&mut box_.core.children);
+            MutableFormattingBox::Table(box_)
         }
-        MutableFormattingBox::Table(box_) => {
+        MutableFormattingBox::Flex(mut box_) => {
             box_.core.style.display = box_.core.style.display.run_in_inlinified();
+            MutableFormattingBox::Flex(box_)
         }
-        MutableFormattingBox::Flex(box_) => {
+        MutableFormattingBox::Replaced(mut box_) => {
             box_.core.style.display = box_.core.style.display.run_in_inlinified();
+            MutableFormattingBox::Replaced(box_)
         }
-        MutableFormattingBox::Replaced(box_) => {
-            box_.core.style.display = box_.core.style.display.run_in_inlinified();
-        }
-        MutableFormattingBox::AnonymousBlock(_) | MutableFormattingBox::Text(_) => {}
+        box_ @ (MutableFormattingBox::AnonymousBlock(_) | MutableFormattingBox::Text(_)) => box_,
     }
 }
 
@@ -365,7 +488,7 @@ fn split_inline_block_context_or_part<'a>(
 
 fn split_inline_style_needs_block_context(element: &Element, style: &ComputedStyle) -> bool {
     matches!(style.position, Position::Relative | Position::Sticky)
-        || style.z_index.is_some()
+        || style.z_index.establishes_stacking_context()
         || style.opacity < 1.0
         || style.has_transform()
         || style.isolation == Isolation::Isolate
@@ -373,8 +496,7 @@ fn split_inline_style_needs_block_context(element: &Element, style: &ComputedSty
         || !matches!(style.filter, FilterValue::None)
         || style.clip_path != ClipPath::None
         || style.mask != MaskValue::None
-        || (property_containment_applies_to_element(element, style)
-            && (style.contain.layout || style.contain.paint))
+        || property_containment_establishes_independent_formatting_context(element, style)
         || matches!(
             style.content_visibility,
             ContentVisibility::Auto | ContentVisibility::Hidden
@@ -673,8 +795,6 @@ pub(crate) fn anonymous_table_style(parent_style: &ComputedStyle) -> ComputedSty
     style.font_variant_emoji = parent_style.font_variant_emoji;
     style.language = parent_style.language.clone();
     style.line_height_value = parent_style.line_height_value.clone();
-    style.line_height_multiplier = parent_style.line_height_multiplier;
-    style.line_height_is_normal = parent_style.line_height_is_normal;
     style.word_spacing = parent_style.word_spacing.clone();
     style.text_transform = parent_style.text_transform;
     style.tab_size = parent_style.tab_size.clone();
@@ -701,7 +821,6 @@ pub(crate) fn anonymous_table_style(parent_style: &ComputedStyle) -> ComputedSty
     style.caption_side = parent_style.caption_side;
     style.empty_cells = parent_style.empty_cells;
     style.border_spacing = parent_style.border_spacing.clone();
-    style.border_spacing_explicit = parent_style.border_spacing_explicit;
     style
 }
 

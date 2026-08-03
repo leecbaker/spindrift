@@ -2,6 +2,47 @@ use super::*;
 use crate::layout::block::{FloatContour, FlowExclusionKind, InitialLetterLayout};
 use std::rc::Rc;
 
+/// Whether the selected final line must reserve a block ellipsis for source
+/// that lies outside the current inline graph.
+///
+/// A `UsedLineClamp` carries the fact through a descendant style, while a
+/// collected inline sequence supplies it directly for a later preserved-break
+/// paragraph. Keeping both sources here prevents graph-local suffix checks
+/// from losing a block-flow continuation.
+fn line_clamp_has_later_in_flow_content(context: InlineParagraphContext<'_>) -> bool {
+    context.clamp_continuation == css::ClampContinuation::LaterInFlowContent
+        || context.line_clamp.is_some_and(|line_clamp| {
+            line_clamp.continuation() == css::ClampContinuation::LaterInFlowContent
+        })
+}
+
+/// Classify the first source-order float in a candidate line range without
+/// treating its zero-advance graph marker as a CSS Text break opportunity.
+fn inline_float_affected_range(
+    graph: &InlineOpportunityGraph,
+    range: InlineGraphRange,
+) -> InlineFloatAffectedRange {
+    let Some(marker) = graph.first_float_position_in_range(range) else {
+        return InlineFloatAffectedRange::None;
+    };
+    inline_float_marker_range(graph, marker)
+}
+
+fn inline_float_marker_range(
+    graph: &InlineOpportunityGraph,
+    marker: InlineGraphPosition,
+) -> InlineFloatAffectedRange {
+    let Some(float) = graph.float_at_position(marker) else {
+        debug_assert!(false, "float graph position must own an inline float");
+        return InlineFloatAffectedRange::None;
+    };
+    if float.style().allows_soft_wrap() {
+        InlineFloatAffectedRange::Wrappable { marker }
+    } else {
+        InlineFloatAffectedRange::UnbreakableContinuation { marker }
+    }
+}
+
 /// One normal or balanced selection in an inline graph.
 ///
 /// CSS Text 4 balancing must use the same legal graph opportunities as normal
@@ -13,6 +54,19 @@ struct BalancedLinePlanEntry {
     start: InlineGraphPosition,
     end: SelectedInlineLineEnd,
     line_index: usize,
+    /// The clamp marker occupies this line without retaining any source.
+    /// Keeping this in the plan prevents final clamp reconciliation from
+    /// treating a deliberate marker-only endpoint as an ordinary no-fit line.
+    clamp_marker_replaces_source: bool,
+}
+
+/// A source-order float that was provisionally placed only to expose the
+/// remaining candidate stream. Once balancing has selected that stream, its
+/// placement is replayed from the state immediately before the float.
+struct PendingBalancedFloatReplay {
+    position: InlineGraphPosition,
+    source_line_index: usize,
+    snapshot: LayoutSnapshot,
 }
 
 /// One complete candidate for a CSS Text Level 4 balanced line group.
@@ -61,6 +115,37 @@ struct PhysicalLineSlab {
     line_index: usize,
     block_offset: f32,
     used_block_size: f32,
+}
+
+/// A selected unbreakable line and the physical block distance skipped before
+/// its source content can be placed beside CSS float exclusions.
+///
+/// The source line remains one CSS line box even when a float moves its used
+/// physical slab below the nominal inherited-strut row. Keeping the skipped
+/// distance with the selected fragment prevents the durable line sequence
+/// from manufacturing an empty source line for that placement retry.
+/// <https://www.w3.org/TR/CSS22/visuren.html#floats>
+struct UnbreakableInlineFloatSelection {
+    fragment: InlineLineFragment,
+    block_before: f32,
+}
+
+/// Return the total containing-block measure a float-clearance retry needs.
+///
+/// An unbreakable line can legally overflow even its full containing block,
+/// but it must not overflow a narrower float-shortened line when the float
+/// can be cleared. Capping the used measure at the full measure therefore
+/// finds the first later slab that removes enough exclusion without requiring
+/// impossible room for the overflowing word itself.
+/// <https://www.w3.org/TR/CSS22/visuren.html#floats>
+fn float_clearance_required_width(
+    used_line_width: f32,
+    full_line_indent: f32,
+    containing_width: f32,
+) -> f32 {
+    (used_line_width + full_line_indent)
+        .min(containing_width)
+        .max(0.0)
 }
 
 impl PhysicalLineSlab {
@@ -175,6 +260,26 @@ pub(in crate::layout) struct InlineLinePhysicalRow {
     line_index: usize,
     identity: SelectedLineIdentity,
     block_offset: f32,
+}
+
+/// Immutable state for committing one source-order inline float.
+///
+/// A float marker is not a CSS Text line end.  Retaining the selected source
+/// range and its physical row together means that a retry cannot accidentally
+/// reinterpret the marker as a new line or reconstruct its y coordinate from
+/// a later mutable block cursor:
+/// <https://www.w3.org/TR/CSS22/visuren.html#float-position> and
+/// <https://www.w3.org/TR/css-text-3/#line-breaking>.
+struct InlineFloatTransactionCheckpoint {
+    source_range: InlineGraphRange,
+    selected_end: SelectedInlineLineEnd,
+    marker: InlineGraphPosition,
+    row: InlineLinePhysicalRow,
+    /// CSS 2.2 constrains a source-order float by preceding line boxes, not
+    /// by the row that happened to select its marker. The float context may
+    /// move it later from this floor, but never needs an invented text row.
+    placement_floor: InlineLinePhysicalRow,
+    snapshot: LayoutSnapshot,
 }
 
 /// Return the boundary after a raised or sunken initial letter that must own
@@ -657,6 +762,8 @@ impl<'a> LayoutBuilder<'a> {
         // treating preceding inline content as an in-flow prefix of the
         // float.
         let mut placed_inline_float_positions = Vec::new();
+        let mut pending_balanced_float_replays = Vec::<PendingBalancedFloatReplay>::new();
+        let mut replayed_float_block_boundaries = Vec::<InlineGraphPosition>::new();
         let mut balanced_plan = self.balanced_line_plan(
             graph,
             context,
@@ -708,10 +815,9 @@ impl<'a> LayoutBuilder<'a> {
         let mut next_soft_wrap_position = 0usize;
         while start < graph_end {
             if context
-                .block_style
                 .line_clamp
                 .as_ref()
-                .is_some_and(|line_clamp| line_index >= line_clamp.max_lines)
+                .is_some_and(|line_clamp| line_index >= line_clamp.max_lines())
             {
                 break;
             }
@@ -724,13 +830,66 @@ impl<'a> LayoutBuilder<'a> {
             if start >= graph_end {
                 break;
             }
+            if let Some(boundary_index) = replayed_float_block_boundaries
+                .iter()
+                .position(|boundary| *boundary < start)
+            {
+                // A source-order float is an out-of-flow participant, but
+                // its marker still occupies the formatted-row transition
+                // between the preceding selected source and following source.
+                // Preserve that transition after replaying the float so the
+                // next source line queries the slab below the float marker.
+                replayed_float_block_boundaries.remove(boundary_index);
+                physical_line_block_offset += context.block_style.line_height;
+                pending_block_before += context.block_style.line_height;
+            }
             while next_soft_wrap_position < soft_wrap_positions.len()
                 && soft_wrap_positions[next_soft_wrap_position] <= start
             {
                 next_soft_wrap_position += 1;
             }
             if let Some(float) = graph.float_at_position(start).cloned() {
-                self.place_inline_waiting_float(&float, context, line_index);
+                // A float marker at the beginning of the source row is the
+                // zero-prefix case of ordinary source-order placement. Keep
+                // the same transactional path used by a marker after text:
+                // the float is committed once, then later source is selected
+                // against its exclusion. `white-space: nowrap` does not turn
+                // this placement into a CSS Text break opportunity.
+                // <https://www.w3.org/TR/CSS22/visuren.html#float-position>
+                // <https://www.w3.org/TR/CSS22/text.html#white-space-prop>
+                if self
+                    .try_place_inline_float_in_line_band(
+                        graph,
+                        start,
+                        context,
+                        line_index,
+                        SelectedLineIdentity {
+                            starts_after_forced_break: starts_after_forced_break
+                                && line_index == paragraph_start_line_index,
+                            is_first_formatted_line: context.initial_first_formatted_line
+                                && paragraph_start_line_index == 0
+                                && fragments.is_empty(),
+                        },
+                    )
+                    .is_placed()
+                {
+                    placed_inline_float_positions.push(start);
+                    has_float_side_effects = true;
+                    balanced_plan = None;
+                    balanced_plan_index = 0;
+                    start.run_index += 1;
+                    start.byte_offset = 0;
+                    continue;
+                }
+                // A marker with no source prefix is already at its earliest
+                // legal float row.  The ordinary floated-child placement path
+                // is allowed to move it farther down around preceding
+                // exclusions, but the marker itself must be consumed even
+                // when the provisional line band rejects it.  Otherwise the
+                // greedy selector retries the same zero-advance graph node
+                // indefinitely and effectively promotes the marker to a
+                // line-break opportunity.
+                self.place_inline_waiting_float(&float, start, context, line_index);
                 placed_inline_float_positions.push(start);
                 has_float_side_effects = true;
                 balanced_plan = None;
@@ -791,8 +950,12 @@ impl<'a> LayoutBuilder<'a> {
             // opportunities between adjacent atomic inline-level boxes and
             // keep the remaining source wrappable.
             // <https://www.w3.org/TR/css-text-3/#white-space-property>
-            let remaining_source_has_soft_wrap =
-                next_soft_wrap_position < soft_wrap_positions.len();
+            let remaining_source_breakability =
+                if next_soft_wrap_position < soft_wrap_positions.len() {
+                    InlineSourceBreakability::HasLegalSoftWrap
+                } else {
+                    InlineSourceBreakability::Unbreakable
+                };
             // Float-excluded rows consume physical block-size but do not make
             // a formatted line. Preserve this identity independently of the
             // physical line index for `text-indent` and hanging indents.
@@ -820,10 +983,54 @@ impl<'a> LayoutBuilder<'a> {
                     &placed_inline_float_positions,
                 );
             }
-            let mut selected_end = balanced_plan
+            if let Some(plan) = balanced_plan.as_ref()
+                && let Some(replay_index) = pending_balanced_float_replays
+                    .iter()
+                    .position(|replay| plan.iter().any(|entry| entry.start < replay.position))
+            {
+                let replayed_plan = plan.clone();
+                let replay = pending_balanced_float_replays.remove(replay_index);
+                // The float's source follows every selected entry whose start
+                // precedes its marker. Replaying from the captured snapshot
+                // places it after those final source lines instead of beside
+                // the greedy prefix that first discovered the marker.
+                let source_lines_before_float = plan
+                    .iter()
+                    .filter(|entry| entry.start < replay.position)
+                    .count();
+                let target_line_index = replay.source_line_index + source_lines_before_float;
+                self.restore(replay.snapshot);
+                self.adjoining_float_origin_y = None;
+                if let Some(float) = graph.float_at_position(replay.position).cloned() {
+                    self.place_inline_waiting_float(
+                        &float,
+                        replay.position,
+                        context,
+                        target_line_index,
+                    );
+                }
+                replayed_float_block_boundaries.push(replay.position);
+                // The replay changes paint/exclusion geometry, not the
+                // source candidate that won the balance search. Retain its
+                // endpoints rather than starting over with a greedy normal
+                // sequence against the newly placed float.
+                balanced_plan = Some(replayed_plan);
+                balanced_plan_index = 0;
+                continue;
+            }
+            // A balance plan is a completed source selection, not a hint to
+            // the ordinary greedy selector.  In particular, a source-order
+            // float makes the selected line's exclusion band meaningful to
+            // the balance score.  Remember when this endpoint came from that
+            // plan so the later float and clamp reconciliation stages can
+            // validate it without silently replacing it with a greedy edge.
+            // <https://drafts.csswg.org/css-text-4/#text-wrap-style>
+            let selected_from_balanced_plan = balanced_plan
                 .as_ref()
                 .and_then(|plan| plan.get(balanced_plan_index))
                 .filter(|plan| plan.start == start)
+                .copied();
+            let mut selected_end = selected_from_balanced_plan
                 .map(|plan| plan.end)
                 .unwrap_or_else(|| {
                     self.select_inline_line_end_with_block_offset(
@@ -836,10 +1043,14 @@ impl<'a> LayoutBuilder<'a> {
                     )
                 });
             // The inherited strut is only a provisional float-query slab.
-            // Refine every selected candidate against its complete used line
-            // slab before committing a CSS Shapes band. Atomic boxes can
+            // Refine an ordinary greedy candidate against its complete used
+            // line slab before committing a CSS Shapes band. Atomic boxes can
             // enlarge a zero-height strut, but ordinary text and markers can
-            // also change the band at a shaped float contour.
+            // also change the band at a shaped float contour. A balanced
+            // endpoint has already been selected against its line-local band;
+            // replacing it here would discard the candidate that was scored
+            // with that band and turn balanced float paragraphs back into
+            // greedy paragraphs.
             //
             // Each iteration selects a legal graph boundary for one physical
             // slab. The cap is a diagnostic guard for a pathological contour
@@ -847,7 +1058,8 @@ impl<'a> LayoutBuilder<'a> {
             // the candidate to a later physical slab below.
             // <https://drafts.csswg.org/css-inline-3/#line-boxes>
             // <https://drafts.csswg.org/TR/css-shapes-1/#shape-outside-property>
-            if selected_end.position > start
+            if selected_from_balanced_plan.is_none()
+                && selected_end.position > start
                 && self
                     .float_contexts
                     .last()
@@ -912,7 +1124,9 @@ impl<'a> LayoutBuilder<'a> {
             if let Some(initial_end) = initial_source_handoff_end {
                 selected_end = SelectedInlineLineEnd {
                     position: initial_end,
-                    break_opportunity: graph.break_opportunity_at(initial_end),
+                    break_opportunity: graph.break_opportunity_at(initial_end).filter(
+                        |opportunity| !matches!(opportunity.kind, InlineBreakKind::FloatPlacement),
+                    ),
                 };
                 // A balance plan selected against the unsplit source is no
                 // longer applicable after the initial-letter-specific first
@@ -927,13 +1141,21 @@ impl<'a> LayoutBuilder<'a> {
             // the marker.
             // <https://drafts.csswg.org/css-overflow-3/#line-clamp>
             let is_final_clamped_line = context
-                .block_style
                 .line_clamp
                 .as_ref()
-                .is_some_and(|line_clamp| line_index + 1 == line_clamp.max_lines);
-            let mut final_clamp_marker_replaces_source = false;
-            if is_final_clamped_line && selected_end.position < graph_end {
-                let ellipsis_width = self.line_clamp_marker_width(context.block_style);
+                .is_some_and(|line_clamp| line_index + 1 == line_clamp.max_lines());
+            let clamp_continues_after_line = line_clamp_has_later_in_flow_content(context);
+            let mut final_clamp_marker_replaces_source =
+                selected_from_balanced_plan.is_some_and(|plan| plan.clamp_marker_replaces_source);
+            if is_final_clamped_line
+                && selected_from_balanced_plan.is_none()
+                && !final_clamp_marker_replaces_source
+                && selected_end.position < graph_end
+                && (!graph_remaining_after_position_is_trimmable(graph, selected_end.position)
+                    || clamp_continues_after_line)
+            {
+                let ellipsis_width =
+                    self.line_clamp_marker_width(context.line_clamp, context.block_style);
                 if ellipsis_width > 0.0 {
                     let band = self.inline_float_band_for_line(
                         line_index,
@@ -991,7 +1213,7 @@ impl<'a> LayoutBuilder<'a> {
                 .is_some_and(|opportunity| matches!(opportunity.kind, InlineBreakKind::Forced));
             let mut end = if final_clamp_marker_replaces_source {
                 start
-            } else if (!remaining_source_has_soft_wrap
+            } else if (!remaining_source_breakability.has_legal_soft_wrap()
                 && !selected_forced_break
                 && initial_source_handoff_end.is_none())
                 || selected_end.position <= start
@@ -1000,14 +1222,44 @@ impl<'a> LayoutBuilder<'a> {
             } else {
                 selected_end.position.min(graph_end)
             };
-            let end_is_unplaced_float_boundary =
-                selected_end.break_opportunity.is_some_and(|opportunity| {
-                    matches!(opportunity.kind, InlineBreakKind::FloatPlacement)
-                        && graph.float_at_position(opportunity.position).is_some()
-                        && !placed_inline_float_positions.contains(&opportunity.position)
-                });
-            if !end_is_unplaced_float_boundary {
-                end = line_end_extended_over_adjacent_inline_float_markers(graph, end);
+            end = line_end_extended_over_adjacent_inline_float_markers(graph, end);
+            // A soft break before a `nowrap` inline does not make the
+            // inline's leading unbreakable prefix a line of its own.  When
+            // that prefix fits with the preceding text, retain it on the
+            // current line and let the following float use the normal
+            // source-order placement path.  Otherwise a float inside `nobr`
+            // is placed against the later line while its prefix was
+            // incorrectly broken before the inline.
+            // <https://www.w3.org/TR/css-text-3/#white-space-property>
+            // <https://www.w3.org/TR/CSS22/visuren.html#float-position>
+            if let Some(float_position) = graph.first_float_position_in_range(InlineGraphRange {
+                start,
+                end: graph_end,
+            }) && end < float_position
+                && !graph
+                    .break_opportunities_after(end)
+                    .take_while(|opportunity| opportunity.position <= float_position)
+                    .any(opportunity_is_soft_wrap)
+            {
+                let prefix = graph.materialize_line(
+                    InlineGraphRange {
+                        start,
+                        end: float_position,
+                    },
+                    None,
+                    &mut self.font_system,
+                    context.block_style,
+                );
+                let full_indent = used_line_indent_for_formatted_line(
+                    line_identity.is_first_formatted_line,
+                    line_identity.starts_after_forced_break,
+                    context.hanging_indent,
+                    context.block_style,
+                    context.available_width,
+                );
+                if prefix.fitting_width <= context.available_width - full_indent + 0.5 {
+                    end = float_position;
+                }
             }
             // A wrappable selected range may fit the unexcluded containing
             // block while exceeding this line's temporary float band. CSS 2.2
@@ -1053,7 +1305,7 @@ impl<'a> LayoutBuilder<'a> {
             // CSS 2.2's float retry is line-box placement, not a synthetic
             // break inside a word or atomic inline participant.
             if context.block_style.allows_soft_wrap()
-                && remaining_source_has_soft_wrap
+                && remaining_source_breakability.has_legal_soft_wrap()
                 && end > start
                 && current_available_width + INLINE_FLOAT_EPSILON < full_available_width
                 && let materialized = graph.materialize_line(
@@ -1274,8 +1526,8 @@ impl<'a> LayoutBuilder<'a> {
                 }
             }
             let selected_range = InlineGraphRange { start, end };
-            if !remaining_source_has_soft_wrap
-                && let Some(fragment) = self.try_select_unbreakable_line_with_inline_floats(
+            if !remaining_source_breakability.has_legal_soft_wrap()
+                && let Some(selection) = self.try_select_unbreakable_line_with_inline_floats(
                     graph,
                     InlineGraphRange {
                         start,
@@ -1293,12 +1545,13 @@ impl<'a> LayoutBuilder<'a> {
                     },
                 )
             {
-                physical_line_block_offset +=
-                    used_inline_line_block_advance(&fragment, context.block_style);
+                physical_line_block_offset += selection.block_before
+                    + used_inline_line_block_advance(&selection.fragment, context.block_style);
                 fragments.push(SelectedInlineLine {
-                    fragment,
+                    fragment: selection.fragment,
                     line_index,
-                    block_before: std::mem::take(&mut pending_block_before),
+                    block_before: std::mem::take(&mut pending_block_before)
+                        + selection.block_before,
                 });
                 has_float_side_effects = true;
                 line_index += 1;
@@ -1306,7 +1559,42 @@ impl<'a> LayoutBuilder<'a> {
                 start = end;
                 continue;
             }
-            if let Some(float_position) = graph.first_float_position_in_range(selected_range)
+            let affected_float_range = inline_float_affected_range(graph, selected_range);
+            if matches!(
+                affected_float_range,
+                InlineFloatAffectedRange::UnbreakableContinuation { .. }
+            ) && let Some(selection) = self.try_select_unbreakable_line_with_inline_floats(
+                graph,
+                selected_range,
+                SelectedInlineLineEnd {
+                    position: end,
+                    break_opportunity: graph.break_opportunity_at(end),
+                },
+                context,
+                InlineLinePhysicalRow {
+                    line_index,
+                    identity: line_identity,
+                    block_offset: physical_line_block_offset,
+                },
+            ) {
+                // The transaction has committed every float in source order
+                // and re-materialized the selected source range against its
+                // accepted band. Keep that geometry frozen for paint/replay.
+                physical_line_block_offset += selection.block_before
+                    + used_inline_line_block_advance(&selection.fragment, context.block_style);
+                fragments.push(SelectedInlineLine {
+                    fragment: selection.fragment,
+                    line_index,
+                    block_before: std::mem::take(&mut pending_block_before)
+                        + selection.block_before,
+                });
+                has_float_side_effects = true;
+                line_index += 1;
+                balanced_plan_index += 1;
+                start = end;
+                continue;
+            }
+            if let Some(float_position) = affected_float_range.marker()
                 && !placed_inline_float_positions.contains(&float_position)
             {
                 if matches!(
@@ -1321,7 +1609,7 @@ impl<'a> LayoutBuilder<'a> {
                     // line start instead of committing the preceding source
                     // as an in-flow prefix.
                     // <https://drafts.csswg.org/css-text-4/#text-wrap-style>
-                    self.place_inline_waiting_float(&float, context, line_index);
+                    self.place_inline_waiting_float(&float, float_position, context, line_index);
                     placed_inline_float_positions.push(float_position);
                     has_float_side_effects = true;
                     balanced_plan = None;
@@ -1330,7 +1618,12 @@ impl<'a> LayoutBuilder<'a> {
                 }
                 if float_position <= start {
                     if let Some(float) = graph.float_at_position(float_position).cloned() {
-                        self.place_inline_waiting_float(&float, context, line_index);
+                        self.place_inline_waiting_float(
+                            &float,
+                            float_position,
+                            context,
+                            line_index,
+                        );
                         placed_inline_float_positions.push(float_position);
                         has_float_side_effects = true;
                     }
@@ -1344,17 +1637,6 @@ impl<'a> LayoutBuilder<'a> {
                 // fit, the prefix is committed and the marker is retried at
                 // the next line top.
                 // <https://www.w3.org/TR/CSS22/visuren.html#float-position>
-                let break_opportunity = Some(InlineBreakOpportunity {
-                    position: float_position,
-                    kind: InlineBreakKind::FloatPlacement,
-                    priority: 110,
-                    trims: false,
-                    hangs: false,
-                    soft_hyphen: false,
-                    discretionary: None,
-                    emergency: false,
-                    min_content: true,
-                });
                 let mut prefix = self.materialize_inline_line_fragment(
                     graph,
                     InlineGraphRange {
@@ -1367,9 +1649,47 @@ impl<'a> LayoutBuilder<'a> {
                         identity: line_identity,
                         block_offset: physical_line_block_offset,
                     },
-                    break_opportunity,
+                    None,
                 );
                 let placement_snapshot = self.snapshot();
+                if matches!(
+                    context.block_style.text_wrap_style,
+                    css::TextWrapStyle::Balance
+                ) && let Some(float) = graph.float_at_position(float_position).cloned()
+                {
+                    // This is an unresolved source-order float, so the
+                    // greedy prefix that discovered it cannot establish its
+                    // physical row. Put the float below that provisional row,
+                    // then restart selection from the same source position.
+                    // The following balance pass sees the actual float band
+                    // and selects the preceding line against it. Placing it
+                    // beside the greedy prefix first would freeze the float
+                    // one row too early when balancing moves source back to
+                    // the preceding line.
+                    // <https://drafts.csswg.org/css-text-4/#text-wrap-style>
+                    // This float follows in-flow source. It is therefore not
+                    // adjoining the earlier float run, even though its
+                    // placement is deferred while the balance candidate is
+                    // replayed. Leaving the old origin active lets float
+                    // placement pull it back to the preceding float's top.
+                    self.adjoining_float_origin_y = None;
+                    self.place_inline_waiting_float(
+                        &float,
+                        float_position,
+                        context,
+                        line_index + 1,
+                    );
+                    placed_inline_float_positions.push(float_position);
+                    pending_balanced_float_replays.push(PendingBalancedFloatReplay {
+                        position: float_position,
+                        source_line_index: line_index,
+                        snapshot: placement_snapshot,
+                    });
+                    has_float_side_effects = true;
+                    balanced_plan = None;
+                    balanced_plan_index = 0;
+                    continue;
+                }
                 if let Some(placement) = self.try_place_inline_float_on_current_line(
                     graph,
                     float_position,
@@ -1380,6 +1700,22 @@ impl<'a> LayoutBuilder<'a> {
                 ) {
                     placed_inline_float_positions.push(float_position);
                     has_float_side_effects = true;
+                    if matches!(
+                        context.block_style.text_wrap_style,
+                        css::TextWrapStyle::Balance
+                    ) {
+                        // The source-order placement above establishes this
+                        // float's physical row. Re-select the whole balance
+                        // group with that resolved exclusion rather than
+                        // committing the greedy prefix that was only needed
+                        // to place the float. This is what lets a later float
+                        // move earlier source to a more balanced preceding
+                        // line without moving the float ahead of its source.
+                        // <https://drafts.csswg.org/css-text-4/#text-wrap-style>
+                        balanced_plan = None;
+                        balanced_plan_index = 0;
+                        continue;
+                    }
                     let suffix_start =
                         InlineGraphPosition::at_run_start(float_position.run_index + 1);
                     let suffix_is_empty =
@@ -1434,17 +1770,29 @@ impl<'a> LayoutBuilder<'a> {
                     start = suffix_start;
                     continue;
                 }
-                let break_opportunity = Some(InlineBreakOpportunity {
-                    position: float_position,
-                    kind: InlineBreakKind::FloatPlacement,
-                    priority: 110,
-                    trims: false,
-                    hangs: false,
-                    soft_hyphen: false,
-                    discretionary: None,
-                    emergency: false,
-                    min_content: true,
-                });
+                if matches!(
+                    context.block_style.text_wrap_style,
+                    css::TextWrapStyle::Balance
+                ) && let Some(float) = graph.float_at_position(float_position).cloned()
+                {
+                    // The float cannot share the provisional greedy prefix,
+                    // so it moves to the next formatted row. Keep the prefix
+                    // provisional too: once the float's real exclusion is
+                    // known, the balance search may move part of it onto a
+                    // different source line.
+                    // <https://drafts.csswg.org/css-text-4/#text-wrap-style>
+                    self.place_inline_waiting_float(
+                        &float,
+                        float_position,
+                        context,
+                        line_index + 1,
+                    );
+                    placed_inline_float_positions.push(float_position);
+                    has_float_side_effects = true;
+                    balanced_plan = None;
+                    balanced_plan_index = 0;
+                    continue;
+                }
                 let mut fragment = self.materialize_inline_line_fragment(
                     graph,
                     InlineGraphRange {
@@ -1457,7 +1805,7 @@ impl<'a> LayoutBuilder<'a> {
                         identity: line_identity,
                         block_offset: physical_line_block_offset,
                     },
-                    break_opportunity,
+                    None,
                 );
                 self.register_initial_letter_exclusion_for_line(
                     &mut fragment,
@@ -1492,82 +1840,32 @@ impl<'a> LayoutBuilder<'a> {
                 },
                 break_opportunity,
             );
-            // The selected fragment can contain an atomic inline whose used
-            // block size is greater than the inherited strut. Re-query the
-            // active float band with that real slab before committing the
-            // line. Without this second phase, a `line-height: 0` inline
-            // block is selected at a zero-height float boundary and paints
-            // beside a full-width float that it actually overlaps.
+            // CSS 2.2 requires a line that cannot contain its content beside
+            // a float to move down until a later float slab can contain it.
+            // This must happen after materialization: atomic inlines can make
+            // the line taller than the selection strut, changing its actual
+            // float-exclusion band.
             // <https://www.w3.org/TR/CSS22/visuren.html#floats>
-            // <https://drafts.csswg.org/css-inline-3/#line-boxes>
-            if context.block_style.allows_soft_wrap()
-                && remaining_source_has_soft_wrap
-                && context.block_style.writing_mode == WritingMode::HorizontalTb
+            // Inline-source float transactions own their own source-order
+            // retry rules. This CSS 2.2 line-clearance path is for ordinary
+            // established exclusions, not a suffix after an inline marker.
+            if placed_inline_float_positions.is_empty()
                 && !committed_slab_retry_used
-                && self
-                    .float_contexts
-                    .last()
-                    .is_some_and(|float_context| !float_context.shapes.is_empty())
-            {
-                let used_block_size = used_inline_line_block_size_from_items(
-                    &fragment.items,
-                    fragment.metrics.height,
-                    context.block_style,
-                );
-                let actual_band = self.inline_float_band_for_physical_slab(
-                    context.block_style,
-                    context.available_width,
-                    context.padding_left,
-                    PhysicalLineSlab::new(line_index, physical_line_block_offset, used_block_size),
-                );
-                let actual_indent = used_line_indent_for_formatted_line(
-                    line_identity.is_first_formatted_line,
-                    line_identity.starts_after_forced_break,
-                    context.hanging_indent,
-                    context.block_style,
-                    actual_band.width(),
-                );
-                let actual_available_width =
-                    InlineSelectionMeasures::new(context.available_width, actual_band)
-                        .band_after_indent(actual_indent);
-                let full_indent = used_line_indent_for_formatted_line(
-                    line_identity.is_first_formatted_line,
-                    line_identity.starts_after_forced_break,
-                    context.hanging_indent,
-                    context.block_style,
-                    context.available_width,
-                );
-                let full_available_width = (context.available_width - full_indent).max(0.0);
-                if fragment.metrics.width > actual_available_width + INLINE_FLOAT_EPSILON
-                    && fragment.metrics.width <= full_available_width + INLINE_FLOAT_EPSILON
-                {
-                    let position = self.inline_line_physical_position_with_block_offset(
+                && let Some(block_advance) = self.horizontal_float_clearance_retry_block_advance(
+                    &fragment,
+                    context,
+                    InlineLinePhysicalRow {
                         line_index,
-                        context.block_style,
-                        physical_line_block_offset,
-                    );
-                    let inline_span = PageInlineSpan::from_edges(
-                        position.content_left + context.padding_left,
-                        position.content_right,
-                    );
-                    if let Some(next_top) = self.float_contexts.last().and_then(|float_context| {
-                        float_context.next_content_slab_with_width(
-                            self.current_float_page_index(),
-                            PageBlockSpan::new(position.cursor_y, used_block_size),
-                            inline_span,
-                            fragment.metrics.width + full_indent,
-                        )
-                    }) {
-                        let block_advance = position.cursor_y - next_top.points();
-                        if block_advance > INLINE_FLOAT_EPSILON {
-                            physical_line_block_offset += block_advance;
-                            pending_block_before += block_advance;
-                            committed_slab_retry_used = true;
-                            balanced_plan = None;
-                            continue;
-                        }
-                    }
-                }
+                        identity: line_identity,
+                        block_offset: physical_line_block_offset,
+                    },
+                )
+            {
+                physical_line_block_offset += block_advance;
+                pending_block_before += block_advance;
+                committed_slab_retry_used = true;
+                balanced_plan = None;
+                continue;
             }
             // A retry after placing an inline-source float already selected
             // this fragment against that float's exclusion band. Preserve the
@@ -1604,16 +1902,11 @@ impl<'a> LayoutBuilder<'a> {
             start = end;
         }
         if context
-            .block_style
             .line_clamp
             .as_ref()
-            .is_some_and(|line_clamp| line_index == line_clamp.max_lines)
-            && (start < graph_end
-                || context
-                    .block_style
-                    .line_clamp
-                    .as_ref()
-                    .is_some_and(|line_clamp| line_clamp.continues_after_clamp_point))
+            .is_some_and(|line_clamp| line_index == line_clamp.max_lines())
+            && (!graph_remaining_after_position_is_trimmable(graph, start)
+                || line_clamp_has_later_in_flow_content(context))
             && let Some(fragment) = fragments.last_mut()
         {
             self.append_line_clamp_ellipsis(
@@ -1700,6 +1993,7 @@ impl<'a> LayoutBuilder<'a> {
                 start,
                 end,
                 line_index,
+                clamp_marker_replaces_source: false,
             });
             start = end.position;
             line_index += 1;
@@ -1710,9 +2004,10 @@ impl<'a> LayoutBuilder<'a> {
 
         let mut clamped_has_overflow = false;
         let mut clamp_source_end = None;
-        if let Some(line_clamp) = &context.block_style.line_clamp {
-            clamped_has_overflow = normal.len() > line_clamp.max_lines
-                || (normal.len() == line_clamp.max_lines && line_clamp.continues_after_clamp_point);
+        if let Some(line_clamp) = &context.line_clamp {
+            clamped_has_overflow = normal.len() > line_clamp.max_lines()
+                || (normal.len() == line_clamp.max_lines()
+                    && line_clamp_has_later_in_flow_content(context));
             if clamped_has_overflow {
                 // Apply the clamp marker to the ordinary final surviving
                 // line before choosing the source boundary to balance. The
@@ -1723,9 +2018,10 @@ impl<'a> LayoutBuilder<'a> {
                 // <https://drafts.csswg.org/css-overflow-4/#line-clamp>
                 clamp_source_end =
                     normal
-                        .get(line_clamp.max_lines.saturating_sub(1))
+                        .get(line_clamp.max_lines().saturating_sub(1))
                         .map(|entry| {
-                            let ellipsis_width = self.line_clamp_marker_width(context.block_style);
+                            let ellipsis_width = self
+                                .line_clamp_marker_width(context.line_clamp, context.block_style);
                             if ellipsis_width <= 0.0 {
                                 return entry.end.position;
                             }
@@ -1767,7 +2063,22 @@ impl<'a> LayoutBuilder<'a> {
                             }
                         });
             }
-            normal.truncate(line_clamp.max_lines);
+            normal.truncate(line_clamp.max_lines());
+            if let (Some(clamp_source_end), Some(final_line)) =
+                (clamp_source_end, normal.last_mut())
+                && clamp_source_end == final_line.start
+            {
+                // A marker-only final line is still a real planned line. It
+                // must survive balance selection and be materialized as the
+                // clamp ellipsis rather than falling through to the ordinary
+                // overflow fallback.
+                // <https://drafts.csswg.org/css-overflow-4/#block-ellipsis>
+                final_line.end = SelectedInlineLineEnd {
+                    position: clamp_source_end,
+                    break_opportunity: None,
+                };
+                final_line.clamp_marker_replaces_source = true;
+            }
         }
 
         let mut output = normal.clone();
@@ -1809,10 +2120,10 @@ impl<'a> LayoutBuilder<'a> {
         context: InlineParagraphContext<'_>,
         _line_index: usize,
     ) {
-        let Some(line_clamp) = &context.block_style.line_clamp else {
+        let Some(line_clamp) = &context.line_clamp else {
             return;
         };
-        let marker = match &line_clamp.ellipsis {
+        let marker = match line_clamp.ellipsis() {
             css::BlockEllipsis::Auto => "…",
             css::BlockEllipsis::None => return,
             css::BlockEllipsis::String(marker) if marker.is_empty() => return,
@@ -1933,7 +2244,7 @@ impl<'a> LayoutBuilder<'a> {
         let group_end_position = clamp_source_end
             .unwrap_or_else(|| group.last().expect("non-empty balance group").end.position);
         let ellipsis_width = if includes_clamp_ellipsis {
-            self.line_clamp_marker_width(context.block_style)
+            self.line_clamp_marker_width(context.line_clamp, context.block_style)
         } else {
             0.0
         };
@@ -1977,7 +2288,7 @@ impl<'a> LayoutBuilder<'a> {
                     entry
                         .end
                         .break_opportunity
-                        .is_some_and(|opportunity| opportunity.emergency)
+                        .is_some_and(|opportunity| opportunity.availability.is_fallback())
                 }),
             },
             group[0].start,
@@ -2016,29 +2327,10 @@ impl<'a> LayoutBuilder<'a> {
         let remaining_allows_last =
             graph_remaining_allows_last_hanging_punctuation(graph, end.position);
         let applies_first_line_style = line_index == 0 && block_style.first_line_style.is_some();
-        if !applies_first_line_style
-            && let Some(measurement) = graph.borrowed_line_measurement_for_full_run_range(
-                range,
-                end.break_opportunity,
-                &mut self.font_system,
-                block_style,
-            )
-        {
-            let runs = &graph.runs[measurement.run_range];
-            if runs.is_empty() {
-                return 0.0;
-            }
-            let hanging_widths = hanging_punctuation_widths_for_line_items(
-                &mut self.font_system,
-                runs,
-                block_style,
-                line_index == 0,
-                remaining_allows_last,
-                true,
-            );
-            return (measurement.fitting_width - hanging_widths.start - hanging_widths.end)
-                .max(0.0);
-        }
+        // Do not use the graph's borrowed prefix measure here. Materializing
+        // the candidate is what applies selected edge trimming, atomic-inline
+        // word-spacing ownership, and pseudo-style shaping before both
+        // balance scoring and ordinary fallback selection.
         let mut materialized = graph.materialize_line(
             range,
             end.break_opportunity,
@@ -2159,7 +2451,7 @@ impl<'a> LayoutBuilder<'a> {
             .break_opportunities_after(start)
             .filter(|opportunity| {
                 self.mixed_graph_opportunity_allowed(search.graph, *opportunity)
-                    && (search.allow_emergency_breaks || !opportunity.emergency)
+                    && (search.allow_emergency_breaks || !opportunity.availability.is_fallback())
                     && opportunity.position <= search.group_end
                     && (is_final_line == (opportunity.position == search.group_end))
             })
@@ -2207,6 +2499,7 @@ impl<'a> LayoutBuilder<'a> {
                 start,
                 end,
                 line_index,
+                clamp_marker_replaces_source: false,
             });
             candidate
                 .remaining_inline_space
@@ -2220,11 +2513,15 @@ impl<'a> LayoutBuilder<'a> {
     /// Measure the block overflow marker using the clamp container's root
     /// inline style, not the last source fragment's style.
     /// <https://drafts.csswg.org/css-overflow-4/#block-ellipsis>
-    fn line_clamp_marker_width(&mut self, block_style: &ComputedStyle) -> f32 {
-        let Some(line_clamp) = &block_style.line_clamp else {
+    fn line_clamp_marker_width(
+        &mut self,
+        line_clamp: Option<css::InlineLineClamp<'_>>,
+        block_style: &ComputedStyle,
+    ) -> f32 {
+        let Some(line_clamp) = line_clamp else {
             return 0.0;
         };
-        let marker = match &line_clamp.ellipsis {
+        let marker = match line_clamp.ellipsis() {
             css::BlockEllipsis::Auto => "…",
             css::BlockEllipsis::None => return 0.0,
             css::BlockEllipsis::String(marker) => marker,
@@ -2864,54 +3161,174 @@ impl<'a> LayoutBuilder<'a> {
     /// according to the active float band:
     /// <https://www.w3.org/TR/css-text-3/#white-space-property> and
     /// <https://www.w3.org/TR/CSS22/visuren.html#float-position>.
-    pub(in crate::layout) fn try_select_unbreakable_line_with_inline_floats(
+    fn try_select_unbreakable_line_with_inline_floats(
         &mut self,
         graph: &InlineOpportunityGraph,
         range: InlineGraphRange,
         selected_end: SelectedInlineLineEnd,
         context: InlineParagraphContext<'_>,
         row: InlineLinePhysicalRow,
-    ) -> Option<InlineLineFragment> {
-        graph.first_float_position_in_range(range)?;
+    ) -> Option<UnbreakableInlineFloatSelection> {
+        let first_float_position = graph.first_float_position_in_range(range)?;
         let break_opportunity = selected_end.break_opportunity.filter(|opportunity| {
             opportunity.position == range.end && range.end < graph.end_position()
         });
-        let mut fragment =
+        // First select the complete in-flow continuation without letting its
+        // out-of-flow markers alter the current line's band. When that
+        // continuation overflows the current band, CSS Text has no legal
+        // point at which to split it merely because a float occurs in the
+        // source. Commit the word as one line, then place its floats on the
+        // following row in source order.
+        //
+        // This is observably different from a fitting continuation: a float
+        // may share a line with text when both fit, but it cannot make an
+        // unbreakable word wrap at its marker.
+        // <https://www.w3.org/TR/css-text-3/#line-break-details>
+        // <https://www.w3.org/TR/CSS22/visuren.html#float-position>
+        let mut unbreakable_source =
             self.materialize_inline_line_fragment(graph, range, context, row, break_opportunity);
+        if first_float_position > range.start
+            && unbreakable_source.metrics.width
+                > unbreakable_source.available_width + INLINE_FLOAT_EPSILON
+        {
+            let snapshot = self.snapshot();
+            let deferred_row = InlineLinePhysicalRow {
+                line_index: row.line_index + 1,
+                identity: row.identity,
+                block_offset: row.block_offset
+                    + used_inline_line_block_advance(&unbreakable_source, context.block_style),
+            };
+            let mut search_start = first_float_position;
+            while let Some(float_position) = graph.first_float_position_in_range(InlineGraphRange {
+                start: search_start,
+                end: range.end,
+            }) {
+                let float = graph
+                    .float_at_position(float_position)
+                    .expect("float marker has an inline float");
+                if !self
+                    .place_inline_waiting_float_on_row(float, float_position, context, deferred_row)
+                    .is_placed()
+                {
+                    self.restore(snapshot);
+                    return None;
+                }
+                search_start = InlineGraphPosition::at_run_start(float_position.run_index + 1);
+            }
+            // The deferred floats are already committed to the following
+            // row. Freeze this line's geometry so later painting does not
+            // re-query their exclusion against the preceding source line.
+            unbreakable_source.suppress_float_adjust = true;
+            return Some(UnbreakableInlineFloatSelection {
+                fragment: unbreakable_source,
+                block_before: 0.0,
+            });
+        }
         let snapshot = self.snapshot();
         let mut search_start = range.start;
         while let Some(float_position) = graph.first_float_position_in_range(InlineGraphRange {
             start: search_start,
             end: range.end,
         }) {
-            // A float after an unbreakable inline prefix cannot affect that
-            // prefix's line box. Preserve the whole unbreakable source run
-            // as one line and place a fitting float at that line's top. This
-            // path is selected from graph opportunities, so it covers a
-            // descendant `nowrap` span even when the containing block itself
-            // still permits wrapping. CSS 2.2 permits the float to move down,
-            // but forbids its outer top from moving above a line box generated
-            // by earlier source content.
+            let mut checkpoint = InlineFloatTransactionCheckpoint {
+                source_range: range,
+                selected_end,
+                marker: float_position,
+                row,
+                placement_floor: InlineLinePhysicalRow {
+                    line_index: 0,
+                    identity: row.identity,
+                    block_offset: row.block_offset,
+                },
+                snapshot: snapshot.clone(),
+            };
+            // A float marker is not a CSS Text wrap opportunity, so the whole
+            // source range stays on this line. It is nevertheless placed in
+            // source order at that line's top, after which every source item
+            // (including a prefix before the marker) participates in the
+            // resulting exclusion band. This path also covers a descendant
+            // `nowrap` span when its containing block still permits wrapping.
+            // CSS 2.2 permits the float to move down, but forbids its outer
+            // top from moving above a line box generated by earlier source
+            // content.
             // <https://www.w3.org/TR/CSS22/visuren.html#float-position>
             if float_position > range.start {
-                if !self.try_place_inline_float_in_line_band(
-                    graph,
-                    float_position,
-                    context,
-                    row.line_index,
-                    row.identity,
-                ) {
+                let float = graph
+                    .float_at_position(float_position)
+                    .expect("float marker has an inline float");
+                if float.style().float == Float::Right {
+                    // A negative physical end margin can make the float's
+                    // margin box fit at the preceding-line floor even after
+                    // the source prefix has consumed the visual line band.
+                    // Otherwise first try the current source row; if that
+                    // is not legal, start shared float placement one physical
+                    // line below without creating a CSS Text marker break.
+                    // <https://www.w3.org/TR/CSS22/visuren.html#float-position>
+                    if float.style().margin.right < -INLINE_FLOAT_EPSILON {
+                        let accepted =
+                            self.place_inline_float_transaction(float, context, checkpoint);
+                        if !accepted.is_placed() {
+                            self.restore(snapshot);
+                            return None;
+                        }
+                    } else {
+                        let prefix = self.materialize_inline_line_fragment(
+                            graph,
+                            InlineGraphRange {
+                                start: range.start,
+                                end: float_position,
+                            },
+                            context,
+                            row,
+                            None,
+                        );
+                        if self
+                            .try_place_inline_float_on_current_line(
+                                graph,
+                                float_position,
+                                prefix.metrics.width,
+                                context,
+                                row.line_index,
+                                row.identity,
+                            )
+                            .is_none()
+                        {
+                            checkpoint.placement_floor = InlineLinePhysicalRow {
+                                line_index: row.line_index,
+                                identity: row.identity,
+                                block_offset: row.block_offset + context.block_style.line_height,
+                            };
+                            let accepted =
+                                self.place_inline_float_transaction(float, context, checkpoint);
+                            if !accepted.is_placed() {
+                                self.restore(snapshot);
+                                return None;
+                            }
+                        }
+                    }
+                } else if !self
+                    .try_place_inline_float_in_line_band(
+                        graph,
+                        float_position,
+                        context,
+                        row.line_index,
+                        row.identity,
+                    )
+                    .is_placed()
+                {
                     self.restore(snapshot);
                     return None;
                 }
             } else if float_position == range.start
-                && !self.try_place_inline_float_in_line_band(
-                    graph,
-                    float_position,
-                    context,
-                    row.line_index,
-                    row.identity,
-                )
+                && !self
+                    .try_place_inline_float_in_line_band(
+                        graph,
+                        float_position,
+                        context,
+                        row.line_index,
+                        row.identity,
+                    )
+                    .is_placed()
             {
                 self.restore(snapshot);
                 return None;
@@ -2921,17 +3338,194 @@ impl<'a> LayoutBuilder<'a> {
                 break;
             }
         }
+        // The float exclusions were committed after the source range was
+        // selected. Re-materialize the whole unbreakable line against their
+        // final band instead of preserving the pre-float fragment: a left
+        // float can shift text that precedes its zero-advance source marker,
+        // while a right float still leaves the overflowing source unbroken.
+        // Keep this resolved geometry frozen for paint, because later line
+        // selection can add exclusions to the live float context.
+        // <https://www.w3.org/TR/CSS22/visuren.html#float-position>
+        // <https://www.w3.org/TR/css-text-3/#white-space-property>
+        let mut fragment =
+            self.materialize_inline_line_fragment(graph, range, context, row, break_opportunity);
+        let block_before = if first_float_position == range.start {
+            self.horizontal_float_clearance_retry_block_advance(&fragment, context, row)
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        if block_before > INLINE_FLOAT_EPSILON {
+            fragment = self.materialize_inline_line_fragment(
+                graph,
+                range,
+                context,
+                InlineLinePhysicalRow {
+                    line_index: row.line_index,
+                    identity: row.identity,
+                    block_offset: row.block_offset + block_before,
+                },
+                break_opportunity,
+            );
+        }
+        // Preserve zero-advance graph markers in the durable source line.
+        // They own source shaping and whitespace boundaries; replay consumes
+        // the already-committed transaction rather than treating the marker
+        // as another floated subtree layout request.
         fragment.suppress_float_adjust = true;
-        Some(fragment)
+        Some(UnbreakableInlineFloatSelection {
+            fragment,
+            block_before,
+        })
+    }
+
+    /// Find the later horizontal float slab required by CSS 2.2 when an
+    /// unbreakable source line overflows a float-shortened line box.
+    ///
+    /// The float has already been placed in source order. This retry moves
+    /// only the selected in-flow source line, then lets materialization query
+    /// the accepted destination slab. Vertical writing keeps its distinct
+    /// logical-band retry model.
+    /// <https://www.w3.org/TR/CSS22/visuren.html#floats>
+    fn horizontal_float_clearance_retry_block_advance(
+        &self,
+        fragment: &InlineLineFragment,
+        context: InlineParagraphContext<'_>,
+        row: InlineLinePhysicalRow,
+    ) -> Option<f32> {
+        if context.block_style.writing_mode != WritingMode::HorizontalTb
+            || fragment.metrics.width <= INLINE_FLOAT_EPSILON
+        {
+            return None;
+        }
+
+        let used_block_size = used_inline_line_block_size_from_items(
+            &fragment.items,
+            fragment.metrics.height,
+            context.block_style,
+        );
+        let position = self.inline_line_physical_position_with_block_offset(
+            row.line_index,
+            context.block_style,
+            row.block_offset,
+        );
+        let actual_band = self.inline_float_band_for_physical_slab(
+            context.block_style,
+            context.available_width,
+            context.padding_left,
+            PhysicalLineSlab::new(row.line_index, row.block_offset, used_block_size),
+        );
+        let actual_indent = used_line_indent_for_formatted_line(
+            row.identity.is_first_formatted_line,
+            row.identity.starts_after_forced_break,
+            context.hanging_indent,
+            context.block_style,
+            actual_band.width(),
+        );
+        let actual_available = InlineSelectionMeasures::new(context.available_width, actual_band)
+            .band_after_indent(actual_indent);
+        let full_indent = used_line_indent_for_formatted_line(
+            row.identity.is_first_formatted_line,
+            row.identity.starts_after_forced_break,
+            context.hanging_indent,
+            context.block_style,
+            context.available_width,
+        );
+        let full_available = (context.available_width - full_indent).max(0.0);
+        if fragment.metrics.width <= actual_available + INLINE_FLOAT_EPSILON
+            || actual_available >= full_available - INLINE_FLOAT_EPSILON
+        {
+            return None;
+        }
+
+        let required_width = float_clearance_required_width(
+            fragment.metrics.width,
+            full_indent,
+            context.available_width,
+        );
+        // `available_width` is measured from the containing block's physical
+        // inline start. `padding_left` only offsets a selected line inside
+        // that measure; applying it again would make a full-width retry ask
+        // a narrower physical span than the CSS containing block.
+        let inline_span = PageInlineSpan::from_edges(
+            position.content_left,
+            position.content_left + context.available_width,
+        );
+        let next_top = self.float_contexts.last()?.next_content_slab_with_width(
+            self.current_float_page_index(),
+            PageBlockSpan::new(position.cursor_y, used_block_size),
+            inline_span,
+            required_width,
+        )?;
+        let block_advance = position.cursor_y - next_top.points();
+        (block_advance > INLINE_FLOAT_EPSILON).then_some(block_advance)
     }
 
     pub(in crate::layout) fn place_inline_waiting_float(
         &mut self,
         float: &InlineFloat,
+        marker: InlineGraphPosition,
         context: InlineParagraphContext<'_>,
         line_index: usize,
     ) {
-        let position = self.inline_line_physical_position(line_index, context.block_style);
+        let _ = self.place_inline_waiting_float_on_row(
+            float,
+            marker,
+            context,
+            InlineLinePhysicalRow {
+                line_index,
+                identity: SelectedLineIdentity {
+                    is_first_formatted_line: false,
+                    starts_after_forced_break: false,
+                },
+                block_offset: 0.0,
+            },
+        );
+    }
+
+    fn place_inline_float_transaction(
+        &mut self,
+        float: &InlineFloat,
+        context: InlineParagraphContext<'_>,
+        checkpoint: InlineFloatTransactionCheckpoint,
+    ) -> InlineFloatBandPlacement {
+        debug_assert!(checkpoint.source_range.start <= checkpoint.marker);
+        debug_assert!(checkpoint.marker < checkpoint.source_range.end);
+        debug_assert!(checkpoint.placement_floor.line_index <= checkpoint.row.line_index);
+        debug_assert!(
+            !matches!(
+                checkpoint.selected_end.break_opportunity,
+                Some(InlineBreakOpportunity {
+                    kind: InlineBreakKind::FloatPlacement,
+                    ..
+                })
+            ),
+            "a float marker cannot be the transaction's CSS Text endpoint"
+        );
+        let outcome = self.place_inline_waiting_float_on_row(
+            float,
+            checkpoint.marker,
+            context,
+            checkpoint.placement_floor,
+        );
+        if !outcome.is_placed() {
+            self.restore(checkpoint.snapshot);
+        }
+        outcome
+    }
+
+    fn place_inline_waiting_float_on_row(
+        &mut self,
+        float: &InlineFloat,
+        marker: InlineGraphPosition,
+        context: InlineParagraphContext<'_>,
+        row: InlineLinePhysicalRow,
+    ) -> InlineFloatBandPlacement {
+        let position = self.inline_line_physical_position_with_block_offset(
+            row.line_index,
+            context.block_style,
+            row.block_offset,
+        );
         let saved_content_left = self.content_left;
         let saved_content_right = self.content_right;
         let saved_cursor_y = self.cursor_y;
@@ -2948,7 +3542,7 @@ impl<'a> LayoutBuilder<'a> {
             position.cursor_y,
         );
         let generated_float_children = [];
-        self.layout_floating_child(
+        let placed = self.layout_floating_child(
             float.element(),
             float.signature().clone(),
             float.style(),
@@ -2959,12 +3553,44 @@ impl<'a> LayoutBuilder<'a> {
             context.stylesheets,
             &mut run,
         );
+        if placed
+            && let Some(exclusion) = self
+                .float_contexts
+                .last()
+                .and_then(|float_context| float_context.shapes.last())
+                .filter(|shape| shape.is_css_float())
+                .cloned()
+        {
+            self.commit_inline_float(float, marker, row.line_index, exclusion);
+        }
         if pushed_containing_block {
             self.containing_blocks.pop();
         }
         self.content_left = saved_content_left;
         self.content_right = saved_content_right;
         self.cursor_y = saved_cursor_y;
+        if placed {
+            InlineFloatBandPlacement::Placed
+        } else {
+            InlineFloatBandPlacement::Rejected
+        }
+    }
+
+    fn commit_inline_float(
+        &mut self,
+        float: &InlineFloat,
+        marker: InlineGraphPosition,
+        selected_row: usize,
+        exclusion: FloatShape,
+    ) {
+        self.committed_inline_floats.insert(
+            float.element().id,
+            CommittedInlineFloat {
+                marker: (marker.run_index, marker.byte_offset),
+                selected_row,
+                exclusion,
+            },
+        );
     }
 
     /// Position an inline-source float against the whole current line band.
@@ -2980,7 +3606,7 @@ impl<'a> LayoutBuilder<'a> {
         context: InlineParagraphContext<'_>,
         line_index: usize,
         line_identity: SelectedLineIdentity,
-    ) -> bool {
+    ) -> InlineFloatBandPlacement {
         if context.block_style.writing_mode != WritingMode::HorizontalTb {
             // A source-order float still establishes a physical CSS float in
             // vertical and sideways text. Its later line-wrap effect is
@@ -2990,7 +3616,7 @@ impl<'a> LayoutBuilder<'a> {
             // <https://drafts.csswg.org/css-writing-modes-4/#logical-to-physical>
             // <https://drafts.csswg.org/css-inline-3/#initial-letter-floats>
             let Some(float) = graph.float_at_position(float_position).cloned() else {
-                return false;
+                return InlineFloatBandPlacement::Rejected;
             };
             let snapshot = self.snapshot();
             let saved_content_left = self.content_left;
@@ -3029,16 +3655,30 @@ impl<'a> LayoutBuilder<'a> {
             if pushed_containing_block {
                 self.containing_blocks.pop();
             }
+            let exclusion = self
+                .float_contexts
+                .last()
+                .and_then(|float_context| float_context.shapes.last())
+                .cloned();
             let accepted = placed
                 && self.pages.len() == snapshot.pages.len()
-                && self.float_contexts.last().is_some_and(|float_context| {
-                    float_context.shapes.len() > shape_count_before
-                        && float_context.shapes.last().is_some_and(|shape| {
+                && match self.float_contexts.last() {
+                    Some(float_context) if float_context.shapes.len() > shape_count_before => {
+                        float_context.shapes.last().is_some_and(|shape| {
                             shape.is_css_float()
                                 && shape.page_index == self.current_float_page_index()
                         })
-                });
+                    }
+                    // An empty inline float has no physical exclusion, but
+                    // its zero-advance marker was successfully consumed.
+                    // It must remain distinct from a failed placement so it
+                    // cannot manufacture a CSS Text source split.
+                    _ => true,
+                };
             if accepted {
+                if let Some(exclusion) = exclusion {
+                    self.commit_inline_float(&float, float_position, line_index, exclusion);
+                }
                 self.content_left = saved_content_left;
                 self.content_right = saved_content_right;
                 self.cursor_y = saved_cursor_y;
@@ -3046,10 +3686,14 @@ impl<'a> LayoutBuilder<'a> {
             } else {
                 self.restore(snapshot);
             }
-            return accepted;
+            return if accepted {
+                InlineFloatBandPlacement::Placed
+            } else {
+                InlineFloatBandPlacement::Rejected
+            };
         }
         let Some(float) = graph.float_at_position(float_position).cloned() else {
-            return false;
+            return InlineFloatBandPlacement::Rejected;
         };
         let block_style = context.block_style;
         let band = self.inline_float_band_for_line(
@@ -3068,10 +3712,6 @@ impl<'a> LayoutBuilder<'a> {
         let line_left = self.content_left + context.padding_left + band.left_offset() + line_indent;
         let line_right =
             self.content_left + context.padding_left + band.left_offset() + band.width();
-        if line_right - line_left <= INLINE_FLOAT_EPSILON {
-            return false;
-        }
-
         let snapshot = self.snapshot();
         let saved_content_left = self.content_left;
         let saved_content_right = self.content_right;
@@ -3106,33 +3746,46 @@ impl<'a> LayoutBuilder<'a> {
         if pushed_containing_block {
             self.containing_blocks.pop();
         }
+        let exclusion = self
+            .float_contexts
+            .last()
+            .and_then(|context| context.shapes.last())
+            .cloned();
         let accepted = if placed && self.pages.len() == snapshot.pages.len() {
-            self.float_contexts
-                .last()
-                .and_then(|context| context.shapes.last())
-                .is_some_and(|shape| {
-                    let float_inline_span = shape.margin_box_inline_span();
-                    let float_block_span = shape.margin_box_block_span();
-                    let float_width = float_inline_span.width();
-                    let band_width = line_right - line_left;
-                    shape.page_index == self.pages.len()
-                        && (float_block_span.top_y() - target_top).abs() <= INLINE_FLOAT_EPSILON
-                        && ((float_inline_span.left_x() + INLINE_FLOAT_EPSILON >= line_left
-                            && float_inline_span.right_x() <= line_right + INLINE_FLOAT_EPSILON)
-                            || float_width > band_width + INLINE_FLOAT_EPSILON)
-                })
+            exclusion.as_ref().is_none_or(|shape| {
+                let float_block_span = shape.margin_box_block_span();
+                let outer_edges = shape.outer_inline_edges();
+                let line_band = PageInlineSpan::from_edges(line_left, line_right);
+                let fits_line_band = outer_edges.fits_at_used_side_in_band(
+                    shape.side,
+                    line_band,
+                    INLINE_FLOAT_EPSILON,
+                );
+                shape.page_index == self.pages.len()
+                    && (float_block_span.top_y() - target_top).abs() <= INLINE_FLOAT_EPSILON
+                    && (fits_line_band
+                        || outer_edges.signed_extent().points()
+                            > line_band.width() + INLINE_FLOAT_EPSILON)
+            })
         } else {
             false
         };
         if accepted {
+            if let Some(exclusion) = &exclusion {
+                self.commit_inline_float(&float, float_position, line_index, exclusion.clone());
+            }
             self.content_left = saved_content_left;
             self.content_right = saved_content_right;
             self.cursor_y = saved_cursor_y;
             self.containing_block_direction = saved_direction;
-            true
+            if exclusion.is_none() || line_right - line_left <= INLINE_FLOAT_EPSILON {
+                InlineFloatBandPlacement::PlacedInZeroWidthBand
+            } else {
+                InlineFloatBandPlacement::Placed
+            }
         } else {
             self.restore(snapshot);
-            false
+            InlineFloatBandPlacement::Rejected
         }
     }
 
@@ -3170,17 +3823,12 @@ impl<'a> LayoutBuilder<'a> {
             Direction::Ltr => ((line_left + prefix_width).min(line_right), line_right),
             Direction::Rtl => (line_left, (line_right - prefix_width).max(line_left)),
         };
-        if remaining_right - remaining_left <= INLINE_FLOAT_EPSILON {
-            return None;
-        }
-
         let snapshot = self.snapshot();
         let saved_content_left = self.content_left;
         let saved_content_right = self.content_right;
         let saved_cursor_y = self.cursor_y;
         let saved_direction = self.containing_block_direction;
         let target_top = self.cursor_y - block_style.line_height * line_index as f32;
-
         self.content_left = remaining_left;
         self.content_right = remaining_right;
         self.cursor_y = target_top;
@@ -3211,37 +3859,52 @@ impl<'a> LayoutBuilder<'a> {
         let accepted_shape = if placed && self.pages.len() == snapshot.pages.len() {
             self.float_contexts.last().and_then(|context| {
                 context.shapes.last().and_then(|shape| {
-                    let float_inline_span = shape.margin_box_inline_span();
                     let float_block_span = shape.margin_box_block_span();
-                    let fits_remaining_band = float_inline_span.left_x() + INLINE_FLOAT_EPSILON
-                        >= remaining_left
-                        && float_inline_span.right_x() <= remaining_right + INLINE_FLOAT_EPSILON;
+                    let outer_edges = shape.outer_inline_edges();
+                    let remaining_band =
+                        PageInlineSpan::from_edges(remaining_left, remaining_right);
+                    let fits_remaining_band = outer_edges.fits_at_used_side_in_band(
+                        shape.side,
+                        remaining_band,
+                        INLINE_FLOAT_EPSILON,
+                    );
                     let accepted = shape.page_index == self.pages.len()
                         && (float_block_span.top_y() - target_top).abs() <= INLINE_FLOAT_EPSILON
                         && (fits_remaining_band
                             || (prefix_width <= INLINE_FLOAT_EPSILON
-                                && float_inline_span.width()
-                                    > remaining_right - remaining_left + INLINE_FLOAT_EPSILON));
-                    accepted.then_some(InlineFloatPlacement::new(
-                        line_left,
-                        line_right,
-                        prefix_width,
-                        float_inline_span.left_x(),
-                        float_inline_span.right_x(),
-                        fits_remaining_band,
-                        shape.side,
-                    ))
+                                && outer_edges.signed_extent().points()
+                                    > remaining_band.width() + INLINE_FLOAT_EPSILON));
+                    accepted.then_some((fits_remaining_band, shape.clone()))
                 })
             })
         } else {
             None
         };
-        if let Some(placement) = accepted_shape {
+        if let Some((fits_remaining_band, exclusion)) = accepted_shape {
+            self.commit_inline_float(&float, float_position, line_index, exclusion);
             self.content_left = saved_content_left;
             self.content_right = saved_content_right;
             self.cursor_y = saved_cursor_y;
             self.containing_block_direction = saved_direction;
-            Some(placement)
+            let post_float_band = self.inline_float_band_for_line(
+                line_index,
+                block_style,
+                context.available_width,
+                context.padding_left,
+            );
+            let post_float_left =
+                self.content_left + context.padding_left + post_float_band.left_offset();
+            let post_float_right = self.content_left + context.padding_left + post_float_band.end();
+            Some(InlineFloatPlacement::new(
+                line_left,
+                line_right,
+                prefix_width,
+                PageInlineSpan::from_edges(
+                    post_float_left.max(line_left),
+                    post_float_right.min(line_right),
+                ),
+                fits_remaining_band,
+            ))
         } else {
             self.restore(snapshot);
             None
@@ -3296,16 +3959,13 @@ impl<'a> LayoutBuilder<'a> {
         {
             return None;
         }
-        let prefix_right = placement.prefix_right();
-        let (float_gap, suffix_available_width) = match placement.side {
-            UsedFloatSide::Left | UsedFloatSide::Top => (
-                (placement.float_right() - prefix_right).max(0.0),
-                (placement.line_right() - placement.float_right()).max(0.0),
-            ),
-            UsedFloatSide::Right | UsedFloatSide::Bottom => {
-                (0.0, (placement.float_left() - prefix_right).max(0.0))
-            }
-        };
+        // The float's signed outer margin geometry chose its placement, but
+        // only the resulting non-negative exclusion band controls the
+        // following in-flow suffix. In particular, a negative end margin may
+        // leave that band unchanged while painting the float past its edge.
+        // <https://www.w3.org/TR/CSS22/visuren.html#float-position>
+        let float_gap = placement.same_line_suffix_gap();
+        let suffix_available_width = placement.same_line_suffix_available_width();
         if suffix_available_width <= INLINE_FLOAT_EPSILON {
             return None;
         }
@@ -3359,6 +4019,7 @@ impl<'a> LayoutBuilder<'a> {
             width: float_gap,
             shaped: None,
         });
+        let suffix_text = suffix.used_text();
         combined_items.extend(suffix.items);
         let width = combined_items.iter().map(|item| item.width).sum::<f32>();
         let metrics = self.mixed_inline_line_metrics(&combined_items, context.block_style, width);
@@ -3366,7 +4027,7 @@ impl<'a> LayoutBuilder<'a> {
             return None;
         }
         let mut text = prefix.text().to_string();
-        text.push_str(&suffix.text);
+        text.push_str(&suffix_text);
         Some(CombinedInlineFloatLine {
             end,
             fragment: InlineLineFragment::new(
@@ -3470,77 +4131,76 @@ impl<'a> LayoutBuilder<'a> {
         // the ordinary last-fitting-line policy.
         // <https://drafts.csswg.org/css-text-4/#wrap-inside-property>
         let mut regular_fit = None::<(u16, SelectedInlineLineEnd)>;
-        let mut emergency_fit = None::<(u16, SelectedInlineLineEnd)>;
+        // CSS Text 4 relaxes candidates in ordered stages. Keeping one best
+        // candidate per stage makes it impossible for an overflow fallback to
+        // outrank a deferred `keep-all` or `auto-phrase` boundary merely
+        // because it appears later in source order.
+        let mut fallback_fits = [None::<(u16, SelectedInlineLineEnd)>; 3];
+        // A zero-width line can have no fitting candidate at all. Preserve
+        // the first candidate in each deferred stage so CSS Text can still
+        // make progress with its required overflow relaxation (notably an
+        // authored `&shy;` under `auto-phrase`).
+        let mut fallback_overflows = [None::<SelectedInlineLineEnd>; 3];
+        // A `break-spaces` boundary is an ordinary, source-order boundary
+        // *after* its preserved space. Unlike the other ordinary boundaries,
+        // its selected line is allowed to overflow: CSS Text retains the
+        // space's advance rather than hanging or trimming it. Keep that
+        // deliberate overflow separate from fitting candidates. Any fitting
+        // candidate, including an `overflow-wrap` emergency boundary before
+        // the preserved space, must win because CSS Text requires line
+        // wrapping to minimize overflow.
+        // <https://drafts.csswg.org/css-text-3/#valdef-white-space-break-spaces>
+        let mut overflowing_break_spaces = None::<SelectedInlineLineEnd>;
         let opportunities = graph.break_opportunities_after(start).collect::<Vec<_>>();
-        if let Some(selected) = self.select_monotonic_regular_line_end(
-            graph,
-            start,
-            block_style,
-            line_available_width,
-            &opportunities,
-        ) {
+        // `::first-line` can change shaping advances (notably
+        // `word-spacing`), so its candidate measurements are not the graph's
+        // monotonic source measurements. Keep it on the shared materialized
+        // measurement path used by balancing and final paint.
+        // <https://drafts.csswg.org/css-pseudo-4/#first-line-pseudo>
+        if (line_index != 0 || block_style.first_line_style.is_none())
+            && let Some(selected) = self.select_monotonic_regular_line_end(
+                graph,
+                start,
+                block_style,
+                line_available_width,
+                &opportunities,
+            )
+        {
             return selected;
         }
         for opportunity in opportunities {
+            // A source-order float marker participates in float placement,
+            // never in CSS Text line breaking. In particular, selecting it
+            // here would split a `white-space: pre`/`nowrap` continuation and
+            // could make an earlier hyphenation opportunity look like a
+            // legitimate rewind target.
+            // <https://www.w3.org/TR/css-text-3/#line-breaking>
+            // <https://www.w3.org/TR/CSS22/visuren.html#float-position>
+            if matches!(opportunity.kind, InlineBreakKind::FloatPlacement) {
+                continue;
+            }
             if !self.mixed_graph_opportunity_allowed(graph, opportunity) {
                 continue;
             }
-            let range = InlineGraphRange {
-                start,
-                end: opportunity.position,
-            };
             let selected_break =
                 (opportunity.position < graph.end_position()).then_some(opportunity);
-            let remaining_allows_last =
-                graph_remaining_allows_last_hanging_punctuation(graph, opportunity.position);
-            let fit_width = if let Some(measurement) = graph
-                .borrowed_line_measurement_for_full_run_range(
-                    range,
-                    selected_break,
-                    &mut self.font_system,
-                    block_style,
-                ) {
-                let runs = &graph.runs[measurement.run_range];
-                if runs.is_empty() {
-                    continue;
-                }
-                let hanging_widths = hanging_punctuation_widths_for_line_items(
-                    &mut self.font_system,
-                    runs,
-                    block_style,
-                    line_index == 0,
-                    remaining_allows_last,
-                    true,
-                );
-                (measurement.fitting_width - hanging_widths.start - hanging_widths.end).max(0.0)
-            } else {
-                let materialized = graph.materialize_line_for_available_width(
-                    range,
-                    selected_break,
-                    line_available_width,
-                    &mut self.font_system,
-                    block_style,
-                );
-                if materialized.items.is_empty() {
-                    continue;
-                }
-                let hanging_widths = hanging_punctuation_widths_for_line_items(
-                    &mut self.font_system,
-                    &materialized.items,
-                    block_style,
-                    line_index == 0,
-                    remaining_allows_last,
-                    true,
-                );
-                (materialized.fitting_width - hanging_widths.start - hanging_widths.end).max(0.0)
+            let selected = SelectedInlineLineEnd {
+                position: opportunity.position,
+                break_opportunity: selected_break,
             };
-            if fit_width <= line_available_width + 0.5 {
+            let fit_width =
+                self.balanced_line_fit_width(graph, start, selected, block_style, line_index);
+            // A fitting `break-spaces` boundary must include the preserved
+            // space exactly. The general half-point tolerance is only for
+            // shaped glyph rounding; applying it here would incorrectly turn
+            // a four-cell preserved space line into a fitting three-cell one.
+            let fitting_tolerance = if matches!(opportunity.kind, InlineBreakKind::BreakSpaces) {
+                0.0
+            } else {
+                0.5
+            };
+            if fit_width <= line_available_width + fitting_tolerance {
                 let avoid_depth = graph.wrap_inside_avoid_depth(opportunity.position);
-                let selected = SelectedInlineLineEnd {
-                    position: opportunity.position,
-                    break_opportunity: (opportunity.position < graph.end_position())
-                        .then_some(opportunity),
-                };
                 // An automatic opportunity inside the paragraph's final word
                 // is unnecessary when that whole word fits on a fresh line.
                 // Keep the preceding ordinary boundary instead of using a
@@ -3549,12 +4209,18 @@ impl<'a> LayoutBuilder<'a> {
                 // exercised by the final-word case; a word that cannot fit
                 // in the line measure still uses its legal dictionary break.
                 // <https://drafts.csswg.org/css-text-3/#hyphenation>
-                if opportunity.soft_hyphen
+                if opportunity.is_discretionary()
+                    // CSS Text's preference for moving an automatically
+                    // hyphenated final word to the next line does not apply
+                    // to an authored U+00AD. The author supplied that exact
+                    // discretionary boundary, whose marker and advance must
+                    // compete with the preceding ordinary space normally.
+                    && graph.source_character_before(opportunity.position) != Some('\u{00ad}')
                     && let Some((previous_depth, previous)) = regular_fit
                     && previous_depth == avoid_depth
                     && previous
                         .break_opportunity
-                        .is_some_and(|previous| !previous.soft_hyphen)
+                        .is_some_and(|previous| !previous.is_discretionary())
                     && graph
                         .source_character_before(previous.position)
                         .is_some_and(is_css_collapsible_whitespace)
@@ -3568,7 +4234,7 @@ impl<'a> LayoutBuilder<'a> {
                         &mut self.font_system,
                         block_style,
                     );
-                    if !remainder.text.chars().any(char::is_whitespace)
+                    if !remainder.used_text_contains_whitespace()
                         && remainder.fitting_width <= line_available_width + 0.5
                     {
                         return previous;
@@ -3590,14 +4256,14 @@ impl<'a> LayoutBuilder<'a> {
                         return previous;
                     }
                 }
-                if opportunity.emergency {
-                    if regular_fit.is_none()
-                        && emergency_fit.is_none_or(|(fit_depth, fit)| {
-                            avoid_depth < fit_depth
-                                || (avoid_depth == fit_depth && selected.position > fit.position)
-                        })
-                    {
-                        emergency_fit = Some((avoid_depth, selected));
+                let stage = usize::from(opportunity.availability.fitting_stage());
+                if stage != 0 {
+                    let fallback_fit = &mut fallback_fits[stage - 1];
+                    if fallback_fit.is_none_or(|(fit_depth, fit)| {
+                        avoid_depth < fit_depth
+                            || (avoid_depth == fit_depth && selected.position > fit.position)
+                    }) {
+                        *fallback_fit = Some((avoid_depth, selected));
                     }
                 } else if regular_fit.is_none_or(|(fit_depth, fit)| {
                     avoid_depth < fit_depth
@@ -3614,9 +4280,33 @@ impl<'a> LayoutBuilder<'a> {
                 if matches!(opportunity.kind, InlineBreakKind::Forced) {
                     return selected;
                 }
-            } else if opportunity.emergency && regular_fit.is_some() {
+            } else if matches!(opportunity.kind, InlineBreakKind::BreakSpaces)
+                && regular_fit.is_none()
+            {
+                // This is not a hanging edge effect: it is the retained
+                // document space itself. Continue in source order so a later
+                // fitting opportunity can still win. It remains a progress
+                // fallback only after every candidate that fits has failed.
+                overflowing_break_spaces = Some(selected);
+            } else if opportunity.availability.is_fallback() {
+                // A later source candidate can still be available in an
+                // earlier relaxation stage. Continue until every typed stage
+                // has been considered, then choose the first populated one.
+                let stage = usize::from(opportunity.availability.fitting_stage());
+                fallback_overflows[stage - 1].get_or_insert(selected);
                 continue;
-            } else if let Some((_, position)) = regular_fit.or(emergency_fit) {
+            } else if let Some(position) = regular_fit
+                .map(|(_, selected)| selected)
+                .or_else(|| {
+                    fallback_fits
+                        .iter()
+                        .flatten()
+                        .next()
+                        .map(|(_, selected)| *selected)
+                })
+                .or(overflowing_break_spaces)
+                .or_else(|| fallback_overflows.iter().flatten().next().copied())
+            {
                 return position;
             } else {
                 return SelectedInlineLineEnd {
@@ -3627,8 +4317,16 @@ impl<'a> LayoutBuilder<'a> {
             }
         }
         regular_fit
-            .or(emergency_fit)
             .map(|(_, selected)| selected)
+            .or_else(|| {
+                fallback_fits
+                    .iter()
+                    .flatten()
+                    .next()
+                    .map(|(_, selected)| *selected)
+            })
+            .or(overflowing_break_spaces)
+            .or_else(|| fallback_overflows.iter().flatten().next().copied())
             .unwrap_or_else(|| SelectedInlineLineEnd {
                 position: graph.end_position(),
                 break_opportunity: None,
@@ -3671,25 +4369,27 @@ impl<'a> LayoutBuilder<'a> {
                                 fragment.style().text_spacing_trim.resolved(),
                                 TextSpacingTrim::SpaceAll | TextSpacingTrim::Normal
                             )
+                            && !inline_run_has_nonzero_tracking(run)
                             && !fragment.text().contains('\t')
-                            && fragment.text().chars().all(|character| {
-                                character.is_ascii_alphanumeric()
-                                    || character.is_ascii_whitespace()
-                            })
+                            && fragment
+                                .text()
+                                .chars()
+                                .all(|character| character.is_ascii_alphanumeric())
                 )
             })
             || !opportunities.iter().all(|opportunity| {
                 matches!(
                     opportunity.kind,
                     InlineBreakKind::SoftWrap
+                        | InlineBreakKind::ExplicitVirtual
                         | InlineBreakKind::PreservedSpace
                         | InlineBreakKind::Forced
                 ) && (opportunity.kind != InlineBreakKind::Forced
                     || opportunity.position == graph.end_position())
                     && !opportunity.hangs
-                    && !opportunity.soft_hyphen
+                    && !opportunity.is_discretionary()
                     && opportunity.discretionary.is_none()
-                    && !opportunity.emergency
+                    && !opportunity.availability.is_fallback()
             })
         {
             return None;
@@ -3703,17 +4403,24 @@ impl<'a> LayoutBuilder<'a> {
             let opportunity = opportunities[candidate_index];
             let selected_break =
                 (opportunity.position < graph.end_position()).then_some(opportunity);
-            let measured = graph.materialize_line_for_available_width(
-                InlineGraphRange {
-                    start,
-                    end: opportunity.position,
-                },
-                selected_break,
-                line_available_width,
-                &mut self.font_system,
-                block_style,
-            );
-            if measured.fitting_width <= line_available_width + 0.5 {
+            let range = InlineGraphRange {
+                start,
+                end: opportunity.position,
+            };
+            let fitting_width = graph
+                .monotonic_source_range_width(range)
+                .unwrap_or_else(|| {
+                    graph
+                        .materialize_line_for_available_width(
+                            range,
+                            selected_break,
+                            line_available_width,
+                            &mut self.font_system,
+                            block_style,
+                        )
+                        .fitting_width
+                });
+            if fitting_width <= line_available_width + 0.5 {
                 lower = candidate_index + 1;
             } else {
                 first_too_wide = candidate_index;
@@ -3741,7 +4448,7 @@ impl<'a> LayoutBuilder<'a> {
             return false;
         }
         if opportunity.position.byte_offset > 0
-            || opportunity.emergency
+            || opportunity.availability.is_fallback()
             || matches!(
                 opportunity.kind,
                 InlineBreakKind::Forced
@@ -3816,6 +4523,8 @@ impl<'a> LayoutBuilder<'a> {
             materialized.content_width,
         );
         let bidi_scope_continuations = graph.bidi_scope_continuations_for_range(range);
+        let used_text = materialized.used_text();
+        let edge_effects = materialized.edge_effects.clone();
         InlineLineFragment::new(
             materialized.items,
             metrics,
@@ -3824,9 +4533,9 @@ impl<'a> LayoutBuilder<'a> {
             band.end(),
             self.current_float_page_index(),
             false,
-            materialized.text,
+            used_text,
         )
-        .with_edge_effects(materialized.edge_effects.clone())
+        .with_edge_effects(edge_effects)
         .with_bidi_scope_continuations(bidi_scope_continuations)
     }
 }
@@ -3932,13 +4641,10 @@ mod tests {
         InlineBreakOpportunity {
             position: InlineGraphPosition::at_run_start(1),
             kind,
-            priority: 0,
+            availability: BreakAvailability::Ordinary,
             trims: false,
             hangs: false,
-            soft_hyphen: false,
             discretionary: None,
-            emergency: false,
-            min_content: true,
         }
     }
 
@@ -3964,6 +4670,12 @@ mod tests {
         let source_width_only = balanced_remaining_space_variance(&[2.0, 8.0, 13.0]);
         assert!(float_aware < source_width_only);
         assert_eq!(balanced_remaining_space_variance(&[4.0, 4.0]), 0.0);
+    }
+
+    #[test]
+    fn float_clearance_caps_an_overwide_line_at_its_containing_measure() {
+        assert_eq!(float_clearance_required_width(140.0, 10.0, 100.0), 100.0);
+        assert_eq!(float_clearance_required_width(60.0, 10.0, 100.0), 70.0);
     }
 
     #[test]

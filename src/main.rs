@@ -38,8 +38,19 @@ struct Cli {
     #[arg(short = 'q', long = "quiet")]
     quiet: bool,
 
-    /// Enable HTML presentational hints.
-    #[arg(short = 'p', long = "presentational-hints")]
+    /// Disable HTML presentational hints.
+    #[arg(long = "no-presentational-hints")]
+    no_presentational_hints: bool,
+
+    /// Enable HTML presentational hints (the default).
+    ///
+    /// Kept as a compatibility spelling for renderer harnesses that pass an
+    /// explicit affirmative option instead of relying on the default.
+    #[arg(
+        long = "presentational-hints",
+        conflicts_with = "no_presentational_hints",
+        hide = true
+    )]
     presentational_hints: bool,
 
     /// URL fragment target for :target and :target-within selectors.
@@ -314,7 +325,7 @@ async fn run(args: Cli) -> quire::Result<()> {
     let mut options = RenderOptions::default();
     options.media_type = args.media_type.into();
     options.forced_colors = args.forced_colors.into();
-    options.presentational_hints = args.presentational_hints;
+    options.presentational_hints = args.presentational_hints || !args.no_presentational_hints;
     options.target_fragment = args.target_fragment;
     let pdf_options = PdfOptions {
         profile: args.pdf_profile,

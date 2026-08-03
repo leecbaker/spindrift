@@ -50,7 +50,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
     ) -> inline_layout::InlineIntrinsicContribution {
         self.intrinsic_inline_measurement_for_element(
@@ -67,7 +67,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         children: &[box_tree::FormattingBox<'_>],
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
     ) -> inline_layout::InlineIntrinsicContribution {
         self.intrinsic_inline_measurement_for_boxes(children, style, stylesheets, f32::MAX)
             .contribution
@@ -86,16 +86,14 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         available_width: f32,
     ) -> inline_layout::InlineIntrinsicMeasurement {
         // Size containment measures the principal box as if it had no
         // content. It has no effect on non-atomic inline boxes.
         // <https://www.w3.org/TR/css-contain-1/#containment-size>
-        if style.contain.size
-            && (!style.display.is_inline_level() || style.display.is_atomic_inline())
-        {
+        if used_property_containment(element, style).size {
             return inline_layout::InlineIntrinsicMeasurement::default();
         }
         self.with_positioned_layout_suppressed(|layout| {
@@ -109,7 +107,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         children: &[box_tree::FormattingBox<'_>],
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         available_width: f32,
     ) -> inline_layout::InlineIntrinsicMeasurement {
         self.with_positioned_layout_suppressed(|layout| {
@@ -123,7 +121,7 @@ impl<'a> LayoutBuilder<'a> {
         children: &[box_tree::FormattingBox<'_>],
         style: &ComputedStyle,
         marker: &ListMarker,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         available_width: f32,
     ) -> inline_layout::InlineIntrinsicMeasurement {
         self.with_positioned_layout_suppressed(|layout| {
@@ -137,7 +135,7 @@ impl<'a> LayoutBuilder<'a> {
                     baseline_shift: 0.0,
                     visual_offset: InlineVisualOffset::zero(),
                     block_style: style,
-                    propagated_decoration: style.text_decoration.clone(),
+                    propagated_decoration_layers: style.text_decoration_layers.clone(),
                 },
                 &mut items,
             );
@@ -167,7 +165,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
     ) -> Vec<InlineItem> {
         let mut items = Vec::new();
@@ -208,7 +206,7 @@ impl<'a> LayoutBuilder<'a> {
                     None,
                     0.0,
                     InlineVisualOffset::zero(),
-                    style.text_decoration.clone(),
+                    style.text_decoration_layers.clone(),
                     &mut items,
                 );
             } else {
@@ -220,7 +218,7 @@ impl<'a> LayoutBuilder<'a> {
                         baseline_shift: 0.0,
                         visual_offset: InlineVisualOffset::zero(),
                         block_style: style,
-                        propagated_decoration: style.text_decoration.clone(),
+                        propagated_decoration_layers: style.text_decoration_layers.clone(),
                     },
                     &mut items,
                 );
@@ -257,7 +255,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         children: &[box_tree::FormattingBox<'_>],
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
     ) -> Vec<InlineItem> {
         let mut items = Vec::new();
         self.collect_intrinsic_inline_box_items(
@@ -268,7 +266,7 @@ impl<'a> LayoutBuilder<'a> {
                 baseline_shift: 0.0,
                 visual_offset: InlineVisualOffset::zero(),
                 block_style: style,
-                propagated_decoration: style.text_decoration.clone(),
+                propagated_decoration_layers: style.text_decoration_layers.clone(),
             },
             &mut items,
         );
@@ -303,7 +301,9 @@ impl<'a> LayoutBuilder<'a> {
         trim_inline_item_edges(&mut items);
         let context = InlineParagraphContext {
             block_style,
-            stylesheets: &[],
+            line_clamp: used_line_clamp_for_style(block_style),
+            clamp_continuation: css::ClampContinuation::None,
+            stylesheets: &css::EMPTY_STYLESHEETS,
             initial_first_formatted_line: true,
             available_width: available_width.max(0.0),
             padding_left: 0.0,
@@ -368,7 +368,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         available_width: f32,
     ) -> (f32, usize) {
@@ -386,7 +386,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         children: &[box_tree::FormattingBox<'_>],
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         available_width: f32,
     ) -> (f32, usize) {
         let measurement = self.intrinsic_inline_measurement_for_boxes(
@@ -445,6 +445,17 @@ impl<'a> LayoutBuilder<'a> {
         let paragraph_index = output.paragraphs.len();
         let paragraph_start_line_index = output.sequence.records.len();
         let graph = self.build_inline_opportunity_graph(paragraph.iter(), context.block_style);
+        // Intrinsic contributions must measure the same pseudo-generated
+        // first-letter fragment as final line layout. In particular, an
+        // auto-sized absolutely positioned inline box uses these values for
+        // shrink-to-fit width before its final paint-time line is selected.
+        // <https://www.w3.org/TR/css-pseudo-4/#first-letter-pseudo> and
+        // <https://www.w3.org/TR/css-sizing-3/#intrinsic>
+        let graph = if context.initial_first_formatted_line && paragraph_start_line_index == 0 {
+            self.graph_with_first_letter_pseudo(&graph, context.block_style)
+        } else {
+            graph
+        };
         let mut contribution =
             graph.intrinsic_contribution(&mut self.font_system, context.block_style);
         // The max-content contribution includes the first formatted line's
@@ -618,7 +629,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         padding: (f32, f32),
         link_target: Option<&str>,
@@ -687,27 +698,56 @@ impl<'a> LayoutBuilder<'a> {
                 &mut items,
             );
         }
-        self.push_generated_pseudo_items(
-            element,
-            style,
-            style.before_style.as_deref(),
-            link_target.clone(),
-            0.0,
-            InlineVisualOffset::zero(),
-            GeneratedPseudoCounterMode::Commit,
-            &mut items,
-        );
-        if let Some(child_boxes) = child_boxes {
-            self.collect_inline_box_items(
-                child_boxes,
-                stylesheets,
+        // A frozen formatting child stream already contains tree-abiding
+        // generated pseudo boxes. Recollecting `::before` here would emit it
+        // twice after block-in-inline normalization and, in particular,
+        // duplicate its post-list-item counter snapshot.
+        // <https://drafts.csswg.org/css-pseudo-4/#generated-content>
+        if child_boxes.is_none() {
+            self.push_generated_pseudo_items(
+                element,
+                style,
+                style.before_style.as_deref(),
                 link_target.clone(),
                 0.0,
                 InlineVisualOffset::zero(),
-                style,
-                style.text_decoration.clone(),
+                GeneratedPseudoCounterMode::Commit,
                 &mut items,
             );
+        }
+        if let Some(child_boxes) = child_boxes {
+            if style.content.is_generated() {
+                // A tree-abiding generated pseudo arrives with an empty
+                // frozen child list, but its own `content` still forms the
+                // item's inline contents.  The frozen path must therefore
+                // evaluate that property instead of treating the empty list
+                // as an empty line.
+                // <https://www.w3.org/TR/css-pseudo-4/#generated-content>
+                self.push_element_content_items_from_boxes(
+                    element,
+                    style,
+                    box_tree::CounterEventSource::Principal,
+                    child_boxes,
+                    stylesheets,
+                    link_target.clone(),
+                    0.0,
+                    InlineVisualOffset::zero(),
+                    style,
+                    style.text_decoration_layers.clone(),
+                    &mut items,
+                );
+            } else {
+                self.collect_inline_box_items(
+                    child_boxes,
+                    stylesheets,
+                    link_target.clone(),
+                    0.0,
+                    InlineVisualOffset::zero(),
+                    style,
+                    style.text_decoration_layers.clone(),
+                    &mut items,
+                );
+            }
         } else {
             self.collect_element_content_or_inline_items(
                 element,
@@ -718,16 +758,18 @@ impl<'a> LayoutBuilder<'a> {
                 &mut items,
             );
         }
-        self.push_generated_pseudo_items(
-            element,
-            style,
-            style.after_style.as_deref(),
-            link_target.clone(),
-            0.0,
-            InlineVisualOffset::zero(),
-            GeneratedPseudoCounterMode::Commit,
-            &mut items,
-        );
+        if child_boxes.is_none() {
+            self.push_generated_pseudo_items(
+                element,
+                style,
+                style.after_style.as_deref(),
+                link_target.clone(),
+                0.0,
+                InlineVisualOffset::zero(),
+                GeneratedPseudoCounterMode::Commit,
+                &mut items,
+            );
+        }
         if block_bidi_scope_needs_inline_controls(style) {
             self.push_bidi_scope_end(
                 style,
@@ -788,94 +830,33 @@ impl<'a> LayoutBuilder<'a> {
             padding_left,
             0.0,
         );
-        let auto_fill_max_height = (content_height.is_none()
-            && style.column_fill == css::ColumnFill::Auto)
-            .then(|| {
-                used_max_height(style, PercentageBasis::definite(layout_pt(available_width)))
-                    .map(SemanticLengthExt::points)
-            })
-            .flatten();
-        let repeated_block_end_decoration =
-            if style.box_decoration_break == css::BoxDecorationBreak::Clone {
-                style.padding.bottom + used_border_widths(style).bottom
-            } else {
-                0.0
-            };
-        let remaining_parent_height =
-            (self.cursor_y - self.page_bottom() - repeated_block_end_decoration)
-                .max(css::CSS_PX_TO_PT);
-        let balanced_height = sequence.balanced_multicolumn_height(column_count, style);
-        let sequential_auto_height = sequence.total_height().max(style.line_height);
-        let natural_column_height =
-            content_height
-                .or(auto_fill_max_height)
-                .unwrap_or_else(|| match style.column_fill {
-                    css::ColumnFill::Auto => sequential_auto_height,
-                    css::ColumnFill::Balance | css::ColumnFill::BalanceAll => balanced_height,
-                });
-        let fragmented_by_parent = self.active_fragmentainer_kind() == FragmentainerKind::Column
-            && natural_column_height > remaining_parent_height + 0.01;
-        let definite_fragment_height = content_height.map(|height| {
-            if fragmented_by_parent {
-                height.min(remaining_parent_height)
-            } else {
-                height
-            }
-        });
-        let unconstrained_column_height = match style.column_fill {
-            css::ColumnFill::Auto => definite_fragment_height
-                .or(auto_fill_max_height)
-                .unwrap_or(sequential_auto_height),
-            css::ColumnFill::Balance | css::ColumnFill::BalanceAll => definite_fragment_height
-                .map(|limit| balanced_height.min(limit))
-                .unwrap_or(balanced_height),
-        };
-        // An auto-block-size nested multicol whose natural balanced row is
-        // taller than the active outer column must fragment that row at the
-        // outer fragmentainer boundary. The final row is rebalanced separately
-        // by the painter and may shrink below this limit.
-        // <https://www.w3.org/TR/css-multicol-1/#pagination-and-overflow-outside-multicol>.
-        let column_height = if fragmented_by_parent {
-            unconstrained_column_height.min(remaining_parent_height)
-        } else {
-            unconstrained_column_height
-        }
-        .max(style.line_height.min(remaining_parent_height));
-        let used_column_set_height = if let Some(height) = definite_fragment_height {
-            height
-        } else if let Some(max_height) = auto_fill_max_height {
-            sequence
-                .total_height()
-                .min(max_height)
-                .max(style.line_height)
-        } else {
-            column_height
-        };
-        self.paint_inline_line_sequence_multicolumn(
+        let plan = self.plan_multicolumn_inline_layout(
             &sequence,
             style,
-            inline_layout::MulticolumnInlinePaintGeometry {
-                column_count,
-                column_gap: gap,
-                column_width,
-                column_height,
-                used_column_set_height,
-                wrap_column_rows: fragmented_by_parent,
-                shrink_final_row: content_height.is_none(),
-            },
+            column_count,
+            gap,
+            column_width,
+            available_width,
+            content_height,
         );
+        self.paint_inline_line_sequence_multicolumn(&sequence, style, plan);
         Ok(())
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The block formatting context, frozen child stream, and list-marker state are independent layout inputs."
+    )]
     pub(in crate::layout) fn layout_inline_items_block(
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
+        child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         padding: (f32, f32),
         link_target: Option<&str>,
         marker: Option<&ListMarker>,
-    ) {
+    ) -> Option<inline_layout::InlineLineSequence> {
         let (padding_left, padding_right) = padding;
         let available_width =
             (self.current_content_logical_inline_size() - padding_left - padding_right).max(1.0);
@@ -883,17 +864,19 @@ impl<'a> LayoutBuilder<'a> {
         let link_target = link_target.map(str::to_string);
         if let Some(marker) = marker
             && marker.paints_outside()
+            && !self.outside_marker_anchor_is_pending(marker)
         {
             if self.cursor_y - style.font_size < self.page_bottom() {
                 self.push_page();
             }
-            self.paint_outside_marker(
-                marker,
+            let anchor = self.outside_marker_fallback_anchor(
                 style,
-                self.content_left + padding_left,
-                self.content_right - padding_right,
-                self.cursor_y,
+                PageInlineSpan::from_edges(
+                    self.content_left + padding_left,
+                    self.content_right - padding_right,
+                ),
             );
+            self.paint_outside_marker(marker, style, anchor);
         }
         if block_bidi_scope_needs_inline_controls(style) {
             self.push_bidi_scope_start(
@@ -911,34 +894,76 @@ impl<'a> LayoutBuilder<'a> {
         {
             self.push_inside_marker_items(marker, style, link_target.clone(), &mut items);
         }
-        self.push_generated_pseudo_items(
-            element,
-            style,
-            style.before_style.as_deref(),
-            link_target.clone(),
-            0.0,
-            InlineVisualOffset::zero(),
-            GeneratedPseudoCounterMode::Commit,
-            &mut items,
-        );
-        self.collect_element_content_or_inline_items(
-            element,
-            style,
-            stylesheets,
-            link_target.clone(),
-            InlinePlacement::zero(),
-            &mut items,
-        );
-        self.push_generated_pseudo_items(
-            element,
-            style,
-            style.after_style.as_deref(),
-            link_target.clone(),
-            0.0,
-            InlineVisualOffset::zero(),
-            GeneratedPseudoCounterMode::Commit,
-            &mut items,
-        );
+        // Frozen child boxes already contain tree-abiding pseudos. This
+        // direct inline collector is also used after block-in-inline
+        // normalization, where a second originating-style collection would
+        // duplicate `::before` and its planned counter value.
+        // <https://drafts.csswg.org/css-pseudo-4/#generated-content>
+        if child_boxes.is_none() {
+            self.push_generated_pseudo_items(
+                element,
+                style,
+                style.before_style.as_deref(),
+                link_target.clone(),
+                0.0,
+                InlineVisualOffset::zero(),
+                GeneratedPseudoCounterMode::Commit,
+                &mut items,
+            );
+        }
+        if let Some(child_boxes) = child_boxes {
+            if style.content.is_generated() {
+                // Tree-abiding generated pseudos have an empty frozen child
+                // list, but their own `content` still forms this item's
+                // inline contents.
+                // <https://www.w3.org/TR/css-pseudo-4/#generated-content>
+                self.push_element_content_items_from_boxes(
+                    element,
+                    style,
+                    box_tree::CounterEventSource::Principal,
+                    child_boxes,
+                    stylesheets,
+                    link_target.clone(),
+                    0.0,
+                    InlineVisualOffset::zero(),
+                    style,
+                    style.text_decoration_layers.clone(),
+                    &mut items,
+                );
+            } else {
+                self.collect_inline_box_items(
+                    child_boxes,
+                    stylesheets,
+                    link_target.clone(),
+                    0.0,
+                    InlineVisualOffset::zero(),
+                    style,
+                    style.text_decoration_layers.clone(),
+                    &mut items,
+                );
+            }
+        } else {
+            self.collect_element_content_or_inline_items(
+                element,
+                style,
+                stylesheets,
+                link_target.clone(),
+                InlinePlacement::zero(),
+                &mut items,
+            );
+        }
+        if child_boxes.is_none() {
+            self.push_generated_pseudo_items(
+                element,
+                style,
+                style.after_style.as_deref(),
+                link_target.clone(),
+                0.0,
+                InlineVisualOffset::zero(),
+                GeneratedPseudoCounterMode::Commit,
+                &mut items,
+            );
+        }
         if let Some(marker) = marker
             && marker.follows_content_in_first_line()
         {
@@ -959,7 +984,31 @@ impl<'a> LayoutBuilder<'a> {
         // the block children are laid out.
         // <https://www.w3.org/TR/CSS22/visuren.html#anonymous-block-level>
         if items.is_empty() {
-            return;
+            return None;
+        }
+        // A vertical list item's marker (when present) and principal inline
+        // content occupy one first-line sequence. Retain that committed
+        // sequence so the enclosing list item can derive its logical-inline
+        // extent without replaying generated marker content and text.
+        // <https://drafts.csswg.org/css-lists-3/#marker-position>
+        // <https://drafts.csswg.org/css-writing-modes-4/#vertical-layout>
+        if matches!(
+            style.writing_mode,
+            WritingMode::VerticalRl | WritingMode::VerticalLr
+        ) && style.display.is_list_item()
+            && items
+                .iter()
+                .all(|item| matches!(item, InlineItem::Word(_) | InlineItem::Atom(_)))
+            && let Some(sequence) = self.try_layout_committed_vertical_inline_sequence(
+                &mut items,
+                style,
+                available_width,
+                padding_left,
+                0.0,
+                stylesheets,
+            )
+        {
+            return Some(sequence);
         }
         let _ = self.layout_inline_items(
             items,
@@ -969,6 +1018,7 @@ impl<'a> LayoutBuilder<'a> {
             0.0,
             stylesheets,
         );
+        None
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -976,7 +1026,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         run_in_children: &[box_tree::FormattingBox<'_>],
         children: &[box_tree::FormattingBox<'_>],
         link_target: Option<&str>,
@@ -987,17 +1037,16 @@ impl<'a> LayoutBuilder<'a> {
         let link_target = link_target.map(str::to_string);
         if let Some(marker) = marker
             && marker.paints_outside()
+            && !self.outside_marker_anchor_is_pending(marker)
         {
             if self.cursor_y - style.font_size < self.page_bottom() {
                 self.push_page();
             }
-            self.paint_outside_marker(
-                marker,
+            let anchor = self.outside_marker_fallback_anchor(
                 style,
-                self.content_left,
-                self.content_right,
-                self.cursor_y,
+                PageInlineSpan::from_edges(self.content_left, self.content_right),
             );
+            self.paint_outside_marker(marker, style, anchor);
         }
         if block_bidi_scope_needs_inline_controls(style) {
             self.push_bidi_scope_start(
@@ -1023,7 +1072,7 @@ impl<'a> LayoutBuilder<'a> {
             0.0,
             InlineVisualOffset::zero(),
             style,
-            style.text_decoration.clone(),
+            style.text_decoration_layers.clone(),
             &mut items,
         );
         if let Some(marker) = marker
@@ -1043,7 +1092,7 @@ impl<'a> LayoutBuilder<'a> {
                 0.0,
                 InlineVisualOffset::zero(),
                 style,
-                style.text_decoration.clone(),
+                style.text_decoration_layers.clone(),
                 &mut items,
             );
         } else {
@@ -1054,7 +1103,7 @@ impl<'a> LayoutBuilder<'a> {
                 0.0,
                 InlineVisualOffset::zero(),
                 style,
-                style.text_decoration.clone(),
+                style.text_decoration_layers.clone(),
                 &mut items,
             );
         }
@@ -1076,7 +1125,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         inherited_link: Option<String>,
         placement: InlinePlacement,
         output: &mut Vec<InlineItem>,
@@ -1113,7 +1162,7 @@ impl<'a> LayoutBuilder<'a> {
                     element_index += 1;
                     let mut child_style = self.style_for_layout_element_with_parent_font_metrics(
                         child_element,
-                        child_signature,
+                        child_signature.clone(),
                         stylesheets,
                         Some(style),
                     );
@@ -1127,78 +1176,84 @@ impl<'a> LayoutBuilder<'a> {
                     child_style.text_decoration = child_style
                         .text_decoration
                         .with_propagated_lines(style.text_decoration.clone());
-                    let link = child_element
-                        .attrs
-                        .get("href")
-                        .cloned()
-                        .or_else(|| inherited_link.clone());
-                    let child_placement = placement
-                        .with_added_baseline_shift(
-                            self.vertical_align_baseline_shift_for_inline_style(
-                                &child_style,
-                                style,
-                            ),
-                        )
-                        .with_added_visual_offset(
-                            self.inline_visual_offset_for_style(&child_style),
+                    // Intrinsic collection recursively resolves descendant
+                    // styles as well, so it must observe the same source-DOM
+                    // selector ancestry as final inline layout.
+                    // <https://drafts.csswg.org/selectors-4/#child-combinators>
+                    self.with_ancestor_signature(child_signature, |layout| {
+                        let link = child_element
+                            .attrs
+                            .get("href")
+                            .cloned()
+                            .or_else(|| inherited_link.clone());
+                        let child_placement = placement
+                            .with_added_baseline_shift(
+                                layout.vertical_align_baseline_shift_for_inline_style(
+                                    &child_style,
+                                    style,
+                                ),
+                            )
+                            .with_added_visual_offset(
+                                layout.inline_visual_offset_for_style(&child_style),
+                            );
+                        let counter_snapshot = layout.counter_set.clone();
+                        let counter_scope = layout.begin_counter_scope(child_element, &child_style);
+                        let atom = layout.intrinsic_inline_atom_for_element(
+                            child_element,
+                            &child_style,
+                            &[],
+                            None,
+                            stylesheets,
+                            placement.baseline_shift,
+                            child_placement.visual_offset,
+                            link.clone(),
                         );
-                    let counter_snapshot = self.counter_set.clone();
-                    let counter_scope = self.begin_counter_scope(child_element, &child_style);
-                    let atom = self.intrinsic_inline_atom_for_element(
-                        child_element,
-                        &child_style,
-                        &[],
-                        None,
-                        stylesheets,
-                        placement.baseline_shift,
-                        child_placement.visual_offset,
-                        link.clone(),
-                    );
-                    self.end_counter_scope(counter_scope);
-                    self.counter_set = counter_snapshot;
-                    if let Some(mut atom) = atom {
-                        atom.baseline_shift +=
-                            self.vertical_align_baseline_shift_for_atom(&atom, style);
-                        output.push(InlineItem::Atom(Box::new(atom)));
-                        continue;
-                    }
-                    let scope = self.begin_inline_element_scope(
-                        child_element,
-                        &child_style,
-                        link.clone(),
-                        child_placement,
-                        InlineElementScopeOptions::DOM_INTRINSIC,
-                        output,
-                    );
-                    self.push_generated_pseudo_items(
-                        child_element,
-                        &child_style,
-                        child_style.before_style.as_deref(),
-                        link.clone(),
-                        child_placement.baseline_shift,
-                        child_placement.visual_offset,
-                        GeneratedPseudoCounterMode::Rollback,
-                        output,
-                    );
-                    self.collect_intrinsic_element_content_or_inline_items(
-                        child_element,
-                        &child_style,
-                        stylesheets,
-                        link.clone(),
-                        child_placement,
-                        output,
-                    );
-                    self.push_generated_pseudo_items(
-                        child_element,
-                        &child_style,
-                        child_style.after_style.as_deref(),
-                        link.clone(),
-                        child_placement.baseline_shift,
-                        child_placement.visual_offset,
-                        GeneratedPseudoCounterMode::Rollback,
-                        output,
-                    );
-                    self.end_inline_element_scope(scope, &child_style, output);
+                        layout.end_counter_scope(counter_scope);
+                        layout.counter_set = counter_snapshot;
+                        if let Some(mut atom) = atom {
+                            atom.baseline_shift +=
+                                layout.vertical_align_baseline_shift_for_atom(&atom, style);
+                            output.push(InlineItem::Atom(Box::new(atom)));
+                            return;
+                        }
+                        let scope = layout.begin_inline_element_scope(
+                            child_element,
+                            &child_style,
+                            link.clone(),
+                            child_placement,
+                            InlineElementScopeOptions::DOM_INTRINSIC,
+                            output,
+                        );
+                        layout.push_generated_pseudo_items(
+                            child_element,
+                            &child_style,
+                            child_style.before_style.as_deref(),
+                            link.clone(),
+                            child_placement.baseline_shift,
+                            child_placement.visual_offset,
+                            GeneratedPseudoCounterMode::Rollback,
+                            output,
+                        );
+                        layout.collect_intrinsic_element_content_or_inline_items(
+                            child_element,
+                            &child_style,
+                            stylesheets,
+                            link.clone(),
+                            child_placement,
+                            output,
+                        );
+                        layout.push_generated_pseudo_items(
+                            child_element,
+                            &child_style,
+                            child_style.after_style.as_deref(),
+                            link,
+                            child_placement.baseline_shift,
+                            child_placement.visual_offset,
+                            GeneratedPseudoCounterMode::Rollback,
+                            output,
+                        );
+                        layout.end_inline_element_scope(scope, &child_style, output);
+                    });
                 }
             }
         }
@@ -1208,7 +1263,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         inherited_link: Option<String>,
         placement: InlinePlacement,
         output: &mut Vec<InlineItem>,
@@ -1238,7 +1293,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         inherited_link: Option<String>,
         placement: InlinePlacement,
         output: &mut Vec<InlineItem>,
@@ -1283,11 +1338,11 @@ impl<'a> LayoutBuilder<'a> {
         element: &Element,
         style: &ComputedStyle,
         children: &[box_tree::FormattingBox<'_>],
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         inherited_link: Option<String>,
         baseline_shift: f32,
         visual_offset: InlineVisualOffset,
-        propagated_decoration: css::TextDecoration,
+        propagated_decoration_layers: Vec<css::TextDecorationLayer>,
         output: &mut Vec<InlineItem>,
     ) {
         let Some(parts) = style.content.generated_parts().map(|parts| parts.to_vec()) else {
@@ -1307,7 +1362,7 @@ impl<'a> LayoutBuilder<'a> {
                             baseline_shift,
                             visual_offset,
                             block_style: style,
-                            propagated_decoration: propagated_decoration.clone(),
+                            propagated_decoration_layers: propagated_decoration_layers.clone(),
                         },
                         output,
                     );
@@ -1384,6 +1439,159 @@ impl<'a> LayoutBuilder<'a> {
         )));
     }
 
+    /// Emit a lexical positioned-containing-block boundary without adding a
+    /// second margin/border/padding advance to the inline box.
+    ///
+    /// A bidi isolate may visually reorder an ordinary zero-width edge that
+    /// sits outside its controls. The positioned marker therefore travels
+    /// *inside* the isolate, while the real box edge remains in its normal
+    /// source position outside it.
+    /// <https://www.w3.org/TR/css-writing-modes-4/#unicode-bidi>
+    /// <https://www.w3.org/TR/css-position-3/#def-cb>
+    #[allow(clippy::too_many_arguments)]
+    fn push_zero_advance_positioning_edge_item(
+        &mut self,
+        style: &ComputedStyle,
+        edge: InlineBoxEdge,
+        positioning_containing_block_id: InlinePositioningContainingBlockId,
+        baseline_shift: f32,
+        visual_offset: InlineVisualOffset,
+        output: &mut Vec<InlineItem>,
+    ) {
+        let edge_fragment = InlineBoxEdgeFragment {
+            logical_edge: match edge {
+                InlineBoxEdge::Start => InlineLogicalEdge::Start,
+                InlineBoxEdge::End => InlineLogicalEdge::End,
+            },
+            physical_side: inline_box_edge_physical_side(style, edge),
+            positioning_containing_block_id: Some(positioning_containing_block_id),
+            advance: 0.0,
+            paint_extent: 0.0,
+        };
+        let baseline_offset = self.inline_box_text_line_layout_baseline_offset(style);
+        output.push(InlineItem::Atom(Box::new(
+            InlineAtom::new(
+                InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge_fragment)),
+                style.clone(),
+                None,
+                InlineSize::new(0.0, style.line_height),
+                baseline_offset,
+                baseline_shift,
+                None,
+                None,
+            )
+            .with_visual_offset(visual_offset),
+        )));
+    }
+
+    /// Push the source-order opening structure of an inline scope.
+    ///
+    /// An inline box contributes a lexical zero-advance boundary even when it
+    /// has no used box edge, followed by any UAX #9 scope control selected by
+    /// `unicode-bidi`. Generated inside markers use this same structure: CSS
+    /// Lists makes an inside marker an inline child, rather than a separate
+    /// line or layout scope.
+    /// <https://www.w3.org/TR/css-inline-3/#inline-boxes> and
+    /// <https://drafts.csswg.org/css-lists-3/#marker-content>
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::layout) fn push_inline_scope_start_items(
+        &mut self,
+        style: &ComputedStyle,
+        link_target: Option<String>,
+        baseline_shift: f32,
+        visual_offset: InlineVisualOffset,
+        positioning_containing_block_id: Option<InlinePositioningContainingBlockId>,
+        include_box_edge: bool,
+        output: &mut Vec<InlineItem>,
+    ) {
+        let positioned_bidi_isolate = positioning_containing_block_id.is_some()
+            && matches!(
+                style.unicode_bidi,
+                UnicodeBidi::Isolate | UnicodeBidi::IsolateOverride | UnicodeBidi::Plaintext
+            );
+        let outer_positioning_containing_block_id = if positioned_bidi_isolate {
+            None
+        } else {
+            positioning_containing_block_id
+        };
+        if include_box_edge {
+            self.push_inline_box_edge_item(
+                style,
+                InlineBoxEdge::Start,
+                outer_positioning_containing_block_id,
+                baseline_shift,
+                visual_offset,
+                None,
+                output,
+            );
+        }
+        self.push_bidi_scope_start(style, link_target, baseline_shift, visual_offset, output);
+        if positioned_bidi_isolate
+            && let Some(positioning_containing_block_id) = positioning_containing_block_id
+        {
+            self.push_zero_advance_positioning_edge_item(
+                style,
+                InlineBoxEdge::Start,
+                positioning_containing_block_id,
+                baseline_shift,
+                visual_offset,
+                output,
+            );
+        }
+    }
+
+    /// Push the source-order closing structure of an inline scope.
+    ///
+    /// See [`Self::push_inline_scope_start_items`] for why generated inside
+    /// markers retain the same transparent boundaries as authored inline
+    /// scopes.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::layout) fn push_inline_scope_end_items(
+        &mut self,
+        style: &ComputedStyle,
+        link_target: Option<String>,
+        baseline_shift: f32,
+        visual_offset: InlineVisualOffset,
+        positioning_containing_block_id: Option<InlinePositioningContainingBlockId>,
+        include_box_edge: bool,
+        output: &mut Vec<InlineItem>,
+    ) {
+        let positioned_bidi_isolate = positioning_containing_block_id.is_some()
+            && matches!(
+                style.unicode_bidi,
+                UnicodeBidi::Isolate | UnicodeBidi::IsolateOverride | UnicodeBidi::Plaintext
+            );
+        let outer_positioning_containing_block_id = if positioned_bidi_isolate {
+            None
+        } else {
+            positioning_containing_block_id
+        };
+        if positioned_bidi_isolate
+            && let Some(positioning_containing_block_id) = positioning_containing_block_id
+        {
+            self.push_zero_advance_positioning_edge_item(
+                style,
+                InlineBoxEdge::End,
+                positioning_containing_block_id,
+                baseline_shift,
+                visual_offset,
+                output,
+            );
+        }
+        self.push_bidi_scope_end(style, link_target, baseline_shift, visual_offset, output);
+        if include_box_edge {
+            self.push_inline_box_edge_item(
+                style,
+                InlineBoxEdge::End,
+                outer_positioning_containing_block_id,
+                baseline_shift,
+                visual_offset,
+                None,
+                output,
+            );
+        }
+    }
+
     pub(in crate::layout) fn begin_inline_element_scope(
         &mut self,
         element: &Element,
@@ -1404,43 +1612,44 @@ impl<'a> LayoutBuilder<'a> {
         // <https://www.w3.org/TR/CSS22/visuren.html#inline-formatting>
         let mut edge_style = self.style_with_current_used_lengths(style);
         let edge_percentage_basis = if options.push_page_scope {
-            self.current_content_logical_inline_size().max(0.0)
+            self.current_content_logical_inline_content_size()
         } else {
-            0.0
+            LogicalInlineContentSize::new(content_box_pt(0.0))
         };
-        apply_used_box_metrics(
+        apply_used_box_metrics_for_logical_inline_basis(
             &mut edge_style,
-            PercentageBasis::definite(layout_pt(edge_percentage_basis)),
+            PercentageBasis::definite(edge_percentage_basis),
         );
         let positioning_containing_block_source =
             inline_scope_establishes_positioning_containing_block(&edge_style).then(|| {
                 InlinePositioningContainingBlockSource {
                     id: InlinePositioningContainingBlockId(inline_box_start),
-                    style: edge_style.clone(),
+                    style: edge_style.as_computed().clone(),
                 }
             });
-        if options.fragment_edges.owns_start {
-            self.push_inline_box_edge_item(
-                &edge_style,
-                InlineBoxEdge::Start,
-                positioning_containing_block_source
-                    .as_ref()
-                    .map(|source| source.id),
-                placement.baseline_shift,
-                placement.visual_offset,
-                None,
-                output,
-            );
-        }
-        let pushed_page_scope = options.push_page_scope && style.page_name_specified;
+        // CSS Paged Media applies `page` only to boxes that establish a
+        // class-A break opportunity. Inline boxes stay inside their enclosing
+        // inline formatting context, so their declarations must not split a
+        // line or materialize a named page group.
+        // <https://www.w3.org/TR/css-page-3/#using-named-pages>
+        let pushed_page_scope = false;
         if pushed_page_scope {
-            output.push(InlineItem::PageScopeStart(style.page_name.clone()));
+            output.push(InlineItem::PageScopeStart(
+                style
+                    .page
+                    .specified_name()
+                    .map(|name| name.as_str().to_string()),
+            ));
         }
-        self.push_bidi_scope_start(
-            style,
+        self.push_inline_scope_start_items(
+            &edge_style,
             link_target.clone(),
             placement.baseline_shift,
             placement.visual_offset,
+            positioning_containing_block_source
+                .as_ref()
+                .map(|source| source.id),
+            options.fragment_edges.owns_start,
             output,
         );
         if options.push_inside_marker
@@ -1457,7 +1666,7 @@ impl<'a> LayoutBuilder<'a> {
             link_target,
             baseline_shift: placement.baseline_shift,
             visual_offset: placement.visual_offset,
-            edge_style,
+            edge_style: edge_style.into_computed(),
             positioning_containing_block_source,
             pushed_page_scope,
             mark_hanging_edges: options.mark_hanging_edges,
@@ -1486,40 +1695,37 @@ impl<'a> LayoutBuilder<'a> {
             counter_scope,
             counter_snapshot,
         } = state;
-        self.push_bidi_scope_end(
+        self.push_inline_scope_end_items(
             &edge_style,
             link_target,
             baseline_shift,
             visual_offset,
+            positioning_containing_block_source
+                .as_ref()
+                .map(|source| source.id),
+            fragment_edges.owns_end,
             output,
         );
         if pushed_page_scope {
             output.push(InlineItem::PageScopeEnd);
         }
-        if fragment_edges.owns_end {
-            self.push_inline_box_edge_item(
-                &edge_style,
-                InlineBoxEdge::End,
-                positioning_containing_block_source
-                    .as_ref()
-                    .map(|source| source.id),
-                baseline_shift,
-                visual_offset,
-                None,
-                output,
-            );
-        }
         if mark_hanging_edges {
             mark_inline_box_hanging_edges(output, inline_box_start, &edge_style, fragment_edges);
         }
-        mark_inline_box_ancestor_decorations(
-            output,
-            inline_box_start,
-            &edge_style,
-            positioning_containing_block_source
-                .as_ref()
-                .map(|source| source.id),
-        );
+        // `display: contents` does not generate an inline box. Its style is
+        // inherited by the promoted contents during box-tree construction,
+        // but it cannot contribute an additional box decoration of its own.
+        // <https://drafts.csswg.org/css-display-4/#box-generation>
+        if !edge_style.display.is_contents() {
+            mark_inline_box_ancestor_decorations(
+                output,
+                inline_box_start,
+                &edge_style,
+                positioning_containing_block_source
+                    .as_ref()
+                    .map(|source| source.id),
+            );
+        }
         self.end_counter_scope(counter_scope);
         if let Some(counter_snapshot) = counter_snapshot {
             self.counter_set = counter_snapshot;
@@ -1530,7 +1736,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         inherited_link: Option<String>,
         placement: InlinePlacement,
         output: &mut Vec<InlineItem>,

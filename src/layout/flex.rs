@@ -72,7 +72,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         available_width: PhysicalContentWidth,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
     ) -> FlexIntrinsicWidthContributions {
@@ -106,7 +106,7 @@ impl<'a> LayoutBuilder<'a> {
                     FlexAvailableSizeSource::IntrinsicContainerSize,
                 ),
                 height: used_length_percentage_or_auto(
-                    style.box_values.height.clone(),
+                    style.box_values.height.value().clone(),
                     PercentageBasis::definite(
                         available_width.content_box_length().into_layout_length(),
                     ),
@@ -116,7 +116,7 @@ impl<'a> LayoutBuilder<'a> {
                 }),
                 height_basis: flex_available_percentage_basis(
                     used_length_percentage_or_auto(
-                        style.box_values.height.clone(),
+                        style.box_values.height.value().clone(),
                         PercentageBasis::definite(
                             available_width.content_box_length().into_layout_length(),
                         ),
@@ -145,7 +145,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         margin_box_width: MarginBoxLength,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
     ) -> MarginBoxLength {

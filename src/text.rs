@@ -4,13 +4,12 @@ use crate::css::{
     FontStyle, FontVariantAlternates, FontVariantCaps, FontVariantEastAsian,
     FontVariantEastAsianValue, FontVariantEmoji, FontVariantLigatures, FontVariantNumeric,
     FontVariantNumericValue, FontVariantPosition, FontVariationSettings, FontWeight, FontWidth,
-    HyphenateLimitChars, Hyphens, LineBreak as CssLineBreak, OverflowWrap as CssOverflowWrap,
-    Stylesheet, TextLayoutPolicy, TextOrientation, UnicodeBidi, UnicodeRange,
+    HyphenateLimitChars, LineBreak as CssLineBreak, OverflowWrap as CssOverflowWrap,
+    StylesheetCollection, TextLayoutPolicy, TextOrientation, UnicodeBidi, UnicodeRange,
     WordBreak as CssWordBreak,
 };
-use crate::document::{
-    DocumentFont, FontProgramKind, RenderedGlyph, RenderedGlyphKind, RenderedTextRun,
-};
+use crate::document::paint::text::{RenderedGlyph, RenderedGlyphKind, RenderedTextRun};
+use crate::document::{DocumentFont, FontProgramKind};
 use crate::units::{LayoutLength, SemanticLengthExt, layout_points, layout_pt};
 use base64::Engine as _;
 use fontique::{
@@ -200,10 +199,14 @@ impl FontRunVerticalExtents {
 
 /// Resolved vertical metrics for one inline text box.
 ///
-/// `content` describes the CSS inline content area used by backgrounds and
-/// borders. `line` describes the line-height box that participates in baseline
-/// alignment. Both are already scaled into layout units before layout code
-/// consumes them.
+/// `content` describes the CSS inline content area used by backgrounds,
+/// borders, and padding. It is selected independently of `line-height`.
+/// `line` describes the line-height box that participates in baseline
+/// alignment and may include fallback-font line extents for `normal`. Both are
+/// already scaled into layout units before layout code consumes them.
+///
+/// CSS 2.2 §10.6.1 separates content-area decoration geometry from line-box
+/// sizing: <https://www.w3.org/TR/CSS22/visudet.html#line-height>.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ResolvedInlineTextMetrics {
     pub(crate) content: FontRunVerticalExtents,
@@ -233,7 +236,7 @@ pub(crate) struct ShapedGlyphRun {
     pub(crate) text: Rc<str>,
     pub(crate) x_offset: f32,
     pub(crate) y_offset: f32,
-    pub(crate) text_matrix: crate::RenderedTextMatrix,
+    pub(crate) text_matrix: crate::document::paint::text::RenderedTextMatrix,
     pub(crate) font_size: f32,
     pub(crate) font_id: Option<usize>,
     pub(crate) font_palette: crate::css::FontPalette,
@@ -391,11 +394,15 @@ impl ShapedInlineLine {
                 // so retain the conventional selected-range shape instead.
                 return None;
             }
-            let mut selected = run.clone();
-            selected.text = Rc::from(&self.text[source_range.0..source_range.1]);
-            selected.x_offset += prefix_advance;
-            selected.glyphs = glyphs;
-            runs.push(selected);
+            runs.push(ShapedInlineRun {
+                text: Rc::from(&self.text[source_range.0..source_range.1]),
+                x_offset: run.x_offset + prefix_advance,
+                font_size: run.font_size,
+                font_id: run.font_id,
+                font_palette: run.font_palette.clone(),
+                glyphs,
+                paints: run.paints,
+            });
         }
         // Source shaping is only reusable when its glyph provenance covers
         // every paintable character in the selected CSS Text range. A
@@ -421,11 +428,81 @@ impl ShapedInlineLine {
         for run in &mut runs {
             run.x_offset -= left_edge;
         }
-        let mut selected = self.clone();
-        selected.text = Rc::from(&self.text[range]);
-        selected.runs = runs;
+        let mut selected = Self {
+            text: Rc::from(&self.text[range]),
+            width: 0.0,
+            offset: self.offset,
+            aligned_by_parley: self.aligned_by_parley,
+            line_height: self.line_height,
+            baseline_adjustment: self.baseline_adjustment,
+            runs,
+        };
         selected.width = selected.advance_width();
         Some(selected)
+    }
+
+    /// Return the advance of a cluster-aligned source range without copying
+    /// text, glyphs, or shaping runs.
+    ///
+    /// This has the same source-provenance requirements and visual-run
+    /// geometry as [`Self::source_slice`], but is intended for speculative
+    /// inline-line fitting where a durable shaped slice is not needed.
+    /// <https://www.w3.org/TR/css-text-3/#line-breaking>
+    pub(crate) fn source_range_advance_width(&self, range: Range<usize>) -> Option<f32> {
+        if range.start >= range.end
+            || range.end > self.text.len()
+            || !self.text.is_char_boundary(range.start)
+            || !self.text.is_char_boundary(range.end)
+        {
+            return None;
+        }
+
+        let mut left_edge = None::<f32>;
+        let mut right_edge = None::<f32>;
+        for run in &self.runs {
+            let mut skipped_advance = 0.0;
+            let mut selected_advance = 0.0;
+            let mut has_selected_glyph = false;
+            for glyph in &run.glyphs {
+                let glyph_range = glyph.source_range.as_ref()?;
+                let overlaps = glyph_range.start < range.end && range.start < glyph_range.end;
+                if overlaps && (glyph_range.start < range.start || glyph_range.end > range.end) {
+                    return None;
+                }
+                if glyph_range.start >= range.start && glyph_range.end <= range.end {
+                    has_selected_glyph = true;
+                    selected_advance += glyph.rendered.x_advance;
+                } else {
+                    skipped_advance += glyph.rendered.x_advance;
+                }
+            }
+            if has_selected_glyph {
+                let run_start = run.x_offset + skipped_advance;
+                let run_end = run_start + selected_advance;
+                left_edge = Some(left_edge.map_or(run_start, |edge| edge.min(run_start)));
+                right_edge = Some(right_edge.map_or(run_end, |edge| edge.max(run_end)));
+            }
+        }
+
+        // Retain the conservative source-slice rule: every non-ignorable
+        // source character must have glyph provenance covering its full
+        // source span, otherwise callers must use a conventional re-shape.
+        for (offset, character) in self.text[range.clone()].char_indices() {
+            if character_is_default_ignorable_code_point(character) {
+                continue;
+            }
+            let character_range = range.start + offset..range.start + offset + character.len_utf8();
+            if !self.runs.iter().flat_map(|run| &run.glyphs).any(|glyph| {
+                glyph.source_range.as_ref().is_some_and(|glyph_range| {
+                    glyph_range.start <= character_range.start
+                        && glyph_range.end >= character_range.end
+                })
+            }) {
+                return None;
+            }
+        }
+
+        Some(right_edge? - left_edge?)
     }
 
     pub(crate) fn rendered_runs(&self) -> Vec<RenderedTextRun> {
@@ -608,18 +685,32 @@ pub(crate) struct ShapedInlineRun {
 
 impl ShapedInlineRun {
     fn rendered_run(&self) -> RenderedTextRun {
-        let actual_text = self
+        // A shaped glyph sequence is not necessarily a one-to-one spelling of
+        // its source text.  In particular, HarfBuzz reports an `fi` ligature
+        // at the source `f` cluster, so its glyph-level ToUnicode summary is
+        // only `f`.  A PDF ToUnicode CMap is keyed by glyph/CID and cannot
+        // restore the omitted source character when that same glyph is also
+        // used by another run.  Attach the exact run-local replacement text
+        // whenever the glyph summaries cannot reproduce the authored source.
+        // ISO 32000-2:2020, 14.9.4.4, "ActualText".
+        let glyph_text = self
             .glyphs
             .iter()
-            .any(|glyph| glyph.rendered.unicode.is_empty() || glyph.rendered.is_advance_only())
-            .then(|| Rc::clone(&self.text))
-            .filter(|text| !text.is_empty());
+            .map(|glyph| glyph.rendered.unicode.as_str())
+            .collect::<String>();
+        let actual_text = (glyph_text != self.text.as_ref()
+            || self
+                .glyphs
+                .iter()
+                .any(|glyph| glyph.rendered.is_advance_only()))
+        .then(|| Rc::clone(&self.text))
+        .filter(|text| !text.is_empty());
         RenderedTextRun {
             text: Rc::clone(&self.text),
             actual_text,
             x_offset: self.x_offset,
             y_offset: 0.0,
-            text_matrix: crate::RenderedTextMatrix::IDENTITY,
+            text_matrix: crate::document::paint::text::RenderedTextMatrix::IDENTITY,
             font_size: self.font_size,
             font_id: self.font_id,
             glyphs: Some(
@@ -837,6 +928,7 @@ struct FontKey {
     family_index: usize,
     face_index: u32,
     request: FontRequestAttributes,
+    synthesize_weight: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -846,6 +938,7 @@ struct ResolvedFontFaceKey {
     registered_face: Option<RegisteredFontFaceKey>,
     family_label: Option<String>,
     request: Option<FontRequest>,
+    synthesize_weight: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -898,6 +991,7 @@ struct ParleyFontRequestKey {
     blob_id: u64,
     face_index: u32,
     request: FontRequest,
+    synthesize_weight: bool,
 }
 
 #[derive(Clone)]
@@ -935,6 +1029,7 @@ struct RegisteredFontFaceMetadata {
 mod bidi;
 mod breaking;
 mod font_matching;
+mod phrase;
 mod shaping;
 mod system;
 mod typographic_units;
@@ -950,15 +1045,17 @@ pub(crate) use breaking::{
     text_with_hyphenation_controls,
 };
 pub(crate) use breaking::{
-    TextBreakPolicy, collect_grapheme_cluster_inner_boundaries,
-    collect_measured_break_opportunities, manual_suppresses_break_between,
+    TextBreakPolicy, collect_auto_phrase_relaxed_wrap_opportunities,
+    collect_grapheme_cluster_inner_boundaries, collect_keep_all_relaxed_wrap_opportunities,
+    collect_measured_break_opportunities,
 };
 #[cfg(test)]
 pub(crate) use breaking::{
-    inline_atomic_boundary_allows_soft_wrap, measured_break_opportunities,
-    text_with_auto_hyphenation,
+    inline_atomic_boundary_allows_soft_wrap, manual_suppresses_break_between,
+    measured_break_opportunities, text_with_auto_hyphenation,
 };
 use font_matching::*;
+pub(crate) use phrase::{AutoPhraseLanguage, phrase_boundaries};
 use shaping::*;
 pub(crate) use shaping::{BidiVisualRange, ResolvedBidiDirection};
 /// Read one OpenType name record for PDF resource metadata.
@@ -969,26 +1066,29 @@ pub(crate) fn font_program_opentype_name(
     font_matching::opentype_name(face, name_id)
 }
 pub(crate) use typographic_units::{
-    inter_character_gap_allowed_between_text, keep_all_suppresses_break_between,
-    text_break_is_min_content_eligible, text_is_inter_character_control_only,
+    character_is_inter_character_control, inter_character_gap_allowed_between_text,
+    keep_all_suppresses_break_between, text_allows_inter_character_gap_after,
+    text_allows_inter_character_gap_before, text_is_inter_character_control_only,
     typographic_unit_count, typographic_unit_ranges,
 };
 use unicode_properties::*;
 pub(crate) use unicode_properties::{
-    SegmentBreakContext, TextSpacingPunctuationClass, character_has_joining_behavior,
-    character_is_arabic_tatweel, character_is_autospace_alpha, character_is_autospace_ideograph,
-    character_is_autospace_numeric, character_is_bidi_format_control,
-    character_is_css_other_space_separator, character_is_css_word_separator,
-    character_is_currency_symbol, character_is_default_ignorable_code_point,
-    character_is_first_hangable_punctuation, character_is_font_neutral_default_ignorable,
-    character_is_hangable_stop_or_comma, character_is_join_control,
-    character_is_last_hangable_punctuation, character_is_mandatory_line_break,
+    SegmentBreakContext, TextSpacingPunctuationClass, character_blocks_atomic_inline_break,
+    character_has_joining_behavior, character_is_arabic_tatweel, character_is_autospace_alpha,
+    character_is_autospace_ideograph, character_is_autospace_numeric,
+    character_is_bidi_format_control, character_is_css_other_space_separator,
+    character_is_css_word_separator, character_is_currency_symbol,
+    character_is_default_ignorable_code_point, character_is_first_hangable_punctuation,
+    character_is_first_letter_associated_space, character_is_first_letter_suffix_punctuation,
+    character_is_font_neutral_default_ignorable, character_is_hangable_stop_or_comma,
+    character_is_join_control, character_is_last_hangable_punctuation,
+    character_is_mandatory_line_break, character_is_ruby_justification_eligible,
     character_is_text_decoration_spacer, character_is_unicode_alphanumeric,
-    character_is_unicode_control, character_is_unicode_letter, character_is_unicode_mark,
-    character_is_unicode_punctuation, character_is_unicode_symbol,
-    character_is_unicode_typographic_letter, character_preserves_word_boundary_context,
-    character_receives_text_emphasis_mark, plaintext_direction_for_text,
-    segment_break_is_removable, text_spacing_punctuation_class,
+    character_is_unicode_control, character_is_unicode_first_letter_base,
+    character_is_unicode_letter, character_is_unicode_mark, character_is_unicode_punctuation,
+    character_is_unicode_symbol, character_is_unicode_typographic_letter,
+    character_preserves_word_boundary_context, character_receives_text_emphasis_mark,
+    plaintext_direction_for_text, segment_break_is_removable, text_spacing_punctuation_class,
     typographic_unit_is_upright_in_mixed_orientation,
     typographic_unit_uses_vertical_forms_in_mixed_orientation,
 };

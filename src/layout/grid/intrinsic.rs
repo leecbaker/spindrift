@@ -77,7 +77,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         available_width: f32,
         width_basis: GridPercentageBasis,
@@ -180,7 +180,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         available_width: f32,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
     ) -> (f32, f32) {
@@ -207,7 +207,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         available_width: f32,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
     ) -> (f32, f32) {
@@ -225,7 +225,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         available_width: f32,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         axis: GridIntrinsicAxis,
@@ -413,7 +413,7 @@ impl<'a> LayoutBuilder<'a> {
     pub(super) fn estimate_grid_item_size(
         &mut self,
         child: &GridChild<'_>,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         available_width: f32,
         available_width_basis: GridPercentageBasis,
         available_height_basis: GridPercentageBasis,
@@ -425,7 +425,10 @@ impl<'a> LayoutBuilder<'a> {
             available_width_basis,
             available_height_basis,
         );
-        if child.style.contain.layout {
+        if child
+            .element_parts()
+            .is_some_and(|(element, _, _)| used_property_containment(element, &child.style).layout)
+        {
             // Layout containment suppresses baseline export; grid alignment
             // synthesizes the fallback from the item's border box.
             // <https://www.w3.org/TR/css-contain-1/#containment-layout>
@@ -437,7 +440,7 @@ impl<'a> LayoutBuilder<'a> {
     fn estimate_grid_item_size_with_exported_baseline(
         &mut self,
         child: &GridChild<'_>,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         available_width: f32,
         available_width_basis: GridPercentageBasis,
         available_height_basis: GridPercentageBasis,
@@ -642,11 +645,12 @@ impl<'a> LayoutBuilder<'a> {
                 // This is the parent-facing intrinsic sizing pass, so size
                 // containment must remove the same items from both grid axes.
                 // The later final-layout pass still receives `grid_children`.
-                let intrinsic_grid_children: &[GridChild<'_>] = if style.contain.size {
-                    &[] as &[GridChild<'_>]
-                } else {
-                    grid_children.as_slice()
-                };
+                let intrinsic_grid_children: &[GridChild<'_>] =
+                    if used_property_containment(element, style).size {
+                        &[] as &[GridChild<'_>]
+                    } else {
+                        grid_children.as_slice()
+                    };
                 if let Some(grid_layout) = layout.compute_grid_layout(
                     style,
                     intrinsic_grid_children,
@@ -878,13 +882,17 @@ fn append_area_created_grid_columns(
 ) {
     let area_column_count = grid_template_area_column_count(areas);
     let authored_column_count = expanded.sizes.len();
-    if area_column_count <= authored_column_count || auto_tracks.tracks.is_empty() {
+    if area_column_count <= authored_column_count {
         return;
     }
-    expanded.sizes.extend(
-        (0..area_column_count - authored_column_count)
-            .map(|index| auto_tracks.tracks[index % auto_tracks.tracks.len()].clone()),
-    );
+    expanded
+        .sizes
+        .extend((0..area_column_count - authored_column_count).map(|index| {
+            auto_tracks
+                .get(index % auto_tracks.len())
+                .expect("grid auto-track list is non-empty")
+                .clone()
+        }));
     expanded
         .line_names
         .resize_with(expanded.sizes.len() + 1, Vec::new);
@@ -910,9 +918,6 @@ fn expand_simple_implicit_grid_columns(
     ) else {
         return;
     };
-    if inputs.auto_tracks.tracks.is_empty() {
-        return;
-    }
     prepend_implicit_grid_columns(expanded, extent.first_line, inputs.auto_tracks);
     append_implicit_grid_columns(expanded, extent.end_line, inputs.auto_tracks);
     expanded
@@ -968,10 +973,7 @@ fn append_implicit_grid_columns(
     expanded.sizes.extend((0..after_count).filter_map(|index| {
         let track_line = current_end_line.checked_add(i32::try_from(index).ok()?)?;
         let auto_index = usize::try_from(track_line.checked_sub(explicit_end_line)?).ok()?;
-        auto_tracks
-            .tracks
-            .get(auto_index % auto_tracks.tracks.len())
-            .cloned()
+        auto_tracks.get(auto_index % auto_tracks.len()).cloned()
     }));
 }
 
@@ -998,11 +1000,17 @@ fn implicit_grid_columns_for_intrinsic_width(
         inputs.row_line_names,
         inputs.children,
     )?;
-    if extent.track_count() == 0 || inputs.auto_tracks.tracks.is_empty() {
+    if extent.track_count() == 0 {
         return None;
     }
     let sizes = (0..area_column_count)
-        .map(|index| inputs.auto_tracks.tracks[index % inputs.auto_tracks.tracks.len()].clone())
+        .map(|index| {
+            inputs
+                .auto_tracks
+                .get(index % inputs.auto_tracks.len())
+                .expect("grid auto-track list is non-empty")
+                .clone()
+        })
         .collect::<Vec<_>>();
     let mut expanded = ExpandedGridTracks {
         explicit_track_count: area_column_count,
@@ -1164,13 +1172,10 @@ fn cycled_auto_track_size_before(
     auto_tracks: &css::GridAutoTrackList,
     distance_from_explicit: usize,
 ) -> Option<css::GridTrackSize> {
-    let len = auto_tracks.tracks.len();
-    if len == 0 {
-        return None;
-    }
+    let len = auto_tracks.len();
     let offset = distance_from_explicit % len;
     let index = (len - offset) % len;
-    auto_tracks.tracks.get(index).cloned()
+    auto_tracks.get(index).cloned()
 }
 
 fn simple_positive_numeric_implicit_column_count(style: &ComputedStyle) -> Option<usize> {
@@ -1203,8 +1208,8 @@ fn simple_positive_named_forward_column_count(
         positive_named_grid_line_index(&style.grid_column_start, line_names, explicit_line_count)?;
     let span = match &style.grid_column_end {
         css::GridPlacement::Auto => 1,
-        css::GridPlacement::Span(span) if span.name.is_none() => {
-            span.span.map(usize::from).filter(|span| *span > 0)?
+        css::GridPlacement::Span(span) if span.name().is_none() => {
+            span.count().map(usize::from).filter(|span| *span > 0)?
         }
         css::GridPlacement::Line(_) => {
             let end = positive_named_grid_line_index(
@@ -1229,8 +1234,8 @@ fn simple_positive_named_backward_column_count(
         positive_named_grid_line_index(&style.grid_column_end, line_names, explicit_line_count)?;
     match &style.grid_column_start {
         css::GridPlacement::Auto => Some(end.checked_sub(1)?),
-        css::GridPlacement::Span(span) if span.name.is_none() => {
-            let span = span.span.map(usize::from).filter(|span| *span > 0)?;
+        css::GridPlacement::Span(span) if span.name().is_none() => {
+            let span = span.count().map(usize::from).filter(|span| *span > 0)?;
             (end > span).then_some(end - 1)
         }
         css::GridPlacement::Span(_) | css::GridPlacement::Line(_) => None,
@@ -1251,7 +1256,7 @@ fn simple_forward_named_span_implicit_column_count(
     let css::GridPlacement::Span(span) = &style.grid_column_end else {
         return None;
     };
-    span.name.as_ref()?;
+    span.name()?;
     let span =
         simple_grid_named_column_span_after(span, start, line_names, explicit_column_count, 1)?;
     usize::try_from(start)
@@ -1273,8 +1278,8 @@ fn positive_named_grid_line_index(
     let css::GridPlacement::Line(line) = placement else {
         return None;
     };
-    let name = line.name.as_ref()?;
-    let occurrence = line.index.unwrap_or(1);
+    let name = line.name()?;
+    let occurrence = line.index().unwrap_or(1);
     if occurrence <= 0 {
         return None;
     }
@@ -1296,8 +1301,8 @@ fn simple_positive_numeric_forward_column_count(style: &ComputedStyle) -> Option
     let start = positive_numeric_grid_line(&style.grid_column_start)?;
     let span = match &style.grid_column_end {
         css::GridPlacement::Auto => 1,
-        css::GridPlacement::Span(span) if span.name.is_none() => {
-            span.span.map(usize::from).filter(|span| *span > 0)?
+        css::GridPlacement::Span(span) if span.name().is_none() => {
+            span.count().map(usize::from).filter(|span| *span > 0)?
         }
         css::GridPlacement::Line(_) => {
             let end = positive_numeric_grid_line(&style.grid_column_end)?;
@@ -1312,8 +1317,8 @@ fn simple_positive_numeric_backward_column_count(style: &ComputedStyle) -> Optio
     let end = positive_numeric_grid_line(&style.grid_column_end)?;
     match &style.grid_column_start {
         css::GridPlacement::Auto => Some(end.checked_sub(1)?),
-        css::GridPlacement::Span(span) if span.name.is_none() => {
-            let span = span.span.map(usize::from).filter(|span| *span > 0)?;
+        css::GridPlacement::Span(span) if span.name().is_none() => {
+            let span = span.count().map(usize::from).filter(|span| *span > 0)?;
             (end > span).then_some(end - 1)
         }
         css::GridPlacement::Span(_) | css::GridPlacement::Line(_) => None,
@@ -1324,10 +1329,10 @@ fn positive_numeric_grid_line(placement: &css::GridPlacement) -> Option<usize> {
     let css::GridPlacement::Line(line) = placement else {
         return None;
     };
-    if line.name.is_some() {
+    if line.name().is_some() {
         return None;
     }
-    line.index
+    line.index()
         .filter(|index| *index > 0)
         .and_then(|index| usize::try_from(index).ok())
 }
@@ -1594,15 +1599,15 @@ fn simple_grid_child_auto_column_span(style: &ComputedStyle) -> Option<usize> {
     }
     if matches!(style.grid_column_end, css::GridPlacement::Auto)
         && let css::GridPlacement::Span(span) = &style.grid_column_start
-        && span.name.is_none()
+        && span.name().is_none()
     {
-        return span.span.map(usize::from).filter(|span| *span > 0);
+        return span.count().map(usize::from).filter(|span| *span > 0);
     }
     if matches!(style.grid_column_start, css::GridPlacement::Auto)
         && let css::GridPlacement::Span(span) = &style.grid_column_end
-        && span.name.is_none()
+        && span.name().is_none()
     {
-        return span.span.map(usize::from).filter(|span| *span > 0);
+        return span.count().map(usize::from).filter(|span| *span > 0);
     }
     None
 }
@@ -2011,8 +2016,8 @@ fn simple_grid_child_column_span_after(
 ) -> Option<usize> {
     match end {
         css::GridPlacement::Auto => Some(1),
-        css::GridPlacement::Span(span) if span.name.is_none() => {
-            span.span.map(usize::from).filter(|span| *span > 0)
+        css::GridPlacement::Span(span) if span.name().is_none() => {
+            span.count().map(usize::from).filter(|span| *span > 0)
         }
         css::GridPlacement::Span(span) => simple_grid_named_column_span_after(
             span,
@@ -2044,8 +2049,8 @@ fn simple_grid_child_column_span_before(
 ) -> Option<usize> {
     match start {
         css::GridPlacement::Auto => Some(1),
-        css::GridPlacement::Span(span) if span.name.is_none() => {
-            span.span.map(usize::from).filter(|span| *span > 0)
+        css::GridPlacement::Span(span) if span.name().is_none() => {
+            span.count().map(usize::from).filter(|span| *span > 0)
         }
         css::GridPlacement::Span(span) => simple_grid_named_column_span_before(
             span,
@@ -2070,8 +2075,8 @@ fn simple_grid_named_column_span_after(
     explicit_track_count: usize,
     first_line_index: i32,
 ) -> Option<usize> {
-    let name = span.name.as_ref()?;
-    let target = span.span.unwrap_or(1);
+    let name = span.name()?;
+    let target = span.count().unwrap_or(1);
     if target == 0 {
         return None;
     }
@@ -2119,8 +2124,8 @@ fn simple_grid_named_column_span_before(
     explicit_track_count: usize,
     first_line_index: i32,
 ) -> Option<usize> {
-    let name = span.name.as_ref()?;
-    let target = span.span.unwrap_or(1);
+    let name = span.name()?;
+    let target = span.count().unwrap_or(1);
     if target == 0 {
         return None;
     }
@@ -2160,15 +2165,15 @@ fn intrinsic_column_line_index(
         return None;
     };
     let explicit_line_count = i32::try_from(explicit_track_count).ok()?.checked_add(1)?;
-    if line.name.is_none() {
-        let index = line.index?;
+    if line.name().is_none() {
+        let index = line.index()?;
         if index > 0 {
             return Some(index);
         }
         return (index < 0).then(|| explicit_line_count + index + 1);
     }
-    let name = line.name.as_ref()?;
-    let occurrence = line.index.unwrap_or(1);
+    let name = line.name()?;
+    let occurrence = line.index().unwrap_or(1);
     named_intrinsic_column_line_index(
         line_names,
         name,
@@ -2400,10 +2405,12 @@ fn grid_item_estimate_from_intrinsic(
         | css::ComputedLengthPercentageOrAuto::FitContent(_)
         | css::ComputedLengthPercentageOrAuto::CalcSize(_) => content_width,
     };
-    let content_height =
-        used_length_percentage_or_auto_with_basis(style.box_values.height.clone(), block_basis)
-            .map(|height| height.points())
-            .unwrap_or(content_height);
+    let content_height = used_length_percentage_or_auto_with_basis(
+        style.box_values.height.value().clone(),
+        block_basis,
+    )
+    .map(|height| height.points())
+    .unwrap_or(content_height);
     GridItemEstimate {
         metrics: IntrinsicItemMetrics {
             width: constrain_content_width(
@@ -2575,22 +2582,20 @@ mod tests {
             },
             style: style.clone(),
         };
-        let mut used_style = style;
-        used_style.apply_effective_zoom();
+        let used_style = css::LayoutStyle::from_computed(&style).into_zoomed();
         GridUsedItem::from_source(source, used_style)
     }
 
     fn grid_line(index: i32) -> css::GridPlacement {
-        css::GridPlacement::Line(css::GridLinePlacement {
-            name: None,
-            index: Some(index),
-        })
+        css::GridPlacement::Line(css::GridLinePlacement::Number(
+            std::num::NonZeroI32::new(index).unwrap(),
+        ))
     }
 
     fn named_grid_line(name: &str) -> css::GridPlacement {
-        css::GridPlacement::Line(css::GridLinePlacement {
-            name: Some(name.to_string()),
-            index: None,
+        css::GridPlacement::Line(css::GridLinePlacement::Named {
+            name: name.to_string(),
+            occurrence: None,
         })
     }
 
@@ -2726,9 +2731,9 @@ mod tests {
     fn implicit_column_count_includes_forward_named_implicit_spans() {
         let mut named_span = ComputedStyle::initial();
         named_span.grid_column_start = grid_line(1);
-        named_span.grid_column_end = css::GridPlacement::Span(css::GridSpanPlacement {
-            name: Some("slot".to_string()),
-            span: None,
+        named_span.grid_column_end = css::GridPlacement::Span(css::GridSpanPlacement::Named {
+            name: "slot".to_string(),
+            count: None,
         });
         let children = [anonymous_grid_child_with_style(named_span)];
 
@@ -2748,9 +2753,9 @@ mod tests {
     #[test]
     fn backward_named_implicit_span_resolves_startward() {
         let mut named_span = ComputedStyle::initial();
-        named_span.grid_column_start = css::GridPlacement::Span(css::GridSpanPlacement {
-            name: Some("slot".to_string()),
-            span: None,
+        named_span.grid_column_start = css::GridPlacement::Span(css::GridSpanPlacement::Named {
+            name: "slot".to_string(),
+            count: None,
         });
         named_span.grid_column_end = grid_line(3);
 

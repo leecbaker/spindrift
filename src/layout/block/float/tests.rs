@@ -3,10 +3,11 @@ use crate::layout::block::{
     LogicalFloatPlacement, UsedRoundedRect,
 };
 use crate::layout::{
-    Clear, Direction, Float, FloatAvoidingBfcMeasurement, FloatBand, FloatBandPlacement,
-    FloatClearanceResolution, FloatContext, FloatId, FloatPlacement, FloatRunState, FloatShape,
-    LogicalFloatBand, LogicalInlineSpan, PageBlockSpan, PageInlineSpan, PageTopBlockPosition,
-    PageTopPoint, PageTopRect, UsedFloatSide, WritingMode, border_box_pt, margin_box_size_pt,
+    Clear, Direction, Float, FloatAvoidanceCandidate, FloatAvoidanceInlineContainment, FloatBand,
+    FloatBandPlacement, FloatClearanceResolution, FloatContext, FloatId, FloatPlacement,
+    FloatRunState, FloatShape, LogicalFloatBand, LogicalInlineSpan, PageBlockSpan, PageInlineSpan,
+    PageTopBlockPosition, PageTopPoint, PageTopRect, UsedFloatSide, WritingMode, border_box_pt,
+    margin_box_pt, margin_box_size_pt,
 };
 
 fn top(value: f32) -> PageTopBlockPosition {
@@ -48,12 +49,12 @@ fn initial_letter_keeps_margin_geometry_distinct_from_wrapping_geometry() {
     );
 }
 
-fn bfc_measurement(left: f32, width: f32, height: f32) -> FloatAvoidingBfcMeasurement {
-    FloatAvoidingBfcMeasurement {
-        border_box_inline_span: PageInlineSpan::new(left, width),
-        border_box_block_size: border_box_pt(height),
-        permits_inline_start_overflow: false,
-        permits_inline_end_overflow: false,
+fn bfc_measurement(left: f32, width: f32, height: f32) -> FloatAvoidanceCandidate {
+    FloatAvoidanceCandidate {
+        normal_flow_border_box_inline_span: PageInlineSpan::new(left, width),
+        normal_flow_border_box_block_size: border_box_pt(height),
+        inline_start_containment: FloatAvoidanceInlineContainment::Required,
+        inline_end_containment: FloatAvoidanceInlineContainment::Required,
     }
 }
 
@@ -330,6 +331,53 @@ fn float_shape_exposes_margin_box_spans() {
 }
 
 #[test]
+fn negative_outer_inline_extent_fits_right_band_without_narrowing_exclusion() {
+    // The right margin edge is aligned to x=100 while the negative outer
+    // width puts the other margin edge beyond it. CSS 2.2 fits this float by
+    // its signed outer extent, but it has no positive-area line exclusion.
+    let mut shape = FloatShape::from_rect(
+        FloatId(9),
+        Float::Right,
+        UsedFloatSide::Right,
+        0,
+        0,
+        PageTopRect::new(130.0, 100.0, 0.0, 20.0),
+    );
+    shape.outer_inline_extent = margin_box_pt(-30.0);
+    let edges = shape.outer_inline_edges();
+    let band = PageInlineSpan::from_edges(80.0, 100.0);
+
+    assert_eq!(edges.signed_extent(), margin_box_pt(-30.0));
+    assert!(edges.fits_at_used_side_in_band(
+        UsedFloatSide::Right,
+        band,
+        super::exclusions::FLOAT_EPSILON,
+    ));
+    assert_eq!(
+        shape.margin_box_inline_span(),
+        PageInlineSpan::new(130.0, 0.0)
+    );
+}
+
+#[test]
+fn positive_outer_inline_extent_still_requires_space_in_right_band() {
+    let shape = FloatShape::from_rect(
+        FloatId(10),
+        Float::Right,
+        UsedFloatSide::Right,
+        0,
+        0,
+        PageTopRect::new(20.0, 100.0, 80.0, 20.0),
+    );
+
+    assert!(!shape.outer_inline_edges().fits_at_used_side_in_band(
+        UsedFloatSide::Right,
+        PageInlineSpan::from_edges(80.0, 100.0),
+        super::exclusions::FLOAT_EPSILON,
+    ));
+}
+
+#[test]
 fn float_run_reset_uses_typed_page_span_and_position() {
     let row_span = PageInlineSpan::from_edges(10.0, 110.0);
     let mut run = FloatRunState::new(row_span, top(100.0));
@@ -533,6 +581,24 @@ fn content_slab_finds_the_first_circle_position_that_fits() {
 }
 
 #[test]
+fn content_slab_for_overwide_line_waits_for_the_full_containing_measure() {
+    let context = FloatContext {
+        shapes: vec![shape(Float::Left, 0, 0.0, 50.0, 100.0, 0.0)],
+    };
+
+    let top = context
+        .next_content_slab_with_width(
+            0,
+            PageBlockSpan::new(100.0, 20.0),
+            PageInlineSpan::from_edges(0.0, 100.0),
+            100.0,
+        )
+        .expect("the full containing measure should be available below the float");
+
+    assert_eq!(top, PageTopBlockPosition::new(0.0));
+}
+
+#[test]
 fn rounded_contour_uses_the_outermost_edge_over_the_complete_slab() {
     let shape = shape(Float::Left, 0, 0.0, 100.0, 100.0, 0.0);
     let area = FloatArea {
@@ -659,7 +725,10 @@ fn bfc_root_placement_retries_same_top_when_measured_height_narrows_band() {
         placement.placement.available_span,
         PageInlineSpan::new(200.0, 100.0)
     );
-    assert_eq!(placement.border_box_block_size, border_box_pt(100.0));
+    assert_eq!(
+        placement.candidate.normal_flow_border_box_block_size,
+        border_box_pt(100.0)
+    );
 }
 
 #[test]
@@ -708,7 +777,13 @@ fn bfc_root_placement_ignores_own_margins_for_float_collision() {
         placement.placement.available_span,
         PageInlineSpan::new(50.0, 50.0)
     );
-    assert_eq!(placement.border_box_inline_span.width(), 50.0);
+    assert_eq!(
+        placement
+            .candidate
+            .normal_flow_border_box_inline_span
+            .width(),
+        50.0
+    );
 }
 
 #[test]
@@ -738,6 +813,90 @@ fn bfc_root_placement_uses_resolved_border_box_start() {
         placement.placement.available_span,
         PageInlineSpan::new(0.0, 100.0)
     );
+}
+
+#[test]
+fn bfc_root_negative_margin_hypothetical_border_top_stays_above_a_float() {
+    let context = FloatContext {
+        shapes: vec![shape(Float::Left, 0, 0.0, 50.0, 100.0, 50.0)],
+    };
+
+    // A negative block-start margin has already moved the hypothetical border
+    // top above the float before avoidance begins. Its border box is disjoint,
+    // so CSS 2.2 normal flow must retain that top rather than clearing it.
+    let placement = context.avoiding_bfc_root_position(
+        0,
+        top(125.0),
+        Clear::None,
+        WritingMode::HorizontalTb,
+        Direction::Ltr,
+        0.0,
+        100.0,
+        |_band, _top| bfc_measurement(0.0, 50.0, 20.0),
+    );
+
+    assert_eq!(placement.placement.origin, PageTopPoint::new(0.0, 125.0));
+}
+
+#[test]
+fn bfc_root_negative_margin_overlap_uses_the_border_box_to_stay_adjacent() {
+    let context = FloatContext {
+        shapes: vec![shape(Float::Left, 0, 0.0, 50.0, 100.0, 50.0)],
+    };
+
+    let placement = context.avoiding_bfc_root_position(
+        0,
+        top(75.0),
+        Clear::None,
+        WritingMode::HorizontalTb,
+        Direction::Ltr,
+        0.0,
+        100.0,
+        |band, _top| bfc_measurement(band.left(), 50.0, 50.0),
+    );
+
+    assert_eq!(placement.placement.origin, PageTopPoint::new(50.0, 75.0));
+    assert_eq!(
+        placement.candidate.normal_flow_border_box_inline_span,
+        PageInlineSpan::new(50.0, 50.0)
+    );
+}
+
+#[test]
+fn bfc_root_negative_margin_overlap_clears_when_its_border_box_cannot_fit() {
+    let context = FloatContext {
+        shapes: vec![shape(Float::Left, 0, 0.0, 50.0, 100.0, 50.0)],
+    };
+
+    let placement = context.avoiding_bfc_root_position(
+        0,
+        top(75.0),
+        Clear::None,
+        WritingMode::HorizontalTb,
+        Direction::Ltr,
+        0.0,
+        100.0,
+        |band, _top| bfc_measurement(band.left(), 75.0, 50.0),
+    );
+
+    assert_eq!(placement.placement.origin, PageTopPoint::new(0.0, 50.0));
+    assert_eq!(
+        placement.placement.available_span,
+        PageInlineSpan::new(0.0, 100.0)
+    );
+}
+
+#[test]
+fn bfc_candidate_records_negative_inline_margin_overflow_per_edge() {
+    let candidate = FloatAvoidanceCandidate {
+        normal_flow_border_box_inline_span: PageInlineSpan::new(-10.0, 50.0),
+        normal_flow_border_box_block_size: border_box_pt(20.0),
+        inline_start_containment: FloatAvoidanceInlineContainment::PermittedNegativeMarginOverflow,
+        inline_end_containment: FloatAvoidanceInlineContainment::Required,
+    };
+
+    assert!(candidate.permits_inline_start_overflow());
+    assert!(!candidate.permits_inline_end_overflow());
 }
 
 #[test]

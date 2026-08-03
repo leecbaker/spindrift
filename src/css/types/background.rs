@@ -277,6 +277,17 @@ impl ComputedImage {
             Self::None | Self::Invalid => None,
         }
     }
+
+    /// Select a concrete `image-set()` option, preserving the CSS distinction
+    /// between `none` and a valid value that represents an invalid image.
+    pub(crate) fn select_image_set(&mut self, device_resolution_dppx: f32) {
+        let Some(image) = self.as_image_mut() else {
+            return;
+        };
+        if !image.select_image_set(device_resolution_dppx) {
+            *self = Self::Invalid;
+        }
+    }
 }
 
 /// Computed single concrete CSS image.
@@ -286,11 +297,19 @@ impl ComputedImage {
 /// <https://www.w3.org/TR/css-images-3/#gradients>.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum BackgroundImage {
-    /// The image selected from an `image-set()` together with the candidate's
-    /// resolution. CSS Images uses that resolution to scale the selected
-    /// image's intrinsic dimensions.
+    /// An `image-set()` before the renderer has selected its concrete option.
+    ///
+    /// CSS Images requires MIME filtering and duplicate-resolution removal to
+    /// happen before the user agent chooses an option. Retaining the complete
+    /// list until that boundary also keeps stylesheet and inline declarations
+    /// on the same selection path.
     /// <https://drafts.csswg.org/css-images-4/#image-set-notation>
-    ImageSet {
+    ImageSet(ImageSet),
+    /// The concrete option selected from an `image-set()` together with its
+    /// resolution. CSS Images uses that resolution to scale the selected
+    /// raster image's intrinsic dimensions.
+    /// <https://drafts.csswg.org/css-images-4/#image-set-notation>
+    SelectedImageSet {
         image: Box<BackgroundImage>,
         resolution: f32,
     },
@@ -304,6 +323,26 @@ pub(crate) enum BackgroundImage {
     RadialGradient(RadialGradient),
     ConicGradient(ConicGradient),
     CssColor(ColorImageColor),
+}
+
+/// Parsed CSS Images `image-set()` candidates before UA selection.
+///
+/// Source order is semantically significant: after unsupported MIME types are
+/// removed, later candidates with an already-seen resolution are discarded.
+/// <https://drafts.csswg.org/css-images-4/#image-set-notation>
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ImageSet {
+    pub(crate) options: Vec<ImageSetOption>,
+}
+
+/// One candidate in an [`ImageSet`].
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ImageSetOption {
+    pub(crate) image: Box<BackgroundImage>,
+    /// Canonical CSS dots-per-pixel value. Resolution descriptors have no
+    /// percentage basis and therefore compute before candidate negotiation.
+    pub(crate) resolution_dppx: f32,
+    pub(crate) mime_type: Option<String>,
 }
 
 /// The color argument to CSS Images Level 4's `image()` function.
@@ -331,7 +370,11 @@ impl BackgroundImage {
     /// candidates.
     pub(crate) fn selected_image(&self) -> &Self {
         match self {
-            Self::ImageSet { image, .. } => image.selected_image(),
+            Self::SelectedImageSet { image, .. } => image.selected_image(),
+            Self::ImageSet(_) => {
+                debug_assert!(false, "image-set candidates must be selected before layout");
+                self
+            }
             image => image,
         }
     }
@@ -339,14 +382,63 @@ impl BackgroundImage {
     /// Return the product of selected `image-set()` resolutions.
     pub(crate) fn intrinsic_resolution(&self) -> f32 {
         match self {
-            Self::ImageSet { image, resolution } => resolution * image.intrinsic_resolution(),
+            Self::SelectedImageSet { image, resolution } => {
+                resolution * image.intrinsic_resolution()
+            }
+            Self::ImageSet(_) => 1.0,
             _ => 1.0,
         }
     }
 
+    /// Resolve an `image-set()` using Quire's deterministic quality-first
+    /// static-rendering policy. Unsupported MIME options are removed before
+    /// duplicate-resolution elimination, exactly as required by CSS Images.
+    pub(crate) fn select_image_set(&mut self, device_resolution_dppx: f32) -> bool {
+        let Self::ImageSet(set) = self else {
+            return true;
+        };
+        let mut retained = Vec::new();
+        for option in &set.options {
+            if !option.resolution_dppx.is_finite()
+                || option.resolution_dppx <= 0.0
+                || option.mime_type.as_ref().is_some_and(|mime| {
+                    !crate::image_store::supports_declared_image_mime_type(mime)
+                })
+                || retained.iter().any(|candidate: &&ImageSetOption| {
+                    candidate.resolution_dppx == option.resolution_dppx
+                })
+            {
+                continue;
+            }
+            retained.push(option);
+        }
+        let selected = retained
+            .iter()
+            .filter(|option| option.resolution_dppx >= device_resolution_dppx)
+            .min_by(|left, right| left.resolution_dppx.total_cmp(&right.resolution_dppx))
+            .or_else(|| {
+                retained
+                    .iter()
+                    .max_by(|left, right| left.resolution_dppx.total_cmp(&right.resolution_dppx))
+            });
+        let Some(selected) = selected else {
+            return false;
+        };
+        *self = Self::SelectedImageSet {
+            image: selected.image.clone(),
+            resolution: selected.resolution_dppx,
+        };
+        true
+    }
+
     pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         match self {
-            Self::ImageSet { image, .. } => image.resolve_font_metric_lengths(ch_advance),
+            Self::ImageSet(set) => {
+                for option in &mut set.options {
+                    option.image.resolve_font_metric_lengths(ch_advance);
+                }
+            }
+            Self::SelectedImageSet { image, .. } => image.resolve_font_metric_lengths(ch_advance),
             Self::LinearGradient(gradient) => gradient.resolve_font_metric_lengths(ch_advance),
             Self::RadialGradient(gradient) => gradient.resolve_font_metric_lengths(ch_advance),
             Self::ConicGradient(gradient) => gradient.resolve_font_metric_lengths(ch_advance),
@@ -357,7 +449,12 @@ impl BackgroundImage {
 
     pub(crate) fn resolve_em_relative_lengths(&mut self, font_size: LayoutLength) {
         match self {
-            Self::ImageSet { image, .. } => image.resolve_em_relative_lengths(font_size),
+            Self::ImageSet(set) => {
+                for option in &mut set.options {
+                    option.image.resolve_em_relative_lengths(font_size);
+                }
+            }
+            Self::SelectedImageSet { image, .. } => image.resolve_em_relative_lengths(font_size),
             Self::LinearGradient(gradient) => gradient.resolve_em_relative_lengths(font_size),
             Self::RadialGradient(gradient) => gradient.resolve_em_relative_lengths(font_size),
             Self::ConicGradient(gradient) => gradient.resolve_em_relative_lengths(font_size),
@@ -367,7 +464,14 @@ impl BackgroundImage {
 
     pub(crate) fn resolve_root_font_relative_lengths(&mut self, root_font_size: f32) {
         match self {
-            Self::ImageSet { image, .. } => {
+            Self::ImageSet(set) => {
+                for option in &mut set.options {
+                    option
+                        .image
+                        .resolve_root_font_relative_lengths(root_font_size);
+                }
+            }
+            Self::SelectedImageSet { image, .. } => {
                 image.resolve_root_font_relative_lengths(root_font_size)
             }
             Self::LinearGradient(gradient) => {
@@ -385,7 +489,11 @@ impl BackgroundImage {
 
     pub(crate) fn requires_ch_advance(&self) -> bool {
         match self {
-            Self::ImageSet { image, .. } => image.requires_ch_advance(),
+            Self::ImageSet(set) => set
+                .options
+                .iter()
+                .any(|option| option.image.requires_ch_advance()),
+            Self::SelectedImageSet { image, .. } => image.requires_ch_advance(),
             Self::LinearGradient(gradient) => gradient.requires_ch_advance(),
             Self::RadialGradient(gradient) => gradient.requires_ch_advance(),
             Self::ConicGradient(gradient) => gradient.requires_ch_advance(),
@@ -476,8 +584,14 @@ pub(crate) struct LinearGradient {
     pub direction: LinearGradientDirection,
     /// The CSS CssColor 4 coordinate system used between color stops.
     ///
-    /// CSS Images 4 defaults this to Oklab when the function omits an
-    /// explicit `in <color-space>` prelude.
+    /// Until CSS Images 4 default-color-space support is enabled, unqualified
+    /// gradients use CSS Images 3's premultiplied sRGB interpolation. An
+    /// explicit `in <color-space>` prelude retains its requested CSS Color 4
+    /// method.
+    ///
+    /// CSS Images 4 instead defaults an omitted prelude to Oklab; that
+    /// intentional divergence is tracked in `SPEC_DIVERGENCES.md`.
+    /// <https://www.w3.org/TR/css-images-3/#coloring-gradient-line>
     /// <https://drafts.csswg.org/css-images-4/#coloring-gradient-line>
     pub interpolation: GradientInterpolationMethod,
     pub repeating: bool,
@@ -700,6 +814,17 @@ pub(crate) struct GradientInterpolationMethod {
 }
 
 impl GradientInterpolationMethod {
+    /// CSS Images Level 3's default gradient interpolation method.
+    ///
+    /// CSS Images 3 interpolates gradient stops in premultiplied RGBA. Named
+    /// and hexadecimal CSS colors are sRGB colors, so the stored RGB
+    /// components are interpolated directly.
+    /// <https://www.w3.org/TR/css-images-3/#coloring-gradient-line>
+    pub(crate) const CSS_IMAGES_3: Self = Self {
+        space: GradientInterpolationSpace::Srgb,
+        hue: HueInterpolationMethod::Shorter,
+    };
+
     pub(crate) const OKLAB: Self = Self {
         space: GradientInterpolationSpace::Oklab,
         hue: HueInterpolationMethod::Shorter,
@@ -1059,7 +1184,12 @@ impl ResolveViewportLengths for BackgroundSizeAxis {
 impl ResolveViewportLengths for BackgroundImage {
     fn resolve_viewport_lengths(&mut self, basis: ViewportLengthBasis) {
         match self {
-            Self::ImageSet { image, .. } => image.resolve_viewport_lengths(basis),
+            Self::ImageSet(set) => {
+                for option in &mut set.options {
+                    option.image.resolve_viewport_lengths(basis);
+                }
+            }
+            Self::SelectedImageSet { image, .. } => image.resolve_viewport_lengths(basis),
             Self::LinearGradient(gradient) => gradient.resolve_viewport_lengths(basis),
             Self::RadialGradient(gradient) => gradient.resolve_viewport_lengths(basis),
             Self::ConicGradient(gradient) => gradient.resolve_viewport_lengths(basis),

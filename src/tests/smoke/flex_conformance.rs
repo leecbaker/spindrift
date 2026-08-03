@@ -18,11 +18,18 @@ body { color: red }\
 .c10 { color: black }\
 .b { background: inherit }";
 
-fn rects_overlap_y(a: &quire::RenderedRect, b: &quire::RenderedRect) -> bool {
+fn rects_overlap_y(
+    a: &crate::document::paint::shapes::RenderedRect,
+    b: &crate::document::paint::shapes::RenderedRect,
+) -> bool {
     a.y() < b.y() + b.height() - 0.01 && b.y() < a.y() + a.height() - 0.01
 }
 
-fn rects_have_gap_x(a: &quire::RenderedRect, b: &quire::RenderedRect, expected: f32) -> bool {
+fn rects_have_gap_x(
+    a: &crate::document::paint::shapes::RenderedRect,
+    b: &crate::document::paint::shapes::RenderedRect,
+    expected: f32,
+) -> bool {
     let gap = if a.x() <= b.x() {
         b.x() - (a.x() + a.width())
     } else {
@@ -31,13 +38,109 @@ fn rects_have_gap_x(a: &quire::RenderedRect, b: &quire::RenderedRect, expected: 
     (gap - expected).abs() < 0.5
 }
 
-fn rects_have_gap_y(a: &quire::RenderedRect, b: &quire::RenderedRect, expected: f32) -> bool {
+fn rects_have_gap_y(
+    a: &crate::document::paint::shapes::RenderedRect,
+    b: &crate::document::paint::shapes::RenderedRect,
+    expected: f32,
+) -> bool {
     let gap = if a.y() <= b.y() {
         b.y() - (a.y() + a.height())
     } else {
         a.y() - (b.y() + b.height())
     };
     (gap - expected).abs() < 0.5
+}
+
+fn page_rect_with_fill(
+    page: &crate::document::Page,
+    color: CssColor,
+) -> &crate::document::paint::shapes::RenderedRect {
+    page.rects()
+        .iter()
+        .find(|rect| rect.fill == Some(color))
+        .unwrap_or_else(|| panic!("expected {color:?} background: {:?}", page.rects()))
+}
+
+#[tokio::test]
+async fn paged_wrapped_flex_space_between_preserves_definite_cross_size() {
+    let document = Html::from_string(
+        "<!doctype html><style>\
+         @page { size: 200pt 120pt; margin: 0 } body { margin: 0 }\
+         .cover { display: flex; flex-wrap: wrap; align-content: space-between; height: 100pt }\
+         .title { width: 100%; height: 20pt; background: red }\
+         .address { flex: 1 50%; height: 10pt } .left { background: green } .right { background: blue }\
+         </style><main class=\"cover\"><div class=\"title\"></div><div class=\"address left\"></div><div class=\"address right\"></div></main>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(document.pages.len(), 1);
+    let page = &document.pages[0];
+    let red = page_rect_with_fill(page, CssColor::new(255, 0, 0));
+    let green = page_rect_with_fill(page, CssColor::new(0, 128, 0));
+    let blue = page_rect_with_fill(page, CssColor::new(0, 0, 255));
+    assert!(
+        (green.y() - 20.0).abs() < 0.01 && (blue.y() - 20.0).abs() < 0.01,
+        "the second flex line must pack against the definite container block-end: red={red:?}, green={green:?}, blue={blue:?}"
+    );
+    assert!(
+        (red.y() - green.y() - 80.0).abs() < 0.01,
+        "align-content: space-between must preserve its distributed free space: red={red:?}, green={green:?}"
+    );
+}
+
+#[tokio::test]
+async fn paged_wrapped_flex_auto_cross_size_keeps_intrinsic_line_stacking() {
+    let document = Html::from_string(
+        "<!doctype html><style>\
+         @page { size: 200pt 120pt; margin: 0 } body { margin: 0 }\
+         .cover { display: flex; flex-wrap: wrap; align-content: space-between }\
+         .title { width: 100%; height: 20pt; background: red }\
+         .address { flex: 1 50%; height: 10pt } .left { background: green } .right { background: blue }\
+         </style><main class=\"cover\"><div class=\"title\"></div><div class=\"address left\"></div><div class=\"address right\"></div></main>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(document.pages.len(), 1);
+    let page = &document.pages[0];
+    let red = page_rect_with_fill(page, CssColor::new(255, 0, 0));
+    let green = page_rect_with_fill(page, CssColor::new(0, 128, 0));
+    assert!(
+        (red.y() - green.y() - 10.0).abs() < 0.01,
+        "an auto-height flex container has no cross-axis free space to distribute: red={red:?}, green={green:?}"
+    );
+}
+
+#[tokio::test]
+async fn paged_wrapped_flex_uses_its_own_remaining_definite_height() {
+    let document = Html::from_string(
+        "<!doctype html><style>\
+         @page { size: 200pt 120pt; margin: 0 } body, p { margin: 0 }\
+         p { height: 20pt }\
+         .cover { display: flex; flex-wrap: wrap; align-content: space-between; height: 100pt }\
+         .title { width: 100%; height: 20pt; background: red }\
+         .address { flex: 1 50%; height: 10pt } .left { background: green } .right { background: blue }\
+         </style><p></p><main class=\"cover\"><div class=\"title\"></div><div class=\"address left\"></div><div class=\"address right\"></div></main>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(
+        document.pages.len(),
+        1,
+        "the definite flex box fits after its predecessor"
+    );
+    let page = &document.pages[0];
+    let green = page_rect_with_fill(page, CssColor::new(0, 128, 0));
+    let blue = page_rect_with_fill(page, CssColor::new(0, 0, 255));
+    assert!(
+        green.y().abs() < 0.01 && blue.y().abs() < 0.01,
+        "the final line packs to its own remaining container edge, not a continuation page: green={green:?}, blue={blue:?}"
+    );
 }
 
 #[tokio::test]
@@ -855,6 +958,75 @@ async fn flex_order_painting_uses_order_modified_document_order_with_negative_ma
         Some(CssColor::new(0, 128, 0)),
         "order-modified flex painting should cover the lower-order red item with the negative-margin green item: {:?}",
         page.rects()
+    );
+}
+
+#[tokio::test]
+async fn flex_items_paint_each_decoration_before_its_own_contents() {
+    let document = Html::from_string(
+        "<style>@page { size: 180pt 80pt; margin: 10pt } body { margin: 0; font-size: 12pt; line-height: 12pt } .flex { display: flex; height: 36pt } .item { flex: 0 0 0; height: 12pt } .first { background: yellow } .second { background: pink }</style><div class=\"flex\"><span class=\"item first\">one</span><span class=\"item second\">two</span></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let yellow = page
+        .rects()
+        .iter()
+        .position(|rect| rect.fill == Some(CssColor::new(255, 255, 0)))
+        .expect("first flex item background should paint");
+    let pink = page
+        .rects()
+        .iter()
+        .position(|rect| rect.fill == Some(CssColor::new(255, 192, 203)))
+        .expect("second flex item background should paint");
+    let one = page
+        .lines()
+        .iter()
+        .position(|line| line.text == "one")
+        .expect("first flex item text should paint");
+    let two = page
+        .lines()
+        .iter()
+        .position(|line| line.text == "two")
+        .expect("second flex item text should paint");
+
+    let yellow_operation = page
+        .operations()
+        .iter()
+        .position(
+            |operation| matches!(operation, crate::document::paint::page::PaintOperation::Rect(index) if *index == yellow),
+        )
+        .expect("first flex item background should have a paint operation");
+    let one_operation = page
+        .operations()
+        .iter()
+        .position(
+            |operation| matches!(operation, crate::document::paint::page::PaintOperation::Line(index) if *index == one),
+        )
+        .expect("first flex item text should have a paint operation");
+    let pink_operation = page
+        .operations()
+        .iter()
+        .position(
+            |operation| matches!(operation, crate::document::paint::page::PaintOperation::Rect(index) if *index == pink),
+        )
+        .expect("second flex item background should have a paint operation");
+    let two_operation = page
+        .operations()
+        .iter()
+        .position(
+            |operation| matches!(operation, crate::document::paint::page::PaintOperation::Line(index) if *index == two),
+        )
+        .expect("second flex item text should have a paint operation");
+
+    assert!(
+        yellow_operation < one_operation
+            && one_operation < pink_operation
+            && pink_operation < two_operation,
+        "flex items must paint like inline blocks in order-modified document order: {:?}",
+        page.operations()
     );
 }
 
@@ -1809,6 +1981,40 @@ async fn baseline_aligned_row_items_share_text_baseline() {
     assert!(
         (big.y() - small.y()).abs() < 0.01,
         "baseline-aligned flex items should share a baseline: big={big:?}, small={small:?}"
+    );
+}
+
+#[tokio::test]
+async fn baseline_fallback_preserves_specified_cross_size_with_negative_margin() {
+    let document = Html::from_string(
+        "<style>@page { size: 80px 80px; margin: 0 } body { margin: 0 }\
+         .flex { align-items: baseline; background: red; display: flex; height: 40px; width: 40px }\
+         .item { background: yellow; border: 1px solid black; flex: 1; height: 20px; margin-top: -4px }\
+         </style><div class=\"flex\"><div class=\"item\">a</div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let flex = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
+        .expect("flex container background should paint");
+    let item = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(255, 255, 0)))
+        .expect("baseline-aligned flex item background should paint");
+    let px = 0.75;
+    assert!(
+        (item.height() - 22.0 * px).abs() < 0.01,
+        "the background paints the specified content box and its two border edges: {item:?}"
+    );
+    assert!(
+        ((item.y() + item.height()) - (flex.y() + flex.height())).abs() < 0.01,
+        "the negative cross-start margin must leave the item's border edge at the flex cross start: flex={flex:?}, item={item:?}"
     );
 }
 
@@ -3308,14 +3514,17 @@ fn assert_display_contents_wpt_flex_output(document: &quire::Document) {
     );
 }
 
-fn rendered_line<'a>(page: &'a quire::Page, text: &str) -> &'a quire::RenderedLine {
+fn rendered_line<'a>(
+    page: &'a quire::Page,
+    text: &str,
+) -> &'a crate::document::paint::text::RenderedLine {
     page.lines()
         .iter()
         .find(|line| line.text == text)
         .unwrap_or_else(|| panic!("expected rendered text {text:?}: {:?}", page.lines()))
 }
 
-fn glyph_start_x(line: &quire::RenderedLine, index: usize) -> f32 {
+fn glyph_start_x(line: &crate::document::paint::text::RenderedLine, index: usize) -> f32 {
     let run = line
         .runs
         .first()
@@ -3333,7 +3542,7 @@ fn glyph_start_x(line: &quire::RenderedLine, index: usize) -> f32 {
             .sum::<f32>()
 }
 
-fn glyph_center_x(line: &quire::RenderedLine, index: usize) -> f32 {
+fn glyph_center_x(line: &crate::document::paint::text::RenderedLine, index: usize) -> f32 {
     let run = line
         .runs
         .first()
@@ -3345,7 +3554,11 @@ fn glyph_center_x(line: &quire::RenderedLine, index: usize) -> f32 {
     glyph_start_x(line, index) + glyphs[index].x_advance / 2.0
 }
 
-fn assert_blue_at_text_position(page: &quire::Page, line: &quire::RenderedLine, x: f32) {
+fn assert_blue_at_text_position(
+    page: &quire::Page,
+    line: &crate::document::paint::text::RenderedLine,
+    x: f32,
+) {
     assert!(
         blue_rect_covers_text_position(page, line, x),
         "expected blue background at x={x} for {line:?}; rects={:?}",
@@ -3353,7 +3566,11 @@ fn assert_blue_at_text_position(page: &quire::Page, line: &quire::RenderedLine, 
     );
 }
 
-fn assert_no_blue_at_text_position(page: &quire::Page, line: &quire::RenderedLine, x: f32) {
+fn assert_no_blue_at_text_position(
+    page: &quire::Page,
+    line: &crate::document::paint::text::RenderedLine,
+    x: f32,
+) {
     assert!(
         !blue_rect_covers_text_position(page, line, x),
         "suppressed .contents.c2 should not paint blue background at x={x} for {line:?}; rects={:?}",
@@ -3361,7 +3578,11 @@ fn assert_no_blue_at_text_position(page: &quire::Page, line: &quire::RenderedLin
     );
 }
 
-fn blue_rect_covers_text_position(page: &quire::Page, line: &quire::RenderedLine, x: f32) -> bool {
+fn blue_rect_covers_text_position(
+    page: &quire::Page,
+    line: &crate::document::paint::text::RenderedLine,
+    x: f32,
+) -> bool {
     page.rects().iter().any(|rect| {
         rect.fill == Some(CssColor::new(0, 0, 255))
             && x >= rect.x() - 0.5
@@ -3472,6 +3693,41 @@ async fn wrapped_row_flex_fragments_by_line() {
 }
 
 #[tokio::test]
+async fn stretched_wrapped_row_uses_nested_wrapped_flex_full_cross_contribution() {
+    let document = Html::from_string(
+        "<style>@page { size: 220pt 180pt; margin: 10pt }\
+         body { margin: 0; font-size: 12pt; line-height: 12pt }\
+         .outer { display: flex; flex-wrap: wrap; width: 180pt }\
+         h4, dl, dt, dd, p { margin: 0 }\
+         h4 { flex: 1 25% }\
+         dl { display: flex; flex: 1 75%; flex-wrap: wrap }\
+         dt { width: 30% } dd { flex: 1 70% }\
+         .after { margin-top: 6pt }</style>\
+         <div class=\"outer\"><h4>Heading</h4><dl>\
+         <dt>Alpha</dt><dd>first</dd><dt>Beta</dt><dd>second</dd>\
+         <dt>Gamma</dt><dd>third</dd></dl></div><p class=\"after\">After</p>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let alpha = rendered_line(page, "Alpha");
+    let beta = rendered_line(page, "Beta");
+    let gamma = rendered_line(page, "Gamma");
+    let after = rendered_line(page, "After");
+
+    assert!(
+        alpha.y() > beta.y() + 0.01 && beta.y() > gamma.y() + 0.01,
+        "each nested wrapped row must occupy a later block position: alpha={alpha:?}, beta={beta:?}, gamma={gamma:?}"
+    );
+    assert!(
+        gamma.y() > after.y() + 11.9,
+        "following normal-flow content must begin after the nested flex item's final row: gamma={gamma:?}, after={after:?}"
+    );
+}
+
+#[tokio::test]
 async fn fragmented_row_flex_clones_container_background() {
     let document = Html::from_string(
         "<style>@page { size: 100pt 80pt; margin: 10pt } body { margin: 0 }\
@@ -3531,6 +3787,111 @@ async fn flex_item_break_before_is_consumed_at_container_layer() {
             .iter()
             .any(|rect| rect.fill == Some(CssColor::new(255, 0, 0))),
         "second item should render on page 2"
+    );
+}
+
+#[tokio::test]
+async fn wrapped_row_forced_first_item_restarts_and_packs_following_lines() {
+    let document = Html::from_string(
+        "<style>@page { size: 160pt 120pt; margin: 10pt } body { margin: 0 }\
+         .intro { width: 140pt; height: 20pt; background: black }\
+         .row { display: flex; flex-wrap: wrap; width: 140pt }\
+         .full { width: 140pt; height: 20pt; break-after: avoid; background: red }\
+         .subtitle { width: 140pt; height: 20pt; background: yellow }\
+         .card { width: 40pt; height: 20pt; background: blue }</style>\
+         <div class=\"intro\"></div><div class=\"row\">\
+         <div class=\"full\" style=\"break-before: page\"></div>\
+         <div class=\"subtitle\"></div><div class=\"card\"></div>\
+         <div class=\"card\"></div><div class=\"card\"></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(
+        document.pages.len(),
+        2,
+        "a forced first flex item must restart wrapped-line packing on its destination page"
+    );
+    let destination_rects = document.pages[1].rects();
+    assert_eq!(
+        destination_rects
+            .iter()
+            .filter(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
+            .count(),
+        1,
+        "the forced full-width item should begin the destination page"
+    );
+    assert!(
+        destination_rects
+            .iter()
+            .any(|rect| rect.fill == Some(CssColor::new(255, 255, 0))),
+        "the following subtitle line should fit on the forced destination page"
+    );
+    assert_eq!(
+        destination_rects
+            .iter()
+            .filter(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
+            .count(),
+        3,
+        "the following card line should fit on the forced destination page"
+    );
+}
+
+#[tokio::test]
+async fn wrapped_row_forced_later_item_keeps_prior_line_and_packs_remainder() {
+    let document = Html::from_string(
+        "<style>@page { size: 160pt 120pt; margin: 10pt } body { margin: 0 }\
+         .intro { width: 140pt; height: 20pt; background: black }\
+         .row { display: flex; flex-wrap: wrap; width: 140pt }\
+         .before { width: 40pt; height: 20pt; background: blue }\
+         .full { width: 140pt; height: 20pt; break-after: avoid; background: red }\
+         .subtitle { width: 140pt; height: 20pt; background: yellow }\
+         .card { width: 40pt; height: 20pt; background: green }</style>\
+         <div class=\"intro\"></div><div class=\"row\">\
+         <div class=\"before\"></div><div class=\"before\"></div><div class=\"before\"></div>\
+         <div class=\"full\" style=\"break-before: page\"></div>\
+         <div class=\"subtitle\"></div><div class=\"card\"></div>\
+         <div class=\"card\"></div><div class=\"card\"></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(
+        document.pages.len(),
+        2,
+        "a later forced flex item must not leave blank intermediate pages"
+    );
+    assert_eq!(
+        document.pages[0]
+            .rects()
+            .iter()
+            .filter(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
+            .count(),
+        3,
+        "the wrapped line before the forced item should remain on page 1"
+    );
+    let destination_rects = document.pages[1].rects();
+    assert!(
+        destination_rects
+            .iter()
+            .any(|rect| rect.fill == Some(CssColor::new(255, 0, 0))),
+        "the forced item should begin page 2"
+    );
+    assert!(
+        destination_rects
+            .iter()
+            .any(|rect| rect.fill == Some(CssColor::new(255, 255, 0))),
+        "the subtitle after the forced item should remain on page 2"
+    );
+    assert_eq!(
+        destination_rects
+            .iter()
+            .filter(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
+            .count(),
+        3,
+        "the later card line should remain on page 2"
     );
 }
 

@@ -271,6 +271,12 @@ pub(in crate::layout) struct FloatShape {
     pub(in crate::layout) continues_on_next_page: bool,
     pub(in crate::layout) page_index: usize,
     pub(in crate::layout) rect: PageTopRect,
+    /// Signed CSS margin-box extent on the physical inline axis.
+    ///
+    /// `rect` intentionally remains a non-negative geometry rectangle for
+    /// painting and float exclusion. This extent preserves the CSS2 outer
+    /// edge relationship when negative margins make the margin edges cross.
+    pub(in crate::layout) outer_inline_extent: MarginBoxLength,
     /// The logical placement selected for a CSS float before it was projected
     /// into this page-local fragment. Initial-letter exclusions retain their
     /// own used layout record instead: they share wrap queries with floats,
@@ -1635,6 +1641,65 @@ impl UsedRoundedRect {
     }
 }
 
+/// The two physical outer inline edges of a CSS float's margin box.
+///
+/// Unlike a line-wrap exclusion, a CSS margin box can have a negative used
+/// inline extent when a negative margin exceeds the border-box width. CSS 2.2
+/// float placement still aligns and fits that signed outer geometry; only its
+/// positive-area portion can shorten a line box. Keeping those concerns
+/// separate prevents a zero-width exclusion span from erasing the outer edge
+/// that source-order placement must inspect:
+/// <https://www.w3.org/TR/CSS22/visuren.html#float-position>.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct FloatOuterInlineEdges {
+    start_x: f32,
+    end_x: f32,
+}
+
+impl FloatOuterInlineEdges {
+    fn from_margin_box(margin_box: PageTopRect, signed_extent: MarginBoxLength) -> Self {
+        Self {
+            start_x: margin_box.x(),
+            end_x: margin_box.x() + signed_extent.points(),
+        }
+    }
+
+    pub(in crate::layout) fn signed_extent(self) -> MarginBoxLength {
+        margin_box_pt(self.end_x - self.start_x)
+    }
+
+    /// Return the non-negative interval available to float-exclusion queries.
+    ///
+    /// A reversed pair of outer edges has no positive-area interval, but its
+    /// `start_x` remains the legacy zero-width anchor used by left/right band
+    /// intersection code.
+    pub(in crate::layout) fn exclusion_span(self) -> PageInlineSpan {
+        PageInlineSpan::new(self.start_x, self.signed_extent().points())
+    }
+
+    /// Whether a float has the CSS 2.2 placement required to share `band`.
+    ///
+    /// This deliberately compares the signed outer extent with the available
+    /// width before checking the physical outer edge. A negative end margin on
+    /// a right float can therefore put its painted border box beyond `band`
+    /// while its right *margin* edge remains correctly aligned inside it.
+    pub(in crate::layout) fn fits_at_used_side_in_band(
+        self,
+        side: UsedFloatSide,
+        band: PageInlineSpan,
+        epsilon: f32,
+    ) -> bool {
+        if self.signed_extent().points() > band.width() + epsilon {
+            return false;
+        }
+        match side {
+            UsedFloatSide::Left => (self.start_x - band.left_x()).abs() <= epsilon,
+            UsedFloatSide::Right => (self.end_x - band.right_x()).abs() <= epsilon,
+            UsedFloatSide::Top | UsedFloatSide::Bottom => false,
+        }
+    }
+}
+
 impl FloatShape {
     pub(in crate::layout) fn from_rect(
         id: FloatId,
@@ -1654,6 +1719,7 @@ impl FloatShape {
             starts_on_previous_page: false,
             continues_on_next_page: false,
             page_index,
+            outer_inline_extent: margin_box_pt(rect.width()),
             rect,
             placement: None,
             area: FloatArea::RECT,
@@ -1672,6 +1738,7 @@ impl FloatShape {
             starts_on_previous_page: fragment.starts_on_previous_page,
             continues_on_next_page: fragment.continues_on_next_page,
             page_index: fragment.page_index,
+            outer_inline_extent: fragment.outer_inline_extent,
             rect: fragment.rect,
             placement: Some(fragment.placement),
             area: fragment.area.clone(),
@@ -1705,6 +1772,7 @@ impl FloatShape {
             starts_on_previous_page,
             continues_on_next_page,
             page_index,
+            outer_inline_extent: margin_box_pt((right - left).max(0.0)),
             rect: PageTopRect::new(left, top, (right - left).max(0.0), (top - bottom).max(0.0)),
             placement: None,
             area: FloatArea::RECT,
@@ -1740,6 +1808,7 @@ impl FloatShape {
             starts_on_previous_page: false,
             continues_on_next_page: false,
             page_index: layout.page_index,
+            outer_inline_extent: margin_box_pt(layout.margin_box.width()),
             rect: layout.wrapping_box,
             placement: None,
             area,
@@ -1767,8 +1836,13 @@ impl FloatShape {
 
     /// The physical horizontal span occupied by this float's margin box.
     pub(in crate::layout) fn margin_box_inline_span(&self) -> PageInlineSpan {
-        let margin_box = self.physical_margin_box();
-        PageInlineSpan::new(margin_box.x(), margin_box.width())
+        self.outer_inline_edges().exclusion_span()
+    }
+
+    /// Physical CSS 2.2 outer inline edges, including a signed negative
+    /// margin-box extent when the two margin edges cross.
+    pub(in crate::layout) fn outer_inline_edges(&self) -> FloatOuterInlineEdges {
+        FloatOuterInlineEdges::from_margin_box(self.physical_margin_box(), self.outer_inline_extent)
     }
 
     /// The physical vertical span occupied by this float's margin box.
@@ -1786,6 +1860,7 @@ impl FloatShape {
         );
         Self {
             rect,
+            outer_inline_extent: self.outer_inline_extent,
             placement: self
                 .placement
                 .map(|placement| placement.with_margin_box(placement.containing, rect)),
@@ -1809,6 +1884,10 @@ pub(in crate::layout) struct FloatPaintFragment {
     pub(in crate::layout) page_index: usize,
     pub(in crate::layout) side: UsedFloatSide,
     pub(in crate::layout) rect: PageTopRect,
+    /// Signed outer inline extent retained separately from `rect` so a
+    /// negative margin cannot be lost when the paint/exclusion rectangle is
+    /// normalized to a non-negative size.
+    pub(in crate::layout) outer_inline_extent: MarginBoxLength,
     pub(in crate::layout) placement: LogicalFloatPlacement,
     pub(in crate::layout) area: FloatArea,
     pub(in crate::layout) source_order: usize,
@@ -1972,17 +2051,50 @@ pub(in crate::layout) struct FloatBandPlacement {
     pub(in crate::layout) available_span: PageInlineSpan,
 }
 
+/// Whether one edge of a normal-flow BFC root must remain in its containing
+/// inline span during float avoidance.
+///
+/// CSS 2.2's normal block-width equation can place a border box outside its
+/// containing block when the corresponding physical margin is negative. This
+/// is a constraint on the *border box*, not on the residual float band:
+/// <https://www.w3.org/TR/CSS22/visuren.html#floats>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) enum FloatAvoidanceInlineContainment {
+    Required,
+    PermittedNegativeMarginOverflow,
+}
+
+/// The normal-flow border box measured for one float-avoidance candidate.
+///
+/// Float margin boxes establish exclusions, while a BFC root is tested using
+/// this resolved border box. Keeping the collision rectangle and containment
+/// policy together prevents callers from accidentally treating the residual
+/// float band (or a margin box) as the root's geometry:
+/// <https://www.w3.org/TR/CSS22/visuren.html#floats>.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(in crate::layout) struct FloatAvoidingBfcMeasurement {
-    /// Physical inline-start edge of the BFC root's border box before its
-    /// relative-position offset. Float collision is defined against this
-    /// normal-flow border box, not merely its width.
-    pub(in crate::layout) border_box_inline_span: PageInlineSpan,
-    pub(in crate::layout) border_box_block_size: BorderBoxLength,
-    /// Negative physical margins may legally place the border box outside its
-    /// containing block while it remains disjoint from active floats.
-    pub(in crate::layout) permits_inline_start_overflow: bool,
-    pub(in crate::layout) permits_inline_end_overflow: bool,
+pub(in crate::layout) struct FloatAvoidanceCandidate {
+    /// Physical inline span of the normal-flow border box before relative
+    /// positioning is applied.
+    pub(in crate::layout) normal_flow_border_box_inline_span: PageInlineSpan,
+    pub(in crate::layout) normal_flow_border_box_block_size: BorderBoxLength,
+    pub(in crate::layout) inline_start_containment: FloatAvoidanceInlineContainment,
+    pub(in crate::layout) inline_end_containment: FloatAvoidanceInlineContainment,
+}
+
+impl FloatAvoidanceCandidate {
+    pub(in crate::layout) fn permits_inline_start_overflow(self) -> bool {
+        matches!(
+            self.inline_start_containment,
+            FloatAvoidanceInlineContainment::PermittedNegativeMarginOverflow
+        )
+    }
+
+    pub(in crate::layout) fn permits_inline_end_overflow(self) -> bool {
+        matches!(
+            self.inline_end_containment,
+            FloatAvoidanceInlineContainment::PermittedNegativeMarginOverflow
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1992,8 +2104,7 @@ pub(in crate::layout) struct FloatAvoidingBfcPlacement {
     /// whenever the normal block-width equation gives the BFC root a used
     /// start margin.
     pub(in crate::layout) placement: FloatBandPlacement,
-    pub(in crate::layout) border_box_inline_span: PageInlineSpan,
-    pub(in crate::layout) border_box_block_size: BorderBoxLength,
+    pub(in crate::layout) candidate: FloatAvoidanceCandidate,
 }
 
 /// A normal-flow margin-box placement selected after float avoidance.

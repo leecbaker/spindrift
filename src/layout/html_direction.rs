@@ -11,7 +11,7 @@ use super::*;
 pub(super) fn style_for_layout_element(
     element: &Element,
     signature: ElementSignature,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
     parent: Option<&ComputedStyle>,
     ancestors: &[ElementSignature],
 ) -> ComputedStyle {
@@ -28,7 +28,7 @@ pub(super) fn style_for_layout_element(
 pub(super) fn style_for_layout_element_with_parent_ch_advance(
     element: &Element,
     signature: ElementSignature,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
     parent: Option<&ComputedStyle>,
     ancestors: &[ElementSignature],
     parent_ch_advance: LayoutLength,
@@ -46,7 +46,7 @@ pub(super) fn style_for_layout_element_with_parent_ch_advance(
 fn style_for_layout_element_with_signature_transform(
     element: &Element,
     signature: ElementSignature,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
     parent: Option<&ComputedStyle>,
     ancestors: &[ElementSignature],
     parent_ch_advance: Option<LayoutLength>,

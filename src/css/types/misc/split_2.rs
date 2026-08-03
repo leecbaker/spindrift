@@ -48,39 +48,40 @@ impl ElementSignature {
         sibling_signatures: ElementSiblingSignatureList,
     ) -> Self {
         let fallback_namespace_attrs = local_attribute_signatures(&attrs);
-        let opaque_id = sibling_signatures
-            .get(sibling_index)
+        let selected_sibling = sibling_signatures.get(sibling_index);
+        // A signature reconstructed from a sibling list can itself later be
+        // an ancestor in a selector chain. Preserve its complete selector
+        // snapshot, including children, so relational selectors such as
+        // `:has(> .match)` inspect the source DOM rather than an empty shell.
+        // <https://drafts.csswg.org/selectors-4/#relational>
+        let opaque_id = selected_sibling
             .map(|sibling| Rc::clone(&sibling.opaque_id))
             .unwrap_or_else(next_element_signature_opaque_id);
-        let is_target = sibling_signatures
-            .get(sibling_index)
-            .is_some_and(|sibling| sibling.is_target);
-        let has_target_descendant = sibling_signatures
-            .get(sibling_index)
-            .is_some_and(|sibling| sibling.has_target_descendant);
-        let document_direction = sibling_signatures
-            .get(sibling_index)
-            .and_then(|sibling| sibling.document_direction);
+        let child_signatures = selected_sibling
+            .map(|sibling| sibling.children.clone())
+            .unwrap_or_else(ElementSiblingSignatureList::empty);
+        let has_text_child = selected_sibling.is_some_and(|sibling| sibling.has_text_child);
+        let is_target = selected_sibling.is_some_and(|sibling| sibling.is_target);
+        let has_target_descendant =
+            selected_sibling.is_some_and(|sibling| sibling.has_target_descendant);
+        let document_direction = selected_sibling.and_then(|sibling| sibling.document_direction);
         Self {
             tag: tag.into(),
-            namespace_url: sibling_signatures
-                .get(sibling_index)
+            namespace_url: selected_sibling
                 .map(|sibling| sibling.namespace_url.clone())
                 .unwrap_or_default(),
-            document_is_html: sibling_signatures
-                .get(sibling_index)
+            document_is_html: selected_sibling
                 .map(|sibling| sibling.document_is_html)
                 .unwrap_or(true),
             attrs,
-            namespace_attrs: sibling_signatures
-                .get(sibling_index)
+            namespace_attrs: selected_sibling
                 .map(|sibling| sibling.namespace_attrs.clone())
                 .unwrap_or(fallback_namespace_attrs),
             opaque_id,
             sibling_index: Some(sibling_index),
             sibling_signatures,
-            child_signatures: ElementSiblingSignatureList::empty(),
-            has_text_child: false,
+            child_signatures,
+            has_text_child,
             is_target,
             has_target_descendant,
             document_direction,
@@ -239,7 +240,7 @@ pub(crate) struct TextDecoration {
     pub skip_spaces: TextDecorationSkipSpaces,
     pub underline_offset: TextUnderlineOffset,
     pub underline_position: TextUnderlinePosition,
-    pub color: Option<CssColor>,
+    pub color: CssColorOrCurrentColor,
 }
 
 impl TextDecoration {
@@ -405,39 +406,29 @@ pub(crate) enum TextDecorationSkipBox {
 /// characters at the line edges or throughout the line:
 /// <https://drafts.csswg.org/css-text-decor-4/#text-decoration-skip-spaces-property>.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TextDecorationSkipSpaces {
-    pub start: bool,
-    pub end: bool,
-    pub all: bool,
+pub(crate) enum TextDecorationSkipSpaces {
+    None,
+    Start,
+    End,
+    StartEnd,
+    All,
 }
 
 impl TextDecorationSkipSpaces {
-    pub(crate) const NONE: Self = Self {
-        start: false,
-        end: false,
-        all: false,
-    };
-    pub(crate) const START_END: Self = Self {
-        start: true,
-        end: true,
-        all: false,
-    };
-    pub(crate) const ALL: Self = Self {
-        start: false,
-        end: false,
-        all: true,
-    };
+    pub(crate) const NONE: Self = Self::None;
+    pub(crate) const START_END: Self = Self::StartEnd;
+    pub(crate) const ALL: Self = Self::All;
 
     pub(crate) fn skips_line_start(self) -> bool {
-        self.all || self.start
+        matches!(self, Self::Start | Self::StartEnd | Self::All)
     }
 
     pub(crate) fn skips_line_end(self) -> bool {
-        self.all || self.end
+        matches!(self, Self::End | Self::StartEnd | Self::All)
     }
 
     pub(crate) fn skips_all(self) -> bool {
-        self.all
+        matches!(self, Self::All)
     }
 }
 

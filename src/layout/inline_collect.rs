@@ -1,7 +1,7 @@
 use super::*;
 use crate::text::{
     character_is_autospace_alpha, character_is_autospace_ideograph, character_is_autospace_numeric,
-    trim_css_collapsible_whitespace,
+    trim_css_collapsible_whitespace, typographic_unit_is_upright_in_mixed_orientation,
 };
 
 mod split_1;

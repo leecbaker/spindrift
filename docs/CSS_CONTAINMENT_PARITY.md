@@ -1,10 +1,13 @@
 # CSS Containment parity
 
-The local CSS Containment reftest run passes **306 / 314** tests at 96 DPI
-with the harness's configured comparison tolerance. The remaining failures are
-concentrated in baseline synthesis, table-cell clipping, exact margin-edge
-rasterization, size-contained caption/multicol layout, and the explicitly
-deferred SVG-text `content-visibility:auto` case.
+Root/body containment is resolved before layout from the cascaded `html` and
+first eligible `body` styles. A non-`none` used `contain` value (including
+`inline-size` and `style`) on either element disables body property
+propagation to the principal flow, viewport overflow, and canvas background;
+`content-visibility` alone does not. When propagation is disabled, the body
+is an ordinary principal block rather than a document-canvas-flow source;
+root/body principal boxes still receive their normal containment effects.
+This is not a statement about CSS Container Query evaluation.
 
 ## Implemented value surface
 
@@ -20,6 +23,18 @@ deferred SVG-text `content-visibility:auto` case.
   keeping generated-quote nesting local to the containment scope.
 - Layout and paint containment establish independent formatting contexts for
   block and atomic-inline layout, including local float and margin behavior.
+  A layout-contained atomic inline suppresses a descendant-exported baseline
+  but uses the ordinary bottom-margin-edge fallback; forced breaks remain
+  consumable by the active local fragmentainer.
+- The used containment record is the layout and paint source of truth. It
+  rejects non-atomic inline and excluded internal-table principal boxes while
+  retaining effects for eligible table cells; layout/paint boundaries export
+  descendant ink but not descendant scrollable overflow.
+- Containment on an eligible `html` or `body` principal box uses the same
+  document-level propagation resolver as background and viewport overflow.
+  It preserves computed inherited writing-mode and text-orientation inside
+  the subtree while preventing the body's values from becoming root used
+  values.
 - `contain: inline-size` is parsed separately from `size`; intrinsic inline
   contributions are suppressed by logical axis in normal-flow, Flexbox, Grid,
   and table measurement while orthogonal physical block contributions remain.
@@ -39,9 +54,10 @@ fixed-point recascade/layout loop are therefore not implemented. Style queries,
 scroll-state queries, and their containment behavior remain out of scope.
 
 General subgrid track inheritance, line-name propagation, and parent sizing
-participation remain unimplemented. `inline-size` containment still needs
-complete replaced-content, table, multicolumn, and fragmentation coverage.
+participation remain unimplemented. Remaining containment work is outside the
+Level 1 acceptance set: `inline-size` containment still needs complete
+replaced-content, table, multicolumn, and fragmentation coverage;
 `content-visibility: auto` has no interactive viewport lifecycle in paged
-output, and SVG text remains explicitly deferred.
+output; and SVG text remains explicitly deferred.
 
 Primary reference: <https://www.w3.org/TR/css-contain-3/>.

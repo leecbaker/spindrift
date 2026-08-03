@@ -62,45 +62,101 @@ async fn iframe_srcdoc_paints_embedded_document() {
     );
 }
 
+/// HTML's legacy body margins are resolved inside the child document's
+/// cascade, including the immediate iframe's fallback attributes. Compare the
+/// two embedding forms to their equivalent child CSS rather than asserting
+/// implementation-specific paint coordinates.
+/// <https://html.spec.whatwg.org/multipage/rendering.html#the-page>
+#[tokio::test]
+async fn iframe_legacy_body_margins_match_equivalent_child_css() {
+    for (name, source_attribute) in [
+        (
+            "srcdoc",
+            "srcdoc=\"<!doctype html><body>frame margins</body>\"".to_string(),
+        ),
+        (
+            "data URL",
+            "src=\"data:text/html,<!doctype html><body>frame margins</body>\"".to_string(),
+        ),
+    ] {
+        let actual = Html::from_string(format!(
+            "<style>@page{{size:420px 240px;margin:0}}body{{margin:0}}</style>\
+             <iframe width=300 height=160 marginwidth=100 marginheight=60 {source_attribute}></iframe>"
+        ))
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+        let reference = Html::from_string(
+            "<style>@page{size:420px 240px;margin:0}body{margin:0}</style>\
+             <iframe width=300 height=160 srcdoc=\"<!doctype html><body style='margin-left:100px;margin-right:100px;margin-top:60px;margin-bottom:60px'>frame margins</body>\"></iframe>"
+        .to_string())
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+
+        let actual_line = actual.pages[0]
+            .lines()
+            .iter()
+            .find(|line| line.text == "frame")
+            .expect("iframe child text should paint");
+        let reference_line = reference.pages[0]
+            .lines()
+            .iter()
+            .find(|line| line.text == "frame")
+            .expect("reference iframe child text should paint");
+        assert_eq!(
+            (actual_line.x(), actual_line.y()),
+            (reference_line.x(), reference_line.y()),
+            "{name} iframe margins differed from equivalent child CSS"
+        );
+    }
+}
+
 fn line_font<'a>(
     document: &'a quire::Document,
-    line: &quire::RenderedLine,
-) -> &'a quire::DocumentFont {
+    line: &crate::document::paint::text::RenderedLine,
+) -> &'a crate::document::DocumentFont {
     let font_id = line
         .font_id
         .expect("rendered line should have a resolved font");
     &document.fonts[font_id]
 }
 
-fn font_label(font: &quire::DocumentFont) -> String {
+fn font_label(font: &crate::document::DocumentFont) -> String {
     format!("{} {}", font.family, font.post_script_name).to_ascii_lowercase()
 }
 
-fn font_label_contains_any(font: &quire::DocumentFont, needles: &[&str]) -> bool {
+fn font_label_contains_any(font: &crate::document::DocumentFont, needles: &[&str]) -> bool {
     let label = font_label(font);
     needles.iter().any(|needle| label.contains(needle))
 }
 
 fn line_font_contains_any(
     document: &quire::Document,
-    line: &quire::RenderedLine,
+    line: &crate::document::paint::text::RenderedLine,
     needles: &[&str],
 ) -> bool {
     font_label_contains_any(line_font(document, line), needles)
 }
 
-fn line_font_is_italic(document: &quire::Document, line: &quire::RenderedLine) -> bool {
+fn line_font_is_italic(
+    document: &quire::Document,
+    line: &crate::document::paint::text::RenderedLine,
+) -> bool {
     let font = line_font(document, line);
     font.italic_angle != 0 || font_label_contains_any(font, &["italic", "oblique"])
 }
 
-fn line_font_is_bold(document: &quire::Document, line: &quire::RenderedLine) -> bool {
+fn line_font_is_bold(
+    document: &quire::Document,
+    line: &crate::document::paint::text::RenderedLine,
+) -> bool {
     font_label_contains_any(line_font(document, line), &["bold", "black", "heavy"])
 }
 
 fn line_run_font_is_italic(
     document: &quire::Document,
-    line: &quire::RenderedLine,
+    line: &crate::document::paint::text::RenderedLine,
     text: &str,
 ) -> bool {
     line.runs.iter().any(|run| {
@@ -116,7 +172,7 @@ fn line_run_font_is_italic(
 
 fn line_run_font_is_bold(
     document: &quire::Document,
-    line: &quire::RenderedLine,
+    line: &crate::document::paint::text::RenderedLine,
     text: &str,
 ) -> bool {
     line.runs.iter().any(|run| {
@@ -128,7 +184,10 @@ fn line_run_font_is_bold(
     })
 }
 
-fn line_font_is_monospace(document: &quire::Document, line: &quire::RenderedLine) -> bool {
+fn line_font_is_monospace(
+    document: &quire::Document,
+    line: &crate::document::paint::text::RenderedLine,
+) -> bool {
     let font = line_font(document, line);
     let Ok(face) = ttf_parser::Face::parse(&font.data, font.face_index) else {
         return false;
@@ -177,7 +236,7 @@ fn first_rect_paint_operation_index(page: &quire::Page, color: CssColor) -> usiz
         .position(|operation| {
             matches!(
                 operation,
-                quire::PaintOperation::Rect(index)
+                crate::document::paint::page::PaintOperation::Rect(index)
                     if page.rects().get(*index).is_some_and(|rect| rect.fill == Some(color))
             )
         })
@@ -188,7 +247,7 @@ fn final_rect_fill_at(page: &quire::Page, x: f32, y: f32) -> Option<CssColor> {
     page.paint_operations()
         .iter()
         .filter_map(|operation| {
-            let quire::PaintOperation::Rect(index) = operation else {
+            let crate::document::paint::page::PaintOperation::Rect(index) = operation else {
                 return None;
             };
             let rect = page.rects().get(*index)?;
@@ -287,7 +346,7 @@ fn find_pdf_bytes_from(haystack: &[u8], needle: &[u8], start: usize) -> Option<u
         .map(|position| start + position)
 }
 
-fn rendered_line_advance(line: &quire::RenderedLine) -> f32 {
+fn rendered_line_advance(line: &crate::document::paint::text::RenderedLine) -> f32 {
     line.runs
         .iter()
         .flat_map(|run| run.glyphs.as_deref().unwrap_or_default())
@@ -297,7 +356,7 @@ fn rendered_line_advance(line: &quire::RenderedLine) -> f32 {
 
 fn rendered_line_baseline_y_for_top(
     document: &quire::Document,
-    line: &quire::RenderedLine,
+    line: &crate::document::paint::text::RenderedLine,
     top_y: f32,
 ) -> f32 {
     let adjustment = line
@@ -312,7 +371,10 @@ fn rendered_line_baseline_y_for_top(
     top_y - line.font_size + adjustment
 }
 
-fn rendered_line_baseline_top(document: &quire::Document, line: &quire::RenderedLine) -> f32 {
+fn rendered_line_baseline_top(
+    document: &quire::Document,
+    line: &crate::document::paint::text::RenderedLine,
+) -> f32 {
     let adjustment = line
         .font_id
         .and_then(|font_id| document.fonts.get(font_id))
@@ -325,7 +387,11 @@ fn rendered_line_baseline_top(document: &quire::Document, line: &quire::Rendered
     line.y() + line.font_size - adjustment
 }
 
-fn assert_line_baseline_at_top(document: &quire::Document, line: &quire::RenderedLine, top_y: f32) {
+fn assert_line_baseline_at_top(
+    document: &quire::Document,
+    line: &crate::document::paint::text::RenderedLine,
+    top_y: f32,
+) {
     let expected = rendered_line_baseline_y_for_top(document, line, top_y);
     assert!(
         (line.y() - expected).abs() < 0.01,

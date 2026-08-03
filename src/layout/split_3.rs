@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashSet;
 use std::rc::Rc;
 
 impl PhysicalInlineTextBounds {
@@ -271,7 +272,15 @@ impl InlineLineGeometry {
 /// <https://www.w3.org/TR/css-inline-3/#line-layout>.
 pub(in crate::layout) struct InlineParagraphContext<'a> {
     pub(in crate::layout) block_style: &'a ComputedStyle,
-    pub(in crate::layout) stylesheets: &'a [Stylesheet],
+    /// The resolved layout clamp for this block formatting context. This is
+    /// distinct from the immutable computed `line-clamp` declaration.
+    pub(in crate::layout) line_clamp: Option<css::InlineLineClamp<'a>>,
+    /// Whether an enclosing block-flow traversal has established that source
+    /// continues after this inline graph. Preserved breaks and block children
+    /// split one clamped stream into several independent inline graphs.
+    /// <https://drafts.csswg.org/css-overflow-4/#line-clamp>
+    pub(in crate::layout) clamp_continuation: css::ClampContinuation,
+    pub(in crate::layout) stylesheets: &'a Stylesheets<'a>,
     /// Whether the first formatted line of the originating block container
     /// is still available to this anonymous inline run.
     ///
@@ -320,14 +329,31 @@ pub(in crate::layout) struct InlineAtomData {
 pub(in crate::layout) struct InlineAtom {
     pub(in crate::layout) data: Rc<InlineAtomData>,
     pub(in crate::layout) size: InlineSize,
-    pub(in crate::layout) baseline_offset: f32,
-    /// Whether this atomic inline exports a baseline produced by its own
-    /// formatting context. Layout containment suppresses that export; its
-    /// inline parent then aligns the principal box at its block-end edge.
-    /// <https://www.w3.org/TR/css-contain-1/#containment-layout>
-    pub(in crate::layout) exports_internal_baseline: bool,
+    pub(in crate::layout) baseline: InlineAtomBaseline,
     pub(in crate::layout) baseline_shift: f32,
     pub(in crate::layout) visual_offset: InlineVisualOffset,
+}
+
+/// The baseline an atomic inline contributes to its containing line.
+///
+/// Atomic inline boxes carry physical margin-box dimensions for paint. Most
+/// exported baselines are measured from the principal border box's logical
+/// block-start edge, but CSS 2.2 makes an `inline-table` align using its table
+/// box rather than its wrapper. Keeping that reference distinct prevents the
+/// enclosing line from applying the wrapper's block-start margin a second
+/// time. Keeping the fallback distinct prevents callers from treating a
+/// synthesized block-end baseline as a descendant text baseline:
+/// <https://www.w3.org/TR/CSS22/tables.html#table-display>
+/// <https://drafts.csswg.org/css-inline-3/#inline-block-baseline>.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout) enum InlineAtomBaseline {
+    Exported {
+        offset_from_border_box_block_start: f32,
+    },
+    ExportedTableBox {
+        offset_from_table_box_block_start: f32,
+    },
+    SynthesizedBorderBoxBlockEnd,
 }
 
 impl InlineAtom {
@@ -342,16 +368,6 @@ impl InlineAtom {
         link_target: Option<String>,
         alt_text: Option<String>,
     ) -> Self {
-        // An empty atomic inline already uses the CSS inline-block fallback
-        // baseline at its block-end edge. Layout containment suppresses only
-        // a descendant-provided baseline, so preserve that identical empty
-        // fallback instead of promoting the atom to a separate line-relative
-        // participant.
-        // <https://www.w3.org/TR/css-inline-3/#inline-block-baseline>
-        // <https://www.w3.org/TR/css-contain-1/#containment-layout>
-        let uses_empty_fallback_baseline =
-            (baseline_offset + style.margin.top + style.margin.bottom - size.height).abs() <= 0.01;
-        let exports_internal_baseline = !style.contain.layout || uses_empty_fallback_baseline;
         Self {
             data: Rc::new(InlineAtomData {
                 content,
@@ -366,8 +382,9 @@ impl InlineAtom {
                 leading_tracking: layout_pt(0.0),
             }),
             size,
-            baseline_offset,
-            exports_internal_baseline,
+            baseline: InlineAtomBaseline::Exported {
+                offset_from_border_box_block_start: baseline_offset,
+            },
             baseline_shift,
             visual_offset: InlineVisualOffset::zero(),
         }
@@ -421,8 +438,75 @@ impl InlineAtom {
         &self.data.style
     }
 
-    pub(in crate::layout) fn exports_internal_baseline(&self) -> bool {
-        self.exports_internal_baseline
+    /// Resolve this atom's baseline from its border-box logical block start.
+    ///
+    /// The caller supplies the border-box block size because atoms retain
+    /// physical dimensions and their containing inline formatting context
+    /// owns the logical-axis projection.
+    pub(in crate::layout) fn baseline_offset_from_border_box_block_start(
+        &self,
+        border_box_block_size: f32,
+    ) -> f32 {
+        match self.baseline {
+            InlineAtomBaseline::Exported {
+                offset_from_border_box_block_start,
+            } => offset_from_border_box_block_start,
+            InlineAtomBaseline::ExportedTableBox {
+                offset_from_table_box_block_start,
+            } => offset_from_table_box_block_start,
+            InlineAtomBaseline::SynthesizedBorderBoxBlockEnd => border_box_block_size,
+        }
+    }
+
+    /// Resolve this atom's baseline from the containing line's logical
+    /// margin-box block-start edge.
+    ///
+    /// For ordinary atomic inlines, the principal border box begins after its
+    /// block-start margin. `inline-table` is the CSS 2.2 exception: its table
+    /// box, rather than the wrapper carrying its margins, supplies the
+    /// baseline used for inline vertical alignment.
+    /// <https://www.w3.org/TR/CSS22/tables.html#table-display>
+    pub(in crate::layout) fn baseline_offset_from_margin_box_block_start(
+        &self,
+        border_box_block_size: f32,
+        block_start_margin: f32,
+    ) -> f32 {
+        match self.baseline {
+            InlineAtomBaseline::Exported {
+                offset_from_border_box_block_start,
+            } => block_start_margin + offset_from_border_box_block_start,
+            InlineAtomBaseline::ExportedTableBox {
+                offset_from_table_box_block_start,
+            } => offset_from_table_box_block_start,
+            InlineAtomBaseline::SynthesizedBorderBoxBlockEnd => {
+                block_start_margin + border_box_block_size
+            }
+        }
+    }
+
+    /// Mark an exported baseline as originating from an inline-table's table
+    /// box rather than its wrapper box.
+    ///
+    /// CSS 2.2 requires `vertical-align` on `inline-table` to use the table
+    /// box. Its wrapper margins remain part of the atomic inline's outer
+    /// geometry, but do not move the exported first-row baseline.
+    /// <https://www.w3.org/TR/CSS22/tables.html#table-display>
+    pub(in crate::layout) fn with_exported_table_box_baseline(mut self) -> Self {
+        let InlineAtomBaseline::Exported {
+            offset_from_border_box_block_start,
+        } = self.baseline
+        else {
+            unreachable!("only an exported baseline can originate from a table box");
+        };
+        self.baseline = InlineAtomBaseline::ExportedTableBox {
+            offset_from_table_box_block_start: offset_from_border_box_block_start,
+        };
+        self
+    }
+
+    pub(in crate::layout) fn with_synthesized_border_box_block_end_baseline(mut self) -> Self {
+        self.baseline = InlineAtomBaseline::SynthesizedBorderBoxBlockEnd;
+        self
     }
 
     pub(in crate::layout) fn outside_marker(&self) -> Option<&ListMarker> {
@@ -439,6 +523,27 @@ impl InlineAtom {
 
     pub(in crate::layout) fn escaped_positioned_layers(&self) -> Option<&[PositionedPaintLayer]> {
         self.data.escaped_positioned_layers.as_deref()
+    }
+
+    /// Keep a positioned descendant with the inline source atom that owns
+    /// its containing block.  The atom replays these layers only if its
+    /// source range survives line selection, which makes a discarded clamp
+    /// continuation discard the descendant as well.
+    pub(in crate::layout) fn append_escaped_positioned_layers(
+        &mut self,
+        layers: Vec<PositionedPaintLayer>,
+    ) {
+        if layers.is_empty() {
+            return;
+        }
+        let data = Rc::make_mut(&mut self.data);
+        let mut retained = data
+            .escaped_positioned_layers
+            .as_deref()
+            .unwrap_or_default()
+            .to_vec();
+        retained.extend(layers);
+        data.escaped_positioned_layers = Some(Rc::from(retained));
     }
 
     pub(in crate::layout) fn link_target(&self) -> Option<&str> {
@@ -538,6 +643,13 @@ pub(in crate::layout) enum InlineAtomContent {
     /// paint pass can composite the matching isolated browsing context.
     Iframe(crate::dom::ElementId),
     Image(DecodedPngImage),
+    /// A generated `content` gradient preserves its CSS image identity until
+    /// paint.  The raster is used only when native PDF shading cannot express
+    /// the gradient exactly.
+    Gradient {
+        image: BackgroundImage,
+        fallback: DecodedPngImage,
+    },
     Svg {
         asset: Option<SharedSvgAsset>,
     },
@@ -554,6 +666,33 @@ pub(in crate::layout) enum InlineAtomContent {
     StaticPositionPlaceholder,
     InlineBox {
         sequence: inline_layout::InlineLineSequence,
+    },
+    /// A coupled ruby base level and its first-level interlinear annotation.
+    ///
+    /// The parent inline graph receives one column-group advance, while paint
+    /// replays the base and annotation sequences at their separate logical
+    /// block positions. This is deliberately distinct from `InlineBox`: ruby
+    /// annotations must not become parent-line text or justification
+    /// opportunities.
+    /// <https://drafts.csswg.org/css-ruby-1/#ruby-layout>
+    Ruby {
+        /// Source text on the base side of this paired ruby column. The
+        /// inline opportunity graph uses it only to apply UAX #14 at the
+        /// boundary between adjacent ruby bases; annotation sidecars remain
+        /// excluded from the parent text stream.
+        base_text: String,
+        base: RubyInlineLevel,
+        annotations: Vec<RubyInlineLevel>,
+        /// Used placement of each annotation level. This remains parallel to
+        /// `annotations`, making a missing side a type-visible construction
+        /// error rather than an implicit default at paint time.
+        annotation_sides: Vec<css::RubyAnnotationSide>,
+        base_block_size: f32,
+        /// Shared logical block extent of each annotation level in the
+        /// normalized ruby column group. Every column uses the same level
+        /// stack so empty anonymous counterparts cannot move a sibling
+        /// annotation independently.
+        annotation_block_sizes: Vec<f32>,
     },
     /// A tate-chu-yoko run shaped in horizontal typographic mode and carried
     /// as one vertical-em atomic inline.  CSS Writing Modes performs this
@@ -574,6 +713,33 @@ pub(in crate::layout) enum InlineAtomContent {
     },
     InlineEdge(InlineEdgeRole),
     Leader(String),
+}
+
+/// A measured ruby base or annotation level together with the role that
+/// establishes its line-box metrics.
+///
+/// Ruby annotations are separate inline formatting contexts: their `rt`/
+/// `rtc` line-height must not be replaced with the containing ruby box's
+/// line-height when they are replayed beside the base level.
+/// <https://drafts.csswg.org/css-ruby-1/#ruby-layout>
+#[derive(Debug, Clone)]
+pub(in crate::layout) struct RubyInlineLevel {
+    pub(in crate::layout) sequence: inline_layout::InlineLineSequence,
+    pub(in crate::layout) style: Box<ComputedStyle>,
+    /// Logical inline extent occupied after `ruby-align: space-around`
+    /// distribution. This can be narrower than its column: the remaining
+    /// space is the equal half-opportunity at each content edge.
+    pub(in crate::layout) paint_inline_size: f32,
+    /// Logical inline extent available for this level's paint replay. A
+    /// spanning annotation owns the combined width of its paired base
+    /// columns while the parent line still advances column by column.
+    pub(in crate::layout) containing_inline_size: f32,
+    /// Whether this level starts its paired base span. Continuation columns
+    /// retain an empty sidecar only to preserve annotation-level indexing.
+    pub(in crate::layout) starts_span: bool,
+    /// Number of adjacent base columns this level covers when it starts a
+    /// span. Non-starting continuation entries use zero-width paint.
+    pub(in crate::layout) column_span: usize,
 }
 
 /// One owned inline box edge fragment carried through inline layout.
@@ -689,22 +855,30 @@ pub(in crate::layout) struct LayoutSnapshot {
         HashMap<ElementId, Vec<box_tree::SuppressedNamedStringEvent>>,
     pub(in crate::layout) page_anchors: HashMap<String, usize>,
     pub(in crate::layout) page_anchor_text: HashMap<String, AnchorText>,
+    pub(in crate::layout) page_anchor_counters: HashMap<String, HashMap<String, Vec<i32>>>,
+    pub(in crate::layout) has_normal_flow_target_references: bool,
     pub(in crate::layout) document_canvas_background: Option<DocumentCanvasBackground>,
-    pub(in crate::layout) document_canvas_overflow: DocumentCanvasOverflowContext,
+    pub(in crate::layout) document_canvas_overflow: DocumentCanvasResolution,
     pub(in crate::layout) document_canvas_fragment_insets: Vec<FragmentOffsets>,
     pub(in crate::layout) current_page: Page,
     pub(in crate::layout) current_page_has_flow_content: bool,
     pub(in crate::layout) current_page_has_named_page_flow_content: bool,
+    pub(in crate::layout) current_page_selected_name: Option<String>,
     pub(in crate::layout) last_block_layout_outcome: BlockLayoutOutcome,
     pub(in crate::layout) current_page_name: Option<String>,
     pub(in crate::layout) current_page_context: PageContext,
     pub(in crate::layout) initial_viewport_context: PageContext,
     pub(in crate::layout) fragmentainer_override: Option<FragmentainerOverride>,
+    pub(in crate::layout) footnote_measurements: Vec<FootnoteMeasurement>,
+    pub(in crate::layout) rendered_footnote_measurements: Vec<FootnoteMeasurement>,
+    pub(in crate::layout) measured_footnotes: HashSet<ElementId>,
+    pub(in crate::layout) committed_inline_floats: HashMap<ElementId, CommittedInlineFloat>,
+    pub(in crate::layout) rendered_footnotes: HashSet<ElementId>,
+    pub(in crate::layout) footnote_measurement_depth: usize,
     pub(in crate::layout) fragmentation_suppression_depth: usize,
     pub(in crate::layout) multicol_spanner_fragmentation_depth: usize,
     pub(in crate::layout) multicol_spanner_speculation_depth: usize,
     pub(in crate::layout) multicol_balance_probe_depth: usize,
-    pub(in crate::layout) forced_break_containment_scopes: Vec<Option<FragmentainerOverride>>,
     pub(in crate::layout) cursor_y: f32,
     pub(in crate::layout) content_left: f32,
     pub(in crate::layout) content_right: f32,
@@ -724,12 +898,14 @@ pub(in crate::layout) struct LayoutSnapshot {
     pub(in crate::layout) positioned_inline_layout_suppression_depth: usize,
     /// Last prepared in-flow line baseline in the active layout coordinate space.
     pub(in crate::layout) last_in_flow_line_baseline_y: Option<f32>,
+    pub(in crate::layout) pending_outside_marker_anchors: Vec<PendingOutsideMarkerAnchor>,
     pub(in crate::layout) block_static_position_y_offset: Option<f32>,
     pub(in crate::layout) absolute_static_position: Option<AbsoluteStaticPosition>,
     pub(in crate::layout) grid_positioning_scopes: Vec<grid::GridPositioningScope>,
     pub(in crate::layout) pending_subgrid_contexts: Vec<Option<grid::ResolvedSubgridContext>>,
     pub(in crate::layout) escaped_atom_positioning_depth: usize,
     pub(in crate::layout) escaped_atom_containing_block: Option<ContainingBlock>,
+    pub(in crate::layout) escaped_atom_positioning_context: Option<EscapedAtomPositioningContext>,
     pub(in crate::layout) containing_block_writing_mode: WritingMode,
     pub(in crate::layout) fragment_top_offsets: Vec<f32>,
     pub(in crate::layout) child_available_space_stack: Vec<ChildAvailableSpace>,
@@ -760,6 +936,7 @@ pub(in crate::layout) struct LayoutSnapshot {
     pub(in crate::layout) bookmarks: Vec<Bookmark>,
     pub(in crate::layout) positioned_layers: Vec<PositionedPaintLayer>,
     pub(in crate::layout) fixed_layers: Vec<FixedPaintLayer>,
+    pub(in crate::layout) absolute_positioned_page_span_target: Option<usize>,
     pub(in crate::layout) pending_positioned_page_span_target: Option<usize>,
     pub(in crate::layout) next_paint_source_order: usize,
     pub(in crate::layout) overflow_clips: Vec<OverflowClip>,
@@ -776,6 +953,33 @@ pub(in crate::layout) struct LayoutSnapshot {
     pub(in crate::layout) defer_next_block_decoration_promotion: bool,
     pub(in crate::layout) suppress_next_principal_box_decoration: bool,
     pub(in crate::layout) pending_page_footnotes: Vec<ElementId>,
+}
+
+/// One successful source-order inline-float placement.
+///
+/// `exclusion` is the physical float shape registered for later line-band
+/// queries.  Its `id` and `source_order` identify the already-captured float
+/// paint subtree, so replay can consume this placement without re-laying out
+/// the floated DOM element.
+#[derive(Debug, Clone)]
+pub(in crate::layout) struct CommittedInlineFloat {
+    /// `(run_index, byte_offset)` in the inline opportunity graph.  Keeping
+    /// the source identity as scalars avoids leaking the graph's private
+    /// representation into the layout-wide transaction state.
+    pub(in crate::layout) marker: (usize, usize),
+    pub(in crate::layout) selected_row: usize,
+    pub(in crate::layout) exclusion: FloatShape,
+}
+
+impl CommittedInlineFloat {
+    /// Validate the durable transaction at the point ordinary child traversal
+    /// consumes it instead of replaying the floated subtree.
+    pub(in crate::layout) fn is_valid(&self) -> bool {
+        self.marker.0 != usize::MAX
+            && self.marker.1 != usize::MAX
+            && self.selected_row != usize::MAX
+            && self.exclusion.is_css_float()
+    }
 }
 
 /// A temporary fragmentainer materialized through Quire's page cursor.
@@ -824,4 +1028,19 @@ pub(in crate::layout) struct AnchorText {
     pub(in crate::layout) content: String,
     pub(in crate::layout) before: String,
     pub(in crate::layout) after: String,
+}
+
+/// Target data captured at the target element's first fragment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::layout) struct TargetAnchor {
+    pub(in crate::layout) page_index: usize,
+    pub(in crate::layout) text: AnchorText,
+    pub(in crate::layout) counters: HashMap<String, Vec<i32>>,
+}
+
+/// Immutable target state exchanged between complete fresh layout passes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(in crate::layout) struct TargetReferenceSnapshot {
+    pub(in crate::layout) anchors: HashMap<String, TargetAnchor>,
+    pub(in crate::layout) total_pages: usize,
 }

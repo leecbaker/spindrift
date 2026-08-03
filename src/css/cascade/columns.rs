@@ -1,4 +1,5 @@
 use super::*;
+use std::num::NonZeroUsize;
 
 pub(super) fn apply_columns(value: &str, style: &mut ComputedStyle) {
     let Some(longhands) = crate::css::cascade::declarations::expand_columns_shorthand(value) else {
@@ -6,7 +7,11 @@ pub(super) fn apply_columns(value: &str, style: &mut ComputedStyle) {
     };
     for (name, value) in longhands {
         match name {
-            "column-count" => style.column_count = parse_column_count(&value),
+            "column-count" => {
+                if let Some(count) = parse_column_count(&value) {
+                    style.column_count = count;
+                }
+            }
             "column-width" => {
                 if let Some(width) = parse_column_width(&value, style.font_size) {
                     style.column_width = width;
@@ -27,16 +32,17 @@ pub(super) fn apply_columns(value: &str, style: &mut ComputedStyle) {
     }
 }
 
-pub(super) fn parse_column_count(value: &str) -> Option<usize> {
+pub(super) fn parse_column_count(value: &str) -> Option<ColumnCount> {
     let value = trim_css_value(value);
     if value.eq_ignore_ascii_case("auto") {
-        return None;
+        return Some(ColumnCount::Auto);
     }
     value
         .parse::<u16>()
         .ok()
         .filter(|count| *count > 0)
-        .map(usize::from)
+        .and_then(|count| NonZeroUsize::new(usize::from(count)))
+        .map(ColumnCount::Count)
 }
 
 /// Parses `column-width` into its computed CSS value.

@@ -1,22 +1,28 @@
-use super::colors::{
-    PdfColorMode, color_space_name, output_color, set_fill_color, set_stroke_color,
-};
+use super::colors::{PdfColorMode, PdfColorPlan, output_color, set_fill_color, set_stroke_color};
 use super::*;
-use crate::document::{
-    PdfSize, RenderedGradient, RenderedPathCommandPoints, RenderedPathLineCap,
-    RenderedPathLineJoin, RenderedPathPaint, RenderedPathPaintOrder,
+use crate::document::paint::geometry::PdfSize;
+use crate::document::paint::paths::{
+    RenderedGradient, RenderedPathCommandPoints, RenderedPathLineCap, RenderedPathLineJoin,
+    RenderedPathPaint, RenderedPathPaintOrder,
 };
-use pdf_writer::types::{ColorSpaceOperand, LineCapStyle, LineJoinStyle};
+use pdf_writer::types::{ColorSpaceOperand, LineCapStyle, LineJoinStyle, TextRenderingMode};
 use pdf_writer::{Content, Name, Str, TextStr};
 use std::collections::BTreeMap;
+
+/// PDF stroke width used to emulate a matched synthetic bold face.
+///
+/// It is expressed in the CSS font's em space so shaping and layout remain
+/// untouched; only the emitted glyph ink changes.
+const SYNTHETIC_BOLD_STROKE_EM: f32 = 1.0 / 24.0;
 
 pub(super) fn page_content_render<'a>(
     page: &crate::Page,
     embedded_fonts: &EmbeddedFontPlans<'_>,
     next_object_id: &'a mut usize,
-    color_mode: PdfColorMode,
+    color_plan: &'a PdfColorPlan,
     image_resources: &'a [PreparedImageResource],
     page_image_sources: &'a [PlannedImageIndex],
+    page_image_pattern_sources: &'a [PlannedImageIndex],
 ) -> PageContentRender {
     let mut content = Content::new();
     let mut forms = Vec::new();
@@ -30,10 +36,12 @@ pub(super) fn page_content_render<'a>(
         // Current page paint coordinates map identically to unrotated PDF
         // user space. Construct the typed PDF extent once at that boundary.
         page_size: PdfSize::new(page.width(), page.height()),
-        color_mode,
+        color_mode: color_plan.mode(),
+        color_plan,
         image_resources,
         page_image_sources,
-        active_paint_transform: crate::document::PaintTransform::identity(),
+        page_image_pattern_sources,
+        active_paint_transform: crate::document::paint::geometry::PaintTransform::identity(),
     };
     write_paint_tree(
         &mut content,
@@ -55,7 +63,7 @@ pub(super) fn page_content_render<'a>(
 fn write_paint_tree(
     content: &mut Content,
     page: &crate::Page,
-    tree: &crate::document::PagePaintTree,
+    tree: &crate::document::paint::display_list::PagePaintTree,
     embedded_fonts: &EmbeddedFontPlans<'_>,
     state: &mut PaintTreeRenderState<'_, '_>,
 ) {
@@ -70,12 +78,14 @@ struct PaintTreeRenderState<'a, 'b> {
     vector_paints: &'b mut VectorPaintResources,
     page_size: PdfSize,
     color_mode: PdfColorMode,
+    color_plan: &'a PdfColorPlan,
     image_resources: &'a [PreparedImageResource],
     page_image_sources: &'a [PlannedImageIndex],
+    page_image_pattern_sources: &'a [PlannedImageIndex],
     /// The CSS effect CTM active in the current PDF content stream. Tiling
     /// pattern matrices are page resources, so they must retain this mapping
     /// rather than assuming their tile origin is always page-aligned.
-    active_paint_transform: crate::document::PaintTransform,
+    active_paint_transform: crate::document::paint::geometry::PaintTransform,
 }
 
 impl PaintTreeRenderState<'_, '_> {
@@ -123,7 +133,7 @@ struct VectorPaintResources {
 impl VectorPaintResources {
     fn svg_path_tiling_resource(
         &mut self,
-        pattern: &crate::document::RenderedSvgPathPattern,
+        pattern: &crate::document::paint::paths::RenderedSvgPathPattern,
         next_object_id: &mut usize,
     ) -> String {
         let name = format!("SVP{}", self.svg_path_tilings.len() + 1);
@@ -139,7 +149,7 @@ impl VectorPaintResources {
 
     fn tiling_gradient_resource(
         &mut self,
-        pattern: &crate::document::RenderedGradientPattern,
+        pattern: &crate::document::paint::patterns::RenderedGradientPattern,
         next_object_id: &mut usize,
         page_size: PdfSize,
     ) -> String {
@@ -237,7 +247,7 @@ fn gradient_key(gradient: &RenderedGradient) -> String {
 fn write_stacking_context(
     content: &mut Content,
     page: &crate::Page,
-    context: &crate::document::PaintStackingContext,
+    context: &crate::document::paint::stacking::PaintStackingContext,
     embedded_fonts: &EmbeddedFontPlans<'_>,
     state: &mut PaintTreeRenderState<'_, '_>,
 ) {
@@ -248,7 +258,7 @@ fn write_stacking_context(
         write_effect_group(content, page, context, embedded_fonts, state);
         return;
     }
-    let items = crate::document::PaintBand::ORDER
+    let items = crate::document::paint::display_list::PaintBand::ORDER
         .into_iter()
         .flat_map(|band| context.bands.bands[band.index()].iter().cloned())
         .collect::<Vec<_>>();
@@ -259,7 +269,10 @@ fn write_stacking_context(
         .into_iter()
         .filter(|step| {
             !(elide_redundant_rect_clips
-                && matches!(step, crate::document::PaintEffectStep::Clip(_)))
+                && matches!(
+                    step,
+                    crate::document::paint::effects::PaintEffectStep::Clip(_)
+                ))
         })
         .collect::<Vec<_>>();
     let scoped = !effect_steps.is_empty();
@@ -269,49 +282,70 @@ fn write_stacking_context(
     let parent_paint_transform = state.active_paint_transform;
     for step in effect_steps {
         match step {
-            crate::document::PaintEffectStep::Clip(clip)
+            crate::document::paint::effects::PaintEffectStep::Clip(clip)
                 if !clip_is_page_media_box(clip, state) =>
             {
                 write_rect_clip(content, clip)
             }
-            crate::document::PaintEffectStep::ClipUnion(clips) => {
+            crate::document::paint::effects::PaintEffectStep::AxisSelectiveClip(clip) => {
+                write_axis_selective_clip(content, clip, state)
+            }
+            crate::document::paint::effects::PaintEffectStep::ClipUnion(clips) => {
                 write_rect_union_clip(content, clips.clips())
             }
-            crate::document::PaintEffectStep::RoundedClip(clip) => {
+            crate::document::paint::effects::PaintEffectStep::RoundedClip(clip) => {
                 write_rounded_clip(content, &clip)
             }
-            crate::document::PaintEffectStep::ClipPath(clip) => match clip {
-                crate::document::PaintClipPathEffect::Polygon(clip) => {
+            crate::document::paint::effects::PaintEffectStep::ClipPath(clip) => match clip {
+                crate::document::paint::effects::PaintClipPathEffect::Polygon(clip) => {
                     write_polygon_clip(content, &clip);
                 }
-                crate::document::PaintClipPathEffect::Path(clip) => {
+                crate::document::paint::effects::PaintClipPathEffect::Path(clip) => {
                     write_rendered_path_clip(content, &clip);
                 }
                 _ => {}
             },
-            crate::document::PaintEffectStep::Transform(transform) => {
+            crate::document::paint::effects::PaintEffectStep::Transform(transform) => {
                 content.transform(transform.pdf_components());
                 state.active_paint_transform = state.active_paint_transform.multiply(transform);
             }
-            crate::document::PaintEffectStep::Clip(_)
-            | crate::document::PaintEffectStep::Filter(_)
-            | crate::document::PaintEffectStep::Mask(_)
-            | crate::document::PaintEffectStep::Opacity(_)
-            | crate::document::PaintEffectStep::Blend(_)
-            | crate::document::PaintEffectStep::Isolation => {}
+            crate::document::paint::effects::PaintEffectStep::Clip(_)
+            | crate::document::paint::effects::PaintEffectStep::Filter(_)
+            | crate::document::paint::effects::PaintEffectStep::Mask(_)
+            | crate::document::paint::effects::PaintEffectStep::Opacity(_)
+            | crate::document::paint::effects::PaintEffectStep::Blend(_)
+            | crate::document::paint::effects::PaintEffectStep::Isolation => {}
         }
     }
+    // Direct primitive records retain their CSS paint order. A recursive
+    // effect-free context, however, preserves structural bands whose parent
+    // decoration can be emitted before its descendant records; it is not a
+    // proof that a descendant primitive is later composited paint.
+    let is_page_root = context.source_order == 0 && context.bounds.is_none();
+    let direct_paint_sequence = items.iter().all(|item| {
+        matches!(
+            item,
+            crate::document::paint::display_list::PaintDisplayItem::Operation(_)
+                | crate::document::paint::display_list::PaintDisplayItem::Primitive(_)
+        )
+    });
+    let cull_hidden_opaque_background = (is_page_root && direct_paint_sequence)
+        || (!context.effects.ordered_steps().is_empty()
+            && (effects_are_rectangular_clips_only(&context.effects)
+                || effects_are_axis_selective_clips_only(&context.effects)));
     write_display_items(
         content,
         page,
         &items,
         embedded_fonts,
         state,
-        context
-            .effects
-            .ordered_steps()
-            .iter()
-            .any(|step| matches!(step, crate::document::PaintEffectStep::Clip(_))),
+        // The retained page paint tree keeps every authored primitive. At
+        // this final PDF-realization boundary, an opaque rectangle wholly
+        // obscured by later opaque rectangular paint has no observable
+        // composited output. Eliding only that underpaint avoids PDF edge
+        // antialiasing sampling a CSS-hidden backdrop.
+        cull_hidden_opaque_background,
+        cull_hidden_opaque_background,
     );
     if scoped {
         content.restore_state();
@@ -322,7 +356,7 @@ fn write_stacking_context(
 fn write_effect_scope(
     content: &mut Content,
     page: &crate::Page,
-    scope: &crate::document::PaintEffectScope,
+    scope: &crate::document::paint::effects::PaintEffectScope,
     embedded_fonts: &EmbeddedFontPlans<'_>,
     state: &mut PaintTreeRenderState<'_, '_>,
 ) {
@@ -340,7 +374,10 @@ fn write_effect_scope(
         .into_iter()
         .filter(|step| {
             !(elide_redundant_rect_clips
-                && matches!(step, crate::document::PaintEffectStep::Clip(_)))
+                && matches!(
+                    step,
+                    crate::document::paint::effects::PaintEffectStep::Clip(_)
+                ))
         })
         .collect::<Vec<_>>();
     let scoped = !effect_steps.is_empty();
@@ -350,36 +387,39 @@ fn write_effect_scope(
     let parent_paint_transform = state.active_paint_transform;
     for step in effect_steps {
         match step {
-            crate::document::PaintEffectStep::Clip(clip)
+            crate::document::paint::effects::PaintEffectStep::Clip(clip)
                 if !clip_is_page_media_box(clip, state) =>
             {
                 write_rect_clip(content, clip)
             }
-            crate::document::PaintEffectStep::ClipUnion(clips) => {
+            crate::document::paint::effects::PaintEffectStep::AxisSelectiveClip(clip) => {
+                write_axis_selective_clip(content, clip, state)
+            }
+            crate::document::paint::effects::PaintEffectStep::ClipUnion(clips) => {
                 write_rect_union_clip(content, clips.clips())
             }
-            crate::document::PaintEffectStep::RoundedClip(clip) => {
+            crate::document::paint::effects::PaintEffectStep::RoundedClip(clip) => {
                 write_rounded_clip(content, &clip)
             }
-            crate::document::PaintEffectStep::ClipPath(clip) => match clip {
-                crate::document::PaintClipPathEffect::Polygon(clip) => {
+            crate::document::paint::effects::PaintEffectStep::ClipPath(clip) => match clip {
+                crate::document::paint::effects::PaintClipPathEffect::Polygon(clip) => {
                     write_polygon_clip(content, &clip);
                 }
-                crate::document::PaintClipPathEffect::Path(clip) => {
+                crate::document::paint::effects::PaintClipPathEffect::Path(clip) => {
                     write_rendered_path_clip(content, &clip);
                 }
                 _ => {}
             },
-            crate::document::PaintEffectStep::Transform(transform) => {
+            crate::document::paint::effects::PaintEffectStep::Transform(transform) => {
                 content.transform(transform.pdf_components());
                 state.active_paint_transform = state.active_paint_transform.multiply(transform);
             }
-            crate::document::PaintEffectStep::Clip(_)
-            | crate::document::PaintEffectStep::Filter(_)
-            | crate::document::PaintEffectStep::Mask(_)
-            | crate::document::PaintEffectStep::Opacity(_)
-            | crate::document::PaintEffectStep::Blend(_)
-            | crate::document::PaintEffectStep::Isolation => {}
+            crate::document::paint::effects::PaintEffectStep::Clip(_)
+            | crate::document::paint::effects::PaintEffectStep::Filter(_)
+            | crate::document::paint::effects::PaintEffectStep::Mask(_)
+            | crate::document::paint::effects::PaintEffectStep::Opacity(_)
+            | crate::document::paint::effects::PaintEffectStep::Blend(_)
+            | crate::document::paint::effects::PaintEffectStep::Isolation => {}
         }
     }
     write_display_items(
@@ -388,11 +428,13 @@ fn write_effect_scope(
         &scope.items,
         embedded_fonts,
         state,
-        scope
-            .effects
-            .ordered_steps()
-            .iter()
-            .any(|step| matches!(step, crate::document::PaintEffectStep::Clip(_))),
+        // A wholly in-clip opaque rectangle has the same realized output as
+        // its retained geometry. Other effect scopes remain atomic.
+        effects_are_rectangular_clips_only(&scope.effects)
+            || effects_are_axis_selective_clips_only(&scope.effects),
+        scope.effects == crate::document::paint::effects::PaintEffects::default()
+            || effects_are_rectangular_clips_only(&scope.effects)
+            || effects_are_axis_selective_clips_only(&scope.effects),
     );
     if scoped {
         content.restore_state();
@@ -407,17 +449,19 @@ fn write_effect_scope(
 fn write_effect_scope_group(
     content: &mut Content,
     page: &crate::Page,
-    scope: &crate::document::PaintEffectScope,
+    scope: &crate::document::paint::effects::PaintEffectScope,
     embedded_fonts: &EmbeddedFontPlans<'_>,
     state: &mut PaintTreeRenderState<'_, '_>,
 ) {
     let reference = state.reserve_transparency_form();
-    let bbox = scope.bounds.unwrap_or(crate::document::PaintClip::new(
-        0.0,
-        0.0,
-        state.page_size.width,
-        state.page_size.height,
-    ));
+    let bbox = scope
+        .bounds
+        .unwrap_or(crate::document::paint::geometry::PaintClip::new(
+            0.0,
+            0.0,
+            state.page_size.width,
+            state.page_size.height,
+        ));
     let mut form_content = Content::new();
     let mut form_scope = scope.clone();
     form_scope.effects = form_scope.effects.without_group_effects();
@@ -433,11 +477,10 @@ fn write_effect_scope_group(
         transparency_group: true,
     });
     content.save_state();
-    if scope.effects.opacity < 1.0 {
-        let alpha = crate::CssColor::TRANSPARENT.with_alpha(scope.effects.opacity);
-        if let Some(resource_name) = paint_alpha_resource_name(alpha) {
-            content.set_parameters(pdf_name(&resource_name));
-        }
+    if scope.effects.opacity < 1.0
+        && let Some(resource_name) = paint_opacity_resource_name(scope.effects.opacity)
+    {
+        content.set_parameters(pdf_name(&resource_name));
     }
     if let Some(resource_name) = scope.effects.blend_mode.resource_name() {
         content.set_parameters(pdf_name(&resource_name));
@@ -450,12 +493,12 @@ fn write_effect_scope_group(
 fn write_effect_group(
     content: &mut Content,
     page: &crate::Page,
-    context: &crate::document::PaintStackingContext,
+    context: &crate::document::paint::stacking::PaintStackingContext,
     embedded_fonts: &EmbeddedFontPlans<'_>,
     state: &mut PaintTreeRenderState<'_, '_>,
 ) {
     let reference = state.reserve_transparency_form();
-    let bbox = context.effect_bounds(crate::document::PaintClip::new(
+    let bbox = context.effect_bounds(crate::document::paint::geometry::PaintClip::new(
         0.0,
         0.0,
         state.page_size.width,
@@ -482,11 +525,10 @@ fn write_effect_group(
         transparency_group: true,
     });
     content.save_state();
-    if context.effects.opacity < 1.0 {
-        let alpha = crate::CssColor::TRANSPARENT.with_alpha(context.effects.opacity);
-        if let Some(resource_name) = paint_alpha_resource_name(alpha) {
-            content.set_parameters(pdf_name(&resource_name));
-        }
+    if context.effects.opacity < 1.0
+        && let Some(resource_name) = paint_opacity_resource_name(context.effects.opacity)
+    {
+        content.set_parameters(pdf_name(&resource_name));
     }
     if let Some(resource_name) = context.effects.blend_mode.resource_name() {
         content.set_parameters(pdf_name(&resource_name));
@@ -499,10 +541,11 @@ fn write_effect_group(
 fn write_display_items(
     content: &mut Content,
     page: &crate::Page,
-    items: &[crate::document::PaintDisplayItem],
+    items: &[crate::document::paint::display_list::PaintDisplayItem],
     embedded_fonts: &EmbeddedFontPlans<'_>,
     state: &mut PaintTreeRenderState<'_, '_>,
     cull_hidden_opaque_background: bool,
+    allow_opaque_text_coverage_elision: bool,
 ) {
     let mut pending_rects = PendingFillRects::default();
     write_display_items_with_pending_rects(
@@ -512,7 +555,9 @@ fn write_display_items(
         embedded_fonts,
         state,
         cull_hidden_opaque_background,
+        allow_opaque_text_coverage_elision,
         &mut pending_rects,
+        &[],
         &[],
     );
     flush_pending_rects(content, &mut pending_rects, state.color_mode);
@@ -534,64 +579,100 @@ fn write_display_items(
 fn write_display_items_with_pending_rects(
     content: &mut Content,
     page: &crate::Page,
-    items: &[crate::document::PaintDisplayItem],
+    items: &[crate::document::paint::display_list::PaintDisplayItem],
     embedded_fonts: &EmbeddedFontPlans<'_>,
     state: &mut PaintTreeRenderState<'_, '_>,
     cull_hidden_opaque_background: bool,
+    allow_opaque_text_coverage_elision: bool,
     pending_rects: &mut PendingFillRects,
-    later_item_lists: &[&[crate::document::PaintDisplayItem]],
+    prior_item_lists: &[&[crate::document::paint::display_list::PaintDisplayItem]],
+    later_item_lists: &[&[crate::document::paint::display_list::PaintDisplayItem]],
 ) {
     for (item_index, item) in items.iter().enumerate() {
-        if let Some(rect) = display_item_rect(page, item, state) {
+        let can_cull_item = cull_hidden_opaque_background;
+        if can_cull_item
+            && transformed_opaque_rect_container_is_fully_covered(
+                page,
+                item,
+                &items[item_index + 1..],
+                state.color_mode,
+            )
+        {
+            // A transform ordinarily establishes a PDF graphics-state
+            // boundary, so it is intentionally not flattened into the
+            // surrounding fill batch.  A scope containing exactly one opaque
+            // axis-aligned rectangle is different: if later sibling scopes
+            // wholly cover its transformed rectangle, CSS compositing makes
+            // the scope unobservable.  Omitting that underpaint keeps PDF
+            // edge antialiasing from sampling a color which CSS has hidden.
+            continue;
+        }
+        if let Some(coverage) = display_item_opaque_text_coverage(page, item) {
+            write_opaque_text_coverage(
+                content,
+                page,
+                coverage,
+                items,
+                item_index,
+                prior_item_lists,
+                later_item_lists,
+                embedded_fonts,
+                state,
+                allow_opaque_text_coverage_elision,
+                pending_rects,
+            );
+        } else if let Some(line) = display_item_line(page, item) {
+            // CSS paints the later opaque cover over this text, but a PDF
+            // rasterizer can still sample the hidden ink at a fractional
+            // vector edge. When the retained glyph-ink bounds prove that the
+            // line is fully covered in this effect-free scope, retain its
+            // text codes and ToUnicode mapping with rendering mode 3 instead
+            // of emitting visible ink. CSS 2.2 Appendix E defines the paint
+            // order; ISO 32000-2:2020, 9.3.6 defines invisible text.
+            let invisible = allow_opaque_text_coverage_elision
+                && rendered_line_ink_is_fully_hidden(
+                    page,
+                    line,
+                    items,
+                    item_index,
+                    later_item_lists,
+                    Some(state),
+                );
+            flush_pending_rects(content, pending_rects, state.color_mode);
+            write_line_with_visibility(content, line, embedded_fonts, state.color_mode, invisible);
+        } else if let Some(rect) = display_item_rect(page, item, state) {
             // Preserve ordinary display-list paint in the PDF.  Fully
             // covered fills can be elided only while serializing a clipped
             // scope, where the optimization prevents a duplicated clip edge
             // from showing through antialiasing.  Applying it to every
             // opaque rectangle changes the authored stacking-context output
             // (and can discard tagged or otherwise significant content).
-            let rects = if rect_is_unpainted_white_canvas(
-                page,
+            let position = DisplayListPaintPosition {
                 items,
                 item_index,
-                &rect,
+                prior_item_lists,
                 later_item_lists,
-                state,
-            ) {
-                Vec::new()
-            } else if cull_hidden_opaque_background
-                || rect_is_fully_covered_by_later_opaque_rects(
-                    page,
-                    items,
-                    item_index,
-                    &rect,
-                    later_item_lists,
-                    state,
-                )
-            {
-                visible_rect_after_later_display_rects(
-                    page,
-                    items,
-                    item_index,
-                    &rect,
-                    later_item_lists,
-                    state,
-                )
-            } else if rect_is_fully_covered_by_later_opaque_path(
-                page,
-                items,
-                item_index,
-                &rect,
-                later_item_lists,
-            ) {
-                // A full-em glyph path is a retained text-coverage companion,
-                // not an authored background.  Removing only a fill that it
-                // completely obscures prevents the PDF rasterizer from
-                // compositing its fractional edge over a color CSS has
-                // already hidden.
-                Vec::new()
-            } else {
-                vec![rect]
             };
+            let rects =
+                if rect_is_unpainted_white_canvas(page, position, &rect, state, can_cull_item)
+                    || (can_cull_item
+                        && rect_is_fully_covered_by_uninterrupted_prior_same_color(
+                            page, position, &rect, state,
+                        ))
+                {
+                    Vec::new()
+                } else if can_cull_item {
+                    visible_rect_after_later_display_rects(
+                        page,
+                        items,
+                        item_index,
+                        &rect,
+                        later_item_lists,
+                        state,
+                    )
+                } else {
+                    vec![rect]
+                };
             for rect in rects {
                 // Merge based on the actual PDF paint values, not their CSS
                 // source coordinates. Equivalent Lab/OKLab and sRGB fills can
@@ -609,44 +690,99 @@ fn write_display_items_with_pending_rects(
                     write_rect(content, &rect, state.color_mode);
                 }
             }
-        } else if let crate::document::PaintDisplayItem::StackingContext(context) = item
-            && context.effects == crate::document::PaintEffects::default()
+        } else if let crate::document::paint::display_list::PaintDisplayItem::StackingContext(
+            context,
+        ) = item
+            && (context.effects == crate::document::paint::effects::PaintEffects::default()
+                || effects_are_rectangular_clips_only(&context.effects))
         {
-            let context_items = crate::document::PaintBand::ORDER
+            let context_items = crate::document::paint::display_list::PaintBand::ORDER
                 .into_iter()
                 .flat_map(|band| context.bands.bands[band.index()].iter().cloned())
                 .collect::<Vec<_>>();
+            let clipped = effects_are_rectangular_clips_only(&context.effects)
+                && !rectangular_clips_are_redundant_for_solid_images(
+                    page,
+                    &context.effects,
+                    &context_items,
+                    state,
+                );
+            if clipped {
+                flush_pending_rects(content, pending_rects, state.color_mode);
+                content.save_state();
+                write_rectangular_clip_effects(content, &context.effects, state);
+            }
             let mut context_later_item_lists =
                 Vec::with_capacity(later_item_lists.len().saturating_add(1));
             context_later_item_lists.push(&items[item_index + 1..]);
             context_later_item_lists.extend_from_slice(later_item_lists);
+            let mut context_prior_item_lists =
+                Vec::with_capacity(prior_item_lists.len().saturating_add(1));
+            context_prior_item_lists.push(&items[..item_index]);
+            context_prior_item_lists.extend_from_slice(prior_item_lists);
+            // The parent lists establish source containment, not a sibling
+            // paint order inside this captured context. Coverage culling may
+            // use them only once this context has installed a clip that makes
+            // its local geometry authoritative.
+            let nested_cull_hidden_opaque_background = cull_hidden_opaque_background || clipped;
             write_display_items_with_pending_rects(
                 content,
                 page,
                 &context_items,
                 embedded_fonts,
                 state,
-                false,
+                nested_cull_hidden_opaque_background,
+                allow_opaque_text_coverage_elision,
                 pending_rects,
+                &context_prior_item_lists,
                 &context_later_item_lists,
             );
-        } else if let crate::document::PaintDisplayItem::EffectScope(scope) = item
-            && scope.effects == crate::document::PaintEffects::default()
+            if clipped {
+                flush_pending_rects(content, pending_rects, state.color_mode);
+                content.restore_state();
+            }
+        } else if let crate::document::paint::display_list::PaintDisplayItem::EffectScope(scope) =
+            item
+            && (scope.effects == crate::document::paint::effects::PaintEffects::default()
+                || effects_are_rectangular_clips_only(&scope.effects))
         {
+            let clipped = effects_are_rectangular_clips_only(&scope.effects)
+                && !rectangular_clips_are_redundant_for_solid_images(
+                    page,
+                    &scope.effects,
+                    &scope.items,
+                    state,
+                );
+            if clipped {
+                flush_pending_rects(content, pending_rects, state.color_mode);
+                content.save_state();
+                write_rectangular_clip_effects(content, &scope.effects, state);
+            }
             let mut scope_later_item_lists =
                 Vec::with_capacity(later_item_lists.len().saturating_add(1));
             scope_later_item_lists.push(&items[item_index + 1..]);
             scope_later_item_lists.extend_from_slice(later_item_lists);
+            let mut scope_prior_item_lists =
+                Vec::with_capacity(prior_item_lists.len().saturating_add(1));
+            scope_prior_item_lists.push(&items[..item_index]);
+            scope_prior_item_lists.extend_from_slice(prior_item_lists);
+            let nested_cull_hidden_opaque_background = cull_hidden_opaque_background || clipped;
             write_display_items_with_pending_rects(
                 content,
                 page,
                 &scope.items,
                 embedded_fonts,
                 state,
-                false,
+                nested_cull_hidden_opaque_background,
+                allow_opaque_text_coverage_elision,
                 pending_rects,
+                &scope_prior_item_lists,
                 &scope_later_item_lists,
             );
+            if clipped {
+                flush_pending_rects(content, pending_rects, state.color_mode);
+                content.restore_state();
+            }
         } else {
             flush_pending_rects(content, pending_rects, state.color_mode);
             write_display_item(content, page, item, embedded_fonts, state);
@@ -654,88 +790,527 @@ fn write_display_items_with_pending_rects(
     }
 }
 
-fn rect_is_fully_covered_by_later_opaque_path(
+/// Deduplicate only a direct earlier same-color fill with no intervening
+/// opaque different-color rectangle. A same-color page canvas is not proof of
+/// redundancy after a dark background has painted over it.
+fn rect_is_fully_covered_by_uninterrupted_prior_same_color(
     page: &crate::Page,
-    items: &[crate::document::PaintDisplayItem],
-    item_index: usize,
-    rect: &crate::RenderedRect,
-    later_item_lists: &[&[crate::document::PaintDisplayItem]],
+    position: DisplayListPaintPosition<'_>,
+    rect: &crate::document::paint::shapes::RenderedRect,
+    state: &PaintTreeRenderState<'_, '_>,
 ) -> bool {
-    if !is_opaque_fill_rect(rect) {
-        return false;
-    }
-    let mut covers = Vec::new();
-    for item in &items[item_index + 1..] {
-        collect_later_opaque_coverage_paths(page, item, &mut covers);
-    }
-    for later_items in later_item_lists {
-        for item in *later_items {
-            collect_later_opaque_coverage_paths(page, item, &mut covers);
+    let rect = rect_with_output_fill(rect.clone(), state.color_mode);
+    let mut prior_rects = Vec::new();
+    for prior_items in position.prior_item_lists.iter().rev() {
+        for item in prior_items.iter() {
+            collect_later_opaque_rects(page, item, state, &mut prior_rects);
         }
     }
-    rect_area_is_covered_by_rects(rect, &covers)
+    for item in &position.items[..position.item_index] {
+        collect_later_opaque_rects(page, item, state, &mut prior_rects);
+    }
+    let mut intervening = Vec::new();
+    for previous in prior_rects.iter().rev() {
+        if !rects_intersect(previous, &rect) {
+            continue;
+        }
+        if previous.fill == rect.fill {
+            return rect_area_is_covered_by_rects(&rect, std::slice::from_ref(previous))
+                && intervening.iter().all(|intermediate| {
+                    rect_area_is_covered_by_rects(intermediate, std::slice::from_ref(&rect))
+                });
+        }
+        intervening.push(previous.clone());
+    }
+    false
 }
 
-/// Collect only paths that explicitly prove opaque rectangular coverage.
+/// Serialize text whose full-em glyph paths are explicit opaque coverage.
 ///
-/// Ordinary path bounds cannot participate: curves, holes, alpha, clips, and
-/// paint servers make them unsuitable for culling an earlier CSS fill.
-fn collect_later_opaque_coverage_paths(
+/// The line keeps the normal PDF text object (and therefore its `/ToUnicode`
+/// extraction data), while `VectorPath` glyphs are emitted in PDF rendering
+/// mode 3. When every companion rectangle is covered by later, effect-free
+/// opaque coverage, omitting those paths exactly preserves the CSS composited
+/// result and prevents PDF antialiasing from sampling hidden ink. PDF text
+/// rendering mode 3 is defined by ISO 32000-2:2020, 9.3.6; CSS paint order is
+/// defined by CSS 2.2 Appendix E: <https://www.w3.org/TR/CSS22/zindex.html>.
+/// A coverage record owns one CSS text-paint operation. Its compatible
+/// rectangles can share a PDF fill within that operation, but must not remain
+/// pending across another record: coalescing coverage from separate line
+/// records changes fractional-edge rasterization even when their geometry and
+/// color are identical.
+#[allow(clippy::too_many_arguments)]
+fn write_opaque_text_coverage(
+    content: &mut Content,
     page: &crate::Page,
-    item: &crate::document::PaintDisplayItem,
-    rects: &mut Vec<crate::RenderedRect>,
+    coverage: &crate::document::paint::page::OpaqueTextCoverage,
+    items: &[crate::document::paint::display_list::PaintDisplayItem],
+    item_index: usize,
+    prior_item_lists: &[&[crate::document::paint::display_list::PaintDisplayItem]],
+    later_item_lists: &[&[crate::document::paint::display_list::PaintDisplayItem]],
+    embedded_fonts: &EmbeddedFontPlans<'_>,
+    state: &mut PaintTreeRenderState<'_, '_>,
+    allow_opaque_text_coverage_elision: bool,
+    pending_rects: &mut PendingFillRects,
 ) {
-    match item {
-        crate::document::PaintDisplayItem::Operation(crate::PaintOperation::Path(index)) => {
-            if let Some(rect) = page
-                .paths
-                .get(*index)
-                .and_then(|path| path.opaque_coverage_rect)
-            {
-                rects.push(crate::RenderedRect::from_paint_rect(
-                    rect,
-                    Some(crate::CssColor::BLACK),
-                ));
+    let Some(line) = page.lines.get(coverage.line_index) else {
+        return;
+    };
+    if pending_rects.ends_with_invisible_text_coverage {
+        // Two distinct CSS text records must not share a fill, even when
+        // both use invisible PDF text. A following ordinary rectangle may
+        // still merge with the preceding record's opaque glyph coverage.
+        flush_pending_rects(content, pending_rects, state.color_mode);
+    }
+    let coverage_fully_hidden = allow_opaque_text_coverage_elision
+        && opaque_text_coverage_is_fully_hidden_with_state(
+            page,
+            coverage,
+            items,
+            item_index,
+            later_item_lists,
+            Some(state),
+        );
+    // This record is created only for opaque vector coverage that reproduces
+    // the line's glyph ink. Keep the text codes for extraction, but let the
+    // retained paths be its sole visible realization. This avoids applying
+    // two fractional-edge coverage rules to the same CSS glyph.
+    let coverage_replaces_glyph_ink = coverage.path_indices.iter().all(|path_index| {
+        page.paths
+            .get(*path_index)
+            .is_some_and(|path| path.opaque_coverage_rect.is_some())
+    });
+    let invisible = coverage_fully_hidden || coverage_replaces_glyph_ink;
+    // A visible text record is a paint boundary. An invisible record has no
+    // PDF paint, so retaining the pending batch lets equal opaque coverage on
+    // either side coalesce into one fill without changing CSS paint output.
+    if !invisible {
+        flush_pending_rects(content, pending_rects, state.color_mode);
+    }
+    write_line_with_visibility(content, line, embedded_fonts, state.color_mode, invisible);
+    if coverage_fully_hidden {
+        return;
+    }
+    for path_index in &coverage.path_indices {
+        if allow_opaque_text_coverage_elision
+            && opaque_text_coverage_path_matches_prior_rect(
+                page,
+                *path_index,
+                items,
+                item_index,
+                prior_item_lists,
+            )
+        {
+            continue;
+        }
+        if let Some(path) = page.paths.get(*path_index) {
+            if let Some(rect) = opaque_text_coverage_rect_for_batch(path, state.color_mode) {
+                if !pending_rects.try_push(&rect) {
+                    flush_pending_rects(content, pending_rects, state.color_mode);
+                    let pushed = pending_rects.try_push(&rect);
+                    debug_assert!(pushed, "verified opaque coverage rect is mergeable");
+                }
+            } else {
+                // Do not turn clipped, transformed, patterned, or otherwise
+                // non-equivalent paths into page-space rectangles.
+                flush_pending_rects(content, pending_rects, state.color_mode);
+                write_path(
+                    content,
+                    path,
+                    state.vector_paints,
+                    state.next_object_id,
+                    state.page_size,
+                    state.color_mode,
+                );
             }
         }
-        crate::document::PaintDisplayItem::StackingContext(context)
+    }
+    // Visible text remains a CSS paint boundary. When this record uses
+    // invisible text, the companion opaque paths are its only visible paint,
+    // so an equal adjacent fill may remain pending and coalesce safely.
+    if !invisible {
+        flush_pending_rects(content, pending_rects, state.color_mode);
+    }
+    if invisible && !pending_rects.rects.is_empty() {
+        pending_rects.ends_with_invisible_text_coverage = true;
+    }
+}
+
+/// Return whether an opaque text-coverage path is already supplied by a
+/// preceding same-color rectangle in the current display-list scope.
+///
+/// The companion rectangle remains emitted: rectangle culling explicitly
+/// preserves a same-color source when this relationship exists, so these two
+/// local optimizations cannot remove both paints.
+fn opaque_text_coverage_path_matches_prior_rect(
+    page: &crate::Page,
+    path_index: usize,
+    items: &[crate::document::paint::display_list::PaintDisplayItem],
+    item_index: usize,
+    prior_item_lists: &[&[crate::document::paint::display_list::PaintDisplayItem]],
+) -> bool {
+    let Some(path) = page.paths.get(path_index) else {
+        return false;
+    };
+    let (Some(fill), Some(coverage_rect)) = (path.fill, path.opaque_coverage_rect) else {
+        return false;
+    };
+    let coverage =
+        crate::document::paint::shapes::RenderedRect::from_paint_rect(coverage_rect, Some(fill));
+    let mut prior_rects = Vec::new();
+    for item in &items[..item_index] {
+        collect_prior_same_color_opaque_rects(page, item, fill, &mut prior_rects);
+    }
+    for prior_items in prior_item_lists {
+        for item in *prior_items {
+            collect_prior_same_color_opaque_rects(page, item, fill, &mut prior_rects);
+        }
+    }
+    rect_area_is_covered_by_rects(&coverage, &prior_rects)
+}
+
+fn collect_prior_same_color_opaque_rects(
+    page: &crate::Page,
+    item: &crate::document::paint::display_list::PaintDisplayItem,
+    color: crate::CssColor,
+    rects: &mut Vec<crate::document::paint::shapes::RenderedRect>,
+) {
+    match item {
+        crate::document::paint::display_list::PaintDisplayItem::Operation(
+            crate::document::paint::page::PaintOperation::Rect(index),
+        ) => {
+            if let Some(rect) = page.rects.get(*index)
+                && is_opaque_fill_rect(rect)
+                && rect.fill == Some(color)
+            {
+                rects.push(rect.clone());
+            }
+        }
+        crate::document::paint::display_list::PaintDisplayItem::Primitive(
+            crate::document::paint::page::PaintPrimitive::Rect(rect),
+        ) if is_opaque_fill_rect(rect) && rect.fill == Some(color) => {
+            rects.push(rect.clone());
+        }
+        crate::document::paint::display_list::PaintDisplayItem::StackingContext(context)
             if effects_are_rectangular_clips_only(&context.effects) =>
         {
-            for band in crate::document::PaintBand::ORDER {
+            for band in crate::document::paint::display_list::PaintBand::ORDER {
                 for child in &context.bands.bands[band.index()] {
-                    collect_later_opaque_coverage_paths(page, child, rects);
+                    collect_prior_same_color_opaque_rects(page, child, color, rects);
                 }
             }
         }
-        crate::document::PaintDisplayItem::EffectScope(scope)
+        crate::document::paint::display_list::PaintDisplayItem::EffectScope(scope)
             if effects_are_rectangular_clips_only(&scope.effects) =>
         {
             for child in &scope.items {
-                collect_later_opaque_coverage_paths(page, child, rects);
+                collect_prior_same_color_opaque_rects(page, child, color, rects);
             }
         }
         _ => {}
     }
 }
 
-fn rect_with_output_fill(
-    mut rect: crate::RenderedRect,
+/// Convert a verified opaque coverage path to a page-space rectangle when its
+/// original path semantics are exactly rectangular.
+///
+/// The full-em classifier can produce rotated text paths as well. Their
+/// page-space bounds are not their coverage, so they retain normal path
+/// serialization rather than being widened to a bounding rectangle.
+fn opaque_text_coverage_rect_for_batch(
+    path: &crate::document::paint::paths::RenderedPath,
     color_mode: PdfColorMode,
-) -> crate::RenderedRect {
+) -> Option<crate::document::paint::shapes::RenderedRect> {
+    let rect = path.opaque_coverage_rect?;
+    let fill = path.fill?;
+    if !fill.is_opaque()
+        || path.clip.is_some()
+        || path.stroke.is_some()
+        || !matches!(path.fill_paint, Some(RenderedPathPaint::Solid(_)))
+        || path.stroke_paint.is_some()
+        || path.paint_order != RenderedPathPaintOrder::FillThenStroke
+        || path.transform.b() != 0.0
+        || path.transform.c() != 0.0
+    {
+        return None;
+    }
+    Some(rect_with_output_fill(
+        crate::document::paint::shapes::RenderedRect::from_paint_rect(rect, Some(fill)),
+        color_mode,
+    ))
+}
+
+fn display_item_opaque_text_coverage<'a>(
+    page: &'a crate::Page,
+    item: &crate::document::paint::display_list::PaintDisplayItem,
+) -> Option<&'a crate::document::paint::page::OpaqueTextCoverage> {
+    let crate::document::paint::display_list::PaintDisplayItem::Operation(
+        crate::document::paint::page::PaintOperation::OpaqueTextCoverage(index),
+    ) = item
+    else {
+        return None;
+    };
+    page.opaque_text_coverages.get(*index)
+}
+
+fn display_item_line<'a>(
+    page: &'a crate::Page,
+    item: &crate::document::paint::display_list::PaintDisplayItem,
+) -> Option<&'a crate::document::paint::text::RenderedLine> {
+    let crate::document::paint::display_list::PaintDisplayItem::Operation(
+        crate::document::paint::page::PaintOperation::Line(index),
+    ) = item
+    else {
+        return None;
+    };
+    page.lines.get(*index)
+}
+
+/// Return whether every pixel of a line's known glyph ink has a later,
+/// effect-free opaque rectangular cover. Missing ink bounds are intentionally
+/// not approximated: only a proven cover may suppress visible PDF glyph ink.
+fn rendered_line_ink_is_fully_hidden(
+    page: &crate::Page,
+    line: &crate::document::paint::text::RenderedLine,
+    items: &[crate::document::paint::display_list::PaintDisplayItem],
+    item_index: usize,
+    later_item_lists: &[&[crate::document::paint::display_list::PaintDisplayItem]],
+    state: Option<&PaintTreeRenderState<'_, '_>>,
+) -> bool {
+    if line.color.alpha() < 1.0 {
+        return false;
+    }
+    let Some(bounds) = line.glyph_ink_bounds else {
+        return false;
+    };
+    let mut covers = Vec::new();
+    for item in &items[item_index + 1..] {
+        collect_later_effect_free_opaque_coverage_paths(page, item, state, &mut covers);
+    }
+    for later_items in later_item_lists {
+        for item in *later_items {
+            collect_later_effect_free_opaque_coverage_paths(page, item, state, &mut covers);
+        }
+    }
+    rect_area_is_covered_by_rects(
+        &crate::document::paint::shapes::RenderedRect::from_paint_rect(
+            bounds.paint_rect(),
+            Some(crate::CssColor::BLACK),
+        ),
+        &covers,
+    )
+}
+
+#[cfg(test)]
+fn opaque_text_coverage_is_fully_hidden(
+    page: &crate::Page,
+    coverage: &crate::document::paint::page::OpaqueTextCoverage,
+    items: &[crate::document::paint::display_list::PaintDisplayItem],
+    item_index: usize,
+    later_item_lists: &[&[crate::document::paint::display_list::PaintDisplayItem]],
+) -> bool {
+    opaque_text_coverage_is_fully_hidden_with_state(
+        page,
+        coverage,
+        items,
+        item_index,
+        later_item_lists,
+        None,
+    )
+}
+
+fn opaque_text_coverage_is_fully_hidden_with_state(
+    page: &crate::Page,
+    coverage: &crate::document::paint::page::OpaqueTextCoverage,
+    items: &[crate::document::paint::display_list::PaintDisplayItem],
+    item_index: usize,
+    later_item_lists: &[&[crate::document::paint::display_list::PaintDisplayItem]],
+    state: Option<&PaintTreeRenderState<'_, '_>>,
+) -> bool {
+    let mut covers = Vec::new();
+    for item in &items[item_index + 1..] {
+        collect_later_effect_free_opaque_coverage_paths(page, item, state, &mut covers);
+    }
+    for later_items in later_item_lists {
+        for item in *later_items {
+            collect_later_effect_free_opaque_coverage_paths(page, item, state, &mut covers);
+        }
+    }
+    coverage.path_indices.iter().all(|path_index| {
+        page.paths
+            .get(*path_index)
+            .and_then(|path| path.opaque_coverage_rect)
+            .is_some_and(|rect| {
+                rect_area_is_covered_by_rects(
+                    &crate::document::paint::shapes::RenderedRect::from_paint_rect(
+                        rect,
+                        Some(crate::CssColor::BLACK),
+                    ),
+                    &covers,
+                )
+            })
+    })
+}
+
+/// Collect proven opaque path coverage that paints in the same compositing
+/// context as a preceding opaque-text replacement. Effects are compositing
+/// boundaries, so their descendants cannot establish a later direct cover.
+fn collect_later_effect_free_opaque_coverage_paths(
+    page: &crate::Page,
+    item: &crate::document::paint::display_list::PaintDisplayItem,
+    state: Option<&PaintTreeRenderState<'_, '_>>,
+    rects: &mut Vec<crate::document::paint::shapes::RenderedRect>,
+) {
+    match item {
+        crate::document::paint::display_list::PaintDisplayItem::Operation(
+            crate::document::paint::page::PaintOperation::Rect(index),
+        ) => {
+            let Some(rect) = page.rects.get(*index) else {
+                return;
+            };
+            if is_opaque_fill_rect(rect) {
+                rects.push(rect.clone());
+            }
+        }
+        crate::document::paint::display_list::PaintDisplayItem::Primitive(
+            crate::document::paint::page::PaintPrimitive::Rect(rect),
+        ) if is_opaque_fill_rect(rect) => {
+            rects.push(rect.clone());
+        }
+        crate::document::paint::display_list::PaintDisplayItem::Operation(
+            crate::document::paint::page::PaintOperation::Path(index),
+        ) => {
+            if let Some(rect) = page
+                .paths
+                .get(*index)
+                .and_then(|path| path.opaque_coverage_rect)
+            {
+                rects.push(
+                    crate::document::paint::shapes::RenderedRect::from_paint_rect(
+                        rect,
+                        Some(crate::CssColor::BLACK),
+                    ),
+                );
+            }
+        }
+        crate::document::paint::display_list::PaintDisplayItem::Operation(
+            crate::document::paint::page::PaintOperation::OpaqueTextCoverage(index),
+        ) => {
+            let Some(coverage) = page.opaque_text_coverages.get(*index) else {
+                return;
+            };
+            for path_index in &coverage.path_indices {
+                if let Some(rect) = page
+                    .paths
+                    .get(*path_index)
+                    .and_then(|path| path.opaque_coverage_rect)
+                {
+                    rects.push(
+                        crate::document::paint::shapes::RenderedRect::from_paint_rect(
+                            rect,
+                            Some(crate::CssColor::BLACK),
+                        ),
+                    );
+                }
+            }
+        }
+        crate::document::paint::display_list::PaintDisplayItem::Operation(
+            crate::document::paint::page::PaintOperation::Image(_),
+        ) => {
+            if let Some(rect) = state.and_then(|state| display_item_rect(page, item, state))
+                && is_opaque_fill_rect(&rect)
+            {
+                rects.push(rect);
+            }
+        }
+        crate::document::paint::display_list::PaintDisplayItem::StackingContext(context)
+            if context.effects == crate::document::paint::effects::PaintEffects::default() =>
+        {
+            for band in crate::document::paint::display_list::PaintBand::ORDER {
+                for child in &context.bands.bands[band.index()] {
+                    collect_later_effect_free_opaque_coverage_paths(page, child, state, rects);
+                }
+            }
+        }
+        crate::document::paint::display_list::PaintDisplayItem::StackingContext(context)
+            if effects_are_rectangular_clips_only(&context.effects) =>
+        {
+            let Some(clips) = rectangular_clips(&context.effects) else {
+                return;
+            };
+            let mut child_rects = Vec::new();
+            for band in crate::document::paint::display_list::PaintBand::ORDER {
+                for child in &context.bands.bands[band.index()] {
+                    collect_later_effect_free_opaque_coverage_paths(
+                        page,
+                        child,
+                        state,
+                        &mut child_rects,
+                    );
+                }
+            }
+            // A rectangular clip is not a compositing boundary, but it does
+            // limit the usable opaque coverage. Keep only a child rectangle
+            // wholly inside every active clip; partial intersections remain
+            // conservative rather than being mistaken for page-space cover.
+            rects.extend(
+                child_rects
+                    .into_iter()
+                    .filter(|rect| clips.iter().all(|clip| rect_is_within_clip(rect, *clip))),
+            );
+        }
+        crate::document::paint::display_list::PaintDisplayItem::EffectScope(scope)
+            if scope.effects == crate::document::paint::effects::PaintEffects::default() =>
+        {
+            for child in &scope.items {
+                collect_later_effect_free_opaque_coverage_paths(page, child, state, rects);
+            }
+        }
+        crate::document::paint::display_list::PaintDisplayItem::EffectScope(scope)
+            if effects_are_rectangular_clips_only(&scope.effects) =>
+        {
+            let Some(clips) = rectangular_clips(&scope.effects) else {
+                return;
+            };
+            let mut child_rects = Vec::new();
+            for child in &scope.items {
+                collect_later_effect_free_opaque_coverage_paths(
+                    page,
+                    child,
+                    state,
+                    &mut child_rects,
+                );
+            }
+            rects.extend(
+                child_rects
+                    .into_iter()
+                    .filter(|rect| clips.iter().all(|clip| rect_is_within_clip(rect, *clip))),
+            );
+        }
+        _ => {}
+    }
+}
+
+fn rect_with_output_fill(
+    mut rect: crate::document::paint::shapes::RenderedRect,
+    color_mode: PdfColorMode,
+) -> crate::document::paint::shapes::RenderedRect {
     rect.fill = rect.fill.map(|fill| output_color(fill, color_mode));
     rect
 }
 
 fn display_item_rect(
     page: &crate::Page,
-    item: &crate::document::PaintDisplayItem,
+    item: &crate::document::paint::display_list::PaintDisplayItem,
     state: &PaintTreeRenderState<'_, '_>,
-) -> Option<crate::RenderedRect> {
+) -> Option<crate::document::paint::shapes::RenderedRect> {
     match item {
-        crate::document::PaintDisplayItem::Operation(crate::PaintOperation::Rect(index)) => {
-            page.rects.get(*index).cloned()
-        }
-        crate::document::PaintDisplayItem::Operation(crate::PaintOperation::Image(index)) => {
+        crate::document::paint::display_list::PaintDisplayItem::Operation(
+            crate::document::paint::page::PaintOperation::Rect(index),
+        ) => page.rects.get(*index).cloned(),
+        crate::document::paint::display_list::PaintDisplayItem::Operation(
+            crate::document::paint::page::PaintOperation::Image(index),
+        ) => {
             let image = page.images.get(*index)?;
             let PreparedImageResource::SolidFill(fill) = state
                 .page_image_sources
@@ -744,7 +1319,7 @@ fn display_item_rect(
             else {
                 return None;
             };
-            solid_image_fill_as_rect(image, *fill)
+            solid_image_fill_as_rect(image, fill)
         }
         _ => None,
     }
@@ -752,29 +1327,28 @@ fn display_item_rect(
 
 /// Return a promoted fill that can share an existing CSS rectangle path.
 ///
-/// A clip-free, untagged sRGB image has no image-specific PDF state. Routing
-/// it through the adjacent-fill batch lets it join an equal CSS background in
-/// one `f` operation, preventing a rasterizer seam at a shared edge. Other
-/// promoted images use [`write_image`] so their clips and marked content stay
+/// An untagged sRGB image whose only clip is its destination rectangle has no
+/// image-specific PDF state. Routing it through the adjacent-fill batch lets
+/// it join an equal CSS background in one `f` operation, preventing a
+/// rasterizer seam at a shared edge. Other promoted images use [`write_image`]
+/// so real crops, rounded clips, transforms, alpha, and marked content stay
 /// scoped exactly as authored.
 fn solid_image_fill_as_rect(
-    image: &crate::RenderedImage,
-    fill: SolidImageFill,
-) -> Option<crate::RenderedRect> {
-    (fill.color_space == crate::css::CssColorSpace::Srgb
-        && image
-            .clip()
-            .is_none_or(|clip| clip_is_exact_paint_rect(clip, image.paint_rect()))
+    image: &crate::document::paint::images::RenderedImage,
+    fill: &SolidImageFill,
+) -> Option<crate::document::paint::shapes::RenderedRect> {
+    (fill.color_space == crate::color::RasterColorSpace::SRGB
+        && image_clip_is_redundant_destination_rect(image)
         && image.actual_text.is_none()
         && image.transform.is_none())
     .then(|| {
-        crate::RenderedRect::from_paint_rect(
+        crate::document::paint::shapes::RenderedRect::from_paint_rect(
             image.paint_rect(),
             Some(crate::CssColor::in_space(
-                fill.color_space,
-                fill.components[0],
-                fill.components[1],
-                fill.components[2],
+                crate::css::CssColorSpace::Srgb,
+                fill.components[0] as f32 / 255.0,
+                fill.components[1] as f32 / 255.0,
+                fill.components[2] as f32 / 255.0,
                 1.0,
             )),
         )
@@ -790,12 +1364,12 @@ fn solid_image_fill_as_rect(
 /// background.
 fn visible_rect_after_later_display_rects(
     page: &crate::Page,
-    items: &[crate::document::PaintDisplayItem],
+    items: &[crate::document::paint::display_list::PaintDisplayItem],
     item_index: usize,
-    rect: &crate::RenderedRect,
-    later_item_lists: &[&[crate::document::PaintDisplayItem]],
+    rect: &crate::document::paint::shapes::RenderedRect,
+    later_item_lists: &[&[crate::document::paint::display_list::PaintDisplayItem]],
     state: &PaintTreeRenderState<'_, '_>,
-) -> Vec<crate::RenderedRect> {
+) -> Vec<crate::document::paint::shapes::RenderedRect> {
     if !is_opaque_fill_rect(rect) {
         return vec![rect.clone()];
     }
@@ -813,62 +1387,211 @@ fn visible_rect_after_later_display_rects(
     // changes the retained display-list geometry (and, in particular, loses
     // the continuous gap-rule path that CSS specifies). The fully-covered
     // case is still safe to elide and avoids an unnecessary underpaint.
-    if rect_area_is_covered_by_rects(rect, &covers) {
+    // Same-color coverage is visually redundant in ideal vector compositing,
+    // but it is still the correct backdrop for the later path's fractional
+    // edge. Keep it so the PDF rasterizer cannot turn a solid CSS fill into a
+    // seam against the page canvas; only a different later color is hidden by
+    // CSS compositing and must be removed before that edge is sampled.
+    let output_rect = rect_with_output_fill(rect.clone(), state.color_mode);
+    let different_color_covers = covers
+        .iter()
+        .filter(|cover| cover.fill != output_rect.fill)
+        .cloned()
+        .collect::<Vec<_>>();
+    if rect_area_is_covered_by_rects(rect, &different_color_covers) {
         Vec::new()
     } else {
         vec![rect.clone()]
     }
 }
 
+/// Return the only opaque rectangle painted by an axis-aligned transform
+/// scope, expressed in the scope's parent paint coordinate system.
+///
+/// This deliberately excludes clips, transparency, filters, and multi-item
+/// scopes.  Those can affect the visible shape or compositing of a descendant
+/// even when its untransformed bounds appear rectangular.
+fn transformed_opaque_rect_container_rect(
+    page: &crate::Page,
+    item: &crate::document::paint::display_list::PaintDisplayItem,
+    color_mode: PdfColorMode,
+) -> Option<crate::document::paint::shapes::RenderedRect> {
+    let (effects, items) = match item {
+        crate::document::paint::display_list::PaintDisplayItem::StackingContext(context) => (
+            &context.effects,
+            crate::document::paint::display_list::PaintBand::ORDER
+                .into_iter()
+                .flat_map(|band| context.bands.bands[band.index()].iter())
+                .collect::<Vec<_>>(),
+        ),
+        crate::document::paint::display_list::PaintDisplayItem::EffectScope(scope) => {
+            (&scope.effects, scope.items.iter().collect::<Vec<_>>())
+        }
+        _ => return None,
+    };
+    let transform = effects.transform?;
+    if !transform.preserves_axis_aligned_rectangles()
+        || effects.opacity != 1.0
+        || effects.needs_group()
+        || effects.suppresses_paint()
+        || effects
+            .overflow_clip
+            .is_some_and(|clip| clip.width() > 0.0 && clip.height() > 0.0)
+        || effects.overflow_clip_union.is_some()
+        || effects.rounded_overflow_clip.is_some()
+        || effects.absolute_clip.is_some()
+        || !matches!(
+            effects.clip_path,
+            crate::document::paint::effects::PaintClipPathEffect::None
+        )
+    {
+        return None;
+    }
+    let [item] = items.as_slice() else {
+        return None;
+    };
+    let rect = match item {
+        crate::document::paint::display_list::PaintDisplayItem::Operation(
+            crate::document::paint::page::PaintOperation::Rect(index),
+        ) => page.rects.get(*index)?.clone(),
+        crate::document::paint::display_list::PaintDisplayItem::Primitive(
+            crate::document::paint::page::PaintPrimitive::Rect(rect),
+        ) => rect.clone(),
+        _ => return None,
+    };
+    if !is_opaque_fill_rect(&rect) {
+        return None;
+    }
+    if let Some(clip) = effects.axis_selective_overflow_clip {
+        let bounds = clip.bounds();
+        let rect_bounds = rect.paint_rect();
+        if (clip.clips_x()
+            && (rect_bounds.min_x() < bounds.x()
+                || rect_bounds.max_x() > bounds.x() + bounds.width()))
+            || (clip.clips_y()
+                && (rect_bounds.min_y() < bounds.y()
+                    || rect_bounds.max_y() > bounds.y() + bounds.height()))
+        {
+            return None;
+        }
+    }
+    let transformed_rect = transform
+        .apply_clip_to_aabb(
+            crate::document::paint::geometry::PaintClip::from_paint_rect(rect.paint_rect()),
+        )
+        .paint_rect();
+    let mut rect = rect_with_output_fill(rect, color_mode);
+    rect.set_paint_rect(transformed_rect);
+    Some(rect)
+}
+
+/// Whether a one-rectangle transformed scope has no visible composited
+/// output because later sibling scopes entirely cover it.
+///
+/// This only compares siblings in the same display-list coordinate system.
+/// Ancestor later lists can be transformed relative to the current scope and
+/// are intentionally left to ordinary PDF serialization.
+fn transformed_opaque_rect_container_is_fully_covered(
+    page: &crate::Page,
+    item: &crate::document::paint::display_list::PaintDisplayItem,
+    later_items: &[crate::document::paint::display_list::PaintDisplayItem],
+    color_mode: PdfColorMode,
+) -> bool {
+    let Some(rect) = transformed_opaque_rect_container_rect(page, item, color_mode) else {
+        return false;
+    };
+    let covers = later_items
+        .iter()
+        .filter_map(|item| transformed_opaque_rect_container_rect(page, item, color_mode))
+        .filter(|cover| cover.fill != rect.fill)
+        .collect::<Vec<_>>();
+    rect_area_is_covered_by_rects(&rect, &covers)
+}
+
 fn collect_later_opaque_rects(
     page: &crate::Page,
-    item: &crate::document::PaintDisplayItem,
+    item: &crate::document::paint::display_list::PaintDisplayItem,
     state: &PaintTreeRenderState<'_, '_>,
-    rects: &mut Vec<crate::RenderedRect>,
+    rects: &mut Vec<crate::document::paint::shapes::RenderedRect>,
 ) {
     match item {
-        crate::document::PaintDisplayItem::Operation(crate::PaintOperation::Rect(index)) => {
+        crate::document::paint::display_list::PaintDisplayItem::Operation(
+            crate::document::paint::page::PaintOperation::Rect(index),
+        ) => {
             if let Some(rect) = page.rects.get(*index)
                 && is_opaque_fill_rect(rect)
             {
-                rects.push(rect.clone());
+                rects.push(rect_with_output_fill(rect.clone(), state.color_mode));
             }
         }
-        crate::document::PaintDisplayItem::Operation(crate::PaintOperation::Image(index)) => {
+        crate::document::paint::display_list::PaintDisplayItem::Operation(
+            crate::document::paint::page::PaintOperation::Image(index),
+        ) => {
             let Some(image) = page.images.get(*index) else {
                 return;
             };
-            let Some(PreparedImageResource::SolidFill(_)) = state
+            let Some(PreparedImageResource::SolidFill(fill)) = state
                 .page_image_sources
                 .get(*index)
                 .and_then(|source| state.image_resources.get(source.0))
             else {
                 return;
             };
-            if image
-                .clip()
-                .is_none_or(|clip| clip_is_exact_paint_rect(clip, image.paint_rect()))
-            {
-                rects.push(crate::RenderedRect::from_paint_rect(
-                    image.paint_rect(),
-                    Some(crate::CssColor::BLACK),
-                ));
+            if let Some(rect) = solid_image_fill_as_rect(image, fill) {
+                // Later-coverage comparisons must use the PDF-output color.
+                // Treating every promoted image as black would incorrectly
+                // cull a same-color parent fill instead of deduplicating it.
+                rects.push(rect_with_output_fill(rect, state.color_mode));
             }
         }
-        crate::document::PaintDisplayItem::StackingContext(context)
-            if context.effects == crate::document::PaintEffects::default() =>
+        crate::document::paint::display_list::PaintDisplayItem::Primitive(
+            crate::document::paint::page::PaintPrimitive::Rect(rect),
+        ) if is_opaque_fill_rect(rect) => {
+            // Positioned and replayed fragments retain materialized primitives
+            // rather than page-operation indices. They are equally opaque
+            // later paint for this effect-free coverage analysis.
+            rects.push(rect_with_output_fill(rect.clone(), state.color_mode));
+        }
+        // Text coverage rectangles approximate glyph ink for the dedicated
+        // invisible-text optimization. They are not rectangular CSS paint
+        // primitives and therefore cannot prove that an authored background
+        // rectangle is fully obscured. Using them here can erase borders
+        // crossed by a glyph's conservative ink bounds.
+        // <https://www.w3.org/TR/CSS2/zindex.html>
+        crate::document::paint::display_list::PaintDisplayItem::StackingContext(context)
+            if context.effects == crate::document::paint::effects::PaintEffects::default() =>
         {
-            for band in crate::document::PaintBand::ORDER {
+            for band in crate::document::paint::display_list::PaintBand::ORDER {
                 for child in &context.bands.bands[band.index()] {
                     collect_later_opaque_rects(page, child, state, rects);
                 }
             }
         }
-        crate::document::PaintDisplayItem::EffectScope(scope)
-            if scope.effects == crate::document::PaintEffects::default() =>
+        crate::document::paint::display_list::PaintDisplayItem::EffectScope(scope)
+            if scope.effects == crate::document::paint::effects::PaintEffects::default() =>
         {
             for child in &scope.items {
                 collect_later_opaque_rects(page, child, state, rects);
+            }
+        }
+        crate::document::paint::display_list::PaintDisplayItem::EffectScope(scope)
+            if effects_are_rectangular_clips_only(&scope.effects) =>
+        {
+            let Some(clips) = rectangular_clips(&scope.effects) else {
+                return;
+            };
+            let start = rects.len();
+            for child in &scope.items {
+                collect_later_opaque_rects(page, child, state, rects);
+            }
+            // A retained rectangle that escapes the clip is not equivalent to
+            // the visible clipped cover. Only expose covers already wholly
+            // contained by every rectangular clip.
+            if !rects[start..]
+                .iter()
+                .all(|rect| clips.iter().all(|clip| rect_is_within_clip(rect, *clip)))
+            {
+                rects.truncate(start);
             }
         }
         _ => {}
@@ -876,57 +1599,50 @@ fn collect_later_opaque_rects(
 }
 
 /// A white fill at the start of an effect-free root paint stream is redundant
-/// when preceding known fills do not reach it: PDF pages rasterize against a
-/// white canvas. Keeping it would create an antialiased boundary against that
-/// same canvas, even though CSS's final color is unchanged. Any preceding
-/// non-rect primitive, overlap, nested scope, or outer item list makes the
-/// backdrop unknown and retains the authored fill.
+/// when every preceding opaque rectangle either misses it or is fully hidden
+/// by it. PDF pages rasterize against a white canvas, so retaining that fill
+/// would otherwise introduce an antialiased white-on-white edge.
+#[derive(Clone, Copy)]
+struct DisplayListPaintPosition<'a> {
+    items: &'a [crate::document::paint::display_list::PaintDisplayItem],
+    item_index: usize,
+    prior_item_lists: &'a [&'a [crate::document::paint::display_list::PaintDisplayItem]],
+    later_item_lists: &'a [&'a [crate::document::paint::display_list::PaintDisplayItem]],
+}
+
 fn rect_is_unpainted_white_canvas(
     page: &crate::Page,
-    items: &[crate::document::PaintDisplayItem],
-    item_index: usize,
-    rect: &crate::RenderedRect,
-    later_item_lists: &[&[crate::document::PaintDisplayItem]],
+    position: DisplayListPaintPosition<'_>,
+    rect: &crate::document::paint::shapes::RenderedRect,
     state: &PaintTreeRenderState<'_, '_>,
+    cull_fully_hidden_backgrounds: bool,
 ) -> bool {
-    if !later_item_lists.is_empty()
+    if (!position.later_item_lists.is_empty() && !cull_fully_hidden_backgrounds)
         || rect.fill != Some(crate::CssColor::WHITE)
         || !is_opaque_fill_rect(rect)
     {
         return false;
     }
-    items[..item_index].iter().all(|previous| {
-        display_item_rect(page, previous, state).is_some_and(|previous| {
-            is_opaque_fill_rect(&previous) && !rects_intersect(&previous, rect)
+    position.items[..position.item_index]
+        .iter()
+        .chain(
+            position
+                .prior_item_lists
+                .iter()
+                .flat_map(|items| items.iter()),
+        )
+        .all(|previous| {
+            display_item_rect(page, previous, state).is_some_and(|previous| {
+                is_opaque_fill_rect(&previous)
+                    && (!rects_intersect(&previous, rect)
+                        || (cull_fully_hidden_backgrounds
+                            && previous.fill != rect.fill
+                            && rect_area_is_covered_by_rects(
+                                &previous,
+                                std::slice::from_ref(rect),
+                            )))
+            })
         })
-    })
-}
-
-/// Whether an opaque rectangle has no visible CSS coverage because later
-/// effect-free opaque rectangles cover all of it. Removing the underpaint is
-/// equivalent for the CSS painting model and prevents a PDF rasterizer from
-/// blending its fractional edge into a color that is already hidden.
-fn rect_is_fully_covered_by_later_opaque_rects(
-    page: &crate::Page,
-    items: &[crate::document::PaintDisplayItem],
-    item_index: usize,
-    rect: &crate::RenderedRect,
-    later_item_lists: &[&[crate::document::PaintDisplayItem]],
-    state: &PaintTreeRenderState<'_, '_>,
-) -> bool {
-    if !is_opaque_fill_rect(rect) {
-        return false;
-    }
-    let mut covers = Vec::new();
-    for item in &items[item_index + 1..] {
-        collect_later_opaque_rects(page, item, state, &mut covers);
-    }
-    for later_items in later_item_lists {
-        for item in *later_items {
-            collect_later_opaque_rects(page, item, state, &mut covers);
-        }
-    }
-    rect_area_is_covered_by_rects(rect, &covers)
 }
 
 /// Return whether rectangular clips cannot affect this paint subtree.
@@ -939,14 +1655,14 @@ fn rect_is_fully_covered_by_later_opaque_rects(
 #[allow(dead_code)]
 fn display_items_are_rects_within_every_clip(
     page: &crate::Page,
-    effects: crate::document::PaintEffects,
-    items: &[crate::document::PaintDisplayItem],
+    effects: crate::document::paint::effects::PaintEffects,
+    items: &[crate::document::paint::display_list::PaintDisplayItem],
 ) -> bool {
     let clips = effects
         .ordered_steps()
         .iter()
         .filter_map(|step| match step {
-            crate::document::PaintEffectStep::Clip(clip) => Some(*clip),
+            crate::document::paint::effects::PaintEffectStep::Clip(clip) => Some(*clip),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -959,48 +1675,119 @@ fn display_items_are_rects_within_every_clip(
 #[allow(dead_code)]
 fn display_item_is_rect_within_active_clips(
     page: &crate::Page,
-    item: &crate::document::PaintDisplayItem,
-    clips: &[crate::document::PaintClip],
+    item: &crate::document::paint::display_list::PaintDisplayItem,
+    clips: &[crate::document::paint::geometry::PaintClip],
 ) -> bool {
     match item {
-        crate::document::PaintDisplayItem::Operation(crate::PaintOperation::Rect(index)) => page
+        crate::document::paint::display_list::PaintDisplayItem::Operation(
+            crate::document::paint::page::PaintOperation::Rect(index),
+        ) => page
             .rects
             .get(*index)
             .is_some_and(|rect| clips.iter().all(|clip| rect_is_within_clip(rect, *clip))),
-        crate::document::PaintDisplayItem::Primitive(crate::document::PaintPrimitive::Rect(
-            rect,
-        )) => clips.iter().all(|clip| rect_is_within_clip(rect, *clip)),
-        crate::document::PaintDisplayItem::StackingContext(context) => {
+        crate::document::paint::display_list::PaintDisplayItem::Primitive(
+            crate::document::paint::page::PaintPrimitive::Rect(rect),
+        ) => clips.iter().all(|clip| rect_is_within_clip(rect, *clip)),
+        crate::document::paint::display_list::PaintDisplayItem::StackingContext(context) => {
             effects_are_rectangular_clips_only(&context.effects)
-                && crate::document::PaintBand::ORDER.into_iter().all(|band| {
-                    context.bands.bands[band.index()]
-                        .iter()
-                        .all(|child| display_item_is_rect_within_active_clips(page, child, clips))
-                })
+                && crate::document::paint::display_list::PaintBand::ORDER
+                    .into_iter()
+                    .all(|band| {
+                        context.bands.bands[band.index()].iter().all(|child| {
+                            display_item_is_rect_within_active_clips(page, child, clips)
+                        })
+                    })
         }
-        crate::document::PaintDisplayItem::EffectScope(scope) => {
+        crate::document::paint::display_list::PaintDisplayItem::EffectScope(scope) => {
             effects_are_rectangular_clips_only(&scope.effects)
                 && scope
                     .items
                     .iter()
                     .all(|child| display_item_is_rect_within_active_clips(page, child, clips))
         }
-        crate::document::PaintDisplayItem::Link(_) => true,
-        crate::document::PaintDisplayItem::Operation(_)
-        | crate::document::PaintDisplayItem::Primitive(_) => false,
+        crate::document::paint::display_list::PaintDisplayItem::Link(_) => true,
+        crate::document::paint::display_list::PaintDisplayItem::Operation(_)
+        | crate::document::paint::display_list::PaintDisplayItem::Primitive(_) => false,
     }
 }
 
-fn effects_are_rectangular_clips_only(effects: &crate::document::PaintEffects) -> bool {
+fn effects_are_rectangular_clips_only(
+    effects: &crate::document::paint::effects::PaintEffects,
+) -> bool {
     !effects.needs_group()
-        && effects
-            .ordered_steps()
-            .iter()
-            .all(|step| matches!(step, crate::document::PaintEffectStep::Clip(_)))
+        && effects.ordered_steps().iter().all(|step| {
+            matches!(
+                step,
+                crate::document::paint::effects::PaintEffectStep::Clip(_)
+            )
+        })
 }
 
-#[allow(dead_code)]
-fn rect_is_within_clip(rect: &crate::RenderedRect, clip: crate::document::PaintClip) -> bool {
+/// Axis-selective overflow clips constrain geometry but do not establish a
+/// compositing group.  Descendants of such a scope share the same clip, so a
+/// later opaque rectangle that geometrically covers an earlier one also
+/// covers its clipped realization.
+fn effects_are_axis_selective_clips_only(
+    effects: &crate::document::paint::effects::PaintEffects,
+) -> bool {
+    !effects.needs_group()
+        && effects.ordered_steps().iter().all(|step| {
+            matches!(
+                step,
+                crate::document::paint::effects::PaintEffectStep::AxisSelectiveClip(_)
+            )
+        })
+}
+
+/// Apply a pure rectangular-clip scope while retaining its descendants in the
+/// surrounding paint-order analysis. A clip changes geometry but not
+/// compositing, so its later opaque descendants can still prove coverage only
+/// after this PDF clipping state is installed.
+fn write_rectangular_clip_effects(
+    content: &mut Content,
+    effects: &crate::document::paint::effects::PaintEffects,
+    state: &PaintTreeRenderState<'_, '_>,
+) {
+    debug_assert!(effects_are_rectangular_clips_only(effects));
+    for step in effects.ordered_steps() {
+        let crate::document::paint::effects::PaintEffectStep::Clip(clip) = step else {
+            continue;
+        };
+        if !clip_is_page_media_box(clip, state) {
+            write_rect_clip(content, clip);
+        }
+    }
+}
+
+/// Whether a rectangular scope has no observable clipping effect because all
+/// of its direct contents are promoted solid-image rectangles already wholly
+/// inside it. Keeping such a scope would create an artificial pending-fill
+/// boundary and a fractional seam between adjacent CSS fills.
+fn rectangular_clips_are_redundant_for_solid_images(
+    page: &crate::Page,
+    effects: &crate::document::paint::effects::PaintEffects,
+    items: &[crate::document::paint::display_list::PaintDisplayItem],
+    state: &PaintTreeRenderState<'_, '_>,
+) -> bool {
+    let Some(clips) = rectangular_clips(effects) else {
+        return false;
+    };
+    !items.is_empty()
+        && items.iter().all(|item| {
+            matches!(
+                item,
+                crate::document::paint::display_list::PaintDisplayItem::Operation(
+                    crate::document::paint::page::PaintOperation::Image(_)
+                )
+            ) && display_item_rect(page, item, state)
+                .is_some_and(|rect| clips.iter().all(|clip| rect_is_within_clip(&rect, *clip)))
+        })
+}
+
+fn rect_is_within_clip(
+    rect: &crate::document::paint::shapes::RenderedRect,
+    clip: crate::document::paint::geometry::PaintClip,
+) -> bool {
     let rect = rect.paint_rect();
     rect.min_x() >= clip.x() - 0.01
         && rect.max_x() <= clip.x() + clip.width() + 0.01
@@ -1016,9 +1803,9 @@ fn rect_is_within_clip(rect: &crate::RenderedRect, clip: crate::document::PaintC
 #[allow(dead_code)]
 fn contained_opaque_rect_layer(
     page: &crate::Page,
-    effects: &crate::document::PaintEffects,
-    items: &[crate::document::PaintDisplayItem],
-) -> Option<Vec<crate::RenderedRect>> {
+    effects: &crate::document::paint::effects::PaintEffects,
+    items: &[crate::document::paint::display_list::PaintDisplayItem],
+) -> Option<Vec<crate::document::paint::shapes::RenderedRect>> {
     let clips = rectangular_clips(effects)?;
     if clips.is_empty() {
         return None;
@@ -1032,8 +1819,8 @@ fn contained_opaque_rect_layer(
 
 #[allow(dead_code)]
 fn rectangular_clips(
-    effects: &crate::document::PaintEffects,
-) -> Option<Vec<crate::document::PaintClip>> {
+    effects: &crate::document::paint::effects::PaintEffects,
+) -> Option<Vec<crate::document::paint::geometry::PaintClip>> {
     if !effects_are_rectangular_clips_only(effects) {
         return None;
     }
@@ -1042,7 +1829,7 @@ fn rectangular_clips(
             .ordered_steps()
             .iter()
             .filter_map(|step| match step {
-                crate::document::PaintEffectStep::Clip(clip) => Some(*clip),
+                crate::document::paint::effects::PaintEffectStep::Clip(clip) => Some(*clip),
                 _ => None,
             })
             .collect(),
@@ -1052,12 +1839,14 @@ fn rectangular_clips(
 #[allow(dead_code)]
 fn collect_contained_opaque_rects(
     page: &crate::Page,
-    item: &crate::document::PaintDisplayItem,
-    ancestor_clips: &[crate::document::PaintClip],
-    rects: &mut Vec<crate::RenderedRect>,
+    item: &crate::document::paint::display_list::PaintDisplayItem,
+    ancestor_clips: &[crate::document::paint::geometry::PaintClip],
+    rects: &mut Vec<crate::document::paint::shapes::RenderedRect>,
 ) -> Option<()> {
     match item {
-        crate::document::PaintDisplayItem::Operation(crate::PaintOperation::Rect(index)) => {
+        crate::document::paint::display_list::PaintDisplayItem::Operation(
+            crate::document::paint::page::PaintOperation::Rect(index),
+        ) => {
             let rect = page.rects.get(*index)?.clone();
             if !is_opaque_fill_rect(&rect)
                 || !ancestor_clips
@@ -1068,9 +1857,9 @@ fn collect_contained_opaque_rects(
             }
             rects.push(rect);
         }
-        crate::document::PaintDisplayItem::Primitive(crate::document::PaintPrimitive::Rect(
-            rect,
-        )) => {
+        crate::document::paint::display_list::PaintDisplayItem::Primitive(
+            crate::document::paint::page::PaintPrimitive::Rect(rect),
+        ) => {
             if !is_opaque_fill_rect(rect)
                 || !ancestor_clips
                     .iter()
@@ -1080,31 +1869,34 @@ fn collect_contained_opaque_rects(
             }
             rects.push(rect.clone());
         }
-        crate::document::PaintDisplayItem::StackingContext(context) => {
+        crate::document::paint::display_list::PaintDisplayItem::StackingContext(context) => {
             let mut clips = ancestor_clips.to_vec();
             clips.extend(rectangular_clips(&context.effects)?);
-            for band in crate::document::PaintBand::ORDER {
+            for band in crate::document::paint::display_list::PaintBand::ORDER {
                 for child in &context.bands.bands[band.index()] {
                     collect_contained_opaque_rects(page, child, &clips, rects)?;
                 }
             }
         }
-        crate::document::PaintDisplayItem::EffectScope(scope) => {
+        crate::document::paint::display_list::PaintDisplayItem::EffectScope(scope) => {
             let mut clips = ancestor_clips.to_vec();
             clips.extend(rectangular_clips(&scope.effects)?);
             for child in &scope.items {
                 collect_contained_opaque_rects(page, child, &clips, rects)?;
             }
         }
-        crate::document::PaintDisplayItem::Link(_) => {}
-        crate::document::PaintDisplayItem::Operation(_)
-        | crate::document::PaintDisplayItem::Primitive(_) => return None,
+        crate::document::paint::display_list::PaintDisplayItem::Link(_) => {}
+        crate::document::paint::display_list::PaintDisplayItem::Operation(_)
+        | crate::document::paint::display_list::PaintDisplayItem::Primitive(_) => return None,
     }
     Some(())
 }
 
 #[allow(dead_code)]
-fn write_contained_opaque_rect_layer(content: &mut Content, rects: Vec<crate::RenderedRect>) {
+fn write_contained_opaque_rect_layer(
+    content: &mut Content,
+    rects: Vec<crate::document::paint::shapes::RenderedRect>,
+) {
     let mut visible = Vec::new();
     for (index, rect) in rects.iter().enumerate() {
         visible.extend(visible_after_later_opaque_rects(
@@ -1124,9 +1916,9 @@ fn write_contained_opaque_rect_layer(content: &mut Content, rects: Vec<crate::Re
 }
 
 fn visible_after_later_opaque_rects<'a>(
-    rect: &crate::RenderedRect,
-    later: impl Iterator<Item = &'a crate::RenderedRect>,
-) -> Vec<crate::RenderedRect> {
+    rect: &crate::document::paint::shapes::RenderedRect,
+    later: impl Iterator<Item = &'a crate::document::paint::shapes::RenderedRect>,
+) -> Vec<crate::document::paint::shapes::RenderedRect> {
     let mut visible = vec![rect.clone()];
     for cover in later.filter(|cover| is_opaque_fill_rect(cover) && cover.fill != rect.fill) {
         visible = visible
@@ -1141,9 +1933,9 @@ fn visible_after_later_opaque_rects<'a>(
 }
 
 fn subtract_opaque_rect_cover(
-    rect: crate::RenderedRect,
-    cover: &crate::RenderedRect,
-) -> Vec<crate::RenderedRect> {
+    rect: crate::document::paint::shapes::RenderedRect,
+    cover: &crate::document::paint::shapes::RenderedRect,
+) -> Vec<crate::document::paint::shapes::RenderedRect> {
     let source = rect.paint_rect();
     let cover = cover.paint_rect();
     let x0 = source.min_x().max(cover.min_x());
@@ -1157,9 +1949,9 @@ fn subtract_opaque_rect_cover(
     let mut push = |x: f32, y: f32, width: f32, height: f32| {
         if width > 0.0 && height > 0.0 {
             let mut fragment = rect.clone();
-            fragment.set_paint_rect(crate::document::PaintRect::new(
-                crate::document::PaintPoint::new(x, y),
-                crate::document::PaintSize::new(width, height),
+            fragment.set_paint_rect(crate::document::paint::geometry::PaintRect::new(
+                crate::document::paint::geometry::PaintPoint::new(x, y),
+                crate::document::paint::geometry::PaintSize::new(width, height),
             ));
             fragments.push(fragment);
         }
@@ -1176,51 +1968,51 @@ fn subtract_opaque_rect_cover(
     fragments
 }
 
-fn is_opaque_fill_rect(rect: &crate::RenderedRect) -> bool {
+fn is_opaque_fill_rect(rect: &crate::document::paint::shapes::RenderedRect) -> bool {
     rect.stroke.is_none() && rect.fill.is_some_and(|fill| fill.alpha() >= 1.0)
 }
 
 fn write_display_item(
     content: &mut Content,
     page: &crate::Page,
-    item: &crate::document::PaintDisplayItem,
+    item: &crate::document::paint::display_list::PaintDisplayItem,
     embedded_fonts: &EmbeddedFontPlans<'_>,
     state: &mut PaintTreeRenderState<'_, '_>,
 ) {
     match item {
-        crate::document::PaintDisplayItem::Operation(operation) => {
+        crate::document::paint::display_list::PaintDisplayItem::Operation(operation) => {
             write_page_operation(content, page, operation, embedded_fonts, state);
         }
-        crate::document::PaintDisplayItem::StackingContext(context) => {
+        crate::document::paint::display_list::PaintDisplayItem::StackingContext(context) => {
             write_stacking_context(content, page, context, embedded_fonts, state);
         }
-        crate::document::PaintDisplayItem::EffectScope(scope) => {
+        crate::document::paint::display_list::PaintDisplayItem::EffectScope(scope) => {
             write_effect_scope(content, page, scope, embedded_fonts, state);
         }
-        crate::document::PaintDisplayItem::Primitive(_)
-        | crate::document::PaintDisplayItem::Link(_) => {}
+        crate::document::paint::display_list::PaintDisplayItem::Primitive(_)
+        | crate::document::paint::display_list::PaintDisplayItem::Link(_) => {}
     }
 }
 
 fn write_page_operation(
     content: &mut Content,
     page: &crate::Page,
-    operation: &crate::PaintOperation,
+    operation: &crate::document::paint::page::PaintOperation,
     embedded_fonts: &EmbeddedFontPlans<'_>,
     state: &mut PaintTreeRenderState<'_, '_>,
 ) {
     match operation {
-        crate::PaintOperation::Rect(index) => {
+        crate::document::paint::page::PaintOperation::Rect(index) => {
             if let Some(rect) = page.rects.get(*index) {
                 write_rect(content, rect, state.color_mode);
             }
         }
-        crate::PaintOperation::RoundedRect(index) => {
+        crate::document::paint::page::PaintOperation::RoundedRect(index) => {
             if let Some(rect) = page.rounded_rects.get(*index) {
                 write_rounded_rect(content, rect, state.color_mode);
             }
         }
-        crate::PaintOperation::Path(index) => {
+        crate::document::paint::page::PaintOperation::Path(index) => {
             if let Some(path) = page.paths.get(*index) {
                 write_path(
                     content,
@@ -1232,12 +2024,12 @@ fn write_page_operation(
                 );
             }
         }
-        crate::PaintOperation::Stroke(index) => {
+        crate::document::paint::page::PaintOperation::Stroke(index) => {
             if let Some(stroke) = page.strokes.get(*index) {
                 write_stroke(content, stroke, state.color_mode);
             }
         }
-        crate::PaintOperation::Image(index) => {
+        crate::document::paint::page::PaintOperation::Image(index) => {
             if let (Some(image), Some(resource)) = (
                 page.images.get(*index),
                 state
@@ -1245,15 +2037,22 @@ fn write_page_operation(
                     .get(*index)
                     .and_then(|source| state.image_resources.get(source.0)),
             ) {
-                write_image(content, image, *index, resource);
+                write_image(content, image, *index, resource, state.color_plan);
             }
         }
-        crate::PaintOperation::ImagePattern(index) => {
-            if let Some(pattern) = page.image_patterns.get(*index) {
+        crate::document::paint::page::PaintOperation::ImagePattern(index) => {
+            if let (Some(pattern), Some(resource)) = (
+                page.image_patterns.get(*index),
+                state
+                    .page_image_pattern_sources
+                    .get(*index)
+                    .and_then(|source| state.image_resources.get(source.0)),
+            ) && !matches!(resource, PreparedImageResource::Transparent)
+            {
                 write_image_pattern(content, pattern, *index);
             }
         }
-        crate::PaintOperation::GradientPattern(index) => {
+        crate::document::paint::page::PaintOperation::GradientPattern(index) => {
             if let Some(pattern) = page.gradient_patterns.get(*index) {
                 write_gradient_tiling_pattern(
                     content,
@@ -1264,21 +2063,41 @@ fn write_page_operation(
                 );
             }
         }
-        crate::PaintOperation::SvgPattern(index) => {
+        crate::document::paint::page::PaintOperation::SvgPattern(index) => {
             if let Some(pattern) = page.svg_patterns.get(*index) {
                 write_svg_tiling_pattern(content, pattern, state);
             }
         }
-        crate::PaintOperation::Line(index) => {
+        crate::document::paint::page::PaintOperation::Line(index) => {
             if let Some(line) = page.lines.get(*index) {
                 write_line(content, line, embedded_fonts, state.color_mode);
+            }
+        }
+        crate::document::paint::page::PaintOperation::OpaqueTextCoverage(index) => {
+            let Some(coverage) = page.opaque_text_coverages.get(*index) else {
+                return;
+            };
+            if let Some(line) = page.lines.get(coverage.line_index) {
+                write_line(content, line, embedded_fonts, state.color_mode);
+            }
+            for path_index in &coverage.path_indices {
+                if let Some(path) = page.paths.get(*path_index) {
+                    write_path(
+                        content,
+                        path,
+                        state.vector_paints,
+                        state.next_object_id,
+                        state.page_size,
+                        state.color_mode,
+                    );
+                }
             }
         }
     }
 }
 
-fn write_rect_clip(content: &mut Content, clip: crate::document::PaintClip) {
-    let rect = crate::document::paint_rect_to_pdf(clip.paint_rect());
+fn write_rect_clip(content: &mut Content, clip: crate::document::paint::geometry::PaintClip) {
+    let rect = crate::document::paint::geometry::paint_rect_to_pdf(clip.paint_rect());
     content
         .rect(
             rect.origin.x,
@@ -1290,15 +2109,40 @@ fn write_rect_clip(content: &mut Content, clip: crate::document::PaintClip) {
         .end_path();
 }
 
+fn write_axis_selective_clip(
+    content: &mut Content,
+    clip: crate::document::paint::geometry::AxisSelectivePaintClip,
+    state: &PaintTreeRenderState<'_, '_>,
+) {
+    let page = crate::document::paint::geometry::PaintClip::new(
+        0.0,
+        0.0,
+        state.page_size.width,
+        state.page_size.height,
+    );
+    // The effect's transform has already been installed. Resolve the CSS
+    // visible axis against the page boundary in that local coordinate space;
+    // using page-space coordinates here would translate or rotate the
+    // synthetic finite PDF rectangle together with the descendants.
+    let local_page = state
+        .active_paint_transform
+        .inverse_apply_clip_to_aabb(page)
+        .unwrap_or(page);
+    write_rect_clip(content, clip.resolved_against_page(local_page));
+}
+
 /// PDF clipping applies the non-zero winding rule to every subpath in one
 /// path. Appending the visible table-cell rectangles before `W n` therefore
 /// retains their union and removes collapsed rowspan holes in a single scope.
-fn write_rect_union_clip(content: &mut Content, clips: &[crate::document::PaintClip]) {
+fn write_rect_union_clip(
+    content: &mut Content,
+    clips: &[crate::document::paint::geometry::PaintClip],
+) {
     if clips.is_empty() {
         return;
     }
     for clip in clips {
-        let rect = crate::document::paint_rect_to_pdf(clip.paint_rect());
+        let rect = crate::document::paint::geometry::paint_rect_to_pdf(clip.paint_rect());
         content.rect(
             rect.origin.x,
             rect.origin.y,
@@ -1313,13 +2157,16 @@ fn write_rect_union_clip(content: &mut Content, clips: &[crate::document::PaintC
 /// CSS viewport clip is redundant and can expose an otherwise hidden
 /// underpaint through antialiasing at the duplicate boundary.
 fn clip_is_page_media_box(
-    clip: crate::document::PaintClip,
+    clip: crate::document::paint::geometry::PaintClip,
     state: &PaintTreeRenderState<'_, '_>,
 ) -> bool {
     clip_is_page_bounds(clip, state.page_size)
 }
 
-fn clip_is_page_bounds(clip: crate::document::PaintClip, page_size: PdfSize) -> bool {
+fn clip_is_page_bounds(
+    clip: crate::document::paint::geometry::PaintClip,
+    page_size: PdfSize,
+) -> bool {
     nearly_equal(clip.x(), 0.0)
         && nearly_equal(clip.y(), 0.0)
         && nearly_equal(clip.width(), page_size.width)
@@ -1337,30 +2184,34 @@ fn write_rounded_clip(content: &mut Content, clip: &RenderedRoundedRect) {
     content.clip_nonzero().end_path();
 }
 
-fn write_polygon_clip(content: &mut Content, polygon: &crate::document::RenderedClipPathPolygon) {
+fn write_polygon_clip(
+    content: &mut Content,
+    polygon: &crate::document::paint::effects::RenderedClipPathPolygon,
+) {
     let Some((&first, rest)) = polygon.points().split_first() else {
         return;
     };
-    let first = crate::document::paint_point_to_pdf(first);
+    let first = crate::document::paint::geometry::paint_point_to_pdf(first);
     content.move_to(first.x, first.y);
     for point in rest {
-        let point = crate::document::paint_point_to_pdf(*point);
+        let point = crate::document::paint::geometry::paint_point_to_pdf(*point);
         content.line_to(point.x, point.y);
     }
     content.close_path().clip_nonzero().end_path();
 }
 
-fn is_mergeable_fill_rect(rect: &crate::RenderedRect) -> bool {
+fn is_mergeable_fill_rect(rect: &crate::document::paint::shapes::RenderedRect) -> bool {
     rect.stroke.is_none() && rect.fill.is_some_and(|fill| fill.is_visible())
 }
 
 #[derive(Default)]
 struct PendingFillRects {
-    rects: Vec<crate::RenderedRect>,
+    rects: Vec<crate::document::paint::shapes::RenderedRect>,
+    ends_with_invisible_text_coverage: bool,
 }
 
 impl PendingFillRects {
-    fn try_push(&mut self, rect: &crate::RenderedRect) -> bool {
+    fn try_push(&mut self, rect: &crate::document::paint::shapes::RenderedRect) -> bool {
         if !is_mergeable_fill_rect(rect) {
             return false;
         }
@@ -1376,11 +2227,20 @@ impl PendingFillRects {
                 return true;
             }
         }
-        if !rect.fill.is_some_and(|fill| fill.alpha() >= 1.0)
-            && self
-                .rects
-                .iter()
-                .any(|pending| rects_intersect(pending, rect))
+        // Repainting the same opaque color over the exact same rectangle has
+        // no CSS-visible effect. Emit it once so a PDF rasterizer cannot
+        // compound fractional edge coverage from nested backgrounds.
+        if self
+            .rects
+            .iter()
+            .any(|pending| pending.paint_rect() == rect.paint_rect())
+        {
+            return true;
+        }
+        if self
+            .rects
+            .iter()
+            .any(|pending| rects_intersect(pending, rect))
         {
             return false;
         }
@@ -1395,12 +2255,13 @@ fn flush_pending_rects(
     color_mode: PdfColorMode,
 ) {
     let Some(fill) = pending.rects.first().and_then(|rect| rect.fill) else {
+        pending.ends_with_invisible_text_coverage = false;
         return;
     };
     let scoped_alpha = write_alpha_graphics_state(content, fill);
     set_fill_color(content, fill, color_mode);
     for rect in pending.rects.drain(..) {
-        let rect = crate::document::paint_rect_to_pdf(rect.paint_rect());
+        let rect = crate::document::paint::geometry::paint_rect_to_pdf(rect.paint_rect());
         content.rect(
             rect.origin.x,
             rect.origin.y,
@@ -1410,9 +2271,13 @@ fn flush_pending_rects(
     }
     content.fill_nonzero();
     close_alpha_graphics_state(content, scoped_alpha);
+    pending.ends_with_invisible_text_coverage = false;
 }
 
-fn merge_adjacent_fill_rect(left: &mut crate::RenderedRect, right: &crate::RenderedRect) -> bool {
+fn merge_adjacent_fill_rect(
+    left: &mut crate::document::paint::shapes::RenderedRect,
+    right: &crate::document::paint::shapes::RenderedRect,
+) -> bool {
     if !is_mergeable_fill_rect(left) || !is_mergeable_fill_rect(right) || left.fill != right.fill {
         return false;
     }
@@ -1452,14 +2317,17 @@ fn merge_adjacent_fill_rect(left: &mut crate::RenderedRect, right: &crate::Rende
         } else {
             return false;
         };
-    left.set_paint_rect(crate::document::PaintRect::new(
-        crate::document::PaintPoint::new(x, y),
-        crate::document::PaintSize::new(width, height),
+    left.set_paint_rect(crate::document::paint::geometry::PaintRect::new(
+        crate::document::paint::geometry::PaintPoint::new(x, y),
+        crate::document::paint::geometry::PaintSize::new(width, height),
     ));
     true
 }
 
-fn rects_intersect(left: &crate::RenderedRect, right: &crate::RenderedRect) -> bool {
+fn rects_intersect(
+    left: &crate::document::paint::shapes::RenderedRect,
+    right: &crate::document::paint::shapes::RenderedRect,
+) -> bool {
     left.x() < right.x() + right.width()
         && right.x() < left.x() + left.width()
         && left.y() < right.y() + right.height()
@@ -1467,8 +2335,8 @@ fn rects_intersect(left: &crate::RenderedRect, right: &crate::RenderedRect) -> b
 }
 
 fn rect_area_is_covered_by_rects(
-    rect: &crate::RenderedRect,
-    covers: &[crate::RenderedRect],
+    rect: &crate::document::paint::shapes::RenderedRect,
+    covers: &[crate::document::paint::shapes::RenderedRect],
 ) -> bool {
     if covers.is_empty() || rect.width() <= 0.0 || rect.height() <= 0.0 {
         return false;
@@ -1521,10 +2389,10 @@ fn nearly_equal(left: f32, right: f32) -> bool {
 
 pub(super) fn write_rect(
     content: &mut Content,
-    rect: &crate::RenderedRect,
+    rect: &crate::document::paint::shapes::RenderedRect,
     color_mode: PdfColorMode,
 ) {
-    let pdf_rect = crate::document::paint_rect_to_pdf(rect.paint_rect());
+    let pdf_rect = crate::document::paint::geometry::paint_rect_to_pdf(rect.paint_rect());
     if let Some(fill) = rect.fill
         && fill.is_visible()
     {
@@ -1600,7 +2468,7 @@ pub(super) fn write_rounded_rect_path(content: &mut Content, rect: &RenderedRoun
     // enough for filled/stroked page graphics.
     const KAPPA: f32 = 0.552_284_8;
 
-    let pdf_rect = crate::document::paint_rect_to_pdf(rect.paint_rect());
+    let pdf_rect = crate::document::paint::geometry::paint_rect_to_pdf(rect.paint_rect());
     let x0 = pdf_rect.origin.x;
     let y0 = pdf_rect.origin.y;
     let x1 = pdf_rect.origin.x + pdf_rect.size.width;
@@ -1683,7 +2551,8 @@ fn write_path(
         let clip = path.clip.as_ref().unwrap();
         write_rendered_path_clip(content, clip);
     }
-    let transformed = path.transform != crate::document::PaintTransform::identity();
+    let transformed =
+        path.transform != crate::document::paint::geometry::PaintTransform::identity();
     if transformed {
         content
             .save_state()
@@ -1883,7 +2752,10 @@ fn write_path_stroke_paint(
     }
 }
 
-fn write_rendered_path_clip(content: &mut Content, clip: &crate::document::RenderedPathClip) {
+fn write_rendered_path_clip(
+    content: &mut Content,
+    clip: &crate::document::paint::paths::RenderedPathClip,
+) {
     write_clip_path(content, &clip.commands, clip.fill_rule);
     for additional_clip in &clip.additional_clips {
         write_clip_path(
@@ -1915,11 +2787,11 @@ fn write_path_commands(content: &mut Content, commands: &[RenderedPathCommand]) 
     for command in commands {
         match command.typed_points() {
             RenderedPathCommandPoints::MoveTo(point) => {
-                let point = crate::document::paint_point_to_pdf(point);
+                let point = crate::document::paint::geometry::paint_point_to_pdf(point);
                 content.move_to(point.x, point.y);
             }
             RenderedPathCommandPoints::LineTo(point) => {
-                let point = crate::document::paint_point_to_pdf(point);
+                let point = crate::document::paint::geometry::paint_point_to_pdf(point);
                 content.line_to(point.x, point.y);
             }
             RenderedPathCommandPoints::CurveTo {
@@ -1927,9 +2799,9 @@ fn write_path_commands(content: &mut Content, commands: &[RenderedPathCommand]) 
                 control_2,
                 end,
             } => {
-                let control_1 = crate::document::paint_point_to_pdf(control_1);
-                let control_2 = crate::document::paint_point_to_pdf(control_2);
-                let end = crate::document::paint_point_to_pdf(end);
+                let control_1 = crate::document::paint::geometry::paint_point_to_pdf(control_1);
+                let control_2 = crate::document::paint::geometry::paint_point_to_pdf(control_2);
+                let end = crate::document::paint::geometry::paint_point_to_pdf(end);
                 content.cubic_to(
                     control_1.x,
                     control_1.y,
@@ -1948,7 +2820,7 @@ fn write_path_commands(content: &mut Content, commands: &[RenderedPathCommand]) 
 
 pub(super) fn write_stroke(
     content: &mut Content,
-    stroke: &crate::RenderedStroke,
+    stroke: &crate::document::paint::shapes::RenderedStroke,
     color_mode: PdfColorMode,
 ) {
     if !stroke.color.is_visible() {
@@ -1964,8 +2836,8 @@ pub(super) fn write_stroke(
         content.set_dash_pattern([], 0.0);
     }
     let (start, end) = stroke.paint_points();
-    let start = crate::document::paint_point_to_pdf(start);
-    let end = crate::document::paint_point_to_pdf(end);
+    let start = crate::document::paint::geometry::paint_point_to_pdf(start);
+    let end = crate::document::paint::geometry::paint_point_to_pdf(end);
     content.set_line_width(stroke.stroke_width.points());
     set_stroke_color(content, stroke.color, color_mode);
     content
@@ -1977,34 +2849,32 @@ pub(super) fn write_stroke(
 
 pub(super) fn write_image(
     content: &mut Content,
-    image: &crate::RenderedImage,
+    image: &crate::document::paint::images::RenderedImage,
     index: usize,
     resource: &PreparedImageResource,
+    color_plan: &PdfColorPlan,
 ) {
-    let rect = crate::document::paint_rect_to_pdf(image.paint_rect());
     if let Some(actual_text) = &image.actual_text {
         let mut marked_content = content.begin_marked_content_with_properties(Name(b"Span"));
         marked_content
             .properties()
             .actual_text(TextStr(actual_text.as_ref()));
     }
-    content.save_state();
-    let omit_destination_clip = matches!(resource, PreparedImageResource::SolidFill(_))
-        && image
-            .clip()
-            .is_some_and(|clip| clip_is_exact_paint_rect(clip, image.paint_rect()));
-    if let Some(clip) = image.clip().filter(|_| !omit_destination_clip) {
-        write_rendered_path_clip(content, clip);
-    }
     match resource {
+        PreparedImageResource::Transparent => {}
         PreparedImageResource::SolidFill(fill) => {
+            let rect = crate::document::paint::geometry::paint_rect_to_pdf(image.paint_rect());
+            content.save_state();
+            let omit_destination_clip = image_clip_is_redundant_destination_rect(image);
+            if let Some(clip) = image.clip().filter(|_| !omit_destination_clip) {
+                write_rendered_path_clip(content, clip);
+            }
             debug_assert!(
                 image.transform.is_none(),
                 "solid image fills require page-space image geometry"
             );
+            color_plan.set_raster_fill_color(content, &fill.color_space, fill.components);
             content
-                .set_fill_color_space(Name(color_space_name(fill.color_space)))
-                .set_fill_color(fill.components)
                 .rect(
                     rect.origin.x,
                     rect.origin.y,
@@ -2012,8 +2882,14 @@ pub(super) fn write_image(
                     rect.size.height,
                 )
                 .fill_nonzero();
+            content.restore_state();
         }
         PreparedImageResource::Raster(_) => {
+            let rect = crate::document::paint::geometry::paint_rect_to_pdf(image.paint_rect());
+            content.save_state();
+            if let Some(clip) = image.clip() {
+                write_rendered_path_clip(content, clip);
+            }
             if let Some(transform) = image.transform {
                 content.transform(transform.pdf_components());
             }
@@ -2027,9 +2903,9 @@ pub(super) fn write_image(
                     rect.origin.y,
                 ])
                 .x_object(pdf_name(&format!("Im{}", index + 1)));
+            content.restore_state();
         }
     }
-    content.restore_state();
     if image.actual_text.is_some() {
         content.end_marked_content();
     }
@@ -2043,24 +2919,26 @@ pub(super) fn write_image(
 /// provably redundant non-zero clip. All rounded and intersected clips remain
 /// active. ISO 32000-2:2020, 8.5.4.
 fn clip_is_exact_paint_rect(
-    clip: &crate::document::RenderedPathClip,
-    rect: crate::document::PaintRect,
+    clip: &crate::document::paint::paths::RenderedPathClip,
+    rect: crate::document::paint::geometry::PaintRect,
 ) -> bool {
-    if clip.fill_rule != crate::RenderedPathFillRule::NonZero || !clip.additional_clips.is_empty() {
+    if clip.fill_rule != crate::document::paint::paths::RenderedPathFillRule::NonZero
+        || !clip.additional_clips.is_empty()
+    {
         return false;
     }
     let origin = rect.origin;
-    let right = crate::document::PaintPoint::new(rect.max_x(), origin.y);
-    let top_right = crate::document::PaintPoint::new(rect.max_x(), rect.max_y());
-    let top_left = crate::document::PaintPoint::new(origin.x, rect.max_y());
+    let right = crate::document::paint::geometry::PaintPoint::new(rect.max_x(), origin.y);
+    let top_right = crate::document::paint::geometry::PaintPoint::new(rect.max_x(), rect.max_y());
+    let top_left = crate::document::paint::geometry::PaintPoint::new(origin.x, rect.max_y());
     matches!(
         clip.commands.as_slice(),
         [
-            crate::RenderedPathCommand::MoveTo(start),
-            crate::RenderedPathCommand::LineTo(line_right),
-            crate::RenderedPathCommand::LineTo(line_top_right),
-            crate::RenderedPathCommand::LineTo(line_top_left),
-            crate::RenderedPathCommand::Close,
+            crate::document::paint::paths::RenderedPathCommand::MoveTo(start),
+            crate::document::paint::paths::RenderedPathCommand::LineTo(line_right),
+            crate::document::paint::paths::RenderedPathCommand::LineTo(line_top_right),
+            crate::document::paint::paths::RenderedPathCommand::LineTo(line_top_left),
+            crate::document::paint::paths::RenderedPathCommand::Close,
         ] if *start == origin
             && *line_right == right
             && *line_top_right == top_right
@@ -2068,27 +2946,58 @@ fn clip_is_exact_paint_rect(
     )
 }
 
+/// Return whether an image has no effective clip beyond its own destination.
+///
+/// Object fitting records this directly whenever it constructs an uncropped
+/// concrete object. The structural path check remains for clips built by
+/// older producers, but is intentionally only a fallback: CSS geometry must
+/// not depend on exact equality after independent floating-point operations.
+fn image_clip_is_redundant_destination_rect(
+    image: &crate::document::paint::images::RenderedImage,
+) -> bool {
+    image.has_destination_rect_clip()
+        || image
+            .clip()
+            .is_none_or(|clip| clip_is_exact_paint_rect(clip, image.paint_rect()))
+}
+
 pub(super) fn write_image_pattern(
     content: &mut Content,
-    pattern: &crate::document::RenderedImagePattern,
+    pattern: &crate::document::paint::patterns::RenderedImagePattern,
     index: usize,
 ) {
-    let rect = crate::document::paint_rect_to_pdf(pattern.paint_rect());
+    write_tiling_pattern_fill(
+        content,
+        pattern.paint_rect(),
+        &format!("P{}", index + 1),
+        pattern.clip(),
+    );
+}
+
+/// Paint a tiling pattern through its destination path.
+///
+/// The fill path already bounds a PDF pattern paint. Adding a second clip with
+/// the same rectangle changes fractional-edge raster coverage without changing
+/// CSS background geometry, so only an additional CSS `background-clip` path
+/// is installed here. This applies CSS Backgrounds' painting-area rule while
+/// preserving authored rounded clips:
+/// <https://www.w3.org/TR/css-backgrounds-3/#background-clip>.
+/// PDF pattern fills and clipping paths are defined by ISO 32000-2:2020,
+/// sections 8.7.4 and 8.5.4.
+fn write_tiling_pattern_fill(
+    content: &mut Content,
+    paint_rect: crate::document::paint::geometry::PaintRect,
+    name: &str,
+    clip: Option<&crate::document::paint::paths::RenderedPathClip>,
+) {
+    let rect = crate::document::paint::geometry::paint_rect_to_pdf(paint_rect);
     content.save_state();
-    if let Some(clip) = pattern.clip() {
+    if let Some(clip) = clip {
         write_rendered_path_clip(content, clip);
     }
     content
-        .rect(
-            rect.origin.x,
-            rect.origin.y,
-            rect.size.width,
-            rect.size.height,
-        )
-        .clip_nonzero()
-        .end_path()
         .set_fill_color_space(ColorSpaceOperand::Pattern)
-        .set_fill_pattern([], pdf_name(&format!("P{}", index + 1)))
+        .set_fill_pattern([], pdf_name(name))
         .rect(
             rect.origin.x,
             rect.origin.y,
@@ -2101,41 +3010,54 @@ pub(super) fn write_image_pattern(
 
 fn write_gradient_tiling_pattern(
     content: &mut Content,
-    pattern: &crate::document::RenderedGradientPattern,
+    pattern: &crate::document::paint::patterns::RenderedGradientPattern,
     vector_paints: &mut VectorPaintResources,
     next_object_id: &mut usize,
     page_size: PdfSize,
 ) {
     let name = vector_paints.tiling_gradient_resource(pattern, next_object_id, page_size);
-    let rect = crate::document::paint_rect_to_pdf(pattern.paint_rect());
-    content.save_state();
-    if let Some(clip) = pattern.clip() {
+    write_transformed_tiling_pattern_fill(
+        content,
+        pattern.paint_rect(),
+        &name,
+        pattern.clip(),
+        pattern.transform(),
+    );
+}
+
+/// Paint a source-local tiling pattern through its destination fragmentainer.
+fn write_transformed_tiling_pattern_fill(
+    content: &mut Content,
+    paint_rect: crate::document::paint::geometry::PaintRect,
+    name: &str,
+    clip: Option<&crate::document::paint::paths::RenderedPathClip>,
+    transform: crate::document::paint::geometry::PaintTransform,
+) {
+    if transform == crate::document::paint::geometry::PaintTransform::identity() {
+        write_tiling_pattern_fill(content, paint_rect, name, clip);
+        return;
+    }
+    let rect = crate::document::paint::geometry::paint_rect_to_pdf(paint_rect);
+    content.save_state().transform(transform.pdf_components());
+    if let Some(clip) = clip {
         write_rendered_path_clip(content, clip);
     }
     content
-        .rect(
-            rect.origin.x,
-            rect.origin.y,
-            rect.size.width,
-            rect.size.height,
-        )
-        .clip_nonzero()
-        .end_path()
         .set_fill_color_space(ColorSpaceOperand::Pattern)
-        .set_fill_pattern([], pdf_name(&name))
+        .set_fill_pattern([], pdf_name(name))
         .rect(
             rect.origin.x,
             rect.origin.y,
             rect.size.width,
             rect.size.height,
         )
-        .fill_nonzero();
-    content.restore_state();
+        .fill_nonzero()
+        .restore_state();
 }
 
 fn write_svg_tiling_pattern(
     content: &mut Content,
-    pattern: &crate::document::RenderedSvgPattern,
+    pattern: &crate::document::paint::patterns::RenderedSvgPattern,
     state: &mut PaintTreeRenderState<'_, '_>,
 ) {
     let form_id = *state.next_object_id;
@@ -2156,7 +3078,7 @@ fn write_svg_tiling_pattern(
         id: form_id,
         name: form_name.clone(),
         form_dependencies: Vec::new(),
-        bbox: crate::document::PaintClip::new(
+        bbox: crate::document::paint::geometry::PaintClip::new(
             0.0,
             0.0,
             pattern.tiling.tile_size.width,
@@ -2175,43 +3097,22 @@ fn write_svg_tiling_pattern(
         form_name,
         pattern: pattern.clone(),
         transform: state.active_paint_transform.multiply(
-            crate::document::PaintTransform::translate(crate::document::PaintTranslation::new(
-                pattern.tiling.origin.x,
-                pattern.tiling.origin.y,
-            )),
+            crate::document::paint::geometry::PaintTransform::translate(
+                crate::document::paint::geometry::PaintTranslation::new(
+                    pattern.tiling.origin.x,
+                    pattern.tiling.origin.y,
+                ),
+            ),
         ),
     });
-    let rect = crate::document::paint_rect_to_pdf(pattern.paint_rect());
-    content.save_state();
-    if let Some(clip) = pattern.clip() {
-        write_rendered_path_clip(content, clip);
-    }
-    content
-        .rect(
-            rect.origin.x,
-            rect.origin.y,
-            rect.size.width,
-            rect.size.height,
-        )
-        .clip_nonzero()
-        .end_path()
-        .set_fill_color_space(ColorSpaceOperand::Pattern)
-        .set_fill_pattern([], pdf_name(&name))
-        .rect(
-            rect.origin.x,
-            rect.origin.y,
-            rect.size.width,
-            rect.size.height,
-        )
-        .fill_nonzero();
-    content.restore_state();
+    write_tiling_pattern_fill(content, pattern.paint_rect(), &name, pattern.clip());
 }
 
 /// Serialize the supported solid-vector subset of an SVG paint-server cell.
 /// The enclosing PDF tiling pattern supplies the cell's bounding box and
 /// matrix; these paths deliberately remain in SVG user coordinates.
 pub(super) fn svg_path_pattern_tile_content(
-    pattern: &crate::document::RenderedSvgPathPattern,
+    pattern: &crate::document::paint::paths::RenderedSvgPathPattern,
     color_mode: PdfColorMode,
 ) -> Vec<u8> {
     let mut content = Content::new();
@@ -2239,11 +3140,28 @@ pub(super) fn svg_path_pattern_tile_content(
 
 pub(super) fn write_line(
     content: &mut Content,
-    line: &crate::RenderedLine,
+    line: &crate::document::paint::text::RenderedLine,
     embedded_fonts: &EmbeddedFontPlans<'_>,
     color_mode: PdfColorMode,
 ) {
-    let wrote_line = write_rendered_line(content, line, embedded_fonts, color_mode);
+    write_line_with_visibility(content, line, embedded_fonts, color_mode, false);
+}
+
+/// Serialize a retained CSS text-paint record, optionally without visible ink.
+///
+/// CSS 2.2 Appendix E requires the record to retain its source paint order;
+/// invisible PDF text is used only after later, same-scope opaque coverage has
+/// proven that its glyph ink cannot contribute to the composited result. PDF
+/// rendering mode 3 preserves glyph codes and `/ToUnicode` extraction while
+/// suppressing painting (ISO 32000-2:2020, 9.3.6).
+fn write_line_with_visibility(
+    content: &mut Content,
+    line: &crate::document::paint::text::RenderedLine,
+    embedded_fonts: &EmbeddedFontPlans<'_>,
+    color_mode: PdfColorMode,
+    invisible: bool,
+) {
+    let wrote_line = write_rendered_line(content, line, embedded_fonts, color_mode, invisible);
     if !wrote_line && !line.text.is_empty() && line.runs.is_empty() {
         log::warn!(
             "skipping unshaped text line without a resolved embedded font: {:?}",
@@ -2254,9 +3172,10 @@ pub(super) fn write_line(
 
 pub(super) fn write_rendered_line(
     content: &mut Content,
-    line: &crate::RenderedLine,
+    line: &crate::document::paint::text::RenderedLine,
     embedded_fonts: &EmbeddedFontPlans<'_>,
     color_mode: PdfColorMode,
+    invisible: bool,
 ) -> bool {
     if !line.color.is_visible() {
         return true;
@@ -2267,13 +3186,32 @@ pub(super) fn write_rendered_line(
     // box.  Identity-matrix runs can retain one text line matrix and move to
     // each absolute run origin with `Td`; transformed runs retain the
     // conservative absolute `Tm` emission required by writing-mode transforms.
-    let line_origin = crate::document::paint_point_to_pdf(line.origin());
+    let line_origin = crate::document::paint::geometry::paint_point_to_pdf(line.origin());
+    let text_runs = pdf_text_runs(line, embedded_fonts.document_font_to_embedded_font.len())
+        .collect::<Vec<_>>();
+    let uses_synthetic_bold = !invisible
+        && text_runs.iter().any(|run| {
+            embedded_fonts
+                .document_font_synthesis
+                .get(run.document_font_id)
+                .is_some_and(|synthesis| synthesis.embolden)
+        });
+    if uses_synthetic_bold {
+        // `w` is a graphics-state parameter. Scope it outside BT/ET so the
+        // synthetic text does not affect later CSS borders or paths.
+        content.save_state();
+    }
     let mut text_started = false;
     let mut scoped_alpha = false;
     let mut saw_text_run = false;
     let mut identity_text_line_origin = None::<(f32, f32)>;
     let mut active_font = None::<(usize, f32)>;
-    for run in pdf_text_runs(line, embedded_fonts.document_font_to_embedded_font.len()) {
+    let mut active_text_rendering_mode = if invisible {
+        TextRenderingMode::Invisible
+    } else {
+        TextRenderingMode::Fill
+    };
+    for run in text_runs {
         saw_text_run = true;
         if run.glyphs.is_empty() {
             log::debug!("empty shaped text line {:?}", line.text);
@@ -2312,7 +3250,30 @@ pub(super) fn write_rendered_line(
             scoped_alpha = write_alpha_graphics_state(content, line.color);
             set_fill_color(content, line.color, color_mode);
             content.begin_text();
+            if invisible {
+                content.set_text_rendering_mode(TextRenderingMode::Invisible);
+            }
             text_started = true;
+        }
+        let synthetic_bold = !invisible
+            && embedded_fonts
+                .document_font_synthesis
+                .get(run.document_font_id)
+                .is_some_and(|synthesis| synthesis.embolden);
+        let visible_mode = if synthetic_bold {
+            TextRenderingMode::FillStroke
+        } else if invisible {
+            TextRenderingMode::Invisible
+        } else {
+            TextRenderingMode::Fill
+        };
+        if visible_mode != active_text_rendering_mode {
+            content.set_text_rendering_mode(visible_mode);
+            active_text_rendering_mode = visible_mode;
+        }
+        if synthetic_bold {
+            set_stroke_color(content, line.color, color_mode);
+            content.set_line_width(run.font_size * SYNTHETIC_BOLD_STROKE_EM);
         }
         let pdf_font_size = quantized_pdf_font_size(run.font_size);
         let run_origin = (line_origin.x + run.x_offset, line_origin.y + run.y_offset);
@@ -2345,20 +3306,35 @@ pub(super) fn write_rendered_line(
                 run_origin,
                 run.glyphs,
                 &font.source_gid_to_cid,
+                invisible,
+                visible_mode,
             );
             // Keep the run's logical text origin installed for a following
             // identity run, whose `Td` displacement is relative to it.
             content.set_text_matrix(run_text_matrix);
         } else {
-            write_glyphs(content, run.font_size, run.glyphs, &font.source_gid_to_cid);
+            write_glyphs(
+                content,
+                run.font_size,
+                run.glyphs,
+                &font.source_gid_to_cid,
+                invisible,
+                visible_mode,
+            );
         }
         if run.actual_text.is_some() {
             content.end_marked_content();
         }
     }
     if text_started {
+        if active_text_rendering_mode != TextRenderingMode::Fill {
+            content.set_text_rendering_mode(TextRenderingMode::Fill);
+        }
         content.end_text();
         close_alpha_graphics_state(content, scoped_alpha);
+    }
+    if uses_synthetic_bold {
+        content.restore_state();
     }
     saw_text_run
 }
@@ -2400,7 +3376,20 @@ fn write_glyphs(
     font_size: f32,
     glyphs: &[RenderedGlyph],
     source_gid_to_cid: &std::collections::BTreeMap<u16, u16>,
+    invisible: bool,
+    visible_mode: TextRenderingMode,
 ) {
+    if glyphs.iter().any(RenderedGlyph::is_painted_by_vector_path) {
+        write_glyphs_with_paint_modes(
+            content,
+            font_size,
+            glyphs,
+            source_gid_to_cid,
+            invisible,
+            visible_mode,
+        );
+        return;
+    }
     if !needs_positioned_glyphs(glyphs) {
         let glyph_bytes = glyph_bytes(glyphs, source_gid_to_cid);
         content.show(Str(&glyph_bytes));
@@ -2432,6 +3421,57 @@ fn write_glyphs(
     }
 }
 
+/// Emit a run that mixes normal PDF text ink with glyphs whose visible ink is
+/// supplied by an equivalent vector path. ISO 32000-2:2020, 9.3.6 defines
+/// rendering mode 3 as non-painting text; retaining its glyph codes preserves
+/// normal font subsetting, tagging, and ToUnicode extraction.
+fn write_glyphs_with_paint_modes(
+    content: &mut Content,
+    font_size: f32,
+    glyphs: &[RenderedGlyph],
+    source_gid_to_cid: &std::collections::BTreeMap<u16, u16>,
+    invisible: bool,
+    visible_mode: TextRenderingMode,
+) {
+    let mut mode = if invisible {
+        TextRenderingMode::Invisible
+    } else {
+        visible_mode
+    };
+    for (index, glyph) in glyphs.iter().enumerate() {
+        let next_mode = if invisible || glyph.is_painted_by_vector_path() {
+            TextRenderingMode::Invisible
+        } else {
+            visible_mode
+        };
+        if next_mode != mode {
+            content.set_text_rendering_mode(next_mode);
+            mode = next_mode;
+        }
+
+        let mut positioned = content.show_positioned();
+        let mut items = positioned.items();
+        if let Some(glyph_id) = glyph.painted_id() {
+            let glyph_bytes = glyph_id_bytes(source_gid_to_cid[&glyph_id]);
+            items.show(Str(&glyph_bytes));
+        }
+        if index + 1 < glyphs.len() {
+            let adjustment_advance = if glyph.is_advance_only() {
+                -glyph.x_advance
+            } else {
+                glyph.nominal_x_advance - glyph.x_advance
+            };
+            let adjustment = (adjustment_advance * 1000.0) / font_size.max(0.001);
+            if adjustment.abs() > 0.01 {
+                items.adjust(adjustment);
+            }
+        }
+    }
+    if !invisible && mode != visible_mode {
+        content.set_text_rendering_mode(visible_mode);
+    }
+}
+
 /// Paint a shaped run with one text matrix per glyph origin.
 ///
 /// OpenType GPOS can assign an individual glyph a local x/y offset while its
@@ -2443,17 +3483,35 @@ fn write_glyphs(
 /// operators. See ISO 32000-2:2020, 9.4.4 "Text Space Details".
 fn write_glyphs_at_origins(
     content: &mut Content,
-    text_matrix: crate::RenderedTextMatrix,
+    text_matrix: crate::document::paint::text::RenderedTextMatrix,
     run_origin: (f32, f32),
     glyphs: &[RenderedGlyph],
     source_gid_to_cid: &std::collections::BTreeMap<u16, u16>,
+    invisible: bool,
+    visible_mode: TextRenderingMode,
 ) {
     let [a, b, c, d] = text_matrix.pdf_components();
     let mut pen_x = 0.0;
+    let mut mode = if invisible {
+        TextRenderingMode::Invisible
+    } else {
+        visible_mode
+    };
     for glyph in glyphs {
+        let next_mode = if invisible || glyph.is_painted_by_vector_path() {
+            TextRenderingMode::Invisible
+        } else {
+            visible_mode
+        };
+        if next_mode != mode {
+            content.set_text_rendering_mode(next_mode);
+            mode = next_mode;
+        }
         if let Some(glyph_id) = glyph.painted_id() {
-            let local_origin =
-                crate::document::TextRunPoint::new(pen_x + glyph.x_offset, glyph.y_offset);
+            let local_origin = crate::document::paint::text::TextRunPoint::new(
+                pen_x + glyph.x_offset,
+                glyph.y_offset,
+            );
             let glyph_origin = text_matrix.transform_local_point(local_origin);
             content.set_text_matrix([
                 a,
@@ -2468,6 +3526,9 @@ fn write_glyphs_at_origins(
         }
         pen_x += glyph.x_advance;
     }
+    if !invisible && mode != visible_mode {
+        content.set_text_rendering_mode(visible_mode);
+    }
     debug_assert!(pen_x.is_finite());
 }
 
@@ -2477,7 +3538,10 @@ fn glyphs_have_origin_offsets(glyphs: &[RenderedGlyph]) -> bool {
         .any(|glyph| glyph.x_offset.abs() > 0.01 || glyph.y_offset.abs() > 0.01)
 }
 
-fn pdf_text_matrix(text_matrix: crate::RenderedTextMatrix, origin: (f32, f32)) -> [f32; 6] {
+fn pdf_text_matrix(
+    text_matrix: crate::document::paint::text::RenderedTextMatrix,
+    origin: (f32, f32),
+) -> [f32; 6] {
     let [a, b, c, d] = text_matrix.pdf_components();
     [a, b, c, d, origin.0, origin.1]
 }
@@ -2511,13 +3575,386 @@ fn pdf_name(name: &str) -> Name<'_> {
 }
 
 #[cfg(test)]
-mod image_tests {
+mod content_tests {
     use super::*;
-    use crate::document::RenderedPathClip;
-    use crate::{
-        PaintPoint, PaintRect, PaintSize, RenderedImage, RenderedPathCommand, RenderedPathFillRule,
+    use crate::document::paint::effects::{PaintEffectScope, PaintEffects};
+    use crate::document::paint::geometry::PaintStrokeWidth;
+    use crate::document::paint::geometry::{PaintPoint, PaintRect, PaintSize};
+    use crate::document::paint::images::RenderedImage;
+    use crate::document::paint::page::PaintOperation;
+    use crate::document::paint::page::{OpaqueTextCoverage, PaintPrimitive};
+    use crate::document::paint::paths::{
+        RenderedPath, RenderedPathClip, RenderedPathCommand, RenderedPathFillRule,
     };
     use std::rc::Rc;
+
+    fn test_color_plan() -> PdfColorPlan {
+        PdfColorPlan::new(
+            crate::PdfProfile::Pdf,
+            1,
+            std::iter::empty(),
+            [crate::css::CssColorSpace::Srgb],
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    fn opaque_coverage_path(x: f32, width: f32) -> RenderedPath {
+        opaque_coverage_path_with_fill(x, width, crate::CssColor::BLACK)
+    }
+
+    fn opaque_coverage_path_with_fill(x: f32, width: f32, fill: crate::CssColor) -> RenderedPath {
+        let rect = PaintRect::new(PaintPoint::new(x, 0.0), PaintSize::new(width, 10.0));
+        RenderedPath::new(
+            vec![
+                RenderedPathCommand::MoveTo(PaintPoint::new(x, 0.0)),
+                RenderedPathCommand::LineTo(PaintPoint::new(x + width, 0.0)),
+                RenderedPathCommand::LineTo(PaintPoint::new(x + width, 10.0)),
+                RenderedPathCommand::LineTo(PaintPoint::new(x, 10.0)),
+                RenderedPathCommand::Close,
+            ],
+            Some(fill),
+            RenderedPathFillRule::NonZero,
+            None,
+            PaintStrokeWidth::ZERO,
+            None,
+        )
+        .with_opaque_coverage_rect(rect)
+    }
+
+    fn coverage_page(later_width: f32) -> crate::Page {
+        let mut page = crate::Page::new(100.0, 100.0);
+        page.paths.push(opaque_coverage_path(0.0, 10.0));
+        page.paths.push(opaque_coverage_path(0.0, later_width));
+        page.opaque_text_coverages.extend([
+            OpaqueTextCoverage {
+                line_index: 0,
+                path_indices: vec![0],
+            },
+            OpaqueTextCoverage {
+                line_index: 1,
+                path_indices: vec![1],
+            },
+        ]);
+        page
+    }
+
+    fn coverage_operation(index: usize) -> crate::document::paint::display_list::PaintDisplayItem {
+        crate::document::paint::display_list::PaintDisplayItem::Operation(
+            PaintOperation::OpaqueTextCoverage(index),
+        )
+    }
+
+    fn line_with_ink_bounds(width: f32) -> crate::document::paint::text::RenderedLine {
+        crate::document::paint::text::RenderedLine::new(
+            "x".to_string(),
+            0.0,
+            10.0,
+            10.0,
+            None,
+            crate::CssColor::BLACK,
+            Vec::new(),
+        )
+        .with_glyph_ink_bounds(Some(
+            crate::document::paint::geometry::PaintClip::from_paint_rect(PaintRect::new(
+                PaintPoint::new(0.0, 0.0),
+                PaintSize::new(width, 10.0),
+            )),
+        ))
+    }
+
+    fn line_operation(index: usize) -> crate::document::paint::display_list::PaintDisplayItem {
+        crate::document::paint::display_list::PaintDisplayItem::Operation(PaintOperation::Line(
+            index,
+        ))
+    }
+
+    fn opaque_rect(x: f32, width: f32) -> crate::document::paint::shapes::RenderedRect {
+        crate::document::paint::shapes::RenderedRect::new(
+            x,
+            0.0,
+            width,
+            10.0,
+            Some(crate::CssColor::BLACK),
+            None,
+            PaintStrokeWidth::ZERO,
+        )
+    }
+
+    fn visible_rects_after_later_items(
+        page: &crate::Page,
+        items: &[crate::document::paint::display_list::PaintDisplayItem],
+    ) -> Vec<crate::document::paint::shapes::RenderedRect> {
+        let mut next_object_id = 0;
+        let mut forms = Vec::new();
+        let mut vector_paints = VectorPaintResources::default();
+        let color_plan = test_color_plan();
+        let state = PaintTreeRenderState {
+            next_object_id: &mut next_object_id,
+            forms: &mut forms,
+            next_form_name: 1,
+            form_dependency_scopes: Vec::new(),
+            vector_paints: &mut vector_paints,
+            page_size: PdfSize::new(page.width(), page.height()),
+            color_mode: PdfColorMode::PreserveCssSpace,
+            color_plan: &color_plan,
+            image_resources: &[],
+            page_image_sources: &[],
+            page_image_pattern_sources: &[],
+            active_paint_transform: crate::document::paint::geometry::PaintTransform::identity(),
+        };
+        visible_rect_after_later_display_rects(page, items, 0, &page.rects[0], &[], &state)
+    }
+
+    #[test]
+    fn serializer_elides_background_fully_covered_by_replayed_primitive_rect() {
+        let mut page = crate::Page::new(100.0, 100.0);
+        page.rects.push(opaque_rect(0.0, 10.0));
+        let mut later_rect = opaque_rect(0.0, 10.0);
+        later_rect.fill = Some(crate::CssColor::rgba(0, 128, 128, 1.0));
+        let items = vec![
+            crate::document::paint::display_list::PaintDisplayItem::Operation(
+                PaintOperation::Rect(0),
+            ),
+            crate::document::paint::display_list::PaintDisplayItem::Primitive(
+                PaintPrimitive::Rect(later_rect),
+            ),
+        ];
+
+        assert!(visible_rects_after_later_items(&page, &items).is_empty());
+    }
+
+    #[test]
+    fn serializer_retains_background_for_partial_or_effect_scoped_replayed_rect() {
+        let mut page = crate::Page::new(100.0, 100.0);
+        page.rects.push(opaque_rect(0.0, 10.0));
+        let partial_items = vec![
+            crate::document::paint::display_list::PaintDisplayItem::Operation(
+                PaintOperation::Rect(0),
+            ),
+            crate::document::paint::display_list::PaintDisplayItem::Primitive(
+                PaintPrimitive::Rect(opaque_rect(0.0, 5.0)),
+            ),
+        ];
+        assert_eq!(
+            visible_rects_after_later_items(&page, &partial_items).len(),
+            1
+        );
+
+        let scoped_items = vec![
+            crate::document::paint::display_list::PaintDisplayItem::Operation(
+                PaintOperation::Rect(0),
+            ),
+            crate::document::paint::display_list::PaintDisplayItem::EffectScope(
+                PaintEffectScope::new(
+                    PaintEffects {
+                        opacity: 0.5,
+                        ..PaintEffects::default()
+                    },
+                    None,
+                    vec![
+                        crate::document::paint::display_list::PaintDisplayItem::Primitive(
+                            PaintPrimitive::Rect(opaque_rect(0.0, 10.0)),
+                        ),
+                    ],
+                ),
+            ),
+        ];
+        assert_eq!(
+            visible_rects_after_later_items(&page, &scoped_items).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn serializer_elides_fully_covered_opaque_text_coverage() {
+        let page = coverage_page(10.0);
+        let items = vec![coverage_operation(0), coverage_operation(1)];
+
+        assert!(opaque_text_coverage_is_fully_hidden(
+            &page,
+            &page.opaque_text_coverages[0],
+            &items,
+            0,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn serializer_retains_partially_covered_opaque_text_coverage() {
+        let page = coverage_page(5.0);
+        let items = vec![coverage_operation(0), coverage_operation(1)];
+
+        assert!(!opaque_text_coverage_is_fully_hidden(
+            &page,
+            &page.opaque_text_coverages[0],
+            &items,
+            0,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn serializer_does_not_cross_effect_boundaries_for_text_coverage() {
+        let page = coverage_page(10.0);
+        let items = vec![
+            coverage_operation(0),
+            crate::document::paint::display_list::PaintDisplayItem::EffectScope(
+                PaintEffectScope::new(
+                    PaintEffects {
+                        opacity: 0.5,
+                        ..PaintEffects::default()
+                    },
+                    None,
+                    vec![coverage_operation(1)],
+                ),
+            ),
+        ];
+
+        assert!(!opaque_text_coverage_is_fully_hidden(
+            &page,
+            &page.opaque_text_coverages[0],
+            &items,
+            0,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn serializer_hides_only_fully_covered_effect_free_lines() {
+        let mut page = crate::Page::new(100.0, 100.0);
+        page.lines.push(line_with_ink_bounds(10.0));
+        page.paths.push(opaque_coverage_path(0.0, 10.0));
+        let fully_covered = vec![
+            line_operation(0),
+            crate::document::paint::display_list::PaintDisplayItem::Operation(
+                PaintOperation::Path(0),
+            ),
+        ];
+        assert!(rendered_line_ink_is_fully_hidden(
+            &page,
+            &page.lines[0],
+            &fully_covered,
+            0,
+            &[],
+            None,
+        ));
+
+        page.paths[0] = opaque_coverage_path(0.0, 5.0);
+        assert!(!rendered_line_ink_is_fully_hidden(
+            &page,
+            &page.lines[0],
+            &fully_covered,
+            0,
+            &[],
+            None,
+        ));
+
+        page.paths[0] = opaque_coverage_path(0.0, 10.0);
+        let effect_scoped = vec![
+            line_operation(0),
+            crate::document::paint::display_list::PaintDisplayItem::EffectScope(
+                PaintEffectScope::new(
+                    PaintEffects {
+                        opacity: 0.5,
+                        ..PaintEffects::default()
+                    },
+                    None,
+                    vec![
+                        crate::document::paint::display_list::PaintDisplayItem::Operation(
+                            PaintOperation::Path(0),
+                        ),
+                    ],
+                ),
+            ),
+        ];
+        assert!(!rendered_line_ink_is_fully_hidden(
+            &page,
+            &page.lines[0],
+            &effect_scoped,
+            0,
+            &[],
+            None,
+        ));
+    }
+
+    #[test]
+    fn opaque_text_coverage_rectangles_share_one_pending_fill() {
+        let first = opaque_coverage_path(0.0, 10.0);
+        let second = opaque_coverage_path(10.0, 10.0);
+        let mut pending = PendingFillRects::default();
+
+        for path in [&first, &second] {
+            let rect = opaque_text_coverage_rect_for_batch(path, PdfColorMode::PreserveCssSpace)
+                .expect("identity opaque full-em rectangle is batchable");
+            assert!(pending.try_push(&rect));
+        }
+
+        assert_eq!(pending.rects.len(), 1);
+        assert_eq!(pending.rects[0].x(), 0.0);
+        assert_eq!(pending.rects[0].width(), 20.0);
+    }
+
+    #[test]
+    fn pending_fills_deduplicate_only_exactly_coincident_rectangles() {
+        let exact = opaque_rect(0.0, 10.0);
+        let partial_overlap = opaque_rect(5.0, 10.0);
+        let mut pending = PendingFillRects::default();
+
+        assert!(pending.try_push(&exact));
+        assert!(pending.try_push(&exact));
+        assert_eq!(pending.rects.len(), 1);
+        assert!(!pending.try_push(&partial_overlap));
+        assert_eq!(pending.rects.len(), 1);
+    }
+
+    #[test]
+    fn solid_image_coverage_uses_semantic_destination_clip_identity() {
+        let rect = PaintRect::new(PaintPoint::new(10.0, 20.0), PaintSize::new(4.0, 5.0));
+        let destination_clip =
+            RenderedPathClip::new(Vec::new(), RenderedPathFillRule::NonZero, Vec::new());
+        let image = RenderedImage::from_paint_rect(
+            rect,
+            false,
+            1,
+            1,
+            None,
+            false,
+            Rc::from([0_u8, 128, 0]),
+            None,
+            None,
+        )
+        .with_destination_rect_clip(destination_clip);
+        let fill = SolidImageFill {
+            color_space: crate::color::RasterColorSpace::SRGB,
+            components: [0, 128, 0],
+        };
+
+        assert!(solid_image_fill_as_rect(&image, &fill).is_some());
+    }
+
+    #[test]
+    fn opaque_text_coverage_batching_preserves_paint_boundaries() {
+        let black = opaque_coverage_path(0.0, 10.0);
+        let red = opaque_coverage_path_with_fill(10.0, 10.0, crate::CssColor::rgba(255, 0, 0, 1.0));
+        let rotated = opaque_coverage_path(20.0, 10.0).with_transform(
+            crate::document::paint::geometry::PaintTransform::new(0.0, 1.0, -1.0, 0.0, 0.0, 0.0),
+        );
+        let black_rect =
+            opaque_text_coverage_rect_for_batch(&black, PdfColorMode::PreserveCssSpace).unwrap();
+        let red_rect =
+            opaque_text_coverage_rect_for_batch(&red, PdfColorMode::PreserveCssSpace).unwrap();
+        let mut pending = PendingFillRects::default();
+        assert!(pending.try_push(&black_rect));
+        assert!(
+            !pending.try_push(&red_rect),
+            "different opaque colors must keep their author paint boundary"
+        );
+        assert!(
+            opaque_text_coverage_rect_for_batch(&rotated, PdfColorMode::PreserveCssSpace).is_none(),
+            "a rotated glyph outline must remain an ordinary vector path"
+        );
+    }
 
     #[test]
     fn bitmap_glyph_image_writes_actual_text_marked_content() {
@@ -2534,6 +3971,7 @@ mod image_tests {
         )
         .with_actual_text(Rc::from("⚪"));
         let mut content = Content::new();
+        let color_plan = test_color_plan();
         write_image(
             &mut content,
             &image,
@@ -2548,12 +3986,44 @@ mod image_tests {
                     alpha: None,
                 },
             }),
+            &color_plan,
         );
         let bytes = content.finish().into_vec();
         let content = String::from_utf8_lossy(&bytes);
         assert!(content.contains("ActualText"));
         assert!(content.contains("/Im1 Do"));
         assert!(content.contains("EMC"));
+    }
+
+    #[test]
+    fn transparent_image_retains_actual_text_without_a_pdf_paint_operation() {
+        let image = RenderedImage::from_paint_rect(
+            PaintRect::new(PaintPoint::new(10.0, 20.0), PaintSize::new(4.0, 5.0)),
+            false,
+            1,
+            1,
+            None,
+            true,
+            Rc::from([255_u8, 255, 255]),
+            Some(Rc::from([0_u8])),
+            None,
+        )
+        .with_actual_text(Rc::from("transparent"));
+        let mut content = Content::new();
+        let color_plan = test_color_plan();
+        write_image(
+            &mut content,
+            &image,
+            0,
+            &PreparedImageResource::Transparent,
+            &color_plan,
+        );
+        let bytes = content.finish().into_vec();
+        let content = String::from_utf8_lossy(&bytes);
+
+        assert!(content.contains("ActualText"));
+        assert!(content.contains("EMC"));
+        assert!(!content.contains(" Do"));
     }
 
     #[test]
@@ -2571,14 +4041,16 @@ mod image_tests {
         )
         .with_actual_text(Rc::from("green"));
         let mut content = Content::new();
+        let color_plan = test_color_plan();
         write_image(
             &mut content,
             &image,
             0,
             &PreparedImageResource::SolidFill(SolidImageFill {
-                color_space: crate::css::CssColorSpace::Srgb,
-                components: [0.0, 128.0 / 255.0, 0.0],
+                color_space: crate::color::RasterColorSpace::SRGB,
+                components: [0, 128, 0],
             }),
+            &color_plan,
         );
         let bytes = content.finish().into_vec();
         let content = String::from_utf8_lossy(&bytes);
@@ -2615,19 +4087,69 @@ mod image_tests {
             Vec::new(),
         ));
         let mut content = Content::new();
+        let color_plan = test_color_plan();
         write_image(
             &mut content,
             &image,
             0,
             &PreparedImageResource::SolidFill(SolidImageFill {
-                color_space: crate::css::CssColorSpace::Srgb,
-                components: [0.0, 128.0 / 255.0, 0.0],
+                color_space: crate::color::RasterColorSpace::SRGB,
+                components: [0, 128, 0],
             }),
+            &color_plan,
         );
         let content = String::from_utf8_lossy(&content.finish().into_vec()).into_owned();
 
         assert!(content.contains("W\nn"));
         assert!(content.contains("ActualText"));
         assert!(content.contains("/CSsRGB cs"));
+    }
+
+    #[test]
+    fn tiling_pattern_fill_uses_its_paint_path_without_a_duplicate_clip() {
+        let mut content = Content::new();
+        write_tiling_pattern_fill(
+            &mut content,
+            PaintRect::new(PaintPoint::new(10.0, 20.0), PaintSize::new(4.0, 5.0)),
+            "P1",
+            None,
+        );
+        let content = String::from_utf8_lossy(&content.finish().into_vec()).into_owned();
+
+        assert!(content.contains("/Pattern cs"));
+        assert!(content.contains("/P1 scn"));
+        assert!(content.contains("10 20 4 5 re"));
+        assert!(content.contains("f\n"));
+        assert!(
+            !content.contains("W\nn"),
+            "the pattern fill path must not first install an identical clip: {content}"
+        );
+    }
+
+    #[test]
+    fn tiling_pattern_fill_retains_an_authored_clip() {
+        let clip = RenderedPathClip::new(
+            vec![
+                RenderedPathCommand::MoveTo(PaintPoint::new(11.0, 20.0)),
+                RenderedPathCommand::LineTo(PaintPoint::new(14.0, 20.0)),
+                RenderedPathCommand::LineTo(PaintPoint::new(14.0, 25.0)),
+                RenderedPathCommand::LineTo(PaintPoint::new(11.0, 25.0)),
+                RenderedPathCommand::Close,
+            ],
+            RenderedPathFillRule::NonZero,
+            Vec::new(),
+        );
+        let mut content = Content::new();
+        write_tiling_pattern_fill(
+            &mut content,
+            PaintRect::new(PaintPoint::new(10.0, 20.0), PaintSize::new(4.0, 5.0)),
+            "P1",
+            Some(&clip),
+        );
+        let content = String::from_utf8_lossy(&content.finish().into_vec()).into_owned();
+
+        assert_eq!(content.matches("W\nn").count(), 1, "content={content}");
+        assert!(content.contains("/P1 scn"));
+        assert!(content.contains("10 20 4 5 re"));
     }
 }

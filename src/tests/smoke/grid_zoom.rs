@@ -1,6 +1,9 @@
 use super::*;
 
-fn rects_with_fill(page: &quire::Page, fill: CssColor) -> Vec<&quire::RenderedRect> {
+fn rects_with_fill(
+    page: &quire::Page,
+    fill: CssColor,
+) -> Vec<&crate::document::paint::shapes::RenderedRect> {
     page.rects()
         .iter()
         .filter(|rect| rect.fill == Some(fill))
@@ -87,4 +90,79 @@ async fn inherited_zoom_on_grid_item_is_applied_once() {
         .expect("inherited-zoom descendant background");
     assert!((paint.width() - 20.0).abs() < 0.01, "paint={paint:?}");
     assert!((paint.height() - 20.0).abs() < 0.01, "paint={paint:?}");
+}
+
+#[tokio::test]
+async fn vertical_grid_item_edges_resolve_against_logical_inline_size() {
+    for (display, direction) in [
+        ("grid", "ltr"),
+        ("grid", "rtl"),
+        ("inline-grid", "ltr"),
+        ("inline-grid", "rtl"),
+    ] {
+        let document = Html::from_string(format!(
+            "<!doctype html><style>
+             @page {{ size: 240pt 160pt; margin: 0 }}
+             body {{ margin: 0 }}
+             #grid {{ display: {display}; direction: {direction}; writing-mode: vertical-lr; width: 80pt; height: 100pt;
+                      grid-template-columns: 100pt; grid-template-rows: 80pt }}
+             #item {{ margin-left: 10%; padding-left: calc(5pt + 5%); background: rgb(255 0 0) }}
+             #paint {{ width: 10pt; height: 10pt; background: rgb(0 0 255) }}
+             </style><div id=\"grid\"><div id=\"item\"><div id=\"paint\"></div></div></div>",
+        ))
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+
+        let page = &document.pages[0];
+        let item = rects_with_fill(page, CssColor::new(255, 0, 0))
+            .into_iter()
+            .max_by(|left, right| left.width().total_cmp(&right.width()))
+            .expect("grid item background");
+        let paint = rects_with_fill(page, CssColor::new(0, 0, 255))
+            .into_iter()
+            .next()
+            .expect("grid item descendant background");
+
+        // Both physical edge percentages use the vertical grid's 100pt
+        // logical inline dimension, not its 80pt physical width.
+        assert!(
+            (item.x() - 10.0).abs() < 0.01,
+            "display={display}, direction={direction}, item={item:?}"
+        );
+        assert!(
+            (paint.x() - 20.0).abs() < 0.01,
+            "display={display}, direction={direction}, paint={paint:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn zoomed_vertical_grid_item_edges_use_scaled_logical_inline_size() {
+    let document = Html::from_string(
+        "<!doctype html><style>
+         @page { size: 500pt 320pt; margin: 0 }
+         body { margin: 0 }
+         #grid { display: grid; writing-mode: vertical-lr; width: 80pt; height: 100pt; zoom: 2;
+                  grid-template-columns: 100pt; grid-template-rows: 80pt }
+         #item { margin-left: 10%; padding-left: calc(5pt + 5%); background: rgb(255 0 0) }
+         #paint { width: 10pt; height: 10pt; background: rgb(0 0 255) }
+         </style><div id=\"grid\"><div id=\"item\"><div id=\"paint\"></div></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let item = rects_with_fill(page, CssColor::new(255, 0, 0))
+        .into_iter()
+        .max_by(|left, right| left.width().total_cmp(&right.width()))
+        .expect("zoomed grid item background");
+    let paint = rects_with_fill(page, CssColor::new(0, 0, 255))
+        .into_iter()
+        .next()
+        .expect("zoomed grid item descendant background");
+
+    assert!((item.x() - 20.0).abs() < 0.01, "item={item:?}");
+    assert!((paint.x() - 40.0).abs() < 0.01, "paint={paint:?}");
 }

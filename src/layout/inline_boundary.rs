@@ -66,6 +66,7 @@ pub(in crate::layout) fn inline_atom_boundary_role(
             InlineBoundaryRole::TransparentTextBoundary
         }
         InlineAtomContent::InlineBox { .. }
+        | InlineAtomContent::Ruby { .. }
         | InlineAtomContent::TextCombineUpright { .. }
         | InlineAtomContent::InlineFragment { .. } => {
             InlineBoundaryRole::IndependentFormattingContext
@@ -73,6 +74,7 @@ pub(in crate::layout) fn inline_atom_boundary_role(
         InlineAtomContent::Canvas
         | InlineAtomContent::Iframe(_)
         | InlineAtomContent::Image(_)
+        | InlineAtomContent::Gradient { .. }
         | InlineAtomContent::Svg { .. }
         | InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace)
         | InlineAtomContent::Leader(_) => InlineBoundaryRole::OpaqueAtomic,

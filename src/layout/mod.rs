@@ -3,32 +3,52 @@ use crate::css::{
     BaselineMetric, BaselineShift, BookmarkLabelPart, BorderStyle, BoxSizing, CaptionSide, Clear,
     ClipPath, ComputedStyle, Content, ContentAlignmentKeyword, ContentVisibility, CounterReset,
     CounterResetKind, CounterStyleRange, CounterStyleRule, CounterStyleSystem, CounterValue,
-    CssBookmarkState, CssColor, Declarations, Direction, Display, DisplayInner, DominantBaseline,
-    ElementAttributeSignature, ElementSiblingSignature, ElementSiblingSignatureList,
-    ElementSignature, EmptyCells, FilterValue, FlexDirection, FlexWrap, Float,
-    GeneratedAltTextPart, GeneratedContentPart, GeneratedQuote, Isolation, JustifyContent,
-    JustifyItems, JustifySelf, LinearGradientDirection, ListStylePosition, ListStyleType,
-    LogicalAxis, LogicalSide, MarkerContent, MarkerContentPart, MarkerSide, MaskValue,
-    MixBlendMode, NamedStringPart, PageBreak, PageRule, PageSpecificity, PhysicalAxis,
-    PhysicalSide, Position, Quotes, SelfAlignmentKeyword, Stylesheet, StylesheetOrigin,
-    TableCellVerticalAlign, TableLayout, TextAlign, TextAlignLast, TextAutospace,
+    CssBookmarkState, CssColor, Declarations, Direction, Display, DisplayInner, DisplayOuter,
+    DominantBaseline, ElementAttributeSignature, ElementSiblingSignature,
+    ElementSiblingSignatureList, ElementSignature, EmptyCells, FilterValue, FlexDirection,
+    FlexWrap, Float, GeneratedAltTextPart, GeneratedContentPart, GeneratedQuote, Isolation,
+    JustifyContent, JustifyItems, JustifySelf, LinearGradientDirection, ListStylePosition,
+    ListStyleType, LogicalAxis, LogicalSide, MarkerContent, MarkerContentPart, MarkerSide,
+    MaskValue, MixBlendMode, NamedStringPart, PageBreak, PageRule, PageSpecificity, PhysicalAxis,
+    PhysicalSide, Position, Quotes, SelfAlignmentKeyword, StylesheetOrigin, Stylesheets,
+    TableCellVerticalAlign, TableLayout, TargetReference, TextAlign, TextAlignLast, TextAutospace,
     TextDecorationSkipInk, TextDecorationSkipSpaces, TextDecorationStyle, TextDecorationThickness,
-    TextJustify, TextSpacingTrim, TextTransformCase, TextUnderlineOffset, TextUnderlinePosition,
-    UnicodeBidi, VerticalAlign, Visibility, WhiteSpace, WritingMode, WritingModeAxes,
-    block_end_side, block_start_side, inline_end_side, inline_start_side,
+    TextJustify, TextOrientation, TextSpacingTrim, TextTransformCase, TextUnderlineOffset,
+    TextUnderlinePosition, UnicodeBidi, VerticalAlign, Visibility, WhiteSpace, WritingMode,
+    WritingModeAxes, block_end_side, block_start_side, inline_end_side, inline_start_side,
+};
+use crate::document::paint::annotations::RenderedLink;
+use crate::document::paint::display_list::PaintBand;
+use crate::document::paint::effects::{
+    PaintBlendMode, PaintClipPathEffect, PaintEffects, PaintFilterEffect, PaintMaskEffect,
+    RenderedClipPathPolygon,
+};
+use crate::document::paint::fragments::PaintFragment;
+use crate::document::paint::geometry::{
+    PaintClip, PaintClipUnion, PaintDisplacement, PaintPoint, PaintRect, PaintSize, PaintSpace,
+    PaintTransform, PaintTranslation,
+};
+use crate::document::paint::images::RenderedImage;
+use crate::document::paint::page::{PaintCheckpoint, PaintPrimitive};
+use crate::document::paint::paths::{
+    RenderedGradient, RenderedGradientKind, RenderedGradientStop, RenderedPath, RenderedPathClip,
+    RenderedPathClipPath, RenderedPathCommand, RenderedPathFillRule, RenderedPathLineCap,
+    RenderedPathStrokeStyle, paint_rect_path_commands,
+};
+use crate::document::paint::patterns::{
+    RenderedGradientPattern, RenderedImagePattern, RenderedImageSourceRect, RenderedSvgPattern,
+};
+use crate::document::paint::shapes::{
+    RenderedCornerRadius, RenderedRect, RenderedRoundedRect, RenderedRoundedRectRadii,
+    RenderedStroke,
+};
+use crate::document::paint::stacking::{PaintStackingContext, StackLevel};
+use crate::document::paint::text::{
+    RenderedGlyph, RenderedLine, RenderedLineSource, RenderedTextMatrix, RenderedTextRun,
+    TextRunPoint,
 };
 use crate::document::{
-    Bookmark, BookmarkState, Document, DocumentMetadata, Page, PaintBand, PaintBlendMode,
-    PaintCheckpoint, PaintClip, PaintClipPathEffect, PaintClipUnion, PaintDisplacement,
-    PaintEffects, PaintFilterEffect, PaintFragment, PaintMaskEffect, PaintPoint, PaintPrimitive,
-    PaintRect, PaintSize, PaintSpace, PaintStackingContext, PaintStrokeWidth, PaintTransform,
-    PaintTranslation, RenderedClipPathPolygon, RenderedCornerRadius, RenderedGlyph,
-    RenderedGradient, RenderedGradientKind, RenderedGradientPattern, RenderedGradientStop,
-    RenderedImage, RenderedImagePattern, RenderedImageSourceRect, RenderedLine, RenderedLineSource,
-    RenderedLink, RenderedPath, RenderedPathClip, RenderedPathClipPath, RenderedPathCommand,
-    RenderedPathFillRule, RenderedPathLineCap, RenderedPathStrokeStyle, RenderedRect,
-    RenderedRoundedRect, RenderedRoundedRectRadii, RenderedStroke, RenderedSvgPattern,
-    RenderedTextMatrix, RenderedTextRun, StackLevel, TextRunPoint, paint_rect_path_commands,
+    Bookmark, BookmarkState, Document, DocumentMetadata, Page, PaintStrokeWidth,
 };
 use crate::dom::{self, Element, ElementId, Node, NodeKind};
 use crate::resource::ResourceCache;
@@ -38,9 +58,11 @@ use crate::text::{
     ResolvedBidiDirection, ShapedInlineLine, StyledTextSpan, TextDecorationFontMetrics,
     bidi_control_scope_for_style, character_has_joining_behavior, character_is_arabic_tatweel,
     character_is_bidi_format_control, character_is_default_ignorable_code_point,
-    character_is_first_hangable_punctuation, character_is_hangable_stop_or_comma,
+    character_is_first_hangable_punctuation, character_is_first_letter_associated_space,
+    character_is_first_letter_suffix_punctuation, character_is_hangable_stop_or_comma,
     character_is_join_control, character_is_last_hangable_punctuation,
-    character_is_unicode_alphanumeric, character_is_unicode_control, character_is_unicode_mark,
+    character_is_unicode_alphanumeric, character_is_unicode_control,
+    character_is_unicode_first_letter_base, character_is_unicode_mark,
     character_is_unicode_punctuation, character_is_unicode_symbol,
     character_preserves_word_boundary_context, character_receives_text_emphasis_mark,
     contains_bidi_text, is_css_collapsible_whitespace, plaintext_direction_for_text,
@@ -60,18 +82,44 @@ use taffy::prelude as taffy_layout;
 
 use self::assets::{
     DocumentCanvasBackgroundArea, PaintBackgroundArea,
+    fragmented_table_root_background_image_primitives,
     background_image_primitives_for_style_with_paint_areas,
     background_image_primitives_for_style_with_paint_areas_and_fixed_positioning_area,
+    structural_table_background_image_primitives,
 };
 
 mod asset_helpers;
 mod assets;
+pub(crate) fn generated_linear_gradient_raster_color_space(
+    gradient: &crate::css::LinearGradient,
+    size: crate::document::paint::geometry::PaintSize,
+    current_color: crate::CssColor,
+) -> Option<crate::css::CssColorSpace> {
+    assets::background_gradients::generated_linear_gradient_raster_color_space(
+        gradient,
+        size,
+        current_color,
+    )
+}
+
+pub(crate) fn generated_radial_gradient_raster_color_space(
+    gradient: &crate::css::RadialGradient,
+    size: crate::document::paint::geometry::PaintSize,
+    current_color: crate::CssColor,
+) -> Option<crate::css::CssColorSpace> {
+    assets::background_gradients::generated_radial_gradient_raster_color_space(
+        gradient,
+        size,
+        current_color,
+    )
+}
 mod block;
 #[allow(unused_imports)]
 pub(in crate::layout) use self::block::{
-    AutoFloatMeasurementKey, FloatAvoidingBfcMeasurement, FloatAvoidingBfcPlacement, FloatBand,
-    FloatBandPlacement, FloatBandQuery, FloatClearanceResolution, FloatContext, FloatId,
-    FloatPaintFragment, FloatPlacement, FloatRunState, FloatShape, LogicalFloatBand, UsedFloatSide,
+    AutoFloatMeasurementKey, FloatAvoidanceCandidate, FloatAvoidanceInlineContainment,
+    FloatAvoidingBfcPlacement, FloatBand, FloatBandPlacement, FloatBandQuery,
+    FloatClearanceResolution, FloatContext, FloatId, FloatPaintFragment, FloatPlacement,
+    FloatRunState, FloatShape, LogicalFloatBand, UsedFloatSide,
     float_avoiding_auto_border_box_width, vertical_physical_inline_span,
 };
 mod box_tree;
@@ -99,13 +147,15 @@ mod list;
 mod page_generated;
 mod page_margin;
 mod paint_helpers;
-pub(crate) use paint_helpers::shaped_rect_path_commands;
+pub(crate) use paint_helpers::block::shaped_rect_path_commands;
 mod paint_ops;
 mod positioned_child;
 mod quotes;
+mod ruby;
 mod scroll_snap;
 mod table;
 mod table_span;
+mod taffy_bridge;
 mod text_helpers;
 mod text_paint;
 

@@ -1,4 +1,5 @@
 use super::*;
+use crate::css::component_values::{find_ascii_case_insensitive, find_matching_brace};
 
 #[allow(
     dead_code,
@@ -16,7 +17,7 @@ pub(super) fn parse_counter_styles(css: &Css) -> Vec<CounterStyleRule> {
         };
         let name = after_at_rule[..open_offset].trim().to_ascii_lowercase();
         let open = start + "@counter-style".len() + open_offset;
-        let Some(close) = find_matching_brace(rest, open) else {
+        let Some(close) = find_matching_brace(rest, open, false) else {
             break;
         };
         let body = &rest[open + 1..close];

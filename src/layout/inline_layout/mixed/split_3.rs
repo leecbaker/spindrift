@@ -152,12 +152,22 @@ pub(in crate::layout) fn mixed_measured_inline_line_bidi_text(
     let mut text = bidi_scope_continuations.prefix_parent_context.clone();
     text.push_str(prefix);
     let mut ranged = Vec::new();
-    for item in items {
+    for (item_index, item) in items.iter().enumerate() {
         let start = text.len();
         match &item.item {
             InlineLineItem::Fragment(fragment) => text.push_str(fragment.text()),
             InlineLineItem::Atom(atom) => {
-                if mixed_inline_atom_participates_in_bidi_ordering(atom) {
+                if inline_shaping_boundary_requires_bidi_join_control(items, item_index) {
+                    // A decorated inline edge interrupts cursive shaping, but
+                    // it is not an atomic inline object for UAX #9. Model its
+                    // typographic boundary with the default-ignorable ZWNJ
+                    // while retaining the edge's zero-width range so the
+                    // normal visual-edge reinsertion keeps its margin/border
+                    // at the CSS inline-box boundary.
+                    // <https://www.w3.org/TR/css-text-3/#boundary-shaping>
+                    // <https://www.unicode.org/reports/tr9/#X9>
+                    text.push('\u{200c}');
+                } else if mixed_inline_atom_participates_in_bidi_ordering(atom) {
                     text.push(OBJECT_REPLACEMENT_CHARACTER);
                 }
             }
@@ -169,15 +179,56 @@ pub(in crate::layout) fn mixed_measured_inline_line_bidi_text(
             range: start..end,
         });
     }
+    // A retained `break-spaces` line-end space supplies this LTR continuation
+    // in RTL lines. It is UAX #9 context only, not authored or extracted text.
+    text.push_str(&bidi_scope_continuations.trailing_line_edge_context);
     text.push_str(suffix);
     text.push_str(&bidi_scope_continuations.suffix_parent_context);
     (text, ranged)
 }
 
+/// Return whether an inline-box shaping boundary needs a virtual U+200C in
+/// the bidi source stream.
+///
+/// U+200C is needed only to preserve the visual placement of a joining-script
+/// shaping boundary. Emitting it beside ordinary neutral text changes UAX #9
+/// neutral resolution even though no cursive joining is present.
+fn inline_shaping_boundary_requires_bidi_join_control(
+    items: &[MeasuredInlineItem],
+    boundary_index: usize,
+) -> bool {
+    let Some(MeasuredInlineItem {
+        item: InlineLineItem::Atom(atom),
+        ..
+    }) = items.get(boundary_index)
+    else {
+        return false;
+    };
+    if !inline_atom_is_logical_shaping_boundary(atom) {
+        return false;
+    }
+    let neighbor_joins = |items: &[MeasuredInlineItem], reverse: bool| {
+        let mut iterator: Box<dyn Iterator<Item = &MeasuredInlineItem>> = if reverse {
+            Box::new(items.iter().rev())
+        } else {
+            Box::new(items.iter())
+        };
+        iterator.find_map(|item| match &item.item {
+            InlineLineItem::Fragment(fragment) => {
+                Some(fragment.text().chars().any(character_has_joining_behavior))
+            }
+            InlineLineItem::Atom(_) if measured_item_is_transparent_mixed_inline_edge(item) => None,
+            InlineLineItem::Atom(_) | InlineLineItem::Float(_) => Some(false),
+        })
+    };
+    neighbor_joins(&items[..boundary_index], true) == Some(true)
+        || neighbor_joins(&items[boundary_index + 1..], false) == Some(true)
+}
+
 /// Selected zero-width controls can be materialized just beyond the graph
-/// range that chose the line. Do not close their CSS scope a second time in
-/// the virtual UAX #9 suffix. The real control remains in the measured item
-/// stream; only its duplicate virtual boundary is removed.
+/// range that chose the line. Do not close their UAX #9 scope a second time in
+/// the virtual suffix. The real control remains in the measured item stream;
+/// only its duplicate virtual boundary is removed.
 pub(in crate::layout) fn bidi_scope_continuations_after_selected_controls(
     items: &[MeasuredInlineItem],
     graph_continuations: &BidiLineScopeContinuations,
@@ -187,20 +238,20 @@ pub(in crate::layout) fn bidi_scope_continuations_after_selected_controls(
         let InlineLineItem::Fragment(fragment) = &item.item else {
             continue;
         };
-        if fragment.source() != InlineTextSource::BidiControl {
-            continue;
-        }
-        let Some((_, end)) = bidi_control_scope_for_style(fragment.style()) else {
-            continue;
-        };
-        if fragment.text() == end && continuations.suffix.starts_with(end) {
-            continuations.suffix.drain(..end.len());
+        for character in fragment.text().chars().filter(is_bidi_scope_terminator) {
+            if continuations.suffix.starts_with(character) {
+                continuations.suffix.drain(..character.len_utf8());
+            }
         }
     }
     if continuations.suffix.is_empty() {
         continuations.suffix_parent_context.clear();
     }
     continuations
+}
+
+fn is_bidi_scope_terminator(character: &char) -> bool {
+    matches!(*character, '\u{202c}' | '\u{2069}')
 }
 
 /// Balance CSS-generated bidi controls selected on only one side of a soft
@@ -371,10 +422,20 @@ pub(in crate::layout) fn merge_owned_join_control_visual_ranges(
 pub(in crate::layout) fn mixed_inline_atom_participates_in_bidi_ordering(
     atom: &InlineAtom,
 ) -> bool {
-    !matches!(
-        atom.content(),
-        InlineAtomContent::Leader(_) | InlineAtomContent::InlineEdge(_)
-    )
+    match atom.content() {
+        // A positioned inline's start/end marker is geometry, not an
+        // ordinary paint edge. It must nevertheless stay attached to its
+        // source location when a nested ruby level establishes a bidi
+        // isolate; treating it as UAX #9-transparent moves a zero-width
+        // containing block to the start of the visual line.
+        // <https://www.w3.org/TR/css-position-3/#def-cb>
+        // <https://www.w3.org/TR/css-writing-modes-4/#unicode-bidi>
+        InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge)) => {
+            edge.positioning_containing_block_id.is_some()
+        }
+        InlineAtomContent::Leader(_) | InlineAtomContent::InlineEdge(_) => false,
+        _ => true,
+    }
 }
 
 pub(in crate::layout) fn measured_item_is_transparent_mixed_inline_edge(
@@ -472,9 +533,11 @@ pub(in crate::layout) fn transparent_inline_edge_precedes_visual_content(
         InlineAtomContent::Canvas
         | InlineAtomContent::Iframe(_)
         | InlineAtomContent::Image(_)
+        | InlineAtomContent::Gradient { .. }
         | InlineAtomContent::Svg { .. }
         | InlineAtomContent::StaticPositionPlaceholder
         | InlineAtomContent::InlineBox { .. }
+        | InlineAtomContent::Ruby { .. }
         | InlineAtomContent::TextCombineUpright { .. }
         | InlineAtomContent::InlineFragment { .. }
         | InlineAtomContent::Leader(_) => None,
@@ -733,7 +796,11 @@ pub(in crate::layout) fn mixed_inline_item_starts_with_suppressed_line_start_pun
 mod tests {
     use super::*;
 
-    fn css_bidi_control_item(text: &str, style: ComputedStyle) -> MeasuredInlineItem {
+    fn bidi_control_item(
+        text: &str,
+        style: ComputedStyle,
+        source: InlineTextSource,
+    ) -> MeasuredInlineItem {
         MeasuredInlineItem {
             item: InlineLineItem::Fragment(InlineFragment::new(
                 text,
@@ -741,7 +808,7 @@ mod tests {
                 0.0,
                 None,
                 true,
-                InlineTextSource::BidiControl,
+                source,
                 false,
                 InlineHangingEdges::default(),
                 Vec::new(),
@@ -761,22 +828,55 @@ mod tests {
             prefix_parent_context: "\u{200e}".to_owned(),
             prefix: "\u{2066}\u{2067}".to_owned(),
             suffix: "\u{2069}\u{2069}".to_owned(),
+            trailing_line_edge_context: "\u{200e}".to_owned(),
             suffix_parent_context: "\u{200e}".to_owned(),
         };
         let effective = bidi_scope_continuations_after_selected_controls(
-            &[css_bidi_control_item("\u{2069}", inner)],
+            &[bidi_control_item(
+                "\u{2069}",
+                inner,
+                InlineTextSource::BidiControl,
+            )],
             &continuations,
         );
 
         assert_eq!(effective.prefix, "\u{2066}\u{2067}");
         assert_eq!(effective.suffix, "\u{2069}");
+        assert_eq!(effective.trailing_line_edge_context, "\u{200e}");
         assert_eq!(effective.suffix_parent_context, "\u{200e}");
         let closed = bidi_scope_continuations_after_selected_controls(
-            &[css_bidi_control_item("\u{2069}", outer)],
+            &[bidi_control_item(
+                "\u{2069}",
+                outer,
+                InlineTextSource::BidiControl,
+            )],
             &effective,
         );
         assert!(closed.suffix.is_empty());
         assert!(closed.suffix_parent_context.is_empty());
+    }
+
+    #[test]
+    fn selected_authored_scope_end_replaces_matching_virtual_suffix() {
+        let continuations = BidiLineScopeContinuations {
+            prefix: "\u{2068}".to_owned(),
+            suffix: "\u{2069}".to_owned(),
+            suffix_parent_context: "\u{200e}".to_owned(),
+            ..BidiLineScopeContinuations::default()
+        };
+
+        let effective = bidi_scope_continuations_after_selected_controls(
+            &[bidi_control_item(
+                "\u{2069}",
+                ComputedStyle::initial(),
+                InlineTextSource::Normal,
+            )],
+            &continuations,
+        );
+
+        assert_eq!(effective.prefix, "\u{2068}");
+        assert!(effective.suffix.is_empty());
+        assert!(effective.suffix_parent_context.is_empty());
     }
 
     #[test]

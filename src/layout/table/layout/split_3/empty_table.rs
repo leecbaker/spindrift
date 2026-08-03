@@ -11,7 +11,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         captions: &[TableCaption<'_>],
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         available_table_width: f32,
         table_width: UsedTableWidth,
     ) -> f32 {
@@ -60,7 +60,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         captions: &[TableCaption<'_>],
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         available_table_width: f32,
         table_width: UsedTableWidth,
         relative_offset: RelativeOffset,
@@ -155,7 +155,7 @@ impl<'a> LayoutBuilder<'a> {
         element: &Element,
         captions: &[TableCaption<'_>],
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         available_table_width: f32,
         table_width: UsedTableWidth,
         table_metrics: TableMetrics,
@@ -233,7 +233,7 @@ impl<'a> LayoutBuilder<'a> {
 
         let table_structure_paint_checkpoint = self.current_page.paint_checkpoint();
         let table_structure_paint_page_index = self.pages.len();
-        if let Some(fill) = style.background_color {
+        if let Some(fill) = style.background_color.visible_color(style.color) {
             let border_rect = paint_space_rect(
                 border_box_x,
                 table_box_top - border_box_height,
@@ -346,7 +346,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         parent: &Element,
         parent_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
     ) {
         let sibling_tags = element_sibling_signature_list(parent);
         let mut element_index = 0usize;
@@ -370,6 +370,15 @@ impl<'a> LayoutBuilder<'a> {
                 &ancestors,
             );
             if style.display.is_none() {
+                continue;
+            }
+            // Captions have already been laid out as table-wrapper children.
+            // An empty grid needs this fallback only for descendants the grid
+            // could not visit; descending into a caption a second time
+            // replays its positioned descendants against unrelated page paint
+            // and violates their caption containing block and stacking order.
+            // <https://www.w3.org/TR/CSS22/tables.html#model>
+            if matches!(style.display.inner, DisplayInner::TableCaption) {
                 continue;
             }
             self.push_ancestor_signature(signature);
@@ -436,7 +445,7 @@ impl<'a> LayoutBuilder<'a> {
         columns: &[TableColumn<'_>],
         footer_rows: &[usize],
         table_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         table_x: f32,
         used_table_width: f32,
         table_cellpadding: Option<f32>,
@@ -494,7 +503,7 @@ impl<'a> LayoutBuilder<'a> {
         columns: &[TableColumn<'_>],
         repeated_rows: &[usize],
         table_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         table_x: f32,
         used_table_width: f32,
         table_cellpadding: Option<f32>,
@@ -587,11 +596,11 @@ impl<'a> LayoutBuilder<'a> {
             // Collapsed-border conflict resolution for repeated fragments
             // still needs durable per-fragment table border grids.
             // https://www.w3.org/TR/CSS22/tables.html#table-display
-            if row_style.background_color.is_some() {
+            if let Some(fill) = row_style.background_color.visible_color(row_style.color) {
                 self.push_rect_in_band(
                     PaintBand::InFlowBlock,
                     PageTopRect::new(occupied_x, row_top, occupied_width, row_height)
-                        .rendered_rect(row_style.background_color),
+                        .rendered_rect(Some(fill)),
                 );
             }
             for placement in &grid.rows[row_index] {
@@ -686,6 +695,7 @@ impl<'a> LayoutBuilder<'a> {
                     cell_placement,
                 );
                 let paint_containment_clip = self.table_cell_content_clip(
+                    cell.element,
                     cell_style,
                     cell_border_box,
                     cell_placement,
@@ -780,10 +790,11 @@ impl<'a> LayoutBuilder<'a> {
                     );
                     self.push_float_context();
                     if let Some(element) = cell.element {
-                        self.layout_inline_items_block(
+                        let _ = self.layout_inline_items_block(
                             element,
                             cell_style,
                             stylesheets,
+                            None,
                             (0.0, 0.0),
                             table_cell_href(cell),
                             None,
@@ -950,7 +961,7 @@ impl<'a> LayoutBuilder<'a> {
         repeated_rows: &[usize],
         columns: &[TableColumn<'_>],
         table_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         table_x: f32,
         used_table_width: f32,
         fragment_top: f32,
@@ -961,7 +972,10 @@ impl<'a> LayoutBuilder<'a> {
         planned_row_occupancy: &[bool],
         table_metrics: TableMetrics,
     ) {
-        if let Some(fill) = table_style.background_color {
+        if let Some(fill) = table_style
+            .background_color
+            .visible_color(table_style.color)
+        {
             let background_top =
                 fragment_top + table_width.padding.top + table_width.border_widths.top;
             let background_bottom = fragment_top
@@ -1142,7 +1156,10 @@ impl<'a> LayoutBuilder<'a> {
         for (start_row, end_row, row_group) in table_row_group_spans(rows) {
             let row_group_style =
                 self.style_for_table_row_group(&row_group, table_style, stylesheets);
-            if let Some(fill) = row_group_style.background_color {
+            if let Some(fill) = row_group_style
+                .background_color
+                .visible_color(row_group_style.color)
+            {
                 let mut segment_start = None;
                 let mut previous_local = None;
                 for (local_row, original_row) in repeated_rows.iter().cloned().enumerate() {

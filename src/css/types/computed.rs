@@ -1,5 +1,325 @@
 use super::*;
 use crate::units::LayoutSize;
+use std::num::{NonZeroU32, NonZeroUsize};
+use std::ops::{Deref, DerefMut};
+use std::rc::Rc;
+use std::sync::Arc;
+
+/// One text-decoration origin carried through eligible in-flow descendants.
+///
+/// CSS text decorations do not inherit, but their lines propagate through
+/// in-flow descendants. The source font context must therefore accompany the
+/// decoration: `auto`, `from-font`, and percentage values are resolved using
+/// the decorating box, never a descendant that merely supplies glyphs.
+///
+/// The retained snapshot has an empty layer list, making this provenance
+/// finite rather than a recursively nested computed-style tree.
+/// <https://drafts.csswg.org/css-text-decor-4/#line-decoration>
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TextDecorationLayer {
+    pub(crate) decoration: TextDecoration,
+    pub(crate) origin_style: Rc<ComputedStyle>,
+}
+
+/// A custom identifier used to select a named `@page` rule.
+/// <https://www.w3.org/TR/css-page-3/#page-property>
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct PageName(String);
+
+impl PageName {
+    pub(crate) fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Computed `page` state, including the distinction between an omitted
+/// declaration and an explicit `page: auto` needed by named-page propagation.
+/// <https://www.w3.org/TR/css-page-3/#using-named-pages>
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PageAssignment {
+    Unspecified,
+    Auto,
+    Named(PageName),
+}
+
+impl PageAssignment {
+    pub(crate) const fn is_specified(&self) -> bool {
+        !matches!(self, Self::Unspecified)
+    }
+
+    pub(crate) fn specified_name(&self) -> Option<&PageName> {
+        match self {
+            Self::Named(name) => Some(name),
+            Self::Unspecified | Self::Auto => None,
+        }
+    }
+
+    pub(crate) fn effective_name(&self, inherited: Option<String>) -> Option<String> {
+        match self {
+            Self::Unspecified => inherited,
+            Self::Auto => None,
+            Self::Named(name) => Some(name.0.clone()),
+        }
+    }
+}
+
+/// A custom identifier for a GCPM running element.
+/// <https://www.w3.org/TR/css-gcpm-3/#running-elements>
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct RunningElementName(String);
+
+impl RunningElementName {
+    pub(crate) fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Computed `background-color`, retaining symbolic forms until the owning
+/// element's foreground color is known.
+/// <https://www.w3.org/TR/css-color-4/#resolving-other-colors>
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BackgroundColor {
+    Color(CssColor),
+    CurrentColor,
+    RelativeCurrentColor {
+        expression: String,
+        used_color_scheme: UsedColorScheme,
+    },
+}
+
+impl BackgroundColor {
+    pub(crate) const TRANSPARENT: Self = Self::Color(CssColor::TRANSPARENT);
+
+    pub(crate) fn resolved_color(&self, current_color: CssColor) -> CssColor {
+        match self {
+            Self::Color(color) => *color,
+            Self::CurrentColor => current_color,
+            Self::RelativeCurrentColor {
+                expression,
+                used_color_scheme,
+            } => crate::css::parse_color_from_currentcolor_in_scheme(
+                expression,
+                current_color,
+                *used_color_scheme,
+            )
+            .unwrap_or(current_color),
+        }
+    }
+
+    pub(crate) fn visible_color(&self, current_color: CssColor) -> Option<CssColor> {
+        let color = self.resolved_color(current_color);
+        color.is_visible().then_some(color)
+    }
+
+    pub(crate) fn is_transparent(&self) -> bool {
+        matches!(self, Self::Color(color) if !color.is_visible())
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn color(&self) -> Option<CssColor> {
+        match self {
+            Self::Color(color) => Some(*color),
+            Self::CurrentColor | Self::RelativeCurrentColor { .. } => None,
+        }
+    }
+
+    pub(crate) fn is_potentially_visible(&self) -> bool {
+        !self.is_transparent()
+    }
+}
+
+/// A CSS color whose initial or omitted spelling is `currentcolor`.
+/// <https://www.w3.org/TR/css-color-4/#currentcolor-color>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum CssColorOrCurrentColor {
+    CurrentColor,
+    Color(CssColor),
+}
+
+impl CssColorOrCurrentColor {
+    pub(crate) const fn resolve(self, current_color: CssColor) -> CssColor {
+        match self {
+            Self::CurrentColor => current_color,
+            Self::Color(color) => color,
+        }
+    }
+
+    pub(crate) const fn unwrap_or(self, current_color: CssColor) -> CssColor {
+        self.resolve(current_color)
+    }
+}
+
+/// Computed SVG presentation paint.
+/// <https://www.w3.org/TR/SVG2/painting.html#SpecifyingPaint>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum SvgPaint {
+    None,
+    Color(CssColor),
+    CurrentColor,
+}
+
+impl SvgPaint {
+    pub(crate) const fn resolve(self, current_color: CssColor) -> Option<CssColor> {
+        match self {
+            Self::None => None,
+            Self::Color(color) => Some(color),
+            Self::CurrentColor => Some(current_color),
+        }
+    }
+}
+
+/// Origin of a host-document SVG presentation property.
+/// <https://www.w3.org/TR/SVG2/styling.html#PresentationAttributes>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SvgPresentationSource {
+    Initial,
+    HostCss,
+}
+
+/// SVG paint together with the source information required by the inline SVG
+/// adapter.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct SvgPresentationPaint {
+    pub(crate) paint: SvgPaint,
+    pub(crate) source: SvgPresentationSource,
+}
+
+impl SvgPresentationPaint {
+    pub(crate) const fn initial(paint: SvgPaint) -> Self {
+        Self {
+            paint,
+            source: SvgPresentationSource::Initial,
+        }
+    }
+
+    pub(crate) const fn host_css(paint: SvgPaint) -> Self {
+        Self {
+            paint,
+            source: SvgPresentationSource::HostCss,
+        }
+    }
+
+    pub(crate) const fn is_overridden(self) -> bool {
+        matches!(self.source, SvgPresentationSource::HostCss)
+    }
+}
+
+/// SVG `stroke-width` and whether it originates from host-document CSS.
+/// <https://www.w3.org/TR/SVG2/painting.html#StrokeProperties>
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum SvgStrokeWidth {
+    Initial(ComputedLengthPercentage),
+    HostCss(ComputedLengthPercentage),
+}
+
+impl SvgStrokeWidth {
+    pub(crate) fn value(&self) -> &ComputedLengthPercentage {
+        match self {
+            Self::Initial(value) | Self::HostCss(value) => value,
+        }
+    }
+
+    pub(crate) const fn is_overridden(&self) -> bool {
+        matches!(self, Self::HostCss(_))
+    }
+}
+
+/// Computed CSS `z-index`.
+/// <https://www.w3.org/TR/css-position-3/#propdef-z-index>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ZIndex {
+    Auto,
+    StackLevel(i32),
+}
+
+/// Computed value of CSS Ruby's interlinear annotation positioning.
+///
+/// `ruby-position` inherits through `::first-line`, even though most Ruby
+/// properties do not apply to the pseudo-element itself. Keeping the
+/// unsupported inter-character form explicit prevents an inter-character
+/// declaration from accidentally being rendered as an interlinear one.
+/// <https://drafts.csswg.org/css-ruby-1/#ruby-position>
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum RubyPosition {
+    /// Select the writing-mode appropriate default annotation side.
+    #[default]
+    Alternate,
+    Over,
+    Under,
+    /// Parsed and cascaded, but not yet supported by Ruby layout.
+    InterCharacter,
+}
+
+/// A resolved physical relationship between an interlinear annotation and its
+/// base level. This is a layout-time fact, deliberately separate from the
+/// inherited [`RubyPosition`] CSS value.
+/// <https://drafts.csswg.org/css-ruby-1/#ruby-position>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RubyAnnotationSide {
+    Over,
+    Under,
+}
+
+/// Whether a used box may establish transform behavior.
+///
+/// CSS Transforms only applies to transformable elements. Ruby containers and
+/// their internal role boxes are layout-internal inline structure rather than
+/// independently transformable boxes; carrying this as an enum avoids
+/// repeatedly treating `has_transform()` as the applicability decision.
+/// <https://drafts.csswg.org/css-transforms-1/#transformable-element>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransformApplicability {
+    Transformable,
+    NonTransformableRubyInternal,
+}
+
+impl RubyPosition {
+    /// Resolve the supported interlinear forms. `inter-character` remains
+    /// visibly equivalent to the initial interlinear placement until its
+    /// distinct layout model is implemented.
+    pub(crate) const fn interlinear_side(self) -> RubyAnnotationSide {
+        match self {
+            Self::Under => RubyAnnotationSide::Under,
+            Self::Alternate | Self::Over | Self::InterCharacter => RubyAnnotationSide::Over,
+        }
+    }
+}
+
+impl ZIndex {
+    pub(crate) const fn stack_level(self) -> Option<i32> {
+        match self {
+            Self::Auto => None,
+            Self::StackLevel(level) => Some(level),
+        }
+    }
+
+    pub(crate) const fn establishes_stacking_context(self) -> bool {
+        matches!(self, Self::StackLevel(_))
+    }
+
+    pub(crate) const fn unwrap_or(self, default: i32) -> i32 {
+        match self {
+            Self::Auto => default,
+            Self::StackLevel(level) => level,
+        }
+    }
+}
+
+/// Computed GCPM bookmark level.
+/// <https://www.w3.org/TR/css-gcpm-3/#bookmarks>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BookmarkLevel {
+    None,
+    Level(NonZeroU32),
+}
 
 /// The marker inserted at a CSS line-clamp point.
 ///
@@ -15,21 +335,148 @@ pub(crate) enum BlockEllipsis {
     String(String),
 }
 
-/// Used non-auto line-clamp state.
+/// Cascaded non-`none` `line-clamp` value.
 ///
-/// `legacy_webkit` records the prefixed syntax without forcing legacy flex
-/// layout; both spellings feed the same line-selection and fragmentation
-/// implementation.
+/// This value contains only authored/computed CSS state. In particular, it
+/// never carries a remaining line budget or information discovered while
+/// traversing descendants; those are [`UsedLineClamp`] layout values.
 /// <https://drafts.csswg.org/css-overflow-4/#line-clamp>
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LineClamp {
+pub(crate) struct ComputedLineClamp {
+    pub(crate) max_lines: NonZeroUsize,
+    pub(crate) ellipsis: BlockEllipsis,
+    pub(crate) continuation: ComputedClampContinuation,
+}
+
+/// The `continue` value synthesized by the supported line-clamp shorthands.
+///
+/// This deliberately differs from [`ClampContinuation`], which is a
+/// layout-time fact about whether an actual clamp boundary has later content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ComputedClampContinuation {
+    Collapse,
+    WebkitLegacy,
+}
+
+/// The specified legacy WebKit display spelling, retained after `display`
+/// has been parsed to its CSS Display equivalent.
+///
+/// `-webkit-line-clamp` tests the specified legacy display value, rather than
+/// the computed display that a valid clamp subsequently turns into
+/// `flow-root`. Keeping this provenance separate prevents declaration-order
+/// dependent activation.
+/// <https://drafts.csswg.org/css-overflow-4/#webkit-line-clamp>
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum LegacyWebkitBox {
+    #[default]
+    None,
+    Block,
+    Inline,
+}
+
+impl LegacyWebkitBox {
+    pub(crate) fn from_specified_display(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "-webkit-box" => Self::Block,
+            "-webkit-inline-box" => Self::Inline,
+            _ => Self::None,
+        }
+    }
+
+    pub(crate) const fn is_present(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    const fn outer_display(self) -> Option<DisplayOuter> {
+        match self {
+            Self::None => None,
+            Self::Block => Some(DisplayOuter::Block),
+            Self::Inline => Some(DisplayOuter::Inline),
+        }
+    }
+}
+
+/// The legacy WebKit box orientation used to enable legacy line clamping.
+///
+/// The initial `horizontal` value deliberately remains distinct from the
+/// physical writing-mode axes: only the authored `vertical` keyword enables
+/// the compatibility behavior.
+/// <https://drafts.csswg.org/css-overflow-4/#webkit-line-clamp>
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum WebkitBoxOrient {
+    #[default]
+    Horizontal,
+    Vertical,
+}
+
+/// The display role captured before CSS Display blockifies an out-of-flow box.
+///
+/// Absolute and fixed positioning preserve the source role only for static
+/// position and baseline rules. Atomic inline is necessarily inline-level, so
+/// this enum prevents those two facts from drifting apart on layout clones.
+/// <https://drafts.csswg.org/css-display-3/#transformations>
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum StaticPositionSource {
+    #[default]
+    BlockLevel,
+    Inline,
+    AtomicInline,
+}
+
+impl StaticPositionSource {
+    pub(crate) fn from_display(display: Display) -> Self {
+        if display.is_atomic_inline() {
+            Self::AtomicInline
+        } else if display.is_inline_level() {
+            Self::Inline
+        } else {
+            Self::BlockLevel
+        }
+    }
+
+    pub(crate) const fn is_inline_level(self) -> bool {
+        matches!(self, Self::Inline | Self::AtomicInline)
+    }
+
+    pub(crate) const fn is_atomic_inline(self) -> bool {
+        matches!(self, Self::AtomicInline)
+    }
+}
+
+/// Layout-only clamp state for one inline/block-flow traversal.
+///
+/// `max_lines` may be zero only after an ancestor has spent all of its
+/// computed non-zero budget. Keeping that state separate from
+/// [`ComputedLineClamp`] makes it impossible for traversal and replay to
+/// mutate cascaded CSS values.
+/// <https://drafts.csswg.org/css-overflow-4/#line-clamp>
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UsedLineClamp {
     pub(crate) max_lines: usize,
     pub(crate) ellipsis: BlockEllipsis,
-    pub(crate) legacy_webkit: bool,
-    /// A layout-time propagation flag for a descendant that consumes the
-    /// remaining lines of an ancestor clamp before later in-flow siblings.
-    /// It is never authored CSS state.
-    pub(crate) continues_after_clamp_point: bool,
+    pub(crate) continuation: ClampContinuation,
+}
+
+/// Whether a clamp point after the current traversal has known later
+/// in-flow content. Inline overflow is discovered separately from the graph;
+/// this value represents only a block-flow boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ClampContinuation {
+    #[default]
+    None,
+    LaterInFlowContent,
+}
+
+/// Borrowed clamp view passed to inline layout.
+///
+/// Inline paragraph contexts are intentionally copyable: line-selection and
+/// fragmentation retries pass them by value. This view exposes either a
+/// computed declaration or a layout budget without copying an authored
+/// custom ellipsis string.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum InlineLineClamp<'a> {
+    Computed(&'a ComputedLineClamp),
+    Used(&'a UsedLineClamp),
 }
 
 /// Reference box and non-negative expansion for an `overflow:clip` edge.
@@ -58,13 +505,136 @@ pub(crate) enum OverflowClipMarginBox {
     Content,
 }
 
-impl LineClamp {
-    pub(crate) const fn new(max_lines: usize, legacy_webkit: bool) -> Self {
+/// Computed reservation policy for scrollbar gutters.
+///
+/// The policy is intentionally separate from overflow: layout resolves it
+/// only after it knows whether a physical scrollable axis needs a scrollbar.
+/// <https://drafts.csswg.org/css-overflow-3/#scrollbar-gutter-property>
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ScrollbarGutter {
+    #[default]
+    Auto,
+    Stable {
+        both_edges: bool,
+    },
+}
+
+/// Author-facing width policy for a scroll container's native scrollbar.
+///
+/// The actual metric is a user-agent choice.  Keeping `none` distinct means
+/// that it can prove a scrollbar reservation is zero before layout starts.
+/// <https://drafts.csswg.org/css-scrollbars/#scrollbar-width>
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ScrollbarWidth {
+    #[default]
+    Auto,
+    Thin,
+    None,
+}
+
+impl ComputedLineClamp {
+    pub(crate) const fn new(
+        max_lines: NonZeroUsize,
+        continuation: ComputedClampContinuation,
+    ) -> Self {
         Self {
             max_lines,
             ellipsis: BlockEllipsis::Auto,
-            legacy_webkit,
-            continues_after_clamp_point: false,
+            continuation,
+        }
+    }
+}
+
+impl ComputedStyle {
+    /// Whether the computed `line-height` retains the CSS `normal` keyword.
+    pub(crate) const fn line_height_is_normal(&self) -> bool {
+        matches!(&self.line_height_value, ComputedLineHeight::Normal)
+    }
+
+    /// Resolve the post-cascade compatibility behavior of legacy WebKit line
+    /// clamping.
+    ///
+    /// The activation condition intentionally runs after every declaration
+    /// has been cascaded: `-webkit-line-clamp` observes the specified legacy
+    /// display spelling and the final `-webkit-box-orient` value, while an
+    /// active clamp computes its layout display to a flow-root container.
+    /// <https://drafts.csswg.org/css-overflow-4/#webkit-line-clamp>
+    pub(crate) fn resolve_legacy_webkit_line_clamp(&mut self) {
+        let Some(clamp) = self.line_clamp.as_ref() else {
+            return;
+        };
+        let legacy_vertical = self.webkit_box_orient == WebkitBoxOrient::Vertical
+            && self.legacy_webkit_box.is_present();
+
+        if clamp.continuation == ComputedClampContinuation::WebkitLegacy && !legacy_vertical {
+            // A legacy shorthand has no effect without both enabling legacy
+            // display and vertical orientation. Do not let its numeric value
+            // leak into ordinary block-flow line selection.
+            self.line_clamp = None;
+            self.used_line_clamp = None;
+            return;
+        }
+
+        if clamp.continuation == ComputedClampContinuation::WebkitLegacy
+            && legacy_vertical
+            && let Some(outer) = self.legacy_webkit_box.outer_display()
+        {
+            // The legacy compatibility algorithm changes the box from the
+            // legacy flex model into a block formatting context while keeping
+            // the authored outer display role (`-webkit-inline-box` remains
+            // inline-level).
+            self.display = Display::new(outer, DisplayInner::FlowRoot);
+        }
+    }
+}
+
+impl UsedLineClamp {
+    pub(crate) fn from_computed(computed: &ComputedLineClamp) -> Self {
+        Self {
+            max_lines: computed.max_lines.get(),
+            ellipsis: computed.ellipsis.clone(),
+            continuation: ClampContinuation::None,
+        }
+    }
+
+    pub(crate) fn with_remaining(&self, max_lines: usize) -> Self {
+        Self {
+            max_lines,
+            ellipsis: self.ellipsis.clone(),
+            continuation: self.continuation,
+        }
+    }
+
+    /// Attach a traversal fact without mutating the cascaded declaration or
+    /// the line budget inherited by a descendant.
+    pub(crate) fn with_continuation(&self, continuation: ClampContinuation) -> Self {
+        Self {
+            max_lines: self.max_lines,
+            ellipsis: self.ellipsis.clone(),
+            continuation,
+        }
+    }
+}
+
+impl<'a> InlineLineClamp<'a> {
+    pub(crate) fn max_lines(self) -> usize {
+        match self {
+            Self::Computed(clamp) => clamp.max_lines.get(),
+            Self::Used(clamp) => clamp.max_lines,
+        }
+    }
+
+    pub(crate) fn ellipsis(self) -> &'a BlockEllipsis {
+        match self {
+            Self::Computed(clamp) => &clamp.ellipsis,
+            Self::Used(clamp) => &clamp.ellipsis,
+        }
+    }
+
+    pub(crate) fn continuation(self) -> ClampContinuation {
+        match self {
+            Self::Computed(_) => ClampContinuation::None,
+            Self::Used(clamp) => clamp.continuation,
         }
     }
 }
@@ -183,23 +753,196 @@ impl EffectiveZoom {
     }
 }
 
+/// Private bridge state for legacy backend records that still store a used
+/// style as `ComputedStyle`.
+///
+/// New layout boundaries use [`LayoutStyle`] and [`ZoomedLayoutStyle`]. This
+/// state exists only while a replay record cannot carry the wrapper itself;
+/// it must never participate in cascade or be exposed to callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum LegacyLayoutZoomState {
+    #[default]
+    Computed,
+    Zoomed,
+}
+
+/// CSS Color Adjustment's computed `color-scheme` value. Custom identifiers
+/// are preserved for validity but have no meaning until a future CSS module
+/// defines them.
+/// <https://www.w3.org/TR/css-color-adjust-1/#color-scheme-prop>
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ComputedColorScheme {
+    Normal,
+    Supported(ColorSchemeSupport),
+}
+
+/// A stylesheet `@property` registration that Quire can compute today.
+/// Registrations remain document-scoped; computed styles carry an `Arc` to
+/// their immutable lookup only so custom-property computation has no ambient
+/// mutable state.
+/// <https://drafts.css-houdini.org/css-properties-values-api/#at-property-rule>
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PropertyRegistrationRule {
+    pub(crate) names: Vec<String>,
+    pub(crate) registration: RegisteredCustomProperty,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RegisteredCustomProperty {
+    pub(crate) inherits: bool,
+    pub(crate) initial_color: CssColor,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct RegisteredCustomProperties {
+    pub(crate) by_name: HashMap<String, RegisteredCustomProperty>,
+}
+
+/// Computed custom-property value. Unregistered properties retain their token
+/// stream, while a registered `<color>` stores a typed CSS color and is only
+/// serialized at a `var()` substitution boundary.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ComputedCustomPropertyValue {
+    Tokens(String),
+    Color(CssColor),
+}
+
+impl ComputedCustomPropertyValue {
+    pub(crate) fn substitution_tokens(&self) -> String {
+        match self {
+            Self::Tokens(value) => value.clone(),
+            Self::Color(color) => {
+                let color = color.to_rgb_space(RgbColorSpace::Srgb);
+                let [red, green, blue] = color.components();
+                format!("color(srgb {red} {green} {blue} / {})", color.alpha())
+            }
+        }
+    }
+
+    pub(crate) fn token_stream(&self) -> Option<&str> {
+        match self {
+            Self::Tokens(value) => Some(value),
+            Self::Color(_) => None,
+        }
+    }
+}
+
+impl RegisteredCustomProperties {
+    pub(crate) fn from_rules<'a>(stylesheets: impl IntoIterator<Item = &'a Stylesheet>) -> Self {
+        let mut by_name = HashMap::new();
+        for stylesheet in stylesheets {
+            for rule in &stylesheet.property_registrations {
+                for name in &rule.names {
+                    by_name.insert(name.clone(), rule.registration.clone());
+                }
+            }
+        }
+        Self { by_name }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ColorSchemeSupport {
+    pub(crate) schemes: Vec<ColorSchemeName>,
+    pub(crate) only: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ColorSchemeName {
+    Light,
+    Dark,
+    Custom(String),
+}
+
+impl ComputedColorScheme {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        let values = crate::css::component_values::split_css_component_values(value);
+        if values.len() == 1 && values[0].eq_ignore_ascii_case("normal") {
+            return Some(Self::Normal);
+        }
+        let mut schemes = Vec::new();
+        let mut only = false;
+        for (index, value) in values.iter().enumerate() {
+            if value.eq_ignore_ascii_case("only") {
+                if index + 1 != values.len() || schemes.is_empty() {
+                    return None;
+                }
+                only = true;
+                continue;
+            }
+            let name = if value.eq_ignore_ascii_case("light") {
+                ColorSchemeName::Light
+            } else if value.eq_ignore_ascii_case("dark") {
+                ColorSchemeName::Dark
+            } else if crate::css::component_values::css_single_ident(value).is_some() {
+                ColorSchemeName::Custom((*value).to_string())
+            } else {
+                return None;
+            };
+            schemes.push(name);
+        }
+        (!schemes.is_empty()).then_some(Self::Supported(ColorSchemeSupport { schemes, only }))
+    }
+
+    pub(crate) fn used_scheme(
+        &self,
+        preference: ColorSchemePreference,
+        page_scheme: UsedColorScheme,
+    ) -> UsedColorScheme {
+        let Self::Supported(support) = self else {
+            return page_scheme;
+        };
+        let recognizes = |scheme| match scheme {
+            UsedColorScheme::Light => support
+                .schemes
+                .iter()
+                .any(|name| matches!(name, ColorSchemeName::Light)),
+            UsedColorScheme::Dark => support
+                .schemes
+                .iter()
+                .any(|name| matches!(name, ColorSchemeName::Dark)),
+        };
+        if let Some(preferred) = preference.preferred()
+            && (recognizes(preferred) || (preference.is_override() && !support.only))
+        {
+            return preferred;
+        }
+        support
+            .schemes
+            .iter()
+            .find_map(|name| match name {
+                ColorSchemeName::Light => Some(UsedColorScheme::Light),
+                ColorSchemeName::Dark => Some(UsedColorScheme::Dark),
+                ColorSchemeName::Custom(_) => None,
+            })
+            .unwrap_or(page_scheme)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ComputedStyle {
-    pub custom_properties: HashMap<String, String>,
+    pub custom_properties: HashMap<String, ComputedCustomPropertyValue>,
+    pub(crate) registered_custom_properties: Arc<RegisteredCustomProperties>,
+    /// Computed author support declared by CSS Color Adjustment's
+    /// `color-scheme` property.
+    pub color_scheme: ComputedColorScheme,
+    /// The resolved scheme used by color-dependent values on this element.
+    pub used_color_scheme: UsedColorScheme,
+    /// The document page scheme inherited by `color-scheme: normal`.
+    pub page_color_scheme: UsedColorScheme,
     /// The element's own non-inherited CSS `zoom` computed value.
     pub zoom: CssZoom,
     /// Layout-only product of this element's and all ancestor zoom values.
     pub effective_zoom: EffectiveZoom,
-    /// Whether this temporary layout style has passed through the used zoom
-    /// boundary. Computed styles remain unscaled until layout resolves their
-    /// viewport and font-relative terms.
-    pub(crate) zoom_applied: bool,
+    pub(crate) layout_zoom_state: LegacyLayoutZoomState,
     pub display: Display,
-    /// Legacy `display: -webkit-box` uses the old single-line box model.
+    /// Specified legacy `display: -webkit-box` provenance.
     ///
-    /// It establishes a flex formatting context for compatibility, but does
-    /// not opt into modern `flex-wrap: balance` behavior.
-    pub legacy_webkit_box: bool,
+    /// It establishes a flex formatting context unless a final line-clamp
+    /// resolution turns it into a flow-root container.
+    pub legacy_webkit_box: LegacyWebkitBox,
+    /// The independently cascaded legacy orientation.
+    pub webkit_box_orient: WebkitBoxOrient,
     pub flex_direction: FlexDirection,
     pub justify_content: JustifyContent,
     pub justify_items: JustifyItems,
@@ -215,7 +958,7 @@ pub(crate) struct ComputedStyle {
     ///
     /// CSS Flexbox Level 2 only applies this property to balanced wrapping:
     /// <https://drafts.csswg.org/css-flexbox-2/#flex-line-count-property>.
-    pub flex_line_count: Option<usize>,
+    pub flex_line_count: FlexLineCount,
     pub order: i32,
     pub row_gap: ComputedGap,
     pub row_rule: GapRuleAxis,
@@ -231,7 +974,7 @@ pub(crate) struct ComputedStyle {
     pub grid_row_end: GridPlacement,
     pub grid_column_start: GridPlacement,
     pub grid_column_end: GridPlacement,
-    pub column_count: Option<usize>,
+    pub column_count: ColumnCount,
     pub column_width: ComputedColumnWidth,
     pub column_height: ComputedColumnHeight,
     pub column_wrap: ColumnWrap,
@@ -241,12 +984,6 @@ pub(crate) struct ComputedStyle {
     pub column_rule: GapRuleAxis,
     pub rule_overlap: GapRuleOverlap,
     pub box_values: ComputedBoxValues,
-    /// Whether the winning physical `height` retains a selected-font metric.
-    ///
-    /// The used-value phase replaces a `ch` component with a numeric length,
-    /// but table row sizing still needs to know that the height must be
-    /// resolved in the table-track context.
-    pub(crate) physical_height_has_font_metric: bool,
     pub aspect_ratio: AspectRatio,
     pub contain_intrinsic_size: ContainIntrinsicSize,
     pub margin_trim: MarginTrim,
@@ -281,17 +1018,8 @@ pub(crate) struct ComputedStyle {
     pub caption_side: CaptionSide,
     pub table_layout: TableLayout,
     pub empty_cells: EmptyCells,
-    pub border_spacing: BorderSpacing,
-    pub border_spacing_explicit: bool,
-    pub background_color: Option<CssColor>,
-    /// Whether `background-color` is specified as `currentcolor` and must be
-    /// resolved against this element's own computed `color` after inheritance.
-    /// CSS CssColor 4 resolves `currentcolor` at used-value time:
-    /// <https://www.w3.org/TR/css-color-4/#resolving-other-colors>.
-    pub background_color_is_current_color: bool,
-    /// The uncomputed relative-color expression when its origin is
-    /// `currentcolor`, retained so inheritance resolves it on each element.
-    pub background_color_current_color_expression: Option<String>,
+    pub border_spacing: TableBorderSpacing,
+    pub background_color: BackgroundColor,
     pub background_image: ComputedImage,
     pub background_size: BackgroundSize,
     pub background_position: BackgroundPosition,
@@ -319,30 +1047,11 @@ pub(crate) struct ComputedStyle {
     /// CSS CssColor Adjustment opt-out state inherited by this element.
     pub forced_color_adjust: ForcedColorAdjust,
     pub color: CssColor,
-    /// Cascaded SVG `fill` presentation paint. `None` represents CSS `none`.
-    ///
-    /// This stays in the computed style so host-document CSS can cross the
-    /// inline SVG scene boundary without reparsing selectors in the SVG
-    /// adapter: <https://www.w3.org/TR/SVG2/painting.html#SpecifyingPaint>.
-    pub svg_fill: Option<CssColor>,
-    /// Whether SVG `fill` was specified as `currentColor`.
-    pub svg_fill_is_current_color: bool,
-    /// Whether `svg_fill` originates from a host-document CSS declaration
-    /// (including inherited SVG paint), rather than its computed initial value.
-    pub svg_fill_overridden: bool,
-    /// Cascaded SVG `stroke` presentation paint. `None` represents CSS `none`.
-    pub svg_stroke: Option<CssColor>,
-    /// Whether SVG `stroke` was specified as `currentColor`.
-    pub svg_stroke_is_current_color: bool,
-    /// Whether `svg_stroke` originates from host-document CSS.
-    pub svg_stroke_overridden: bool,
-    /// Cascaded SVG `stroke-width`, retained as a typed CSS length until the
-    /// inline SVG serializer resolves it in the element's used font context.
-    pub svg_stroke_width: ComputedLengthPercentage,
-    /// Whether `svg_stroke_width` originates from host-document CSS.
-    pub svg_stroke_width_overridden: bool,
-    /// WebKit-compatible glyph fill color; `None` represents `currentColor`.
-    pub text_fill_color: Option<CssColor>,
+    pub svg_fill: SvgPresentationPaint,
+    pub svg_stroke: SvgPresentationPaint,
+    pub svg_stroke_width: SvgStrokeWidth,
+    /// WebKit-compatible glyph fill color.
+    pub text_fill_color: CssColorOrCurrentColor,
     pub font_size: f32,
     /// Used font size of the document root, the computed-value basis for `rem`.
     /// <https://www.w3.org/TR/css-values-4/#rem>
@@ -355,8 +1064,6 @@ pub(crate) struct ComputedStyle {
     pub font_size_adjust: FontSizeAdjust,
     pub line_height_value: ComputedLineHeight,
     pub line_height: f32,
-    pub line_height_multiplier: Option<f32>,
-    pub line_height_is_normal: bool,
     pub letter_spacing: ComputedLengthPercentage,
     pub word_spacing: ComputedLengthPercentage,
     pub box_sizing: BoxSizing,
@@ -384,6 +1091,7 @@ pub(crate) struct ComputedStyle {
     pub font_style: FontStyle,
     pub font_width: FontWidth,
     pub font_family: FontFamily,
+    pub font_language_override: FontLanguageOverride,
     pub font_synthesis: FontSynthesis,
     pub font_feature_settings: FontFeatureSettings,
     pub font_variation_settings: FontVariationSettings,
@@ -406,12 +1114,17 @@ pub(crate) struct ComputedStyle {
     ///
     /// CSS Overflow defines line clamping; CSS Text 4 requires clamp selection
     /// to precede `text-wrap: balance` selection.
-    pub line_clamp: Option<LineClamp>,
+    pub line_clamp: Option<ComputedLineClamp>,
+    /// A transient layout override for a computed line clamp inherited from
+    /// an ancestor block-flow traversal. It is never cascaded or serialized.
+    pub(crate) used_line_clamp: Option<UsedLineClamp>,
     pub tab_size: TabSize,
     pub word_break: WordBreak,
     pub overflow: Overflow,
     pub overflow_x: Overflow,
     pub overflow_y: Overflow,
+    pub scrollbar_gutter: ScrollbarGutter,
+    pub scrollbar_width: ScrollbarWidth,
     pub scroll_snap_type: ScrollSnapType,
     pub scroll_snap_align: ScrollSnapAlign,
     pub scroll_snap_stop: ScrollSnapStop,
@@ -452,33 +1165,21 @@ pub(crate) struct ComputedStyle {
     pub counter_increments: Vec<CounterChange>,
     pub counter_sets: Vec<CounterChange>,
     pub string_sets: Vec<NamedStringSet>,
-    /// Computed CSS `page` value, where `None` represents `auto`.
-    ///
-    /// CSS Paged Media uses the computed `page` property to create named page
-    /// groups, and an explicit `page: auto` can end an ancestor's named page
-    /// group:
-    /// <https://www.w3.org/TR/css-page-3/#using-named-pages>.
-    pub page_name: Option<String>,
-    /// Whether the CSS `page` property was explicitly specified on this box.
-    ///
-    /// This distinguishes omitted `page` declarations from explicit
-    /// `page: auto`, which have the same computed value but different
-    /// named-page propagation behavior:
-    /// <https://www.w3.org/TR/css-page-3/#using-named-pages>.
-    pub page_name_specified: bool,
+    pub page: PageAssignment,
     pub break_before: PageBreak,
     pub break_after: PageBreak,
     pub break_inside_avoid: bool,
     pub break_inside_avoid_column: bool,
     pub orphans: usize,
     pub widows: usize,
-    pub text_decoration_layers: Vec<TextDecoration>,
+    pub text_decoration_layers: Vec<TextDecorationLayer>,
     pub text_decoration: TextDecoration,
     pub text_shadow: Vec<TextShadow>,
     pub text_emphasis_style: TextEmphasisStyle,
-    pub text_emphasis_color: Option<CssColor>,
+    pub text_emphasis_color: CssColorOrCurrentColor,
     pub text_emphasis_position: TextEmphasisPosition,
     pub text_emphasis_skip: TextEmphasisSkip,
+    pub ruby_position: RubyPosition,
     pub position: Position,
     pub float: Float,
     /// GCPM presentation mode for this element after `float: footnote`
@@ -488,10 +1189,8 @@ pub(crate) struct ComputedStyle {
     /// `float: footnote`.
     pub footnote_policy: FootnotePolicy,
     pub clear: Clear,
-    pub running_element_name: Option<String>,
-    pub abspos_static_source_was_inline_level: bool,
-    pub abspos_static_source_was_atomic_inline: bool,
-    pub z_index: Option<i32>,
+    pub abspos_static_source: StaticPositionSource,
+    pub z_index: ZIndex,
     pub opacity: f32,
     pub transform: TransformList,
     pub individual_transforms: IndividualTransforms,
@@ -512,9 +1211,82 @@ pub(crate) struct ComputedStyle {
     pub container_names: ContainerNames,
     pub content_visibility: ContentVisibility,
     pub will_change: WillChange,
-    pub bookmark_level: Option<u32>,
+    pub bookmark_level: BookmarkLevel,
     pub bookmark_label: BookmarkLabel,
     pub bookmark_state: CssBookmarkState,
+}
+
+/// A cloned style at the layout used-value boundary, before CSS `zoom`.
+///
+/// Viewport- and font-relative normalization mutate this owned working copy;
+/// cascade and frozen-tree state remain [`ComputedStyle`]. Consuming this
+/// wrapper is the only path to [`ZoomedLayoutStyle`].
+/// <https://drafts.csswg.org/css-cascade-5/#used>
+/// <https://drafts.csswg.org/css-viewport/#zoom-property>
+#[derive(Debug, Clone)]
+pub(crate) struct LayoutStyle(ComputedStyle);
+
+impl LayoutStyle {
+    pub(crate) fn from_computed(style: &ComputedStyle) -> Self {
+        Self(style.clone())
+    }
+
+    pub(crate) fn into_zoomed(mut self) -> ZoomedLayoutStyle {
+        if !matches!(self.0.layout_zoom_state, LegacyLayoutZoomState::Zoomed) {
+            self.0.apply_effective_zoom();
+        }
+        ZoomedLayoutStyle(self.0)
+    }
+}
+
+impl Deref for LayoutStyle {
+    type Target = ComputedStyle;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for LayoutStyle {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+/// A layout style whose fixed components have crossed the CSS `zoom`
+/// used-value boundary exactly once.
+///
+/// This wrapper deliberately has no conversion back to [`LayoutStyle`]. It
+/// can be read or mutated by layout algorithms, but it cannot be zoomed a
+/// second time or reused as a cascade input.
+/// <https://drafts.csswg.org/css-viewport/#zoom-property>
+#[derive(Debug, Clone)]
+pub(crate) struct ZoomedLayoutStyle(ComputedStyle);
+
+impl ZoomedLayoutStyle {
+    pub(crate) fn as_computed(&self) -> &ComputedStyle {
+        &self.0
+    }
+
+    /// Extract the temporary style at a backend boundary that cannot yet
+    /// carry the used-value phase in its type.
+    pub(crate) fn into_computed(self) -> ComputedStyle {
+        self.0
+    }
+}
+
+impl Deref for ZoomedLayoutStyle {
+    type Target = ComputedStyle;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for ZoomedLayoutStyle {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
 }
 
 impl ComputedStyle {
@@ -589,6 +1361,24 @@ impl ComputedStyle {
         }
     }
 
+    /// Return whether CSS `word-break` disables both authored discretionary
+    /// hyphens and automatic language hyphenation.
+    /// <https://drafts.csswg.org/css-text-4/#word-break-property>
+    pub(crate) fn hyphenation_is_unconditionally_suppressed(&self) -> bool {
+        self.hyphens == Hyphens::None
+            || matches!(self.word_break, WordBreak::BreakAll | WordBreak::AutoPhrase)
+    }
+
+    /// Whether automatic hyphenation may be collected for this style.
+    ///
+    /// `word-break:auto-phrase` retains its opportunities as a typed fallback
+    /// when ordinary phrase-wrap relaxation cannot prevent overflow. It must
+    /// therefore not erase them during source collection.
+    /// <https://drafts.csswg.org/css-text-4/#word-break-property>
+    pub(crate) fn automatic_hyphenation_is_suppressed(&self) -> bool {
+        self.hyphenation_is_unconditionally_suppressed()
+    }
+
     /// Returns the clip edge for the color layer beneath every background
     /// image layer.
     ///
@@ -610,13 +1400,10 @@ impl ComputedStyle {
     /// fresh layout-style clone, so this transformation is intentionally
     /// destructive and must be performed exactly once per clone.
     /// <https://drafts.csswg.org/css-viewport/#zoom-property>
-    pub(crate) fn apply_effective_zoom(&mut self) {
-        if self.zoom_applied {
-            return;
-        }
+    fn apply_effective_zoom(&mut self) {
         let factor = self.effective_zoom.factor();
         if factor == 1.0 {
-            self.zoom_applied = true;
+            self.layout_zoom_state = LegacyLayoutZoomState::Zoomed;
             return;
         }
         self.box_values.scale_fixed_length_components(factor);
@@ -658,18 +1445,23 @@ impl ComputedStyle {
         self.text_indent
             .amount
             .scale_fixed_length_components(factor);
-        self.zoom_applied = true;
+        self.layout_zoom_state = LegacyLayoutZoomState::Zoomed;
     }
 
     pub fn initial() -> Self {
         let font_size = 12.0;
         Self {
             custom_properties: HashMap::new(),
+            registered_custom_properties: Arc::default(),
+            color_scheme: ComputedColorScheme::Normal,
+            used_color_scheme: UsedColorScheme::Light,
+            page_color_scheme: UsedColorScheme::Light,
             zoom: CssZoom::NORMAL,
             effective_zoom: EffectiveZoom::NORMAL,
-            zoom_applied: false,
+            layout_zoom_state: LegacyLayoutZoomState::Computed,
             display: Display::INLINE,
-            legacy_webkit_box: false,
+            legacy_webkit_box: LegacyWebkitBox::None,
+            webkit_box_orient: WebkitBoxOrient::Horizontal,
             flex_direction: FlexDirection::Row,
             justify_content: JustifyContent::NORMAL,
             justify_items: JustifyItems::NORMAL,
@@ -681,7 +1473,7 @@ impl ComputedStyle {
             flex_shrink: 1.0,
             flex_basis: ComputedFlexBasis::AUTO,
             flex_wrap: FlexWrap::NoWrap,
-            flex_line_count: None,
+            flex_line_count: FlexLineCount::Auto,
             order: 0,
             row_gap: ComputedGap::NORMAL,
             row_rule: GapRuleAxis::initial(),
@@ -697,7 +1489,7 @@ impl ComputedStyle {
             grid_row_end: GridPlacement::AUTO,
             grid_column_start: GridPlacement::AUTO,
             grid_column_end: GridPlacement::AUTO,
-            column_count: None,
+            column_count: ColumnCount::Auto,
             column_width: ComputedColumnWidth::AUTO,
             column_height: ComputedColumnHeight::AUTO,
             column_wrap: ColumnWrap::Auto,
@@ -707,7 +1499,6 @@ impl ComputedStyle {
             column_rule: GapRuleAxis::initial(),
             rule_overlap: GapRuleOverlap::RowOverColumn,
             box_values: ComputedBoxValues::initial(),
-            physical_height_has_font_metric: false,
             aspect_ratio: AspectRatio::AUTO,
             contain_intrinsic_size: ContainIntrinsicSize::NONE,
             margin_trim: MarginTrim::NONE,
@@ -742,11 +1533,8 @@ impl ComputedStyle {
             caption_side: CaptionSide::Top,
             table_layout: TableLayout::Auto,
             empty_cells: EmptyCells::Show,
-            border_spacing: BorderSpacing::ZERO,
-            border_spacing_explicit: false,
-            background_color: None,
-            background_color_is_current_color: false,
-            background_color_current_color_expression: None,
+            border_spacing: TableBorderSpacing::INITIAL,
+            background_color: BackgroundColor::TRANSPARENT,
             background_image: ComputedImage::None,
             background_size: BackgroundSize::AUTO,
             background_position: BackgroundPosition::INITIAL,
@@ -774,23 +1562,18 @@ impl ComputedStyle {
             box_shadow: Vec::new(),
             forced_color_adjust: ForcedColorAdjust::Auto,
             color: CssColor::BLACK,
-            svg_fill: Some(CssColor::BLACK),
-            svg_fill_is_current_color: false,
-            svg_fill_overridden: false,
-            svg_stroke: None,
-            svg_stroke_is_current_color: false,
-            svg_stroke_overridden: false,
-            svg_stroke_width: ComputedLengthPercentage::from_points(CSS_PX_TO_PT),
-            svg_stroke_width_overridden: false,
-            text_fill_color: None,
+            svg_fill: SvgPresentationPaint::initial(SvgPaint::Color(CssColor::BLACK)),
+            svg_stroke: SvgPresentationPaint::initial(SvgPaint::None),
+            svg_stroke_width: SvgStrokeWidth::Initial(ComputedLengthPercentage::from_points(
+                CSS_PX_TO_PT,
+            )),
+            text_fill_color: CssColorOrCurrentColor::CurrentColor,
             font_size,
             root_font_size: font_size,
             deferred_font_size: DeferredFontSize::INITIAL,
             font_size_adjust: FontSizeAdjust::None,
             line_height_value: ComputedLineHeight::NORMAL,
             line_height: font_size * 1.2,
-            line_height_multiplier: Some(1.2),
-            line_height_is_normal: true,
             letter_spacing: ComputedLengthPercentage::ZERO,
             word_spacing: ComputedLengthPercentage::ZERO,
             box_sizing: BoxSizing::ContentBox,
@@ -818,6 +1601,7 @@ impl ComputedStyle {
             font_style: FontStyle::Normal,
             font_width: FontWidth::NORMAL,
             font_family: FontFamily::SansSerif,
+            font_language_override: FontLanguageOverride::Normal,
             font_synthesis: FontSynthesis::ALL,
             font_feature_settings: FontFeatureSettings::NORMAL,
             font_variation_settings: FontVariationSettings::NORMAL,
@@ -837,11 +1621,14 @@ impl ComputedStyle {
             text_wrap_style: TextWrapStyle::Auto,
             wrap_inside: WrapInside::Auto,
             line_clamp: None,
+            used_line_clamp: None,
             tab_size: TabSize::INITIAL,
             word_break: WordBreak::Normal,
             overflow: Overflow::Visible,
             overflow_x: Overflow::Visible,
             overflow_y: Overflow::Visible,
+            scrollbar_gutter: ScrollbarGutter::Auto,
+            scrollbar_width: ScrollbarWidth::Auto,
             scroll_snap_type: ScrollSnapType::None,
             scroll_snap_align: ScrollSnapAlign::default(),
             scroll_snap_stop: ScrollSnapStop::Normal,
@@ -872,8 +1659,7 @@ impl ComputedStyle {
             counter_increments: Vec::new(),
             counter_sets: Vec::new(),
             string_sets: Vec::new(),
-            page_name: None,
-            page_name_specified: false,
+            page: PageAssignment::Unspecified,
             break_before: PageBreak::Auto,
             break_after: PageBreak::Auto,
             break_inside_avoid: false,
@@ -897,22 +1683,21 @@ impl ComputedStyle {
                 skip_spaces: TextDecorationSkipSpaces::START_END,
                 underline_offset: TextUnderlineOffset::Auto,
                 underline_position: TextUnderlinePosition::AUTO,
-                color: None,
+                color: CssColorOrCurrentColor::CurrentColor,
             },
             text_shadow: Vec::new(),
             text_emphasis_style: TextEmphasisStyle::None,
-            text_emphasis_color: None,
+            text_emphasis_color: CssColorOrCurrentColor::CurrentColor,
             text_emphasis_position: TextEmphasisPosition::default(),
             text_emphasis_skip: TextEmphasisSkip::default(),
+            ruby_position: RubyPosition::Alternate,
             position: Position::Static,
             float: Float::None,
             footnote_display: FootnoteDisplay::Block,
             footnote_policy: FootnotePolicy::Auto,
             clear: Clear::None,
-            running_element_name: None,
-            abspos_static_source_was_inline_level: false,
-            abspos_static_source_was_atomic_inline: false,
-            z_index: None,
+            abspos_static_source: StaticPositionSource::BlockLevel,
+            z_index: ZIndex::Auto,
             opacity: 1.0,
             transform: Vec::new(),
             individual_transforms: IndividualTransforms::NONE,
@@ -929,7 +1714,7 @@ impl ComputedStyle {
             container_names: ContainerNames::default(),
             content_visibility: ContentVisibility::Visible,
             will_change: WillChange::default(),
-            bookmark_level: None,
+            bookmark_level: BookmarkLevel::None,
             bookmark_label: BookmarkLabel::content_text(),
             bookmark_state: CssBookmarkState::Open,
         }
@@ -942,11 +1727,8 @@ impl ComputedStyle {
     /// <https://www.w3.org/TR/css-fonts-4/#font-size-prop>
     pub(crate) fn resolve_deferred_font_size(&mut self, parent: FontRelativeLengthBasis) {
         self.font_size = clamp_used_layout_length(self.deferred_font_size.resolve(parent)).points();
-        let (line_height, multiplier, is_normal) =
-            self.line_height_value.clone().projected(self.font_size);
+        let (line_height, _, _) = self.line_height_value.clone().projected(self.font_size);
         self.line_height = line_height;
-        self.line_height_multiplier = multiplier;
-        self.line_height_is_normal = is_normal;
     }
 
     /// Resolves deferred `font-size` after the page viewport has become known.
@@ -975,11 +1757,8 @@ impl ComputedStyle {
                 .resolve_with_viewport_and_root_metrics(parent, Some(basis), root_metrics),
         )
         .points();
-        let (line_height, multiplier, is_normal) =
-            self.line_height_value.clone().projected(self.font_size);
+        let (line_height, _, _) = self.line_height_value.clone().projected(self.font_size);
         self.line_height = line_height;
-        self.line_height_multiplier = multiplier;
-        self.line_height_is_normal = is_normal;
     }
 
     /// Returns whether this style has an unresolved value that depends on its
@@ -1062,6 +1841,40 @@ impl ComputedStyle {
         self != &resolved
     }
 
+    /// Returns whether this style contains a root-font metric unit.
+    ///
+    /// Root-relative selected-font units use the document root's chosen face,
+    /// so the root must be measured before any descendant resolves one.  The
+    /// structural comparison keeps that lookup lazy for documents that never
+    /// use such a unit.
+    /// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        if self.deferred_font_size.requires_root_font_metrics() {
+            return true;
+        }
+        let zero = layout_pt(0.0);
+        let mut resolved = self.clone();
+        resolved.resolve_root_font_metric_lengths(RootFontMetricLengthBasis {
+            font_size: zero,
+            ch_advance: zero,
+            x_height: zero,
+            cap_height: zero,
+            ic_advance: zero,
+            line_height: zero,
+        });
+        self != &resolved
+            || [
+                self.marker_style.as_deref(),
+                self.before_style.as_deref(),
+                self.after_style.as_deref(),
+                self.first_line_style.as_deref(),
+                self.first_letter_style.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(Self::requires_root_font_metrics)
+    }
+
     /// Returns whether a generated pseudo-style needs this style's `ch`
     /// advance to resolve its deferred `font-size`.
     pub(crate) fn pseudo_styles_require_parent_ch_advance(&self) -> bool {
@@ -1133,11 +1946,8 @@ impl ComputedStyle {
     ) {
         self.line_height_value
             .resolve_font_metric_lengths(ch_advance);
-        let (line_height, multiplier, is_normal) =
-            self.line_height_value.clone().projected(self.font_size);
+        let (line_height, _, _) = self.line_height_value.clone().projected(self.font_size);
         self.line_height = line_height;
-        self.line_height_multiplier = multiplier;
-        self.line_height_is_normal = is_normal;
         self.row_gap.resolve_font_metric_lengths(ch_advance);
         self.column_gap.resolve_font_metric_lengths(ch_advance);
         self.row_rule.resolve_font_metric_lengths(ch_advance);
@@ -1227,11 +2037,8 @@ impl ComputedStyle {
     ) {
         self.line_height_value
             .resolve_ic_relative_lengths(ic_advance);
-        let (line_height, multiplier, is_normal) =
-            self.line_height_value.clone().projected(self.font_size);
+        let (line_height, _, _) = self.line_height_value.clone().projected(self.font_size);
         self.line_height = line_height;
-        self.line_height_multiplier = multiplier;
-        self.line_height_is_normal = is_normal;
         self.box_values
             .resolve_ic_relative_lengths_by_physical_axis(
                 horizontal_box_advance,
@@ -1243,11 +2050,8 @@ impl ComputedStyle {
     /// <https://www.w3.org/TR/css-values-4/#ex>
     pub(crate) fn resolve_ex_relative_lengths(&mut self, x_height: f32) {
         self.line_height_value.resolve_ex_relative_lengths(x_height);
-        let (line_height, multiplier, is_normal) =
-            self.line_height_value.clone().projected(self.font_size);
+        let (line_height, _, _) = self.line_height_value.clone().projected(self.font_size);
         self.line_height = line_height;
-        self.line_height_multiplier = multiplier;
-        self.line_height_is_normal = is_normal;
         self.box_values.resolve_ex_relative_lengths(x_height);
     }
 
@@ -1256,11 +2060,8 @@ impl ComputedStyle {
     pub(crate) fn resolve_cap_relative_lengths(&mut self, cap_height: f32) {
         self.line_height_value
             .resolve_cap_relative_lengths(cap_height);
-        let (line_height, multiplier, is_normal) =
-            self.line_height_value.clone().projected(self.font_size);
+        let (line_height, _, _) = self.line_height_value.clone().projected(self.font_size);
         self.line_height = line_height;
-        self.line_height_multiplier = multiplier;
-        self.line_height_is_normal = is_normal;
         self.box_values.resolve_cap_relative_lengths(cap_height);
     }
 
@@ -1287,11 +2088,8 @@ impl ComputedStyle {
     pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
         self.line_height_value
             .resolve_root_font_metric_lengths(basis);
-        let (line_height, multiplier, is_normal) =
-            self.line_height_value.clone().projected(self.font_size);
+        let (line_height, _, _) = self.line_height_value.clone().projected(self.font_size);
         self.line_height = line_height;
-        self.line_height_multiplier = multiplier;
-        self.line_height_is_normal = is_normal;
         self.box_values.resolve_root_font_metric_lengths(basis);
     }
 
@@ -1333,6 +2131,23 @@ impl ComputedStyle {
     /// transform property applies a non-initial transformation.
     pub(crate) fn has_transform(&self) -> bool {
         !self.transform.is_empty() || !self.individual_transforms.is_none()
+    }
+
+    pub(crate) fn transform_applicability(&self) -> TransformApplicability {
+        if self.display.is_ruby() || self.display.is_ruby_internal() {
+            TransformApplicability::NonTransformableRubyInternal
+        } else {
+            TransformApplicability::Transformable
+        }
+    }
+
+    /// Remove transforms that are specified on a non-transformable ruby box
+    /// before that style reaches inline geometry or paint setup.
+    pub(crate) fn suppress_inapplicable_transform(&mut self) {
+        if self.transform_applicability() == TransformApplicability::NonTransformableRubyInternal {
+            self.transform.clear();
+            self.individual_transforms = IndividualTransforms::NONE;
+        }
     }
 
     /// Return the used `letter-spacing` length in layout units.
@@ -1515,9 +2330,10 @@ mod tests {
         );
         style.font_size = 10.0;
         style.line_height = 12.0;
-        style.apply_effective_zoom();
+        let style = LayoutStyle::from_computed(&style).into_zoomed();
 
-        let ComputedLengthPercentageOrAuto::LengthPercentage(width) = style.box_values.width else {
+        let ComputedLengthPercentageOrAuto::LengthPercentage(width) = &style.box_values.width
+        else {
             panic!("test width remains a length-percentage");
         };
         assert_eq!(
@@ -1542,16 +2358,15 @@ mod tests {
         );
         style.box_values.inset_right = ComputedLengthPercentageOrAuto::AUTO;
 
-        style.apply_effective_zoom();
-        style.apply_effective_zoom();
+        let style = LayoutStyle::from_computed(&style).into_zoomed();
 
-        let ComputedLengthPercentageOrAuto::LengthPercentage(left) = style.box_values.inset_left
+        let ComputedLengthPercentageOrAuto::LengthPercentage(left) = &style.box_values.inset_left
         else {
             panic!("left inset remains a length-percentage");
         };
         assert_eq!(left.length_points(), 18.0);
         assert_eq!(left.percentage_coefficient_or_zero(), 0.25);
-        let ComputedLengthPercentageOrAuto::LengthPercentage(top) = style.box_values.inset_top
+        let ComputedLengthPercentageOrAuto::LengthPercentage(top) = &style.box_values.inset_top
         else {
             panic!("top inset remains a length-percentage");
         };
@@ -1574,9 +2389,9 @@ mod tests {
         style.column_gap =
             ComputedGap::LengthPercentage(ComputedLengthPercentage::from_points(7.0));
 
-        style.apply_effective_zoom();
+        let style = LayoutStyle::from_computed(&style).into_zoomed();
 
-        let ComputedFlexBasis::LengthPercentage(basis) = style.flex_basis else {
+        let ComputedFlexBasis::LengthPercentage(basis) = &style.flex_basis else {
             panic!("flex basis remains a length-percentage");
         };
         assert_eq!(
@@ -1586,7 +2401,7 @@ mod tests {
                 .unwrap(),
             layout_pt(68.0)
         );
-        let ComputedGap::LengthPercentage(row_gap) = style.row_gap else {
+        let ComputedGap::LengthPercentage(row_gap) = &style.row_gap else {
             panic!("row gap remains a length-percentage");
         };
         assert_eq!(
@@ -1595,7 +2410,7 @@ mod tests {
                 .unwrap(),
             layout_pt(31.0)
         );
-        let ComputedGap::LengthPercentage(column_gap) = style.column_gap else {
+        let ComputedGap::LengthPercentage(column_gap) = &style.column_gap else {
             panic!("column gap remains a length-percentage");
         };
         assert_eq!(column_gap.length_points(), 14.0);
@@ -1626,14 +2441,13 @@ mod tests {
             ComputedLengthPercentage::from_affine(layout_pt(2.0), 0.5, true),
         );
 
-        style.apply_effective_zoom();
-        style.apply_effective_zoom();
+        let style = LayoutStyle::from_computed(&style).into_zoomed();
 
-        let ComputedColumnWidth::Length(width) = style.column_width else {
+        let ComputedColumnWidth::Length(width) = &style.column_width else {
             panic!("column width remains a length");
         };
         assert_eq!(width.length_points(), 18.0);
-        let ComputedColumnHeight::Length(height) = style.column_height else {
+        let ComputedColumnHeight::Length(height) = &style.column_height else {
             panic!("column height remains a length");
         };
         assert_eq!(height.length_points(), 14.0);
@@ -1653,7 +2467,7 @@ mod tests {
                 .length_points(),
             10.0,
         );
-        let GapRuleInsetValue::LengthPercentage(inset) = style.column_rule.inset_cap_start else {
+        let GapRuleInsetValue::LengthPercentage(inset) = &style.column_rule.inset_cap_start else {
             panic!("fixed rule inset remains a length percentage");
         };
         assert_eq!(
@@ -1668,13 +2482,12 @@ mod tests {
     fn effective_zoom_scales_fixed_border_spacing_once_without_scaling_percentages() {
         let mut style = ComputedStyle::initial();
         style.effective_zoom = EffectiveZoom(2.0);
-        style.border_spacing = BorderSpacing {
+        style.border_spacing = TableBorderSpacing::NonAuthor(BorderSpacing {
             horizontal: ComputedLengthPercentage::from_affine(layout_pt(7.0), 0.25, true),
             vertical: ComputedLengthPercentage::from_points(11.0),
-        };
+        });
 
-        style.apply_effective_zoom();
-        style.apply_effective_zoom();
+        let style = LayoutStyle::from_computed(&style).into_zoomed();
 
         assert_eq!(
             style
@@ -1720,16 +2533,13 @@ mod tests {
             )],
             trailing_names: Vec::new(),
         };
-        style.grid_auto_rows = GridAutoTrackList {
-            tracks: vec![GridTrackSize {
-                min: GridMinTrackBreadth::LengthPercentage(ComputedLengthPercentage::from_points(
-                    9.0,
-                )),
-                max: GridMaxTrackBreadth::MaxContent,
-            }],
-        };
+        style.grid_auto_rows = GridAutoTrackList::from_tracks(vec![GridTrackSize {
+            min: GridMinTrackBreadth::LengthPercentage(ComputedLengthPercentage::from_points(9.0)),
+            max: GridMaxTrackBreadth::MaxContent,
+        }])
+        .expect("test grid auto-track list is non-empty");
 
-        style.apply_effective_zoom();
+        let style = LayoutStyle::from_computed(&style).into_zoomed();
 
         let GridTrackList::Tracks { components, .. } = &style.grid_template_columns else {
             panic!("grid template remains an explicit track list");
@@ -1757,7 +2567,11 @@ mod tests {
             panic!("track maximum remains fit-content");
         };
         assert_eq!(value.length_points(), 16.0);
-        let GridMinTrackBreadth::LengthPercentage(value) = &style.grid_auto_rows.tracks[0].min
+        let GridMinTrackBreadth::LengthPercentage(value) = &style
+            .grid_auto_rows
+            .get(0)
+            .expect("test grid auto-track list is non-empty")
+            .min
         else {
             panic!("implicit track minimum remains a length-percentage");
         };

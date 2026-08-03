@@ -1,4 +1,5 @@
 use super::*;
+use crate::layout::inline_collect::TextDecorationPropagationContext;
 
 impl<'a> LayoutBuilder<'a> {
     /// Lay out in-flow block descendants inside a table cell content box.
@@ -16,10 +17,18 @@ impl<'a> LayoutBuilder<'a> {
         row_sizing_style: &ComputedStyle,
         table_style: &ComputedStyle,
         table_height_is_definite: bool,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         cell_borders: css::Edges,
         content_geometry: TableCellContentGeometry,
     ) {
+        // Table internal boxes retain their computed styles in the frozen
+        // grid. Carry the table's in-flow decoration origins into the cell's
+        // anonymous block container before its content is collected or
+        // painted.
+        // <https://drafts.csswg.org/css-text-decor-4/#line-decoration>
+        let table_decoration_context = TextDecorationPropagationContext::from_style(table_style);
+        let used_cell_style = table_decoration_context.used_child_style(cell_style);
+        let cell_style = &used_cell_style;
         let built_children;
         let children = if let Some(children) = cell.children.as_deref() {
             children
@@ -40,7 +49,7 @@ impl<'a> LayoutBuilder<'a> {
 
         let content_box = content_geometry.content_box();
         let cell_content_height = content_box.height();
-        let percentage_height_basis = table_cell_percentage_height_basis(
+        let content_pass = table_cell_content_pass(
             row_sizing_style,
             table_style,
             cell_content_height,
@@ -51,7 +60,7 @@ impl<'a> LayoutBuilder<'a> {
             cell_style,
             content_box,
             self.table_cell_child_ancestors(cell, row),
-            percentage_height_basis,
+            content_pass.percentage_basis(),
         );
         // Table-row fragmentation owns the fragmentainer boundary for its
         // cells. Descendant block layout is a replay into that committed row
@@ -98,7 +107,11 @@ impl<'a> LayoutBuilder<'a> {
                     }
                 }
                 if table_cell_has_in_flow_layout_child(child_box) {
-                    self.layout_formatting_box(child_box, stylesheets);
+                    self.layout_formatting_box_with_parent_decoration(
+                        child_box,
+                        stylesheets,
+                        Some(cell_style),
+                    );
                 }
             }
             self.flush_float_run(&mut float_run);
@@ -117,7 +130,7 @@ impl<'a> LayoutBuilder<'a> {
         row_style: &ComputedStyle,
         row_containing_block: Option<ContainingBlock>,
         cell_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         cell_borders: css::Edges,
         border_box: TableCellBorderBox,
         placement: TableGridPlacement,
@@ -156,10 +169,21 @@ impl<'a> LayoutBuilder<'a> {
         // unrelated inline static position.
         // <https://drafts.csswg.org/css-tables-3/#abspos-boxes-in-table-internal>
         let previous_absolute_static_position = self.absolute_static_position;
+        // An anonymous table cell has no principal text box, but an
+        // absolutely positioned descendant uses the hypothetical in-flow
+        // line box for its static position. Move from the cell content edge
+        // to that line box's content edge by removing half the line leading.
+        // <https://www.w3.org/TR/css-position-3/#staticpos-insets>
+        let anonymous_cell_leading = if cell.element.is_none() {
+            ((cell_style.line_height - cell_style.font_size).max(0.0)) / 2.0
+        } else {
+            0.0
+        };
+        let static_top = static_content_box.top_y() + anonymous_cell_leading;
         self.absolute_static_position = Some(AbsoluteStaticPosition::from_page_rect(
             static_content_box.left(),
             static_content_box.right(),
-            static_content_box.top_y(),
+            static_top,
         ));
         if self.escaped_atom_positioning_depth > 0 && row_containing_block_scope.is_some() {
             self.escaped_atom_containing_block = row_containing_block;
@@ -223,7 +247,7 @@ impl<'a> LayoutBuilder<'a> {
     fn layout_table_cell_positioned_boxes(
         &mut self,
         children: &[box_tree::FormattingBox<'_>],
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
     ) {
         for child_box in children {
             match child_box {

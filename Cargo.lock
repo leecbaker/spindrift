@@ -1600,6 +1600,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kham-core"
+version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b660bf383de3120f9fd00c0baa4a1829d5e2d17616a559a7750692fcfb0b1cc2"
+dependencies = [
+ "miniz_oxide",
+]
+
+[[package]]
 name = "kurbo"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2200,6 +2209,7 @@ dependencies = [
  "icu_segmenter",
  "image",
  "jxl-oxide",
+ "kham-core",
  "log",
  "markup5ever_rcdom",
  "miniz_oxide",

@@ -13,14 +13,20 @@ fn assert_green_100px_square(document: &quire::Document) {
     );
 }
 
-fn rect_covers(covering: &quire::RenderedRect, covered: &quire::RenderedRect) -> bool {
+fn rect_covers(
+    covering: &crate::document::paint::shapes::RenderedRect,
+    covered: &crate::document::paint::shapes::RenderedRect,
+) -> bool {
     covering.x() <= covered.x() + 0.01
         && covering.y() <= covered.y() + 0.01
         && covering.x() + covering.width() >= covered.x() + covered.width() - 0.01
         && covering.y() + covering.height() >= covered.y() + covered.height() - 0.01
 }
 
-fn largest_filled_rect(page: &quire::Page, color: CssColor) -> &quire::RenderedRect {
+fn largest_filled_rect(
+    page: &quire::Page,
+    color: CssColor,
+) -> &crate::document::paint::shapes::RenderedRect {
     page.rects()
         .iter()
         .filter(|rect| rect.fill == Some(color))
@@ -56,7 +62,7 @@ fn filled_rect_bounds(page: &quire::Page, color: CssColor) -> (f32, f32, f32, f3
     (left, bottom, right, top)
 }
 
-fn rect_top(rect: &quire::RenderedRect) -> f32 {
+fn rect_top(rect: &crate::document::paint::shapes::RenderedRect) -> f32 {
     rect.y() + rect.height()
 }
 
@@ -67,13 +73,13 @@ fn rect_contains_bounds(rect: (f32, f32, f32, f32), bounds: (f32, f32, f32, f32)
         && rect.3 >= bounds.3 - 0.01
 }
 
-fn path_bounds(path: &quire::RenderedPath) -> Option<(f32, f32, f32, f32)> {
+fn path_bounds(path: &crate::document::paint::paths::RenderedPath) -> Option<(f32, f32, f32, f32)> {
     let mut left = f32::INFINITY;
     let mut bottom = f32::INFINITY;
     let mut right = f32::NEG_INFINITY;
     let mut top = f32::NEG_INFINITY;
     let mut saw_point = false;
-    let mut include_point = |point: quire::PaintPoint| {
+    let mut include_point = |point: crate::document::paint::geometry::PaintPoint| {
         saw_point = true;
         left = left.min(point.x);
         bottom = bottom.min(point.y);
@@ -82,9 +88,11 @@ fn path_bounds(path: &quire::RenderedPath) -> Option<(f32, f32, f32, f32)> {
     };
     for command in &path.commands {
         match command {
-            quire::RenderedPathCommand::MoveTo(point)
-            | quire::RenderedPathCommand::LineTo(point) => include_point(*point),
-            quire::RenderedPathCommand::CurveTo {
+            crate::document::paint::paths::RenderedPathCommand::MoveTo(point)
+            | crate::document::paint::paths::RenderedPathCommand::LineTo(point) => {
+                include_point(*point)
+            }
+            crate::document::paint::paths::RenderedPathCommand::CurveTo {
                 control_1,
                 control_2,
                 end,
@@ -93,20 +101,21 @@ fn path_bounds(path: &quire::RenderedPath) -> Option<(f32, f32, f32, f32)> {
                 include_point(*control_2);
                 include_point(*end);
             }
-            quire::RenderedPathCommand::Close => {}
+            crate::document::paint::paths::RenderedPathCommand::Close => {}
         }
     }
     saw_point.then_some((left, bottom, right, top))
 }
 
-fn path_contains_point(path: &quire::RenderedPath, x: f32, y: f32) -> bool {
+fn path_contains_point(path: &crate::document::paint::paths::RenderedPath, x: f32, y: f32) -> bool {
     let points = path
         .commands
         .iter()
         .filter_map(|command| match command {
-            quire::RenderedPathCommand::MoveTo(point)
-            | quire::RenderedPathCommand::LineTo(point) => Some(*point),
-            quire::RenderedPathCommand::CurveTo { .. } | quire::RenderedPathCommand::Close => None,
+            crate::document::paint::paths::RenderedPathCommand::MoveTo(point)
+            | crate::document::paint::paths::RenderedPathCommand::LineTo(point) => Some(*point),
+            crate::document::paint::paths::RenderedPathCommand::CurveTo { .. }
+            | crate::document::paint::paths::RenderedPathCommand::Close => None,
         })
         .collect::<Vec<_>>();
     if points.len() < 3 {
@@ -128,7 +137,11 @@ fn path_contains_point(path: &quire::RenderedPath, x: f32, y: f32) -> bool {
     inside
 }
 
-fn path_fill_at(paths: &[&quire::RenderedPath], x: f32, y: f32) -> Option<CssColor> {
+fn path_fill_at(
+    paths: &[&crate::document::paint::paths::RenderedPath],
+    x: f32,
+    y: f32,
+) -> Option<CssColor> {
     paths
         .iter()
         .rev()
@@ -154,7 +167,7 @@ fn table_wrapper_border_paint_operation_indices(page: &quire::Page) -> Vec<usize
         .iter()
         .enumerate()
         .filter_map(|(operation_index, operation)| {
-            let quire::PaintOperation::Rect(rect_index) = operation else {
+            let crate::document::paint::page::PaintOperation::Rect(rect_index) = operation else {
                 return None;
             };
             let rect = page.rects().get(*rect_index)?;
@@ -1597,7 +1610,7 @@ async fn repeated_collapsed_table_header_paints_fragment_borders() {
             page.paint_operations().iter().any(|operation| {
                 matches!(
                     operation,
-                    quire::PaintOperation::Rect(index)
+                    crate::document::paint::page::PaintOperation::Rect(index)
                         if page.rects().get(*index).is_some_and(|rect| {
                             rect.fill == Some(CssColor::new(255, 0, 0))
                                 && rect.width() > 0.0
@@ -1670,7 +1683,7 @@ async fn repeated_table_header_traps_positioned_descendants_in_fragment() {
         repeated_page.paint_operations().iter().any(|operation| {
             matches!(
                 operation,
-                quire::PaintOperation::Rect(index)
+                crate::document::paint::page::PaintOperation::Rect(index)
                     if repeated_page.rects().get(*index).is_some_and(|rect| {
                         rect.fill == Some(CssColor::new(255, 0, 0))
                             && rect.width() > 0.0
@@ -1712,7 +1725,7 @@ async fn fragmented_collapsed_table_body_paints_borders_on_each_page() {
             page.paint_operations().iter().any(|operation| {
                 matches!(
                     operation,
-                    quire::PaintOperation::Rect(index)
+                    crate::document::paint::page::PaintOperation::Rect(index)
                         if page.rects().get(*index).is_some_and(|rect| {
                             rect.fill == Some(CssColor::new(255, 0, 0))
                                 && rect.width() > 0.0
@@ -3587,10 +3600,13 @@ async fn html_display_table_shrink_wraps_body_inline_blocks() {
         2,
         "{green_vertical_borders:?}"
     );
+    // Atomic inline boxes align to the line box's baseline by default.  The
+    // anonymous table cell therefore retains the font's descender below the
+    // 300px boxes (WeasyPrint emits 323.46 CSS px for the border box).
     assert!(
         green_vertical_borders
             .iter()
-            .all(|rect| (rect.height() - 240.0).abs() < 0.5),
+            .all(|rect| (rect.height() - 243.0).abs() < 0.5),
         "{green_vertical_borders:?}"
     );
     assert!(
@@ -3642,10 +3658,12 @@ async fn html_display_table_root_stays_shrink_wrapped_on_large_page() {
         2,
         "{green_vertical_borders:?}"
     );
+    // As above, the root table's anonymous cell includes the inline line
+    // box's baseline descent below its 160px atomic inline child.
     assert!(
         green_vertical_borders
             .iter()
-            .all(|rect| (rect.height() - 135.0).abs() < 0.5),
+            .all(|rect| (rect.height() - 138.0).abs() < 0.5),
         "{green_vertical_borders:?}"
     );
     assert!(
@@ -3721,7 +3739,6 @@ async fn captions_and_abspos_descendants() {
     let page = &document.pages[0];
     let green = CssColor::new(0, 128, 0);
     let red = CssColor::new(255, 0, 0);
-
     assert_eq!(final_rect_fill_at(page, 33.75, 52.5), Some(green));
     assert_eq!(final_rect_fill_at(page, 71.25, 52.5), Some(green));
     assert_ne!(final_rect_fill_at(page, 86.25, 52.5), Some(red));
@@ -4916,17 +4933,13 @@ async fn table_cell_inline_vertical_align_keywords_align_as_baseline() {
 }
 
 #[tokio::test]
-async fn table_valign_presentational_hint_aligns_cell_content_when_enabled() {
-    let options = RenderOptions {
-        presentational_hints: true,
-        ..RenderOptions::default()
-    };
+async fn table_valign_presentational_hint_aligns_cell_content_by_default() {
     let document = Html::from_string(
         "<table cellpadding=\"0\" style=\"margin:0;width:60pt;border-spacing:0;font-size:10pt;line-height:10pt\">\
          <tr style=\"height:40pt\"><td valign=\"top\" style=\"width:30pt\">Top</td><td valign=\"bottom\" style=\"width:30pt\">Bottom</td></tr>\
          </table>",
     )
-    .render(&options).await
+    .render(&RenderOptions::default()).await
     .unwrap();
 
     let top = document.pages[0]
@@ -5065,7 +5078,7 @@ async fn break_inside_avoid_keeps_table_row_groups_together_when_they_fit() {
 }
 
 #[tokio::test]
-async fn page_break_inside_avoid_tbody_keeps_default_cell_block_children_together() {
+async fn page_break_inside_avoid_tbody_relaxes_at_a_cell_boundary_when_edge_spacing_overflows() {
     let document = Html::from_string(
         "<!DOCTYPE html>\
          <html lang=\"en-US\"><head>\
@@ -5093,29 +5106,65 @@ async fn page_break_inside_avoid_tbody_keeps_default_cell_block_children_togethe
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    let blue_rect_counts = document
-        .pages
-        .iter()
-        .map(|page| {
-            page.rects()
-                .iter()
-                .filter(|rect| {
-                    rect.fill == Some(CssColor::new(0, 0, 255))
-                        && (rect.width() - 72.0).abs() < 0.01
-                        && (rect.height() - 72.0).abs() < 0.01
-                })
-                .count()
-        })
-        .collect::<Vec<_>>();
+    assert_eq!(document.pages.len(), 3, "{page_texts:?}");
+    assert_eq!(page_texts, vec![vec!["1"], vec!["2"], vec!["3"]]);
+}
 
-    assert_eq!(
-        document.pages.len(),
-        2,
-        "{page_texts:?} {blue_rect_counts:?}"
-    );
-    assert_eq!(page_texts[0], vec!["1"], "{page_texts:?}");
-    assert_eq!(page_texts[1], vec!["2", "3"], "{page_texts:?}");
-    assert_eq!(blue_rect_counts, vec![1, 2], "{page_texts:?}");
+#[tokio::test]
+async fn page_break_inside_avoid_row_group_wpt_variants_preserve_fragment_sequence() {
+    // These inputs mirror the CSS2 pagination row-group avoid reftests, but
+    // remain self-contained so a default separated-border table is covered by
+    // the local smoke suite as well.
+    let cases = [
+        (
+            "thead",
+            "<p>1</p><table><thead class=\"test\"><tr><td><p>2</p><p>3</p></td></tr></thead></table>",
+            vec![vec!["1"], vec!["2"], vec!["3"]],
+        ),
+        (
+            "tfoot",
+            "<p>1</p><table><tfoot class=\"test\"><tr><td><p>2</p><p>3</p></td></tr></tfoot></table>",
+            vec![vec!["1"], vec!["2"], vec!["3"]],
+        ),
+        (
+            "repeated-header-and-footer",
+            "<table border=\"1\"><tfoot><tr><td><p>3</p></td></tr></tfoot><thead><tr><td><p>1</p></td></tr></thead><tbody class=\"test\"><tr><td><p>2</p><p>2</p></td></tr></tbody></table>",
+            vec![
+                // Repeating both groups would leave no room for the body.
+                // The source header/footer remain on the outer fragments,
+                // while repeats are emitted only for the body fragments.
+                vec!["1", "3"],
+                vec!["1", "2"],
+                vec!["1", "2"],
+                vec!["1", "3"],
+            ],
+        ),
+        (
+            "repeated-header",
+            "<table border=\"1\"><thead><tr><td><p>1</p></td></tr></thead><tbody class=\"test\"><tr><td><p>2</p><p>3</p></td></tr></tbody></table>",
+            vec![vec!["1"], vec!["1", "2"], vec!["1", "3"], vec!["1"]],
+        ),
+    ];
+
+    for (name, body, expected_pages) in cases {
+        let document = Html::from_string(format!(
+            "<!DOCTYPE html><style>@page {{ size:5in 3in; margin:.5in }} p {{ height:1in; width:1in; margin:0; background:blue }} .test {{ page-break-inside:avoid }}</style><body>{body}</body>"
+        ))
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+        let pages = document
+            .pages
+            .iter()
+            .map(|page| {
+                page.lines()
+                    .iter()
+                    .map(|line| line.text.as_str())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(pages, expected_pages, "{name}: {pages:?}");
+    }
 }
 
 #[tokio::test]
@@ -5127,7 +5176,7 @@ async fn row_group_break_inside_avoid_suppresses_repeats_when_they_prevent_progr
              <title>CSS Test: CSS 2.1 page-break-inside:avoid</title>\
              <style>@page { size:5in 3in; margin:0.5in; }\
              p { height: 1in; width: 1in; margin:0; background-color:blue; }\
-             td { padding:0; }\
+             table { border-collapse:separate; border-spacing:0; } td { padding:0; }\
              .test { page-break-inside:avoid; }</style></head><body>\
              <table border=\"1\">\
              <tfoot><tr><td><p>3</p></td></tr></tfoot>\
@@ -6661,7 +6710,7 @@ async fn collapsed_table_borders_enter_paint_operation_stream() {
     assert_eq!(vertical_edge_indexes.len(), 3);
     for rect_index in vertical_edge_indexes {
         assert!(page.operations().iter().any(|operation| {
-            matches!(operation, quire::PaintOperation::Rect(index) if *index == rect_index)
+            matches!(operation, crate::document::paint::page::PaintOperation::Rect(index) if *index == rect_index)
         }));
     }
 }
@@ -6760,7 +6809,8 @@ async fn collapsed_table_borders_paint_below_cell_foreground_content() {
             .iter()
             .enumerate()
             .find_map(|(operation_index, operation)| {
-                let quire::PaintOperation::Rect(rect_index) = operation else {
+                let crate::document::paint::page::PaintOperation::Rect(rect_index) = operation
+                else {
                     return None;
                 };
                 let rect = page.rects().get(*rect_index)?;
@@ -7178,7 +7228,7 @@ async fn collapsed_table_dotted_borders_render_as_round_dot_paths() {
     assert_eq!(dot_indexes.len(), 1);
     for path_index in dot_indexes {
         assert!(page.operations().iter().any(|operation| {
-            matches!(operation, quire::PaintOperation::Path(index) if *index == path_index)
+            matches!(operation, crate::document::paint::page::PaintOperation::Path(index) if *index == path_index)
         }));
     }
 }
@@ -7575,7 +7625,7 @@ async fn collapsed_rowspan_cell_vertical_borders_cover_each_spanned_row() {
         6,
         "rowspan edges must paint once per row: {red_edges:?}"
     );
-    for edge_pair in red_edges.chunks_exact(3) {
+    for edge_pair in red_edges.as_chunks::<3>().0 {
         for adjacent in edge_pair.windows(2) {
             assert!(
                 (adjacent[0].y() + adjacent[0].height() - adjacent[1].y()).abs() < 0.01,
@@ -7797,10 +7847,134 @@ async fn collapsed_table_cell_content_uses_resolved_half_border_insets() {
         .iter()
         .find(|line| line.text == "Inset")
         .unwrap();
+    let border = document.pages[0]
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
+        .unwrap();
+    let grid_edge = border.x() + border.width() / 2.0;
 
     assert!(
-        line.x() >= 18.0,
-        "cell content should consume half of the resolved collapsed border, got {line:?}"
+        (line.x() - grid_edge - 10.0).abs() < 0.01,
+        "cell content should consume half of the 20pt winning border from the grid edge, got line={line:?} border={border:?}"
+    );
+}
+
+#[tokio::test]
+async fn invoice_shaped_collapsed_border_box_table_keeps_a_15cm_non_overlapping_grid() {
+    let document = Html::from_string(
+        r#"<style>
+        @page { size: 800pt 180pt; margin: 0 }
+        body { margin: 0; font-size: 10pt; line-height: 10pt }
+        table {
+          position: absolute;
+          left: 120pt;
+          bottom: 0;
+          margin: 0 -3cm;
+          width: 18cm;
+          box-sizing: border-box;
+          border-collapse: collapse;
+          border-width: 2cm 3cm;
+          border-style: solid;
+          border-color: black;
+          background: #eeeeee;
+        }
+        td { padding: 0; height: 16pt }
+        .account { background: #ff0000 }
+        .total { background: #00ff00 }
+        .due { background: #0000ff }
+        </style>
+        <table><tr><td class=account>Account</td><td class=total>Total</td><td class=due>DUE</td></tr></table>"#,
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let account = largest_filled_rect(page, CssColor::new(255, 0, 0));
+    let total = largest_filled_rect(page, CssColor::new(0, 255, 0));
+    let due = largest_filled_rect(page, CssColor::new(0, 0, 255));
+    let wrapper = largest_filled_rect(page, CssColor::new(238, 238, 238));
+    let outer_horizontal_insets = 3.0 * 72.0 / 2.54;
+    let grid_width = wrapper.width() - outer_horizontal_insets;
+
+    assert!(
+        account.x() + account.width() <= total.x() + 0.01
+            && total.x() + total.width() <= due.x() + 0.01,
+        "invoice columns must not overlap: account={account:?} total={total:?} due={due:?}"
+    );
+    assert!(
+        (grid_width - 15.0 * 72.0 / 2.54).abs() < 0.02,
+        "18cm border-box table with 2cm/3cm collapsed borders should leave a 15cm grid, got {grid_width}pt"
+    );
+    assert!(
+        (wrapper.width() - 18.0 * 72.0 / 2.54).abs() < 0.02,
+        "collapsed outer half-borders should restore the 18cm wrapper border box: {wrapper:?}"
+    );
+    assert!(
+        wrapper.y().abs() < 0.01,
+        "invoice wrapper's resolved bottom border edge should align with its containing block: {wrapper:?}"
+    );
+}
+
+#[tokio::test]
+async fn static_positioned_collapsed_table_background_uses_wrapper_border_box() {
+    let document = Html::from_string(
+        r#"<style>
+        @page { size: 21cm 20cm; margin: 3cm }
+        body { margin: 0; font-size: 10pt; line-height: 10pt }
+        footer { display: block; height: 6cm }
+        table {
+          position: absolute;
+          bottom: 0;
+          margin: 0 -3cm;
+          width: 18cm;
+          box-sizing: border-box;
+          border-collapse: collapse;
+          border-width: 2cm 3cm;
+          border-style: solid;
+          border-color: #eeeeee;
+          background: #eeeeee;
+        }
+        td { padding: 0; height: 16pt }
+        </style>
+        <footer><table><tr><td>Due</td><td>Account</td><td>Total</td></tr></table></footer>"#,
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let wrapper = largest_filled_rect(&document.pages[0], CssColor::new(238, 238, 238));
+    let cm = 72.0 / 2.54;
+    assert!(
+        wrapper.x().abs() < 0.02 && (wrapper.width() - 18.0 * cm).abs() < 0.02,
+        "collapsed positioned table background must cover its 18cm wrapper border box, got {wrapper:?}"
+    );
+}
+
+#[tokio::test]
+async fn invoice_total_background_covers_its_collapsed_wrapper_border_box() {
+    let document = Html::from_file("weasyprint-samples/invoice/invoice.html")
+        .await
+        .unwrap()
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+
+    let wrapper = largest_filled_rect(&document.pages[0], CssColor::new(246, 246, 246));
+    let cm = 72.0 / 2.54;
+    assert!(
+        wrapper.x().abs() < 0.02 && (wrapper.width() - 18.0 * cm).abs() < 0.02,
+        "invoice total background must cover its 18cm collapsed wrapper border box, got {wrapper:?}"
+    );
+    assert_eq!(
+        final_rect_fill_at(
+            &document.pages[0],
+            wrapper.x() + 1.0,
+            wrapper.y() + wrapper.height() / 2.0,
+        ),
+        Some(CssColor::new(246, 246, 246)),
+        "invoice total wrapper background must remain visible outside the grid"
     );
 }
 

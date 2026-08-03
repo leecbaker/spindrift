@@ -10,10 +10,11 @@ part of this parity measure rather than a separate raster-only baseline.
 - Fully opaque decoded raster images with one final RGB sample are emitted as
   calibrated PDF vector fills rather than image XObjects. The promotion occurs
   after cropping, orientation, and output-color conversion, retains the same
-  ICC-based color components and destination geometry, and is disabled for
-  JPEG passthrough, transparency, non-uniform samples, transformed images,
-  and repeated image patterns. This avoids PDF image-sampling edge artifacts
-  without changing CSS image sizing or ordinary raster-image semantics.
+  built-in or embedded ICC-based color components and destination geometry,
+  and is disabled for JPEG passthrough, transparency, non-uniform samples,
+  transformed images, and repeated image patterns. This avoids PDF
+  image-sampling edge artifacts without changing CSS image sizing or ordinary
+  raster-image semantics.
 - Replaced raster images now share concrete-object sizing for `fill`,
   `contain`, `cover`, `none`, and `scale-down`, with a parsed, inherited
   `object-position`. Raster `<img>`, `<embed>`, `<object>`, and video poster
@@ -31,19 +32,38 @@ part of this parity measure rather than a separate raster-only baseline.
   viewport fallback. Their viewport coverage remains SVG scene geometry until
   painting, rather than being replaced with a CSS solid rectangle; this
   preserves source-coordinate extent, clipping, and edge coverage.
+- URL SVG background paths receive the CSS `background-clip` even when their
+  own redundant root-viewport clip has been elided. Positioned non-repeating
+  tiles therefore cannot leak outside the selected background painting area,
+  and retain the same visible edge geometry as equivalent replaced SVGs.
 - CSS Images 5 `object-view-box` resolves source selection before
   concrete-object sizing and uses the same mapping for inline, block, raster,
   and SVG replaced content. Empty, negative, and inapplicable source bounds
   leave the natural source unchanged.
+- A single CSS `content` image now retains a typed replaced-image payload
+  through sizing and paint: raster, SVG, and generated linear/radial
+  gradients share the used content and border-box geometry. Gradients have no
+  natural dimensions, so automatic sizing negotiates the CSS 300px by 150px
+  default object size rather than a font-relative square. Eligible generated
+  linear and radial replacements use the same native PDF shading program as
+  backgrounds; conic gradients, non-native interpolation methods, and
+  object-fit/view-box mappings that cannot yet be represented exactly retain a
+  tile-bounded raster fallback.
+- HTML `width` and `height` presentation attributes for image-like replaced
+  elements are emitted as zero-specificity author-origin cascade hints. This
+  preserves author-CSS precedence for `img`, `embed`, `iframe`, `object`,
+  `video`, and image-button inputs, and paired `img`/`video` dimensions also
+  supply HTML's `aspect-ratio: auto w / h` hint.
 - SVG gradients preserve padded endpoint colors and coincident color stops as
-  PDF stitching-function discontinuities. Their paint-server matrix is
-  composed with the path viewport transform, keeping gradients aligned with
-  transformed SVG geometry.
+  PDF stitching-function discontinuities. SVG geometry and paint-server
+  transforms are materialized independently into page paint space, preserving
+  transformed marker `context-fill`/`context-stroke` continuity with the
+  context element's bounding box without relying on a local PDF path CTM.
 - SVG `pattern` paint servers containing supported solid vector paths are
   emitted as native PDF Type 1 tiling patterns. Their SVG user-space placement
-  is composed with the target path transform, so transformed inline SVG shapes
-  retain their pattern alignment without expanding a repeated cell into page
-  primitives.
+  is materialized in page paint space independently of the target path, so
+  transformed inline SVG shapes retain their pattern alignment without
+  expanding a repeated cell into page primitives.
 - Inline SVG descendants receive the host document's cascaded, resolvable CSS
   `transform`, `fill`, `stroke`, and non-percentage `stroke-width` values
   before SVG parsing, so document rules correctly override SVG presentation
@@ -52,15 +72,14 @@ part of this parity measure rather than a separate raster-only baseline.
   background-image tiles as well as repeated patterns and replaced raster
   images, so all of those PDF image consumers request non-interpolated
   sampling consistently.
-- `image-set()` selects the appropriate supported candidate for Quire's
-  1dppx output environment in CSS backgrounds, generated content,
-  border-image sources, and URL-backed list markers. Its selected resolution
-  scales raster and SVG intrinsic dimensions; it supports URL/string sources,
-  the standard resolution units, basic `calc()` arithmetic, and MIME
-  descriptors matched against Quire's enabled image decoders. An exhausted
-  valid set is retained
-  as an invalid image, allowing property-specific fallback such as normal
-  border painting.
+- `image-set()` retains typed candidates through cascade and chooses a
+  quality-first option for `RenderOptions`' configured device density (1dppx
+  by default). It supports the standard and `-webkit-` spellings, URL/string
+  and implemented generated-image sources, unordered descriptors, MIME
+  filtering, source-order duplicate-resolution removal, intrinsic-resolution
+  scaling, and dimension-aware `calc()` arithmetic. An exhausted valid set is
+  retained as an invalid image, allowing property-specific fallback such as
+  normal border painting.
 - The image store keeps raw and EXIF-oriented versions of a raster source as
   distinct resources, preserving both correct intrinsic dimensions and PDF
   image deduplication. `image-orientation: from-image` is the initial,
@@ -117,7 +136,10 @@ part of this parity measure rather than a separate raster-only baseline.
 - Generated gradient raster fallbacks are created after `background-size`,
   `background-position`, and repeat geometry resolve. Their RGB and alpha PDF
   image streams use Flate compression; unsupported fallback images therefore
-  have the used tile dimensions rather than page-sized dimensions.
+  have the used tile dimensions rather than page-sized dimensions. CSS
+  interpolation coordinates are converted into one RGB storage space per tile
+  before 8-bit image encoding: in-gamut tiles use sRGB and other tiles use
+  Display-P3, never a D50 XYZ profile paired with RGB image bytes.
 - CSS Images 4 gradient preludes accept all rectangular and polar interpolation
   spaces for linear, radial, and conic gradients. Encoded rectangular spaces
   keep their native PDF shadings; Oklab, Lab, linear-light, and polar methods
@@ -145,5 +167,6 @@ part of this parity measure rather than a separate raster-only baseline.
 - A nearest-neighbor raster fallback for `image-rendering: pixelated` where a
   PDF reader does not honor `/Interpolate false`; the PDF sampling hint alone
   does not satisfy the mixed-scale WPT.
-- Full `image-set()` option grammar, dynamic device resolution, and expression
-  evaluation beyond the supported basic arithmetic.
+- CSS Values Math functions beyond `calc()`, `min()`, `max()`, `clamp()`,
+  and statically computable `sign()` expressions in `image-set()` resolution
+  descriptors.

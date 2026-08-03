@@ -1,0 +1,31 @@
+<!doctype html>
+<style>
+  @font-face {
+    font-family: RootMetricAhem;
+    src: url(Ahem.ttf);
+  }
+
+  @page { size: 240px 180px; margin: 0 }
+  :root { font-family: RootMetricAhem; font-size: 20px }
+  body { margin: 0 }
+  .ancestor { font-family: monospace; font-size: 1.5em }
+  .sample { font-family: sans-serif; margin: 0; line-height: 1 }
+  .rex { font-size: 1rex }
+  .rcap { font-size: 1rcap }
+  .ric { font-size: 1ric }
+  .ex { font-size: 1ex }
+  .cap { font-size: 1cap }
+  .ic { font-size: 1ic }
+</style>
+
+<div class="ancestor">
+  <div class="sample rex">nested-rex</div>
+  <div class="sample rcap">nested-rcap</div>
+  <div class="sample ric">nested-ric</div>
+</div>
+<div class="sample rex">root-rex</div>
+<div class="sample rcap">root-rcap</div>
+<div class="sample ric">root-ric</div>
+<div class="sample ex">parent-rex</div>
+<div class="sample cap">parent-rcap</div>
+<div class="sample ic">parent-ric</div>

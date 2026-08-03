@@ -523,6 +523,24 @@ impl LogicalInlineContentSize {
     }
 }
 
+impl SemanticLengthExt for LogicalInlineContentSize {
+    fn points(self) -> f32 {
+        self.0.points()
+    }
+}
+
+impl crate::units::IntoLayoutLength for LogicalInlineContentSize {
+    fn into_layout_length(self) -> LayoutLength {
+        crate::units::IntoLayoutLength::into_layout_length(self.0)
+    }
+}
+
+/// A percentage basis whose value is explicitly a logical inline content-box
+/// size. CSS Box percentage edges must cross this boundary before becoming
+/// physical edges.
+pub(in crate::layout) type LogicalInlinePercentageBasis<Source = ()> =
+    PercentageBasis<LogicalInlineContentSize, Source>;
+
 /// A CSS content-box size on the logical block axis.
 ///
 /// In vertical writing modes this maps to physical width, which is the key

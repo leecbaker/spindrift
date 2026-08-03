@@ -1,22 +1,103 @@
 use super::*;
 
-/// Return the block-size basis used by CSS Tables 3 table-cell content relayout.
+/// A committed, definite table-cell content-box block size.
+///
+/// CSS Tables performs a second content layout only after table row layout has
+/// fixed the cell's content box. Keeping that fact separate from the general
+/// percentage-basis enum prevents a final relayout from accidentally using an
+/// indefinite fallback basis.
+/// <https://drafts.csswg.org/css-tables-3/#table-cell-content-relayout>
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout::table) struct DefiniteTableCellBlockSizeBasis(BlockSizePercentageBasis);
+
+impl DefiniteTableCellBlockSizeBasis {
+    pub(in crate::layout::table) fn from_content_height(height: ContentBoxLength) -> Self {
+        Self(PercentageBasis::definite_from(
+            height,
+            BlockSizeBasisSource::TableCell,
+        ))
+    }
+
+    pub(in crate::layout::table) fn from_explicit_cell_height(
+        cell_style: &ComputedStyle,
+        border_insets: css::Edges,
+    ) -> Option<Self> {
+        let vertical_non_content = cell_style.padding.top
+            + cell_style.padding.bottom
+            + border_insets.top
+            + border_insets.bottom;
+        used_content_box_height_or_auto_with_basis(
+            cell_style,
+            percentage_basis_from_points(None),
+            non_content_pt(vertical_non_content),
+        )
+        .map(Self::from_content_height)
+    }
+
+    pub(in crate::layout::table) fn percentage_basis(self) -> BlockSizePercentageBasis {
+        self.0
+    }
+}
+
+/// The two table-cell content sizing passes defined by CSS Tables.
+///
+/// The final pass owns a [`DefiniteTableCellBlockSizeBasis`], while the row
+/// minimum pass cannot expose one. This makes percentage-height resolution a
+/// property of the pass rather than an optional convention at each call site.
+/// <https://drafts.csswg.org/css-tables-3/#row-layout>
+/// <https://drafts.csswg.org/css-tables-3/#table-cell-content-relayout>
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout::table) enum TableCellContentPass {
+    RowMinimum,
+    FinalRelayout(DefiniteTableCellBlockSizeBasis),
+}
+
+impl TableCellContentPass {
+    pub(in crate::layout::table) fn percentage_basis(self) -> BlockSizePercentageBasis {
+        match self {
+            Self::RowMinimum => PercentageBasis::indefinite(),
+            Self::FinalRelayout(basis) => basis.percentage_basis(),
+        }
+    }
+
+    pub(in crate::layout::table) fn final_basis(self) -> Option<DefiniteTableCellBlockSizeBasis> {
+        match self {
+            Self::RowMinimum => None,
+            Self::FinalRelayout(basis) => Some(basis),
+        }
+    }
+}
+
+/// Create a cell-content pass at the point where a caller commits a
+/// percentage basis to a table-cell content height.
+pub(in crate::layout::table) fn table_cell_content_pass_from_committed_basis(
+    basis: BlockSizePercentageBasis,
+) -> TableCellContentPass {
+    match basis {
+        PercentageBasis::Definite { value, .. } => TableCellContentPass::FinalRelayout(
+            DefiniteTableCellBlockSizeBasis::from_content_height(value),
+        ),
+        PercentageBasis::Indefinite => TableCellContentPass::RowMinimum,
+    }
+}
+
+/// Select the CSS Tables content-sizing pass for a table cell.
 ///
 /// Percentage heights on table-cell descendants are resolved during the second
 /// content layout pass only when the cell itself has an explicit length height,
 /// or when its table root has a length or percentage height:
 /// <https://drafts.csswg.org/css-tables-3/#table-cell-content-relayout>.
-pub(in crate::layout::table) fn table_cell_percentage_height_basis(
+pub(in crate::layout::table) fn table_cell_content_pass(
     cell_style: &ComputedStyle,
     table_style: &ComputedStyle,
     final_content_height: f32,
     border_insets: css::Edges,
     table_height_is_definite: bool,
-) -> BlockSizePercentageBasis {
+) -> TableCellContentPass {
     if table_cell_content_relayout_policy(cell_style, table_style, table_height_is_definite)
         != TableCellContentSizingPolicy::FinalRelayout
     {
-        return PercentageBasis::indefinite();
+        return TableCellContentPass::RowMinimum;
     }
     if cell_style
         .box_values
@@ -24,34 +105,16 @@ pub(in crate::layout::table) fn table_cell_percentage_height_basis(
         .length_if_no_percent()
         .is_some()
     {
-        return table_cell_explicit_content_height_basis(cell_style, border_insets);
+        return DefiniteTableCellBlockSizeBasis::from_explicit_cell_height(
+            cell_style,
+            border_insets,
+        )
+        .map(TableCellContentPass::FinalRelayout)
+        .unwrap_or(TableCellContentPass::RowMinimum);
     }
-    PercentageBasis::definite_from(
+    TableCellContentPass::FinalRelayout(DefiniteTableCellBlockSizeBasis::from_content_height(
         content_box_pt(final_content_height),
-        BlockSizeBasisSource::TableCell,
-    )
-}
-
-/// Return a table cell's own explicit content-box height as a percentage basis.
-///
-/// A length-sized cell establishes a definite block-size containing block for
-/// its contents even while row sizing is measuring its intrinsic minimum.
-/// <https://drafts.csswg.org/css-tables-3/#table-cell-content-relayout>
-pub(in crate::layout::table) fn table_cell_explicit_content_height_basis(
-    cell_style: &ComputedStyle,
-    border_insets: css::Edges,
-) -> BlockSizePercentageBasis {
-    let vertical_non_content = cell_style.padding.top
-        + cell_style.padding.bottom
-        + border_insets.top
-        + border_insets.bottom;
-    used_content_box_height_or_auto_with_basis(
-        cell_style,
-        percentage_basis_from_points(None),
-        non_content_pt(vertical_non_content),
-    )
-    .map(|height| PercentageBasis::definite_from(height, BlockSizeBasisSource::TableCell))
-    .unwrap_or_else(PercentageBasis::indefinite)
+    ))
 }
 
 pub(in crate::layout::table) fn table_cell_content_relayout_policy(
@@ -69,7 +132,7 @@ pub(in crate::layout::table) fn table_cell_content_relayout_policy(
     }
     if table_height_is_definite
         && (matches!(
-            table_style.box_values.height.clone(),
+            table_style.box_values.height.value().clone(),
             css::ComputedLengthPercentageOrAuto::LengthPercentage(_)
         ) || matches!(
             table_style.box_values.min_height.clone(),
@@ -88,7 +151,7 @@ pub(in crate::layout::table) fn apply_table_cell_content_sizing_policy(
     if policy != TableCellContentSizingPolicy::RowMinimum {
         return;
     }
-    if table_cell_block_size_depends_on_parent_percentage(style.box_values.height.clone()) {
+    if table_cell_block_size_depends_on_parent_percentage(style.box_values.height.value().clone()) {
         set_style_auto_height(style);
     }
     if table_cell_block_size_depends_on_parent_percentage(style.box_values.min_height.clone()) {
@@ -119,7 +182,7 @@ pub(in crate::layout::table) fn table_cell_block_size_depends_on_parent_percenta
 pub(in crate::layout::table) fn table_cell_style_has_parent_percentage_block_size(
     style: &ComputedStyle,
 ) -> bool {
-    table_cell_block_size_depends_on_parent_percentage(style.box_values.height.clone())
+    table_cell_block_size_depends_on_parent_percentage(style.box_values.height.value().clone())
         || table_cell_block_size_depends_on_parent_percentage(style.box_values.min_height.clone())
         || table_cell_block_size_depends_on_parent_percentage(style.box_values.max_height.clone())
 }
@@ -580,9 +643,12 @@ pub(in crate::layout::table) fn table_cell_children_can_use_inline_line_sequence
             ) && box_.core.style.float == Float::None
                 && table_cell_children_can_use_inline_line_sequence(&box_.core.children)
         }
-        box_tree::FormattingBox::AnonymousBlock(box_) => {
-            table_cell_children_can_use_inline_line_sequence(&box_.children)
-        }
+        // Anonymous blocks are emitted by block-container normalization to
+        // preserve each inline run around an in-flow block.  Collapsing such
+        // runs back into one cell-wide inline sequence would erase that
+        // block boundary during final table-cell replay.
+        // <https://www.w3.org/TR/CSS22/visuren.html#anonymous-block-level>
+        box_tree::FormattingBox::AnonymousBlock(_) => false,
         box_tree::FormattingBox::InlineSplitBlockContext(_) => false,
         box_tree::FormattingBox::AtomicInline(box_) => {
             !matches!(
@@ -600,6 +666,33 @@ pub(in crate::layout::table) fn table_cell_children_can_use_inline_line_sequence
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn table_cell_content_pass_keeps_row_minimum_percentage_heights_indefinite() {
+        let cell = ComputedStyle::initial();
+        let table = ComputedStyle::initial();
+        let pass = table_cell_content_pass(&cell, &table, 40.0, css::Edges::ZERO, false);
+
+        assert!(matches!(pass, TableCellContentPass::RowMinimum));
+        assert!(!pass.percentage_basis().is_definite());
+    }
+
+    #[test]
+    fn final_replaced_content_relayout_requires_a_committed_cell_height() {
+        let cell = ComputedStyle::initial();
+        let mut table = ComputedStyle::initial();
+        table.box_values.height.replace_with_used(
+            css::ComputedLengthPercentageOrAuto::LengthPercentage(
+                css::ComputedLengthPercentage::from_points(100.0),
+            ),
+        );
+        let pass = table_cell_content_pass(&cell, &table, 80.0, css::Edges::ZERO, true);
+
+        let basis = pass
+            .final_basis()
+            .expect("only a committed cell height selects the replaced-content relayout pass");
+        assert_eq!(basis.percentage_basis().points(), Some(80.0));
+    }
 
     fn first_element_by_tag<'a>(node: &'a Node, tag: &str) -> Option<&'a Element> {
         match &node.kind {
@@ -637,11 +730,12 @@ mod tests {
             .await;
         let options = RenderOptions::default();
         let stylesheets = vec![stylesheet];
+        let stylesheet_view = Stylesheets::document_only(&stylesheets);
         let resource_cache = ResourceCache::default();
         let iframe_documents = HashMap::new();
         let mut builder = LayoutBuilder::new(LayoutBuilderConfig {
             options: &options,
-            stylesheets: &stylesheets,
+            stylesheets: stylesheet_view,
             base_url: None,
             root_url: None,
             resource_cache: &resource_cache,
@@ -649,6 +743,7 @@ mod tests {
             iframe_viewport: None,
             page_progression_direction: Direction::Ltr,
             page_counter_initial_values: HashMap::new(),
+            target_references: crate::layout::TargetReferenceSnapshot::default(),
             font_system,
         });
         let mut table_style = ComputedStyle {
@@ -673,7 +768,7 @@ mod tests {
             running_cells: Vec::new(),
         };
 
-        let row_style = builder.style_for_table_row(&row, &table_style, &stylesheets);
+        let row_style = builder.style_for_table_row(&row, &table_style, &stylesheet_view);
 
         assert!((row_style.font_size - parent_ch_advance.points() * 2.0).abs() < 0.01);
     }

@@ -1,5 +1,6 @@
 use super::*;
 use crate::layout::inline_layout::InlineLineStackCursor;
+use std::rc::Rc;
 
 /// An explicitly inset positioned descendant held until its positioned inline
 /// ancestor has emitted the final edge that completes its containing block.
@@ -15,6 +16,50 @@ struct DeferredInlinePositionedDescendant {
     containing_block_source: InlinePositioningContainingBlockSource,
 }
 
+/// Paint produced while resolving a positioned descendant whose lexical inline
+/// containing block has not yet been selected for paint.
+///
+/// The source id is an explicit anchor in the collected inline stream.  The
+/// effect is attached to that start edge, rather than the builder's global
+/// positioned-layer list, so line-clamp selection commits it exactly when the
+/// source edge is replayed.
+/// <https://drafts.csswg.org/css-overflow-4/#continue>
+enum DeferredClampEffect {
+    PositionedLayers {
+        owner: InlinePositioningContainingBlockId,
+        layers: Vec<PositionedPaintLayer>,
+    },
+}
+
+impl DeferredClampEffect {
+    fn attach_to_owner(self, output: &mut [InlineItem]) {
+        let Self::PositionedLayers { owner, layers } = self;
+        if layers.is_empty() {
+            return;
+        }
+        let owner_start = output.iter_mut().find_map(|item| {
+            let InlineItem::Atom(atom) = item else {
+                return None;
+            };
+            let InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge)) = atom.content()
+            else {
+                return None;
+            };
+            (edge.logical_edge == InlineLogicalEdge::Start
+                && edge.positioning_containing_block_id == Some(owner))
+            .then_some(atom)
+        });
+        if let Some(owner_start) = owner_start {
+            owner_start.append_escaped_positioned_layers(layers);
+        } else {
+            debug_assert!(
+                false,
+                "positioned inline effect must have its source start edge"
+            );
+        }
+    }
+}
+
 fn positioned_descendant_has_explicit_inset(style: &ComputedStyle) -> bool {
     [
         &style.box_values.inset_top,
@@ -26,12 +71,23 @@ fn positioned_descendant_has_explicit_inset(style: &ComputedStyle) -> bool {
     .any(|inset| !matches!(inset, css::ComputedLengthPercentageOrAuto::Auto))
 }
 
+/// Mark generated text belonging to one footnote call without assigning the
+/// footnote to a page yet. The marker is retained through graph selection and
+/// consumed only when the owning line is committed.
+fn mark_inline_items_as_footnote_call(items: &mut [InlineItem], element: ElementId) {
+    for item in items {
+        if let InlineItem::Word(word) = item {
+            word.source = InlineTextSource::FootnoteCall(element);
+        }
+    }
+}
+
 impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn push_element_content_items_from_dom(
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         inherited_link: Option<String>,
         placement: InlinePlacement,
         output: &mut Vec<InlineItem>,
@@ -53,7 +109,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         inherited_link: Option<String>,
         placement: InlinePlacement,
         active_positioning_containing_block: Option<&InlinePositioningContainingBlockSource>,
@@ -103,12 +159,12 @@ impl<'a> LayoutBuilder<'a> {
         style: &ComputedStyle,
         source: box_tree::CounterEventSource,
         children: &[box_tree::FormattingBox<'_>],
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         inherited_link: Option<String>,
         baseline_shift: f32,
         visual_offset: InlineVisualOffset,
         block_style: &ComputedStyle,
-        propagated_decoration: css::TextDecoration,
+        propagated_decoration_layers: Vec<css::TextDecorationLayer>,
         output: &mut Vec<InlineItem>,
     ) {
         let Some(parts) = style.content.generated_parts().map(|parts| parts.to_vec()) else {
@@ -127,7 +183,7 @@ impl<'a> LayoutBuilder<'a> {
                         baseline_shift,
                         visual_offset,
                         block_style,
-                        propagated_decoration.clone(),
+                        propagated_decoration_layers.clone(),
                         output,
                     );
                 }
@@ -151,7 +207,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         inherited_link: Option<String>,
         placement: InlinePlacement,
         output: &mut Vec<InlineItem>,
@@ -180,7 +236,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         inherited_link: Option<String>,
         placement: InlinePlacement,
         active_positioning_containing_block: Option<&InlinePositioningContainingBlockSource>,
@@ -232,6 +288,13 @@ impl<'a> LayoutBuilder<'a> {
                     if child_style.display.is_none() {
                         continue;
                     }
+                    // The box-tree builder retargets a suppressed source
+                    // event to the nearest visible source boundary. This
+                    // direct-DOM path bypasses frozen formatting boxes, so it
+                    // must consume that boundary here just as the frozen-box
+                    // collector does.
+                    // <https://www.w3.org/TR/css-gcpm-3/#setting-named-strings>
+                    self.capture_suppressed_named_strings_before(child_element.id);
                     if is_line_break_element(child_element) {
                         // `<br>` is an HTML forced-break boundary. Its
                         // generated UA `::before` content supplies the
@@ -250,23 +313,46 @@ impl<'a> LayoutBuilder<'a> {
                             child_signature,
                             child_style,
                             false,
-                            inline_style_establishes_positioning_containing_block(style).then(
-                                || InlinePositioningContainingBlockSource {
-                                    id: InlinePositioningContainingBlockId(output.len()),
-                                    style: style.clone(),
-                                },
-                            ),
+                            active_positioning_containing_block.cloned().or_else(|| {
+                                inline_style_establishes_positioning_containing_block(style).then(
+                                    || InlinePositioningContainingBlockSource {
+                                        id: InlinePositioningContainingBlockId(output.len()),
+                                        style: style.clone(),
+                                    },
+                                )
+                            }),
                         ))));
                         continue;
                     }
-                    // This DOM collector owns only inline-formatting content.
-                    // Block/table source boxes are represented by frozen
-                    // formatting boxes and their positioned descendants must
-                    // be laid out from that owner exactly once.
+                    // CSS Ruby inlinifies a direct in-flow block child before
+                    // it reaches the generic DOM inline collector. The
+                    // frozen box-tree normalizer performs the equivalent
+                    // transformation, but this source-DOM path must retain
+                    // the same atomic flow-root boundary for painting and
+                    // sizing.
+                    // <https://drafts.csswg.org/css-ruby-1/#anon-gen-inlinize>
+                    let ruby_inlinifies_direct_block = (style.display.is_ruby()
+                        || style.display.is_ruby_internal())
+                        && !matches!(child_style.position, Position::Absolute | Position::Fixed)
+                        && child_style.display.is_block_level()
+                        && child_style.display.is_flow();
+                    if ruby_inlinifies_direct_block {
+                        child_style.display =
+                            Display::new(DisplayOuter::Inline, DisplayInner::FlowRoot);
+                    }
+                    // This DOM collector owns inline-formatting content.
+                    // Normal-flow block-level source boxes are represented
+                    // by frozen formatting boxes. Inline-level tables instead
+                    // establish an atomic inline formatting context and must
+                    // remain in this collector. An absolutely positioned
+                    // descendant instead participates in the inline
+                    // ancestor's static-position algorithm regardless of its
+                    // outer display type.
+                    // <https://www.w3.org/TR/css-position-3/#abspos-layout>
                     // <https://www.w3.org/TR/css-display-3/#inlinification>
                     let participates_in_inline_collection = !child_style.display.is_none()
-                        && !child_style.display.is_block_level()
-                        && !child_style.display.is_table();
+                        && (matches!(child_style.position, Position::Absolute | Position::Fixed)
+                            || !child_style.display.is_block_level());
                     if participates_in_inline_collection
                         && matches!(child_style.position, Position::Absolute | Position::Fixed)
                     {
@@ -301,9 +387,6 @@ impl<'a> LayoutBuilder<'a> {
                         );
                         continue;
                     }
-                    child_style.text_decoration = child_style
-                        .text_decoration
-                        .with_propagated_lines(style.text_decoration.clone());
                     if !participates_in_inline_collection {
                         continue;
                     }
@@ -312,130 +395,161 @@ impl<'a> LayoutBuilder<'a> {
                         .get("href")
                         .cloned()
                         .or_else(|| inherited_link.clone());
+                    let child_is_atomic_inline = child_style.display.is_atomic_inline()
+                        || (is_replaced_element(child_element)
+                            && child_style.display.is_inline_level());
                     let child_placement = placement
-                        .with_added_baseline_shift(
-                            self.vertical_align_baseline_shift_for_inline_style(
-                                &child_style,
-                                style,
-                            ),
-                        )
+                        // Atomic inline boxes resolve their own baseline from
+                        // their margin box below. Applying the generic inline
+                        // box shift here as well would align the same
+                        // `vertical-align` value twice.
+                        // <https://www.w3.org/TR/css-inline-3/#atomic-inline>
+                        .with_added_baseline_shift(if !child_is_atomic_inline {
+                            self.vertical_align_baseline_shift_for_inline_style(&child_style, style)
+                        } else {
+                            Default::default()
+                        })
                         .with_added_visual_offset(
                             self.inline_visual_offset_for_style(&child_style),
                         );
-                    // An empty `inline-block` still establishes an atomic
-                    // inline-level box.  It must not be represented only by
-                    // transparent inline-scope edge markers: doing so drops
-                    // its explicit dimensions and background, particularly
-                    // after a forced break where no text fragment can keep
-                    // the scope alive.  Content-bearing atomic inline boxes
-                    // are collected through their frozen formatting boxes;
-                    // this direct-DOM path supplies the corresponding empty
-                    // principal box.
-                    // <https://www.w3.org/TR/css-display-3/#atomic-inline>
-                    // <https://www.w3.org/TR/css-inline-3/#inline-boxes>
-                    if child_style.display.is_atomic_inline()
-                        && child_element.children.is_empty()
-                        && !child_style.content.is_generated()
-                        && child_style.before_style.is_none()
-                        && child_style.after_style.is_none()
-                    {
-                        let counter_scope = self.begin_counter_scope(child_element, &child_style);
-                        let atom = self.inline_atom_for_element(
+                    let decoration_layers = propagated_decoration_layers_for_child(
+                        &style.text_decoration_layers,
+                        &child_style,
+                    );
+                    apply_propagated_decoration_layers(&mut child_style, &decoration_layers);
+                    // The inline collector recurses through the source DOM
+                    // rather than frozen formatting boxes. Keep the current
+                    // child in the selector ancestry for all of its
+                    // descendants so child combinators remain direct-child
+                    // combinators instead of degrading to descendant matches.
+                    // <https://drafts.csswg.org/selectors-4/#child-combinators>
+                    self.with_ancestor_signature(child_signature.clone(), |layout| {
+                        // Atomic inline boxes establish an independent formatting
+                        // context even when the parent block is using the DOM
+                        // inline collector. Rebuild their frozen child stream at
+                        // this boundary so their descendants, own decorations,
+                        // and exported baseline remain one atomic line item.
+                        // Flattening a nonempty inline-block into an inline scope
+                        // loses that boundary and drops its captured paint.
+                        // <https://www.w3.org/TR/css-display-3/#atomic-inline>
+                        // <https://www.w3.org/TR/css-inline-3/#inline-boxes>
+                        if child_is_atomic_inline {
+                            let child_boxes = layout
+                                .build_frozen_child_boxes_with_current_ancestors(
+                                    child_element,
+                                    stylesheets,
+                                    &child_style,
+                                );
+                            let built_table_fragment;
+                            let table_fragment = if child_style.display.is_table() {
+                                built_table_fragment = box_tree::build_frozen_table_fragment(
+                                    child_element,
+                                    &child_signature,
+                                    &child_boxes,
+                                );
+                                Some(&built_table_fragment)
+                            } else {
+                                None
+                            };
+                            let counter_scope =
+                                layout.begin_counter_scope(child_element, &child_style);
+                            let atom = layout.inline_atom_for_element(
+                                child_element,
+                                &child_signature,
+                                &child_style,
+                                &child_boxes,
+                                table_fragment,
+                                stylesheets,
+                                child_placement.baseline_shift,
+                                child_placement.visual_offset,
+                                link.clone(),
+                            );
+                            layout.end_counter_scope(counter_scope);
+                            if let Some(mut atom) = atom {
+                                atom.baseline_shift +=
+                                    layout.vertical_align_baseline_shift_for_atom(&atom, style);
+                                output.push(InlineItem::Atom(Box::new(atom)));
+                            }
+                            return;
+                        }
+                        let scope = layout.begin_inline_element_scope(
                             child_element,
-                            &child_signature,
                             &child_style,
-                            &[],
-                            None,
-                            stylesheets,
+                            link.clone(),
+                            child_placement,
+                            InlineElementScopeOptions::DOM_PAINT,
+                            output,
+                        );
+                        let next_positioning_containing_block =
+                            if inline_style_establishes_positioning_containing_block(&child_style) {
+                                scope.positioning_containing_block_source.as_ref()
+                            } else {
+                                active_positioning_containing_block
+                            };
+                        let scope_establishes_positioned_containing_block =
+                            scope.positioning_containing_block_source.is_some();
+                        let mut scope_deferred_positioned_descendants = Vec::new();
+                        layout.push_generated_pseudo_items(
+                            child_element,
+                            &child_style,
+                            child_style.before_style.as_deref(),
+                            link.clone(),
                             child_placement.baseline_shift,
                             child_placement.visual_offset,
-                            link.clone(),
+                            GeneratedPseudoCounterMode::Commit,
+                            output,
                         );
-                        self.end_counter_scope(counter_scope);
-                        if let Some(mut atom) = atom {
-                            atom.baseline_shift +=
-                                self.vertical_align_baseline_shift_for_atom(&atom, style);
-                            output.push(InlineItem::Atom(Box::new(atom)));
-                        }
-                        continue;
-                    }
-                    let scope = self.begin_inline_element_scope(
-                        child_element,
-                        &child_style,
-                        link.clone(),
-                        child_placement,
-                        InlineElementScopeOptions::DOM_PAINT,
-                        output,
-                    );
-                    let next_positioning_containing_block =
-                        if inline_style_establishes_positioning_containing_block(&child_style) {
-                            scope.positioning_containing_block_source.as_ref()
+                        if child_style.content.is_generated() {
+                            layout.push_element_content_items_from_dom_with_positioned_descendants(
+                                child_element,
+                                &child_style,
+                                stylesheets,
+                                link.clone(),
+                                child_placement,
+                                next_positioning_containing_block,
+                                if scope_establishes_positioned_containing_block {
+                                    Some(&mut scope_deferred_positioned_descendants)
+                                } else {
+                                    deferred_positioned_descendants.as_deref_mut()
+                                },
+                                output,
+                            );
                         } else {
-                            active_positioning_containing_block
-                        };
-                    let scope_establishes_positioned_containing_block =
-                        scope.positioning_containing_block_source.is_some();
-                    let mut scope_deferred_positioned_descendants = Vec::new();
-                    self.push_generated_pseudo_items(
-                        child_element,
-                        &child_style,
-                        child_style.before_style.as_deref(),
-                        link.clone(),
-                        child_placement.baseline_shift,
-                        child_placement.visual_offset,
-                        GeneratedPseudoCounterMode::Commit,
-                        output,
-                    );
-                    if child_style.content.is_generated() {
-                        self.push_element_content_items_from_dom_with_positioned_descendants(
+                            layout.collect_inline_items_with_positioned_descendants(
+                                child_element,
+                                &child_style,
+                                stylesheets,
+                                link.clone(),
+                                child_placement,
+                                next_positioning_containing_block,
+                                if scope_establishes_positioned_containing_block {
+                                    Some(&mut scope_deferred_positioned_descendants)
+                                } else {
+                                    deferred_positioned_descendants.as_deref_mut()
+                                },
+                                output,
+                            );
+                        }
+                        layout.push_generated_pseudo_items(
                             child_element,
                             &child_style,
-                            stylesheets,
+                            child_style.after_style.as_deref(),
                             link.clone(),
-                            child_placement,
-                            next_positioning_containing_block,
-                            if scope_establishes_positioned_containing_block {
-                                Some(&mut scope_deferred_positioned_descendants)
-                            } else {
-                                deferred_positioned_descendants.as_deref_mut()
-                            },
+                            child_placement.baseline_shift,
+                            child_placement.visual_offset,
+                            GeneratedPseudoCounterMode::Commit,
                             output,
                         );
-                    } else {
-                        self.collect_inline_items_with_positioned_descendants(
-                            child_element,
-                            &child_style,
-                            stylesheets,
-                            link.clone(),
-                            child_placement,
-                            next_positioning_containing_block,
-                            if scope_establishes_positioned_containing_block {
-                                Some(&mut scope_deferred_positioned_descendants)
-                            } else {
-                                deferred_positioned_descendants.as_deref_mut()
-                            },
-                            output,
-                        );
-                    }
-                    self.push_generated_pseudo_items(
-                        child_element,
-                        &child_style,
-                        child_style.after_style.as_deref(),
-                        link.clone(),
-                        child_placement.baseline_shift,
-                        child_placement.visual_offset,
-                        GeneratedPseudoCounterMode::Commit,
-                        output,
-                    );
-                    self.end_inline_element_scope(scope, &child_style, output);
-                    if scope_establishes_positioned_containing_block {
-                        self.layout_deferred_inline_positioned_descendants(
-                            scope_deferred_positioned_descendants,
-                            stylesheets,
-                            style,
-                            output,
-                        );
-                    }
+                        layout.end_inline_element_scope(scope, &child_style, output);
+                        if scope_establishes_positioned_containing_block {
+                            layout.layout_deferred_inline_positioned_descendants(
+                                scope_deferred_positioned_descendants,
+                                stylesheets,
+                                style,
+                                output,
+                            );
+                        }
+                    });
                 }
             }
         }
@@ -445,12 +559,12 @@ impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn collect_inline_box_items(
         &mut self,
         children: &[box_tree::FormattingBox<'_>],
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         inherited_link: Option<String>,
         baseline_shift: f32,
         visual_offset: InlineVisualOffset,
         block_style: &ComputedStyle,
-        propagated_decoration: css::TextDecoration,
+        propagated_decoration_layers: Vec<css::TextDecorationLayer>,
         output: &mut Vec<InlineItem>,
     ) {
         self.collect_inline_box_items_with_float_containing_block(
@@ -460,7 +574,7 @@ impl<'a> LayoutBuilder<'a> {
             baseline_shift,
             visual_offset,
             block_style,
-            propagated_decoration,
+            propagated_decoration_layers,
             None,
             None,
             output,
@@ -471,12 +585,12 @@ impl<'a> LayoutBuilder<'a> {
     fn collect_inline_box_items_with_float_containing_block(
         &mut self,
         children: &[box_tree::FormattingBox<'_>],
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         inherited_link: Option<String>,
         baseline_shift: f32,
         visual_offset: InlineVisualOffset,
         block_style: &ComputedStyle,
-        propagated_decoration: css::TextDecoration,
+        propagated_decoration_layers: Vec<css::TextDecorationLayer>,
         active_float_containing_block: Option<&InlinePositioningContainingBlockSource>,
         mut deferred_positioned_descendants: Option<&mut Vec<DeferredInlinePositionedDescendant>>,
         output: &mut Vec<InlineItem>,
@@ -546,11 +660,10 @@ impl<'a> LayoutBuilder<'a> {
                     baseline_shift,
                     visual_offset,
                     block_style,
-                    box_.core
-                        .style
-                        .text_decoration
-                        .clone()
-                        .with_propagated_lines(propagated_decoration.clone()),
+                    propagated_decoration_layers_for_child(
+                        &propagated_decoration_layers,
+                        &box_.core.style,
+                    ),
                     active_float_containing_block,
                     deferred_positioned_descendants.as_deref_mut(),
                     output,
@@ -568,9 +681,11 @@ impl<'a> LayoutBuilder<'a> {
             match child {
                 box_tree::FormattingBox::Text(box_) => {
                     let mut text_style = box_tree::owned_style(&box_.style);
-                    text_style.text_decoration = text_style
-                        .text_decoration
-                        .with_propagated_lines(propagated_decoration.clone());
+                    let decoration_layers = propagated_decoration_layers_for_child(
+                        &propagated_decoration_layers,
+                        &text_style,
+                    );
+                    apply_propagated_decoration_layers(&mut text_style, &decoration_layers);
                     self.push_inline_words(
                         &box_.text,
                         &text_style,
@@ -581,13 +696,12 @@ impl<'a> LayoutBuilder<'a> {
                     );
                 }
                 box_tree::FormattingBox::Inline(box_) => {
-                    if matches!(
+                    let footnote_call = matches!(
                         &box_.core.source,
                         box_tree::BoxSource::GeneratedPseudo(pseudo)
                             if pseudo.kind == box_tree::GeneratedPseudoKind::FootnoteCall
-                    ) {
-                        self.handle_footnote_call(box_.core.element);
-                    }
+                    )
+                    .then_some(box_.core.element.id);
                     let principal_source =
                         matches!(&box_.core.source, box_tree::BoxSource::Principal);
                     if principal_source {
@@ -604,16 +718,30 @@ impl<'a> LayoutBuilder<'a> {
                         continue;
                     }
                     let mut inline_style = box_tree::owned_style(&box_.core.style);
-                    inline_style.text_decoration = inline_style
-                        .text_decoration
-                        .with_propagated_lines(propagated_decoration.clone());
-                    let link = box_
-                        .core
-                        .element
-                        .attrs
-                        .get("href")
-                        .cloned()
-                        .or_else(|| inherited_link.clone());
+                    inline_style.suppress_inapplicable_transform();
+                    let decoration_layers = propagated_decoration_layers_for_child(
+                        &propagated_decoration_layers,
+                        &inline_style,
+                    );
+                    apply_propagated_decoration_layers(&mut inline_style, &decoration_layers);
+                    // A ruby text container containing only out-of-flow
+                    // descendants has no anonymous annotation box, but its
+                    // descendants still need the normal positioned/float
+                    // collection path below. Suppressing this source box
+                    // outright would lose an abspos descendant and its
+                    // static-position containing block.
+                    // <https://drafts.csswg.org/css-ruby-1/#anon-gen-ruby>
+                    // Only defer ruby materialization when a first-letter
+                    // pseudo actually needs to select from the base level.
+                    // A ruby at the beginning of an ordinary line must still
+                    // go through paired base/annotation layout; otherwise
+                    // the generic inline recursion flattens its annotations
+                    // into parent text.
+                    // <https://drafts.csswg.org/css-ruby-1/#ruby-layout>
+                    // <https://drafts.csswg.org/css-pseudo-4/#first-letter-pseudo>
+                    let ruby_can_own_first_letter = inline_style.display.is_ruby()
+                        && block_style.first_letter_style.is_some()
+                        && !output.iter().any(inline_item_has_typographic_content);
                     let child_placement = InlinePlacement::new(baseline_shift, visual_offset)
                         .with_added_baseline_shift(
                             self.vertical_align_baseline_shift_for_inline_style(
@@ -624,6 +752,82 @@ impl<'a> LayoutBuilder<'a> {
                         .with_added_visual_offset(
                             self.inline_visual_offset_for_style(&inline_style),
                         );
+                    // A ruby formatting context contributes its bases to the
+                    // parent inline stream while annotations are sidecars.
+                    // Materialize the normalized in-flow levels as a coupled
+                    // ruby atom until the graph gains per-column break nodes;
+                    // this keeps annotations out of ordinary parent text,
+                    // spacing, and justification. Positioned and floated
+                    // descendants stay on the generic scope path below so
+                    // their containing-block ownership remains intact.
+                    // <https://drafts.csswg.org/css-ruby-1/#ruby-layout>
+                    if inline_style.display.is_ruby() {
+                        let out_of_flow_overlay =
+                            ruby_has_out_of_flow_descendant(&box_.core.children).then(|| {
+                                ruby_out_of_flow_overlay(&box_tree::FormattingBox::Inline(
+                                    box_.clone(),
+                                ))
+                            });
+                        if self.collect_normalized_ruby_items(
+                            &box_.core.children,
+                            &inline_style,
+                            stylesheets,
+                            box_.core
+                                .element
+                                .attrs
+                                .get("href")
+                                .cloned()
+                                .or_else(|| inherited_link.clone()),
+                            child_placement,
+                            block_style,
+                            ruby_can_own_first_letter
+                                .then_some(block_style.first_letter_style.as_deref())
+                                .flatten(),
+                            decoration_layers.clone(),
+                            output,
+                        ) {
+                            if let Some(out_of_flow_overlay) = out_of_flow_overlay {
+                                self.collect_inline_box_items_with_float_containing_block(
+                                    std::slice::from_ref(&out_of_flow_overlay),
+                                    stylesheets,
+                                    inherited_link.clone(),
+                                    child_placement.baseline_shift,
+                                    child_placement.visual_offset,
+                                    block_style,
+                                    decoration_layers.clone(),
+                                    active_float_containing_block,
+                                    deferred_positioned_descendants.as_deref_mut(),
+                                    output,
+                                );
+                            }
+                            if principal_source {
+                                self.capture_suppressed_named_strings_after(box_.core.element.id);
+                            }
+                            continue;
+                        }
+                    }
+                    // A principal HTML `br` is a semantic forced line break,
+                    // not merely the UA `::before` newline used as its
+                    // fallback representation.  Box-tree collection reaches
+                    // this path after pseudo generation, so recognize the
+                    // principal box directly; author `br::before { content:
+                    // none }` must not erase the HTML line boundary.
+                    // <https://html.spec.whatwg.org/multipage/text-level-semantics.html#the-br-element>
+                    if principal_source && is_line_break_element(box_.core.element) {
+                        output.push(InlineItem::Break(InlineBreak {
+                            clear: inline_style.clear,
+                            origin: InlineBreakOrigin::Explicit,
+                        }));
+                        self.capture_suppressed_named_strings_after(box_.core.element.id);
+                        continue;
+                    }
+                    let link = box_
+                        .core
+                        .element
+                        .attrs
+                        .get("href")
+                        .cloned()
+                        .or_else(|| inherited_link.clone());
                     let contents_generated_pseudo = inline_style.display.is_contents()
                         && matches!(&box_.core.source, box_tree::BoxSource::GeneratedPseudo(_));
                     // `display: contents` retains generated content but
@@ -655,7 +859,48 @@ impl<'a> LayoutBuilder<'a> {
                     let scope_establishes_positioned_containing_block = scope
                         .as_ref()
                         .is_some_and(|scope| scope.positioning_containing_block_source.is_some());
+                    let ruby_positioning_source = (inline_style.display.is_ruby()
+                        || inline_style.display.is_ruby_internal())
+                    .then(|| {
+                        scope
+                            .as_ref()
+                            .and_then(|scope| scope.positioning_containing_block_source.clone())
+                    })
+                    .flatten();
                     let mut scope_deferred_positioned_descendants = Vec::new();
+                    let inlinified_ruby_children = inline_style
+                        .display
+                        .is_ruby_internal()
+                        .then(|| ruby::inlinified_direct_children(&box_.core.children));
+                    let inline_children = inlinified_ruby_children
+                        .as_deref()
+                        .unwrap_or(&box_.core.children);
+                    if scope_establishes_positioned_containing_block
+                        && (inline_style.display.is_ruby()
+                            || inline_style.display.is_ruby_internal())
+                        && !ruby_container_has_in_flow_content(&box_.core.children)
+                    {
+                        // Empty ruby levels can still establish the
+                        // containing block for an explicitly inset abspos
+                        // descendant. Keep a zero-advance, non-painting line
+                        // participant so the positioned-inline replay has a
+                        // selected line fragment from which to recover the
+                        // scope's start/end edges.
+                        // <https://drafts.csswg.org/css-ruby-1/#ruby-layout>
+                        // <https://drafts.csswg.org/css-position-3/#def-cb>
+                        output.push(InlineItem::Atom(Box::new(InlineAtom::new(
+                            InlineAtomContent::Canvas,
+                            inline_style.clone(),
+                            None,
+                            InlineSize::new(0.0, inline_style.line_height),
+                            self.font_system
+                                .rendered_first_line_baseline_offset(&inline_style)
+                                .points(),
+                            child_placement.baseline_shift,
+                            None,
+                            None,
+                        ))));
+                    }
                     if inline_style.content.is_generated() {
                         let generated_pseudo_content_style =
                             matches!(&box_.core.source, box_tree::BoxSource::GeneratedPseudo(_))
@@ -675,13 +920,13 @@ impl<'a> LayoutBuilder<'a> {
                                     box_tree::CounterEventSource::Principal
                                 }
                             },
-                            &box_.core.children,
+                            inline_children,
                             stylesheets,
                             link.clone(),
                             child_placement.baseline_shift,
                             child_placement.visual_offset,
                             block_style,
-                            inline_style.text_decoration.clone(),
+                            decoration_layers.clone(),
                             output,
                         );
                         let clear = generated_content_originating_clear(&box_.core.source)
@@ -692,15 +937,21 @@ impl<'a> LayoutBuilder<'a> {
                             output,
                             start_len,
                         );
+                        if let Some(footnote_call) = footnote_call {
+                            mark_inline_items_as_footnote_call(
+                                &mut output[start_len..],
+                                footnote_call,
+                            );
+                        }
                     } else {
                         self.collect_inline_box_items_with_float_containing_block(
-                            &box_.core.children,
+                            inline_children,
                             stylesheets,
                             link.clone(),
                             child_placement.baseline_shift,
                             child_placement.visual_offset,
                             block_style,
-                            inline_style.text_decoration.clone(),
+                            decoration_layers,
                             next_float_containing_block,
                             if scope_establishes_positioned_containing_block {
                                 Some(&mut scope_deferred_positioned_descendants)
@@ -714,12 +965,26 @@ impl<'a> LayoutBuilder<'a> {
                         self.end_inline_element_scope(scope, &inline_style, output);
                     }
                     if scope_establishes_positioned_containing_block {
+                        let deferred_element_ids = scope_deferred_positioned_descendants
+                            .iter()
+                            .map(|descendant| descendant.element.id)
+                            .collect::<Vec<_>>();
                         self.layout_deferred_inline_positioned_descendants(
                             scope_deferred_positioned_descendants,
                             stylesheets,
                             block_style,
                             output,
                         );
+                        if let Some(source) = ruby_positioning_source.as_ref() {
+                            self.layout_undeferred_ruby_positioned_descendants(
+                                &box_.core.children,
+                                stylesheets,
+                                block_style,
+                                source,
+                                &deferred_element_ids,
+                                output,
+                            );
+                        }
                     }
                     if principal_source {
                         self.capture_suppressed_named_strings_after(box_.core.element.id);
@@ -773,6 +1038,44 @@ impl<'a> LayoutBuilder<'a> {
                             atom_visual_offset,
                             output,
                         );
+                    }
+                }
+                box_tree::FormattingBox::Table(box_)
+                    if box_.core.style.display.is_inline_level() =>
+                {
+                    // The table tree retains its durable `Table` variant
+                    // independently of its outer display. An `inline-table`
+                    // is nevertheless an atomic inline in this formatting
+                    // context, so collecting it as a block drops both its
+                    // intrinsic inline contribution and exported baseline.
+                    // <https://drafts.csswg.org/css-display-3/#valdef-display-inline-table>
+                    let link = box_
+                        .core
+                        .element
+                        .attrs
+                        .get("href")
+                        .cloned()
+                        .or_else(|| inherited_link.clone());
+                    let atom_visual_offset =
+                        visual_offset.plus(self.inline_visual_offset_for_style(&box_.core.style));
+                    let counter_scope =
+                        self.begin_counter_scope(box_.core.element, &box_.core.style);
+                    let atom = self.inline_atom_for_element(
+                        box_.core.element,
+                        &box_.core.signature,
+                        &box_.core.style,
+                        &box_.core.children,
+                        Some(&box_.fragment),
+                        stylesheets,
+                        baseline_shift,
+                        atom_visual_offset,
+                        link.clone(),
+                    );
+                    self.end_counter_scope(counter_scope);
+                    if let Some(mut atom) = atom {
+                        atom.baseline_shift +=
+                            self.vertical_align_baseline_shift_for_atom(&atom, block_style);
+                        output.push(InlineItem::Atom(Box::new(atom)));
                     }
                 }
                 box_tree::FormattingBox::Replaced(box_) => {
@@ -841,18 +1144,18 @@ impl<'a> LayoutBuilder<'a> {
                         baseline_shift,
                         visual_offset,
                         block_style,
-                        box_.style
-                            .text_decoration
-                            .clone()
-                            .with_propagated_lines(propagated_decoration.clone()),
+                        propagated_decoration_layers_for_child(
+                            &propagated_decoration_layers,
+                            &box_.style,
+                        ),
                         active_float_containing_block,
                         deferred_positioned_descendants.as_deref_mut(),
                         output,
                     ),
                 box_tree::FormattingBox::Block(_)
                 | box_tree::FormattingBox::InlineSplitBlockContext(_)
-                | box_tree::FormattingBox::Table(_)
                 | box_tree::FormattingBox::Flex(_) => {}
+                box_tree::FormattingBox::Table(_) => {}
             }
         }
     }
@@ -862,7 +1165,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
         block_style: &ComputedStyle,
@@ -873,7 +1176,7 @@ impl<'a> LayoutBuilder<'a> {
             return;
         }
         let source_was_inline_level =
-            style.abspos_static_source_was_inline_level || style.display.is_inline_level();
+            style.abspos_static_source.is_inline_level() || style.display.is_inline_level();
         if source_was_inline_level {
             // A horizontal replaced source inside a principal vertical flow
             // is measured in a scratch physical span. Its normal-flow
@@ -903,9 +1206,13 @@ impl<'a> LayoutBuilder<'a> {
                 );
             }
             let mut positioned_style = style.clone();
-            positioned_style.abspos_static_source_was_inline_level = true;
-            positioned_style.abspos_static_source_was_atomic_inline =
-                style.abspos_static_source_was_atomic_inline || style.display.is_atomic_inline();
+            positioned_style.abspos_static_source = if style.abspos_static_source.is_atomic_inline()
+                || style.display.is_atomic_inline()
+            {
+                css::StaticPositionSource::AtomicInline
+            } else {
+                css::StaticPositionSource::Inline
+            };
             let static_position = self.inline_static_position_from_hypothetical_placeholder(
                 element,
                 &positioned_style,
@@ -1076,7 +1383,8 @@ impl<'a> LayoutBuilder<'a> {
                     source,
                     block_style,
                     output,
-                )?;
+                );
+                let containing_block = containing_block?;
                 // See the corresponding inline-level branch above.  The
                 // source containing block is expressed in the temporary
                 // atom page and therefore moves with that atom on escape.
@@ -1245,9 +1553,9 @@ impl<'a> LayoutBuilder<'a> {
     fn layout_deferred_inline_positioned_descendants(
         &mut self,
         descendants: Vec<DeferredInlinePositionedDescendant>,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         block_style: &ComputedStyle,
-        output: &[InlineItem],
+        output: &mut [InlineItem],
     ) {
         for descendant in descendants {
             // Rebuild only at the final inline edge, where its ancestor's
@@ -1259,6 +1567,7 @@ impl<'a> LayoutBuilder<'a> {
                 stylesheets,
                 &descendant.style,
             );
+            let positioned_layer_start = self.positioned_layers.len();
             self.layout_positioned_inline_descendant(
                 &descendant.element,
                 &descendant.style,
@@ -1269,7 +1578,384 @@ impl<'a> LayoutBuilder<'a> {
                 Some(&descendant.containing_block_source),
                 output,
             );
+            let layers = self.positioned_layers.split_off(positioned_layer_start);
+            DeferredClampEffect::PositionedLayers {
+                owner: descendant.containing_block_source.id,
+                layers,
+            }
+            .attach_to_owner(output);
         }
+    }
+
+    /// Replay explicitly inset positioned descendants that are nested in a
+    /// ruby role but did not travel through the ordinary inline collector.
+    ///
+    /// Ruby's anonymous base/text containers may be structurally empty after
+    /// excluding out-of-flow descendants. They must nevertheless inherit a
+    /// positioned ruby/rbc scope as their containing block; CSS Ruby does not
+    /// turn that ownership into ordinary annotation content.
+    /// <https://drafts.csswg.org/css-ruby-1/#ruby-layout>
+    /// <https://drafts.csswg.org/css-position-3/#def-cb>
+    #[allow(clippy::too_many_arguments)]
+    fn layout_undeferred_ruby_positioned_descendants(
+        &mut self,
+        children: &[box_tree::FormattingBox<'_>],
+        stylesheets: &Stylesheets<'_>,
+        block_style: &ComputedStyle,
+        containing_block_source: &InlinePositioningContainingBlockSource,
+        already_deferred: &[ElementId],
+        output: &[InlineItem],
+    ) {
+        for child in children {
+            let Some((element, _, style, child_boxes)) = child.element_parts() else {
+                if let box_tree::FormattingBox::AnonymousBlock(box_) = child {
+                    self.layout_undeferred_ruby_positioned_descendants(
+                        &box_.children,
+                        stylesheets,
+                        block_style,
+                        containing_block_source,
+                        already_deferred,
+                        output,
+                    );
+                }
+                continue;
+            };
+            if matches!(style.position, Position::Absolute | Position::Fixed)
+                && positioned_descendant_has_explicit_inset(style)
+            {
+                if !already_deferred.contains(&element.id) {
+                    let table_fragment = match child {
+                        box_tree::FormattingBox::AtomicInline(box_) => box_.table_fragment.as_ref(),
+                        box_tree::FormattingBox::Table(box_) => Some(&box_.fragment),
+                        _ => None,
+                    };
+                    self.layout_positioned_inline_descendant(
+                        element,
+                        style,
+                        stylesheets,
+                        Some(child_boxes),
+                        table_fragment,
+                        block_style,
+                        Some(containing_block_source),
+                        output,
+                    );
+                }
+                continue;
+            }
+            self.layout_undeferred_ruby_positioned_descendants(
+                child_boxes,
+                stylesheets,
+                block_style,
+                containing_block_source,
+                already_deferred,
+                output,
+            );
+        }
+    }
+
+    /// Collect a ruby container through its normalized base/annotation
+    /// columns. Both the source-DOM and frozen-box collectors use this one
+    /// materialization boundary, ensuring that authored layout-internal roles
+    /// do not alter ruby pairing semantics.
+    #[allow(clippy::too_many_arguments)]
+    fn collect_normalized_ruby_items(
+        &mut self,
+        children: &[box_tree::FormattingBox<'_>],
+        ruby_style: &ComputedStyle,
+        stylesheets: &Stylesheets<'_>,
+        link: Option<String>,
+        placement: InlinePlacement,
+        block_style: &ComputedStyle,
+        first_letter_style: Option<&ComputedStyle>,
+        propagated_decoration_layers: Vec<css::TextDecorationLayer>,
+        output: &mut Vec<InlineItem>,
+    ) -> bool {
+        let normalized = ruby::NormalizedRuby::from_children(children);
+        debug_assert!(
+            normalized
+                .columns
+                .iter()
+                .all(|column| column.annotations.len() == normalized.annotation_level_count)
+        );
+        let mut ruby_atoms = Vec::with_capacity(normalized.columns.len());
+        let mut pending_first_letter_style = first_letter_style;
+        for column in &normalized.columns {
+            let Some((mut atom, has_base_content)) = self.ruby_inline_atom(
+                column,
+                ruby_style,
+                stylesheets,
+                link.clone(),
+                placement,
+                block_style,
+                pending_first_letter_style,
+                propagated_decoration_layers.clone(),
+            ) else {
+                return false;
+            };
+            if has_base_content {
+                pending_first_letter_style = None;
+            }
+            atom.baseline_shift += self.vertical_align_baseline_shift_for_atom(&atom, block_style);
+            ruby_atoms.push(InlineItem::Atom(Box::new(atom)));
+        }
+        normalize_ruby_column_group_metrics(&mut ruby_atoms, block_style);
+        normalize_ruby_annotation_span_inline_sizes(&mut ruby_atoms, block_style);
+        if ruby_atoms.is_empty() {
+            return false;
+        }
+        output.extend(ruby_atoms);
+        true
+    }
+
+    /// Build a coupled ruby base/annotation atom from normalized in-flow
+    /// segments.  This is the materialization boundary between CSS Ruby's
+    /// paired levels and the parent inline graph.
+    ///
+    /// The graph currently keeps a whole ruby group together; later work can
+    /// replace this atom with per-column graph ranges without changing the
+    /// normalization or paint representation.
+    /// <https://drafts.csswg.org/css-ruby-1/#ruby-layout>
+    #[allow(clippy::too_many_arguments)]
+    fn ruby_inline_atom(
+        &mut self,
+        column: &ruby::RubyColumn<'_>,
+        ruby_style: &ComputedStyle,
+        stylesheets: &Stylesheets<'_>,
+        link: Option<String>,
+        placement: InlinePlacement,
+        block_style: &ComputedStyle,
+        first_letter_style: Option<&ComputedStyle>,
+        propagated_decoration_layers: Vec<css::TextDecorationLayer>,
+    ) -> Option<(InlineAtom, bool)> {
+        // A Ruby level is not an independently originating block line. Its
+        // own `::first-line` rules must therefore remain dormant; the parent
+        // block applies its selected overlay to the complete ruby formatting
+        // context once the parent first line is known.
+        // <https://drafts.csswg.org/css-pseudo-4/#first-line-pseudo>
+        let mut base_style = column.base.style.as_deref().unwrap_or(ruby_style).clone();
+        base_style.first_line_style = None;
+        base_style.suppress_inapplicable_transform();
+        let mut base_items = Vec::new();
+        self.collect_inline_box_items(
+            &column.base.boxes,
+            stylesheets,
+            link.clone(),
+            placement.baseline_shift,
+            placement.visual_offset,
+            block_style,
+            propagated_decoration_layers.clone(),
+            &mut base_items,
+        );
+        let has_base_content = base_items.iter().any(inline_item_has_typographic_content);
+        if let Some(first_letter_style) = first_letter_style {
+            apply_first_letter_style_to_ruby_base_items(&mut base_items, first_letter_style);
+        }
+        // Ruby's no-break-inside default means this temporary measurement can
+        // use a deliberately unbounded inline span.  Its selected fragments
+        // are replayed into the final coupled width below.
+        let unconstrained_inline_size = 1_000_000.0;
+        let base_items_for_distribution = base_items.clone();
+        let mut base = RubyInlineLevel {
+            sequence: self.collect_inline_line_sequence_with_text_box_trim(
+                base_items,
+                &base_style,
+                unconstrained_inline_size,
+                0.0,
+                0.0,
+            ),
+            style: Box::new(base_style.clone()),
+            paint_inline_size: 0.0,
+            containing_inline_size: 0.0,
+            starts_span: true,
+            column_span: 1,
+        };
+        let mut annotations = Vec::with_capacity(column.annotations.len());
+        let mut annotation_sides = Vec::with_capacity(column.annotations.len());
+        let mut annotation_items_for_distribution = Vec::with_capacity(column.annotations.len());
+        for annotation in &column.annotations {
+            let mut annotation_style = annotation
+                .segment
+                .style
+                .as_deref()
+                .unwrap_or(ruby_style)
+                .clone();
+            annotation_style.first_line_style = None;
+            annotation_style.suppress_inapplicable_transform();
+            annotation_sides.push(annotation_style.ruby_position.interlinear_side());
+            let mut annotation_items = Vec::new();
+            // A structurally present annotation containing generated `" "`
+            // is real ruby content. Only the explicitly synthesized empty
+            // counterpart has no inner formatting context to collect.
+            // <https://drafts.csswg.org/css-ruby-1/#anon-gen-ruby>
+            if annotation.starts_span && !annotation.segment.is_empty() {
+                self.collect_inline_box_items(
+                    &annotation.segment.boxes,
+                    stylesheets,
+                    link.clone(),
+                    placement.baseline_shift,
+                    placement.visual_offset,
+                    block_style,
+                    propagated_decoration_layers.clone(),
+                    &mut annotation_items,
+                );
+            }
+            annotation_items_for_distribution.push(annotation_items.clone());
+            annotations.push(RubyInlineLevel {
+                sequence: self.collect_inline_line_sequence_with_text_box_trim(
+                    annotation_items,
+                    &annotation_style,
+                    unconstrained_inline_size,
+                    0.0,
+                    0.0,
+                ),
+                style: Box::new(annotation_style.clone()),
+                paint_inline_size: 0.0,
+                containing_inline_size: 0.0,
+                starts_span: annotation.starts_span,
+                column_span: annotation.span,
+            });
+        }
+        if !has_base_content
+            && !annotations.iter().any(|sequence| {
+                sequence
+                    .sequence
+                    .records
+                    .iter()
+                    .any(|record| record.fragment.is_some())
+            })
+        {
+            return None;
+        }
+        let sequence_inline_size = |sequence: &inline_layout::InlineLineSequence| {
+            sequence
+                .records
+                .iter()
+                .filter_map(|record| record.fragment.as_ref())
+                .map(|fragment| fragment.metrics.width)
+                .fold(0.0, f32::max)
+        };
+        let inline_size = ruby::RubyInlineSpan::new(
+            column
+                .annotations
+                .iter()
+                .zip(annotations.iter())
+                // A spanning annotation is sized and aligned across the complete
+                // paired base range. It must not inflate each base column (and
+                // thereby manufacture parent-line justification opportunities);
+                // excess annotation width overhangs the spanned range.
+                // <https://drafts.csswg.org/css-ruby-1/#ruby-overhang>
+                .filter(|(annotation, _)| annotation.span == 1)
+                .map(|(_, sequence)| sequence_inline_size(&sequence.sequence))
+                .fold(sequence_inline_size(&base.sequence), f32::max),
+        )
+        .points();
+        base.paint_inline_size = sequence_inline_size(&base.sequence);
+        base.containing_inline_size = inline_size;
+        for annotation in &mut annotations {
+            annotation.paint_inline_size = sequence_inline_size(&annotation.sequence);
+            annotation.containing_inline_size = inline_size;
+        }
+        self.distribute_ruby_level_space_around(
+            &mut base,
+            &base_items_for_distribution,
+            inline_size,
+        );
+        for ((annotation, source_items), pairing) in annotations
+            .iter_mut()
+            .zip(annotation_items_for_distribution.iter())
+            .zip(column.annotations.iter())
+        {
+            // A spanning annotation is positioned by the column group that
+            // owns its full span. This per-column atom only has its local
+            // span available today, so retain its natural alignment until
+            // group-level span paint is materialized below.
+            if pairing.span == 1 {
+                self.distribute_ruby_level_space_around(annotation, source_items, inline_size);
+            }
+        }
+        let base_block_size = base.sequence.total_height().max(base_style.line_height);
+        let annotation_block_sizes = annotations
+            .iter()
+            .map(|annotation| annotation.sequence.total_height())
+            .collect::<Vec<_>>();
+        let annotation_block_size = annotation_block_sizes.iter().sum::<f32>();
+        let base_baseline = base
+            .sequence
+            .records
+            .iter()
+            .find_map(|record| {
+                record
+                    .fragment
+                    .as_ref()
+                    .map(|fragment| fragment.metrics.baseline_offset)
+            })
+            .unwrap_or_else(|| {
+                self.font_system
+                    .rendered_first_line_baseline_offset(ruby_style)
+                    .points()
+            });
+        Some((
+            InlineAtom::new(
+                InlineAtomContent::Ruby {
+                    base_text: column.base.boundary_text(),
+                    base,
+                    annotations,
+                    annotation_sides,
+                    base_block_size,
+                    annotation_block_sizes,
+                },
+                ruby_style.clone(),
+                None,
+                InlineSize::new(inline_size, base_block_size + annotation_block_size),
+                annotation_block_size + base_baseline,
+                placement.baseline_shift,
+                link,
+                None,
+            )
+            .with_visual_offset(placement.visual_offset),
+            has_base_content,
+        ))
+    }
+
+    /// Apply the initial `ruby-align: space-around` distribution to a level.
+    ///
+    /// The CSS Ruby UA rule delegates its inner opportunities to
+    /// `text-justify: ruby`; this implementation uses the existing
+    /// typographic-unit justification path for CJK-wide units, then reserves
+    /// half an equal opportunity at each edge of the level.
+    /// <https://drafts.csswg.org/css-ruby-1/#ruby-align-property>
+    fn distribute_ruby_level_space_around(
+        &mut self,
+        level: &mut RubyInlineLevel,
+        items: &[InlineItem],
+        containing_inline_size: f32,
+    ) {
+        let natural_inline_size = ruby_line_sequence_inline_size(&level.sequence);
+        let Some(unit_count) = ruby_distribution_unit_count(items) else {
+            return;
+        };
+        let free_space = (containing_inline_size - natural_inline_size).max(0.0);
+        if free_space <= 0.0 {
+            return;
+        }
+        // `space-around` has one extra opportunity split across the two
+        // edges. With N CJK units, the N equal shares leave N-1 internal
+        // gaps and one split edge gap. Lay out the justified core in the
+        // remaining width, then center it in the ruby column.
+        let per_opportunity = free_space / unit_count as f32;
+        let core_inline_size = (containing_inline_size - per_opportunity).max(natural_inline_size);
+        let mut distribution_style = (*level.style).clone();
+        distribution_style.text_align = TextAlign::JustifyAll;
+        distribution_style.text_justify = TextJustify::InterCharacter;
+        level.sequence = self.collect_inline_line_sequence_with_text_box_trim(
+            items.to_vec(),
+            &distribution_style,
+            core_inline_size,
+            0.0,
+            0.0,
+        );
+        *level.style = distribution_style;
+        level.paint_inline_size = core_inline_size;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1277,7 +1963,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
         block_style: &ComputedStyle,
@@ -1331,15 +2017,15 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
     ) -> InlineAtom {
         let available_width = (self.content_right - self.content_left).max(style.font_size);
         let mut placeholder_style = self.style_with_current_viewport_lengths(style);
-        apply_used_box_metrics(
+        apply_used_box_metrics_for_logical_inline_basis(
             &mut placeholder_style,
-            PercentageBasis::definite(layout_pt(available_width)),
+            self.current_content_logical_inline_percentage_basis(),
         );
         let horizontal_non_content = placeholder_style.padding.left
             + placeholder_style.padding.right
@@ -1383,9 +2069,14 @@ impl<'a> LayoutBuilder<'a> {
         .unwrap_or(placeholder_style.line_height);
         let border_box_height = content_height + vertical_non_content;
         let line_baseline_offset = if placeholder_style.display.is_atomic_inline()
-            || placeholder_style.abspos_static_source_was_atomic_inline
+            || placeholder_style.abspos_static_source.is_atomic_inline()
         {
-            Self::inline_block_baseline_offset(&placeholder_style, border_box_height, None)
+            Self::inline_block_baseline_offset(
+                &placeholder_style,
+                used_property_containment(element, &placeholder_style).layout,
+                border_box_height,
+                None,
+            )
         } else {
             self.font_system
                 .rendered_first_line_baseline_offset(&placeholder_style)
@@ -1394,7 +2085,7 @@ impl<'a> LayoutBuilder<'a> {
 
         InlineAtom::new(
             InlineAtomContent::StaticPositionPlaceholder,
-            placeholder_style.clone(),
+            placeholder_style.as_computed().clone(),
             None,
             InlineSize::new(
                 border_box_width + placeholder_style.margin.left + placeholder_style.margin.right,
@@ -1453,9 +2144,13 @@ impl<'a> LayoutBuilder<'a> {
                             .then_some(InlineStaticPosition {
                                 start_x: atom.content_rect.x(),
                                 end_x: atom.content_rect.x() + atom.content_rect.width(),
-                                top_y: atom.content_rect.y()
-                                    + atom.content_rect.height()
-                                    + atom.atom.style().margin.top,
+                                // `content_rect` is already placed within
+                                // the placeholder's margin box. Adding the
+                                // source margin again shifts an abspos atomic
+                                // source by that margin twice when the
+                                // absolute-position equation moves from its
+                                // static margin edge to its border box.
+                                top_y: atom.content_rect.y() + atom.content_rect.height(),
                                 // The positioned fragment is later translated
                                 // from its own first-line baseline. Preserve
                                 // the matching baseline of the hypothetical
@@ -1474,7 +2169,7 @@ impl<'a> LayoutBuilder<'a> {
                                 // their margin box.
                                 // <https://drafts.csswg.org/css-position-3/#staticpos-rect>
                                 use_margin_box_top: atom.atom.style().display.is_atomic_inline()
-                                    || atom.atom.style().abspos_static_source_was_atomic_inline
+                                    || atom.atom.style().abspos_static_source.is_atomic_inline()
                                     // A definite block-size gives the
                                     // hypothetical inline box a concrete
                                     // margin-box block-start. Auto-height
@@ -1506,7 +2201,7 @@ impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn collect_intrinsic_inline_box_items(
         &mut self,
         children: &[box_tree::FormattingBox<'_>],
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         inherited_link: Option<String>,
         context: IntrinsicInlineCollectionContext<'_>,
         output: &mut Vec<InlineItem>,
@@ -1528,7 +2223,10 @@ impl<'a> LayoutBuilder<'a> {
                     trim_trailing_inline_spaces(output);
                     output.push(InlineItem::Break(InlineBreak::default()));
                 }
-                let propagated_decoration = context.propagated_decoration.clone();
+                let decoration_layers = propagated_decoration_layers_for_child(
+                    &context.propagated_decoration_layers,
+                    &box_.core.style,
+                );
                 self.collect_intrinsic_inline_box_items(
                     &box_.core.children,
                     stylesheets,
@@ -1536,13 +2234,7 @@ impl<'a> LayoutBuilder<'a> {
                     context
                         .clone()
                         .with_block_style(&box_.core.style)
-                        .with_propagated_decoration(
-                            box_.core
-                                .style
-                                .text_decoration
-                                .clone()
-                                .with_propagated_lines(propagated_decoration),
-                        ),
+                        .with_propagated_decoration_layers(decoration_layers),
                     output,
                 );
                 if formatting_box_has_inline_content(&box_.core.children)
@@ -1558,9 +2250,11 @@ impl<'a> LayoutBuilder<'a> {
             match child {
                 box_tree::FormattingBox::Text(box_) => {
                     let mut text_style = box_tree::owned_style(&box_.style);
-                    text_style.text_decoration = text_style
-                        .text_decoration
-                        .with_propagated_lines(context.propagated_decoration.clone());
+                    let decoration_layers = propagated_decoration_layers_for_child(
+                        &context.propagated_decoration_layers,
+                        &text_style,
+                    );
+                    apply_propagated_decoration_layers(&mut text_style, &decoration_layers);
                     self.push_inline_words(
                         &box_.text,
                         &text_style,
@@ -1572,9 +2266,11 @@ impl<'a> LayoutBuilder<'a> {
                 }
                 box_tree::FormattingBox::Inline(box_) => {
                     let mut inline_style = box_tree::owned_style(&box_.core.style);
-                    inline_style.text_decoration = inline_style
-                        .text_decoration
-                        .with_propagated_lines(context.propagated_decoration.clone());
+                    let decoration_layers = propagated_decoration_layers_for_child(
+                        &context.propagated_decoration_layers,
+                        &inline_style,
+                    );
+                    apply_propagated_decoration_layers(&mut inline_style, &decoration_layers);
                     let link = box_
                         .core
                         .element
@@ -1602,17 +2298,28 @@ impl<'a> LayoutBuilder<'a> {
                             .with_fragment_edges(box_.fragment_edges),
                         output,
                     );
+                    let ruby_positioning_source = (inline_style.display.is_ruby()
+                        || inline_style.display.is_ruby_internal())
+                    .then(|| scope.positioning_containing_block_source.clone())
+                    .flatten();
+                    let inlinified_ruby_children = inline_style
+                        .display
+                        .is_ruby_internal()
+                        .then(|| ruby::inlinified_direct_children(&box_.core.children));
+                    let inline_children = inlinified_ruby_children
+                        .as_deref()
+                        .unwrap_or(&box_.core.children);
                     if inline_style.content.is_generated() {
                         let start_len = output.len();
                         self.push_intrinsic_element_content_items_from_boxes(
                             box_.core.element,
                             &inline_style.clone(),
-                            &box_.core.children,
+                            inline_children,
                             stylesheets,
                             link.clone(),
                             child_placement.baseline_shift,
                             child_placement.visual_offset,
-                            inline_style.text_decoration.clone(),
+                            decoration_layers.clone(),
                             output,
                         );
                         let clear = generated_content_originating_clear(&box_.core.source)
@@ -1625,7 +2332,7 @@ impl<'a> LayoutBuilder<'a> {
                         );
                     } else {
                         self.collect_intrinsic_inline_box_items(
-                            &box_.core.children,
+                            inline_children,
                             stylesheets,
                             link.clone(),
                             context
@@ -1633,11 +2340,28 @@ impl<'a> LayoutBuilder<'a> {
                                 .with_baseline_shift(child_placement.baseline_shift)
                                 .with_visual_offset(child_placement.visual_offset)
                                 .with_block_style(&inline_style.clone())
-                                .with_propagated_decoration(inline_style.text_decoration.clone()),
+                                .with_propagated_decoration_layers(decoration_layers),
                             output,
                         );
                     }
                     self.end_inline_element_scope(scope, &inline_style, output);
+                    // Intrinsic inline collection is also used to construct
+                    // the retained item stream for inline formatting
+                    // contexts. Ruby's generated empty counterparts can
+                    // therefore hide an explicitly inset positioned child
+                    // from the ordinary in-flow traversal. Replay it from
+                    // the ruby role's completed inline scope, whose paired
+                    // start/end edges define the containing block.
+                    if let Some(source) = ruby_positioning_source.as_ref() {
+                        self.layout_undeferred_ruby_positioned_descendants(
+                            &box_.core.children,
+                            stylesheets,
+                            context.block_style,
+                            source,
+                            &[],
+                            output,
+                        );
+                    }
                 }
                 box_tree::FormattingBox::AtomicInline(box_) => {
                     let link = box_
@@ -1681,6 +2405,40 @@ impl<'a> LayoutBuilder<'a> {
                         );
                     }
                 }
+                box_tree::FormattingBox::Table(box_)
+                    if box_.core.style.display.is_inline_level() =>
+                {
+                    let link = box_
+                        .core
+                        .element
+                        .attrs
+                        .get("href")
+                        .cloned()
+                        .or_else(|| inherited_link.clone());
+                    let atom_visual_offset = context
+                        .visual_offset
+                        .plus(self.inline_visual_offset_for_style(&box_.core.style));
+                    let counter_snapshot = self.counter_set.clone();
+                    let counter_scope =
+                        self.begin_counter_scope(box_.core.element, &box_.core.style);
+                    let atom = self.intrinsic_inline_atom_for_element(
+                        box_.core.element,
+                        &box_.core.style,
+                        &box_.core.children,
+                        Some(&box_.fragment),
+                        stylesheets,
+                        context.baseline_shift,
+                        atom_visual_offset,
+                        link,
+                    );
+                    self.end_counter_scope(counter_scope);
+                    self.counter_set = counter_snapshot;
+                    if let Some(mut atom) = atom {
+                        atom.baseline_shift +=
+                            self.vertical_align_baseline_shift_for_atom(&atom, context.block_style);
+                        output.push(InlineItem::Atom(Box::new(atom)));
+                    }
+                }
                 box_tree::FormattingBox::AnonymousBlock(box_) => self
                     .collect_intrinsic_inline_box_items(
                         &box_.children,
@@ -1689,19 +2447,367 @@ impl<'a> LayoutBuilder<'a> {
                         context
                             .clone()
                             .with_block_style(&box_.style)
-                            .with_propagated_decoration(
-                                box_.style
-                                    .text_decoration
-                                    .clone()
-                                    .with_propagated_lines(context.propagated_decoration.clone()),
+                            .with_propagated_decoration_layers(
+                                propagated_decoration_layers_for_child(
+                                    &context.propagated_decoration_layers,
+                                    &box_.style,
+                                ),
                             ),
                         output,
                     ),
                 box_tree::FormattingBox::Block(_)
                 | box_tree::FormattingBox::InlineSplitBlockContext(_)
-                | box_tree::FormattingBox::Table(_)
                 | box_tree::FormattingBox::Flex(_)
                 | box_tree::FormattingBox::Replaced(_) => {}
+                box_tree::FormattingBox::Table(_) => {}
+            }
+        }
+    }
+}
+
+/// Return whether an already-collected item prevents a following ruby base
+/// from being the block's first typographic letter.
+fn inline_item_has_typographic_content(item: &InlineItem) -> bool {
+    match item {
+        InlineItem::Word(word) => !word.text.trim().is_empty(),
+        InlineItem::Atom(atom) => !atom.content().is_inline_edge(),
+        InlineItem::Float(_)
+        | InlineItem::Break(_)
+        | InlineItem::PageScopeStart(_)
+        | InlineItem::PageScopeEnd => false,
+    }
+}
+
+/// Whether a ruby annotation container has content that can form an
+/// annotation box. Out-of-flow positioned descendants and floats do not take
+/// part in anonymous ruby box generation.
+fn ruby_container_has_in_flow_content(children: &[box_tree::FormattingBox<'_>]) -> bool {
+    children.iter().any(|child| {
+        if let Some((_, _, style, _)) = child.element_parts()
+            && (matches!(style.position, Position::Absolute | Position::Fixed)
+                || style.float != Float::None)
+        {
+            return false;
+        }
+        match child {
+            box_tree::FormattingBox::Text(text) => !text.text.is_empty(),
+            box_tree::FormattingBox::Inline(box_) => {
+                ruby_container_has_in_flow_content(&box_.core.children)
+            }
+            box_tree::FormattingBox::AnonymousBlock(box_) => {
+                ruby_container_has_in_flow_content(&box_.children)
+            }
+            box_tree::FormattingBox::Block(box_) => {
+                ruby_container_has_in_flow_content(&box_.core.children)
+            }
+            box_tree::FormattingBox::AtomicInline(_)
+            | box_tree::FormattingBox::Table(_)
+            | box_tree::FormattingBox::Flex(_)
+            | box_tree::FormattingBox::Replaced(_)
+            | box_tree::FormattingBox::InlineSplitBlockContext(_) => true,
+        }
+    })
+}
+
+/// Whether a ruby subtree needs the generic inline scope so its positioned or
+/// floated descendants retain their normal containing-block/float ownership.
+/// Such descendants are excluded from ruby's anonymous base/annotation box
+/// generation and therefore cannot be captured in the coupled paint atom.
+fn ruby_has_out_of_flow_descendant(children: &[box_tree::FormattingBox<'_>]) -> bool {
+    children.iter().any(|child| {
+        if let Some((_, _, style, descendants)) = child.element_parts() {
+            matches!(style.position, Position::Absolute | Position::Fixed)
+                || style.float != Float::None
+                || ruby_has_out_of_flow_descendant(descendants)
+        } else {
+            match child {
+                box_tree::FormattingBox::AnonymousBlock(box_) => {
+                    ruby_has_out_of_flow_descendant(&box_.children)
+                }
+                box_tree::FormattingBox::Text(_) => false,
+                box_tree::FormattingBox::InlineSplitBlockContext(box_) => {
+                    ruby_has_out_of_flow_descendant(&box_.core.children)
+                }
+                box_tree::FormattingBox::Block(_)
+                | box_tree::FormattingBox::Inline(_)
+                | box_tree::FormattingBox::AtomicInline(_)
+                | box_tree::FormattingBox::Table(_)
+                | box_tree::FormattingBox::Flex(_)
+                | box_tree::FormattingBox::Replaced(_) => false,
+            }
+        }
+    })
+}
+
+/// Clone only the positioned/float branch of a ruby subtree for the generic
+/// positioned-inline collector. The ruby formatter consumes in-flow bases and
+/// annotations itself, but CSS Ruby does not remove out-of-flow descendants
+/// from their normal containing-block and float ownership.
+/// <https://drafts.csswg.org/css-ruby-1/#anon-gen-ruby>
+fn ruby_out_of_flow_overlay<'a>(box_: &box_tree::FormattingBox<'a>) -> box_tree::FormattingBox<'a> {
+    fn has_out_of_flow_style(style: &ComputedStyle) -> bool {
+        matches!(style.position, Position::Absolute | Position::Fixed) || style.float != Float::None
+    }
+
+    if box_
+        .element_parts()
+        .is_some_and(|(_, _, style, _)| has_out_of_flow_style(style))
+    {
+        return box_.clone();
+    }
+
+    match box_.clone() {
+        box_tree::FormattingBox::Inline(mut box_) => {
+            box_.core.children = box_
+                .core
+                .children
+                .iter()
+                .filter(|child| ruby_has_out_of_flow_descendant(std::slice::from_ref(*child)))
+                .map(ruby_out_of_flow_overlay)
+                .collect();
+            box_tree::FormattingBox::Inline(box_)
+        }
+        box_tree::FormattingBox::Block(mut box_) => {
+            box_.core.children = box_
+                .core
+                .children
+                .iter()
+                .filter(|child| ruby_has_out_of_flow_descendant(std::slice::from_ref(*child)))
+                .map(ruby_out_of_flow_overlay)
+                .collect();
+            box_tree::FormattingBox::Block(box_)
+        }
+        box_tree::FormattingBox::InlineSplitBlockContext(mut box_) => {
+            box_.core.children = box_
+                .core
+                .children
+                .iter()
+                .filter(|child| ruby_has_out_of_flow_descendant(std::slice::from_ref(*child)))
+                .map(ruby_out_of_flow_overlay)
+                .collect();
+            box_tree::FormattingBox::InlineSplitBlockContext(box_)
+        }
+        box_tree::FormattingBox::AnonymousBlock(mut box_) => {
+            box_.children = box_
+                .children
+                .iter()
+                .filter(|child| ruby_has_out_of_flow_descendant(std::slice::from_ref(*child)))
+                .map(ruby_out_of_flow_overlay)
+                .collect();
+            box_tree::FormattingBox::AnonymousBlock(box_)
+        }
+        box_ => box_,
+    }
+}
+
+/// Materialize `::first-letter` inside the base level of a ruby container.
+///
+/// The generic graph pass receives a ruby container through transparent inline
+/// edges. Preserve the pseudo's tree-abiding ownership at the ruby boundary
+/// before its annotation levels are removed from the parent stream.
+/// <https://drafts.csswg.org/css-pseudo-4/#first-letter-pseudo>
+fn apply_first_letter_style_to_ruby_base_items(
+    output: &mut Vec<InlineItem>,
+    first_letter_style: &ComputedStyle,
+) {
+    let Some(index) = output.iter().position(|item| {
+        matches!(item, InlineItem::Word(word) if crate::layout::first_letter_byte_range(&word.text).is_some())
+    }) else {
+        return;
+    };
+    let InlineItem::Word(word) = &output[index] else {
+        unreachable!("the selected ruby first-letter item is a word")
+    };
+    let range = crate::layout::first_letter_byte_range(&word.text)
+        .expect("selected ruby word has a typographic first letter");
+    let word = (**word).clone();
+    let mut replacement = Vec::with_capacity(3);
+    if range.start > 0 {
+        let mut prefix = word.clone();
+        prefix.text = word.text[..range.start].to_owned();
+        replacement.push(InlineItem::Word(Box::new(prefix)));
+    }
+    let mut letter = word.clone();
+    letter.text = word.text[range.clone()].to_owned();
+    letter.style = Rc::new(first_letter_style.clone());
+    letter.mergeable = false;
+    replacement.push(InlineItem::Word(Box::new(letter)));
+    if range.end < word.text.len() {
+        let mut suffix = word;
+        suffix.text = suffix.text[range.end..].to_owned();
+        replacement.push(InlineItem::Word(Box::new(suffix)));
+    }
+    output.splice(index..=index, replacement);
+}
+
+fn ruby_line_sequence_inline_size(sequence: &inline_layout::InlineLineSequence) -> f32 {
+    sequence
+        .records
+        .iter()
+        .filter_map(|record| record.fragment.as_ref())
+        .map(|fragment| fragment.metrics.width)
+        .fold(0.0, f32::max)
+}
+
+/// Count typographic units eligible for the UA default `text-justify: ruby`
+/// behavior. Ruby distributes only CJK-wide units; Latin and Bopomofo content
+/// has no ruby justification opportunities and is therefore centered.
+fn ruby_distribution_unit_count(items: &[InlineItem]) -> Option<usize> {
+    let mut count = 0usize;
+    for item in items {
+        let InlineItem::Word(word) = item else {
+            return None;
+        };
+        for range in crate::text::typographic_unit_ranges(&word.text) {
+            let unit = &word.text[range];
+            if !unit
+                .chars()
+                .filter(|character| {
+                    !crate::text::character_is_unicode_mark(*character)
+                        && !crate::text::character_is_unicode_control(*character)
+                })
+                .all(crate::text::character_is_ruby_justification_eligible)
+            {
+                return None;
+            }
+            count += 1;
+        }
+    }
+    (count > 1).then_some(count)
+}
+
+/// Give all columns of one normalized ruby container a common block-axis
+/// metric stack. CSS Ruby places annotation levels across the column group,
+/// not independently inside each base. In particular, an anonymous empty
+/// base must export the same base baseline as its non-empty siblings.
+///
+/// This runs after every column has been measured, while the columns are
+/// still consecutive source items. The parent opportunity graph therefore
+/// retains one base-level participant per column, but its line metrics see a
+/// single coupled ruby level stack.
+/// <https://drafts.csswg.org/css-ruby-1/#ruby-layout>
+fn normalize_ruby_column_group_metrics(
+    ruby_atoms: &mut [InlineItem],
+    containing_style: &ComputedStyle,
+) {
+    let mut base_block_size = 0.0f32;
+    let mut annotation_block_sizes: Vec<f32> = Vec::new();
+    let mut base_baseline = 0.0f32;
+
+    for item in ruby_atoms.iter() {
+        let InlineItem::Atom(atom) = item else {
+            continue;
+        };
+        let InlineAtomContent::Ruby {
+            base_block_size: column_base_block_size,
+            annotation_block_sizes: column_annotation_block_sizes,
+            ..
+        } = atom.content()
+        else {
+            continue;
+        };
+        base_block_size = base_block_size.max(*column_base_block_size);
+        for (index, block_size) in column_annotation_block_sizes.iter().enumerate() {
+            if annotation_block_sizes.len() <= index {
+                annotation_block_sizes.push(0.0);
+            }
+            annotation_block_sizes[index] = annotation_block_sizes[index].max(*block_size);
+        }
+        base_baseline = base_baseline.max(
+            atom.baseline_offset_from_border_box_block_start(
+                inline_atom_logical_border_block_size(atom, containing_style),
+            ) - column_annotation_block_sizes.iter().sum::<f32>(),
+        );
+    }
+
+    let base_metrics = ruby::RubyLevelMetrics {
+        before_baseline: ruby::RubyBlockExtent::new(base_baseline),
+        after_baseline: ruby::RubyBlockExtent::new((base_block_size - base_baseline).max(0.0)),
+        baseline: ruby::RubyBaselineOffset::new(base_baseline),
+    };
+    let annotation_levels = annotation_block_sizes
+        .iter()
+        .copied()
+        .map(|block_extent| ruby::RubyLevelMetrics {
+            // Annotation sequences are replayed from their own line-box
+            // baseline. Their group metric records the level extent here;
+            // paint applies that local baseline exactly once.
+            before_baseline: ruby::RubyBlockExtent::default(),
+            after_baseline: ruby::RubyBlockExtent::new(block_extent),
+            baseline: ruby::RubyBaselineOffset::default(),
+        })
+        .collect::<Vec<_>>();
+    let annotations_block_extent = annotation_levels
+        .iter()
+        .map(|level| level.block_extent().points())
+        .sum::<f32>();
+    let metrics = ruby::RubyColumnGroupMetrics {
+        base: base_metrics,
+        annotation_levels,
+        exported_baseline: ruby::RubyBaselineOffset::new(
+            annotations_block_extent + base_metrics.baseline.points(),
+        ),
+    };
+    let group_block_size = metrics.base.block_extent().points() + annotations_block_extent;
+    for item in ruby_atoms {
+        let InlineItem::Atom(atom) = item else {
+            continue;
+        };
+        let content = Rc::make_mut(&mut atom.data);
+        let InlineAtomContent::Ruby {
+            base_block_size: column_base_block_size,
+            annotation_block_sizes: column_annotation_block_sizes,
+            ..
+        } = &mut content.content
+        else {
+            continue;
+        };
+        *column_base_block_size = metrics.base.block_extent().points();
+        *column_annotation_block_sizes = metrics
+            .annotation_levels
+            .iter()
+            .map(|level| level.block_extent().points())
+            .collect();
+        atom.size.height = group_block_size;
+        atom.baseline = InlineAtomBaseline::Exported {
+            offset_from_border_box_block_start: metrics.exported_baseline.points(),
+        };
+    }
+}
+
+/// Assign the combined base-column width to annotations that begin a ruby
+/// span. The parent graph retains separate base advances, while the sidecar
+/// paints once from the first covered column across the complete paired range.
+/// <https://drafts.csswg.org/css-ruby-1/#ruby-annotation-pairing>
+fn normalize_ruby_annotation_span_inline_sizes(
+    ruby_atoms: &mut [InlineItem],
+    containing_style: &ComputedStyle,
+) {
+    let column_inline_sizes = ruby_atoms
+        .iter()
+        .filter_map(|item| {
+            let InlineItem::Atom(atom) = item else {
+                return None;
+            };
+            matches!(atom.content(), InlineAtomContent::Ruby { .. })
+                .then(|| inline_atom_logical_border_inline_size(atom, containing_style))
+        })
+        .collect::<Vec<_>>();
+
+    for (column_index, item) in ruby_atoms.iter_mut().enumerate() {
+        let InlineItem::Atom(atom) = item else {
+            continue;
+        };
+        let content = Rc::make_mut(&mut atom.data);
+        let InlineAtomContent::Ruby { annotations, .. } = &mut content.content else {
+            continue;
+        };
+        for annotation in annotations {
+            if annotation.starts_span && annotation.column_span > 1 {
+                annotation.containing_inline_size = column_inline_sizes
+                    [column_index..column_index + annotation.column_span]
+                    .iter()
+                    .sum();
             }
         }
     }
@@ -1730,7 +2836,7 @@ fn generated_pseudo_inline_content_style(style: &ComputedStyle) -> ComputedStyle
     content_style.border_radius = css::BorderRadius::ZERO;
     content_style.corner_shapes = css::CornerShapes::ROUND;
     content_style.border_image = css::BorderImage::initial();
-    content_style.background_color = None;
+    content_style.background_color = css::BackgroundColor::TRANSPARENT;
     content_style.background_image = css::ComputedImage::None;
     content_style.background_layers.clear();
     content_style
@@ -1757,7 +2863,7 @@ pub(in crate::layout) fn annotate_line_break_element_breaks_with_clear(
     for item in output.iter_mut().skip(start_len) {
         match item {
             InlineItem::Break(break_) => break_.clear = clear,
-            InlineItem::Word(word) if word.source == InlineTextSource::Generated => {
+            InlineItem::Word(word) if word.source.is_generated() => {
                 std::rc::Rc::make_mut(&mut word.style).clear = clear;
             }
             _ => {}

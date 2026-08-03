@@ -105,7 +105,7 @@ conflict with a stronger Quire convention.
 | `--xmp-metadata` (repeatable) | None | Missing | Accept repo/user-provided XMP packet fragments with clear merge/validation rules. |
 | `--custom-metadata` | None | Missing | Extract and serialize custom HTML metadata rather than only title/author/creator. |
 | `--output-intent` | None | Missing | Add ICC/profile resolution and PDF output-intent serialization. |
-| `-p`, `--presentational-hints` | `-p`, `--presentational-hints` | Available | Continue the element-by-element conformance audit in `SPEC_DIVERGENCES.md`. |
+| `-p`, `--presentational-hints` | Presentational hints are enabled by default; `--no-presentational-hints` disables them | Intentional divergence | Quire follows the HTML rendering model by default rather than making legacy attributes opt-in. Continue the element-by-element conformance audit in `SPEC_DIVERGENCES.md`. |
 | `--optimize-images` | None | Missing | Add lossless image optimization that preserves required PDF/A/PDF/UA behavior. |
 | `-j`, `--jpeg-quality` | None | Missing | Add bounded JPEG re-encoding as an opt-in output step. |
 | `-D`, `--dpi` | None | Missing | Downsample raster images at a maximum effective DPI while retaining correct CSS intrinsic geometry. |
@@ -121,7 +121,7 @@ conflict with a stronger Quire convention.
 | `-m`, `--media-type` | `--media-type print\|screen` | Partial | Support the CSS media type accepted by the API rather than only this two-value subset, while retaining typed well-known values. |
 | `-u`, `--base-url` | `-u`, `--base-url` | Available | Test stdin/base-url behavior when stdin is added. |
 | `-t`, `--timeout` | None | Missing | Put HTTP timeout in `ResourcePolicy` and pass it to the HTTP client. |
-| `--allowed-protocols` | Fixed `file`, `http`, and `https` allowlist | Partial | Make the allowlist public and configurable; keep a safe default. |
+| `--allowed-protocols` | Fixed `data`, `file`, `http`, and `https` allowlist | Partial | Make the allowlist public and configurable; keep a safe default. `data:` resources are decoded locally through Fetch's data-URL processing model. |
 | `--no-http-redirects` | `--no-http-redirects`; `ResourcePolicy::follow_http_redirects` | Available | Quire follows redirects by default and retains the final response URL as the base for HTML and CSS resources. |
 | `--fail-on-http-errors` | Deliberately different: strict fetching is the default; `--allow-fetch-errors` / `FetchErrorPolicy::Allow` opt into recovery | Deliberately different | Quire treats HTTP, filesystem, and other external-resource failures as fatal unless recovery is explicitly enabled. |
 

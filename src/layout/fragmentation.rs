@@ -431,8 +431,8 @@ pub(in crate::layout) struct FragmentPrebreakInput {
 
 /// Decision to advance to another fragmentainer before a source unit.
 ///
-/// CSS Fragmentation may break before a unit when overflow or avoid pressure
-/// applies, provided the layout mode can make forward progress. Layout modes
+/// CSS Fragmentation may break before a unit when it overflows, provided the
+/// layout mode can make forward progress. Layout modes
 /// still own target-specific transition metadata such as table repeated chrome
 /// or flex source offsets; this shared decision keeps the common advance gate
 /// from being restated in each mode:
@@ -445,7 +445,6 @@ pub(in crate::layout) struct FragmentAdvanceDecision {
 pub(in crate::layout) struct FragmentAdvanceInput {
     pub(in crate::layout) break_is_applicable: bool,
     pub(in crate::layout) overflows: bool,
-    pub(in crate::layout) avoid_break: bool,
     pub(in crate::layout) can_advance: bool,
 }
 
@@ -905,7 +904,13 @@ impl FragmentAdvanceDecision {
         Self {
             should_advance: input.break_is_applicable
                 && input.can_advance
-                && (input.overflows || input.avoid_break),
+                // `avoid` restricts which unforced boundary may be selected
+                // after content overflows; it never creates a fragmentation
+                // break on its own.  Advancing merely because a heading asks
+                // to avoid a following break strands otherwise-fitting flex
+                // lines on later pages.
+                // <https://www.w3.org/TR/css-break-3/#avoid-breaks>
+                && input.overflows,
         }
     }
 }
@@ -977,11 +982,12 @@ mod tests {
         Fragmentainer::new(layout_pt(block_size), layout_pt(available_size))
     }
 
-    fn test_layout_builder<'a>(
+    fn test_layout_builder<'a, Collection: crate::css::StylesheetCollection + ?Sized>(
         options: &'a RenderOptions,
-        stylesheets: &'a [Stylesheet],
+        stylesheets: &'a Collection,
         resource_cache: &'a ResourceCache,
     ) -> LayoutBuilder<'a> {
+        let stylesheets = crate::css::StylesheetCollection::stylesheet_view(stylesheets);
         LayoutBuilder::new(LayoutBuilderConfig {
             options,
             stylesheets,
@@ -992,6 +998,7 @@ mod tests {
             iframe_viewport: None,
             page_progression_direction: Direction::Ltr,
             page_counter_initial_values: HashMap::new(),
+            target_references: crate::layout::TargetReferenceSnapshot::default(),
             font_system: FontSystem::new(),
         })
     }
@@ -1230,21 +1237,19 @@ mod tests {
     }
 
     #[test]
-    fn advance_decision_moves_for_overflow_or_avoid_pressure() {
+    fn advance_decision_moves_only_for_overflow() {
         assert!(
             FragmentAdvanceDecision::choose(FragmentAdvanceInput {
                 break_is_applicable: true,
                 overflows: true,
-                avoid_break: false,
                 can_advance: true,
             })
             .should_advance
         );
         assert!(
-            FragmentAdvanceDecision::choose(FragmentAdvanceInput {
+            !FragmentAdvanceDecision::choose(FragmentAdvanceInput {
                 break_is_applicable: true,
                 overflows: false,
-                avoid_break: true,
                 can_advance: true,
             })
             .should_advance
@@ -1257,7 +1262,6 @@ mod tests {
             !FragmentAdvanceDecision::choose(FragmentAdvanceInput {
                 break_is_applicable: false,
                 overflows: true,
-                avoid_break: true,
                 can_advance: true,
             })
             .should_advance
@@ -1266,7 +1270,6 @@ mod tests {
             !FragmentAdvanceDecision::choose(FragmentAdvanceInput {
                 break_is_applicable: true,
                 overflows: false,
-                avoid_break: false,
                 can_advance: true,
             })
             .should_advance
@@ -1275,7 +1278,6 @@ mod tests {
             !FragmentAdvanceDecision::choose(FragmentAdvanceInput {
                 break_is_applicable: true,
                 overflows: true,
-                avoid_break: true,
                 can_advance: false,
             })
             .should_advance

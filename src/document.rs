@@ -1,34 +1,21 @@
-mod paint;
+pub(crate) mod paint;
 
-pub use paint::LinkAnnotation;
-pub(crate) use paint::PaintSpace;
-pub use paint::PaintStrokeWidth;
-pub(crate) use paint::RenderedImageSource;
-pub(crate) use paint::{
-    PagePaintTree, PaintBand, PaintBlendMode, PaintCheckpoint, PaintClip, PaintClipPathEffect,
-    PaintClipUnion, PaintDisplacement, PaintDisplayItem, PaintEffectScope, PaintEffectStep,
-    PaintEffects, PaintFilterEffect, PaintFragment, PaintMaskEffect, PaintPrimitive,
-    PaintStackingContext, PaintTransform, PaintTranslation, RenderedGradient, RenderedGradientKind,
-    RenderedGradientStop, RenderedLineSource, RenderedPathCommandPoints, RenderedPathLineCap,
-    RenderedPathLineJoin, RenderedPathPaint, RenderedPathPaintOrder, RenderedPathStrokeStyle,
-    RenderedPeriodicGradient, RenderedSvgPathPattern, StackLevel, paint_point_to_pdf,
-    paint_rect_path_commands, paint_rect_to_pdf,
-};
-pub(crate) use paint::{
-    PaintOperation, PaintPatternTiling, PaintPoint, PaintRect, PaintSize, PdfSize,
-    RenderedClipPathPolygon, RenderedCornerRadius, RenderedGlyph, RenderedGlyphKind,
-    RenderedGradientPattern, RenderedImage, RenderedImagePattern, RenderedImageSourceRect,
-    RenderedLine, RenderedLink, RenderedPath, RenderedPathClip, RenderedPathClipPath,
-    RenderedPathCommand, RenderedPathFillRule, RenderedRect, RenderedRoundedRect,
-    RenderedRoundedRectRadii, RenderedStroke, RenderedSvgPattern, RenderedTextMatrix,
-    RenderedTextRun, TextRunPoint,
-};
+pub use paint::annotations::LinkAnnotation;
+pub(crate) use paint::geometry::PaintStrokeWidth;
 
-use crate::css::CssColorSpace;
+use paint::annotations::RenderedLink;
+use paint::display_list::PagePaintTree;
+use paint::geometry::{PaintPoint, PaintSize};
+use paint::images::RenderedImage;
+use paint::page::{OpaqueTextCoverage, PaintOperation};
+use paint::paths::{RenderedGradient, RenderedPath, RenderedPathPaint};
+use paint::patterns::{RenderedGradientPattern, RenderedImagePattern, RenderedSvgPattern};
+use paint::shapes::{RenderedRect, RenderedRoundedRect, RenderedStroke};
+use paint::text::RenderedLine;
+
 use crate::{CssColor, Error, Result, image_store::DocumentImageStore, pdf, timing::DebugTimer};
 use fontique::Blob as FontiqueBlob;
 use std::borrow::Cow;
-use std::collections::HashSet;
 use std::fmt;
 use std::ops::Deref;
 #[cfg(not(target_arch = "wasm32"))]
@@ -524,11 +511,12 @@ pub struct Page {
     pub(crate) image_patterns: Vec<RenderedImagePattern>,
     pub(crate) gradient_patterns: Vec<RenderedGradientPattern>,
     pub(crate) svg_patterns: Vec<RenderedSvgPattern>,
+    pub(crate) opaque_text_coverages: Vec<OpaqueTextCoverage>,
     /// A committed CSS fragmentation slice that owns this page even when it
     /// has no visible paint primitives (for example, the trailing slice of a
     /// tall table row).
     pub(crate) has_fragmentation_content: bool,
-    paint_tree: paint::PagePaintTree,
+    paint_tree: PagePaintTree,
 }
 
 #[allow(dead_code)]
@@ -547,8 +535,9 @@ impl Page {
             image_patterns: Vec::new(),
             gradient_patterns: Vec::new(),
             svg_patterns: Vec::new(),
+            opaque_text_coverages: Vec::new(),
             has_fragmentation_content: false,
-            paint_tree: paint::PagePaintTree::new(),
+            paint_tree: PagePaintTree::new(),
         }
     }
 
@@ -667,70 +656,70 @@ impl Page {
         self.has_fragmentation_content
     }
 
-    /// Return the CSS component spaces referenced by vector paint on this page.
+    /// Return every concrete CSS color that can become vector PDF paint.
     ///
-    /// Ordinary PDF preserves an authored CSS color space with an ICCBased
-    /// resource, whereas PDF/A converts all paint to its sRGB output intent.
-    /// Planning this from retained paint values keeps ordinary PDFs calibrated
-    /// without embedding unused profiles for every CSS CssColor 4 space.
-    pub(crate) fn used_css_color_spaces(&self) -> HashSet<CssColorSpace> {
-        let mut spaces = HashSet::new();
+    /// PDF resource planning must follow the eventual output colors rather
+    /// than these colors' retained CSS component spaces. In particular, a
+    /// D50 PCS color may serialize as Display-P3 when it cannot fit in sRGB.
+    pub(crate) fn vector_paint_colors(&self) -> Vec<CssColor> {
+        let mut colors = Vec::new();
         for rect in &self.rects {
-            collect_optional_color_space(rect.fill, &mut spaces);
-            collect_optional_color_space(rect.stroke, &mut spaces);
+            collect_optional_color(rect.fill, &mut colors);
+            collect_optional_color(rect.stroke, &mut colors);
         }
         for rect in &self.rounded_rects {
-            collect_optional_color_space(rect.fill, &mut spaces);
-            collect_optional_color_space(rect.stroke, &mut spaces);
+            collect_optional_color(rect.fill, &mut colors);
+            collect_optional_color(rect.stroke, &mut colors);
         }
         for path in &self.paths {
-            collect_path_color_spaces(path, &mut spaces);
+            collect_path_colors(path, &mut colors);
         }
         for stroke in &self.strokes {
-            spaces.insert(stroke.color.space());
+            colors.push(stroke.color);
         }
         for line in &self.lines {
-            spaces.insert(line.color.space());
+            colors.push(line.color);
         }
         for pattern in &self.gradient_patterns {
-            collect_gradient_color_spaces(&pattern.gradient, &mut spaces);
+            collect_gradient_colors(&pattern.gradient, &mut colors);
         }
         for pattern in &self.svg_patterns {
             for path in &pattern.paths {
-                collect_path_color_spaces(path, &mut spaces);
+                collect_path_colors(path, &mut colors);
             }
         }
-        spaces
+        colors
     }
 }
 
-fn collect_optional_color_space(color: Option<CssColor>, spaces: &mut HashSet<CssColorSpace>) {
+fn collect_optional_color(color: Option<CssColor>, colors: &mut Vec<CssColor>) {
     if let Some(color) = color {
-        spaces.insert(color.space());
+        colors.push(color);
     }
 }
 
-fn collect_gradient_color_spaces(gradient: &RenderedGradient, spaces: &mut HashSet<CssColorSpace>) {
-    spaces.insert(gradient.color_space);
+fn collect_gradient_colors(gradient: &RenderedGradient, colors: &mut Vec<CssColor>) {
+    colors.extend(gradient.stops.iter().map(|stop| stop.color));
+    if let Some(periodic) = &gradient.periodic {
+        colors.extend(periodic.stops.iter().map(|stop| stop.color));
+    }
 }
 
-fn collect_path_color_spaces(path: &RenderedPath, spaces: &mut HashSet<CssColorSpace>) {
-    collect_optional_color_space(path.fill, spaces);
-    collect_optional_color_space(path.stroke, spaces);
+fn collect_path_colors(path: &RenderedPath, colors: &mut Vec<CssColor>) {
+    collect_optional_color(path.fill, colors);
+    collect_optional_color(path.stroke, colors);
     for paint in [path.fill_paint.as_ref(), path.stroke_paint.as_ref()]
         .into_iter()
         .flatten()
     {
         match paint {
             RenderedPathPaint::Solid(color) => {
-                spaces.insert(color.space());
+                colors.push(*color);
             }
-            RenderedPathPaint::Gradient(gradient) => {
-                collect_gradient_color_spaces(gradient, spaces)
-            }
+            RenderedPathPaint::Gradient(gradient) => collect_gradient_colors(gradient, colors),
             RenderedPathPaint::SvgPattern(pattern) => {
                 for path in &pattern.paths {
-                    collect_path_color_spaces(path, spaces);
+                    collect_path_colors(path, colors);
                 }
             }
         }
@@ -828,6 +817,19 @@ pub(crate) struct CssFontVerticalMetrics {
     pub(crate) line_gap: i16,
 }
 
+/// PDF-visible synthesis selected while matching a CSS font face.
+///
+/// CSS Fonts permits a user agent to synthesize a bold face only when font
+/// matching selected that synthesis and `font-synthesis-weight` allows it.
+/// This is deliberately independent from the embedded font program: a
+/// regular and an emboldened use can share one subset while retaining their
+/// distinct paint state.
+/// <https://www.w3.org/TR/css-fonts-4/#font-synthesis-intro>
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub(crate) struct DocumentFontSynthesis {
+    pub(crate) embolden: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DocumentFont {
     pub(crate) id: usize,
@@ -842,4 +844,5 @@ pub(crate) struct DocumentFont {
     pub(crate) cap_height: i16,
     pub(crate) italic_angle: i16,
     pub(crate) bbox: [i16; 4],
+    pub(crate) synthesis: DocumentFontSynthesis,
 }

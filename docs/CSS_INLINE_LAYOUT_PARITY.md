@@ -1,6 +1,6 @@
 # CSS Inline Layout Parity
 
-Last updated: 2026-07-28
+Last updated: 2026-07-31
 
 CSS Inline Layout Level 3 and CSS Pseudo-Elements Level 4 are the conformance
 targets for inline line construction, typographic pseudo-elements, and initial
@@ -16,10 +16,19 @@ comparisons, but it is not a complete `initial-letter` model.
   initial-letter alignment and common Indic language selectors to hanging
   alignment, with script-subtag selectors for alphabetic and ideographic
   defaults.
-- `::first-letter` text extraction is applied while building the inline
-  opportunity graph, so styled first letters participate in shaping, measured
-  advances, line-break selection, intrinsic measurements, and collected inline
+- `::first-letter` text extraction selects complete Unicode `L*`, `N*`, and
+  `S*` typographic units with their associated punctuation. It is applied while
+  building the inline opportunity graph for both final layout and intrinsic
+  measurement, so styled first letters participate in shaping, measured
+  advances, line-break selection, shrink-to-fit sizing, and collected inline
   line records instead of being only a paint-time rewrite.
+- Inline and `::first-letter` text paint with `opacity` is emitted through the
+  normal PDF transparency-group path, preserving atomic compositing for glyphs,
+  shadows, decorations, color glyph paths, raster glyphs, and links.
+- Non-replaced inline content areas use a stable primary-font em box for
+  backgrounds, borders, and padding. That geometry is independent of
+  `line-height` and glyph fallback; fallback faces may enlarge only a
+  `line-height: normal` line box.
 - Specified `initial-letter` values compute `drop` to a sink equal to
   `floor(size)`, compute `raise` to sink `1`, preserve explicit sink values,
   and reject invalid zero, negative, fractional sink, or unknown keyword forms.
@@ -54,10 +63,33 @@ comparisons, but it is not a complete `initial-letter` model.
 - Block-in-inline splits preserve a relatively positioned inline ancestor's
   visual coordinate space for float-exclusion queries while retaining the
   ancestor's normal-flow geometry and single paint translation.
+- Generated `::before` and `::after` boxes whose structural child tree was
+  frozen for a parent formatting context are re-collected as generated inline
+  content rather than mistaken for empty elements. This preserves their text
+  and anonymous inline itemization when the parent is a flex or grid item.
+- Atomic inline-block baseline export derives its line baseline from the
+  measured inline sequence, including an orthogonal writing-mode placeholder,
+  instead of assuming the border-box block end.
 - Atomic inline blocks with non-visible overflow use their required
   margin-box-edge fallback baseline in both line layout and paint placement.
   That box-edge baseline is kept in CSS line coordinates rather than being
   adjusted through an internal text glyph origin.
+- Atomic inline baseline export distinguishes an internal logical
+  border-box-block-start offset from the synthesized border-box block-end
+  fallback. The same resolved logical margin-box geometry now drives line
+  ascent/descent and final atom placement for ordinary atomic inlines,
+  including block-start/end margins in horizontal, `vertical-rl`, and
+  `vertical-lr` lines. Inline tables retain their CSS 2.2 table-box baseline
+  reference so wrapper block-start margins are not applied to their first-row
+  baseline a second time.
+- Empty `inline-flex` boxes export their synthesized baseline from the border
+  box; the shared atomic-inline margin-box adapter accounts for margins once,
+  so a block-end margin moves the painted border box without moving its
+  margin-box baseline.
+- Run-in sequences use the normalized formatting tree through block-flow
+  traversal. Their inlinified prelude, including in-flow block descendants,
+  merges with the target’s inline source exactly once, while intervening
+  out-of-flow boxes keep their principal box type and static-position rules.
 
 ## Needed for Parity
 
@@ -89,3 +121,6 @@ comparisons, but it is not a complete `initial-letter` model.
 - Add WPT-style local fixtures for raised, sunken, fractional, aligned,
   wrapped, paginated, generated-content, punctuation, bidi, vertical-writing,
   and float-interaction cases.
+- Unify the static-position rectangle and inline-background bounds of
+  absolutely positioned inline boxes with the used first-letter line metrics;
+  `first-letter-width` still exposes a small background edge.

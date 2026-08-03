@@ -36,6 +36,15 @@ fn can_shape_inline_text_prep_spans_together<F: InlineFragmentAccess>(
     left.fragment.style().vertical_align == right.fragment.style().vertical_align
         && left.fragment.style().writing_mode == right.fragment.style().writing_mode
         && left.fragment.style().language == right.fragment.style().language
+        // A text group is also the smallest paint subtree emitted by this
+        // path. Do not let boundary shaping merge across an opacity stacking
+        // context, whose paint must be composited atomically.
+        // <https://www.w3.org/TR/css-color-4/#transparency>
+        && left.fragment.style().opacity == right.fragment.style().opacity
+        && inline_ancestor_decorations_have_same_text_paint_effect(
+            left.fragment.ancestor_inline_decorations(),
+            right.fragment.ancestor_inline_decorations(),
+        )
         && left.fragment.resolved_bidi_direction() == right.fragment.resolved_bidi_direction()
         && !inline_box_edge_breaks_shaping(left.fragment.style())
         && !inline_box_edge_breaks_shaping(right.fragment.style())
@@ -43,30 +52,39 @@ fn can_shape_inline_text_prep_spans_together<F: InlineFragmentAccess>(
         && !inline_box_bidi_isolation_breaks_shaping(right.fragment.style())
 }
 
-/// Join visual fragments that all retain glyphs from selected source slices.
+/// Join visual fragments that retain glyphs from selected source slices.
 ///
 /// Inline bidi ordering may split one selected source range into several
 /// paint fragments. Re-shaping their visual text would discard the original
 /// cursive forms; composing their already-shaped visual runs keeps the source
-/// shaping while preserving the selected line's paint order:
+/// shaping while preserving the selected line's paint order. A control-only
+/// fragment can own a U+200C/U+200D source range without owning a paintable
+/// glyph, so it is deliberately permitted to have no selected source slice:
 /// <https://www.w3.org/TR/css-text-3/#boundary-shaping> and
 /// <https://www.w3.org/TR/css-writing-modes-4/#bidi-linebox>.
 fn compose_selected_source_shapes<F: InlineFragmentAccess>(
     group: &[InlineTextPrepSpan<'_, F>],
     text: &str,
 ) -> Option<ShapedInlineLine> {
-    if group.is_empty()
-        || !group
-            .iter()
-            .all(|span| span.fragment.preserves_source_shaping())
-    {
+    if group.is_empty() {
         return None;
     }
-    let mut result = group.first()?.fragment.selected_shaped()?.clone();
+    let mut result = group
+        .iter()
+        .find_map(|span| span.fragment.selected_shaped())?
+        .clone();
     result.runs.clear();
     let mut width = 0.0;
     for span in group {
-        let shaped = span.fragment.selected_shaped()?;
+        let Some(shaped) = span.fragment.selected_shaped() else {
+            if inline_text_prep_span_is_join_control_only(span) {
+                continue;
+            }
+            return None;
+        };
+        if !span.fragment.preserves_source_shaping() {
+            return None;
+        }
         for mut run in shaped.runs.clone() {
             run.x_offset += width;
             result.runs.push(run);
@@ -138,9 +156,10 @@ impl<'a> LayoutBuilder<'a> {
                 .and_then(|span| span.fragment.resolved_bidi_direction())
                 .unwrap_or(ResolvedBidiDirection::Ltr);
             // A join-control-only neighbor may have been folded into this
-            // visual span above. Only an explicitly selected source shape
-            // retains the logical joining context through that reordering;
-            // an ordinary cached shape predates the folded U+200C/U+200D.
+            // visual span above. A selected source shape retains the logical
+            // joining context through that reordering; re-shaping visual
+            // fragments cannot recover a U+200C/U+200D's source position
+            // after UAX #9 removes it from visual clusters.
             // <https://www.w3.org/TR/css-text-3/#boundary-shaping> and
             // <https://www.w3.org/TR/alreq/#h_joining-enforcement>
             // A cached source shape can have resolved a preserved tab before
@@ -150,6 +169,11 @@ impl<'a> LayoutBuilder<'a> {
             let has_join_control = group_text
                 .chars()
                 .any(crate::text::character_is_join_control);
+            let has_only_zwnj_controls = has_join_control
+                && group_text
+                    .chars()
+                    .filter(|character| crate::text::character_is_join_control(*character))
+                    .all(|character| character == '\u{200c}');
             // Visual reordering reverses the order of the separate inline
             // fragments in an RTL run, while retaining the source order
             // inside each fragment. Keep join controls as their own spans so
@@ -164,12 +188,12 @@ impl<'a> LayoutBuilder<'a> {
             let shaping_spans = logical_joining_spans.as_deref().unwrap_or(&spans);
             let reused_selected_shape = if !group_text.contains('\t')
                 && group.len() == 1
-                && !has_join_control
+                && (!has_join_control || has_only_zwnj_controls)
                 && group[0].text == group[0].fragment.text()
             {
                 group[0].fragment.selected_shaped().cloned()
             } else if !group_text.contains('\t')
-                && !has_join_control
+                && (!has_join_control || has_only_zwnj_controls)
                 && group.iter().all(|span| span.text == span.fragment.text())
             {
                 compose_selected_source_shapes(group, &group_text)
@@ -202,7 +226,14 @@ impl<'a> LayoutBuilder<'a> {
             return None;
         }
 
-        let first_font_id = self.font_system.resolve_style(first.style());
+        // The shaped run, rather than the style fallback alone, owns the
+        // glyph program that will receive the paint-origin conversion. This
+        // is especially important when a nested atomic inline and adjacent
+        // source both resolve through a fallback face.
+        let first_font_id = shaped_runs
+            .first()
+            .and_then(|run| run.font_id)
+            .or_else(|| self.font_system.resolve_style(first.style()));
         let line_height = self
             .font_system
             .line_height_for_font(first_font_id, first.style())
@@ -223,9 +254,25 @@ impl<'a> LayoutBuilder<'a> {
         let metrics =
             self.inline_text_box_metrics(first.style(), Some(&shaped), first.baseline_shift());
         let y = self.cursor_y - metrics.line_baseline_offset + first.baseline_shift();
+        let paint_opacity = first
+            .ancestor_inline_decorations()
+            .iter()
+            .fold(first.style().opacity, |opacity, decoration| {
+                opacity * decoration.style.opacity
+            });
+        let paint_scope_ancestry = Rc::from(
+            first
+                .ancestor_inline_decorations()
+                .iter()
+                .filter_map(|decoration| decoration.paint_effect_scope_id)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
         Some(PreparedInlineTextGroup {
             bounds: PhysicalInlineTextBounds::new(InlinePoint::new(x, y), width),
             style: first.style().clone(),
+            paint_opacity,
+            paint_scope_ancestry,
             link_target: first.link_target().map(ToOwned::to_owned),
             link_paint_rect: None,
             decoration_paint_rect: None,

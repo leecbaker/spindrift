@@ -336,6 +336,51 @@ pub(in crate::layout) fn inline_atom_logical_border_block_size(
     .max(0.0)
 }
 
+/// Return an atomic inline's baseline offset from its logical margin-box
+/// block-start edge in the containing line.
+///
+/// CSS Inline aligns atomic inline boxes by their exported baseline when one
+/// exists, otherwise by a synthesized border-box block-end baseline. Margins
+/// are outside the ordinary principal box but are part of the line
+/// participant. `inline-table` exports from its table box instead of its
+/// wrapper, so the atom carries that exceptional reference explicitly. This
+/// is the single place that resolves either reference into line coordinates:
+/// <https://www.w3.org/TR/CSS22/tables.html#table-display>
+/// <https://drafts.csswg.org/css-inline-3/#inline-block-baseline>.
+pub(in crate::layout) fn inline_atom_logical_margin_box_baseline_offset(
+    atom: &InlineAtom,
+    containing_style: &ComputedStyle,
+) -> f32 {
+    let border_box_block_size = inline_atom_logical_border_block_size(atom, containing_style);
+    atom.baseline_offset_from_margin_box_block_start(
+        border_box_block_size,
+        inline_atom_logical_block_start_margin(atom, containing_style),
+    )
+}
+
+/// Return the baseline coordinate used to place an atom's border-box content.
+///
+/// The line-layout baseline contribution for an `inline-table` comes from its
+/// table box, not its wrapper. Its captured fragment retains the wrapper
+/// margins for paint replay, so placement must not add the block-start margin
+/// a second time. Ordinary atomic inlines, whose captured content excludes
+/// their outer margins, continue to use their margin-box baseline.
+/// <https://www.w3.org/TR/CSS22/tables.html#table-display>
+pub(in crate::layout) fn inline_atom_logical_content_placement_baseline_offset(
+    atom: &InlineAtom,
+    containing_style: &ComputedStyle,
+) -> f32 {
+    let baseline = atom.baseline_offset_from_border_box_block_start(
+        inline_atom_logical_border_block_size(atom, containing_style),
+    );
+    match atom.baseline {
+        InlineAtomBaseline::ExportedTableBox { .. } => baseline,
+        InlineAtomBaseline::Exported { .. } | InlineAtomBaseline::SynthesizedBorderBoxBlockEnd => {
+            inline_atom_logical_block_start_margin(atom, containing_style) + baseline
+        }
+    }
+}
+
 /// Return a line item's logical block-size in its containing line.
 ///
 /// Text fragments expose `line-height` in the line block axis. Atomic inline
@@ -395,7 +440,16 @@ pub(in crate::layout) fn can_paint_inline_fragments_together(
         // <https://drafts.csswg.org/css-fonts-4/#font-palette-prop>
         && left.style().font_palette == right.style().font_palette
         && left.style().visibility == right.style().visibility
+        // Opacity establishes a stacking context. Adjacent text cannot share
+        // one prepared paint group across that compositing boundary even when
+        // their shaping state is otherwise identical.
+        // <https://www.w3.org/TR/css-color-4/#transparency>
+        && left.style().opacity == right.style().opacity
         && left.style().text_decoration == right.style().text_decoration
+        && inline_ancestor_decorations_have_same_text_paint_effect(
+            left.ancestor_inline_decorations(),
+            right.ancestor_inline_decorations(),
+        )
 }
 
 pub(in crate::layout) fn inline_text_sources_are_paint_compatible(
@@ -403,6 +457,10 @@ pub(in crate::layout) fn inline_text_sources_are_paint_compatible(
     right: InlineTextSource,
 ) -> bool {
     match (left, right) {
+        (InlineTextSource::FootnoteCall(left), InlineTextSource::FootnoteCall(right)) => {
+            left == right
+        }
+        (InlineTextSource::FootnoteCall(_), _) | (_, InlineTextSource::FootnoteCall(_)) => false,
         (InlineTextSource::BidiControl, InlineTextSource::BidiControl) => true,
         (InlineTextSource::BidiControl, _) | (_, InlineTextSource::BidiControl) => false,
         (InlineTextSource::Marker, InlineTextSource::Marker) => true,
@@ -410,6 +468,33 @@ pub(in crate::layout) fn inline_text_sources_are_paint_compatible(
         (InlineTextSource::RunIn, InlineTextSource::RunIn) => true,
         (InlineTextSource::RunIn, _) | (_, InlineTextSource::RunIn) => false,
         (InlineTextSource::Normal | InlineTextSource::Generated, _) => true,
+    }
+}
+
+/// Return whether source provenance may keep adjacent text in one layout
+/// shaping group.
+///
+/// Marker provenance identifies generated list-label semantics at paint and
+/// extraction time, but an inside marker is an inline child. It must not by
+/// itself introduce a CSS Text shaping boundary with following inline text.
+/// Footnote calls, run-ins, and UAX #9 control runs retain their dedicated
+/// layout boundaries.
+/// <https://drafts.csswg.org/css-lists-3/#marker-content> and
+/// <https://www.w3.org/TR/css-text-3/#boundary-shaping>
+pub(in crate::layout) fn inline_text_sources_are_layout_compatible(
+    left: InlineTextSource,
+    right: InlineTextSource,
+) -> bool {
+    match (left, right) {
+        (InlineTextSource::FootnoteCall(left), InlineTextSource::FootnoteCall(right)) => {
+            left == right
+        }
+        (InlineTextSource::FootnoteCall(_), _) | (_, InlineTextSource::FootnoteCall(_)) => false,
+        (InlineTextSource::BidiControl, InlineTextSource::BidiControl) => true,
+        (InlineTextSource::BidiControl, _) | (_, InlineTextSource::BidiControl) => false,
+        (InlineTextSource::RunIn, InlineTextSource::RunIn) => true,
+        (InlineTextSource::RunIn, _) | (_, InlineTextSource::RunIn) => false,
+        _ => true,
     }
 }
 
@@ -426,7 +511,7 @@ pub(in crate::layout) fn can_queue_inline_fragments_for_shaping(
     left: &(impl InlineFragmentAccess + ?Sized),
     right: &(impl InlineFragmentAccess + ?Sized),
 ) -> bool {
-    if !inline_text_sources_are_paint_compatible(left.source(), right.source()) {
+    if !inline_text_sources_are_layout_compatible(left.source(), right.source()) {
         return false;
     }
     can_paint_inline_fragments_together(left, right)
@@ -510,7 +595,6 @@ pub(in crate::layout) fn styles_have_equivalent_text_shaping_inputs(
         // artifact, so a paint-only palette boundary must remain explicit.
         // <https://drafts.csswg.org/css-fonts-4/#font-palette-prop>
         && left.font_palette == right.font_palette
-        && left.word_break == right.word_break
         && left.overflow_wrap == right.overflow_wrap
         && left.text_wrap_mode == right.text_wrap_mode
         && left.word_spacing == right.word_spacing

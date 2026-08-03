@@ -1,6 +1,6 @@
 # CSS Grid Parity
 
-Last updated: 2026-07-18
+Last updated: 2026-08-01
 
 This document tracks Quire's CSS Grid implementation. It is a living
 tracking document: update it whenever grid behavior is added, narrowed,
@@ -52,6 +52,14 @@ or writing-mode behavior.
   percentages resolve against the zoomed Grid content box, while `fr` and
   intrinsic track sizing remain algorithmic. Grid Lanes Level 3's
   lanes-specific model and positioned layout remain outside this milestone.
+- Grid's CSS-to-Taffy boundary is shared with Flex for direction, box sizing,
+  common alignment keywords, borders, and percentage gaps. Grid item physical
+  margin and padding percentages resolve against the Grid container's logical
+  inline size before entering Taffy's physical axes, including vertical
+  writing modes, RTL, mixed `calc()` values, and zoom. The resolved edge
+  metrics are retained with the placed item and reused by replay and
+  post-layout corrections, preventing either physical-width resolution or a
+  second application of the same edge.
 - Taffy 0.11.0 is already a dependency and its default feature set includes
   CSS Grid support. Grid integration should use Taffy for the core Grid Level
   1 placement and track-sizing algorithm where its public model matches the
@@ -174,13 +182,21 @@ or writing-mode behavior.
   non-whitespace text runs, ignores CSS document-whitespace-only text runs
   even when `white-space` preserves them, and uses existing box-tree
   `display: contents` flattening so flattened children participate as grid
-  items. Tree-abiding `::before` and `::after`
+  items. Non-contiguous anonymous text runs separated by an absolutely
+  positioned child become separate grid items; the matching
+  `anonymous-grid-item-001.html` WPT passes without changing document-canvas
+  body-margin placement. Grid containers keep their
+  items' margins contained while their own outer block margins remain eligible
+  to collapse with adjacent normal-flow block siblings. Tree-abiding `::before`
+  and `::after`
   generated boxes participate as same-page grid items, including
   order-modified auto-placement with real children. Out-of-flow children are
   split out of normal grid item layout, and absolutely positioned children get a first
   same-page static-position path for positive and negative numeric explicit
   lines and positive/negative named explicit-line occurrences over fixed
   explicit tracks, including gaps between those tracks. Intrinsic placement
+  replay preserves frozen pseudo child content, so those generated grid items
+  retain their inline contents instead of becoming empty placeholders.
   contribution assignment and absolute static-position offsets share the same
   explicit grid line resolver for numeric lines, named occurrences, generated
   line names, crossed fixed-track gaps, and content-aligned final line
@@ -190,12 +206,13 @@ or writing-mode behavior.
   Same-page absolutely positioned grid children resolve explicit physical
   offsets against the grid-area containing block derived from those lines.
   A typed final-geometry grid positioning scope is active while a grid
-  container remains an abspos descendant's containing block, so qualifying
-  descendants use the same resolved grid-area static rectangle as direct
-  positioned grid children. Explicit grid placement supplies the positioned
-  grid area, while all-auto grid lines retain the grid container's actual CSS
-  containing block for percentage resolution. That static context carries the
-  grid alignment container through positioned layout until automatic intrinsic
+  container remains an abspos descendant's containing block. In that case,
+  direct children and qualifying descendants use the resolved grid-placement
+  area, including padding-edge automatic placement lines. Otherwise a direct
+  Grid child's static-position rectangle is the Grid content box and ignores
+  its grid-placement properties. The selected rectangle remains independent
+  of the actual containing block and passes through generic positioned layout
+  unchanged, so self-alignment is resolved once after automatic intrinsic
   sizes are known. Orthogonal positioned items resolve an automatic physical
   height from their logical inline measure rather than their physical text
   advance.
@@ -267,11 +284,15 @@ or writing-mode behavior.
   for horizontal
   `justify-self`/`justify-items` `left`/`right` so those keywords remain
   physical in LTR and RTL grids.
+  Baseline requests whose Grid-item sizing depends on an intrinsic track are
+  permanently excluded from sharing and use their required first/last
+  start/end fallback during item replay, so they cannot affect an exported
+  Grid baseline.
   Same-page horizontal grid container first and last exported baselines come
   from the first and last occupied grid rows for inline-grid and nested grid
   baseline-sharing cases, and simple same-page spanning items share first/last
-  baselines with items on the same row edge. Full baseline synthesis,
-  orthogonal `self-start`/`self-end` writing-mode details, broader spanning
+  baselines with items on the same row edge. Full baseline shims during
+  intrinsic track sizing, orthogonal baseline sharing, broader spanning
   baseline groups, and fragmentation interactions remain incomplete.
 
 ## Implementation Plan
@@ -439,10 +460,11 @@ or writing-mode behavior.
   `justify-self`/`justify-items` `left`/`right` stays physical in LTR/RTL
   grids; same-page horizontal grid container first/last exported baselines work
   for occupied-row baseline-sharing cases, and simple spanning items share
-  baselines by start/end row edge. Full exported baseline synthesis, broader
-  spanning baseline groups, orthogonal self-start/self-end writing-mode
-  details, and fragmentation interactions remain incomplete and should also be
-  tracked in
+  baselines by start/end row edge. Cyclic intrinsic-track baseline requests use
+  their required start/end fallback and are excluded from sharing and exported
+  baselines. Full baseline shims during intrinsic track sizing, broader
+  spanning baseline groups, orthogonal baseline sharing, and fragmentation
+  interactions remain incomplete and should also be tracked in
   `docs/CSS_BOX_ALIGNMENT_PARITY.md`.
 - [ ] `SPEC_DIVERGENCES.md` accurately lists all remaining grid divergences.
 

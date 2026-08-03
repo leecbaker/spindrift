@@ -164,7 +164,12 @@ impl StyleElement<'_> {
 
     pub(in crate::css) fn child_element_at(&self, child_index: usize) -> Option<Self> {
         let child = self.signature().child_at(child_index)?;
-        let mut chain = self.chain.as_ref().clone();
+        // `self` can be an ancestor borrowed from a longer subject chain while
+        // evaluating a relational selector. Its synthetic child belongs below
+        // this element, not below the original subject that follows it in the
+        // chain. Keep only the path through `self` before appending the child.
+        // <https://drafts.csswg.org/selectors-4/#relational>
+        let mut chain = self.chain[..=self.index].to_vec();
         chain.push(Cow::Owned(child));
         let index = chain.len() - 1;
         Some(Self {

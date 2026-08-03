@@ -60,6 +60,69 @@ impl CollapsedBorderSegment {
         };
         Self { rect, orientation }
     }
+
+    /// Return the physical cross-axis position used to paint adjacent
+    /// collapsed-border segments in a stable page order.
+    ///
+    /// The grid remains in source-logical order through conflict resolution,
+    /// but adjacent centered rules overlap at their joins.  Painting them in
+    /// source order would reverse that overlap for an RTL table whose columns
+    /// are otherwise physically equivalent to an LTR table with reversed DOM
+    /// cells.  Select the physical coordinate only after projection so the
+    /// same rule covers horizontal and vertical table roots:
+    /// <https://www.w3.org/TR/CSS22/tables.html#collapsing-borders> and
+    /// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>.
+    fn physical_paint_order_position(self) -> f32 {
+        match self.orientation {
+            CollapsedBorderOrientation::Horizontal => self.rect.top_y(),
+            CollapsedBorderOrientation::Vertical => self.rect.x(),
+        }
+    }
+}
+
+/// One resolved collapsed-border rule ready for page paint.
+///
+/// The grid owns conflict resolution and source-logical indexing; this record
+/// is the narrow boundary where the resolved line is put into physical page
+/// paint order so coincident joins raster consistently.
+#[derive(Debug, Clone, Copy)]
+struct CollapsedBorderPaintCommand {
+    border: CollapsedBorder,
+    segment: CollapsedBorderSegment,
+}
+
+impl CollapsedBorderPaintCommand {
+    fn physical_paint_order(self) -> f32 {
+        self.segment.physical_paint_order_position()
+    }
+
+    /// Return the start of this rule's physical painted span.
+    ///
+    /// All segments generated for one horizontal grid boundary meet at their
+    /// ends. Their logical column order reverses for RTL tables, so owning an
+    /// antialiased join in that order would make otherwise equivalent LTR and
+    /// RTL tables raster differently. Select the physical span only after
+    /// writing-mode projection.
+    fn physical_span_start(self) -> f32 {
+        match self.segment.orientation {
+            CollapsedBorderOrientation::Horizontal => self.segment.rect.x(),
+            CollapsedBorderOrientation::Vertical => self.segment.rect.top_y(),
+        }
+    }
+}
+
+fn sort_collapsed_border_paint_commands(commands: &mut [CollapsedBorderPaintCommand]) {
+    commands.sort_by(|left, right| {
+        left.physical_paint_order()
+            .total_cmp(&right.physical_paint_order())
+    });
+}
+
+fn sort_collapsed_boundary_segments(commands: &mut [CollapsedBorderPaintCommand]) {
+    commands.sort_by(|left, right| {
+        left.physical_span_start()
+            .total_cmp(&right.physical_span_start())
+    });
 }
 
 impl CollapsedBorderGrid {
@@ -494,6 +557,7 @@ impl CollapsedBorderGrid {
             let Some(row) = self.vertical.get(original_row) else {
                 continue;
             };
+            let mut vertical_paint_commands = Vec::new();
             for (boundary, border) in row.iter().enumerate() {
                 let Some(border) = border else {
                     continue;
@@ -509,17 +573,22 @@ impl CollapsedBorderGrid {
                     0.0
                 };
                 let block_start = source_block_start - top_extension;
-                border.paint_vertical(
-                    &mut rects,
-                    &mut paths,
-                    segment_placement.project_inline_line(
+                vertical_paint_commands.push(CollapsedBorderPaintCommand {
+                    border: *border,
+                    segment: segment_placement.project_inline_line(
                         TableGridInlineOffset::new(column_plan.boundary_x(boundary)),
                         TableGridBlockOffset::new(TableGridLength::new(block_start)),
                         TableGridBlockOffset::new(TableGridLength::new(
                             height + top_extension + bottom_extension,
                         )),
                     ),
-                );
+                });
+            }
+            sort_collapsed_border_paint_commands(&mut vertical_paint_commands);
+            for command in vertical_paint_commands {
+                command
+                    .border
+                    .paint_vertical(&mut rects, &mut paths, command.segment);
             }
         }
 
@@ -545,6 +614,7 @@ impl CollapsedBorderGrid {
             return;
         };
         let row_count = self.vertical.len();
+        let mut commands = Vec::new();
         for (column, border) in row.iter().enumerate() {
             let Some(border) = border else {
                 continue;
@@ -576,15 +646,20 @@ impl CollapsedBorderGrid {
                     first_boundary + TableGridLength::new(before_extension),
                 )
             };
-            border.paint_horizontal(
-                rects,
-                paths,
-                placement.project_block_line(
+            commands.push(CollapsedBorderPaintCommand {
+                border: *border,
+                segment: placement.project_block_line(
                     TableGridInlineOffset::new(inline_start),
                     TableGridInlineOffset::new(inline_end - inline_start),
                     block,
                 ),
-            );
+            });
+        }
+        sort_collapsed_boundary_segments(&mut commands);
+        for command in commands {
+            command
+                .border
+                .paint_horizontal(rects, paths, command.segment);
         }
     }
 
@@ -1083,6 +1158,51 @@ mod tests {
             origin,
             tie_position: 0,
         }
+    }
+
+    fn vertical_paint_command(x: f32, color: CssColor) -> CollapsedBorderPaintCommand {
+        CollapsedBorderPaintCommand {
+            border: CollapsedBorder {
+                width: layout_pt(2.0 * css::CSS_PX_TO_PT),
+                style: BorderStyle::Solid,
+                color,
+                side: BorderSide::Left,
+                origin: BorderOrigin::Cell,
+                tie_position: 0,
+            },
+            segment: CollapsedBorderSegment::vertical(x, 20.0, 40.0),
+        }
+    }
+
+    #[test]
+    fn collapsed_vertical_rules_paint_in_the_same_physical_order_for_ltr_and_rtl() {
+        let green = CssColor::new(0, 128, 0);
+        let blue = CssColor::new(0, 0, 255);
+        let black = CssColor::BLACK;
+        let mut ltr = vec![
+            vertical_paint_command(10.0, green),
+            vertical_paint_command(20.0, blue),
+            vertical_paint_command(30.0, black),
+        ];
+        // An RTL grid visits those same physical boundaries in reverse logical
+        // column order.  Its paint result must nevertheless be identical.
+        let mut rtl = vec![
+            vertical_paint_command(30.0, black),
+            vertical_paint_command(20.0, blue),
+            vertical_paint_command(10.0, green),
+        ];
+
+        sort_collapsed_border_paint_commands(&mut ltr);
+        sort_collapsed_border_paint_commands(&mut rtl);
+
+        let colors = |commands: &[CollapsedBorderPaintCommand]| {
+            commands
+                .iter()
+                .map(|command| command.border.color)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(colors(&rtl), colors(&ltr));
+        assert_eq!(colors(&rtl), vec![green, blue, black]);
     }
 
     #[test]

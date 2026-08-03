@@ -5,7 +5,7 @@ use std::rc::Rc;
 impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn marker_for_list_item(
         &mut self,
-        _element: &Element,
+        element: &Element,
         style: &ComputedStyle,
         parent_direction: Direction,
     ) -> Option<ListMarker> {
@@ -27,14 +27,14 @@ impl<'a> LayoutBuilder<'a> {
             .counter_plan
             .values_at_origin
             .get(&CounterOriginKey::new(
-                _element,
+                element,
                 box_tree::CounterEventSource::Marker,
             ))
             .or_else(|| {
                 self.counter_plan
                     .values_at_origin
                     .get(&CounterOriginKey::new(
-                        _element,
+                        element,
                         box_tree::CounterEventSource::Principal,
                     ))
             });
@@ -64,6 +64,21 @@ impl<'a> LayoutBuilder<'a> {
             // stream, where it remains available for extraction.
             // <https://drafts.csswg.org/css-lists-3/#list-style-position-property>
             Some((String::new(), true))
+        } else if let Some(parts) = marker_style.content.generated_parts() {
+            let text = evaluate_generated_content_text(
+                element,
+                parts,
+                counter_stacks,
+                &self.counter_styles,
+            );
+            (!text.is_empty()).then_some((text, false))
+        } else if marker_style.marker_content == MarkerContent::Auto {
+            // The originating list item's list-style properties select the
+            // automatic marker representation. `::marker` can style that
+            // representation, but cannot substitute its inherited
+            // `list-style-type` or `list-style-image` values.
+            // <https://drafts.csswg.org/css-lists-3/#marker-content>
+            automatic_marker_text(style.list_style_type.clone(), ordinal, &self.counter_styles)
         } else {
             marker_text(
                 &marker_style,
@@ -99,9 +114,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         marker: &ListMarker,
         style: &ComputedStyle,
-        content_inline_start: f32,
-        content_inline_end: f32,
-        row_top: f32,
+        anchor: OutsideMarkerAnchor,
     ) {
         if !marker.paints_outside()
             || style.visibility != Visibility::Visible
@@ -116,10 +129,16 @@ impl<'a> LayoutBuilder<'a> {
                 0.0
             };
             let x = match marker.positioning_direction {
-                Direction::Ltr => content_inline_start - image.width - gap,
-                Direction::Rtl => content_inline_end + gap,
+                Direction::Ltr => anchor.content_inline_span.left_x() - image.width - gap,
+                Direction::Rtl => anchor.content_inline_span.right_x() + gap,
             };
-            let rect = PageTopRect::new(x, row_top, image.width, image.height).paint_rect();
+            let rect = PageTopRect::new(
+                x,
+                anchor.formatted_line_block_start.points(),
+                image.width,
+                image.height,
+            )
+            .paint_rect();
             if let Some(asset) = &image.svg {
                 for path in asset.paint_paths(rect) {
                     self.push_path_in_band(PaintBand::Inline, path);
@@ -165,16 +184,128 @@ impl<'a> LayoutBuilder<'a> {
             )
         };
         let marker_left = match marker.positioning_direction {
-            Direction::Ltr => content_inline_start - marker_width,
-            Direction::Rtl => content_inline_end,
+            Direction::Ltr => anchor.content_inline_span.left_x() - marker_width,
+            Direction::Rtl => anchor.content_inline_span.right_x(),
         };
+        let marker_baseline_offset = layout_pt(sequence.first_line_baseline_offset(
+            self.inline_box_text_line_layout_baseline_offset(&marker.style),
+        ));
+        let marker_block_start = anchor
+            .alphabetic_baseline
+            .toward_block_start(marker_baseline_offset);
         self.paint_inline_box_sequence(
             &sequence,
             &marker.style,
             marker_left,
             marker_width,
-            row_top,
+            marker_block_start.points(),
         );
+    }
+
+    /// Begin deferring an outside marker until an accepted in-flow line
+    /// supplies its interoperable anchor.  This deliberately scopes the
+    /// capture to horizontal writing: physical vertical-marker placement has
+    /// separate unresolved behavior and retains its established fallback.
+    pub(in crate::layout) fn begin_outside_marker_anchor(
+        &mut self,
+        marker: Option<&ListMarker>,
+        list_item_style: &ComputedStyle,
+        content_inline_span: PageInlineSpan,
+    ) -> bool {
+        let Some(marker) = marker.filter(|marker| marker.paints_outside()) else {
+            return false;
+        };
+        if list_item_style.writing_mode != WritingMode::HorizontalTb {
+            return false;
+        }
+        self.pending_outside_marker_anchors
+            .push(PendingOutsideMarkerAnchor {
+                marker: marker.clone(),
+                list_item_style: list_item_style.clone(),
+                content_inline_span,
+                fallback_line_block_start: PageTopBlockPosition::new(self.cursor_y),
+                painted: false,
+            });
+        true
+    }
+
+    /// Finish a list item's marker capture, retaining the old block-start
+    /// fallback only for an item that establishes no eligible in-flow line.
+    pub(in crate::layout) fn finish_outside_marker_anchor(&mut self) {
+        let Some(pending) = self.pending_outside_marker_anchors.pop() else {
+            return;
+        };
+        if pending.painted {
+            return;
+        }
+        let line_block_start = pending.fallback_line_block_start;
+        let fallback_baseline = line_block_start.toward_block_end(layout_pt(
+            self.inline_box_text_line_layout_baseline_offset(&pending.list_item_style),
+        ));
+        self.paint_outside_marker(
+            &pending.marker,
+            &pending.list_item_style,
+            OutsideMarkerAnchor {
+                content_inline_span: pending.content_inline_span,
+                formatted_line_block_start: line_block_start,
+                alphabetic_baseline: fallback_baseline,
+            },
+        );
+    }
+
+    pub(in crate::layout) fn outside_marker_anchor_is_pending(&self, marker: &ListMarker) -> bool {
+        self.pending_outside_marker_anchors
+            .iter()
+            .any(|pending| pending.marker == *marker)
+    }
+
+    pub(in crate::layout) fn outside_marker_fallback_anchor(
+        &mut self,
+        style: &ComputedStyle,
+        content_inline_span: PageInlineSpan,
+    ) -> OutsideMarkerAnchor {
+        let formatted_line_block_start = PageTopBlockPosition::new(self.cursor_y);
+        let alphabetic_baseline = formatted_line_block_start.toward_block_end(layout_pt(
+            self.inline_box_text_line_layout_baseline_offset(style),
+        ));
+        OutsideMarkerAnchor {
+            content_inline_span,
+            formatted_line_block_start,
+            alphabetic_baseline,
+        }
+    }
+
+    pub(in crate::layout) fn anchor_pending_outside_markers_to_in_flow_line(
+        &mut self,
+        formatted_line_block_start: PageTopBlockPosition,
+        baseline_offset: LayoutLength,
+    ) {
+        let alphabetic_baseline = formatted_line_block_start.toward_block_end(baseline_offset);
+        let anchors = self
+            .pending_outside_marker_anchors
+            .iter()
+            .enumerate()
+            .filter(|(_, pending)| !pending.painted)
+            .map(|(index, pending)| {
+                (
+                    index,
+                    pending.marker.clone(),
+                    pending.list_item_style.clone(),
+                    OutsideMarkerAnchor {
+                        content_inline_span: pending.content_inline_span,
+                        formatted_line_block_start,
+                        alphabetic_baseline,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        for (index, marker, list_item_style, anchor) in anchors {
+            // Mark this before marker-line layout re-enters the shared line
+            // painter. The marker's own generated line is not the list
+            // item's principal line and must not recursively re-anchor it.
+            self.pending_outside_marker_anchors[index].painted = true;
+            self.paint_outside_marker(&marker, &list_item_style, anchor);
+        }
     }
 
     pub(in crate::layout) fn marker_gap_width(&mut self, style: &ComputedStyle) -> LayoutLength {
@@ -193,12 +324,23 @@ impl<'a> LayoutBuilder<'a> {
         items: &mut Vec<InlineItem>,
     ) {
         let marker_scope_style = marker_inline_scope_style(&marker.style);
-        self.push_bidi_scope_start_with_source(
+        let marker_ends_in_preserved_space = marker.suffix_space
+            || marker
+                .text
+                .chars()
+                .last()
+                .is_some_and(is_css_preserved_document_space);
+        self.push_inline_scope_start_items(
             &marker_scope_style,
             link_target.clone(),
             0.0,
             InlineVisualOffset::zero(),
-            InlineTextSource::Marker,
+            None,
+            // A marker ending in preserved document space keeps its existing
+            // whitespace-collection path. A punctuation-suffixed marker has
+            // no separator and shares the zero-size inline scope shape of an
+            // authored isolate.
+            !marker_ends_in_preserved_space,
             items,
         );
         if let Some(image) = &marker.image {
@@ -245,12 +387,13 @@ impl<'a> LayoutBuilder<'a> {
                 ancestor_inline_decorations: Vec::new().into(),
             })));
         }
-        self.push_bidi_scope_end_with_source(
+        self.push_inline_scope_end_items(
             &marker_scope_style,
             link_target,
             0.0,
             InlineVisualOffset::zero(),
-            InlineTextSource::Marker,
+            None,
+            !marker_ends_in_preserved_space,
             items,
         );
     }
@@ -260,7 +403,6 @@ impl<'a> LayoutBuilder<'a> {
         style: &ComputedStyle,
     ) -> Option<MarkerImage> {
         let image = style.list_style_image.as_image()?;
-        let intrinsic_resolution = image.intrinsic_resolution().max(f32::MIN_POSITIVE);
         let css::BackgroundImage::Url {
             src,
             base_url,
@@ -281,6 +423,14 @@ impl<'a> LayoutBuilder<'a> {
             style.image_orientation == css::ImageOrientation::FromImage,
             request_modifiers,
         )?;
+        // Candidate density selects SVG options but does not rescale their
+        // vector natural dimensions.
+        // <https://drafts.csswg.org/css-images-4/#image-set-notation>
+        let intrinsic_resolution = match &asset {
+            ResolvedImageAsset::Raster(_) => image.intrinsic_resolution(),
+            ResolvedImageAsset::Svg(_) => 1.0,
+        }
+        .max(f32::MIN_POSITIVE);
         let intrinsic_size = asset.intrinsic_size();
         let width = intrinsic_size.width / intrinsic_resolution;
         let height = intrinsic_size.height / intrinsic_resolution;
@@ -863,7 +1013,8 @@ mod tests {
     fn ua_counter_styles() -> HashMap<String, CounterStyleRule> {
         crate::css::html5_user_agent_stylesheet()
             .counter_styles
-            .into_iter()
+            .iter()
+            .cloned()
             .map(|style| (style.name.clone(), style))
             .collect()
     }
@@ -882,5 +1033,44 @@ mod tests {
             counter_text(style, -1, &counter_styles),
             Some("-1".to_string())
         );
+    }
+
+    #[test]
+    fn list_style_none_suppresses_only_the_automatic_marker() {
+        let counter_styles = HashMap::new();
+        assert_eq!(
+            automatic_marker_text(ListStyleType::None, 2, &counter_styles),
+            None
+        );
+
+        let mut marker_style = ComputedStyle::initial();
+        marker_style.marker_content = MarkerContent::Parts(vec![
+            MarkerContentPart::Counter {
+                name: LIST_ITEM_COUNTER_NAME.to_string(),
+                style: Some(ListStyleType::Decimal),
+            },
+            MarkerContentPart::Text(". ".to_string()),
+        ]);
+        let stacks = HashMap::from([(LIST_ITEM_COUNTER_NAME.to_string(), vec![2])]);
+        let mut quote_depth = 0;
+        assert_eq!(
+            marker_text(&marker_style, 2, &counter_styles, &stacks, &mut quote_depth),
+            Some(("2. ".to_string(), false))
+        );
+    }
+
+    #[test]
+    fn outside_anchor_preserves_line_start_and_baseline_as_distinct_positions() {
+        let line_start = PageTopBlockPosition::new(100.0);
+        let anchor = OutsideMarkerAnchor {
+            content_inline_span: PageInlineSpan::from_edges(20.0, 80.0),
+            formatted_line_block_start: line_start,
+            alphabetic_baseline: line_start.toward_block_end(layout_pt(12.0)),
+        };
+
+        assert_eq!(anchor.content_inline_span.left_x(), 20.0);
+        assert_eq!(anchor.content_inline_span.right_x(), 80.0);
+        assert_eq!(anchor.formatted_line_block_start.points(), 100.0);
+        assert_eq!(anchor.alphabetic_baseline.points(), 88.0);
     }
 }

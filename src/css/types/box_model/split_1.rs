@@ -386,6 +386,69 @@ pub(crate) struct BorderSpacing {
     pub vertical: ComputedLengthPercentage,
 }
 
+/// Cascaded table border spacing together with the provenance HTML table
+/// layout needs to decide whether a `cellspacing` attribute may supply its
+/// compatibility fallback.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum TableBorderSpacing {
+    AuthorDeclared(BorderSpacing),
+    NonAuthor(BorderSpacing),
+}
+
+impl TableBorderSpacing {
+    pub(crate) const INITIAL: Self = Self::NonAuthor(BorderSpacing::ZERO);
+
+    pub(crate) const fn is_author_declared(&self) -> bool {
+        matches!(self, Self::AuthorDeclared(_))
+    }
+
+    pub(crate) const fn value(&self) -> &BorderSpacing {
+        match self {
+            Self::AuthorDeclared(value) | Self::NonAuthor(value) => value,
+        }
+    }
+
+    pub(crate) fn value_mut(&mut self) -> &mut BorderSpacing {
+        match self {
+            Self::AuthorDeclared(value) | Self::NonAuthor(value) => value,
+        }
+    }
+
+    pub(crate) fn from_declaration(value: BorderSpacing, author_declared: bool) -> Self {
+        if author_declared {
+            Self::AuthorDeclared(value)
+        } else {
+            Self::NonAuthor(value)
+        }
+    }
+
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
+        self.value_mut().resolve_font_metric_lengths(ch_advance);
+    }
+
+    pub(crate) fn requires_ch_advance(&self) -> bool {
+        self.value().requires_ch_advance()
+    }
+
+    pub(crate) fn scale_fixed_length_components(&mut self, factor: f32) {
+        self.value_mut().scale_fixed_length_components(factor);
+    }
+}
+
+impl std::ops::Deref for TableBorderSpacing {
+    type Target = BorderSpacing;
+
+    fn deref(&self) -> &Self::Target {
+        self.value()
+    }
+}
+
+impl ResolveViewportLengths for TableBorderSpacing {
+    fn resolve_viewport_lengths(&mut self, basis: ViewportLengthBasis) {
+        self.value_mut().resolve_viewport_lengths(basis);
+    }
+}
+
 impl BorderSpacing {
     pub(crate) const ZERO: Self = Self {
         horizontal: ComputedLengthPercentage::ZERO,

@@ -1,10 +1,13 @@
-use crate::document::RenderedImagePattern;
-use crate::document::{FontProgramKind, PdfSize, RenderedImageSourceRect};
-use crate::{
-    Bookmark, BookmarkState, CssColor, Document, DocumentFont, DocumentMetadata, Page,
-    RenderedGlyph, RenderedImage, RenderedPath, RenderedPathCommand, RenderedPathFillRule,
-    RenderedRoundedRect, RenderedTextMatrix,
-};
+use crate::document::DocumentFont;
+use crate::document::FontProgramKind;
+use crate::document::paint::geometry::PdfSize;
+use crate::document::paint::images::RenderedImage;
+use crate::document::paint::paths::{RenderedPath, RenderedPathCommand, RenderedPathFillRule};
+use crate::document::paint::patterns::RenderedImagePattern;
+use crate::document::paint::patterns::RenderedImageSourceRect;
+use crate::document::paint::shapes::RenderedRoundedRect;
+use crate::document::paint::text::{RenderedGlyph, RenderedTextMatrix};
+use crate::{Bookmark, BookmarkState, CssColor, Document, DocumentMetadata, Page};
 use pdf_writer::types::BlendMode;
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
@@ -63,25 +66,25 @@ pub(super) fn flate_compress(data: &[u8]) -> Vec<u8> {
 ///
 /// PDF 1.4 transparency defines `/BM` in an ExtGState dictionary: ISO
 /// 32000-1:2008, 11.3.5 "Blend Mode".
-impl From<crate::document::PaintBlendMode> for BlendMode {
-    fn from(mode: crate::document::PaintBlendMode) -> Self {
+impl From<crate::document::paint::effects::PaintBlendMode> for BlendMode {
+    fn from(mode: crate::document::paint::effects::PaintBlendMode) -> Self {
         match mode {
-            crate::document::PaintBlendMode::Normal => Self::Normal,
-            crate::document::PaintBlendMode::Multiply => Self::Multiply,
-            crate::document::PaintBlendMode::Screen => Self::Screen,
-            crate::document::PaintBlendMode::Overlay => Self::Overlay,
-            crate::document::PaintBlendMode::Darken => Self::Darken,
-            crate::document::PaintBlendMode::Lighten => Self::Lighten,
-            crate::document::PaintBlendMode::ColorDodge => Self::ColorDodge,
-            crate::document::PaintBlendMode::ColorBurn => Self::ColorBurn,
-            crate::document::PaintBlendMode::HardLight => Self::HardLight,
-            crate::document::PaintBlendMode::SoftLight => Self::SoftLight,
-            crate::document::PaintBlendMode::Difference => Self::Difference,
-            crate::document::PaintBlendMode::Exclusion => Self::Exclusion,
-            crate::document::PaintBlendMode::Hue => Self::Hue,
-            crate::document::PaintBlendMode::Saturation => Self::Saturation,
-            crate::document::PaintBlendMode::Color => Self::Color,
-            crate::document::PaintBlendMode::Luminosity => Self::Luminosity,
+            crate::document::paint::effects::PaintBlendMode::Normal => Self::Normal,
+            crate::document::paint::effects::PaintBlendMode::Multiply => Self::Multiply,
+            crate::document::paint::effects::PaintBlendMode::Screen => Self::Screen,
+            crate::document::paint::effects::PaintBlendMode::Overlay => Self::Overlay,
+            crate::document::paint::effects::PaintBlendMode::Darken => Self::Darken,
+            crate::document::paint::effects::PaintBlendMode::Lighten => Self::Lighten,
+            crate::document::paint::effects::PaintBlendMode::ColorDodge => Self::ColorDodge,
+            crate::document::paint::effects::PaintBlendMode::ColorBurn => Self::ColorBurn,
+            crate::document::paint::effects::PaintBlendMode::HardLight => Self::HardLight,
+            crate::document::paint::effects::PaintBlendMode::SoftLight => Self::SoftLight,
+            crate::document::paint::effects::PaintBlendMode::Difference => Self::Difference,
+            crate::document::paint::effects::PaintBlendMode::Exclusion => Self::Exclusion,
+            crate::document::paint::effects::PaintBlendMode::Hue => Self::Hue,
+            crate::document::paint::effects::PaintBlendMode::Saturation => Self::Saturation,
+            crate::document::paint::effects::PaintBlendMode::Color => Self::Color,
+            crate::document::paint::effects::PaintBlendMode::Luminosity => Self::Luminosity,
         }
     }
 }
@@ -97,13 +100,15 @@ struct ImageResource {
 
 /// One resolved PDF paint representation for a raster source.
 ///
-/// A uniform, fully opaque decoded image can be painted as an ICC-tagged
-/// vector fill without changing its resolved CSS destination geometry. All
-/// other sources retain their PDF image XObject representation.
+/// A fully transparent decoded image has no PDF paint operation, while a
+/// uniform, fully opaque image can be painted as an ICC-tagged vector fill
+/// without changing its resolved CSS destination geometry. All other sources
+/// retain their PDF image XObject representation.
 /// ISO 32000-2:2020, 8.9.5 defines image XObjects and 8.6.5 defines
 /// calibrated color spaces for direct graphics paint.
 #[derive(Debug, Clone, PartialEq)]
 enum PreparedImageResource {
+    Transparent,
     Raster(ImageResource),
     SolidFill(SolidImageFill),
 }
@@ -113,10 +118,10 @@ enum PreparedImageResource {
 /// `color_space` and `components` are retained after image color conversion,
 /// so a vector replacement selects the same ICC resource and component values
 /// that the ordinary image XObject would have used.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SolidImageFill {
-    color_space: crate::css::CssColorSpace,
-    components: [f32; 3],
+    color_space: crate::color::RasterColorSpace,
+    components: [u8; 3],
 }
 
 /// The PDF encoding selected for one resolved raster-image resource.
@@ -283,8 +288,8 @@ struct SvgTilingPatternPlan {
     name: String,
     form_id: usize,
     form_name: String,
-    pattern: crate::document::RenderedSvgPattern,
-    transform: crate::document::PaintTransform,
+    pattern: crate::document::paint::patterns::RenderedSvgPattern,
+    transform: crate::document::paint::geometry::PaintTransform,
 }
 
 /// A Type 1 tiling pattern used as the fill or stroke paint of one SVG path.
@@ -294,7 +299,7 @@ struct SvgTilingPatternPlan {
 struct SvgPathTilingPatternPlan {
     id: usize,
     name: String,
-    pattern: crate::document::RenderedSvgPathPattern,
+    pattern: crate::document::paint::paths::RenderedSvgPathPattern,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -303,7 +308,7 @@ struct GradientTilingPatternPlan {
     name: String,
     shading_pattern_name: String,
     alpha_gstate_name: Option<String>,
-    pattern: crate::document::RenderedGradientPattern,
+    pattern: crate::document::paint::patterns::RenderedGradientPattern,
 }
 
 /// A page-local PDF shading-pattern resource for one normalized gradient paint.
@@ -315,7 +320,7 @@ struct GradientPatternPlan {
     id: usize,
     name: String,
     function_ids: Vec<usize>,
-    gradient: crate::document::RenderedGradient,
+    gradient: crate::document::paint::paths::RenderedGradient,
     alpha: Option<GradientAlphaPlan>,
 }
 
@@ -345,7 +350,7 @@ struct FormXObjectRender {
     /// including the page's complete form set introduces recursive resources
     /// and duplicate dictionary keys. ISO 32000-1:2008, 8.10 Form XObjects.
     form_dependencies: Vec<FormXObjectReference>,
-    bbox: crate::document::PaintClip,
+    bbox: crate::document::paint::geometry::PaintClip,
     stream: Vec<u8>,
     /// Effect-scope forms need an isolated transparency group; a simple SVG
     /// tile is an opaque reusable drawing and must retain ordinary form
@@ -439,6 +444,9 @@ struct FontDescriptorMetrics {
 struct EmbeddedFontPlans<'a> {
     fonts: Vec<EmbeddedFontPlan<'a>>,
     document_font_to_embedded_font: Vec<Option<usize>>,
+    /// Paint-only synthesis remains keyed by document font rather than by
+    /// embedded resource, because multiple document uses can share a subset.
+    document_font_synthesis: Vec<crate::document::DocumentFontSynthesis>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

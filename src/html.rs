@@ -48,6 +48,11 @@ pub struct Html {
     /// An embedded document has a scrolling viewport distinct from the
     /// unfragmented canvas used to lay out its static contents.
     iframe_viewport: Option<layout::PageSize>,
+    /// Legacy body-margin values from this document's immediate container
+    /// frame. They are cascade context for the embedded document, not a
+    /// property of the iframe's own layout box.
+    /// <https://html.spec.whatwg.org/multipage/rendering.html#the-page>
+    iframe_container_body_margins: Option<css::HtmlContainerFrameBodyMargins>,
 }
 
 impl Html {
@@ -66,6 +71,7 @@ impl Html {
             resource_policy: ResourcePolicy::default(),
             iframe_depth: 0,
             iframe_viewport: None,
+            iframe_container_body_margins: None,
         }
     }
 
@@ -102,6 +108,7 @@ impl Html {
             resource_policy: ResourcePolicy::default(),
             iframe_depth: 0,
             iframe_viewport: None,
+            iframe_container_body_margins: None,
         })
     }
 
@@ -172,6 +179,7 @@ impl Html {
             resource_policy,
             iframe_depth: 0,
             iframe_viewport: None,
+            iframe_container_body_margins: None,
         })
     }
 
@@ -314,10 +322,10 @@ impl Html {
                 css::apply_stylesheet_options(stylesheet, &mut options);
             }
         }
-        let mut parsed_stylesheets = vec![css::html5_user_agent_stylesheet()];
-        if document_syntax == dom::DocumentSyntax::Html {
-            parsed_stylesheets.push(css::html_document_important_user_agent_stylesheet());
-        }
+        let user_agent_stylesheet = css::html5_user_agent_stylesheet();
+        let html_important_stylesheet = (document_syntax == dom::DocumentSyntax::Html)
+            .then(css::html_document_important_user_agent_stylesheet);
+        let mut parsed_stylesheets = Vec::new();
         if options.presentational_hints {
             parsed_stylesheets.push(css::html5_presentational_hints_stylesheet_with_urls(
                 self.base_url.as_ref(),
@@ -333,10 +341,17 @@ impl Html {
                 css::parse_stylesheet_with_media_environment(stylesheet, &media_environment)
             }));
         }
+        let layout_stylesheets = css::Stylesheets::for_document(
+            user_agent_stylesheet,
+            html_important_stylesheet,
+            &parsed_stylesheets,
+        )
+        .with_html_container_frame_body_margins(self.iframe_container_body_margins)
+        .with_image_set_resolution_dppx(options.device_resolution_dppx());
         let font_system_load = {
             let _timer = DebugTimer::start("loading @font-face sources");
             font_system_load
-                .load_stylesheet_fonts_with_fetcher(&parsed_stylesheets, resource_fetcher.clone())
+                .load_stylesheet_fonts_with_fetcher(&layout_stylesheets, resource_fetcher.clone())
         };
         // Images and CSS image resources are optional visual subresources:
         // CSS Images keeps their replaced box in layout when fetching fails.
@@ -360,6 +375,12 @@ impl Html {
             ));
             resource::ResourceCache::preload(&visual_asset_fetcher, resource_paths).await?
         };
+        resolve_object_rendering_states(
+            &mut root,
+            self.base_url(),
+            self.root_url(),
+            &resource_cache,
+        );
         let font_system = {
             let _timer = DebugTimer::start("finishing document font system");
             font_system_load.finish_checked().await?
@@ -369,7 +390,7 @@ impl Html {
             let _timer = DebugTimer::start("measuring iframe viewports");
             layout::layout_prepared_dom(layout::PreparedDomLayout {
                 root: &root,
-                stylesheets: &parsed_stylesheets,
+                stylesheets: layout_stylesheets,
                 options: &options,
                 base_url: self.base_url(),
                 root_url: self.root_url(),
@@ -394,7 +415,7 @@ impl Html {
             let _timer = DebugTimer::start("laying out document with iframe subdocuments");
             layout::layout_prepared_dom(layout::PreparedDomLayout {
                 root: &root,
-                stylesheets: &parsed_stylesheets,
+                stylesheets: layout_stylesheets,
                 options: &options,
                 base_url: self.base_url(),
                 root_url: self.root_url(),
@@ -535,9 +556,12 @@ impl Html {
                         continue;
                     };
                     log::debug!("loading linked stylesheet {path}");
-                    match Css::from_url_with_fetcher(path, resource_fetcher).await {
-                        Ok(stylesheet) => {
+                    match Css::from_link_url_with_fetcher(path, resource_fetcher).await {
+                        Ok(Some(stylesheet)) => {
                             styles.push(stylesheet.with_root_url(self.root_url.clone()))
+                        }
+                        Ok(None) => {
+                            log::debug!("ignoring linked stylesheet {href} with non-CSS MIME type");
                         }
                         Err(error) if resource_fetcher.allows_fetch_errors() => {
                             log::debug!("failed to load linked stylesheet {href}: {error}");
@@ -592,20 +616,20 @@ impl Html {
         let mut sources = Vec::new();
         collect_iframe_sources(root, &mut sources);
         let mut documents = HashMap::new();
-        for (element_id, source) in sources {
-            let Some((width, height)) = viewports.get(&element_id).copied() else {
+        for source in sources {
+            let Some((width, height)) = viewports.get(&source.element_id).copied() else {
                 continue;
             };
             let mut iframe_options = options.clone();
             iframe_options.page_size =
                 layout::PageSize::from_points(width.max(1.0), height.max(10_000.0));
             iframe_options.set_margin(layout_pt(0.0));
-            let iframe_result = match source {
+            let iframe_result = match source.source {
                 // `srcdoc` wins over `src` and its URL is `about:srcdoc`; its
                 // fallback base URL is inherited from the embedding document.
                 // <https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-srcdoc>
-                IframeSource::Srcdoc(source) => Ok(Html {
-                    source,
+                IframeSource::Srcdoc(srcdoc) => Ok(Html {
+                    source: srcdoc,
                     input_syntax: InputSyntax::Html,
                     base_url: self.base_url.clone(),
                     root_url: self.root_url.clone(),
@@ -616,14 +640,15 @@ impl Html {
                         width.max(1.0),
                         height.max(1.0),
                     )),
+                    iframe_container_body_margins: Some(source.container_body_margins),
                 }),
-                IframeSource::Url(source) => {
+                IframeSource::Url(url_source) => {
                     // Resource fetching deliberately removes a URL fragment
                     // because it does not identify a distinct network
                     // resource. Keep it for the embedded browsing context's
                     // initial fragment navigation.
                     let Some(resolved_url) =
-                        resource::resolve_url(&source, self.base_url(), self.root_url())
+                        resource::resolve_url(&url_source, self.base_url(), self.root_url())
                     else {
                         continue;
                     };
@@ -641,10 +666,11 @@ impl Html {
                         width.max(1.0),
                         height.max(1.0),
                     ));
+                    iframe.iframe_container_body_margins = Some(source.container_body_margins);
                     match Box::pin(iframe.render(&iframe_options)).await {
                         Ok(mut document) => {
                             document.materialize_images_for_embedding();
-                            documents.insert(element_id, document);
+                            documents.insert(source.element_id, document);
                         }
                         Err(error) => log::debug!("failed to render iframe subdocument: {error}"),
                     }
@@ -689,6 +715,80 @@ fn resource_paths(
         }
     }
     paths
+}
+
+/// Resolve the static representation selected for every HTML `<object>`.
+///
+/// In a live browser this selection can change while the resource fetch is in
+/// flight. Paged output has one deterministic layout pass, so Quire selects
+/// the external representation only when a preloaded resource can be decoded
+/// as an image that this renderer can paint; every other outcome exposes the
+/// element's fallback subtree to the CSS formatting model.
+/// <https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-object-element>
+fn resolve_object_rendering_states(
+    node: &mut dom::Node,
+    base_url: Option<&Url>,
+    root_url: Option<&Url>,
+    resource_cache: &resource::ResourceCache,
+) {
+    let dom::NodeKind::Element(element) = &mut node.kind else {
+        return;
+    };
+    for child in &mut element.children {
+        resolve_object_rendering_states(child, base_url, root_url, resource_cache);
+    }
+    if !has_html_object_rendering_semantics(element) {
+        return;
+    }
+    element.object_rendering =
+        if object_has_supported_static_image(element, base_url, root_url, resource_cache) {
+            dom::ObjectRendering::Image
+        } else {
+            dom::ObjectRendering::Fallback
+        };
+}
+
+fn has_html_object_rendering_semantics(element: &dom::Element) -> bool {
+    element.tag == "object"
+        && (element.namespace_url == "http://www.w3.org/1999/xhtml"
+            || (element.document_syntax == dom::DocumentSyntax::Html
+                && element.namespace_url.is_empty()))
+}
+
+/// Return whether the object can use Quire's existing static replaced-image
+/// renderer. A declared unsupported MIME type selects fallback before resource
+/// decoding, matching HTML's permitted early fallback for unsupported types.
+/// <https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-object-element>
+fn object_has_supported_static_image(
+    element: &dom::Element,
+    base_url: Option<&Url>,
+    root_url: Option<&Url>,
+    resource_cache: &resource::ResourceCache,
+) -> bool {
+    if element
+        .attrs
+        .get("type")
+        .is_some_and(|mime_type| !crate::image_store::supports_declared_image_mime_type(mime_type))
+    {
+        return false;
+    }
+    let Some(data) = element
+        .attrs
+        .get("data")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|data| !data.is_empty())
+    else {
+        return false;
+    };
+    if data.starts_with("data:") {
+        return resource_cache
+            .data_image_asset_with_orientation(data, false)
+            .is_some();
+    }
+    resource::resolve_url(data, base_url, root_url)
+        .and_then(|url| resource_cache.image_asset_url_with_orientation(&url, false))
+        .is_some()
 }
 
 fn collect_html_resource_paths(
@@ -739,11 +839,19 @@ fn collect_html_resource_paths(
     {
         paths.push(path);
     }
-    if matches!(element.tag.as_str(), "object" | "embed")
+    if element.tag == "object"
         && let Some(src) = element
             .attrs
             .get("data")
-            .or_else(|| element.attrs.get("src"))
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|data| !data.is_empty())
+        && let Some(path) = resource::resolve_fetchable_url(src, base_url, root_url)
+    {
+        paths.push(path);
+    }
+    if element.tag == "embed"
+        && let Some(src) = element.attrs.get("src")
         && let Some(path) = resource::resolve_fetchable_url(src, base_url, root_url)
     {
         paths.push(path);
@@ -758,17 +866,33 @@ enum IframeSource {
     Url(String),
 }
 
-fn collect_iframe_sources(node: &dom::Node, sources: &mut Vec<(dom::ElementId, IframeSource)>) {
+struct IframeSourceRequest {
+    element_id: dom::ElementId,
+    source: IframeSource,
+    container_body_margins: css::HtmlContainerFrameBodyMargins,
+}
+
+fn collect_iframe_sources(node: &dom::Node, sources: &mut Vec<IframeSourceRequest>) {
     let dom::NodeKind::Element(element) = &node.kind else {
         return;
     };
     if element.tag.eq_ignore_ascii_case("iframe") {
+        let container_body_margins =
+            css::HtmlContainerFrameBodyMargins::from_iframe_attributes(&element.attrs);
         // `srcdoc` takes precedence even if its value is the empty string.
         // <https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-srcdoc>
         if let Some(source) = element.attrs.get("srcdoc") {
-            sources.push((element.id, IframeSource::Srcdoc(source.clone())));
+            sources.push(IframeSourceRequest {
+                element_id: element.id,
+                source: IframeSource::Srcdoc(source.clone()),
+                container_body_margins,
+            });
         } else if let Some(source) = element.attrs.get("src") {
-            sources.push((element.id, IframeSource::Url(source.clone())));
+            sources.push(IframeSourceRequest {
+                element_id: element.id,
+                source: IframeSource::Url(source.clone()),
+                container_body_margins,
+            });
         }
     }
     for child in &element.children {
@@ -819,7 +943,7 @@ fn embedded_style_css(source: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FetchErrorPolicy, ResourcePolicy, dom};
+    use crate::{CssColor, FetchErrorPolicy, ResourcePolicy, dom};
 
     #[tokio::test]
     async fn missing_image_is_an_optional_visual_subresource() {
@@ -855,6 +979,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn linked_data_stylesheet_with_default_text_plain_mime_is_ignored() {
+        let document = Html::from_string(
+            "<link rel=\"stylesheet\" href=\"data:,p%7Bcolor%3Ared%7D\"><p>Text</p>",
+        )
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+
+        assert_eq!(document.pages[0].lines()[0].color, CssColor::BLACK);
+    }
+
+    #[tokio::test]
+    async fn linked_text_css_data_stylesheet_applies_percent_encoded_source() {
+        let document = Html::from_string(
+            "<link rel=\"stylesheet\" href=\"data:text/css,p%7Bcolor%3Ared%7D\"><p>Text</p>",
+        )
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+
+        assert_eq!(document.pages[0].lines()[0].color, CssColor::new(255, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn linked_text_css_data_stylesheet_applies_base64_source() {
+        let document = Html::from_string(
+            "<link rel=\"stylesheet\" href=\"data:text/css;base64,cCB7IGNvbG9yOiByZWQgfQ==\"><p>Text</p>",
+        )
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+
+        assert_eq!(document.pages[0].lines()[0].color, CssColor::new(255, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn imported_text_css_data_stylesheet_applies() {
+        let document = Html::from_string("<p>Text</p>")
+            .with_stylesheet(Css::from_string(
+                "@import url(data:text/css,p%7Bcolor%3Ared%7D);",
+            ))
+            .render(&RenderOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(document.pages[0].lines()[0].color, CssColor::new(255, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn eof_immediately_after_selector_in_data_stylesheet_does_not_abort_rendering() {
+        Html::from_string("<link rel=\"stylesheet\" href=\"data:,a{\">")
+            .render(&RenderOptions::default())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn eof_after_selector_content_in_data_stylesheet_does_not_abort_rendering() {
+        Html::from_string("<link rel=\"stylesheet\" href=\"data:text/css,a{xyz\">")
+            .render(&RenderOptions::default())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn rendered_data_image_uses_document_store_after_layout() {
         let html = Html::from_string(
             "<img src=\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC\">",
@@ -864,7 +1053,7 @@ mod tests {
         assert_eq!(document.image_store.len(), 1);
         assert!(matches!(
             document.pages[0].images[0].source,
-            crate::document::RenderedImageSource::Stored { .. }
+            crate::document::paint::images::RenderedImageSource::Stored { .. }
         ));
         assert!(
             document

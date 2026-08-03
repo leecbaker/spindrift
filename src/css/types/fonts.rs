@@ -113,6 +113,29 @@ pub(crate) struct FontSynthesis {
     pub(crate) position: bool,
 }
 
+/// The OpenType language system selected by `font-language-override`.
+///
+/// CSS accepts a quoted OpenType language-system tag.  OpenType stores that
+/// tag in a four-byte field, padding the common three-letter tags with a
+/// trailing space.  Keeping the normalized tag rather than a BCP-47 locale is
+/// important: this property changes only OpenType feature selection, not the
+/// element language used by CSS Text.
+/// <https://drafts.csswg.org/css-fonts-4/#font-language-override-prop>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FontLanguageOverride {
+    Normal,
+    OpenType([u8; 4]),
+}
+
+impl FontLanguageOverride {
+    pub(crate) const fn opentype_tag(self) -> Option<[u8; 4]> {
+        match self {
+            Self::Normal => None,
+            Self::OpenType(tag) => Some(tag),
+        }
+    }
+}
+
 impl FontSynthesis {
     pub(crate) const ALL: Self = Self {
         weight: true,

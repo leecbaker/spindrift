@@ -1,10 +1,121 @@
 use super::*;
 
-fn fragments_share_visual_line(lines: &[quire::RenderedLine]) -> bool {
+fn fragments_share_visual_line(lines: &[crate::document::paint::text::RenderedLine]) -> bool {
     let Some(first) = lines.first() else {
         return true;
     };
     lines.iter().all(|line| (line.y() - first.y()).abs() < 3.0)
+}
+
+fn rendered_text_occurrences(document: &quire::Document, needle: &str) -> usize {
+    document
+        .pages
+        .iter()
+        .flat_map(|page| page.lines())
+        .map(|line| line.text.matches(needle).count())
+        .sum()
+}
+
+#[tokio::test]
+async fn nowrap_left_float_after_prefix_reflows_the_prefix_once() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 240px 120px; margin: 0 }\
+         body { margin: 0; font: 16px/20px monospace }\
+         div { white-space: nowrap }\
+         span { float: left; width: 48px; height: 20px; background: blue }\
+         </style><div>Kittie<span>Hello&nbsp;</span></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let blue = CssColor::new(0, 0, 255);
+    assert_eq!(
+        page.rects()
+            .iter()
+            .filter(|rect| rect.fill == Some(blue))
+            .count(),
+        1,
+        "the selected inline float must own one paint subtree"
+    );
+    assert_eq!(rendered_text_occurrences(&document, "Hello"), 1);
+    assert_eq!(rendered_text_occurrences(&document, "Kittie"), 1);
+    let hello = page
+        .lines()
+        .iter()
+        .find(|line| line.text.contains("Hello"))
+        .expect("floating prefix should be painted");
+    let kittie = page
+        .lines()
+        .iter()
+        .find(|line| line.text.contains("Kittie"))
+        .expect("in-flow prefix should be painted");
+    assert!(
+        hello.x() < kittie.x(),
+        "a same-row left float should reflow the earlier source prefix: {hello:?}, {kittie:?}"
+    );
+}
+
+#[tokio::test]
+async fn overflowing_nowrap_prefix_keeps_one_text_source_line_before_lower_float() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 240px 160px; margin: 0 }\
+         body { margin: 0; font: 16px/20px monospace }\
+         div { width: 10ch; white-space: nowrap }\
+         span { float: right; width: 5ch; height: 5ch; background: blue }\
+         </style><div>Some text that overflows my parent.<span></span></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    assert_eq!(
+        rendered_text_occurrences(&document, "Some text that overflows my parent."),
+        1
+    );
+    assert_eq!(
+        page.rects()
+            .iter()
+            .filter(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
+            .count(),
+        1,
+        "the lower float-placement row must not duplicate its paint subtree"
+    );
+}
+
+#[tokio::test]
+async fn start_and_post_prefix_inline_floats_each_commit_once() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 240px 160px; margin: 0 }\
+         body { margin: 0; font: 16px/20px monospace }\
+         div { white-space: nowrap }\
+         .first { float: left; width: 40px; height: 20px; background: blue }\
+         .second { float: left; width: 40px; height: 20px; background: red }\
+         </style><div><span class=\"first\">Hello</span>Kittie<span class=\"second\">World</span></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    for color in [CssColor::new(0, 0, 255), CssColor::new(255, 0, 0)] {
+        assert_eq!(
+            page.rects()
+                .iter()
+                .filter(|rect| rect.fill == Some(color))
+                .count(),
+            1,
+            "each inline float must create one exclusion/paint subtree"
+        );
+    }
+    for text in ["Hello", "Kittie", "World"] {
+        assert_eq!(rendered_text_occurrences(&document, text), 1, "{text}");
+    }
 }
 
 #[tokio::test]
@@ -117,6 +228,37 @@ async fn inline_block_with_only_preserved_newline_uses_forced_line_baseline() {
     assert!(
         (green_blocks[0].y() - green_blocks[1].y()).abs() < 0.01,
         "inline-block top edges should align: {green_blocks:?}"
+    );
+}
+
+#[tokio::test]
+async fn zero_font_text_float_has_no_intrinsic_inline_size() {
+    let document = Html::from_string(
+        "<!DOCTYPE html><style>@page { size: 240px 240px; margin: 0 } body { margin: 0 }\
+         .zero { float: left; height: 200px; font-size: 0; background: red }\
+         .target { width: 200px; height: 200px; background: green }</style>\
+         <div class=\"zero\">Text that has no intrinsic contribution.</div><div class=\"target\"></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let green = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
+        .expect("following fixed-size block background");
+    assert!(
+        green.x().abs() < 0.01,
+        "zero-size float displaced green: {green:?}"
+    );
+    assert!(
+        page.rects().iter().all(|rect| {
+            rect.fill != Some(CssColor::new(255, 0, 0)) || rect.width() * rect.height() == 0.0
+        }),
+        "zero-size text float painted a non-empty red background: {:?}",
+        page.rects()
     );
 }
 
@@ -866,7 +1008,52 @@ async fn counter_reset_that_shadows_ancestor_does_not_replace_ancestor_counter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>()
         .join("");
-    assert!(text.contains("01 02 99 03"), "{text}");
+    assert!(text.contains("01 02 99 100"), "{text}");
+}
+
+#[tokio::test]
+async fn nested_counter_reset_replaces_a_previous_sibling_and_remains_in_scope() {
+    let document = Html::from_string(
+        "<style>@page { size: 320pt 120pt; margin: 10pt } body, p, div, span { margin: 0; font-size: 10pt; line-height: 12pt } body { counter-reset: c } p, #test span { counter-increment: c } #test span:first-child { counter-reset: c } #test span::before { content: counters(c, \".\", decimal) \" \" } </style><p></p><div id=\"test\"><span></span><span></span><span style=\"counter-reset: c 98\"></span><span></span><span style=\"counter-reset: c 999998\"></span><span></span></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let text = document
+        .pages
+        .iter()
+        .flat_map(|page| page.lines().iter())
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>()
+        .join("");
+    assert!(
+        text.contains("1.1 1.2 1.99 1.100 1.999999 1.1000000"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn nested_hebrew_counters_fall_back_after_a_sibling_reset() {
+    let document = Html::from_string(
+        "<style>@page { size: 320pt 120pt; margin: 10pt } body, p, div, span { margin: 0; font-size: 10pt; line-height: 12pt } body { counter-reset: c } p, #test span { counter-increment: c } #test span:first-child { counter-reset: c } #test span::before { content: counters(c, \".\", hebrew) \" \" } </style><p></p><div id=\"test\"><span></span><span style=\"counter-reset: c 999998\"></span><span></span></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let text = document
+        .pages
+        .iter()
+        .flat_map(|page| page.lines().iter())
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>()
+        .join("");
+    // The line text is in visual order under the surrounding LTR paragraph,
+    // so the decimal fallback follows the outer Hebrew counter here.
+    assert!(text.contains("א.א"), "{text}");
+    assert!(text.contains("999999.א"), "{text}");
+    assert!(text.contains("1000000.א"), "{text}");
 }
 
 #[tokio::test]
@@ -899,7 +1086,7 @@ async fn inline_generated_counters_use_inline_element_counter_scope() {
            <span></span> <span></span> <span style=\"counter-reset: c 98\"></span> \
            <span></span> <span></span>\
          </div>\
-         <div>01 02 03 04 05 06 07 08 09 10 11 12 99 13 14</div>",
+         <div>01 02 03 04 05 06 07 08 09 10 11 12 99 100 101</div>",
     )
     .render(&RenderOptions::default())
     .await
@@ -911,7 +1098,10 @@ async fn inline_generated_counters_use_inline_element_counter_scope() {
         .flat_map(|page| page.lines().iter())
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
-    let expected = "01 02 03 04 05 06 07 08 09 10 11 12 99 13 14";
+    // A counter reset on a sibling remains in scope for following siblings,
+    // so their increments continue from the reset value.
+    // <https://www.w3.org/TR/css-lists-3/#nested-counters-and-scope>
+    let expected = "01 02 03 04 05 06 07 08 09 10 11 12 99 100 101";
     let count = texts.iter().filter(|text| **text == expected).count();
     assert_eq!(
         count, 2,
@@ -962,8 +1152,8 @@ async fn generated_gradient_content_renders_inline_atom() {
         "<style>\
          @page { size: 180pt 80pt; margin: 10pt }\
          body, p { margin: 0; font-size: 10pt; line-height: 12pt }\
-         p::before { content: linear-gradient(red, blue) \" \"; width: 8pt; height: 6pt }\
-         p::after { content: radial-gradient(circle, red, blue); width: 6pt; height: 6pt }\
+         p::before { content: linear-gradient(in srgb, red, blue) \" \"; width: 8pt; height: 6pt }\
+         p::after { content: radial-gradient(in srgb circle, red, blue); width: 6pt; height: 6pt }\
          </style><p>Grad</p>",
     )
     .render(&RenderOptions::default())
@@ -971,16 +1161,21 @@ async fn generated_gradient_content_renders_inline_atom() {
     .unwrap();
 
     let images = document.pages[0].images();
-    assert_eq!(images.len(), 2);
+    assert_eq!(images.len(), 0);
     assert!(
-        images
+        document.pages[0]
+            .gradient_patterns()
             .iter()
-            .any(|image| (image.width() - 8.0).abs() < 0.01 && (image.height() - 6.0).abs() < 0.01)
+            .any(|gradient| (gradient.width() - 8.0).abs() < 0.01
+                && (gradient.height() - 6.0).abs() < 0.01)
     );
     assert!(
-        images
+        document.pages[0]
+            .gradient_patterns()
             .iter()
-            .any(|image| (image.width() - 6.0).abs() < 0.01 && (image.height() - 6.0).abs() < 0.01)
+            .any(|gradient| {
+                (gradient.width() - 6.0).abs() < 0.01 && (gradient.height() - 6.0).abs() < 0.01
+            })
     );
     assert!(
         document.pages[0]
@@ -1238,6 +1433,26 @@ async fn leader_content_expands_between_inline_items() {
 }
 
 #[tokio::test]
+async fn html_input_and_textarea_suppress_generated_content_pseudos() {
+    let document = Html::from_string(
+        "<style>@page { size: 220pt 100pt; margin: 10pt } body { margin: 0; font: 10pt/12pt monospace } input, textarea { display: block; width: 100pt; height: 12pt } input::before { content: \"input-generated\" } textarea::after { content: \"textarea-generated\" } div::before { content: \"ordinary-generated\" }</style><input><textarea></textarea><div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let text = document.pages[0]
+        .lines()
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>()
+        .join("");
+    assert!(!text.contains("input-generated"), "{text}");
+    assert!(!text.contains("textarea-generated"), "{text}");
+    assert!(text.contains("ordinary-generated"), "{text}");
+}
+
+#[tokio::test]
 async fn page_margin_leader_content_uses_sequence_owned_resolution() {
     let document = Html::from_string(
         "<style>\
@@ -1358,7 +1573,9 @@ async fn rtl_and_vertical_leaders_use_prepared_text_placement() {
             .iter()
             .flat_map(|line| line.runs.iter())
             .any(|run| {
-                run.text.contains('.') && run.text_matrix == quire::RenderedTextMatrix::ROTATE_CW
+                run.text.contains('.')
+                    && run.text_matrix
+                        == crate::document::paint::text::RenderedTextMatrix::ROTATE_CW
             }),
         "{:?}",
         vertical.pages[0].lines()
@@ -2173,7 +2390,7 @@ async fn preserved_tabs_from_no_space_font_are_advance_only() {
                 document.pages[0].lines()
             )
         });
-    let e_x = |line: &crate::RenderedLine| {
+    let e_x = |line: &crate::document::paint::text::RenderedLine| {
         line.x()
             + line
                 .runs
@@ -3153,7 +3370,7 @@ async fn text_align_last_start_overrides_center_on_final_ltr_and_rtl_lines() {
 
     let content_left = 10.0;
     let content_right = 190.0;
-    let group_bounds = |group: &&Vec<&quire::RenderedLine>| {
+    let group_bounds = |group: &&Vec<&crate::document::paint::text::RenderedLine>| {
         let left = group
             .iter()
             .map(|line| rendered_line_visual_bounds(line).0)
@@ -3164,14 +3381,15 @@ async fn text_align_last_start_overrides_center_on_final_ltr_and_rtl_lines() {
             .fold(f32::NEG_INFINITY, f32::max);
         (left, right)
     };
-    let has_centered_non_final_line = |groups: &[&Vec<&quire::RenderedLine>]| {
-        groups[..groups.len() - 1].iter().any(|group| {
-            let (left, right) = group_bounds(group);
-            let start_space = left - content_left;
-            let end_space = content_right - right;
-            start_space > 2.0 && end_space > 2.0 && (start_space - end_space).abs() < 2.0
-        })
-    };
+    let has_centered_non_final_line =
+        |groups: &[&Vec<&crate::document::paint::text::RenderedLine>]| {
+            groups[..groups.len() - 1].iter().any(|group| {
+                let (left, right) = group_bounds(group);
+                let start_space = left - content_left;
+                let end_space = content_right - right;
+                start_space > 2.0 && end_space > 2.0 && (start_space - end_space).abs() < 2.0
+            })
+        };
 
     assert!(
         has_centered_non_final_line(&ltr_groups),
@@ -3664,7 +3882,7 @@ async fn letter_spacing_crosses_text_empty_inline_boundaries() {
     );
 }
 
-fn rendered_fragment_group_span(lines: &[&quire::RenderedLine]) -> f32 {
+fn rendered_fragment_group_span(lines: &[&crate::document::paint::text::RenderedLine]) -> f32 {
     let left = lines
         .iter()
         .map(|line| line.x())
@@ -3676,8 +3894,10 @@ fn rendered_fragment_group_span(lines: &[&quire::RenderedLine]) -> f32 {
     right - left
 }
 
-fn lines_grouped_by_y(lines: &[quire::RenderedLine]) -> Vec<Vec<&quire::RenderedLine>> {
-    let mut groups = Vec::<Vec<&quire::RenderedLine>>::new();
+fn lines_grouped_by_y(
+    lines: &[crate::document::paint::text::RenderedLine],
+) -> Vec<Vec<&crate::document::paint::text::RenderedLine>> {
+    let mut groups = Vec::<Vec<&crate::document::paint::text::RenderedLine>>::new();
     for line in lines {
         if let Some(group) = groups
             .iter_mut()
@@ -3692,7 +3912,7 @@ fn lines_grouped_by_y(lines: &[quire::RenderedLine]) -> Vec<Vec<&quire::Rendered
 }
 
 fn grouped_line_texts(page: &quire::Page) -> Vec<String> {
-    let mut groups = Vec::<Vec<&quire::RenderedLine>>::new();
+    let mut groups = Vec::<Vec<&crate::document::paint::text::RenderedLine>>::new();
     for line in page.lines() {
         if let Some(group) = groups
             .iter_mut()
@@ -3715,13 +3935,16 @@ fn grouped_line_texts(page: &quire::Page) -> Vec<String> {
         .collect()
 }
 
-fn rendered_rects_share_row(left: &quire::RenderedRect, right: &quire::RenderedRect) -> bool {
+fn rendered_rects_share_row(
+    left: &crate::document::paint::shapes::RenderedRect,
+    right: &crate::document::paint::shapes::RenderedRect,
+) -> bool {
     let left_center = left.y() + left.height() / 2.0;
     let right_center = right.y() + right.height() / 2.0;
     (left_center - right_center).abs() < 24.0
 }
 
-fn rendered_line_visual_bounds(line: &quire::RenderedLine) -> (f32, f32) {
+fn rendered_line_visual_bounds(line: &crate::document::paint::text::RenderedLine) -> (f32, f32) {
     let mut left = f32::INFINITY;
     let mut right = f32::NEG_INFINITY;
     for run in &line.runs {
@@ -3743,8 +3966,10 @@ fn rendered_line_visual_bounds(line: &quire::RenderedLine) -> (f32, f32) {
     }
 }
 
-fn visual_line_groups(lines: &[quire::RenderedLine]) -> Vec<Vec<&quire::RenderedLine>> {
-    let mut groups = Vec::<Vec<&quire::RenderedLine>>::new();
+fn visual_line_groups(
+    lines: &[crate::document::paint::text::RenderedLine],
+) -> Vec<Vec<&crate::document::paint::text::RenderedLine>> {
+    let mut groups = Vec::<Vec<&crate::document::paint::text::RenderedLine>>::new();
     for line in lines {
         if let Some(group) = groups
             .iter_mut()
@@ -3833,11 +4058,51 @@ async fn vertical_writing_mixed_text_emits_writing_mode_aware_runs() {
         .collect::<Vec<_>>();
 
     assert!(runs.iter().any(|run| {
-        run.text.contains('中') && run.text_matrix == quire::RenderedTextMatrix::IDENTITY
+        run.text.contains('中')
+            && run.text_matrix == crate::document::paint::text::RenderedTextMatrix::IDENTITY
     }));
     assert!(runs.iter().any(|run| {
-        run.text.contains("AB") && run.text_matrix == quire::RenderedTextMatrix::ROTATE_CW
+        run.text.contains("AB")
+            && run.text_matrix == crate::document::paint::text::RenderedTextMatrix::ROTATE_CW
     }));
+}
+
+#[tokio::test]
+async fn vertical_inside_list_markers_with_mixed_font_sizes_complete() {
+    let document = Html::from_string(
+        r#"<style>
+            html { writing-mode: vertical-lr; }
+            ol { list-style-position: inside; padding: 0; margin: 0; }
+            .content::marker { content: "1. "; }
+            .sz1 { font-size: 40px; }
+            .sz1::marker { font-size: 20px; }
+            .sz2 { font-size: 20px; }
+            .sz2::marker { font-size: 40px; }
+        </style>
+        <ol><li>1.</li></ol>
+        <ol><li class="content">1.</li></ol>
+        <ol><li class="sz1">1.</li></ol>
+        <ol><li class="content sz1">1.</li></ol>
+        <ol><li class="sz2">1.</li></ol>
+        <ol><li class="content sz2">1.</li></ol>"#,
+    )
+    .render(&RenderOptions::default())
+    .await
+    .expect("vertical inside list markers should lay out");
+
+    let lines = document
+        .pages
+        .iter()
+        .flat_map(|page| page.lines())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lines
+            .iter()
+            .map(|line| line.text.matches("1.").count())
+            .sum::<usize>(),
+        12,
+        "each marker and principal text run should paint once: {lines:#?}"
+    );
 }
 
 #[tokio::test]
@@ -3856,16 +4121,20 @@ async fn vertical_mixed_text_uses_unicode_vertical_orientation() {
         .collect::<Vec<_>>();
 
     assert!(runs.iter().any(|run| {
-        run.text.contains('a') && run.text_matrix == quire::RenderedTextMatrix::ROTATE_CW
+        run.text.contains('a')
+            && run.text_matrix == crate::document::paint::text::RenderedTextMatrix::ROTATE_CW
     }));
     assert!(runs.iter().any(|run| {
-        run.text.contains('§') && run.text_matrix == quire::RenderedTextMatrix::IDENTITY
+        run.text.contains('§')
+            && run.text_matrix == crate::document::paint::text::RenderedTextMatrix::IDENTITY
     }));
     assert!(runs.iter().any(|run| {
-        run.text.contains('、') && run.text_matrix == quire::RenderedTextMatrix::IDENTITY
+        run.text.contains('、')
+            && run.text_matrix == crate::document::paint::text::RenderedTextMatrix::IDENTITY
     }));
     assert!(runs.iter().any(|run| {
-        run.text.contains('〈') && run.text_matrix == quire::RenderedTextMatrix::ROTATE_CW
+        run.text.contains('〈')
+            && run.text_matrix == crate::document::paint::text::RenderedTextMatrix::ROTATE_CW
     }));
 }
 
@@ -3885,13 +4154,16 @@ async fn vertical_text_orientation_upright_paints_latin_upright() {
         .collect::<Vec<_>>();
 
     assert!(runs.iter().any(|run| {
-        run.text.contains('A') && run.text_matrix == quire::RenderedTextMatrix::IDENTITY
+        run.text.contains('A')
+            && run.text_matrix == crate::document::paint::text::RenderedTextMatrix::IDENTITY
     }));
     assert!(runs.iter().any(|run| {
-        run.text.contains('B') && run.text_matrix == quire::RenderedTextMatrix::IDENTITY
+        run.text.contains('B')
+            && run.text_matrix == crate::document::paint::text::RenderedTextMatrix::IDENTITY
     }));
     assert!(runs.iter().any(|run| {
-        run.text.contains('中') && run.text_matrix == quire::RenderedTextMatrix::IDENTITY
+        run.text.contains('中')
+            && run.text_matrix == crate::document::paint::text::RenderedTextMatrix::IDENTITY
     }));
 }
 
@@ -3911,15 +4183,18 @@ async fn vertical_text_orientation_sideways_rotates_cjk_and_latin() {
         .collect::<Vec<_>>();
 
     assert!(runs.iter().any(|run| {
-        run.text.contains("中文") && run.text_matrix == quire::RenderedTextMatrix::ROTATE_CW
+        run.text.contains("中文")
+            && run.text_matrix == crate::document::paint::text::RenderedTextMatrix::ROTATE_CW
     }));
     assert!(runs.iter().any(|run| {
-        run.text.contains("AB") && run.text_matrix == quire::RenderedTextMatrix::ROTATE_CW
+        run.text.contains("AB")
+            && run.text_matrix == crate::document::paint::text::RenderedTextMatrix::ROTATE_CW
     }));
     assert!(
         runs.iter()
             .filter(|run| !run.text.is_empty())
-            .all(|run| run.text_matrix == quire::RenderedTextMatrix::ROTATE_CW)
+            .all(|run| run.text_matrix
+                == crate::document::paint::text::RenderedTextMatrix::ROTATE_CW)
     );
 }
 
@@ -3938,7 +4213,8 @@ async fn page_margin_text_orientation_uses_shared_vertical_placement() {
             .iter()
             .flat_map(|line| line.runs.iter())
             .any(|run| {
-                run.text.contains('A') && run.text_matrix == quire::RenderedTextMatrix::IDENTITY
+                run.text.contains('A')
+                    && run.text_matrix == crate::document::paint::text::RenderedTextMatrix::IDENTITY
             })
     );
     assert!(
@@ -3947,7 +4223,8 @@ async fn page_margin_text_orientation_uses_shared_vertical_placement() {
             .iter()
             .flat_map(|line| line.runs.iter())
             .any(|run| {
-                run.text.contains('B') && run.text_matrix == quire::RenderedTextMatrix::IDENTITY
+                run.text.contains('B')
+                    && run.text_matrix == crate::document::paint::text::RenderedTextMatrix::IDENTITY
             })
     );
 }
@@ -3968,10 +4245,12 @@ async fn page_margin_mixed_text_uses_unicode_vertical_orientation() {
         .collect::<Vec<_>>();
 
     assert!(runs.iter().any(|run| {
-        run.text.contains('a') && run.text_matrix == quire::RenderedTextMatrix::ROTATE_CW
+        run.text.contains('a')
+            && run.text_matrix == crate::document::paint::text::RenderedTextMatrix::ROTATE_CW
     }));
     assert!(runs.iter().any(|run| {
-        run.text.contains('§') && run.text_matrix == quire::RenderedTextMatrix::IDENTITY
+        run.text.contains('§')
+            && run.text_matrix == crate::document::paint::text::RenderedTextMatrix::IDENTITY
     }));
 }
 
@@ -3990,7 +4269,9 @@ async fn inline_block_text_orientation_uses_shared_vertical_placement() {
             .iter()
             .flat_map(|line| line.runs.iter())
             .any(|run| {
-                run.text.contains("中文") && run.text_matrix == quire::RenderedTextMatrix::ROTATE_CW
+                run.text.contains("中文")
+                    && run.text_matrix
+                        == crate::document::paint::text::RenderedTextMatrix::ROTATE_CW
             })
     );
 }
@@ -4284,6 +4565,50 @@ async fn renders_styled_bidi_inline_text_in_visual_order() {
         .collect::<String>();
 
     assert_eq!(text, "abc גבא def");
+}
+
+#[tokio::test]
+async fn bdi_is_neutral_to_its_outer_rtl_paragraph() {
+    let document = Html::from_string(
+        "<div dir=\"rtl\" style=\"margin: 0; font-size: 12pt; line-height: 12pt\">a - <bdi>[1]</bdi>...</div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let y = document.pages[0].lines()[0].y();
+    let mut line = document.pages[0]
+        .lines()
+        .iter()
+        .filter(|line| (line.y() - y).abs() < 0.1)
+        .collect::<Vec<_>>();
+    line.sort_by(|left, right| left.x().total_cmp(&right.x()));
+    let text = line
+        .into_iter()
+        .map(|line| line.text.as_str())
+        .collect::<String>();
+
+    assert_eq!(text, "...[1] - a");
+}
+
+#[tokio::test]
+async fn bdi_is_neutral_in_a_constrained_rtl_block() {
+    let document = Html::from_string(
+        "<style>body { font-size: 2em } .test { width: 400px }</style>\
+         <div class=\"test\">\
+           <div dir=\"rtl\">a - <bdi dir=\"ltr\">[1]</bdi>...</div>\
+         </div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(
+        grouped_line_texts(&document.pages[0])
+            .last()
+            .expect("expected the RTL bdi line"),
+        "...[1] - a"
+    );
 }
 
 #[tokio::test]
@@ -5153,6 +5478,24 @@ async fn generated_zero_width_space_wraps_without_visible_text() {
 
     let lines = grouped_line_texts(&document.pages[0]);
     assert_eq!(lines, vec!["abc", "def"]);
+}
+
+#[tokio::test]
+async fn thai_wbr_min_content_uses_complete_named_entity_units() {
+    let document = Html::from_string(
+        "<style>@page { size: 240pt 180pt; margin: 10pt }\
+         p { margin: 0; width: min-content; font-size: 20pt; line-height: 24pt; word-break: normal }\
+         </style><p lang=th>กรุงเทพ<wbr>คือ<wbr>สวยงาม</p>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(
+        grouped_line_texts(&document.pages[0]),
+        vec!["กรุงเทพ", "คือ", "สวยงาม"],
+        "explicit virtual separators must split min-content at whole Thai units"
+    );
 }
 
 #[tokio::test]

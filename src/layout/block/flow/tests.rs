@@ -111,6 +111,8 @@ fn block_border_box_projects_top_edge_to_paint_space() {
 
 #[test]
 fn typed_border_edges_control_block_margin_collapse() {
+    let node = Node::element("div");
+    let element = node.as_element().expect("constructed an element node");
     let style = ComputedStyle::initial();
     let zero_edges = UsedEdges {
         top: layout_pt(0.0),
@@ -120,18 +122,21 @@ fn typed_border_edges_control_block_margin_collapse() {
     };
 
     assert!(can_collapse_block_start_margin(
+        element,
         &style,
         zero_edges,
         false,
         css::Overflow::Visible,
     ));
     assert!(can_collapse_block_end_margin(
+        element,
         &style,
         zero_edges,
         false,
         css::Overflow::Visible,
     ));
     assert!(!can_collapse_block_start_margin(
+        element,
         &style,
         UsedEdges {
             top: layout_pt(1.0),
@@ -141,6 +146,7 @@ fn typed_border_edges_control_block_margin_collapse() {
         css::Overflow::Visible,
     ));
     assert!(!can_collapse_block_end_margin(
+        element,
         &style,
         UsedEdges {
             bottom: layout_pt(1.0),
@@ -322,8 +328,10 @@ fn unconstrained_scroll_container_stops_outer_fallback_while_non_scroller_constr
     // orthogonal line measure even when it is larger than the ICB fallback.
     // It must not, however, make percentage heights definite.
     let mut fixed_height = ComputedStyle::initial();
-    fixed_height.box_values.height = css::ComputedLengthPercentageOrAuto::LengthPercentage(
-        css::ComputedLengthPercentage::from_points(720.0),
+    fixed_height.box_values.height.replace_with_used(
+        css::ComputedLengthPercentageOrAuto::LengthPercentage(
+            css::ComputedLengthPercentage::from_points(720.0),
+        ),
     );
     let fixed = child_available_space_for_formatting_context(
         &fixed_height,

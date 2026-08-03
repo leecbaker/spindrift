@@ -13,7 +13,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
     ) -> (f32, f32) {
         let measurement =
             self.with_intrinsic_inline_percentage_basis(PercentageBasis::indefinite(), |layout| {

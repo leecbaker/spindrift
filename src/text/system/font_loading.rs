@@ -115,17 +115,21 @@ impl FontSystem {
 
 impl FontSystemLoad {
     #[cfg(test)]
-    pub(crate) fn load_stylesheet_fonts(self, stylesheets: &[Stylesheet]) -> FontSystemSeedLoad {
+    pub(crate) fn load_stylesheet_fonts<Collection: StylesheetCollection + ?Sized>(
+        self,
+        stylesheets: &Collection,
+    ) -> FontSystemSeedLoad {
         let fetcher = crate::resource::ResourceFetcher::new(crate::ResourcePolicy::default())
             .expect("default resource policy must create an HTTP client");
         self.load_stylesheet_fonts_with_fetcher(stylesheets, fetcher)
     }
 
-    pub(crate) fn load_stylesheet_fonts_with_fetcher(
+    pub(crate) fn load_stylesheet_fonts_with_fetcher<Collection: StylesheetCollection + ?Sized>(
         self,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Collection,
         resource_fetcher: crate::resource::ResourceFetcher,
     ) -> FontSystemSeedLoad {
+        let stylesheets = stylesheets.stylesheet_view();
         let font_faces = stylesheets
             .iter()
             .flat_map(|stylesheet| stylesheet.font_faces.iter().cloned())
@@ -137,7 +141,7 @@ impl FontSystemLoad {
         );
         let mut font_feature_values = FontFeatureValues::default();
         let mut font_palette_values = FontPaletteValues::default();
-        for stylesheet in stylesheets {
+        for stylesheet in stylesheets.iter() {
             font_feature_values.extend(stylesheet.font_feature_values.clone());
             font_palette_values.extend(stylesheet.font_palette_values.clone());
         }
@@ -742,11 +746,24 @@ impl FontSystem {
         family_override: Option<&str>,
         request: &FontRequest,
     ) -> Option<usize> {
+        self.document_font_from_query_font_with_synthesis(font, family_override, request, true)
+    }
+
+    /// Resolve one Fontique result for PDF emission, retaining only CSS
+    /// weight synthesis that the computed style permits.
+    pub(crate) fn document_font_from_query_font_with_synthesis(
+        &mut self,
+        font: FontiqueQueryFont,
+        family_override: Option<&str>,
+        request: &FontRequest,
+        synthesize_weight: bool,
+    ) -> Option<usize> {
         self.document_fonts.document_font_from_query(
             &mut self.parley_font_context.collection,
             font,
             family_override,
             request,
+            synthesize_weight,
         )
     }
 
@@ -769,7 +786,11 @@ impl FontSystem {
             style.font_style,
             style.font_width,
         );
-        if let Some(font_id) = self.document_fonts.cached_parley_font(font_data, &request) {
+        let synthesize_weight = style.font_synthesis.weight;
+        if let Some(font_id) =
+            self.document_fonts
+                .cached_parley_font(font_data, &request, synthesize_weight)
+        {
             return Some(font_id);
         }
 
@@ -781,9 +802,14 @@ impl FontSystem {
             style.font_style,
             style.font_width,
         ) {
-            let font_id = self.document_font_from_query_font(font, None, &request)?;
+            let font_id = self.document_font_from_query_font_with_synthesis(
+                font,
+                None,
+                &request,
+                synthesize_weight,
+            )?;
             self.document_fonts
-                .cache_parley_font(font_data, &request, font_id);
+                .cache_parley_font(font_data, &request, synthesize_weight, font_id);
             return Some(font_id);
         }
 
@@ -794,9 +820,14 @@ impl FontSystem {
             style.font_style,
             style.font_width,
         ) {
-            let font_id = self.document_font_from_query_font(font, None, &request)?;
+            let font_id = self.document_font_from_query_font_with_synthesis(
+                font,
+                None,
+                &request,
+                synthesize_weight,
+            )?;
             self.document_fonts
-                .cache_parley_font(font_data, &request, font_id);
+                .cache_parley_font(font_data, &request, synthesize_weight, font_id);
             return Some(font_id);
         }
 
@@ -805,7 +836,7 @@ impl FontSystem {
         // expose a matching fallback face for the run's script.
         let font_id = self.document_font_from_parley_font_data(font_data)?;
         self.document_fonts
-            .cache_parley_font(font_data, &request, font_id);
+            .cache_parley_font(font_data, &request, synthesize_weight, font_id);
         Some(font_id)
     }
 

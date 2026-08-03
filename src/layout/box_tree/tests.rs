@@ -1,7 +1,7 @@
 use super::*;
 use crate::css::{
     ComputedLengthPercentage, ComputedLengthPercentageOrAuto, ComputedLineHeight, Css, Edges,
-    FontFamily, TextOrientation,
+    FontFamily, Stylesheet, TextOrientation,
 };
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -16,8 +16,8 @@ fn parent_style() -> ComputedStyle {
 }
 
 fn build_test_page<'a>(root: &'a Node, author_stylesheets: &[Stylesheet]) -> PageBox<'a> {
-    let mut stylesheets = vec![css::html5_user_agent_stylesheet()];
-    stylesheets.extend_from_slice(author_stylesheets);
+    let stylesheets =
+        Stylesheets::for_document(css::html5_user_agent_stylesheet(), None, author_stylesheets);
     freeze_page_box(build_page_box(root, &stylesheets, &parent_style()))
 }
 
@@ -25,8 +25,8 @@ async fn build_test_page_with_font_metrics<'a>(
     root: &'a Node,
     author_stylesheets: &[Stylesheet],
 ) -> PageBox<'a> {
-    let mut stylesheets = vec![css::html5_user_agent_stylesheet()];
-    stylesheets.extend_from_slice(author_stylesheets);
+    let stylesheets =
+        Stylesheets::for_document(css::html5_user_agent_stylesheet(), None, author_stylesheets);
     let mut font_system = FontSystem::start_loading()
         .load_stylesheet_fonts(&stylesheets)
         .finish()
@@ -223,6 +223,7 @@ fn element_box_core_round_trip_preserves_identity_source_marker_and_children() {
             style: Box::new(style.clone()),
         }),
         run_in_children: Vec::new(),
+        fieldset: None,
     })]);
 
     let [FormattingBox::Block(frozen_block)] = frozen.as_slice() else {
@@ -269,7 +270,7 @@ fn style_accessor_supports_every_formatting_box_variant() {
             <img style="display: block" src="x">
         </body></html>"#,
     );
-    let stylesheets = [css::html5_user_agent_stylesheet()];
+    let stylesheets = Stylesheets::for_document(css::html5_user_agent_stylesheet(), None, &[]);
     let mutable = build_page_box(&root, &stylesheets, &parent_style());
     let frozen = freeze_page_box(build_page_box(&root, &stylesheets, &parent_style()));
 
@@ -311,7 +312,7 @@ fn mutable_accessors_support_every_formatting_box_variant() {
             <img style="display: block" src="x">
         </body></html>"#,
     );
-    let stylesheets = [css::html5_user_agent_stylesheet()];
+    let stylesheets = Stylesheets::for_document(css::html5_user_agent_stylesheet(), None, &[]);
     let mut mutable = build_page_box(&root, &stylesheets, &parent_style());
     let mut frozen = freeze_page_box(build_page_box(&root, &stylesheets, &parent_style()));
 
@@ -353,7 +354,7 @@ fn element_core_accessors_support_every_formatting_box_variant() {
             <img style="display: block" src="x">
         </body></html>"#,
     );
-    let stylesheets = [css::html5_user_agent_stylesheet()];
+    let stylesheets = Stylesheets::for_document(css::html5_user_agent_stylesheet(), None, &[]);
     let mut mutable = build_page_box(&root, &stylesheets, &parent_style());
     let mut frozen = freeze_page_box(build_page_box(&root, &stylesheets, &parent_style()));
 
@@ -637,6 +638,153 @@ fn builds_styled_formatting_box_tree() {
 }
 
 #[test]
+fn user_agent_ruby_roles_preserve_the_internal_inline_tree() {
+    let root = dom::parse(
+        "<html><body>X<ruby class=\"rel\"><rbc><rb><span class=\"abs\">X</span></rb></rbc></ruby></body></html>",
+    );
+    let stylesheet = css::parse_stylesheet(&Css::from_string(
+        ".rel { position: relative } .abs { position:absolute; left: 0; top: -1em }",
+    ));
+    let page = build_test_page(&root, &[stylesheet]);
+    let body = &page.children[0].children()[0];
+    assert_eq!(body.kind(), FormattingBoxKind::Block);
+    assert_eq!(body.children()[0].kind(), FormattingBoxKind::Text);
+    let ruby = &body.children()[1];
+    let FormattingBox::Inline(ruby) = ruby else {
+        panic!("ruby kind: {:?}", ruby.kind())
+    };
+    assert_eq!(ruby.core.style.display.inner, DisplayInner::Ruby);
+    assert_eq!(ruby.core.style.position, Position::Relative);
+    let FormattingBox::Inline(rbc) = &ruby.core.children[0] else {
+        panic!("rbc kind")
+    };
+    assert_eq!(
+        rbc.core.style.display.inner,
+        DisplayInner::RubyBaseContainer
+    );
+    let FormattingBox::Inline(rb) = &rbc.core.children[0] else {
+        panic!("rb kind")
+    };
+    assert_eq!(rb.core.style.display.inner, DisplayInner::RubyBase);
+    let FormattingBox::Block(abs) = &rb.core.children[0] else {
+        panic!("out-of-flow descendants are blockified")
+    };
+    assert!(matches!(abs.core.style.position, Position::Absolute));
+}
+
+#[test]
+fn positioned_ruby_base_container_preserves_its_positioning_role() {
+    let root = dom::parse(
+        "<html><body><ruby><rbc class=\"rel\"><rb><span class=\"abs\">X</span></rb></rbc></ruby></body></html>",
+    );
+    let stylesheet = css::parse_stylesheet(&Css::from_string(
+        ".rel { position: relative } .abs { position:absolute; left: 0; top: -1em }",
+    ));
+    let page = build_test_page(&root, &[stylesheet]);
+    let body = &page.children[0].children()[0];
+    let FormattingBox::Inline(ruby) = &body.children()[0] else {
+        panic!("ruby kind")
+    };
+    let FormattingBox::Inline(rbc) = &ruby.core.children[0] else {
+        panic!("rbc kind")
+    };
+    assert_eq!(
+        rbc.core.style.display.inner,
+        DisplayInner::RubyBaseContainer
+    );
+    assert_eq!(rbc.core.style.position, Position::Relative);
+}
+
+#[test]
+fn ruby_normalization_pairs_explicit_base_and_annotation_segments() {
+    let root = dom::parse(
+        "<html><body><ruby><rbc><rb>A</rb><rb>B</rb></rbc><rtc><rt>a</rt><rt>b</rt></rtc></ruby></body></html>",
+    );
+    let page = build_test_page(&root, &[]);
+    let body = &page.children[0].children()[0];
+    let FormattingBox::Inline(ruby) = &body.children()[0] else {
+        panic!("ruby generates an inline formatting box")
+    };
+    let normalized = crate::layout::ruby::NormalizedRuby::from_children(&ruby.core.children);
+
+    assert_eq!(normalized.columns.len(), 2);
+    assert_eq!(normalized.annotation_level_count, 1);
+    assert!(
+        normalized
+            .columns
+            .iter()
+            .all(|column| !column.base.is_empty())
+    );
+    assert!(normalized.columns.iter().all(|column| {
+        column.annotations.len() == 1
+            && column.annotations[0].starts_span
+            && column.annotations[0].span == 1
+    }));
+}
+
+#[test]
+fn ruby_normalization_spans_only_anonymous_single_annotations() {
+    let root =
+        dom::parse("<html><body><ruby><rb>A</rb> <rb>B</rb><rtc>ab</rtc></ruby></body></html>");
+    let page = build_test_page(&root, &[]);
+    let body = &page.children[0].children()[0];
+    let FormattingBox::Inline(ruby) = &body.children()[0] else {
+        panic!("ruby generates an inline formatting box")
+    };
+    let normalized = crate::layout::ruby::NormalizedRuby::from_children(&ruby.core.children);
+
+    assert_eq!(normalized.columns.len(), 2);
+    assert_eq!(normalized.annotation_level_count, 1);
+    assert_eq!(normalized.columns[0].annotations[0].span, 2);
+    assert!(normalized.columns[0].annotations[0].starts_span);
+    assert_eq!(normalized.columns[1].annotations[0].span, 2);
+    assert!(!normalized.columns[1].annotations[0].starts_span);
+}
+
+#[test]
+fn ruby_normalization_excludes_out_of_flow_annotation_content() {
+    let root = dom::parse(
+        "<html><body><ruby><rb>A</rb><rtc><rt><span class=\"abs\">a</span></rt></rtc></ruby></body></html>",
+    );
+    let stylesheet = css::parse_stylesheet(&Css::from_string(".abs { position: absolute }"));
+    let page = build_test_page(&root, &[stylesheet]);
+    let body = &page.children[0].children()[0];
+    let FormattingBox::Inline(ruby) = &body.children()[0] else {
+        panic!("ruby generates an inline formatting box")
+    };
+    let normalized = crate::layout::ruby::NormalizedRuby::from_children(&ruby.core.children);
+
+    assert_eq!(normalized.columns.len(), 1);
+    assert_eq!(normalized.annotation_level_count, 0);
+    assert!(normalized.columns[0].annotations.is_empty());
+}
+
+#[test]
+fn ruby_normalization_inlinifies_direct_block_children() {
+    let root = dom::parse(
+        "<html><body><div><ruby>a<div class=\"inline\">b</div>c</ruby></div></body></html>",
+    );
+    let stylesheet = css::parse_stylesheet(&Css::from_string(
+        ".inline { display: block; width: 30px; height: 30px }",
+    ));
+    let page = build_test_page(&root, &[stylesheet]);
+    let body = &page.children[0].children()[0];
+    let FormattingBox::Block(div) = &body.children()[0] else {
+        panic!("div generates a block formatting box")
+    };
+    let FormattingBox::Inline(ruby) = &div.core.children[0] else {
+        panic!("ruby generates an inline formatting box")
+    };
+    let normalized = crate::layout::ruby::NormalizedRuby::from_children(&ruby.core.children);
+    assert_eq!(normalized.columns.len(), 1);
+    assert!(matches!(
+        normalized.columns[0].base.boxes.get(1),
+        Some(FormattingBox::AtomicInline(box_))
+            if box_.core.style.display == Display::new(DisplayOuter::Inline, DisplayInner::FlowRoot)
+    ));
+}
+
+#[test]
 fn pure_block_children_remain_block_children() {
     let root = dom::parse("<html><body><div><p>A</p><section>B</section></div></body></html>");
     let page = build_test_page(&root, &[]);
@@ -833,7 +981,7 @@ fn box_tree_preserves_font_shorthand_unit_line_height() {
     );
     assert!((test_div.style().font_size - 37.5).abs() < 0.001);
     assert!((test_div.style().line_height - 37.5).abs() < 0.001);
-    assert!(!test_div.style().line_height_is_normal);
+    assert!(!test_div.style().line_height_is_normal());
 }
 
 #[tokio::test]
@@ -885,11 +1033,8 @@ fn mutable_tree_defers_parent_ch_font_size_without_a_font_system() {
     let root = dom::parse(
         "<html><body><div><span style=\"font-size: 2ch\">probe</span></div></body></html>",
     );
-    let page = build_page_box(
-        &root,
-        &[css::html5_user_agent_stylesheet()],
-        &parent_style(),
-    );
+    let stylesheets = Stylesheets::for_document(css::html5_user_agent_stylesheet(), None, &[]);
+    let page = build_page_box(&root, &stylesheets, &parent_style());
     let span = &page.children[0].children()[0].children()[0].children()[0];
 
     assert!(matches!(
@@ -1015,11 +1160,33 @@ fn anonymous_blocks_reset_non_inherited_parent_properties() {
         assert_eq!(style.margin, Edges::ZERO);
         assert_eq!(style.padding, Edges::ZERO);
         assert_eq!(style.border_widths, Edges::ZERO);
-        assert_eq!(style.background_color, None);
+        assert_eq!(style.background_color.color(), Some(CssColor::TRANSPARENT));
         assert!(style.box_values.width.is_auto());
         assert_eq!(style.position, Position::Static);
         assert_eq!(style.float, Float::None);
     }
+}
+
+#[test]
+fn text_nodes_inherit_only_inherited_properties() {
+    let stylesheet = css::parse_stylesheet(&Css::from_string(
+        ".parent { color: red; writing-mode: vertical-rl; background: blue; width: 40pt; position: relative }",
+    ));
+    let root = dom::parse("<html><body><div class=\"parent\">Text</div></body></html>");
+    let page = build_test_page(&root, &[stylesheet]);
+    let div = &page.children[0].children()[0].children()[0];
+    let [FormattingBox::Text(text)] = div.children() else {
+        panic!("expected direct text child");
+    };
+
+    assert_eq!(text.style.color, CssColor::new(255, 0, 0));
+    assert_eq!(text.style.writing_mode, WritingMode::VerticalRl);
+    assert_eq!(
+        text.style.background_color.color(),
+        Some(CssColor::TRANSPARENT)
+    );
+    assert!(text.style.box_values.width.is_auto());
+    assert_eq!(text.style.position, Position::Static);
 }
 
 #[test]
@@ -1056,7 +1223,7 @@ fn positioned_inline_block_split_preserves_inline_context_for_block_segment() {
         panic!("positioned inline split should preserve a transparent block context");
     };
     assert_eq!(context.core.style.position, Position::Relative);
-    assert_eq!(context.core.style.z_index, Some(2));
+    assert_eq!(context.core.style.z_index, css::ZIndex::StackLevel(2));
     assert_eq!(
         context
             .core
@@ -1789,7 +1956,7 @@ fn display_contents_inside_table_flattens_children_with_inherited_style() {
         table.core.style.border_spacing.vertical.length_points(),
         0.0
     );
-    assert!(!table.core.style.border_spacing_explicit);
+    assert!(!table.core.style.border_spacing.is_author_declared());
     assert_eq!(table.fragment.rows.len(), 3);
     assert_eq!(table.fragment.rows[0].cells.len(), 3);
     assert_eq!(table.fragment.rows[1].cells.len(), 1);
@@ -1941,6 +2108,23 @@ fn inline_table_creates_atomic_inline_box_with_table_children() {
             .map(FormattingBox::kind)
             .collect::<Vec<_>>(),
         vec![FormattingBoxKind::Block]
+    );
+}
+
+#[test]
+fn class_selected_inline_table_creates_an_atomic_inline_box() {
+    let root = dom::parse(
+        "<html><body><div><span>Before</span><table class=\"table\"><td>Cell</td></table></div></body></html>",
+    );
+    let stylesheet = css::parse_stylesheet(&Css::from_string(".table { display: inline-table; }"));
+    let page = build_test_page(&root, &[stylesheet]);
+    let container = &page.children[0].children()[0].children()[0];
+
+    assert!(
+        container
+            .children()
+            .iter()
+            .any(|child| matches!(child, FormattingBox::AtomicInline(_)))
     );
 }
 

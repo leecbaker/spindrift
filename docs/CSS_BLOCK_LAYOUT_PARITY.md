@@ -7,9 +7,16 @@ where block sizing interacts with margin collapse.
 
 - Adjacent in-flow block sibling vertical margins collapse using CSS 2.2's
   adjoining-margin rules, including mixed positive/negative margin sets.
+  Absolutely and fixed-positioned source children are transparent to the
+  pending in-flow sibling margin set, so they cannot separate two adjoining
+  normal-flow blocks.
 - First-child top margins and last-child bottom margins can collapse through
   auto-height block containers when no border, padding, clearance, line box, or
   formatting-context boundary separates the margins.
+- A first child that follows an earlier zero-margin in-flow sibling still
+  carries its wrapper and first-descendant margins as one adjoining start set;
+  the descendant margin is not subtracted a second time. CSS 2.2:
+  <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>.
 - HTML document-canvas overflow follows CSS Overflow viewport propagation
   before block layout decides whether it establishes a formatting-context
   boundary. In particular, `body { overflow: hidden }` uses `visible` when it
@@ -18,6 +25,9 @@ where block sizing interacts with margin collapse.
 - The propagated overflow source is the exact root or first eligible `body`
   principal box. Other `body` boxes retain their local clips, and propagated
   `overflow-x`/`overflow-y` values preserve their independent viewport axes.
+- Overflow clipping keeps physical axes separate through deferred paint and
+  transformed stacking contexts. A `clip` axis therefore does not turn its
+  `visible` companion axis into a rectangular two-axis clip.
 - Phantom inline line boxes are ignored for margin-collapse adjacency, so empty
   inline boxes with only block-axis decoration do not block parent/child or
   self-collapsing margin collapse; non-zero inline-axis margin, border, or
@@ -27,12 +37,20 @@ where block sizing interacts with margin collapse.
   contents allow it. Blocks containing atomic inline line-box participants,
   including inline-blocks, are not treated as self-collapsing solely because
   their own `line-height` is zero.
+- Block-in-inline anonymous structural wrappers are transparent to adjoining
+  margin propagation. Their self-collapsing descendants therefore collapse
+  through the enclosing block exactly as ordinary block descendants do, except
+  where the descendant establishes a block formatting context, which terminates
+  the adjoining-margin set as required by CSS 2.2.
 - A last child's bottom margin is measured outside the parent when it collapses
   through, but is excluded from the parent's min/max-height constraint
   calculation when `min-height` or `max-height` prevents that collapse.
 - Forced page breaks between block descendants continue at the next page's
   block-start edge without cloning ancestor block-start margin, border, or
   padding, matching `box-decoration-break: slice`.
+- `break-inside: avoid` retries preserve the root/body canvas's inline insets
+  on their destination page, so the kept subtree shares the same containing
+  block origin as an ordinary in-flow page continuation.
 - Block sibling `break-before: avoid` and `break-after: avoid` rollback runs
   use the shared adjacent-box fragmentation decision to arm candidate starts,
   recognize current avoid boundaries through target-aware committed break
@@ -89,8 +107,10 @@ where block sizing interacts with margin collapse.
 
 ## Remaining Gaps
 
-- `margin-trim: block-end`, inline-axis margin trimming, and fully logical
-  writing-mode-aware margin trimming remain incomplete; see
+- Ordinary horizontal, non-fragmented block containers trim the final
+  in-flow block child's block-end adjoining margin, including a
+  self-collapsing descendant margin set. Inline-axis trimming, fully logical
+  writing-mode-aware trimming, and fragmentation remain incomplete; see
   `SPEC_DIVERGENCES.md`.
 - Fragmented block layout still needs broader WPT coverage for margin collapse
   across page breaks, clearance, and nested formatting contexts.

@@ -15,7 +15,7 @@ impl<'a> LayoutBuilder<'a> {
         row: &TableRow<'_>,
         cell_style: &ComputedStyle,
         child_box: &box_tree::FormattingBox<'_>,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         available_width: f32,
     ) -> Option<TableCellNestedFragmentPlan> {
         if !matches!(
@@ -40,7 +40,7 @@ impl<'a> LayoutBuilder<'a> {
             None,
         );
 
-        self.layout_formatting_box(child_box, stylesheets);
+        self.layout_formatting_box_with_parent_decoration(child_box, stylesheets, Some(cell_style));
         self.flush_positioned_layers_since(positioned_layer_start);
 
         let fragment = self
@@ -67,7 +67,7 @@ impl<'a> LayoutBuilder<'a> {
         cell: &TableCell<'_>,
         row: &TableRow<'_>,
         cell_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         content_geometry: TableCellContentGeometry,
         content_plan: &TableCellContentPlan,
     ) {
@@ -124,7 +124,7 @@ impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout::table) fn paint_table_cell_planned_child_slice(
         &mut self,
         child_box: &box_tree::FormattingBox<'_>,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         child_plan: &TableCellChildFragmentPlan,
     ) {
         let child_top = child_plan.painted_child_top;
@@ -329,7 +329,7 @@ impl<'a> LayoutBuilder<'a> {
         element: &Element,
         style: &ComputedStyle,
         children: &[box_tree::FormattingBox<'_>],
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         child_top: f32,
         child_height: f32,
         slice_top: f32,
@@ -458,7 +458,7 @@ impl<'a> LayoutBuilder<'a> {
         child_top: f32,
         slice_top: f32,
         slice_bottom: f32,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
     ) {
         let available_width = (self.content_right - self.content_left).max(1.0);
         if let Some(sequence) = self.table_cell_nested_inline_sequence_for_children(
@@ -506,7 +506,7 @@ impl<'a> LayoutBuilder<'a> {
         grid: &TableGrid,
         columns: &[TableColumn<'_>],
         table_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         table_x: f32,
         used_table_width: f32,
         table_width: UsedTableWidth,
@@ -531,43 +531,117 @@ impl<'a> LayoutBuilder<'a> {
             return (backgrounds, outlines, relative_part_paints);
         }
 
-        if let Some(fill) = table_style.background_color {
-            let background_top = top
-                + vertical_edge_spacing
-                + table_width.padding.top
-                + table_width.border_widths.top;
-            let background_bottom = bottom
-                - vertical_edge_spacing
-                - table_width.padding.bottom
-                - table_width.border_widths.bottom;
-            let border_rect = paint_space_rect(
-                table_x - table_width.padding.left - table_width.border_widths.left,
-                background_bottom,
-                used_table_width
-                    + table_width.padding.left
-                    + table_width.padding.right
-                    + table_width.border_widths.left
-                    + table_width.border_widths.right,
-                background_top - background_bottom,
-            );
-            let clip_rect = crate::layout::paint_helpers::background_rect_area_for_box(
-                border_rect,
-                table_style,
-                table_width.border_widths,
-                table_style.background_clip,
-            );
-            backgrounds.push(PaintPrimitive::Rect(RenderedRect::from_paint_rect(
-                clip_rect,
-                Some(fill),
-            )));
-        }
         let fragment_rows = fragment.rows();
         let fragment_row_tops = fragment.row_tops();
         let fragment_row_heights = fragment.row_heights();
         let fragment_row_offsets = fragment.row_offsets();
         let fragment_original_row_heights = fragment.original_row_heights();
-        let grid_placement = fragment.grid_placement;
-        let grid_row_bounds = fragment.grid_row_bounds.as_deref();
+        let grid_viewport = fragment.grid_viewport.as_ref();
+        let grid_placement = grid_viewport.map(|viewport| viewport.destination_placement());
+        let source_grid_placement = grid_viewport.map(|viewport| viewport.source_placement());
+        let grid_row_bounds = grid_viewport.map(|viewport| viewport.row_bounds());
+        let background_top =
+            top + vertical_edge_spacing + table_width.padding.top + table_width.border_widths.top;
+        // `bottom` is the trailing row edge in the fragment's block
+        // coordinate system. The table root extends by its separated-border
+        // edge spacing beyond it before applying its own padding and border.
+        // <https://www.w3.org/TR/CSS22/tables.html#separated-borders>
+        let background_bottom = bottom
+            - vertical_edge_spacing
+            - table_width.padding.bottom
+            - table_width.border_widths.bottom;
+        let border_rect = paint_space_rect(
+            table_x - table_width.padding.left - table_width.border_widths.left,
+            background_bottom,
+            used_table_width
+                + table_width.padding.left
+                + table_width.padding.right
+                + table_width.border_widths.left
+                + table_width.border_widths.right,
+            background_top - background_bottom,
+        );
+        let clip_rect = crate::layout::paint_helpers::background_rect_area_for_box(
+            border_rect,
+            table_style,
+            table_width.border_widths,
+            table_style.background_clip,
+        );
+        if let (Some(source_placement), Some(placement), Some(row_bounds)) =
+            (source_grid_placement, grid_placement, grid_row_bounds)
+        {
+            let is_unfragmented_root = fragment.plan.break_reason()
+                == TableFragmentBreakReason::TableStart
+                && fragment.plan.outgoing_boundary.is_none();
+            // Table-root backgrounds belong to the root paint area, not to
+            // the cell grid.  Keep the color in destination space below the
+            // structural grid layers; images retain their unfragmented root
+            // positioning area and are translated into each fragmentainer.
+            // <https://drafts.csswg.org/css-tables-3/#drawing-backgrounds>
+            if is_unfragmented_root {
+                if let Some(fill) = table_style
+                    .background_color
+                    .visible_color(table_style.color)
+                {
+                    backgrounds.push(PaintPrimitive::Rect(RenderedRect::from_paint_rect(
+                        clip_rect,
+                        Some(fill),
+                    )));
+                }
+                backgrounds.extend(background_image_primitives_for_style_with_paint_areas(
+                    PaintBackgroundArea::from_paint_rect(border_rect),
+                    PaintBackgroundArea::from_paint_rect(clip_rect),
+                    table_style,
+                    self.base_url,
+                    self.root_url,
+                    self.resource_cache,
+                ));
+            } else {
+                let root_background_viewport = TableRootBackgroundViewport::new(
+                    source_placement,
+                    placement,
+                    row_bounds,
+                    &fragment_rows,
+                    &fragment_row_heights,
+                    &fragment_row_offsets,
+                    table_style,
+                    table_width,
+                    vertical_edge_spacing,
+                );
+                if let Some(fill) = table_style
+                    .background_color
+                    .visible_color(table_style.color)
+                {
+                    backgrounds.push(PaintPrimitive::Rect(RenderedRect::from_paint_rect(
+                        clip_rect,
+                        Some(fill),
+                    )));
+                }
+                outlines.extend(root_background_viewport.image_primitives(
+                    table_style,
+                    self.base_url,
+                    self.root_url,
+                    self.resource_cache,
+                ));
+            }
+        } else {
+            if let Some(fill) = table_style
+                .background_color
+                .visible_color(table_style.color)
+            {
+                backgrounds.push(PaintPrimitive::Rect(RenderedRect::from_paint_rect(
+                    clip_rect,
+                    Some(fill),
+                )));
+            }
+            backgrounds.extend(background_image_primitives_for_style_with_paint_areas(
+                PaintBackgroundArea::from_paint_rect(border_rect),
+                PaintBackgroundArea::from_paint_rect(clip_rect),
+                table_style,
+                self.base_url,
+                self.root_url,
+                self.resource_cache,
+            ));
+        }
         let mut column_group_spans = table_column_group_spans(columns, column_plan.column_count());
         if let Some(placement) = grid_placement
             && table_style.writing_mode.has_vertical_lines()
@@ -598,14 +672,19 @@ impl<'a> LayoutBuilder<'a> {
             let column_group_style =
                 self.style_for_table_column_group(&column_group, table_style, stylesheets);
             let mut layer_primitives = Vec::new();
-            if let (Some(placement), Some(row_bounds)) = (grid_placement, grid_row_bounds)
+            if let (Some(source_placement), Some(destination_placement), Some(row_bounds)) =
+                (source_grid_placement, grid_placement, grid_row_bounds)
                 && table_style.writing_mode.has_vertical_lines()
             {
                 layer_primitives.extend(table_column_grid_background_primitives(
-                    placement,
+                    source_placement,
+                    destination_placement,
                     column_plan,
+                    grid,
                     &fragment_rows,
                     row_bounds,
+                    &fragment_row_heights,
+                    &fragment_row_offsets,
                     start_column,
                     end_column,
                     &column_group_style,
@@ -705,14 +784,19 @@ impl<'a> LayoutBuilder<'a> {
         for (column_index, span, column) in column_spans {
             let column_style = self.style_for_table_column(column, table_style, stylesheets);
             let mut layer_primitives = Vec::new();
-            if let (Some(placement), Some(row_bounds)) = (grid_placement, grid_row_bounds)
+            if let (Some(source_placement), Some(destination_placement), Some(row_bounds)) =
+                (source_grid_placement, grid_placement, grid_row_bounds)
                 && table_style.writing_mode.has_vertical_lines()
             {
                 layer_primitives.extend(table_column_grid_background_primitives(
-                    placement,
+                    source_placement,
+                    destination_placement,
                     column_plan,
+                    grid,
                     &fragment_rows,
                     row_bounds,
+                    &fragment_row_heights,
+                    &fragment_row_offsets,
                     column_index,
                     column_index + span,
                     &column_style,
@@ -787,9 +871,12 @@ impl<'a> LayoutBuilder<'a> {
                 self.style_for_table_row_group(&row_group, table_style, stylesheets);
             let background_start = backgrounds.len();
             let outline_start = outlines.len();
-            if let (Some(placement), Some(row_bounds)) = (grid_placement, grid_row_bounds) {
+            if let (Some(source_placement), Some(destination_placement), Some(row_bounds)) =
+                (source_grid_placement, grid_placement, grid_row_bounds)
+            {
                 backgrounds.extend(table_row_group_grid_background_primitives(
-                    placement,
+                    source_placement,
+                    destination_placement,
                     row_bounds,
                     column_plan,
                     grid,
@@ -803,7 +890,10 @@ impl<'a> LayoutBuilder<'a> {
                     self.root_url,
                     self.resource_cache,
                 ));
-            } else if let Some(fill) = row_group_style.background_color {
+            } else if let Some(fill) = row_group_style
+                .background_color
+                .visible_color(row_group_style.color)
+            {
                 let mut segment_start = None;
                 let mut previous_local = None;
                 for (local_row, original_row) in fragment_rows.iter().cloned().enumerate() {
@@ -882,11 +972,16 @@ impl<'a> LayoutBuilder<'a> {
                 local_row,
                 local_row + 1,
             ) {
-                let mut row_backgrounds = if let (Some(placement), Some(row_bounds)) =
-                    (grid_placement, grid_row_bounds)
+                let mut row_backgrounds = if let (
+                    Some(source_placement),
+                    Some(destination_placement),
+                    Some(row_bounds),
+                ) =
+                    (source_grid_placement, grid_placement, grid_row_bounds)
                 {
                     table_row_grid_background_primitives(
-                        placement,
+                        source_placement,
+                        destination_placement,
                         row_bounds,
                         column_plan,
                         grid,
@@ -1062,7 +1157,9 @@ impl<'a> LayoutBuilder<'a> {
         // suppressing all collapsed-border paint; vertical roots still require
         // the retained grid placement inside `paint_fragment_rows`.
         let placement = fragment
-            .grid_placement
+            .grid_viewport
+            .as_ref()
+            .map(|viewport| viewport.destination_placement())
             .unwrap_or_else(|| TableGridPlacement::new(PageTopPoint::new(table_x, 0.0)));
         let (rects, paths) = geometry.grid.paint_fragment_rows(
             placement,
@@ -1073,7 +1170,10 @@ impl<'a> LayoutBuilder<'a> {
             &row_heights,
             &row_offsets,
             &original_row_heights,
-            fragment.grid_row_bounds.as_deref(),
+            fragment
+                .grid_viewport
+                .as_ref()
+                .map(|viewport| viewport.row_bounds()),
         );
         rects
             .into_iter()
@@ -1179,6 +1279,20 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         context: &TableGridLayoutContext<'_, '_>,
     ) -> TableHeightPlan {
+        let cache_key = context.rows.first().and_then(|row| {
+            row.element.map(|element| {
+                (
+                    element.id,
+                    context.column_plan.total_width().points().to_bits(),
+                )
+            })
+        });
+        if let Some(plan) = cache_key
+            .and_then(|key| self.speculative_table_height_plans.get(&key))
+            .cloned()
+        {
+            return plan;
+        }
         // CSS Tables 3 row layout first computes minimum row sizes, applies
         // spanning-cell minimum constraints, then distributes any definite
         // table height against reference sizes:
@@ -1188,12 +1302,12 @@ impl<'a> LayoutBuilder<'a> {
         let mut spanning_cells = Vec::new();
         for (row_index, row) in context.rows.iter().enumerate() {
             let row_style = self.style_for_table_row(row, context.table_style, context.stylesheets);
-            let source_height = if row_style.running_element_name.is_some() {
+            let source_height = if row_style.position.is_running() {
                 0.0
             } else {
                 self.measure_table_row_height(context, row_index, &row_style)
             };
-            if table_row_is_collapsed(&row_style) || row_style.running_element_name.is_some() {
+            if table_row_is_collapsed(&row_style) || row_style.position.is_running() {
                 plan_rows.push(TableRowHeightPlan {
                     base: 0.0,
                     source_height,
@@ -1285,24 +1399,50 @@ impl<'a> LayoutBuilder<'a> {
             context.wrapper_border_box_block_size,
             context.wrapper_non_grid_block_size,
         );
-        self.compute_table_reference_heights(
-            &mut plan_rows,
-            context,
-            target_content_height
-                .map(|value| {
-                    PercentageBasis::definite_from(value, BlockSizeBasisSource::TableWrapper)
+        // With no resolved wrapper block-size target, the first row-layout
+        // pass already contains every cell and row constraint that can affect
+        // the table's intrinsic height.  A second pass against an indefinite
+        // percentage basis would reproduce those same values.  Row-group
+        // heights are the exception because they are group-level constraints
+        // rather than cell contributions, so retain the reference pass when
+        // any group has an authored block size.
+        // <https://drafts.csswg.org/css-tables-3/#row-layout>
+        let needs_reference_pass = target_content_height.is_some()
+            || context.rows.iter().any(|row| {
+                row.row_groups.last().is_some_and(|group| {
+                    !table_root_block_size(&self.style_for_table_row_group(
+                        group,
+                        context.table_style,
+                        context.stylesheets,
+                    ))
+                    .is_auto()
                 })
-                .unwrap_or_else(PercentageBasis::indefinite),
-        );
+            });
+        if needs_reference_pass {
+            self.compute_table_reference_heights(
+                &mut plan_rows,
+                context,
+                target_content_height
+                    .map(|value| {
+                        PercentageBasis::definite_from(value, BlockSizeBasisSource::TableWrapper)
+                    })
+                    .unwrap_or_else(PercentageBasis::indefinite),
+            );
+        }
         self.distribute_table_height_plan(
             &mut plan_rows,
             target_content_height,
             context.table_metrics.clone(),
         );
-        TableHeightPlan {
+        let plan = TableHeightPlan {
             rows: plan_rows,
             target_content_height,
+        };
+        if let Some(key) = cache_key {
+            self.speculative_table_height_plans
+                .insert(key, plan.clone());
         }
+        plan
     }
 }
 

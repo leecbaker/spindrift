@@ -29,6 +29,11 @@ OpenType per-glyph positioning offsets are retained through PDF serialization:
 outline text emits offset glyphs from their shaped origins, matching the
 existing bitmap and COLR paint paths without changing CSS inline advances or
 line geometry.
+Compact TrueType subsets are accepted only after every source-GID/CID pair has
+the same advance, bounds, and resolved outline command stream as the source
+face. A mismatch falls back to complete-program embedding with identity CIDs,
+preserving the PDF text map and PDF/A CIDSet behavior rather than emitting a
+different glyph program.
 Fixed `@font-face` `font-weight` and `font-stretch` descriptors also pin the
 matching `wght` and `wdth` OpenType axis defaults before shaping, while ranges
 and `auto` descriptors retain the font's intrinsic axis defaults for matching.
@@ -41,6 +46,15 @@ System generic families are resolved to one concrete, outline-embeddable face
 before shaping. This keeps the face used for CSS metrics and glyph shaping
 identical to the program embedded in the PDF, rather than allowing the shaping
 engine's platform generic alias to select a different restricted font.
+
+Root-relative `rex`, `rcap`, and `ric` values used in `font-size` are measured
+from a dedicated document-root metric snapshot. That snapshot is established
+from the root's selected font even when the root has no local metric-relative
+property, so intervening generic-family ancestors cannot change the result.
+
+`font-language-override` remains blocked on a Parley shaping API capable of
+carrying a raw case-sensitive OpenType language-system tag; the limitation and
+required upstream interface are recorded in `docs/PARLEY_SHORTCOMINGS.md`.
 
 After the authored family list is exhausted, installed-font fallback is selected
 through Fontique's platform backend (CoreText on macOS), with the character's
@@ -68,6 +82,11 @@ bases rather than an approximate emoji range. This preserves authored VS15 and
 VS16 selectors while applying the requested default presentation to keycap
 bases, including `#`, `*`, and the ASCII digits; `font-variant-emoji-005`
 passes.
+
+Focused CSS Fonts evaluation also passes `font-size-adjust-014`,
+`font-size-zero-3`, and `font-variant-emoji-1`. The remaining
+`font-language-override-03` failure is the documented Parley limitation, not
+a Quire fallback policy.
 
 ## Largest remaining clusters
 

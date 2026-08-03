@@ -24,7 +24,7 @@ impl<'a> LayoutBuilder<'a> {
     ///
     /// <https://drafts.csswg.org/css-writing-modes-4/#text-combine-layout>
     /// <https://drafts.csswg.org/css-inline-3/#line-box>
-    fn align_sideways_runs_to_vertical_line_box(
+    pub(in crate::layout) fn align_sideways_runs_to_vertical_line_box(
         &mut self,
         runs: &mut [RenderedTextRun],
         shaped: &ShapedInlineLine,
@@ -96,12 +96,7 @@ impl<'a> LayoutBuilder<'a> {
         let color_glyph_paths =
             self.font_system
                 .take_color_glyph_paths(origin, &mut rendered_runs, &palettes, style);
-        let full_em_rect_coverage_paths = self.font_system.full_em_rect_glyph_coverage_paths(
-            origin,
-            &rendered_runs,
-            style.text_fill_color.unwrap_or(style.color),
-        );
-        let rendered_line = RenderedLine::from_paint_origin(
+        let mut rendered_line = RenderedLine::from_paint_origin(
             shaped.text.to_string(),
             origin,
             rendered_line_font_size(&rendered_runs, style.font_size),
@@ -110,6 +105,9 @@ impl<'a> LayoutBuilder<'a> {
             rendered_runs,
         )
         .with_glyph_origin_adjustment(PaintDisplacement::new(0.0, shaped.baseline_adjustment));
+        let glyph_ink_bounds =
+            glyph_ink_bounds_for_rendered_line(&self.font_system, &rendered_line);
+        rendered_line = rendered_line.with_glyph_ink_bounds(glyph_ink_bounds);
         self.paint_text_shadows(&rendered_line, style);
         self.paint_text_decoration_lines_for_phase(
             rendered_line.x(),
@@ -125,9 +123,19 @@ impl<'a> LayoutBuilder<'a> {
         for image in raster_glyph_images {
             self.push_image_in_band(PaintBand::Inline, image);
         }
-        self.push_line_in_band(PaintBand::Inline, rendered_line.clone());
-        for path in full_em_rect_coverage_paths {
-            self.push_path_in_band(PaintBand::Inline, path);
+        let full_em_rect_coverage_paths = self.font_system.full_em_rect_glyph_coverage_paths(
+            origin,
+            &rendered_line.runs,
+            style.text_fill_color.unwrap_or(style.color),
+        );
+        if full_em_rect_coverage_paths.is_empty() {
+            self.push_line_in_band(PaintBand::Inline, rendered_line.clone());
+        } else {
+            self.current_page.push_opaque_text_coverage_in_band(
+                PaintBand::Inline,
+                rendered_line.clone(),
+                full_em_rect_coverage_paths,
+            );
         }
         self.paint_prepared_text_emphasis_marks_for_line(&rendered_line, style);
         self.paint_text_decoration_lines_for_phase(
@@ -140,24 +148,90 @@ impl<'a> LayoutBuilder<'a> {
         );
         Some(rendered_line)
     }
-    pub(in crate::layout) fn paint_prepared_inline_text_group(
+    pub(in crate::layout) fn paint_prepared_inline_text_group_with_decoration_geometries(
         &mut self,
         group: &PreparedInlineTextGroup,
+        decoration_geometries: &[TextDecorationOriginLineGeometry],
     ) {
         let source = match group.source {
             InlineTextSource::Normal
             | InlineTextSource::Generated
+            | InlineTextSource::FootnoteCall(_)
             | InlineTextSource::BidiControl => RenderedLineSource::Normal,
             InlineTextSource::RunIn => RenderedLineSource::RunIn,
             InlineTextSource::Marker => RenderedLineSource::Marker,
         };
-        self.paint_prepared_inline_text_group_with_source(group, source);
+        self.paint_prepared_inline_text_group_with_source_and_decoration_geometries(
+            group,
+            source,
+            decoration_geometries,
+        );
     }
 
-    pub(in crate::layout) fn paint_prepared_inline_text_group_with_source(
+    pub(in crate::layout) fn paint_prepared_inline_text_group_with_source_and_decoration_geometries(
         &mut self,
         group: &PreparedInlineTextGroup,
         source: RenderedLineSource,
+        decoration_geometries: &[TextDecorationOriginLineGeometry],
+    ) {
+        // A direct text fragment has no lexical owner beyond its own used
+        // style. Once materialized pseudo/inline ancestry is present, retain
+        // the prepared product so each copied source slice uses the same
+        // lexical effect chain.
+        let paint_opacity = if group.paint_scope_ancestry.is_empty() {
+            group.style.opacity
+        } else {
+            group.paint_opacity
+        };
+        if paint_opacity >= 1.0 {
+            self.paint_prepared_inline_text_group_unscoped(group, source, decoration_geometries);
+            return;
+        }
+
+        // `opacity` applies after the inline-like pseudo box and all of its
+        // text paint have composed. Capture the complete prepared text group
+        // rather than attenuating glyph colors, so shadows, decorations,
+        // color glyph paths, raster glyphs, and links stay in the same PDF
+        // transparency group.
+        // <https://www.w3.org/TR/css-color-4/#transparency> and
+        // <https://www.w3.org/TR/css-pseudo-4/#first-letter-styling>
+        let checkpoint = self.current_page.paint_checkpoint();
+        self.paint_prepared_inline_text_group_unscoped(group, source, decoration_geometries);
+        let mut fragment = self.current_page.take_paint_fragment_since(checkpoint);
+        if fragment.is_empty() {
+            return;
+        }
+        // Link annotations participate in the same transformed geometry, but
+        // they are interactive page annotations rather than graphical paint.
+        // Keep them outside the PDF transparency form so `opacity: 0` hides
+        // the owned glyph/decorations without disabling hit testing.
+        // <https://drafts.csswg.org/css-color-4/#transparency>
+        let links = std::mem::take(&mut fragment.links);
+        let bounds = PaintClip::from_paint_rect(group.link_paint_rect());
+        let context = PaintStackingContext::from_banded_fragment(fragment, Vec::new())
+            .with_source_order(self.next_paint_source_order())
+            .with_effects(PaintEffects {
+                opacity: paint_opacity,
+                ..PaintEffects::default()
+            })
+            .with_bounds(bounds);
+        self.current_page.append_paint_fragment_owned(
+            PaintFragment::from_stacking_context_in_band(PaintBand::Inline, context),
+            PaintTranslation::identity(),
+        );
+        if !links.is_empty() {
+            self.current_page.append_paint_fragment_owned(
+                PaintFragment::from_primitives(Vec::new(), links),
+                PaintTranslation::identity(),
+            );
+        }
+    }
+
+    fn paint_prepared_inline_text_group_unscoped(
+        &mut self,
+        group: &PreparedInlineTextGroup,
+        source: RenderedLineSource,
+        decoration_geometries: &[TextDecorationOriginLineGeometry],
     ) {
         let mut rendered_runs =
             positioned_rendered_runs_for_writing_mode(&group.shaped, &group.style);
@@ -185,12 +259,7 @@ impl<'a> LayoutBuilder<'a> {
                 .collect::<Vec<_>>(),
             &group.style,
         );
-        let full_em_rect_coverage_paths = self.font_system.full_em_rect_glyph_coverage_paths(
-            text_origin,
-            &rendered_runs,
-            group.style.text_fill_color.unwrap_or(group.style.color),
-        );
-        let rendered_line = RenderedLine::from_paint_origin_with_source(
+        let mut rendered_line = RenderedLine::from_paint_origin_with_source(
             group.shaped.text.to_string(),
             text_origin,
             rendered_line_font_size(&rendered_runs, group.style.font_size),
@@ -204,6 +273,9 @@ impl<'a> LayoutBuilder<'a> {
             group.shaped.baseline_adjustment,
         ))
         .with_source_run(Rc::clone(&group.source_run));
+        let glyph_ink_bounds =
+            glyph_ink_bounds_for_rendered_line(&self.font_system, &rendered_line);
+        rendered_line = rendered_line.with_glyph_ink_bounds(glyph_ink_bounds);
         let decoration_runs = rendered_line.runs.clone();
         let mut decoration_style = group.style.clone();
         let (decoration_x, decoration_baseline_y, decoration_width, decoration_style) =
@@ -234,14 +306,22 @@ impl<'a> LayoutBuilder<'a> {
             } else {
                 (group.x(), group.y(), group.width(), &group.style)
             };
+        // A selected line edge is a glyph-sequence edge, not the fitted line
+        // measure.  In particular, `break-spaces` retains trailing advances
+        // for painting after layout has excluded them from the fitting width.
+        // Use the exact shaped run span so skip-spaces can remove only the
+        // leading/trailing spacers instead of clipping a final text glyph.
+        // <https://drafts.csswg.org/css-text-decor-4/#text-decoration-skip-spaces-property>
+        let decoration_width = decoration_width.max(rendered_text_line_width(&rendered_line));
         self.paint_text_shadows(&rendered_line, &group.style);
-        self.paint_text_decoration_lines_for_phase(
+        self.paint_text_decoration_lines_for_phase_with_line_geometries(
             decoration_x,
             decoration_baseline_y,
             decoration_width,
             decoration_style,
             &decoration_runs,
             TextDecorationPaintPhase::BeforeText,
+            decoration_geometries,
         );
         for path in color_glyph_paths {
             self.push_path_in_band(PaintBand::Inline, path);
@@ -249,18 +329,29 @@ impl<'a> LayoutBuilder<'a> {
         for image in raster_glyph_images {
             self.push_image_in_band(PaintBand::Inline, image);
         }
-        self.push_line_in_band(PaintBand::Inline, rendered_line.clone());
-        for path in full_em_rect_coverage_paths {
-            self.push_path_in_band(PaintBand::Inline, path);
+        let full_em_rect_coverage_paths = self.font_system.full_em_rect_glyph_coverage_paths(
+            text_origin,
+            &rendered_line.runs,
+            group.style.text_fill_color.unwrap_or(group.style.color),
+        );
+        if full_em_rect_coverage_paths.is_empty() {
+            self.push_line_in_band(PaintBand::Inline, rendered_line.clone());
+        } else {
+            self.current_page.push_opaque_text_coverage_in_band(
+                PaintBand::Inline,
+                rendered_line.clone(),
+                full_em_rect_coverage_paths,
+            );
         }
         self.paint_prepared_text_emphasis_marks_for_line(&rendered_line, &group.style);
-        self.paint_text_decoration_lines_for_phase(
+        self.paint_text_decoration_lines_for_phase_with_line_geometries(
             decoration_x,
             decoration_baseline_y,
             decoration_width,
             decoration_style,
             &decoration_runs,
             TextDecorationPaintPhase::AfterText,
+            decoration_geometries,
         );
 
         if let Some(target) = &group.link_target {
@@ -294,7 +385,7 @@ impl<'a> LayoutBuilder<'a> {
             || fragment.style().display.is_atomic_inline()
             || rect.width() <= 0.0
             || rect.height() <= 0.0
-            || (fragment.style().background_color.is_none()
+            || (fragment.style().background_color.is_transparent()
                 && fragment.style().background_image.is_none()
                 && used_border_width(fragment.style()) == layout_pt(0.0))
         {
@@ -319,6 +410,32 @@ impl<'a> LayoutBuilder<'a> {
             self.push_primitive_in_band(PaintBand::Inline, primitive);
         }
     }
+}
+
+/// Return the page-space union of the selected glyph outlines for one line.
+///
+/// CSS fragmentation keeps the whole line box together, but PDF overflow
+/// clipping must act on painted ink.  Retaining this outline union lets a
+/// fragment edge avoid becoming a synthetic clip edge for glyphs that are
+/// already wholly within the fragmentainer.
+/// <https://www.w3.org/TR/css-overflow-3/#overflow-clipping>
+fn glyph_ink_bounds_for_rendered_line(
+    font_system: &crate::text::FontSystem,
+    line: &RenderedLine,
+) -> Option<PaintClip> {
+    let boxes = font_system.glyph_ink_boxes_for_runs(&line.runs, line.y());
+    let mut left = f32::INFINITY;
+    let mut right = f32::NEG_INFINITY;
+    let mut bottom = f32::INFINITY;
+    let mut top = f32::NEG_INFINITY;
+    for ink in boxes {
+        left = left.min(line.x() + ink.x_min);
+        right = right.max(line.x() + ink.x_max);
+        bottom = bottom.min(ink.y_min);
+        top = top.max(ink.y_max);
+    }
+    (left.is_finite() && right > left && bottom.is_finite() && top > bottom)
+        .then(|| PaintClip::new(left, bottom, right - left, top - bottom))
 }
 
 pub(in crate::layout) fn rendered_line_font_size(

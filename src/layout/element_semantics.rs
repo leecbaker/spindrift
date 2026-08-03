@@ -1,8 +1,236 @@
 use super::*;
-use crate::dom::DocumentSyntax;
+use crate::dom::{DocumentSyntax, ObjectRendering};
 
 const XHTML_NAMESPACE_URL: &str = "http://www.w3.org/1999/xhtml";
 const SVG_NAMESPACE_URL: &str = "http://www.w3.org/2000/svg";
+
+/// One used overflow value in a physical axis.
+///
+/// CSS Overflow's clipping and scrolling semantics are axis-specific.  This
+/// representation deliberately does not let a caller reduce `clip visible`
+/// to one generic "clipping" value.
+/// <https://drafts.csswg.org/css-overflow-3/#overflow-properties>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) enum UsedOverflowAxis {
+    Visible,
+    Clip,
+    ScrollContainer(css::Overflow),
+}
+
+impl UsedOverflowAxis {
+    const fn from_overflow(overflow: css::Overflow) -> Self {
+        match overflow {
+            css::Overflow::Visible => Self::Visible,
+            css::Overflow::Clip => Self::Clip,
+            css::Overflow::Hidden | css::Overflow::Scroll | css::Overflow::Auto => {
+                Self::ScrollContainer(overflow)
+            }
+        }
+    }
+
+    const fn overflow(self) -> css::Overflow {
+        match self {
+            Self::Visible => css::Overflow::Visible,
+            Self::Clip => css::Overflow::Clip,
+            Self::ScrollContainer(overflow) => overflow,
+        }
+    }
+
+    pub(in crate::layout) const fn clips(self) -> bool {
+        !matches!(self, Self::Visible)
+    }
+
+    pub(in crate::layout) const fn is_scroll_container(self) -> bool {
+        matches!(self, Self::ScrollContainer(_))
+    }
+}
+
+/// Used overflow for the physical horizontal and vertical axes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) struct UsedOverflowAxes {
+    pub(in crate::layout) horizontal: UsedOverflowAxis,
+    pub(in crate::layout) vertical: UsedOverflowAxis,
+}
+
+impl UsedOverflowAxes {
+    const VISIBLE: Self = Self {
+        horizontal: UsedOverflowAxis::Visible,
+        vertical: UsedOverflowAxis::Visible,
+    };
+
+    pub(in crate::layout) fn from_style(style: &ComputedStyle) -> Self {
+        let (horizontal, vertical) = resolved_overflow_axes(style);
+        Self {
+            horizontal: UsedOverflowAxis::from_overflow(horizontal),
+            vertical: UsedOverflowAxis::from_overflow(vertical),
+        }
+    }
+
+    fn from_viewport_style(style: &ComputedStyle) -> Self {
+        let (horizontal, vertical) = viewport_overflow_axes(style);
+        Self {
+            horizontal: UsedOverflowAxis::from_overflow(horizontal),
+            vertical: UsedOverflowAxis::from_overflow(vertical),
+        }
+    }
+
+    pub(in crate::layout) const fn clips_any_axis(self) -> bool {
+        self.horizontal.clips() || self.vertical.clips()
+    }
+
+    pub(in crate::layout) const fn clips_x(self) -> bool {
+        self.horizontal.clips()
+    }
+
+    pub(in crate::layout) const fn clips_y(self) -> bool {
+        self.vertical.clips()
+    }
+
+    fn representative(self, fallback: css::Overflow) -> css::Overflow {
+        if self.horizontal == UsedOverflowAxis::Visible
+            && self.vertical == UsedOverflowAxis::Visible
+        {
+            fallback
+        } else {
+            [self.horizontal, self.vertical]
+                .into_iter()
+                .map(UsedOverflowAxis::overflow)
+                .find(|overflow| *overflow != css::Overflow::Visible)
+                .unwrap_or(fallback)
+        }
+    }
+}
+
+/// Reserved physical scrollbar gutters around a scrollport.
+///
+/// These are layout lengths, not CSS box-model padding: callers must obtain
+/// the adjusted paint rectangle through [`ScrollportGeometry`] rather than
+/// subtracting a raw scalar in an arbitrary formatting context.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct PhysicalScrollbarGutters {
+    pub(in crate::layout) left: LayoutLength,
+    pub(in crate::layout) right: LayoutLength,
+    pub(in crate::layout) top: LayoutLength,
+    pub(in crate::layout) bottom: LayoutLength,
+}
+
+/// Resolved scrollport geometry for a single physical padding box.
+///
+/// The static PDF UA reserves deterministic classic-gutter space but does
+/// not paint native interactive chrome. Keeping this value explicit lets
+/// layout, background positioning, and clipping agree on that choice.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct ScrollportGeometry {
+    pub(in crate::layout) padding_box: PaintClip,
+    pub(in crate::layout) scrollport: PaintClip,
+    pub(in crate::layout) gutters: PhysicalScrollbarGutters,
+}
+
+impl ScrollportGeometry {
+    /// Resolve static-media scrollbar reservation against known overflow.
+    /// `auto` receives the actual overflow flags, while `stable` and `scroll`
+    /// can reserve space before descendant layout has finished.
+    pub(in crate::layout) fn for_padding_box(
+        padding_box: PaintClip,
+        style: &ComputedStyle,
+        overflow: UsedOverflowAxes,
+        has_overflow_x: bool,
+        has_overflow_y: bool,
+    ) -> Self {
+        let thickness = match style.scrollbar_width {
+            css::ScrollbarWidth::None => LayoutLength::new(0.0),
+            css::ScrollbarWidth::Thin => LayoutLength::new(8.0 * css::CSS_PX_TO_PT),
+            css::ScrollbarWidth::Auto => LayoutLength::new(15.0 * css::CSS_PX_TO_PT),
+        };
+        let reserves_x = reserves_scrollbar_gutter(
+            overflow.horizontal,
+            style.scrollbar_gutter,
+            style.scrollbar_width,
+            has_overflow_x,
+        );
+        let reserves_y = reserves_scrollbar_gutter(
+            overflow.vertical,
+            style.scrollbar_gutter,
+            style.scrollbar_width,
+            has_overflow_y,
+        );
+        let both_edges = matches!(
+            style.scrollbar_gutter,
+            css::ScrollbarGutter::Stable { both_edges: true }
+        );
+        let gutters = PhysicalScrollbarGutters {
+            left: if reserves_y && both_edges {
+                thickness
+            } else {
+                LayoutLength::new(0.0)
+            },
+            right: if reserves_y {
+                thickness
+            } else {
+                LayoutLength::new(0.0)
+            },
+            top: if reserves_x && both_edges {
+                thickness
+            } else {
+                LayoutLength::new(0.0)
+            },
+            bottom: if reserves_x {
+                thickness
+            } else {
+                LayoutLength::new(0.0)
+            },
+        };
+        let left = gutters.left.points();
+        let right = gutters.right.points();
+        let top = gutters.top.points();
+        let bottom = gutters.bottom.points();
+        let scrollport = PaintClip::new(
+            padding_box.x() + left,
+            padding_box.y() + bottom,
+            (padding_box.width() - left - right).max(0.0),
+            (padding_box.height() - top - bottom).max(0.0),
+        );
+        Self {
+            padding_box,
+            scrollport,
+            gutters,
+        }
+    }
+}
+
+fn reserves_scrollbar_gutter(
+    overflow: UsedOverflowAxis,
+    gutter: css::ScrollbarGutter,
+    width: css::ScrollbarWidth,
+    has_overflow: bool,
+) -> bool {
+    if width == css::ScrollbarWidth::None || !overflow.is_scroll_container() {
+        return false;
+    }
+    match overflow.overflow() {
+        css::Overflow::Scroll => true,
+        css::Overflow::Auto => {
+            has_overflow || matches!(gutter, css::ScrollbarGutter::Stable { .. })
+        }
+        css::Overflow::Hidden => matches!(gutter, css::ScrollbarGutter::Stable { .. }),
+        css::Overflow::Visible | css::Overflow::Clip => false,
+    }
+}
+
+/// The principal HTML element currently supplying the viewport overflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewportOverflowSource {
+    Root(ElementId),
+    Body(ElementId),
+}
+
+impl ViewportOverflowSource {
+    const fn element_id(self) -> ElementId {
+        match self {
+            Self::Root(id) | Self::Body(id) => id,
+        }
+    }
+}
 
 /// Return whether an element has HTML rendering semantics.
 ///
@@ -17,7 +245,7 @@ pub(super) fn has_html_rendering_semantics(element: &Element) -> bool {
         || (element.document_syntax == DocumentSyntax::Html && element.namespace_url.is_empty())
 }
 
-/// Used overflow propagation for the HTML document canvas.
+/// Resolved document-level propagation for the HTML document canvas.
 ///
 /// CSS Overflow propagates the root element's overflow to the viewport. When
 /// the HTML root has visible overflow, its first eligible body child provides
@@ -25,34 +253,48 @@ pub(super) fn has_html_rendering_semantics(element: &Element) -> bool {
 /// layout. This is a used-value concern, kept separate from `ComputedStyle`:
 /// <https://drafts.csswg.org/css-overflow-3/#overflow-propagation>.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::layout) struct DocumentCanvasOverflowContext {
-    viewport_overflow_source: Option<ElementId>,
-    root_has_containment: bool,
-    viewport_overflow_x: css::Overflow,
-    viewport_overflow_y: css::Overflow,
+pub(in crate::layout) struct DocumentCanvasResolution {
+    root: Option<ElementId>,
+    /// The first eligible body whose properties propagate to the document
+    /// canvas.  CSS Containment disables every such body propagation when
+    /// either the root or that body has a non-`none` used `contain` value.
+    /// <https://drafts.csswg.org/css-contain-1/#contain-property>
+    propagated_body: Option<ElementId>,
+    principal_flow: DocumentPrincipalFlow,
+    viewport_overflow_source: Option<ViewportOverflowSource>,
+    viewport_overflow: UsedOverflowAxes,
     viewport_uses_auto_overflow: bool,
     viewport_has_auto_overflow: bool,
 }
 
-impl Default for DocumentCanvasOverflowContext {
+impl Default for DocumentCanvasResolution {
     fn default() -> Self {
         Self {
+            root: None,
+            propagated_body: None,
+            principal_flow: DocumentPrincipalFlow {
+                writing_mode: WritingMode::HorizontalTb,
+                direction: Direction::Ltr,
+                text_orientation: TextOrientation::Mixed,
+                source: PrincipalFlowSource::Root,
+            },
             viewport_overflow_source: None,
-            root_has_containment: false,
-            viewport_overflow_x: css::Overflow::Visible,
-            viewport_overflow_y: css::Overflow::Visible,
+            viewport_overflow: UsedOverflowAxes::VISIBLE,
             viewport_uses_auto_overflow: false,
             viewport_has_auto_overflow: false,
         }
     }
 }
 
-impl DocumentCanvasOverflowContext {
-    pub(in crate::layout) fn from_page_box(page_box: &box_tree::PageBox<'_>) -> Self {
+impl DocumentCanvasResolution {
+    pub(in crate::layout) fn from_page_box<S>(page_box: &box_tree::PageBoxWith<'_, S>) -> Self
+    where
+        S: AsRef<ComputedStyle>,
+    {
         let Some((html, _, html_style, html_children)) = page_box
             .children
             .iter()
-            .find_map(box_tree::FormattingBox::element_parts)
+            .find_map(|child| child.element_parts())
             .filter(|(element, _, _, _)| {
                 has_html_rendering_semantics(element) && element.tag == "html"
             })
@@ -69,26 +311,40 @@ impl DocumentCanvasOverflowContext {
                 })
                 .map(|(element, _, style, _)| (element, style))
         });
-        let root_has_containment = style_has_property_containment(html_style);
-        let body_provides_viewport_overflow = body.is_some()
-            && !root_has_containment
-            && body.is_some_and(|(_, style)| !style_has_property_containment(style))
+        let propagated_body = body.filter(|(_, style)| {
+            !style_has_non_none_contain_property(html_style)
+                && !style_has_non_none_contain_property(style)
+        });
+        // When body property propagation is disabled, root overflow still
+        // supplies the viewport; the body keeps its own overflow behavior.
+        // <https://drafts.csswg.org/css-contain-1/#contain-property>
+        // <https://drafts.csswg.org/css-overflow-3/#overflow-propagation>
+        let body_provides_viewport_overflow = propagated_body.is_some()
             && html_style.overflow_x == css::Overflow::Visible
             && html_style.overflow_y == css::Overflow::Visible;
         let (viewport_overflow_source, viewport_style) = if body_provides_viewport_overflow {
-            let (body, body_style) = body.expect("body overflow source was checked above");
-            (Some(body.id), body_style)
-        } else if !root_has_containment {
-            (Some(html.id), html_style)
+            let (body, body_style) =
+                propagated_body.expect("body overflow source was checked above");
+            (Some(ViewportOverflowSource::Body(body.id)), body_style)
         } else {
-            (None, html_style)
+            (Some(ViewportOverflowSource::Root(html.id)), html_style)
         };
-        let (viewport_overflow_x, viewport_overflow_y) = viewport_overflow_axes(viewport_style);
+        let viewport_overflow = UsedOverflowAxes::from_viewport_style(viewport_style);
+        let principal_flow = propagated_body.map_or_else(
+            || DocumentPrincipalFlow::from_style(html_style),
+            |(body, body_style)| DocumentPrincipalFlow {
+                writing_mode: body_style.writing_mode,
+                direction: body_style.direction,
+                text_orientation: body_style.text_orientation,
+                source: PrincipalFlowSource::Body(body.id),
+            },
+        );
         Self {
+            root: Some(html.id),
+            propagated_body: propagated_body.map(|(body, _)| body.id),
+            principal_flow,
             viewport_overflow_source,
-            root_has_containment,
-            viewport_overflow_x,
-            viewport_overflow_y,
+            viewport_overflow,
             // Keep static-PDF scrollbar chrome opt-in: a visible viewport is
             // specified as auto, but ordinary overflowing pages must not gain
             // synthetic scrollbar tracks merely because their canvas is
@@ -99,25 +355,80 @@ impl DocumentCanvasOverflowContext {
         }
     }
 
+    /// Returns the writing-mode principal flow selected from the same
+    /// cascaded root/body pair as canvas background and overflow propagation.
+    pub(in crate::layout) fn principal_flow(self) -> DocumentPrincipalFlow {
+        self.principal_flow
+    }
+
     pub(in crate::layout) fn used_overflow(
         self,
         element: &Element,
         style: &ComputedStyle,
     ) -> css::Overflow {
-        if !has_html_rendering_semantics(element) {
-            return effective_overflow_for_style(style);
-        }
+        // Propagating the root or eligible body overflow to the viewport
+        // changes both of the source element's used axes to `visible`.  Do
+        // not use the computed shorthand as the representative fallback here:
+        // it may still be `hidden`, `scroll`, or `auto`.
+        // <https://drafts.csswg.org/css-overflow-3/#overflow-propagation>
         if self.is_viewport_overflow_source(element) {
             css::Overflow::Visible
         } else {
-            effective_overflow_for_style(style)
+            UsedOverflowAxes::from_style(style).representative(style.overflow)
+        }
+    }
+
+    /// Return the element's used physical overflow axes after document-canvas
+    /// propagation.  The selected source becomes visible locally while every
+    /// other principal element retains its own axis-specific behavior.
+    pub(in crate::layout) fn used_overflow_axes(
+        self,
+        element: &Element,
+        style: &ComputedStyle,
+    ) -> UsedOverflowAxes {
+        if has_html_rendering_semantics(element) && self.is_viewport_overflow_source(element) {
+            UsedOverflowAxes::VISIBLE
+        } else {
+            UsedOverflowAxes::from_style(style)
         }
     }
 
     /// Return whether this exact principal element supplies the viewport's
     /// used overflow. Multiple HTML body elements must not be conflated.
     pub(in crate::layout) fn is_viewport_overflow_source(self, element: &Element) -> bool {
-        self.viewport_overflow_source == Some(element.id)
+        self.viewport_overflow_source
+            .is_some_and(|source| source.element_id() == element.id)
+    }
+
+    /// Whether `element` participates in the document canvas flow.
+    ///
+    /// A contained eligible body is an ordinary principal block, not a
+    /// second canvas-flow source. CSS Containment disables the entire body
+    /// propagation mechanism, not merely selected propagated properties.
+    /// <https://drafts.csswg.org/css-contain-1/#contain-property>
+    pub(in crate::layout) fn is_document_canvas_flow_element(self, element: &Element) -> bool {
+        self.is_document_canvas_property_source(element)
+    }
+
+    /// Whether `element` supplies document-canvas properties. The root
+    /// always does; an eligible body does only when containment leaves body
+    /// propagation enabled.
+    pub(in crate::layout) fn is_document_canvas_property_source(self, element: &Element) -> bool {
+        self.root == Some(element.id) || self.propagated_body == Some(element.id)
+    }
+
+    /// Whether this element is the root canvas-background source.
+    pub(in crate::layout) fn is_root_canvas_background_source(self, element: &Element) -> bool {
+        self.root == Some(element.id)
+    }
+
+    /// Whether this element can provide the body fallback background for an
+    /// otherwise transparent root canvas.
+    pub(in crate::layout) fn is_body_canvas_background_fallback_source(
+        self,
+        element: &Element,
+    ) -> bool {
+        self.propagated_body == Some(element.id)
     }
 
     /// Whether propagated root/body overflow clips the document viewport.
@@ -125,8 +436,8 @@ impl DocumentCanvasOverflowContext {
         // A viewport with an automatic axis remains printable in static
         // media. Only a fully non-automatic viewport with a hidden vertical
         // axis retains a finite page-height clip.
-        self.viewport_overflow_x != css::Overflow::Auto
-            && self.viewport_overflow_y == css::Overflow::Hidden
+        self.viewport_overflow.horizontal.overflow() != css::Overflow::Auto
+            && self.viewport_overflow.vertical.overflow() == css::Overflow::Hidden
     }
 
     /// Records that the propagated automatic viewport overflow needs classic
@@ -141,10 +452,6 @@ impl DocumentCanvasOverflowContext {
     ) {
         self.viewport_has_auto_overflow |= self.viewport_uses_auto_overflow
             && (content_width > viewport_width + 0.01 || content_height > viewport_height + 0.01);
-    }
-
-    pub(in crate::layout) fn has_auto_scrollbar_tracks(self) -> bool {
-        self.viewport_has_auto_overflow
     }
 }
 
@@ -174,14 +481,7 @@ fn viewport_overflow_axes(style: &ComputedStyle) -> (css::Overflow, css::Overflo
 /// separate concern.
 /// <https://www.w3.org/TR/css-overflow-3/#overflow-properties>
 pub(super) fn effective_overflow_for_style(style: &ComputedStyle) -> css::Overflow {
-    let (overflow_x, overflow_y) = resolved_overflow_axes(style);
-    if overflow_x == css::Overflow::Visible && overflow_y == css::Overflow::Visible {
-        return style.overflow;
-    }
-    [overflow_x, overflow_y]
-        .into_iter()
-        .find(|overflow| *overflow != css::Overflow::Visible)
-        .unwrap_or(style.overflow)
+    UsedOverflowAxes::from_style(style).representative(style.overflow)
 }
 
 /// Return Overflow's cross-axis adjusted computed values.
@@ -222,20 +522,17 @@ pub(super) fn style_clips_overflow(style: &ComputedStyle) -> bool {
 /// axis remains unbounded.
 /// <https://www.w3.org/TR/css-overflow-3/#overflow-clip-edge>
 pub(super) fn overflow_clip_edge_axes(style: &ComputedStyle) -> (bool, bool) {
-    let (overflow_x, overflow_y) = resolved_overflow_axes(style);
+    let axes = UsedOverflowAxes::from_style(style);
     (
-        overflow_x == css::Overflow::Clip,
-        overflow_y == css::Overflow::Clip,
+        axes.horizontal == UsedOverflowAxis::Clip,
+        axes.vertical == UsedOverflowAxis::Clip,
     )
 }
 
 /// Return the physical axes whose visual overflow is bounded at all.
 pub(super) fn overflow_clipping_axes(style: &ComputedStyle) -> (bool, bool) {
-    let (overflow_x, overflow_y) = resolved_overflow_axes(style);
-    (
-        overflow_x != css::Overflow::Visible,
-        overflow_y != css::Overflow::Visible,
-    )
+    let axes = UsedOverflowAxes::from_style(style);
+    (axes.clips_x(), axes.clips_y())
 }
 
 /// Return whether any containment effect prevents special root/body canvas
@@ -245,12 +542,12 @@ pub(super) fn overflow_clipping_axes(style: &ComputedStyle) -> (bool, bool) {
 /// from propagating background, overflow, and principal writing-mode canvas
 /// properties. `content` and `strict` are already expanded into these bits.
 /// <https://www.w3.org/TR/css-contain-1/#containment-layout>
-pub(super) fn style_has_property_containment(style: &ComputedStyle) -> bool {
+pub(super) fn style_has_non_none_contain_property(style: &ComputedStyle) -> bool {
     style.contain.size
+        || style.contain.inline_size
         || style.contain.layout
         || style.contain.paint
         || style.contain.style
-        || !matches!(style.content_visibility, ContentVisibility::Visible)
 }
 
 /// Return whether size/layout/paint containment applies to this principal box.
@@ -289,20 +586,63 @@ pub(super) fn property_containment_applies_to_element(
 /// formatting, positioning, clipping, and Grid cannot accidentally apply an
 /// authored containment bit to a non-applicable inline or table-internal box.
 /// <https://drafts.csswg.org/css-contain-1/#containment-principal>
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct UsedPropertyContainment {
     pub(super) size: bool,
+    pub(super) inline_size: bool,
     pub(super) layout: bool,
     pub(super) paint: bool,
+}
+
+/// Whether descendants may enlarge an ancestor's scrollable-overflow area.
+///
+/// Layout and paint containment do not suppress descendant ink, but they do
+/// isolate scrollable overflow at the contained principal box.
+/// <https://www.w3.org/TR/css-contain-1/#containment-layout>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DescendantOverflowContribution {
+    Scrollable,
+    InkOnly,
+}
+
+impl UsedPropertyContainment {
+    /// Layout and paint containment establish an independent formatting
+    /// context; paint containment additionally clips descendant paint.
+    /// <https://www.w3.org/TR/css-contain-1/#containment-layout>
+    /// <https://www.w3.org/TR/css-contain-1/#containment-paint>
+    pub(super) fn establishes_independent_formatting_context(self) -> bool {
+        self.layout || self.paint
+    }
+
+    pub(super) fn establishes_fixed_position_containing_block(self) -> bool {
+        self.layout || self.paint
+    }
+
+    pub(super) fn clips_descendant_paint(self) -> bool {
+        self.paint
+    }
+
+    pub(super) fn descendant_overflow_contribution(self) -> DescendantOverflowContribution {
+        if self.layout || self.paint {
+            DescendantOverflowContribution::InkOnly
+        } else {
+            DescendantOverflowContribution::Scrollable
+        }
+    }
 }
 
 pub(super) fn used_property_containment(
     element: &Element,
     style: &ComputedStyle,
 ) -> UsedPropertyContainment {
+    // Root and body principal boxes remain ordinary containment subjects.
+    // The separate document-canvas resolver controls only their special HTML
+    // property propagation.
+    // <https://drafts.csswg.org/css-contain-1/#containment-principal>
     let applies = property_containment_applies_to_element(element, style);
     UsedPropertyContainment {
         size: applies && style.contain.size,
+        inline_size: applies && style.contain.inline_size,
         layout: applies && style.contain.layout,
         paint: applies && style.contain.paint,
     }
@@ -315,6 +655,13 @@ pub(super) fn layout_containment_applies_to_element(
     used_property_containment(element, style).layout
 }
 
+pub(super) fn property_containment_establishes_independent_formatting_context(
+    element: &Element,
+    style: &ComputedStyle,
+) -> bool {
+    used_property_containment(element, style).establishes_independent_formatting_context()
+}
+
 pub(super) fn paint_containment_applies_to_element(
     element: &Element,
     style: &ComputedStyle,
@@ -322,24 +669,28 @@ pub(super) fn paint_containment_applies_to_element(
     used_property_containment(element, style).paint
 }
 
-pub(super) fn propagates_document_canvas_properties(
+pub(super) fn descendant_overflow_contribution_for_element(
     element: &Element,
     style: &ComputedStyle,
-) -> bool {
-    is_document_canvas_element(element) && !style_has_property_containment(style)
+) -> DescendantOverflowContribution {
+    used_property_containment(element, style).descendant_overflow_contribution()
 }
 
 impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn element_propagates_document_canvas_properties(
         &self,
         element: &Element,
-        style: &ComputedStyle,
+        _style: &ComputedStyle,
     ) -> bool {
         self.element_side_effect_suppression_depth == 0
-            && propagates_document_canvas_properties(element, style)
-            && !(element.tag == "body"
-                && (self.document_canvas_overflow.root_has_containment
-                    || self.document_canvas_root_background_defined()))
+            && self
+                .document_canvas_overflow
+                .is_document_canvas_property_source(element)
+    }
+
+    pub(in crate::layout) fn element_uses_document_canvas_flow(&self, element: &Element) -> bool {
+        self.document_canvas_overflow
+            .is_document_canvas_flow_element(element)
     }
 
     /// Returns the element's overflow after document-canvas propagation.
@@ -351,6 +702,16 @@ impl<'a> LayoutBuilder<'a> {
         self.document_canvas_overflow.used_overflow(element, style)
     }
 
+    /// Axis-preserving counterpart to [`Self::used_overflow_for_element`].
+    pub(in crate::layout) fn used_overflow_axes_for_element(
+        &self,
+        element: &Element,
+        style: &ComputedStyle,
+    ) -> UsedOverflowAxes {
+        self.document_canvas_overflow
+            .used_overflow_axes(element, style)
+    }
+
     /// Returns whether an element establishes a local overflow clip after
     /// document-canvas overflow propagation.
     pub(in crate::layout) fn element_used_overflow_clips(
@@ -359,8 +720,8 @@ impl<'a> LayoutBuilder<'a> {
         style: &ComputedStyle,
     ) -> bool {
         (self
-            .used_overflow_for_element(element, style)
-            .clips_overflow()
+            .used_overflow_axes_for_element(element, style)
+            .clips_any_axis()
             || paint_containment_applies_to_element(element, style))
             && !self
                 .document_canvas_overflow
@@ -481,7 +842,14 @@ pub(super) fn replaced_element_kind(element: &Element) -> Option<ReplacedElement
         // replaced-image layout path gives CSS Images one concrete-object
         // implementation for img, embed, object, and video poster images.
         // <https://html.spec.whatwg.org/multipage/embedded-content.html>
-        "img" | "embed" | "object" | "video" => Some(ReplacedElementKind::Image),
+        "img" | "embed" | "video" => Some(ReplacedElementKind::Image),
+        // HTML `<object>` renders its fallback subtree unless the resource
+        // selection algorithm chose a supported external representation.
+        // The static renderer resolves that state before building CSS boxes.
+        // <https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-object-element>
+        "object" if element.object_rendering == ObjectRendering::Image => {
+            Some(ReplacedElementKind::Image)
+        }
         _ => None,
     }
 }
@@ -516,17 +884,14 @@ pub(super) fn element_has_direct_line_break(element: &Element) -> bool {
     )
 }
 
-pub(super) fn is_document_canvas_element(element: &Element) -> bool {
-    has_html_rendering_semantics(element) && matches!(element.tag.as_str(), "html" | "body")
-}
-
 /// Return whether the element's used overflow clips its own box.
 ///
 /// Return raw style clipping for layout paths that do not have a document
 /// canvas context. Context-aware principal block layout replaces this with the
 /// selected viewport overflow source's used `visible` value.
 pub(super) fn used_overflow_clips_element(element: &Element, style: &ComputedStyle) -> bool {
-    style_clips_overflow(style) || paint_containment_applies_to_element(element, style)
+    UsedOverflowAxes::from_style(style).clips_any_axis()
+        || paint_containment_applies_to_element(element, style)
 }
 
 pub(super) fn is_html_table_element(element: &Element) -> bool {
@@ -538,11 +903,14 @@ pub(super) fn is_table_or_replaced_element(element: &Element) -> bool {
 }
 
 pub(super) fn suppresses_ordered_mixed_flow_detection(element: &Element) -> bool {
-    // These elements either paint the document canvas, manage list markers, or
-    // run table construction; the ordered mixed-flow fallback would duplicate
-    // those formatting-context-specific layout paths.
-    is_document_canvas_element(element)
-        || is_html_select_element(element)
+    // These elements manage list markers or table construction; the ordered
+    // mixed-flow fallback would duplicate those formatting-context-specific
+    // layout paths. The selected document canvas is deliberately *not*
+    // excluded: a body with direct inline content around a fragmented block
+    // must preserve DOM order instead of collecting all its text before that
+    // block.
+    // <https://www.w3.org/TR/CSS2/visuren.html#anonymous-block-level>
+    is_html_select_element(element)
         || is_html_select_item_element(element)
         || matches!(
             list_container_kind(element),
@@ -643,6 +1011,94 @@ mod tests {
         element
     }
 
+    fn resolve_document_canvas(document: &str, author_css: &str) -> DocumentCanvasResolution {
+        let root = crate::dom::parse(document);
+        let author = css::parse_stylesheet(&crate::css::Css::from_string(author_css));
+        let stylesheets = Stylesheets::for_document(
+            css::html5_user_agent_stylesheet(),
+            None,
+            std::slice::from_ref(&author),
+        );
+        let page_box = box_tree::build_page_box(&root, &stylesheets, &ComputedStyle::initial());
+        DocumentCanvasResolution::from_page_box(&page_box)
+    }
+
+    #[test]
+    fn containment_bits_are_the_single_body_propagation_gate() {
+        for contain in [
+            "size",
+            "inline-size",
+            "layout",
+            "style",
+            "paint",
+            "strict",
+            "content",
+        ] {
+            let resolution = resolve_document_canvas(
+                "<html><body>content</body></html>",
+                &format!("body {{ contain: {contain}; writing-mode: vertical-rl }}"),
+            );
+            assert_eq!(
+                resolution.principal_flow().source,
+                PrincipalFlowSource::Root,
+                "contain: {contain}"
+            );
+        }
+
+        let content_visibility = resolve_document_canvas(
+            "<html><body>content</body></html>",
+            "body { content-visibility: hidden; writing-mode: vertical-rl }",
+        );
+        assert!(matches!(
+            content_visibility.principal_flow().source,
+            PrincipalFlowSource::Body(_)
+        ));
+
+        let hidden_body = resolve_document_canvas(
+            "<html><body hidden>content</body></html>",
+            "body { writing-mode: vertical-rl }",
+        );
+        assert_eq!(
+            hidden_body.principal_flow().source,
+            PrincipalFlowSource::Root
+        );
+    }
+
+    #[test]
+    fn containment_disables_body_overflow_and_background_fallback_together() {
+        let root = crate::dom::parse("<html><body>content</body></html>");
+        let author = css::parse_stylesheet(&crate::css::Css::from_string(
+            "html { overflow: visible } body { overflow: hidden; background: red; contain: style }",
+        ));
+        let stylesheets = Stylesheets::for_document(
+            css::html5_user_agent_stylesheet(),
+            None,
+            std::slice::from_ref(&author),
+        );
+        let page_box = box_tree::build_page_box(&root, &stylesheets, &ComputedStyle::initial());
+        let resolution = DocumentCanvasResolution::from_page_box(&page_box);
+        let document = root
+            .as_element()
+            .expect("parsed document has an element root");
+        let html = document
+            .children
+            .iter()
+            .filter_map(Node::as_element)
+            .find(|element| element.tag == "html")
+            .expect("document has an HTML root");
+        let body = html
+            .children
+            .iter()
+            .filter_map(Node::as_element)
+            .find(|element| element.tag == "body")
+            .expect("HTML root has a body");
+
+        assert!(resolution.is_viewport_overflow_source(html));
+        assert!(!resolution.is_viewport_overflow_source(body));
+        assert!(!resolution.is_body_canvas_background_fallback_source(body));
+        assert!(!resolution.is_document_canvas_flow_element(body));
+    }
+
     #[test]
     fn root_overflow_is_used_by_the_viewport() {
         let html = html_element("html");
@@ -650,9 +1106,9 @@ mod tests {
         style.overflow = css::Overflow::Hidden;
 
         assert_eq!(
-            DocumentCanvasOverflowContext {
-                viewport_overflow_source: Some(html.id),
-                ..DocumentCanvasOverflowContext::default()
+            DocumentCanvasResolution {
+                viewport_overflow_source: Some(ViewportOverflowSource::Root(html.id)),
+                ..DocumentCanvasResolution::default()
             }
             .used_overflow(&html, &style),
             css::Overflow::Visible
@@ -666,13 +1122,9 @@ mod tests {
         style.overflow = css::Overflow::Hidden;
 
         assert_eq!(
-            DocumentCanvasOverflowContext {
-                viewport_overflow_source: Some(body.id),
-                root_has_containment: false,
-                viewport_overflow_x: css::Overflow::Visible,
-                viewport_overflow_y: css::Overflow::Visible,
-                viewport_uses_auto_overflow: false,
-                viewport_has_auto_overflow: false,
+            DocumentCanvasResolution {
+                viewport_overflow_source: Some(ViewportOverflowSource::Body(body.id)),
+                ..DocumentCanvasResolution::default()
             }
             .used_overflow(&body, &style),
             css::Overflow::Visible
@@ -686,9 +1138,24 @@ mod tests {
         style.overflow = css::Overflow::Hidden;
 
         assert_eq!(
-            DocumentCanvasOverflowContext::default().used_overflow(&body, &style),
+            DocumentCanvasResolution::default().used_overflow(&body, &style),
             css::Overflow::Hidden
         );
+    }
+
+    #[test]
+    fn canvas_background_fallback_uses_only_the_propagated_body() {
+        let html = html_element("html");
+        let body = html_element("body");
+        let context = DocumentCanvasResolution {
+            root: Some(html.id),
+            propagated_body: Some(body.id),
+            ..DocumentCanvasResolution::default()
+        };
+
+        assert!(context.is_root_canvas_background_source(&html));
+        assert!(!context.is_body_canvas_background_fallback_source(&html));
+        assert!(context.is_body_canvas_background_fallback_source(&body));
     }
 
     #[test]
@@ -697,14 +1164,118 @@ mod tests {
         let other = html_element("body");
         let mut style = ComputedStyle::initial();
         style.overflow = css::Overflow::Hidden;
-        let context = DocumentCanvasOverflowContext {
-            viewport_overflow_source: Some(selected.id),
-            ..DocumentCanvasOverflowContext::default()
+        let context = DocumentCanvasResolution {
+            viewport_overflow_source: Some(ViewportOverflowSource::Body(selected.id)),
+            ..DocumentCanvasResolution::default()
         };
 
         assert!(context.is_viewport_overflow_source(&selected));
         assert!(!context.is_viewport_overflow_source(&other));
         assert!(style_clips_overflow(&style));
+    }
+
+    #[test]
+    fn used_containment_ignores_table_internal_principal_boxes() {
+        let element = html_element("div");
+        let mut style = ComputedStyle::initial();
+        style.display = Display::TABLE_ROW_GROUP;
+        style.contain.layout = true;
+        style.contain.paint = true;
+
+        assert_eq!(
+            used_property_containment(&element, &style),
+            UsedPropertyContainment {
+                size: false,
+                inline_size: false,
+                layout: false,
+                paint: false,
+            }
+        );
+        assert!(!property_containment_establishes_independent_formatting_context(&element, &style));
+        assert_eq!(
+            descendant_overflow_contribution_for_element(&element, &style),
+            DescendantOverflowContribution::Scrollable
+        );
+    }
+
+    #[test]
+    fn used_containment_applicability_matrix_keeps_only_eligible_principal_boxes() {
+        let element = html_element("div");
+        let excluded = [
+            Display::INLINE,
+            Display::TABLE_COLUMN_GROUP,
+            Display::TABLE_COLUMN,
+            Display::TABLE_ROW_GROUP,
+            Display::TABLE_HEADER_GROUP,
+            Display::TABLE_FOOTER_GROUP,
+            Display::TABLE_ROW,
+        ];
+
+        for display in excluded {
+            let mut style = ComputedStyle::initial();
+            style.display = display;
+            style.contain.size = true;
+            style.contain.inline_size = true;
+            style.contain.layout = true;
+            style.contain.paint = true;
+            assert_eq!(
+                used_property_containment(&element, &style),
+                UsedPropertyContainment {
+                    size: false,
+                    inline_size: false,
+                    layout: false,
+                    paint: false,
+                },
+                "{display:?} must not regain containment from copied styles",
+            );
+        }
+
+        let mut inline_block = ComputedStyle::initial();
+        inline_block.display = Display::INLINE_BLOCK;
+        inline_block.contain.layout = true;
+        assert!(used_property_containment(&element, &inline_block).layout);
+
+        let mut table_cell = ComputedStyle::initial();
+        table_cell.display = Display::TABLE_CELL;
+        table_cell.contain.inline_size = true;
+        table_cell.contain.paint = true;
+        assert!(used_property_containment(&element, &table_cell).inline_size);
+        assert!(used_property_containment(&element, &table_cell).paint);
+    }
+
+    #[test]
+    fn used_containment_keeps_table_cell_paint_effects() {
+        let element = html_element("td");
+        let mut style = ComputedStyle::initial();
+        style.display = Display::TABLE_CELL;
+        style.contain.paint = true;
+
+        assert!(paint_containment_applies_to_element(&element, &style));
+        assert!(property_containment_establishes_independent_formatting_context(&element, &style));
+        assert_eq!(
+            descendant_overflow_contribution_for_element(&element, &style),
+            DescendantOverflowContribution::InkOnly
+        );
+    }
+
+    #[test]
+    fn body_propagation_uses_only_the_contain_property() {
+        let mut style = ComputedStyle::initial();
+        assert!(!style_has_non_none_contain_property(&style));
+
+        style.contain.inline_size = true;
+        assert!(style_has_non_none_contain_property(&style));
+        style.contain.inline_size = false;
+
+        style.contain.style = true;
+        assert!(style_has_non_none_contain_property(&style));
+        style.contain.style = false;
+
+        style.content_visibility = ContentVisibility::Hidden;
+        assert!(
+            !style_has_non_none_contain_property(&style),
+            "content-visibility does not change contain's used value"
+        );
     }
 
     #[test]
@@ -720,6 +1291,28 @@ mod tests {
     }
 
     #[test]
+    fn scrollport_geometry_keeps_none_gutters_zero() {
+        let mut style = ComputedStyle::initial();
+        style.overflow_x = css::Overflow::Auto;
+        style.overflow_y = css::Overflow::Auto;
+        style.scrollbar_gutter = css::ScrollbarGutter::Stable { both_edges: true };
+        style.scrollbar_width = css::ScrollbarWidth::None;
+
+        let geometry = ScrollportGeometry::for_padding_box(
+            PaintClip::new(0.0, 0.0, 100.0, 80.0),
+            &style,
+            UsedOverflowAxes::from_style(&style),
+            true,
+            true,
+        );
+        assert_eq!(geometry.padding_box, geometry.scrollport);
+        assert_eq!(geometry.gutters.left.points(), 0.0);
+        assert_eq!(geometry.gutters.right.points(), 0.0);
+        assert_eq!(geometry.gutters.top.points(), 0.0);
+        assert_eq!(geometry.gutters.bottom.points(), 0.0);
+    }
+
+    #[test]
     fn xhtml_namespace_uses_html_rendering_semantics() {
         let mut html = html_element("html");
         html.document_syntax = DocumentSyntax::Xml;
@@ -728,7 +1321,7 @@ mod tests {
         image.document_syntax = DocumentSyntax::Xml;
         image.namespace_url = XHTML_NAMESPACE_URL.to_string();
 
-        assert!(is_document_canvas_element(&html));
+        assert!(has_html_rendering_semantics(&html));
         assert_eq!(
             replaced_element_kind(&image),
             Some(ReplacedElementKind::Image)

@@ -24,6 +24,7 @@ pub(super) fn property_is_inherited(name: &str) -> bool {
             | "border-spacing"
             | "caption-side"
             | "color"
+            | "color-scheme"
             | "forced-color-adjust"
             | "fill"
             | "stroke"
@@ -33,6 +34,7 @@ pub(super) fn property_is_inherited(name: &str) -> bool {
             | "dominant-baseline"
             | "empty-cells"
             | "font-family"
+            | "font-language-override"
             | "font-feature-settings"
             | "font-variation-settings"
             | "font-palette"
@@ -93,6 +95,7 @@ pub(super) fn property_is_inherited(name: &str) -> bool {
             | "text-emphasis-position"
             | "text-emphasis-skip"
             | "text-emphasis-style"
+            | "ruby-position"
             | "text-shadow"
             | "text-indent"
             | "hanging-punctuation"
@@ -112,6 +115,7 @@ pub(super) fn property_is_inherited(name: &str) -> bool {
 }
 
 pub(in crate::css) const ALL_MODELED_LONGHANDS: &[&str] = &[
+    "color-scheme",
     "zoom",
     "display",
     "flex-direction",
@@ -245,6 +249,7 @@ pub(in crate::css) const ALL_MODELED_LONGHANDS: &[&str] = &[
     "initial-letter-wrap",
     "font-size",
     "font-size-adjust",
+    "font-language-override",
     "font-synthesis",
     "font-synthesis-weight",
     "font-synthesis-style",
@@ -317,6 +322,7 @@ pub(in crate::css) const ALL_MODELED_LONGHANDS: &[&str] = &[
     "font-width",
     "font-stretch",
     "font-family",
+    "font-language-override",
     "font-feature-settings",
     "font-variation-settings",
     "font-palette",
@@ -369,6 +375,7 @@ pub(in crate::css) const ALL_MODELED_LONGHANDS: &[&str] = &[
     "text-emphasis-color",
     "text-emphasis-position",
     "text-emphasis-skip",
+    "ruby-position",
     "text-shadow",
     "white-space",
     "text-wrap",
@@ -377,10 +384,13 @@ pub(in crate::css) const ALL_MODELED_LONGHANDS: &[&str] = &[
     "wrap-inside",
     "line-clamp",
     "-webkit-line-clamp",
+    "-webkit-box-orient",
     "word-break",
     "overflow",
     "overflow-x",
     "overflow-y",
+    "scrollbar-gutter",
+    "scrollbar-width",
     "scroll-snap-type",
     "scroll-snap-align",
     "scroll-snap-stop",
@@ -414,8 +424,9 @@ pub(super) fn inherited_base_style(parent: &ComputedStyle) -> ComputedStyle {
     let mut style = ComputedStyle::initial();
     style.root_font_size = parent.root_font_size;
     style.custom_properties = parent.custom_properties.clone();
+    style.used_color_scheme = parent.used_color_scheme;
+    style.page_color_scheme = parent.page_color_scheme;
     style.language = parent.language.clone();
-    style.text_decoration_layers = parent.text_decoration_layers.clone();
     for longhand in ALL_MODELED_LONGHANDS {
         if property_is_inherited(longhand) {
             copy_modeled_property(&mut style, parent, longhand);
@@ -440,11 +451,17 @@ pub(super) fn pseudo_inherited_base_style(originating_style: &ComputedStyle) -> 
 
 pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &ComputedStyle, name: &str) {
     match name {
+        "color-scheme" => {
+            style.color_scheme = source.color_scheme.clone();
+            style.used_color_scheme = source.used_color_scheme;
+            style.page_color_scheme = source.page_color_scheme;
+        }
         "zoom" => style.zoom = source.zoom,
         "display" => {
             style.display = source.display;
             style.legacy_webkit_box = source.legacy_webkit_box;
         }
+        "-webkit-box-orient" => style.webkit_box_orient = source.webkit_box_orient,
         "flex-direction" => style.flex_direction = source.flex_direction,
         "justify-content" => style.justify_content = source.justify_content,
         "justify-items" => style.justify_items = source.justify_items,
@@ -721,13 +738,9 @@ pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &Computed
         "empty-cells" => style.empty_cells = source.empty_cells,
         "border-spacing" => {
             style.border_spacing = source.border_spacing.clone();
-            style.border_spacing_explicit = source.border_spacing_explicit;
         }
         "background-color" => {
-            style.background_color = source.background_color;
-            style.background_color_is_current_color = source.background_color_is_current_color;
-            style.background_color_current_color_expression =
-                source.background_color_current_color_expression.clone();
+            style.background_color = source.background_color.clone();
         }
         "background-image" => {
             style.background_image = source.background_image.clone();
@@ -813,17 +826,12 @@ pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &Computed
         "forced-color-adjust" => style.forced_color_adjust = source.forced_color_adjust,
         "fill" => {
             style.svg_fill = source.svg_fill;
-            style.svg_fill_is_current_color = source.svg_fill_is_current_color;
-            style.svg_fill_overridden = source.svg_fill_overridden;
         }
         "stroke" => {
             style.svg_stroke = source.svg_stroke;
-            style.svg_stroke_is_current_color = source.svg_stroke_is_current_color;
-            style.svg_stroke_overridden = source.svg_stroke_overridden;
         }
         "stroke-width" => {
             style.svg_stroke_width = source.svg_stroke_width.clone();
-            style.svg_stroke_width_overridden = source.svg_stroke_width_overridden;
         }
         "-webkit-text-fill-color" => style.text_fill_color = source.text_fill_color,
         "direction" => style.direction = source.direction,
@@ -847,15 +855,12 @@ pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &Computed
         "line-height" => {
             style.line_height_value = source.line_height_value.clone();
             style.line_height = source.line_height;
-            style.line_height_multiplier = source.line_height_multiplier;
-            style.line_height_is_normal = source.line_height_is_normal;
         }
         "letter-spacing" => style.letter_spacing = source.letter_spacing.clone(),
         "word-spacing" => style.word_spacing = source.word_spacing.clone(),
         "width" => style.box_values.width = source.box_values.clone().width,
         "height" => {
-            style.box_values.height = source.box_values.clone().height;
-            style.physical_height_has_font_metric = source.physical_height_has_font_metric;
+            style.box_values.height = source.box_values.height.clone();
         }
         "min-width" => style.box_values.min_width = source.box_values.clone().min_width,
         "max-width" => style.box_values.max_width = source.box_values.clone().max_width,
@@ -866,7 +871,7 @@ pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &Computed
         "top" => style.box_values.inset_top = source.box_values.clone().inset_top,
         "right" => style.box_values.inset_right = source.box_values.clone().inset_right,
         "bottom" => style.box_values.inset_bottom = source.box_values.clone().inset_bottom,
-        "position" => style.position = source.position,
+        "position" => style.position = source.position.clone(),
         "float" => style.float = source.float,
         "footnote-display" => style.footnote_display = source.footnote_display,
         "footnote-policy" => style.footnote_policy = source.footnote_policy,
@@ -932,6 +937,9 @@ pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &Computed
         "font-style" => style.font_style = source.font_style,
         "font-width" | "font-stretch" => style.font_width = source.font_width,
         "font-family" => style.font_family = source.font_family.clone(),
+        "font-language-override" => {
+            style.font_language_override = source.font_language_override;
+        }
         "font-feature-settings" => {
             style.font_feature_settings = source.font_feature_settings.clone();
         }
@@ -981,8 +989,7 @@ pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &Computed
         "counter-set" => style.counter_sets = source.counter_sets.clone(),
         "string-set" => style.string_sets = source.string_sets.clone(),
         "page" => {
-            style.page_name = source.page_name.clone();
-            style.page_name_specified = source.page_name_specified;
+            style.page = source.page.clone();
         }
         "break-before" | "page-break-before" => style.break_before = source.break_before,
         "break-after" | "page-break-after" => style.break_after = source.break_after,
@@ -1044,6 +1051,7 @@ pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &Computed
             style.text_emphasis_position = source.text_emphasis_position;
         }
         "text-emphasis-skip" => style.text_emphasis_skip = source.text_emphasis_skip,
+        "ruby-position" => style.ruby_position = source.ruby_position,
         "text-shadow" => style.text_shadow = source.text_shadow.clone(),
         "box-shadow" => style.box_shadow = source.box_shadow.clone(),
         "white-space" => {
@@ -1057,7 +1065,10 @@ pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &Computed
         "text-wrap-mode" => style.text_wrap_mode = source.text_wrap_mode,
         "text-wrap-style" => style.text_wrap_style = source.text_wrap_style,
         "wrap-inside" => style.wrap_inside = source.wrap_inside,
-        "line-clamp" | "-webkit-line-clamp" => style.line_clamp = source.line_clamp.clone(),
+        "line-clamp" | "-webkit-line-clamp" => {
+            style.line_clamp = source.line_clamp.clone();
+            style.used_line_clamp = None;
+        }
         "word-break" => style.word_break = source.word_break,
         "overflow" => {
             style.overflow = source.overflow;
@@ -1066,6 +1077,8 @@ pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &Computed
         }
         "overflow-x" => style.overflow_x = source.overflow_x,
         "overflow-y" => style.overflow_y = source.overflow_y,
+        "scrollbar-gutter" => style.scrollbar_gutter = source.scrollbar_gutter,
+        "scrollbar-width" => style.scrollbar_width = source.scrollbar_width,
         "scroll-snap-type" => style.scroll_snap_type = source.scroll_snap_type,
         "scroll-snap-align" => style.scroll_snap_align = source.scroll_snap_align,
         "scroll-snap-stop" => style.scroll_snap_stop = source.scroll_snap_stop,

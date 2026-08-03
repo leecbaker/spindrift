@@ -4,7 +4,60 @@ use super::*;
 struct PlannedCounterInstance {
     id: usize,
     reversed: bool,
+    creator: CounterOriginKey,
     creator_scope: usize,
+}
+
+/// Counter membership at a source-tree position, before numeric values are
+/// materialized.  CSS Lists counter inheritance takes membership from an
+/// element's parent or preceding sibling, but values from the preceding
+/// element in tree order.  Keeping this separate from traversal frames avoids
+/// treating an element's subtree as the scope of a counter it creates.
+/// <https://drafts.csswg.org/css-lists-3/#inheriting-counters>
+#[derive(Debug, Clone, Default)]
+struct PlannedCounterState {
+    values: HashMap<String, Vec<PlannedCounterInstance>>,
+}
+
+impl PlannedCounterState {
+    fn inherit(membership_source: &Self, value_source: &Self) -> Self {
+        let values = value_source
+            .values
+            .iter()
+            .filter_map(|(name, value_instances)| {
+                let membership_instances = membership_source.values.get(name)?;
+                let inherited = value_instances
+                    .iter()
+                    .copied()
+                    .filter(|value| {
+                        membership_instances
+                            .iter()
+                            .any(|membership| membership.id == value.id)
+                    })
+                    .collect::<Vec<_>>();
+                (!inherited.is_empty()).then_some((name.clone(), inherited))
+            })
+            .collect();
+        Self { values }
+    }
+
+    fn current(&self, name: &str, mutation_floor: usize) -> Option<PlannedCounterInstance> {
+        self.values
+            .get(name)
+            .and_then(|values| values.last())
+            .filter(|instance| instance.creator_scope >= mutation_floor)
+            .copied()
+    }
+
+    fn reset(&mut self, name: &str, instance: PlannedCounterInstance, current_scope: usize) {
+        let values = self.values.entry(name.to_string()).or_default();
+        if values.last().is_some_and(|previous| {
+            previous.creator == instance.creator || previous.creator_scope == current_scope
+        }) {
+            values.pop();
+        }
+        values.push(instance);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -17,8 +70,6 @@ struct ReversedAccumulator {
 
 #[derive(Debug)]
 struct CounterPlanBuilder {
-    values: HashMap<String, Vec<PlannedCounterInstance>>,
-    frames: Vec<CounterFrame>,
     next_scope_id: usize,
     accumulators: Vec<ReversedAccumulator>,
 }
@@ -26,12 +77,6 @@ struct CounterPlanBuilder {
 impl CounterPlanBuilder {
     fn new() -> Self {
         Self {
-            values: HashMap::new(),
-            frames: vec![CounterFrame {
-                base_lengths: HashMap::new(),
-                scope_id: 0,
-                counter_mutation_floor: 0,
-            }],
             next_scope_id: 1,
             accumulators: Vec::new(),
         }
@@ -39,7 +84,7 @@ impl CounterPlanBuilder {
 
     fn build(events: &[box_tree::CounterEventNode<'_>]) -> CounterPlan {
         let mut builder = Self::new();
-        builder.visit_siblings(events);
+        builder.visit_siblings(events, &PlannedCounterState::default(), 0, 0);
         let reversed_initial_values = builder
             .accumulators
             .into_iter()
@@ -61,15 +106,34 @@ impl CounterPlanBuilder {
         }
     }
 
-    fn visit_siblings(&mut self, events: &[box_tree::CounterEventNode<'_>]) {
+    fn visit_siblings(
+        &mut self,
+        events: &[box_tree::CounterEventNode<'_>],
+        parent_state: &PlannedCounterState,
+        current_scope: usize,
+        mutation_floor: usize,
+    ) -> PlannedCounterState {
+        let mut preceding_sibling = None;
+        let mut preceding_tree_order = parent_state.clone();
         for event in events {
-            self.visit(event);
+            let membership_source = preceding_sibling.as_ref().unwrap_or(parent_state);
+            let state = PlannedCounterState::inherit(membership_source, &preceding_tree_order);
+            let (node_state, last_tree_order) =
+                self.visit(event, state, current_scope, mutation_floor);
+            preceding_sibling = Some(node_state);
+            preceding_tree_order = last_tree_order;
         }
+        preceding_tree_order
     }
 
-    fn visit(&mut self, event: &box_tree::CounterEventNode<'_>) {
+    fn visit(
+        &mut self,
+        event: &box_tree::CounterEventNode<'_>,
+        mut state: PlannedCounterState,
+        current_scope: usize,
+        mutation_floor: usize,
+    ) -> (PlannedCounterState, PlannedCounterState) {
         let origin = CounterOriginKey::new(event.element, event.source);
-        let mut temporary_counters = Vec::new();
         for (declaration_index, reset) in event.counter_style.counter_resets.iter().enumerate() {
             let accumulator_id = self.accumulators.len();
             self.accumulators.push(ReversedAccumulator {
@@ -84,11 +148,10 @@ impl CounterPlanBuilder {
             let instance = PlannedCounterInstance {
                 id: accumulator_id,
                 reversed: reset.kind.is_reversed(),
-                creator_scope: self.current_scope_id(),
+                creator: origin,
+                creator_scope: current_scope,
             };
-            if self.reset_for_node(&reset.name, instance) {
-                temporary_counters.push(reset.name.clone());
-            }
+            state.reset(&reset.name, instance, current_scope);
         }
 
         let mut increments = Vec::<(String, CounterValue)>::new();
@@ -104,7 +167,10 @@ impl CounterPlanBuilder {
                 .iter()
                 .any(|(name, _)| name == LIST_ITEM_COUNTER_NAME)
         {
-            let amount = if self.current_is_reversed(LIST_ITEM_COUNTER_NAME) {
+            let amount = if state
+                .current(LIST_ITEM_COUNTER_NAME, mutation_floor)
+                .is_some_and(|instance| instance.reversed)
+            {
                 -1
             } else {
                 1
@@ -135,16 +201,25 @@ impl CounterPlanBuilder {
                 .iter()
                 .find(|change| change.name == name)
                 .map(|change| change.value);
-            let instance = self.ensure(&name);
+            let instance = self.ensure(&mut state, &name, origin, current_scope, mutation_floor);
             self.observe(instance.id, increment, set);
         }
 
-        self.push_frame(event.counter_style.style_containment);
-        self.visit_siblings(&event.children);
-        self.pop_frame();
-        for name in temporary_counters.into_iter().rev() {
-            self.pop_temporary(&name);
-        }
+        let node_state = state.clone();
+        let child_scope = self.next_scope_id;
+        self.next_scope_id = self.next_scope_id.saturating_add(1);
+        let child_mutation_floor = if event.counter_style.style_containment {
+            child_scope
+        } else {
+            mutation_floor
+        };
+        let last_tree_order = self.visit_siblings(
+            &event.children,
+            &node_state,
+            child_scope,
+            child_mutation_floor,
+        );
+        (node_state, last_tree_order)
     }
 
     fn observe(&mut self, id: usize, increment: CounterValue, set: Option<CounterValue>) {
@@ -166,134 +241,34 @@ impl CounterPlanBuilder {
         }
     }
 
-    fn reset(&mut self, name: &str, instance: PlannedCounterInstance) {
-        let base_len = self.current_frame_base_len(name);
-        let values = self.values.entry(name.to_string()).or_default();
-        values.truncate(base_len);
-        values.push(instance);
-    }
-
-    fn reset_for_node(&mut self, name: &str, instance: PlannedCounterInstance) -> bool {
-        if self.counter_should_be_temporary_for_node(name) {
-            self.values
-                .entry(name.to_string())
-                .or_default()
-                .push(instance);
-            true
-        } else {
-            self.reset(name, instance);
-            false
-        }
-    }
-
-    fn counter_should_be_temporary_for_node(&self, name: &str) -> bool {
-        let Some(values) = self.values.get(name) else {
-            return false;
-        };
-        let Some(frame) = self.frames.last() else {
-            return false;
-        };
-        let base_len = frame
-            .base_lengths
-            .get(name)
-            .cloned()
-            .unwrap_or(values.len());
-        values.len() == base_len && base_len > 0
-    }
-
-    fn pop_temporary(&mut self, name: &str) {
-        if let Some(values) = self.values.get_mut(name) {
-            values.pop();
-            if values.is_empty() {
-                self.values.remove(name);
-            }
-        }
-    }
-
-    fn ensure(&mut self, name: &str) -> PlannedCounterInstance {
-        if let Some(instance) = self
-            .values
-            .get(name)
-            .and_then(|values| values.last())
-            .filter(|instance| instance.creator_scope >= self.counter_mutation_floor())
-        {
-            return *instance;
+    fn ensure(
+        &mut self,
+        state: &mut PlannedCounterState,
+        name: &str,
+        creator: CounterOriginKey,
+        current_scope: usize,
+        mutation_floor: usize,
+    ) -> PlannedCounterInstance {
+        if let Some(instance) = state.current(name, mutation_floor) {
+            return instance;
         }
         let id = self.accumulators.len();
         self.accumulators.push(ReversedAccumulator::default());
         let instance = PlannedCounterInstance {
             id,
             reversed: false,
-            creator_scope: self.current_scope_id(),
+            creator,
+            creator_scope: current_scope,
         };
-        self.reset(name, instance);
+        state.reset(name, instance, current_scope);
         instance
-    }
-
-    fn current_is_reversed(&self, name: &str) -> bool {
-        self.values
-            .get(name)
-            .and_then(|values| values.last())
-            .filter(|instance| instance.creator_scope >= self.counter_mutation_floor())
-            .is_some_and(|instance| instance.reversed)
-    }
-
-    fn current_frame_base_len(&mut self, name: &str) -> usize {
-        let current_len = self.values.get(name).map_or(0, Vec::len);
-        *self
-            .frames
-            .last_mut()
-            .expect("counter planner always has a root frame")
-            .base_lengths
-            .entry(name.to_string())
-            .or_insert(current_len)
-    }
-
-    fn current_scope_id(&self) -> usize {
-        self.frames.last().map_or(0, |frame| frame.scope_id)
-    }
-
-    fn counter_mutation_floor(&self) -> usize {
-        self.frames
-            .last()
-            .map_or(0, |frame| frame.counter_mutation_floor)
-    }
-
-    fn push_frame(&mut self, establishes_style_containment: bool) {
-        let scope_id = self.next_scope_id;
-        self.next_scope_id = self.next_scope_id.saturating_add(1);
-        let inherited_floor = self.counter_mutation_floor();
-        self.frames.push(CounterFrame {
-            base_lengths: HashMap::new(),
-            scope_id,
-            counter_mutation_floor: if establishes_style_containment {
-                scope_id
-            } else {
-                inherited_floor
-            },
-        });
-    }
-
-    fn pop_frame(&mut self) {
-        let frame = self
-            .frames
-            .pop()
-            .expect("counter planner never pops its root frame");
-        for (name, base_len) in frame.base_lengths {
-            if let Some(values) = self.values.get_mut(&name) {
-                values.truncate(base_len);
-                if values.is_empty() {
-                    self.values.remove(&name);
-                }
-            }
-        }
     }
 }
 
 struct CounterSnapshotPlanner<'a> {
-    counters: CounterSet,
     reversed_initial_values: &'a HashMap<CounterResetKey, CounterValue>,
     values_at_origin: HashMap<CounterOriginKey, HashMap<String, Vec<i32>>>,
+    next_scope_id: usize,
 }
 
 impl<'a> CounterSnapshotPlanner<'a> {
@@ -302,23 +277,81 @@ impl<'a> CounterSnapshotPlanner<'a> {
         reversed_initial_values: &'a HashMap<CounterResetKey, CounterValue>,
     ) -> HashMap<CounterOriginKey, HashMap<String, Vec<i32>>> {
         let mut planner = Self {
-            counters: CounterSet::new(),
             reversed_initial_values,
             values_at_origin: HashMap::new(),
+            next_scope_id: 1,
         };
-        planner.visit_siblings(events);
+        planner.visit_siblings(events, &CounterSet::new(), 0, 0);
         planner.values_at_origin
     }
 
-    fn visit_siblings(&mut self, events: &[box_tree::CounterEventNode<'_>]) {
-        for event in events {
-            self.visit(event);
+    fn inherit(
+        membership_source: &CounterSet,
+        value_source: &CounterSet,
+        current_scope: usize,
+        mutation_floor: usize,
+    ) -> CounterSet {
+        let values = value_source
+            .values
+            .iter()
+            .filter_map(|(name, value_instances)| {
+                let membership_instances = membership_source.values.get(name)?;
+                let inherited = value_instances
+                    .iter()
+                    .filter(|value| {
+                        membership_instances
+                            .iter()
+                            .any(|membership| membership.creator == value.creator)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (!inherited.is_empty()).then_some((name.clone(), inherited))
+            })
+            .collect();
+        CounterSet {
+            values,
+            frames: vec![CounterFrame {
+                base_lengths: HashMap::new(),
+                scope_id: current_scope,
+                counter_mutation_floor: mutation_floor,
+            }],
+            next_scope_id: current_scope.saturating_add(1),
         }
     }
 
-    fn visit(&mut self, event: &box_tree::CounterEventNode<'_>) {
+    fn visit_siblings(
+        &mut self,
+        events: &[box_tree::CounterEventNode<'_>],
+        parent_state: &CounterSet,
+        current_scope: usize,
+        mutation_floor: usize,
+    ) -> CounterSet {
+        let mut preceding_sibling = None;
+        let mut preceding_tree_order = parent_state.clone();
+        for event in events {
+            let membership_source = preceding_sibling.as_ref().unwrap_or(parent_state);
+            let state = Self::inherit(
+                membership_source,
+                &preceding_tree_order,
+                current_scope,
+                mutation_floor,
+            );
+            let (node_state, last_tree_order) =
+                self.visit(event, state, current_scope, mutation_floor);
+            preceding_sibling = Some(node_state);
+            preceding_tree_order = last_tree_order;
+        }
+        preceding_tree_order
+    }
+
+    fn visit(
+        &mut self,
+        event: &box_tree::CounterEventNode<'_>,
+        mut counters: CounterSet,
+        _current_scope: usize,
+        mutation_floor: usize,
+    ) -> (CounterSet, CounterSet) {
         let origin = CounterOriginKey::new(event.element, event.source);
-        let mut temporary_counters = Vec::new();
         for (declaration_index, reset) in event.counter_style.counter_resets.iter().enumerate() {
             let value = reset.kind.explicit_value().unwrap_or_else(|| {
                 self.reversed_initial_values
@@ -329,9 +362,7 @@ impl<'a> CounterSnapshotPlanner<'a> {
                     .cloned()
                     .unwrap_or(CounterValue::ZERO)
             });
-            if self.counters.reset_counter_for_element(reset, value) {
-                temporary_counters.push(reset.name.clone());
-            }
+            counters.reset_counter(reset, value, origin);
         }
 
         let mut increments = Vec::<(String, CounterValue)>::new();
@@ -347,7 +378,7 @@ impl<'a> CounterSnapshotPlanner<'a> {
                 .iter()
                 .any(|(name, _)| name == LIST_ITEM_COUNTER_NAME)
         {
-            let amount = if self.counters.current_is_reversed(LIST_ITEM_COUNTER_NAME) {
+            let amount = if counters.current_is_reversed(LIST_ITEM_COUNTER_NAME) {
                 -1
             } else {
                 1
@@ -358,20 +389,28 @@ impl<'a> CounterSnapshotPlanner<'a> {
             ));
         }
         for (name, amount) in increments {
-            self.counters.increment_counter(&name, amount);
+            counters.increment_counter(&name, amount, origin);
         }
         for change in &event.counter_style.counter_sets {
-            self.counters.set_counter(&change.name, change.value);
+            counters.set_counter(&change.name, change.value, origin);
         }
 
-        self.values_at_origin.insert(origin, self.counters.stacks());
-        self.counters
-            .push_frame(event.counter_style.style_containment);
-        self.visit_siblings(&event.children);
-        self.counters.pop_frame();
-        for name in temporary_counters.into_iter().rev() {
-            self.counters.pop_temporary_counter(&name);
-        }
+        self.values_at_origin.insert(origin, counters.stacks());
+        let node_state = counters.clone();
+        let child_scope = self.next_scope_id;
+        self.next_scope_id = self.next_scope_id.saturating_add(1);
+        let child_mutation_floor = if event.counter_style.style_containment {
+            child_scope
+        } else {
+            mutation_floor
+        };
+        let last_tree_order = self.visit_siblings(
+            &event.children,
+            &node_state,
+            child_scope,
+            child_mutation_floor,
+        );
+        (node_state, last_tree_order)
     }
 }
 
@@ -412,6 +451,7 @@ impl CounterSet {
                     .map(|value| CounterInstance {
                         value: CounterValue::new(value),
                         reversed: false,
+                        creator: None,
                         creator_scope: 0,
                     })
                     .collect();
@@ -489,51 +529,46 @@ impl CounterSet {
     /// descendants and following siblings, replacing earlier counters of the
     /// same name from the same parent scope:
     /// <https://www.w3.org/TR/css-lists-3/#inheriting-counters>.
-    fn reset_counter(&mut self, reset: &CounterReset, value: CounterValue) {
+    fn reset_counter(
+        &mut self,
+        reset: &CounterReset,
+        value: CounterValue,
+        creator: CounterOriginKey,
+    ) {
         let name = reset.name.as_str();
-        let base_len = self.current_frame_base_len(name);
+        let current_scope = self.frames.last().map_or(0, |frame| frame.scope_id);
+        let replaces_previous_sibling = self
+            .values
+            .get(name)
+            .and_then(|values| values.last())
+            .is_some_and(|previous| {
+                previous.creator == Some(creator) || previous.creator_scope == current_scope
+            });
+        let base_len = self.current_frame_base_len(name, replaces_previous_sibling);
         let creator_scope = self.frames.last().map_or(0, |frame| frame.scope_id);
         let values = self.values.entry(name.to_string()).or_default();
-        values.truncate(base_len);
+        if replaces_previous_sibling {
+            values.truncate(base_len);
+        } else {
+            debug_assert_eq!(
+                values.len(),
+                base_len,
+                "only counters created by preceding siblings may be replaced"
+            );
+        }
         values.push(CounterInstance {
             value,
             reversed: reset.kind.is_reversed(),
+            creator: Some(creator),
             creator_scope,
         });
-    }
-
-    fn reset_counter_for_element(&mut self, reset: &CounterReset, value: CounterValue) -> bool {
-        if self.counter_should_be_temporary_for_element(&reset.name) {
-            let creator_scope = self.frames.last().map_or(0, |frame| frame.scope_id);
-            self.values
-                .entry(reset.name.clone())
-                .or_default()
-                .push(CounterInstance {
-                    value,
-                    reversed: reset.kind.is_reversed(),
-                    creator_scope,
-                });
-            true
-        } else {
-            self.reset_counter(reset, value);
-            false
-        }
-    }
-
-    fn pop_temporary_counter(&mut self, name: &str) {
-        if let Some(values) = self.values.get_mut(name) {
-            values.pop();
-            if values.is_empty() {
-                self.values.remove(name);
-            }
-        }
     }
 
     /// Applies `counter-increment` to the innermost counter, instantiating a
     /// missing counter at `0` first as defined by CSS Lists 3:
     /// <https://www.w3.org/TR/css-lists-3/#propdef-counter-increment>.
-    fn increment_counter(&mut self, name: &str, amount: CounterValue) {
-        self.ensure_counter(name);
+    fn increment_counter(&mut self, name: &str, amount: CounterValue, creator: CounterOriginKey) {
+        self.ensure_counter(name, creator);
         if let Some(instance) = self
             .values
             .get_mut(name)
@@ -546,8 +581,8 @@ impl CounterSet {
     /// Applies `counter-set` to the innermost counter, instantiating a missing
     /// counter at `0` first as defined by CSS Lists 3:
     /// <https://www.w3.org/TR/css-lists-3/#propdef-counter-set>.
-    fn set_counter(&mut self, name: &str, value: CounterValue) {
-        self.ensure_counter(name);
+    fn set_counter(&mut self, name: &str, value: CounterValue, creator: CounterOriginKey) {
+        self.ensure_counter(name, creator);
         if let Some(instance) = self
             .values
             .get_mut(name)
@@ -557,7 +592,7 @@ impl CounterSet {
         }
     }
 
-    fn ensure_counter(&mut self, name: &str) {
+    fn ensure_counter(&mut self, name: &str, creator: CounterOriginKey) {
         if self
             .values
             .get(name)
@@ -566,25 +601,26 @@ impl CounterSet {
         {
             return;
         }
-        let base_len = self.current_frame_base_len(name);
+        let base_len = self.current_frame_base_len(name, false);
         let creator_scope = self.frames.last().map_or(0, |frame| frame.scope_id);
         let values = self.values.entry(name.to_string()).or_default();
         values.truncate(base_len);
         values.push(CounterInstance {
             value: CounterValue::ZERO,
             reversed: false,
+            creator: Some(creator),
             creator_scope,
         });
     }
 
-    fn current_frame_base_len(&mut self, name: &str) -> usize {
+    fn current_frame_base_len(&mut self, name: &str, replaces_previous_sibling: bool) -> usize {
         let current_len = self.values.get(name).map_or(0, Vec::len);
         self.frames
             .last_mut()
             .expect("counter set always has a root frame")
             .base_lengths
             .entry(name.to_string())
-            .or_insert(current_len)
+            .or_insert_with(|| current_len.saturating_sub(replaces_previous_sibling as usize))
             .to_owned()
     }
 
@@ -592,21 +628,6 @@ impl CounterSet {
         self.frames
             .last()
             .map_or(0, |frame| frame.counter_mutation_floor)
-    }
-
-    fn counter_should_be_temporary_for_element(&self, name: &str) -> bool {
-        let Some(values) = self.values.get(name) else {
-            return false;
-        };
-        let Some(frame) = self.frames.last() else {
-            return false;
-        };
-        let base_len = frame
-            .base_lengths
-            .get(name)
-            .cloned()
-            .unwrap_or(values.len());
-        values.len() == base_len && base_len > 0
     }
 }
 
@@ -671,11 +692,9 @@ impl<'a> LayoutBuilder<'a> {
         element: &Element,
         style: &ComputedStyle,
     ) -> CounterScopeState {
-        let temporary_counters =
-            self.apply_counter_effects(element, box_tree::CounterEventSource::Principal, style);
+        self.apply_counter_effects(element, box_tree::CounterEventSource::Principal, style);
         self.counter_set.push_frame(style.contain.style);
         CounterScopeState {
-            temporary_counters,
             previous_counter_set: None,
             previous_quote_depth: style.contain.style.then_some(self.quote_depth),
         }
@@ -690,9 +709,6 @@ impl<'a> LayoutBuilder<'a> {
             return;
         }
         self.counter_set.pop_frame();
-        for name in state.temporary_counters.into_iter().rev() {
-            self.counter_set.pop_temporary_counter(&name);
-        }
     }
 
     pub(super) fn begin_pseudo_counter_scope(
@@ -708,7 +724,6 @@ impl<'a> LayoutBuilder<'a> {
         );
         self.counter_set.push_frame(style.contain.style);
         CounterScopeState {
-            temporary_counters: Vec::new(),
             previous_counter_set: Some(previous_counter_set),
             previous_quote_depth: style.contain.style.then_some(self.quote_depth),
         }
@@ -719,25 +734,22 @@ impl<'a> LayoutBuilder<'a> {
         element: &Element,
         source: box_tree::CounterEventSource,
         style: &ComputedStyle,
-    ) -> Vec<String> {
+    ) {
         let origin = CounterOriginKey::new(element, source);
-        let mut temporary_counters = Vec::new();
         for (declaration_index, reset) in style.counter_resets.iter().enumerate() {
             let value = self.counter_reset_initial_value(origin, declaration_index, reset);
-            if self.counter_set.reset_counter_for_element(reset, value) {
-                temporary_counters.push(reset.name.clone());
-            }
+            self.counter_set.reset_counter(reset, value, origin);
         }
 
         let increments = self.effective_counter_increments(style);
         for (name, amount) in increments {
-            self.counter_set.increment_counter(&name, amount);
+            self.counter_set.increment_counter(&name, amount, origin);
         }
 
         for change in &style.counter_sets {
-            self.counter_set.set_counter(&change.name, change.value);
+            self.counter_set
+                .set_counter(&change.name, change.value, origin);
         }
-        temporary_counters
     }
 
     fn counter_reset_initial_value(
@@ -1087,7 +1099,7 @@ impl<'a> LayoutBuilder<'a> {
         element: &Element,
         style: &ComputedStyle,
     ) -> bool {
-        let Some(name) = &style.running_element_name else {
+        let css::Position::Running(name) = &style.position else {
             return false;
         };
         if self.element_side_effect_suppression_depth > 0 {
@@ -1099,7 +1111,7 @@ impl<'a> LayoutBuilder<'a> {
         let placement = self.running_element_source_marker_placement();
         let id = self.next_assignment_id();
         self.current_page_running_elements
-            .entry(name.clone())
+            .entry(name.as_str().to_owned())
             .or_default()
             .push(NamedStringAssignment {
                 id,
@@ -1470,7 +1482,7 @@ fn image_with_context_urls(
     let Some(mut selected) = image.as_image_mut() else {
         return image;
     };
-    while let css::BackgroundImage::ImageSet { image, .. } = selected {
+    while let css::BackgroundImage::SelectedImageSet { image, .. } = selected {
         selected = image;
     }
     if let css::BackgroundImage::Url {
@@ -1524,6 +1536,59 @@ fn running_element_content_parts(
 mod tests {
     use super::*;
 
+    fn counter_event<'a>(
+        element: &'a Element,
+        resets: Vec<CounterReset>,
+        increments: Vec<css::CounterChange>,
+        sets: Vec<css::CounterChange>,
+        children: Vec<box_tree::CounterEventNode<'a>>,
+    ) -> box_tree::CounterEventNode<'a> {
+        box_tree::CounterEventNode {
+            element,
+            source: box_tree::CounterEventSource::Principal,
+            counter_style: box_tree::CounterEventStyle {
+                counter_resets: resets,
+                counter_increments: increments,
+                counter_sets: sets,
+                is_list_item: false,
+                style_containment: false,
+            },
+            children,
+        }
+    }
+
+    fn counter_reset(name: &str, kind: CounterResetKind) -> CounterReset {
+        CounterReset {
+            name: name.to_string(),
+            kind,
+        }
+    }
+
+    fn counter_change(name: &str, value: i32) -> css::CounterChange {
+        css::CounterChange {
+            name: name.to_string(),
+            value: CounterValue::new(value),
+        }
+    }
+
+    fn element(tag: &str) -> Element {
+        let NodeKind::Element(element) = Node::element(tag).kind else {
+            unreachable!("Node::element always creates an element")
+        };
+        element
+    }
+
+    fn principal_origin(element: &Element) -> CounterOriginKey {
+        CounterOriginKey::new(element, box_tree::CounterEventSource::Principal)
+    }
+
+    fn test_counter_origin() -> CounterOriginKey {
+        CounterOriginKey {
+            element_id: ElementId::next(),
+            source: box_tree::CounterEventSource::Principal,
+        }
+    }
+
     fn seeded_counter(value: i32) -> CounterSet {
         let mut counters = CounterSet::new();
         counters.values.insert(
@@ -1531,6 +1596,7 @@ mod tests {
             vec![CounterInstance {
                 value: CounterValue::new(value),
                 reversed: false,
+                creator: None,
                 creator_scope: 0,
             }],
         );
@@ -1542,7 +1608,7 @@ mod tests {
         let mut counters = seeded_counter(17);
         counters.push_frame(true);
         for _ in 0..5 {
-            counters.increment_counter("section", CounterValue::new(4));
+            counters.increment_counter("section", CounterValue::new(4), test_counter_origin());
         }
 
         assert_eq!(counters.current("section"), Some(20));
@@ -1555,11 +1621,281 @@ mod tests {
         counters.push_frame(true);
         counters.push_frame(false);
         for _ in 0..4 {
-            counters.increment_counter("section", CounterValue::new(5));
+            counters.increment_counter("section", CounterValue::new(5), test_counter_origin());
         }
         assert_eq!(counters.current("section"), Some(20));
 
         counters.pop_frame();
         assert_eq!(counters.current("section"), Some(13));
+    }
+
+    #[test]
+    fn reversed_start_includes_following_sibling_descendants() {
+        let creator = element("creator");
+        let following_sibling = element("following-sibling");
+        let descendant = element("descendant");
+        let events = vec![
+            counter_event(
+                &creator,
+                vec![counter_reset("foo", CounterResetKind::Reversed(None))],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            counter_event(
+                &following_sibling,
+                Vec::new(),
+                vec![counter_change("foo", -2)],
+                Vec::new(),
+                vec![counter_event(
+                    &descendant,
+                    Vec::new(),
+                    vec![counter_change("foo", -3)],
+                    Vec::new(),
+                    Vec::new(),
+                )],
+            ),
+        ];
+
+        let plan = CounterPlanBuilder::build(&events);
+        assert_eq!(
+            plan.reversed_initial_values[&CounterResetKey {
+                origin: principal_origin(&creator),
+                declaration_index: 0,
+            }]
+                .get(),
+            8
+        );
+        assert_eq!(
+            plan.values_at_origin[&principal_origin(&following_sibling)]["foo"],
+            [6]
+        );
+        assert_eq!(
+            plan.values_at_origin[&principal_origin(&descendant)]["foo"],
+            [3]
+        );
+    }
+
+    #[test]
+    fn later_sibling_reset_shadows_reversed_counter_scope() {
+        let creator = element("creator");
+        let incrementer = element("incrementer");
+        let shadow = element("shadow");
+        let after_shadow = element("after-shadow");
+        let events = vec![
+            counter_event(
+                &creator,
+                vec![counter_reset("foo", CounterResetKind::Reversed(None))],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            counter_event(
+                &incrementer,
+                Vec::new(),
+                vec![counter_change("foo", -2)],
+                Vec::new(),
+                Vec::new(),
+            ),
+            counter_event(
+                &shadow,
+                vec![counter_reset(
+                    "foo",
+                    CounterResetKind::Forward(CounterValue::ZERO),
+                )],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            counter_event(
+                &after_shadow,
+                Vec::new(),
+                vec![counter_change("foo", -5)],
+                Vec::new(),
+                Vec::new(),
+            ),
+        ];
+
+        let plan = CounterPlanBuilder::build(&events);
+        assert_eq!(
+            plan.reversed_initial_values[&CounterResetKey {
+                origin: principal_origin(&creator),
+                declaration_index: 0,
+            }]
+                .get(),
+            4
+        );
+        assert_eq!(
+            plan.values_at_origin[&principal_origin(&after_shadow)]["foo"],
+            [-5]
+        );
+    }
+
+    #[test]
+    fn reversed_start_uses_last_nonzero_increment_before_first_set() {
+        let creator = element("creator");
+        let first = element("first");
+        let zero = element("zero");
+        let setter = element("setter");
+        let events = vec![
+            counter_event(
+                &creator,
+                vec![counter_reset("foo", CounterResetKind::Reversed(None))],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            counter_event(
+                &first,
+                Vec::new(),
+                vec![counter_change("foo", -2)],
+                Vec::new(),
+                Vec::new(),
+            ),
+            counter_event(
+                &zero,
+                Vec::new(),
+                vec![counter_change("foo", 0)],
+                Vec::new(),
+                Vec::new(),
+            ),
+            counter_event(
+                &setter,
+                Vec::new(),
+                vec![counter_change("foo", -7)],
+                vec![counter_change("foo", 5)],
+                Vec::new(),
+            ),
+        ];
+
+        let plan = CounterPlanBuilder::build(&events);
+        assert_eq!(
+            plan.reversed_initial_values[&CounterResetKey {
+                origin: principal_origin(&creator),
+                declaration_index: 0,
+            }]
+                .get(),
+            14
+        );
+        assert_eq!(
+            plan.values_at_origin[&principal_origin(&setter)]["foo"],
+            [5]
+        );
+    }
+
+    #[test]
+    fn nested_reversed_counter_is_a_distinct_scope() {
+        let outer = element("outer");
+        let first_outer = element("first-outer");
+        let inner = element("inner");
+        let inner_item = element("inner-item");
+        let final_outer = element("final-outer");
+        let events = vec![counter_event(
+            &outer,
+            vec![counter_reset("foo", CounterResetKind::Reversed(None))],
+            Vec::new(),
+            Vec::new(),
+            vec![
+                counter_event(
+                    &first_outer,
+                    Vec::new(),
+                    vec![counter_change("foo", -2)],
+                    Vec::new(),
+                    vec![counter_event(
+                        &inner,
+                        vec![counter_reset("foo", CounterResetKind::Reversed(None))],
+                        Vec::new(),
+                        Vec::new(),
+                        vec![counter_event(
+                            &inner_item,
+                            Vec::new(),
+                            vec![counter_change("foo", -3)],
+                            Vec::new(),
+                            Vec::new(),
+                        )],
+                    )],
+                ),
+                counter_event(
+                    &final_outer,
+                    Vec::new(),
+                    vec![counter_change("foo", -2)],
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            ],
+        )];
+
+        let plan = CounterPlanBuilder::build(&events);
+        assert_eq!(
+            plan.reversed_initial_values[&CounterResetKey {
+                origin: principal_origin(&outer),
+                declaration_index: 0,
+            }]
+                .get(),
+            6
+        );
+        assert_eq!(
+            plan.reversed_initial_values[&CounterResetKey {
+                origin: principal_origin(&inner),
+                declaration_index: 0,
+            }]
+                .get(),
+            6
+        );
+        assert_eq!(
+            plan.values_at_origin[&principal_origin(&inner_item)]["foo"],
+            [4, 3]
+        );
+        assert_eq!(
+            plan.values_at_origin[&principal_origin(&final_outer)]["foo"],
+            [2]
+        );
+    }
+
+    #[test]
+    fn reversed_list_item_counter_uses_implicit_decrements() {
+        let list = element("list");
+        let first = element("first");
+        let second = element("second");
+        let third = element("third");
+        let mut first_event = counter_event(&first, Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut second_event =
+            counter_event(&second, Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut third_event = counter_event(&third, Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        first_event.counter_style.is_list_item = true;
+        second_event.counter_style.is_list_item = true;
+        third_event.counter_style.is_list_item = true;
+        let events = vec![counter_event(
+            &list,
+            vec![counter_reset(
+                LIST_ITEM_COUNTER_NAME,
+                CounterResetKind::Reversed(None),
+            )],
+            Vec::new(),
+            Vec::new(),
+            vec![first_event, second_event, third_event],
+        )];
+
+        let plan = CounterPlanBuilder::build(&events);
+        assert_eq!(
+            plan.reversed_initial_values[&CounterResetKey {
+                origin: principal_origin(&list),
+                declaration_index: 0,
+            }]
+                .get(),
+            4
+        );
+        assert_eq!(
+            plan.values_at_origin[&principal_origin(&first)][LIST_ITEM_COUNTER_NAME],
+            [3]
+        );
+        assert_eq!(
+            plan.values_at_origin[&principal_origin(&second)][LIST_ITEM_COUNTER_NAME],
+            [2]
+        );
+        assert_eq!(
+            plan.values_at_origin[&principal_origin(&third)][LIST_ITEM_COUNTER_NAME],
+            [1]
+        );
     }
 }

@@ -5,7 +5,7 @@ pub(in crate::layout) fn has_later_normal_block_flow_child_with_resolver(
     start_element_index: usize,
     sibling_tags: &ElementSiblingSignatureList,
     parent_style: &ComputedStyle,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
     ancestors: &[ElementSignature],
     resolver: &mut DomStyleResolver<'_>,
 ) -> bool {
@@ -43,11 +43,12 @@ pub(in crate::layout) fn has_later_normal_block_flow_box_child(
     child_boxes: &[box_tree::FormattingBox<'_>],
     start_index: usize,
     parent: &Element,
+    document_canvas: DocumentCanvasResolution,
 ) -> bool {
     child_boxes
         .iter()
         .skip(start_index)
-        .any(|child| formatting_box_is_normal_block_flow_sibling(child, parent))
+        .any(|child| formatting_box_is_normal_block_flow_sibling(child, parent, document_canvas))
 }
 
 /// Return whether a formatting box is a later in-flow block sibling.
@@ -62,6 +63,7 @@ pub(in crate::layout) fn has_later_normal_block_flow_box_child(
 pub(in crate::layout) fn formatting_box_is_normal_block_flow_sibling(
     child: &box_tree::FormattingBox<'_>,
     parent: &Element,
+    document_canvas: DocumentCanvasResolution,
 ) -> bool {
     match child {
         box_tree::FormattingBox::AnonymousBlock(box_) => {
@@ -72,7 +74,7 @@ pub(in crate::layout) fn formatting_box_is_normal_block_flow_sibling(
             .element_parts()
             .is_some_and(|(child_element, _, child_style, _)| {
                 is_normal_block_flow_child(child_element, child_style)
-                    || is_document_canvas_element(parent)
+                    || document_canvas.is_document_canvas_flow_element(parent)
                     || is_replaced_element(child_element)
             }),
     }
@@ -148,6 +150,99 @@ pub(in crate::layout) fn collapsed_margin_delta(
     layout_pt(collapse_margins(previous_applied, next).points() - previous_applied.points())
 }
 
+/// The collapsed block-start margin set owned by one in-flow child.
+///
+/// An auto-height block and its first in-flow child's adjoining block-start
+/// margins form one set. The child therefore carries only the additional local
+/// margin needed after its parent or preceding sibling has already consumed a
+/// portion of that set; it must not subtract its first descendant's margin a
+/// second time.
+///
+/// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
+/// <https://www.w3.org/TR/CSS22/visuren.html#block-formatting>
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(in crate::layout) struct AdjoiningBlockStartMargin {
+    collapsed: LayoutLength,
+    descendant_deferred_to_child: LayoutLength,
+}
+
+impl AdjoiningBlockStartMargin {
+    /// Construct the margin set from a child's own margin and its adjoining
+    /// first descendant's margin.
+    ///
+    /// CSS 2.2 collapses all adjoining positive margins to their maximum;
+    /// negative margins follow the corresponding signed rule. The resulting
+    /// value belongs to the whole adjoining set, not separately to each box.
+    ///
+    /// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
+    pub(in crate::layout) fn from_child_and_descendant(
+        child_margin: LayoutLength,
+        descendant_margin: Option<LayoutLength>,
+    ) -> Self {
+        let collapsed = descendant_margin
+            .map(|descendant| collapse_margins(child_margin, descendant))
+            .unwrap_or(child_margin);
+        Self {
+            collapsed,
+            // When the descendant is itself the collapsed result, leave that
+            // contribution to the child's own start-margin pass. The sibling
+            // delta must then cancel the preceding margin without consuming
+            // the descendant twice. Mixed-sign margin sets remain whole at
+            // this boundary because neither individual margin represents the
+            // collapsed result.
+            descendant_deferred_to_child: descendant_margin
+                .filter(|descendant| *descendant == collapsed)
+                .unwrap_or_else(|| layout_pt(0.0)),
+        }
+    }
+
+    /// Construct an already-collapsed set for a self-collapsing child.
+    ///
+    /// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
+    pub(in crate::layout) fn from_collapsed(collapsed: LayoutLength) -> Self {
+        Self {
+            collapsed,
+            descendant_deferred_to_child: layout_pt(0.0),
+        }
+    }
+
+    /// Return the collapsed value for bookkeeping that continues the same
+    /// adjoining margin set through later transparent boxes.
+    pub(in crate::layout) fn value(self) -> LayoutLength {
+        self.collapsed
+    }
+
+    /// Return the child-local delta after the parent has consumed its
+    /// block-start margin set.
+    ///
+    /// The parent collapses directly with the complete adjoining set, so
+    /// page-start trimming applies before the local delta is computed.
+    ///
+    /// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
+    pub(in crate::layout) fn child_delta_at_parent_start(
+        self,
+        parent_applied: LayoutLength,
+        starts_at_page_top: bool,
+    ) -> LayoutLength {
+        collapsed_start_margin_delta(parent_applied, self.collapsed, starts_at_page_top)
+    }
+
+    /// Return the child-local delta after a preceding sibling's adjoining
+    /// block-end margin. When a first descendant itself supplies the
+    /// collapsed value, defer that part to the child's own layout pass.
+    ///
+    /// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
+    pub(in crate::layout) fn child_delta_after_sibling(
+        self,
+        previous_sibling_margin: LayoutLength,
+    ) -> LayoutLength {
+        layout_pt(
+            collapsed_margin_delta(previous_sibling_margin, self.collapsed).points()
+                - self.descendant_deferred_to_child.points(),
+        )
+    }
+}
+
 /// Applies CSS Box Model Level 4 `margin-trim: block-start` to the first
 /// in-flow child adjoining a block container's block-start edge.
 ///
@@ -187,6 +282,7 @@ pub(in crate::layout) fn trim_adjoining_block_start_margin(
 /// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
 /// <https://www.w3.org/TR/css-contain-1/#containment-layout>
 pub(in crate::layout) fn can_collapse_own_block_margins(
+    element: &Element,
     style: &ComputedStyle,
     border_widths: css::Edges,
     has_direct_inline_content: bool,
@@ -197,8 +293,7 @@ pub(in crate::layout) fn can_collapse_own_block_margins(
         DisplayInner::Flow | DisplayInner::FlowRoot
     ) && style.float == Float::None
         && !style_establishes_multicol_formatting_context(style)
-        && !style.contain.layout
-        && !style.contain.paint
+        && !used_property_containment(element, style).establishes_independent_formatting_context()
         && !has_direct_inline_content
         && used_overflow == css::Overflow::Visible
         && style.padding.top == 0.0
@@ -231,7 +326,7 @@ pub(in crate::layout) fn is_self_collapsing_block_box(
     element: &Element,
     style: &ComputedStyle,
     child_boxes: &[box_tree::FormattingBox<'_>],
-    overflow_context: DocumentCanvasOverflowContext,
+    overflow_context: DocumentCanvasResolution,
 ) -> bool {
     // Generated content participates in the generated pseudo-element's box
     // just like an inline child, even though it is collected from `content`
@@ -241,8 +336,17 @@ pub(in crate::layout) fn is_self_collapsing_block_box(
     let has_line_box_content = has_direct_inline_content_box(child_boxes)
         || has_atomic_inline_formatting_box(child_boxes)
         || generated_content_has_non_phantom_inline_content(style);
-    is_collapsible_block_child(element, style)
+    // Clearance places the box after matching float margin boxes.  Although
+    // an otherwise empty cleared box has no own block-size, that placement is
+    // observable by its parent: treating it as an adjoining self-collapsing
+    // child would let the parent collapse through the clearance and omit the
+    // float-containing extent from its used auto height.
+    // <https://www.w3.org/TR/CSS22/visuren.html#flow-control>
+    // <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
+    style.clear == Clear::None
+        && is_collapsible_block_child(element, style)
         && can_collapse_own_block_margins(
+            element,
             style,
             used_border_widths(style),
             has_line_box_content,
@@ -272,13 +376,26 @@ pub(in crate::layout) fn self_collapsing_block_margin_set_for_box(
 
 pub(in crate::layout) fn formatting_box_keeps_self_collapsing_parent(
     box_: &box_tree::FormattingBox<'_>,
-    overflow_context: DocumentCanvasOverflowContext,
+    overflow_context: DocumentCanvasResolution,
 ) -> bool {
     if box_tree::is_out_of_flow_box(box_) || box_tree::is_floated_box(box_) {
         return true;
     }
     if formatting_box_can_only_create_phantom_line_boxes(box_) {
         return true;
+    }
+    // CSS 2.2 block-in-inline splitting materializes this transparent
+    // context solely to retain the originating inline box's painting and
+    // positioning state. Its block child still participates directly in the
+    // enclosing block formatting context, including adjoining margin sets.
+    // <https://www.w3.org/TR/CSS22/visuren.html#anonymous-block-level>
+    // <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
+    if let box_tree::FormattingBox::InlineSplitBlockContext(context) = box_ {
+        return context
+            .core
+            .children
+            .iter()
+            .all(|child| formatting_box_keeps_self_collapsing_parent(child, overflow_context));
     }
     if let box_tree::FormattingBox::AnonymousBlock(box_) = box_ {
         return box_
@@ -297,9 +414,25 @@ pub(in crate::layout) fn collapsible_first_child_start_margin_from_boxes(
     child_boxes: &[box_tree::FormattingBox<'_>],
     parent: &Element,
     parent_style: &ComputedStyle,
-    overflow_context: DocumentCanvasOverflowContext,
+    overflow_context: DocumentCanvasResolution,
 ) -> Option<f32> {
     for child_box in child_boxes {
+        // An inline split context is transparent to the parent block's
+        // margin-collapse chain. Recurse into its generated block segment
+        // instead of treating the originating inline wrapper as a separator.
+        // <https://www.w3.org/TR/CSS22/visuren.html#anonymous-block-level>
+        // <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
+        if let box_tree::FormattingBox::InlineSplitBlockContext(context) = child_box {
+            if let Some(margin) = collapsible_first_child_start_margin_from_boxes(
+                &context.core.children,
+                parent,
+                parent_style,
+                overflow_context,
+            ) {
+                return Some(margin);
+            }
+            continue;
+        }
         let Some((child_element, _, child_style, child_children)) = child_box.element_parts()
         else {
             if matches!(
@@ -322,7 +455,7 @@ pub(in crate::layout) fn collapsible_first_child_start_margin_from_boxes(
             continue;
         }
         let is_flow_child = is_normal_block_flow_child(child_element, child_style)
-            || is_document_canvas_element(parent)
+            || overflow_context.is_document_canvas_flow_element(parent)
             || is_replaced_element(child_element);
         if !is_flow_child {
             if !inline_text(child_element).is_empty() {
@@ -347,9 +480,10 @@ pub(in crate::layout) fn collapsible_start_margin_for_box(
     element: &Element,
     style: &ComputedStyle,
     child_boxes: &[box_tree::FormattingBox<'_>],
-    overflow_context: DocumentCanvasOverflowContext,
+    overflow_context: DocumentCanvasResolution,
 ) -> f32 {
     if can_collapse_block_start_margin(
+        element,
         style,
         UsedEdges::from_css_edges(used_border_widths(style)),
         has_direct_inline_content_box(child_boxes),
@@ -399,11 +533,15 @@ pub(in crate::layout) fn has_non_inline_formatting_box(
             box_tree::FormattingBox::AnonymousBlock(_) => {
                 !formatting_box_can_only_create_phantom_line_boxes(child)
             }
+            box_tree::FormattingBox::Table(_) => child.style().display.is_block_level(),
             box_tree::FormattingBox::InlineSplitBlockContext(_)
             | box_tree::FormattingBox::Block(_)
-            | box_tree::FormattingBox::Table(_)
-            | box_tree::FormattingBox::Flex(_)
-            | box_tree::FormattingBox::Replaced(_) => true,
+            | box_tree::FormattingBox::Flex(_) => true,
+            // Replaced elements retain their own durable formatting-box
+            // variant, but their outer display decides whether they form a
+            // block-flow child or one atomic participant in an inline line.
+            // <https://drafts.csswg.org/css-display-3/#replaced-elements>
+            box_tree::FormattingBox::Replaced(_) => child.style().display.is_block_level(),
             _ => false,
         }
     })
@@ -527,10 +665,10 @@ pub(in crate::layout) fn has_atomic_inline_formatting_box(
 pub(in crate::layout) fn collapsible_first_child_start_margin_dom_with_font_metrics(
     element: &Element,
     parent_style: &ComputedStyle,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
     ancestors: &[ElementSignature],
     font_system: &mut FontSystem,
-    overflow_context: DocumentCanvasOverflowContext,
+    overflow_context: DocumentCanvasResolution,
 ) -> Option<f32> {
     let mut resolver = DomStyleResolver::with_font_system(font_system);
     collapsible_first_child_start_margin_dom_with_resolver(
@@ -546,10 +684,10 @@ pub(in crate::layout) fn collapsible_first_child_start_margin_dom_with_font_metr
 pub(in crate::layout) fn collapsible_first_child_start_margin_dom_with_resolver(
     element: &Element,
     parent_style: &ComputedStyle,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
     ancestors: &[ElementSignature],
     resolver: &mut DomStyleResolver<'_>,
-    overflow_context: DocumentCanvasOverflowContext,
+    overflow_context: DocumentCanvasResolution,
 ) -> Option<f32> {
     let sibling_tags = element_sibling_signature_list(element);
     let mut element_index = 0usize;
@@ -584,9 +722,7 @@ pub(in crate::layout) fn collapsible_first_child_start_margin_dom_with_resolver(
         {
             continue;
         }
-        let is_flow_child = is_normal_block_flow_child(child_element, &child_style)
-            || is_document_canvas_element(element)
-            || is_replaced_element(child_element);
+        let is_flow_child = is_normal_block_flow_child(child_element, &child_style);
         if !is_flow_child {
             if !inline_text(child_element).is_empty() {
                 return None;
@@ -613,12 +749,13 @@ pub(in crate::layout) fn collapsible_first_child_start_margin_dom_with_resolver(
 pub(in crate::layout) fn collapsible_start_margin_dom_with_resolver(
     element: &Element,
     style: &ComputedStyle,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
     ancestors: &[ElementSignature],
     resolver: &mut DomStyleResolver<'_>,
-    overflow_context: DocumentCanvasOverflowContext,
+    overflow_context: DocumentCanvasResolution,
 ) -> f32 {
     if can_collapse_block_start_margin(
+        element,
         style,
         UsedEdges::from_css_edges(used_border_widths(style)),
         has_direct_inline_content_dom_with_resolver(
@@ -674,10 +811,10 @@ pub(in crate::layout) fn collapsible_start_margin_dom_with_resolver(
 pub(in crate::layout) fn is_self_collapsing_block_dom_with_font_metrics(
     element: &Element,
     style: &ComputedStyle,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
     ancestors: &[ElementSignature],
     font_system: &mut FontSystem,
-    overflow_context: DocumentCanvasOverflowContext,
+    overflow_context: DocumentCanvasResolution,
 ) -> bool {
     let mut resolver = DomStyleResolver::with_font_system(font_system);
     is_self_collapsing_block_dom_with_resolver(
@@ -693,10 +830,10 @@ pub(in crate::layout) fn is_self_collapsing_block_dom_with_font_metrics(
 pub(in crate::layout) fn is_self_collapsing_block_dom_with_resolver(
     element: &Element,
     style: &ComputedStyle,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
     ancestors: &[ElementSignature],
     resolver: &mut DomStyleResolver<'_>,
-    overflow_context: DocumentCanvasOverflowContext,
+    overflow_context: DocumentCanvasResolution,
 ) -> bool {
     let has_direct_inline_content = has_direct_inline_content_dom_with_resolver(
         element,
@@ -705,8 +842,10 @@ pub(in crate::layout) fn is_self_collapsing_block_dom_with_resolver(
         ancestors,
         resolver,
     );
-    is_collapsible_block_child(element, style)
+    style.clear == Clear::None
+        && is_collapsible_block_child(element, style)
         && can_collapse_own_block_margins(
+            element,
             style,
             used_border_widths(style),
             has_direct_inline_content,
@@ -725,10 +864,10 @@ pub(in crate::layout) fn is_self_collapsing_block_dom_with_resolver(
 pub(in crate::layout) fn dom_children_keep_self_collapsing_parent(
     element: &Element,
     parent_style: &ComputedStyle,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
     ancestors: &[ElementSignature],
     resolver: &mut DomStyleResolver<'_>,
-    overflow_context: DocumentCanvasOverflowContext,
+    overflow_context: DocumentCanvasResolution,
 ) -> bool {
     let sibling_tags = element_sibling_signature_list(element);
     let mut element_index = 0usize;
@@ -787,7 +926,7 @@ pub(in crate::layout) fn dom_children_keep_self_collapsing_parent(
 fn dom_inline_element_can_only_create_phantom_line_boxes(
     element: &Element,
     style: &ComputedStyle,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
     ancestors: &[ElementSignature],
     resolver: &mut DomStyleResolver<'_>,
 ) -> bool {
@@ -844,7 +983,7 @@ fn dom_text_can_only_create_phantom_line_box(text: &str, style: &ComputedStyle) 
 pub(in crate::layout) fn has_direct_inline_content_dom_with_font_metrics(
     element: &Element,
     parent_style: &ComputedStyle,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
     ancestors: &[ElementSignature],
     font_system: &mut FontSystem,
 ) -> bool {
@@ -858,10 +997,62 @@ pub(in crate::layout) fn has_direct_inline_content_dom_with_font_metrics(
     )
 }
 
+/// Return whether direct inline content precedes the first normal-flow block
+/// child in DOM order.
+///
+/// Only inline content before that child prevents the parent's block-start
+/// margin from adjoining the child's margin. Inline content after a first
+/// block belongs to a later anonymous block box and cannot retroactively
+/// separate the parent's block-start edge:
+/// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins> and
+/// <https://www.w3.org/TR/CSS22/visuren.html#anonymous-block-level>.
+pub(in crate::layout) fn has_direct_inline_content_before_first_flow_child_dom_with_font_metrics(
+    element: &Element,
+    parent_style: &ComputedStyle,
+    stylesheets: &Stylesheets<'_>,
+    ancestors: &[ElementSignature],
+    font_system: &mut FontSystem,
+) -> bool {
+    let mut resolver = DomStyleResolver::with_font_system(font_system);
+    let sibling_tags = element_sibling_signature_list(element);
+    let mut element_index = 0usize;
+    for child in &element.children {
+        match &child.kind {
+            NodeKind::Text(text) if !collapse_whitespace(text).is_empty() => return true,
+            NodeKind::Text(_) => {}
+            NodeKind::Element(child) => {
+                let signature = ElementSignature::with_sibling_list(
+                    child.tag.clone(),
+                    child.attrs.clone(),
+                    element_index,
+                    sibling_tags.clone(),
+                );
+                element_index += 1;
+                let child_style = resolver.style_for_element(
+                    child,
+                    signature,
+                    stylesheets,
+                    Some(parent_style),
+                    ancestors,
+                );
+                if is_normal_block_flow_child(child, &child_style) {
+                    return false;
+                }
+                if is_line_break_element(child)
+                    || (!is_replaced_element(child) && !inline_text(child).is_empty())
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 pub(in crate::layout) fn has_direct_inline_content_dom_with_resolver(
     element: &Element,
     parent_style: &ComputedStyle,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
     ancestors: &[ElementSignature],
     resolver: &mut DomStyleResolver<'_>,
 ) -> bool {
@@ -889,6 +1080,63 @@ pub(in crate::layout) fn has_direct_inline_content_dom_with_resolver(
                 && !inline_text(child).is_empty()
         }
     })
+}
+
+/// Whether a raw DOM fallback contains only direct in-flow inline content.
+///
+/// The document canvas deliberately has no own text run, so this identifies
+/// the narrow case where its direct DOM children must be collected as one
+/// inline formatting context.  Block, float, replaced, and out-of-flow
+/// children retain their dedicated layout paths.
+///
+/// <https://www.w3.org/TR/CSS22/visuren.html#inline-formatting>
+pub(in crate::layout) fn has_only_direct_in_flow_inline_dom_content_with_font_metrics(
+    element: &Element,
+    parent_style: &ComputedStyle,
+    stylesheets: &Stylesheets<'_>,
+    ancestors: &[ElementSignature],
+    font_system: &mut FontSystem,
+) -> bool {
+    let mut resolver = DomStyleResolver::with_font_system(font_system);
+    let sibling_tags = element_sibling_signature_list(element);
+    let mut element_index = 0usize;
+    let mut has_content = false;
+
+    for child in &element.children {
+        match &child.kind {
+            NodeKind::Text(text) => {
+                has_content |= !collapse_whitespace(text).is_empty();
+            }
+            NodeKind::Element(child_element) => {
+                let signature = ElementSignature::with_sibling_list(
+                    child_element.tag.clone(),
+                    child_element.attrs.clone(),
+                    element_index,
+                    sibling_tags.clone(),
+                );
+                element_index += 1;
+                let child_style = resolver.style_for_element(
+                    child_element,
+                    signature,
+                    stylesheets,
+                    Some(parent_style),
+                    ancestors,
+                );
+                if child_style.display.is_none() {
+                    continue;
+                }
+                if !child_style.display.is_inline_level()
+                    || child_style.float != Float::None
+                    || matches!(child_style.position, Position::Absolute | Position::Fixed)
+                    || is_replaced_element(child_element)
+                {
+                    return false;
+                }
+                has_content |= !inline_text(child_element).is_empty();
+            }
+        }
+    }
+    has_content
 }
 
 #[cfg(test)]
@@ -933,7 +1181,51 @@ mod tests {
     }
 
     #[test]
-    fn atomic_inline_page_values_include_descendant_start_and_end_values() {
+    fn independent_formatting_contexts_keep_outer_margins_adjoining_siblings() {
+        let root = dom::parse("<html><body><div></div><img></body></html>");
+        let block = first_element_by_tag(&root, "div").expect("expected block element");
+        let image = first_element_by_tag(&root, "img").expect("expected image element");
+
+        for (name, display) in [
+            ("grid", Display::GRID),
+            ("flex", Display::FLEX),
+            (
+                "flow-root",
+                Display::BLOCK.with_inner(DisplayInner::FlowRoot),
+            ),
+        ] {
+            let mut style = ComputedStyle::initial();
+            style.display = display;
+            assert!(
+                outer_margins_adjoin_block_siblings(block, &style),
+                "a block-level {name} container's outer margins should adjoin a normal-flow sibling"
+            );
+        }
+
+        let mut absolute = ComputedStyle::initial();
+        absolute.position = Position::Absolute;
+        assert!(!outer_margins_adjoin_block_siblings(block, &absolute));
+
+        let mut fixed = ComputedStyle::initial();
+        fixed.position = Position::Fixed;
+        assert!(!outer_margins_adjoin_block_siblings(block, &fixed));
+
+        let mut floated = ComputedStyle::initial();
+        floated.float = Float::Left;
+        assert!(!outer_margins_adjoin_block_siblings(block, &floated));
+
+        let mut atomic_inline = ComputedStyle::initial();
+        atomic_inline.display = Display::INLINE_BLOCK;
+        assert!(!outer_margins_adjoin_block_siblings(block, &atomic_inline));
+
+        assert!(!outer_margins_adjoin_block_siblings(
+            image,
+            &ComputedStyle::initial()
+        ));
+    }
+
+    #[test]
+    fn atomic_inline_page_values_do_not_escape_its_atomic_formatting_context() {
         let root = dom::parse(
             "<html><body>\
              <div style=\"page:c; display:inline-block\">\
@@ -943,7 +1235,7 @@ mod tests {
              <div style=\"page:c\">C</div>\
              </body></html>",
         );
-        let stylesheets = vec![css::html5_user_agent_stylesheet()];
+        let stylesheets = Stylesheets::for_document(css::html5_user_agent_stylesheet(), None, &[]);
         let page = box_tree::freeze_page_box(box_tree::build_page_box(
             &root,
             &stylesheets,
@@ -954,7 +1246,7 @@ mod tests {
 
         assert_eq!(
             formatting_box_page_values(anonymous_inline_run),
-            (Some("a".to_string()), Some("b".to_string()))
+            (None, None)
         );
         assert_eq!(
             formatting_box_page_values(&body.children()[1]),
@@ -979,7 +1271,8 @@ mod tests {
                 let root = dom::parse(&format!(
                     "<html><style>span {{ zoom: .1%; }}</style><body>{spans}text{closing_spans}</body></html>"
                 ));
-                let stylesheets = vec![css::html5_user_agent_stylesheet()];
+                let stylesheets =
+                    Stylesheets::for_document(css::html5_user_agent_stylesheet(), None, &[]);
                 let page = box_tree::freeze_page_box(box_tree::build_page_box(
                     &root,
                     &stylesheets,
@@ -1015,7 +1308,11 @@ mod tests {
             .with_base_path(".")
             .expect("current directory should be a valid file URL"),
         );
-        let stylesheets = vec![css::html5_user_agent_stylesheet(), stylesheet];
+        let stylesheets = Stylesheets::for_document(
+            css::html5_user_agent_stylesheet(),
+            None,
+            std::slice::from_ref(&stylesheet),
+        );
         let mut parent_style = ComputedStyle {
             font_family: css::FontFamily::Names(vec!["MetricProbe".to_string()]),
             font_size: 40.0,

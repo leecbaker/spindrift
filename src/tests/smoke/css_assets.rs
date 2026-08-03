@@ -23,7 +23,10 @@ const GREEN_1X1_PNG: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAA
 
 const GREEN_50X50_SVG: &str = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI1MCIgaGVpZ2h0PSI1MCIgdmlld0JveD0iMCAwIDUwIDUwIj48cmVjdCB3aWR0aD0iNTAiIGhlaWdodD0iNTAiIGZpbGw9ImdyZWVuIi8+PC9zdmc+";
 
-fn filled_rect(page: &quire::Page, color: CssColor) -> &quire::RenderedRect {
+fn filled_rect(
+    page: &quire::Page,
+    color: CssColor,
+) -> &crate::document::paint::shapes::RenderedRect {
     page.rects()
         .iter()
         .find(|rect| rect.fill == Some(color))
@@ -35,7 +38,10 @@ fn filled_rect(page: &quire::Page, color: CssColor) -> &quire::RenderedRect {
         })
 }
 
-fn filled_rects(page: &quire::Page, color: CssColor) -> Vec<&quire::RenderedRect> {
+fn filled_rects(
+    page: &quire::Page,
+    color: CssColor,
+) -> Vec<&crate::document::paint::shapes::RenderedRect> {
     page.rects()
         .iter()
         .filter(|rect| rect.fill == Some(color))
@@ -503,7 +509,12 @@ async fn corner_shape_bevels_background_fill_clip() {
     let curve_count = path
         .commands
         .iter()
-        .filter(|command| matches!(command, quire::RenderedPathCommand::CurveTo { .. }))
+        .filter(|command| {
+            matches!(
+                command,
+                crate::document::paint::paths::RenderedPathCommand::CurveTo { .. }
+            )
+        })
         .count();
 
     assert_eq!(
@@ -601,7 +612,7 @@ async fn corner_shorthand_matches_equivalent_corner_longhands() {
             .paths()
             .iter()
             .any(|path| path.fill == Some(CssColor::new(0, 128, 0))
-                && path.fill_rule == quire::RenderedPathFillRule::EvenOdd)
+                && path.fill_rule == crate::document::paint::paths::RenderedPathFillRule::EvenOdd)
     );
 }
 
@@ -664,7 +675,10 @@ async fn mixed_width_solid_rounded_border_paints_as_even_odd_path() {
         .find(|path| path.fill == Some(CssColor::new(0, 0, 255)))
         .unwrap();
 
-    assert_eq!(border_path.fill_rule, quire::RenderedPathFillRule::EvenOdd);
+    assert_eq!(
+        border_path.fill_rule,
+        crate::document::paint::paths::RenderedPathFillRule::EvenOdd
+    );
     assert!(border_path.commands.len() >= 10);
 
     let pdf = document
@@ -693,7 +707,8 @@ async fn mixed_color_solid_rounded_border_paints_clipped_side_paths() {
     assert!(
         border_paths
             .iter()
-            .all(|path| path.fill_rule == quire::RenderedPathFillRule::EvenOdd)
+            .all(|path| path.fill_rule
+                == crate::document::paint::paths::RenderedPathFillRule::EvenOdd)
     );
     assert!(
         border_paths
@@ -753,7 +768,8 @@ async fn rounded_inset_border_paints_clipped_shaded_side_paths() {
     assert!(
         border_paths
             .iter()
-            .all(|path| path.fill_rule == quire::RenderedPathFillRule::EvenOdd)
+            .all(|path| path.fill_rule
+                == crate::document::paint::paths::RenderedPathFillRule::EvenOdd)
     );
     assert!(
         border_paths
@@ -789,7 +805,8 @@ async fn rounded_groove_border_paints_clipped_outer_and_inner_side_paths() {
     assert!(
         border_paths
             .iter()
-            .all(|path| path.fill_rule == quire::RenderedPathFillRule::EvenOdd)
+            .all(|path| path.fill_rule
+                == crate::document::paint::paths::RenderedPathFillRule::EvenOdd)
     );
     assert!(
         border_paths
@@ -833,7 +850,8 @@ async fn uniform_double_rounded_border_paints_as_two_path_rings() {
     assert!(
         border_paths
             .iter()
-            .all(|path| path.fill_rule == quire::RenderedPathFillRule::EvenOdd)
+            .all(|path| path.fill_rule
+                == crate::document::paint::paths::RenderedPathFillRule::EvenOdd)
     );
 
     let pdf = document
@@ -861,7 +879,8 @@ async fn mixed_double_rounded_border_paints_clipped_outer_and_inner_side_paths()
     assert!(
         border_paths
             .iter()
-            .all(|path| path.fill_rule == quire::RenderedPathFillRule::EvenOdd)
+            .all(|path| path.fill_rule
+                == crate::document::paint::paths::RenderedPathFillRule::EvenOdd)
     );
     assert!(
         border_paths
@@ -1022,9 +1041,10 @@ async fn rounded_dashed_borders_clip_dashes_to_side_and_border_ring() {
     assert!(dashes.iter().all(|path| {
         path.commands.len() == 5
             && path.clip.as_ref().is_some_and(|clip| {
-                clip.fill_rule == quire::RenderedPathFillRule::NonZero
+                clip.fill_rule == crate::document::paint::paths::RenderedPathFillRule::NonZero
                     && clip.additional_clips.len() == 1
-                    && clip.additional_clips[0].fill_rule == quire::RenderedPathFillRule::EvenOdd
+                    && clip.additional_clips[0].fill_rule
+                        == crate::document::paint::paths::RenderedPathFillRule::EvenOdd
             })
     }));
 }
@@ -1140,6 +1160,183 @@ async fn external_svg_url_images_paint_as_vectors_for_img_background_and_border_
             .filter(|path| path.fill == Some(CssColor::new(34, 146, 212)))
             .count()
             >= 3
+    );
+}
+
+#[tokio::test]
+async fn generated_float_svg_background_retains_its_vector_paths() {
+    let base_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let document = Html::from_string(
+        r#"<style>
+            @page { size: 120pt 120pt; margin: 10pt }
+            body { margin: 0 }
+            section::before {
+                background: url(external-vector.svg) no-repeat center / 50%;
+                content: "";
+                display: block;
+                float: left;
+                height: 20pt;
+                margin-right: 5pt;
+                width: 40pt;
+            }
+        </style>
+        <section>Generated float SVG background.</section>"#,
+    )
+    .with_base_path(&base_path)
+    .unwrap()
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert!(
+        document.pages[0]
+            .paths()
+            .iter()
+            .any(|path| path.fill == Some(CssColor::new(34, 146, 212))),
+        "a generated floated pseudo's SVG background must remain vector paint"
+    );
+}
+
+/// CSS Pseudo-Elements §4.1 generated boxes are ordinary tree-abiding boxes;
+/// CSS 2.2 float painting must therefore retain their CSS Backgrounds image
+/// layers through both DOM and frozen formatting-box traversal.
+///
+/// <https://drafts.csswg.org/css-pseudo-4/#generated-content>
+/// <https://www.w3.org/TR/CSS22/visuren.html#floats>
+/// <https://www.w3.org/TR/css-backgrounds-3/#layering>
+#[tokio::test]
+async fn generated_float_svg_background_matches_direct_and_frozen_traversal() {
+    let base_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let stylesheet = r#"
+        @page { size: 120pt 120pt; margin: 10pt }
+        body { margin: 0 }
+        section::before {
+            background: url(external-vector.svg) no-repeat center / 50%;
+            content: "";
+            display: block;
+            float: left;
+            height: 20pt;
+            margin-right: 5pt;
+            width: 40pt;
+        }
+    "#;
+    let direct = Html::from_string(format!(
+        "<style>{stylesheet}</style><section>Generated float SVG background.</section>"
+    ))
+    .with_base_path(&base_path)
+    .unwrap()
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+    let frozen = Html::from_string(format!(
+        "<style>{stylesheet} main {{ column-count: 1; column-gap: 0 }}</style>\
+         <main><section>Generated float SVG background.</section></main>"
+    ))
+    .with_base_path(&base_path)
+    .unwrap()
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let icon_color = CssColor::new(34, 146, 212);
+    let direct_paths = direct.pages[0]
+        .paths()
+        .iter()
+        .filter(|path| path.fill == Some(icon_color))
+        .cloned()
+        .collect::<Vec<_>>();
+    let frozen_paths = frozen.pages[0]
+        .paths()
+        .iter()
+        .filter(|path| path.fill == Some(icon_color))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(direct_paths, frozen_paths);
+}
+
+/// CSS Backgrounds §3.4 repeats an SVG background as a tiled image layer,
+/// which remains a vector `SvgPattern` when captured by a generated float.
+/// <https://www.w3.org/TR/css-backgrounds-3/#the-background-repeat>
+#[tokio::test]
+async fn repeated_svg_background_on_generated_float_retains_svg_pattern() {
+    let base_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let document = Html::from_string(
+        r#"<style>
+            @page { size: 120pt 120pt; margin: 10pt }
+            body { margin: 0 }
+            section::before {
+                background-image: url(generated-float-pattern.svg);
+                background-repeat: repeat;
+                background-size: 10pt 5pt;
+                content: "";
+                display: block;
+                float: left;
+                height: 20pt;
+                width: 40pt;
+            }
+        </style><section>Generated float SVG background.</section>"#,
+    )
+    .with_base_path(&base_path)
+    .unwrap()
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    assert_eq!(page.svg_patterns.len(), 1);
+    assert!(page.operations().iter().any(|operation| matches!(
+        operation,
+        crate::document::paint::page::PaintOperation::SvgPattern(_)
+    )));
+}
+
+/// A non-repeating background layer belongs to the generated float's source
+/// fragment and is not synthesized for its continuation fragments.
+///
+/// <https://www.w3.org/TR/css-backgrounds-3/#the-background-repeat>
+/// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+#[tokio::test]
+async fn fragmented_generated_float_does_not_duplicate_non_repeating_svg_background() {
+    let base_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let document = Html::from_string(
+        r#"<style>
+            @page { size: 100pt 100pt; margin: 10pt }
+            body { margin: 0 }
+            section::before {
+                background: url(external-vector.svg) no-repeat center / 50%;
+                content: "";
+                display: block;
+                float: left;
+                height: 150pt;
+                width: 40pt;
+            }
+        </style><section>Generated float SVG background.</section>"#,
+    )
+    .with_base_path(&base_path)
+    .unwrap()
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert!(document.pages.len() >= 2);
+    let icon_color = CssColor::new(34, 146, 212);
+    assert!(
+        document.pages[0]
+            .paths()
+            .iter()
+            .any(|path| path.fill == Some(icon_color) && path.clip.is_none())
+    );
+    let continuation_paths = document.pages[1]
+        .paths()
+        .iter()
+        .filter(|path| path.fill == Some(icon_color))
+        .collect::<Vec<_>>();
+    assert_eq!(continuation_paths.len(), 1);
+    let continuation = continuation_paths[0];
+    assert!(continuation.clip.is_some());
+    assert!(
+        continuation.paint_bounds().unwrap().min_y() >= 90.0,
+        "the source-positioned SVG must fall outside the continuation and be clipped, not be re-positioned there"
     );
 }
 
@@ -3146,4 +3343,46 @@ async fn supports_basic_descendant_and_child_selectors() {
         &document.pages[0].lines()[1]
     ));
     assert_eq!(document.pages[0].lines()[1].color, CssColor::BLACK);
+}
+
+#[tokio::test]
+async fn child_selectors_keep_nested_inline_descendants_out_of_direct_child_rules() {
+    let source = "<style>@page { size: 160pt 80pt; margin: 10pt } body { margin: 0 } div { font: 10pt/10pt monospace } .inner { color: red } .middle { color: blue }</style><div>A<span><span class=\"inner\">B</span><span class=\"middle\">C</span></span>D</div>";
+    let baseline = Html::from_string(source)
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+    let styled = Html::from_string(source)
+        .with_stylesheet(Css::from_string("div > span { margin-right: 10pt }"))
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+
+    let run_x = |document: &quire::Document, text: &str| {
+        let line = document.pages[0]
+            .lines()
+            .iter()
+            .find(|line| line.runs.iter().any(|run| run.text.as_ref() == text))
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected {text:?} inline text run in {:?}",
+                    document.pages[0].lines()
+                )
+            });
+        line.runs
+            .iter()
+            .find(|run| run.text.as_ref() == text)
+            .map(|run| line.x() + run.x_offset)
+            .unwrap_or_else(|| panic!("expected {text:?} run in {:?}", line.runs))
+    };
+
+    assert!((run_x(&styled, "B") - run_x(&baseline, "B")).abs() < 0.01);
+    assert!(
+        (run_x(&styled, "C") - run_x(&baseline, "C")).abs() < 0.01,
+        "a direct-child margin must not apply to the nested span"
+    );
+    assert!(
+        ((run_x(&styled, "D") - run_x(&baseline, "D")) - 10.0).abs() < 0.01,
+        "the direct span's margin should appear only after its inline contents"
+    );
 }

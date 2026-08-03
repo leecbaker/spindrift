@@ -190,15 +190,126 @@ fn subset_font_is_valid(
     subset_data: &[u8],
     source_gid_to_cid: &BTreeMap<u16, u16>,
 ) -> bool {
-    let Ok(face) = ttf_parser::Face::parse(subset_data, 0) else {
+    let Ok(source_face) = ttf_parser::Face::parse(font.data.as_ref(), font.face_index) else {
         return false;
     };
-    if face.units_per_em() != font.units_per_em {
+    let Ok(subset_face) = ttf_parser::Face::parse(subset_data, 0) else {
+        return false;
+    };
+    if subset_face.units_per_em() != source_face.units_per_em()
+        || source_face.units_per_em() != font.units_per_em
+    {
         return false;
     }
-    source_gid_to_cid
-        .values()
-        .all(|cid| face.glyph_hor_advance(ttf_parser::GlyphId(*cid)).is_some())
+    source_gid_to_cid.iter().all(|(source_gid, cid)| {
+        remapped_glyph_is_visually_equivalent(
+            &source_face,
+            ttf_parser::GlyphId(*source_gid),
+            &subset_face,
+            ttf_parser::GlyphId(*cid),
+        )
+    })
+}
+
+/// Validate one compact-subset glyph against its source program.
+///
+/// A valid SFNT and a matching advance are insufficient for PDF text: an
+/// incorrectly remapped simple or composite glyph can still rasterize as a
+/// different shape.  Compare the resolved outline command stream so composite
+/// component IDs are normalized to their visible geometry, alongside the
+/// advance and bounds that PDF text positioning consumes.  This is the last
+/// acceptance gate before using compact CIDs; failure deliberately falls back
+/// to the complete source program and identity CID map.
+///
+/// ISO 32000-2:2020, 9.7.4.3 and 9.9.2 require the CIDFont glyph program to
+/// agree with the text-showing CIDs.
+fn remapped_glyph_is_visually_equivalent(
+    source_face: &ttf_parser::Face<'_>,
+    source_glyph: ttf_parser::GlyphId,
+    subset_face: &ttf_parser::Face<'_>,
+    subset_glyph: ttf_parser::GlyphId,
+) -> bool {
+    source_face.glyph_hor_advance(source_glyph) == subset_face.glyph_hor_advance(subset_glyph)
+        && source_face.glyph_bounding_box(source_glyph)
+            == subset_face.glyph_bounding_box(subset_glyph)
+        && normalized_glyph_outline(source_face, source_glyph)
+            == normalized_glyph_outline(subset_face, subset_glyph)
+}
+
+/// A canonical, resolved TrueType/CFF outline representation.
+///
+/// `ttf-parser` expands composite glyphs before calling `OutlineBuilder`, so
+/// equality here tests visible outline structure rather than implementation
+/// details such as remapped component glyph IDs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NormalizedOutlineCommand {
+    MoveTo([u32; 2]),
+    LineTo([u32; 2]),
+    QuadTo([u32; 4]),
+    CurveTo([u32; 6]),
+    Close,
+}
+
+#[derive(Default)]
+struct NormalizedOutlineBuilder {
+    commands: Vec<NormalizedOutlineCommand>,
+}
+
+impl NormalizedOutlineBuilder {
+    fn point(x: f32, y: f32) -> [u32; 2] {
+        // The outline callback's coordinates are font units. Preserve their
+        // exact IEEE representation (while canonicalizing -0) rather than
+        // introducing a geometric tolerance into the subset acceptance path.
+        [Self::coordinate(x), Self::coordinate(y)]
+    }
+
+    fn coordinate(value: f32) -> u32 {
+        if value == 0.0 {
+            0.0f32.to_bits()
+        } else {
+            value.to_bits()
+        }
+    }
+}
+
+impl ttf_parser::OutlineBuilder for NormalizedOutlineBuilder {
+    fn move_to(&mut self, x: f32, y: f32) {
+        self.commands
+            .push(NormalizedOutlineCommand::MoveTo(Self::point(x, y)));
+    }
+
+    fn line_to(&mut self, x: f32, y: f32) {
+        self.commands
+            .push(NormalizedOutlineCommand::LineTo(Self::point(x, y)));
+    }
+
+    fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
+        let [x1, y1] = Self::point(x1, y1);
+        let [x, y] = Self::point(x, y);
+        self.commands
+            .push(NormalizedOutlineCommand::QuadTo([x1, y1, x, y]));
+    }
+
+    fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
+        let [x1, y1] = Self::point(x1, y1);
+        let [x2, y2] = Self::point(x2, y2);
+        let [x, y] = Self::point(x, y);
+        self.commands
+            .push(NormalizedOutlineCommand::CurveTo([x1, y1, x2, y2, x, y]));
+    }
+
+    fn close(&mut self) {
+        self.commands.push(NormalizedOutlineCommand::Close);
+    }
+}
+
+fn normalized_glyph_outline(
+    face: &ttf_parser::Face<'_>,
+    glyph: ttf_parser::GlyphId,
+) -> Option<Vec<NormalizedOutlineCommand>> {
+    let mut builder = NormalizedOutlineBuilder::default();
+    face.outline_glyph(glyph, &mut builder)
+        .map(|_| builder.commands)
 }
 
 pub(super) fn identity_glyph_mapping(used_glyphs: &BTreeMap<u16, String>) -> BTreeMap<u16, u16> {
@@ -373,5 +484,49 @@ mod tests {
         assert_eq!(collection_face_size(&collection, 0), Some(32));
         let extracted = extract_collection_face(&collection, 0).unwrap();
         assert_eq!(extracted.len(), 32);
+    }
+
+    #[test]
+    fn compact_ahem_subset_preserves_space_and_x_outlines() {
+        // This local WPT fixture deliberately gives U+0020 and `X` different
+        // source GIDs. Exercise both mappings so a compact CID reorder cannot
+        // silently substitute either glyph's program.
+        let source =
+            std::fs::read("tests/fixtures/wpt/css/css-fonts/Ahem.ttf").expect("local Ahem fixture");
+        let source_face = ttf_parser::Face::parse(&source, 0).expect("Ahem parses");
+        let space = source_face.glyph_index(' ').expect("Ahem space").0;
+        let x = source_face.glyph_index('X').expect("Ahem X").0;
+        let remapper = subsetter::GlyphRemapper::new_from_glyphs_sorted(&[space, x]);
+        let subset = subsetter::subset(&source, 0, &remapper).expect("Ahem subsets");
+        let subset_face = ttf_parser::Face::parse(&subset, 0).expect("subset parses");
+
+        for source_glyph in [space, x] {
+            let compact_gid = remapper
+                .get(source_glyph)
+                .expect("every selected Ahem glyph remaps");
+            assert!(remapped_glyph_is_visually_equivalent(
+                &source_face,
+                ttf_parser::GlyphId(source_glyph),
+                &subset_face,
+                ttf_parser::GlyphId(compact_gid),
+            ));
+        }
+
+        let compact_space = remapper.get(space).unwrap();
+        let compact_x = remapper.get(x).unwrap();
+        assert!(
+            !remapped_glyph_is_visually_equivalent(
+                &source_face,
+                ttf_parser::GlyphId(space),
+                &subset_face,
+                ttf_parser::GlyphId(compact_x),
+            ) || !remapped_glyph_is_visually_equivalent(
+                &source_face,
+                ttf_parser::GlyphId(x),
+                &subset_face,
+                ttf_parser::GlyphId(compact_space),
+            ),
+            "the verifier must reject a source-to-CID substitution"
+        );
     }
 }

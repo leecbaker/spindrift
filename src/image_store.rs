@@ -54,10 +54,25 @@ pub(crate) fn image_mime_support(mime_type: &str) -> MimeSupport {
 /// candidate rather than making the surrounding `image-set()` syntactically
 /// invalid.
 fn declared_mime_essence(value: &str) -> Option<String> {
-    let essence = value
-        .trim()
+    let value = value.trim_matches(|character: char| character.is_ascii_whitespace());
+    let (essence, parameters) = value
         .split_once(';')
-        .map_or(value.trim(), |(head, _)| head.trim());
+        .map_or((value, None), |(head, tail)| (head, Some(tail)));
+    if let Some(parameters) = parameters {
+        for parameter in parameters.split(';') {
+            let parameter =
+                parameter.trim_matches(|character: char| character.is_ascii_whitespace());
+            let (name, value) = parameter.split_once('=')?;
+            if name.is_empty()
+                || !name.bytes().all(is_mime_token_character)
+                || !valid_mime_parameter_value(
+                    value.trim_matches(|character: char| character.is_ascii_whitespace()),
+                )
+            {
+                return None;
+            }
+        }
+    }
     let (type_, subtype) = essence.split_once('/')?;
     if type_.is_empty()
         || subtype.is_empty()
@@ -68,6 +83,32 @@ fn declared_mime_essence(value: &str) -> Option<String> {
         return None;
     }
     Some(essence.to_ascii_lowercase())
+}
+
+/// Validate the token-or-quoted-string parameter grammar used by the
+/// MIME Sniffing standard's `is a valid MIME type string` algorithm.
+/// <https://mimesniff.spec.whatwg.org/#valid-mime-type-string>
+fn valid_mime_parameter_value(value: &str) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    if let Some(quoted) = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    {
+        let mut escaped = false;
+        for byte in quoted.bytes() {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte.is_ascii_control() || byte == b'"' {
+                return false;
+            }
+        }
+        return !escaped;
+    }
+    value.bytes().all(is_mime_token_character)
 }
 
 fn is_mime_token_character(byte: u8) -> bool {
@@ -174,12 +215,12 @@ enum ImageAsset {
 pub(crate) enum GeneratedRasterImage {
     Linear {
         gradient: crate::css::LinearGradient,
-        size: crate::document::PaintSize,
+        size: crate::document::paint::geometry::PaintSize,
         metadata: ImageMetadata,
     },
     Radial {
         gradient: crate::css::RadialGradient,
-        size: crate::document::PaintSize,
+        size: crate::document::paint::geometry::PaintSize,
         metadata: ImageMetadata,
     },
 }
@@ -199,20 +240,28 @@ impl GeneratedRasterImage {
         }
     }
 
-    /// Resolve the component space that gradient rasterization will use
+    /// Resolve the RGB storage space that gradient rasterization will use
     /// without materializing its pixels. This keeps PDF resource planning
-    /// bounded while matching the interpolation-space conversion used at
-    /// rasterization.
+    /// bounded while matching the final image encoding rather than treating
+    /// CSS interpolation coordinates as image samples.
     fn color_space(&self) -> crate::color::RasterColorSpace {
         let space = match self {
-            Self::Linear { gradient, .. } => {
-                generated_gradient_interpolation_output_space(gradient.interpolation)
+            Self::Linear { gradient, size, .. } => {
+                crate::layout::generated_linear_gradient_raster_color_space(
+                    gradient,
+                    *size,
+                    crate::css::CssColor::TRANSPARENT,
+                )
             }
-            Self::Radial { gradient, .. } => {
-                generated_gradient_interpolation_output_space(gradient.interpolation)
+            Self::Radial { gradient, size, .. } => {
+                crate::layout::generated_radial_gradient_raster_color_space(
+                    gradient,
+                    *size,
+                    crate::css::CssColor::TRANSPARENT,
+                )
             }
         };
-        crate::color::RasterColorSpace::BuiltIn(space)
+        crate::color::RasterColorSpace::BuiltIn(space.unwrap_or(crate::css::CssColorSpace::Srgb))
     }
 
     fn key(&self) -> GeneratedImageKey {
@@ -251,6 +300,7 @@ impl GeneratedRasterImage {
 /// expanding its pixels. CSS gradients interpolate in their selected space;
 /// perceptual and Lab-family methods use the D50 XYZ connection space.
 /// <https://drafts.csswg.org/css-color-4/#interpolation-space>
+#[allow(dead_code)]
 fn generated_gradient_interpolation_output_space(
     method: crate::css::GradientInterpolationMethod,
 ) -> crate::css::CssColorSpace {
@@ -642,7 +692,7 @@ impl DocumentImageStore {
         let mut rgb = Vec::with_capacity(rgba.len() / 4 * 3);
         let mut alpha = Vec::with_capacity(rgba.len() / 4);
         let mut has_alpha = false;
-        for pixel in rgba.chunks_exact(4) {
+        for pixel in rgba.as_chunks::<4>().0 {
             rgb.extend_from_slice(&pixel[..3]);
             alpha.push(pixel[3]);
             has_alpha |= pixel[3] < 255;
@@ -805,10 +855,11 @@ fn png_color_space(
 }
 
 fn png_chromaticities(bytes: &[u8]) -> Option<crate::color::PngChromaticities> {
-    let mut values = bytes.chunks_exact(4).map(|value| {
-        u32::from_be_bytes(value.try_into().expect("chunks_exact yields four bytes")) as f64
-            / 100_000.0
-    });
+    let mut values = bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|value| u32::from_be_bytes(*value) as f64 / 100_000.0);
     Some(crate::color::PngChromaticities {
         white_x: values.next()?,
         white_y: values.next()?,
@@ -903,6 +954,31 @@ mod tests {
     use super::*;
     use base64::Engine as _;
     use image::{ExtendedColorType, Frame, ImageEncoder, RgbaImage};
+
+    #[test]
+    fn image_set_mime_parameters_require_valid_mime_syntax() {
+        assert_eq!(
+            image_mime_support("image/png; charset=utf-8"),
+            MimeSupport::Supported
+        );
+        assert_eq!(
+            image_mime_support("image/png; profile=\"display p3\""),
+            MimeSupport::Supported
+        );
+        for invalid in [
+            "image/png; charset",
+            "image/png; =utf-8",
+            "image/png; charset=\"unterminated",
+            "image/png; charset=bad value",
+            "image/png;",
+        ] {
+            assert_eq!(
+                image_mime_support(invalid),
+                MimeSupport::Unsupported,
+                "{invalid}"
+            );
+        }
+    }
 
     fn tagged_png(profile: Vec<u8>) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -1085,7 +1161,9 @@ mod tests {
         assert!(
             raster
                 .rgb
-                .chunks_exact(3)
+                .as_chunks::<3>()
+                .0
+                .iter()
                 .all(|pixel| pixel == &raster.rgb[0..3])
         );
     }
@@ -1214,10 +1292,7 @@ mod tests {
         assert_eq!(raster.rgb, vec![230, 32, 16, 0, 0, 0]);
         assert_eq!(raster.alpha, None);
         assert!(
-            !raster
-                .rgb
-                .chunks_exact(3)
-                .any(|pixel| pixel == [0, 96, 255]),
+            !raster.rgb.as_chunks::<3>().0.contains(&[0, 96, 255]),
             "later WebP frames must not contribute samples: {raster:?}"
         );
     }
@@ -1246,10 +1321,7 @@ mod tests {
         assert_eq!(&raster.rgb[0..3], &[230, 32, 16]);
         assert_eq!(&raster.rgb[6..9], &[10, 20, 30]);
         assert!(
-            !raster
-                .rgb
-                .chunks_exact(3)
-                .any(|pixel| pixel == [0, 96, 255]),
+            !raster.rgb.as_chunks::<3>().0.contains(&[0, 96, 255]),
             "later GIF frames must not contribute samples: {raster:?}"
         );
     }

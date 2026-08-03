@@ -402,6 +402,11 @@ pub(crate) enum WordBreak {
     Normal,
     BreakAll,
     KeepAll,
+    /// CSS Text 4 retains ordinary wrapping except within language-detected
+    /// phrases. The phrase detector itself lives at the inline paragraph
+    /// boundary, where it can preserve one source coordinate system.
+    /// <https://drafts.csswg.org/css-text-4/#valdef-word-break-auto-phrase>
+    AutoPhrase,
     /// CSS Text 4 disables automatic word-boundary detection in complex
     /// (notably Southeast Asian) scripts while retaining manual breaks.
     /// <https://drafts.csswg.org/css-text-4/#word-boundary-detection>
@@ -551,18 +556,30 @@ impl HyphenateCharacter {
     /// <https://drafts.csswg.org/css-text-4/#hyphenate-character>
     pub(crate) fn used_text_for_language(&self, language: Option<&str>) -> &str {
         match self {
-            Self::Auto => match language.map(str::to_ascii_lowercase).as_deref() {
+            Self::Auto => match language {
                 // Uyghur uses kashida as its conventional discretionary
                 // marker. The graph materializer supplies the ZWJ context at
                 // a joining-script source boundary.
-                Some(language) if language == "ug" || language.starts_with("ug-") => "\u{0640}",
+                Some(language) if language_has_primary_subtag(language, "ug") => "\u{0640}",
                 // Canadian Aboriginal Syllabics uses U+1400 HYPHEN.
-                Some(language) if language == "cr" || language.starts_with("cr-") => "\u{1400}",
+                Some(language) if language_has_primary_subtag(language, "cr") => "\u{1400}",
                 _ => "-",
             },
             Self::String(value) => value,
         }
     }
+}
+
+/// Match an ASCII BCP 47 primary language subtag without allocating a
+/// normalized copy of the full tag.
+fn language_has_primary_subtag(language: &str, primary: &str) -> bool {
+    language
+        .get(..primary.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(primary))
+        && language
+            .as_bytes()
+            .get(primary.len())
+            .is_none_or(|separator| *separator == b'-')
 }
 
 /// Computed value of CSS `hyphenate-limit-chars`.
@@ -602,5 +619,34 @@ impl ResolveViewportLengths for BaselineShift {
 impl ResolveViewportLengths for VerticalAlign {
     fn resolve_viewport_lengths(&mut self, basis: ViewportLengthBasis) {
         self.baseline_shift.resolve_viewport_lengths(basis);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn automatic_hyphenate_character_matches_ascii_language_subtags_without_normalizing() {
+        let automatic = HyphenateCharacter::Auto;
+        assert_eq!(automatic.used_text_for_language(Some("ug")), "\u{0640}");
+        assert_eq!(
+            automatic.used_text_for_language(Some("UG-Arab-CN")),
+            "\u{0640}"
+        );
+        assert_eq!(automatic.used_text_for_language(Some("Cr")), "\u{1400}");
+        assert_eq!(
+            automatic.used_text_for_language(Some("CR-Latn")),
+            "\u{1400}"
+        );
+        assert_eq!(automatic.used_text_for_language(Some("ugx")), "-");
+        assert_eq!(automatic.used_text_for_language(Some("crx")), "-");
+        assert_eq!(automatic.used_text_for_language(None), "-");
+    }
+
+    #[test]
+    fn explicit_hyphenate_character_does_not_depend_on_language() {
+        let explicit = HyphenateCharacter::String("=".into());
+        assert_eq!(explicit.used_text_for_language(Some("UG-Arab")), "=");
     }
 }

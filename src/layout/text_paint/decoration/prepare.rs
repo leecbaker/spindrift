@@ -21,7 +21,7 @@ pub(in crate::layout) fn prepare_text_decoration_strokes(
         phase,
         color,
         color_override,
-        metrics,
+        geometry,
     } = input;
     if inline_span.length() <= 0.0 {
         return Vec::new();
@@ -40,14 +40,14 @@ pub(in crate::layout) fn prepare_text_decoration_strokes(
 
     let underline_thickness = used_text_decoration_thickness(
         decoration.thickness.clone(),
-        style.font_size,
-        &metrics,
+        decoration_thickness_font_size(&decoration.thickness, geometry),
+        &geometry.considered_metrics,
         false,
     );
     let strikeout_thickness = used_text_decoration_thickness(
         decoration.thickness.clone(),
-        style.font_size,
-        &metrics,
+        decoration_thickness_font_size(&decoration.thickness, geometry),
+        &geometry.considered_metrics,
         true,
     );
     let mut strokes = Vec::new();
@@ -64,10 +64,11 @@ pub(in crate::layout) fn prepare_text_decoration_strokes(
                 axis,
                 baseline.x,
                 baseline.y,
-                style,
+                geometry.considered_font_size,
+                style.writing_mode,
                 decoration.underline_position,
                 decoration.underline_offset.clone(),
-                &metrics,
+                &geometry.considered_metrics,
                 underline_thickness,
                 TextDecorationPreparedLineKind::Underline,
             ),
@@ -91,10 +92,11 @@ pub(in crate::layout) fn prepare_text_decoration_strokes(
                 axis,
                 baseline.x,
                 baseline.y,
-                style,
+                geometry.considered_font_size,
+                style.writing_mode,
                 decoration.underline_position,
                 decoration.underline_offset.clone(),
-                &metrics,
+                &geometry.considered_metrics,
                 underline_thickness,
                 TextDecorationPreparedLineKind::Overline,
             ),
@@ -118,10 +120,11 @@ pub(in crate::layout) fn prepare_text_decoration_strokes(
                 axis,
                 baseline.x,
                 baseline.y,
-                style,
+                geometry.considered_font_size,
+                style.writing_mode,
                 decoration.underline_position,
                 decoration.underline_offset.clone(),
-                &metrics,
+                &geometry.considered_metrics,
                 strikeout_thickness,
                 TextDecorationPreparedLineKind::LineThrough,
             ),
@@ -142,10 +145,11 @@ pub(in crate::layout) fn prepare_text_decoration_strokes(
                 axis,
                 baseline.x,
                 baseline.y,
-                style,
+                geometry.considered_font_size,
+                style.writing_mode,
                 decoration.underline_position,
                 decoration.underline_offset.clone(),
-                &metrics,
+                &geometry.considered_metrics,
                 underline_thickness,
                 TextDecorationPreparedLineKind::Underline,
             ),
@@ -166,10 +170,11 @@ pub(in crate::layout) fn prepare_text_decoration_strokes(
                 axis,
                 baseline.x,
                 baseline.y,
-                style,
+                geometry.considered_font_size,
+                style.writing_mode,
                 decoration.underline_position,
                 decoration.underline_offset,
-                &metrics,
+                &geometry.considered_metrics,
                 underline_thickness,
                 TextDecorationPreparedLineKind::Underline,
             ),
@@ -182,6 +187,23 @@ pub(in crate::layout) fn prepare_text_decoration_strokes(
     }
 
     strokes
+}
+
+/// Select the percentage basis for a decoration thickness.
+///
+/// Explicit lengths and percentages are values of the decorating origin;
+/// automatic and font-derived thickness are selected from the considered text
+/// on this line.
+fn decoration_thickness_font_size(
+    thickness: &TextDecorationThickness,
+    geometry: TextDecorationLineGeometry,
+) -> f32 {
+    match thickness {
+        TextDecorationThickness::Auto | TextDecorationThickness::FromFont => {
+            geometry.considered_font_size
+        }
+        TextDecorationThickness::LengthPercentage(_) => geometry.origin_font_size,
+    }
 }
 
 pub(in crate::layout) fn text_decoration_inline_span(
@@ -225,7 +247,8 @@ pub(in crate::layout) fn text_decoration_block_position(
     axis: TextDecorationStrokeAxis,
     x: f32,
     baseline_y: f32,
-    style: &ComputedStyle,
+    considered_font_size: f32,
+    writing_mode: WritingMode,
     underline_position: TextUnderlinePosition,
     underline_offset: TextUnderlineOffset,
     metrics: &TextDecorationFontMetrics,
@@ -234,40 +257,51 @@ pub(in crate::layout) fn text_decoration_block_position(
 ) -> f32 {
     match axis {
         TextDecorationStrokeAxis::Horizontal => match kind {
-            TextDecorationPreparedLineKind::Underline => used_underline_y(
-                baseline_y,
-                underline_position,
-                underline_offset,
-                style.font_size,
-                metrics,
-                thickness,
-            ),
-            TextDecorationPreparedLineKind::Overline => baseline_y + style.font_size,
+            // The CSS zero position is the inner edge of an underline. In
+            // page coordinates text-under points toward decreasing y, so the
+            // painted stroke extends its full thickness outward from that
+            // edge rather than back through the glyph ink.
+            // <https://drafts.csswg.org/css-text-decor-4/#text-underline-offset-property>
+            TextDecorationPreparedLineKind::Underline => {
+                used_underline_y(
+                    baseline_y,
+                    underline_position,
+                    underline_offset,
+                    considered_font_size,
+                    metrics,
+                ) - thickness
+            }
+            TextDecorationPreparedLineKind::Overline => baseline_y + considered_font_size,
             TextDecorationPreparedLineKind::LineThrough => baseline_y + metrics.strikeout_position,
         },
         TextDecorationStrokeAxis::Vertical => {
-            let offset = used_text_underline_offset(underline_offset, style.font_size).max(0.0);
             match kind {
                 TextDecorationPreparedLineKind::Underline => {
+                    // `text-underline-offset` applies only to the underline;
+                    // it must not move an overline or a line-through.  Keep
+                    // the signed used value: a negative offset intentionally
+                    // moves an underline back toward the text.
+                    // <https://www.w3.org/TR/css-text-decor-4/#text-underline-offset-property>
+                    let offset = used_text_underline_offset(underline_offset, considered_font_size);
                     vertical_text_decoration_side_position(
                         x,
-                        style,
-                        resolve_vertical_underline_side(underline_position, style.writing_mode),
+                        considered_font_size,
+                        resolve_vertical_underline_side(underline_position, writing_mode),
                         thickness,
                         offset,
                     )
                 }
                 TextDecorationPreparedLineKind::Overline => vertical_text_decoration_side_position(
                     x,
-                    style,
+                    considered_font_size,
                     opposite_text_decoration_side(resolve_vertical_underline_side(
                         underline_position,
-                        style.writing_mode,
+                        writing_mode,
                     )),
                     thickness,
-                    offset,
+                    0.0,
                 ),
-                TextDecorationPreparedLineKind::LineThrough => x + style.font_size * 0.5,
+                TextDecorationPreparedLineKind::LineThrough => x + considered_font_size * 0.5,
             }
         }
     }
@@ -317,14 +351,14 @@ pub(in crate::layout) fn opposite_text_decoration_side(
 
 pub(in crate::layout) fn vertical_text_decoration_side_position(
     x: f32,
-    style: &ComputedStyle,
+    font_size: f32,
     side: TextDecorationSide,
     thickness: f32,
     offset: f32,
 ) -> f32 {
     match side {
         TextDecorationSide::Left => x - thickness - offset,
-        TextDecorationSide::Right => x + style.font_size + offset,
+        TextDecorationSide::Right => x + font_size + offset,
     }
 }
 

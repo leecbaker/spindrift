@@ -2,6 +2,35 @@ use super::*;
 use crate::layout::builder::{page_for_context, positioned_layer_fragment};
 use crate::layout::flex::compute::effective_align_self;
 
+/// Convert Flexbox's main-axis content alignment into the equivalent
+/// self-alignment used to retain an abspos child's static-position rectangle.
+/// Distributed values use the one-item fallback required by Flexbox.
+/// <https://www.w3.org/TR/css-flexbox-1/#abspos-items>
+/// <https://drafts.csswg.org/css-align-3/#distribution-fallback>
+fn flex_static_main_alignment(alignment: css::ContentAlignment) -> css::SelfAlignment {
+    let keyword = match alignment.keyword {
+        css::ContentAlignmentKeyword::Normal
+        | css::ContentAlignmentKeyword::Start
+        | css::ContentAlignmentKeyword::FlexStart
+        | css::ContentAlignmentKeyword::Stretch
+        | css::ContentAlignmentKeyword::SpaceBetween
+        | css::ContentAlignmentKeyword::Baseline
+        | css::ContentAlignmentKeyword::LastBaseline => SelfAlignmentKeyword::Start,
+        css::ContentAlignmentKeyword::End | css::ContentAlignmentKeyword::FlexEnd => {
+            SelfAlignmentKeyword::End
+        }
+        css::ContentAlignmentKeyword::Left => SelfAlignmentKeyword::Left,
+        css::ContentAlignmentKeyword::Right => SelfAlignmentKeyword::Right,
+        css::ContentAlignmentKeyword::Center
+        | css::ContentAlignmentKeyword::SpaceAround
+        | css::ContentAlignmentKeyword::SpaceEvenly => SelfAlignmentKeyword::Center,
+    };
+    css::SelfAlignment {
+        keyword,
+        safety: alignment.safety,
+    }
+}
+
 /// Record the visible block-end of one committed nested table fragment.
 ///
 /// Flex owns the outer source range, but a table's repeated chrome can make
@@ -55,19 +84,20 @@ impl<'a> LayoutBuilder<'a> {
         signature: &ElementSignature,
         style: &ComputedStyle,
         child_boxes: &[box_tree::FormattingBox<'_>],
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         baseline_shift: f32,
         link_target: Option<String>,
     ) -> InlineAtom {
+        let containment = used_property_containment(element, style);
         let available_outer_width = layout_pt(
             (self.content_right - self.content_left - style.margin.left - style.margin.right)
                 .max(style.font_size),
         );
         let mut used_style =
-            FlexUsedStyle::from_normalized(self.style_with_current_viewport_lengths(style));
-        let box_metrics = apply_used_box_metrics(
+            FlexUsedStyle::from_normalized(self.style_with_current_used_lengths(style));
+        let box_metrics = apply_used_box_metrics_for_logical_inline_basis(
             &mut used_style,
-            PercentageBasis::definite(available_outer_width),
+            self.current_content_logical_inline_percentage_basis(),
         );
         let style = &used_style;
         let border_widths = box_metrics.border.to_css_edges();
@@ -75,8 +105,8 @@ impl<'a> LayoutBuilder<'a> {
         let vertical_non_content = box_metrics.vertical_non_content_length();
         let (mut children, mut positioned_children) =
             flex_child_lists_from_boxes(element, signature, style, child_boxes);
-        self.resolve_styled_children_viewport_lengths(&mut children);
-        self.resolve_styled_children_viewport_lengths(&mut positioned_children);
+        self.resolve_styled_children_used_lengths(&mut children);
+        self.resolve_styled_children_used_lengths(&mut positioned_children);
 
         let height_percentage_basis = self.flex_container_height_percentage_basis();
         let intrinsic_content_height = used_content_box_height_or_auto_with_basis(
@@ -88,7 +118,7 @@ impl<'a> LayoutBuilder<'a> {
         // for the principal flex box. The real flex layout still runs below so
         // descendants paint, overflow, and contribute the exported baseline.
         // <https://www.w3.org/TR/css-contain-1/#containment-size>
-        let intrinsic = if style.contain.size {
+        let intrinsic = if containment.size {
             FlexItemEstimate::fixed(
                 PhysicalContentWidth::new(content_box_pt(0.0)),
                 PhysicalContentHeight::new(content_box_pt(0.0)),
@@ -156,7 +186,7 @@ impl<'a> LayoutBuilder<'a> {
                 0.0,
                 InlineVisualOffset::zero(),
                 style,
-                style.text_decoration.clone(),
+                style.text_decoration_layers.clone(),
                 &mut items,
             );
             let measurement =
@@ -173,8 +203,12 @@ impl<'a> LayoutBuilder<'a> {
             let border_box_height = content_height + vertical_non_content.points();
             let line_baseline_offset =
                 self.inline_box_sequence_baseline_offset(&sequence, style, border_widths);
-            let baseline_offset =
-                Self::inline_block_baseline_offset(style, border_box_height, line_baseline_offset);
+            let baseline_offset = Self::inline_block_baseline_offset(
+                style,
+                containment.layout,
+                border_box_height,
+                line_baseline_offset,
+            );
             let overflow_offset = if style.flex_direction == FlexDirection::RowReverse
                 && style.direction == Direction::Ltr
             {
@@ -266,7 +300,7 @@ impl<'a> LayoutBuilder<'a> {
             );
         };
 
-        let total_content_height = if style.contain.size {
+        let total_content_height = if containment.size {
             definite_content_height.unwrap_or_else(|| {
                 constrain_content_height(
                     style,
@@ -301,7 +335,7 @@ impl<'a> LayoutBuilder<'a> {
         // Inline-fragment and paint APIs are legacy scalar boundaries. Keep
         // the border-box conversion above typed until this projection.
         let border_box_height_points = border_box_height.points();
-        let estimated_baseline_offset = (!style.contain.layout)
+        let estimated_baseline_offset = (!containment.layout)
             .then(|| inline_flex_exported_vertical_baseline(flex_layout.baselines))
             .flatten()
             .map(|baseline| border_widths.top + style.padding.top + baseline.points())
@@ -401,6 +435,9 @@ impl<'a> LayoutBuilder<'a> {
                             .unwrap_or_else(PercentageBasis::indefinite),
                     },
                     inner_inline_span: PageInlineSpan::new(inner_x, inner_width),
+                    content_height: PhysicalContentHeight::new(content_box_pt(
+                        total_content_height,
+                    )),
                     content_top: PageTopBlockPosition::new(content_top),
                     source_fragment_block_offset: FlexFragmentBlockOffset::new(0.0),
                     first_fragment_source_block_size: FlexFragmentBlockSize::new(0.0),
@@ -568,10 +605,12 @@ impl<'a> LayoutBuilder<'a> {
         if hypothetical_child.style.display.is_inline_level() {
             hypothetical_child.style.display = hypothetical_child.style.display.blockified();
         }
+        let mut hypothetical_container_style = context.container_style.clone();
+        resolve_static_flex_probe_justify_content(&mut hypothetical_container_style);
         let hypothetical = self
             .compute_flex_layout(
                 std::slice::from_ref(&hypothetical_child),
-                context.container_style,
+                &hypothetical_container_style,
                 context.stylesheets,
                 context.available,
             )
@@ -598,30 +637,53 @@ impl<'a> LayoutBuilder<'a> {
         let static_top =
             context.content_top.points() - hypothetical.y().points() + child.style.margin.top;
         let flex_axes = FlexAxes::for_style(context.container_style);
-        let main_axis_centers = matches!(
-            context.container_style.justify_content.keyword,
-            css::ContentAlignmentKeyword::Center
+        let main_alignment =
+            flex_static_main_alignment(hypothetical_container_style.justify_content);
+        let cross_alignment = effective_align_self(&child.style, context.container_style);
+        let container_axes = WritingModeAxes::new(
+            context.container_style.writing_mode,
+            context.container_style.used_direction(),
         );
-        let cross_axis_centers = matches!(
-            effective_align_self(&child.style, context.container_style).keyword,
-            SelfAlignmentKeyword::Center
-        );
-        let flex_alignment = FlexAbsposStaticAlignment {
-            area: PageTopRect::new(
-                static_left,
-                static_top,
-                (static_right - static_left).max(0.0),
-                (hypothetical.height().points()
-                    + child.style.margin.top
-                    + child.style.margin.bottom)
-                    .max(0.0),
-            ),
-            centers_horizontal: if flex_axes.is_main_row_axis() {
-                main_axis_centers
-            } else {
-                cross_axis_centers
-            },
+        let main_is_inline = if flex_axes.is_main_row_axis() {
+            !container_axes.swaps_physical_axes()
+        } else {
+            container_axes.swaps_physical_axes()
         };
+        let (inline_alignment, block_alignment) = if main_is_inline {
+            (main_alignment, cross_alignment)
+        } else {
+            (cross_alignment, main_alignment)
+        };
+        let hypothetical_outer_height =
+            (hypothetical.height().points() + child.style.margin.top + child.style.margin.bottom)
+                .max(0.0);
+        // Flexbox gives the static-position rectangle the container's content
+        // edges in the cross axis, while the sole hypothetical item's margin
+        // edges determine it in the main axis. This distinction is essential
+        // when the eventual abspos size differs from the sizing probe.
+        // <https://www.w3.org/TR/css-flexbox-1/#abspos-items>
+        let static_area = if flex_axes.is_main_row_axis() {
+            PageTopRect::new(
+                static_left,
+                context.content_top.points(),
+                (static_right - static_left).max(0.0),
+                context.content_height.points(),
+            )
+        } else {
+            PageTopRect::new(
+                context.inner_inline_span.left_x(),
+                static_top,
+                context.inner_inline_span.width(),
+                hypothetical_outer_height,
+            )
+        };
+        let static_alignment = AbsposStaticAlignment::new(
+            static_area,
+            context.container_style.writing_mode,
+            context.container_style.used_direction(),
+            inline_alignment,
+            block_alignment,
+        );
         let source_static_block_start = layout_pt(hypothetical.y().points().max(0.0));
         let source_static_block_end = layout_pt(
             (hypothetical.y().points()
@@ -632,7 +694,7 @@ impl<'a> LayoutBuilder<'a> {
         );
         (
             PositionedChildStaticRect::new(static_left, static_right, static_top)
-                .with_flex_alignment(flex_alignment),
+                .with_static_alignment(static_alignment),
             (source_static_block_start, source_static_block_end),
         )
     }
@@ -647,7 +709,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         child: &StyledChild<'_>,
         placed_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         context: SplitFlexItemPaintContext,
         replay: SplitFlexItemReplayState<'_>,
     ) {
@@ -672,26 +734,48 @@ impl<'a> LayoutBuilder<'a> {
         // <https://www.w3.org/TR/css-tables-3/#computing-the-table-height>
         let mut table_replay_style = placed_style.clone();
         if child_fragment_replay {
-            table_replay_style.box_values.height = css::ComputedLengthPercentageOrAuto::Auto;
+            table_replay_style
+                .box_values
+                .height
+                .replace_with_used(css::ComputedLengthPercentageOrAuto::Auto);
         }
         let replay_style = if child_fragment_replay {
             &table_replay_style
         } else {
             placed_style
         };
+        // The parent flex fragment has already committed the ordinary
+        // item's used principal decoration at each materialized slice. This
+        // source-canvas replay contributes only the item's formatting
+        // context; allowing block layout to paint the same principal again
+        // produces duplicate background edges on continuation pages.
+        // Tables and replaced elements retain their dedicated decoration
+        // replay paths.
+        // <https://www.w3.org/TR/css-flexbox-1/#pagination>
+        // <https://www.w3.org/TR/css-break-3/#box-splitting>
+        let replay_owns_principal_decoration = !table_replay
+            && !child
+                .element_parts()
+                .is_some_and(|(element, _, _)| is_replaced_element(element));
+        let replay_has_descendant_paint = child
+            .element_parts()
+            .is_none_or(|(_, _, children)| children.is_some_and(|children| !children.is_empty()));
         let table_first_capacity = context.continuation.first_fragmentainer_capacity.points();
         let table_continuation_capacity = context
             .continuation
             .continuation_fragmentainer_capacity
             .points();
-        let content_slice_start = if context.replay_source_slice_offset {
-            context
-                .continuation
-                .source_content_slice
-                .block_start
-                .points()
-        } else {
-            0.0
+        let source_canvas_slice_start = match context.replay_origin {
+            // Visible descendant overflow belongs to one frozen item source
+            // canvas. Every committed flex continuation must translate that
+            // canvas by its own recorded source start, irrespective of the
+            // flex main axis or whether the container wraps.
+            FlexItemReplayOrigin::SourceSlice => {
+                context.continuation.source_canvas_block_start.points()
+            }
+            // A child that fragments on its own is replayed from its
+            // committed local fragment selected by continuation ordinal.
+            FlexItemReplayOrigin::ChildFragment => 0.0,
         };
         if slice_border_box.height() <= 0.0 {
             return;
@@ -713,7 +797,13 @@ impl<'a> LayoutBuilder<'a> {
                 .clone()
                 .translated(PaintTranslation::new(
                     slice_border_box.x(),
-                    slice_border_box.y(),
+                    // Each cached child fragment is already expressed in its
+                    // own destination fragmentainer's page-local block
+                    // coordinates. Reapplying the outer flex slice's block
+                    // offset shifts the final partial fragment below its
+                    // clip and drops nested overflow paint.
+                    // <https://www.w3.org/TR/css-break-3/#box-splitting>
+                    0.0,
                 ))
                 // A primitive clip would flatten nested stacking contexts and
                 // lose effects such as descendant opacity. Keep the committed
@@ -735,7 +825,9 @@ impl<'a> LayoutBuilder<'a> {
             {
                 *replay_destination_block_end = Some(slice_border_box.y() + *local_block_end);
             }
-            self.append_split_flex_item_replay(placed_style, slice_border_box, fragment);
+            if !replay_owns_principal_decoration || replay_has_descendant_paint {
+                self.append_split_flex_item_replay(placed_style, slice_border_box, fragment);
+            }
             return;
         }
 
@@ -798,7 +890,7 @@ impl<'a> LayoutBuilder<'a> {
                     ContainingBlock::from_page_top_rect(PageTopRect::new(
                         containing_block.x() - slice_border_box.x(),
                         offpage_top + containing_block.top_y() - source_item_top
-                            + content_slice_start,
+                            + source_canvas_slice_start,
                         containing_block.width(),
                         containing_block.height(),
                     ))
@@ -836,6 +928,11 @@ impl<'a> LayoutBuilder<'a> {
             },
             replay_style,
             |layout| {
+                let previous_suppress_principal_box_decoration =
+                    layout.suppress_next_principal_box_decoration;
+                if replay_owns_principal_decoration {
+                    layout.suppress_next_principal_box_decoration = true;
+                }
                 if child_fragment_replay {
                     layout.layout_split_flex_item_continuation_contents(
                         child,
@@ -851,8 +948,33 @@ impl<'a> LayoutBuilder<'a> {
                         context.percentage_height_basis,
                     );
                 }
+                layout.suppress_next_principal_box_decoration =
+                    previous_suppress_principal_box_decoration;
             },
         );
+
+        // A descendant-overflow replay lays the complete child tree once on
+        // its off-page source canvas, then lets the flex fragment plan select
+        // visible slices. Unlike an independently fragmenting child it does
+        // not populate `replay_fragment_local_block_ends`, but its final
+        // logical block end is still available from the scratch cursor. Export
+        // it for the one destination slice that contains that end so the
+        // automatic flex wrapper and following normal flow do not claim the
+        // unused tail of the final page.
+        // <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+        // <https://www.w3.org/TR/css-flexbox-1/#pagination>
+        if !table_replay && !child_fragment_replay {
+            let source_end = offpage_top - self.cursor_y;
+            let source_slice = context.continuation.source_content_slice;
+            if source_end >= source_slice.block_start.points() - 0.01
+                && source_end <= source_slice.block_end.points() + 0.01
+            {
+                *replay_destination_block_end = Some(
+                    slice_border_box.y()
+                        - (source_end - source_slice.block_start.points()).max(0.0),
+                );
+            }
+        }
 
         if child_fragment_replay && table_replay_fragments.is_empty() {
             table_replay_fragments.extend(
@@ -901,7 +1023,7 @@ impl<'a> LayoutBuilder<'a> {
         } else {
             PaintTranslation::new(
                 slice_border_box.x(),
-                source_item_top - offpage_top - content_slice_start,
+                source_item_top - offpage_top - source_canvas_slice_start,
             )
         };
         let source_fragment = if child_fragment_replay {
@@ -923,11 +1045,22 @@ impl<'a> LayoutBuilder<'a> {
         // lets a tall descendant background cover a later flex item's owner.
         // <https://www.w3.org/TR/css-break-3/#box-splitting>
         // <https://www.w3.org/TR/css-color-4/#transparency>
-        let fragment = if context.has_descendant_source_overflow {
-            fragment.with_primitives_clipped_to_rect_preserving_structure(slice_border_box)
-        } else {
-            fragment.with_contents_effect_scoped_to_rect(slice_border_box)
-        };
+        // The selected flex slice constrains every descendant paint band,
+        // including an ordinary nested block's background. A contents-only
+        // overflow scope leaves that nested BackgroundBorder band outside the
+        // continuation clip, so a final partial slice either disappears under
+        // the flex container's background or paints through later siblings.
+        // Preserve the nested paint-tree structure while clipping it at the
+        // common fragment-span boundary.
+        // <https://www.w3.org/TR/css-break-3/#box-splitting>
+        let fragment =
+            fragment.with_primitives_clipped_to_rect_preserving_structure(slice_border_box);
+        // The geometric fragmentainer slice above has already trimmed the
+        // captured primitive tree. Do not wrap it in a second PDF overflow
+        // clip: applying one around the complete stacking context
+        // antialiases a background at every page edge, unlike the equivalent
+        // ordinary block which paints each used slice directly.
+        // <https://www.w3.org/TR/css-break-3/#box-splitting>
         if table_replay {
             record_table_replay_fragment_bottom(
                 table_replay_fragment_bottoms,
@@ -943,7 +1076,16 @@ impl<'a> LayoutBuilder<'a> {
         }
         self.restore(snapshot);
 
-        self.append_split_flex_item_replay(placed_style, slice_border_box, fragment);
+        // An empty size-contained flex item has no descendant paint to replay:
+        // its durable flex fragment span has already materialized the full
+        // principal border-box decoration for every destination page. Replaying
+        // the scratch tree would add that same decoration a second time, with
+        // a different local fragmentainer origin on continuations.
+        // <https://drafts.csswg.org/css-contain-1/#containment-size>
+        // <https://drafts.csswg.org/css-break-3/#box-splitting>
+        if !replay_owns_principal_decoration || replay_has_descendant_paint {
+            self.append_split_flex_item_replay(placed_style, slice_border_box, fragment);
+        }
 
         // A layer which escaped the split item belongs to the flex
         // container's containing block. Positioned layout has therefore
@@ -977,9 +1119,7 @@ impl<'a> LayoutBuilder<'a> {
             return;
         }
         let policy = StackingContextPolicy::for_flex_item(placed_style, slice_border_box);
-        let mut effects = policy.effects;
-        effects.overflow_clip = Some(slice_border_box);
-        effects.absolute_clip = Some(slice_border_box);
+        let effects = policy.effects;
         let context = PaintStackingContext::from_banded_fragment(fragment, Vec::new())
             .with_source_order(self.next_paint_source_order())
             .with_effects(effects)
@@ -990,15 +1130,14 @@ impl<'a> LayoutBuilder<'a> {
         );
     }
 
-    pub(in crate::layout::flex) fn resolve_styled_children_viewport_lengths(
-        &self,
+    pub(in crate::layout::flex) fn resolve_styled_children_used_lengths(
+        &mut self,
         children: &mut [StyledChild<'_>],
     ) {
         for child in children {
-            self.resolve_style_current_viewport_lengths(&mut child.style);
-            // Flex item sizing consumes the item style directly rather than
-            // rebuilding it through a normal-flow used-style helper.
-            child.style.apply_effective_zoom();
+            child.style = self
+                .style_with_current_used_lengths(&child.style)
+                .into_computed();
         }
     }
 }
@@ -1015,9 +1154,11 @@ pub(in crate::layout::flex) fn inline_flex_synthesized_baseline_offset(
     border_box_height: BorderBoxLength,
 ) -> FlexVerticalBaselineOffset {
     match style.writing_mode {
-        WritingMode::HorizontalTb => {
-            FlexVerticalBaselineOffset::new(border_box_height.points() + style.margin.bottom)
-        }
+        // `InlineAtom` stores its exported baseline from the border-box
+        // block start. The shared atomic-inline adapter adds the block-start
+        // margin and compares it with the complete margin-box size, so adding
+        // the block-end margin here would count it twice.
+        WritingMode::HorizontalTb => FlexVerticalBaselineOffset::new(border_box_height.points()),
         WritingMode::VerticalRl
         | WritingMode::VerticalLr
         | WritingMode::SidewaysRl

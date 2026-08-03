@@ -157,16 +157,18 @@ than text shaping alone.
   Sideways glyph runs inside a table cell also project their horizontal
   baseline into that cell's vertical line box, without changing ordinary
   vertical text outside table layout.
-- Inline-table baseline selection now consults the first row's physical-Y
-  baseline eligibility. Orthogonal first-row cells no longer leak their
-  vertical painted line into a horizontal inline-table baseline; they use the
-  table's block-end fallback. Isolated vertical inline-tables also freeze
-  their logical inline track through physical `height` and expose their
-  logical block track as the parent-facing physical inline size. Speculative
-  inline-table track probes now restore their page state before the retained
-  atom fragment is built, so probe paint cannot escape into the parent line.
-  Inline-table replay retains the table-cell writing-mode and direction
-  context through final text paint, including reversed sideways RTL content.
+- Inline-table atoms export their first-row baseline as a logical block-axis
+  offset where an eligible row baseline exists, and otherwise synthesize the
+  table border-box block-end fallback. The enclosing line projects that
+  baseline through the table box rather than reapplying the wrapper's
+  block-start margin; `vertical-rl` no longer replaces the exported baseline
+  with a block-end shortcut. Isolated vertical inline-tables also freeze their
+  logical inline track through physical `height` and expose their logical block
+  track as the parent-facing physical inline size. Speculative inline-table
+  track probes now restore their page state before the retained atom fragment
+  is built, so probe paint cannot escape into the parent line. Inline-table
+  replay retains the table-cell writing-mode and direction context through
+  final text paint, including reversed sideways RTL content.
 - Vertical table roots now resolve their column-grid preferred size from the
   physical `height` property, and parent/float intrinsic sizing projects the
   table's logical block tracks to physical width. This prevents a vertical

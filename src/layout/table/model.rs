@@ -11,7 +11,7 @@ use std::ops::{Deref, DerefMut};
 #[derive(Debug, Clone)]
 pub(super) struct TableUsedStyle {
     source: ComputedStyle,
-    used: ComputedStyle,
+    used: css::ZoomedLayoutStyle,
 }
 
 pub(super) trait TableStyleSource {
@@ -31,8 +31,10 @@ impl TableStyleSource for TableUsedStyle {
 }
 
 impl TableUsedStyle {
-    pub(super) fn from_source_and_normalized(source: ComputedStyle, used: ComputedStyle) -> Self {
-        debug_assert!(used.zoom_applied);
+    pub(super) fn from_source_and_normalized(
+        source: ComputedStyle,
+        used: css::ZoomedLayoutStyle,
+    ) -> Self {
         Self { source, used }
     }
 
@@ -61,11 +63,102 @@ impl DerefMut for TableUsedStyle {
     }
 }
 
+/// The table-part box-model rule selected for rows and row groups.
+///
+/// CSS table rows and row groups do not establish ordinary margin, border, or
+/// padding boxes. In the collapsed-border model their authored borders remain
+/// candidates in the separate conflict-resolution algorithm, but never become
+/// layout insets or ordinary paint borders.
+/// <https://www.w3.org/TR/CSS22/tables.html#table-layers>
+/// <https://www.w3.org/TR/CSS22/tables.html#collapsing-borders>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TablePartBoxModel {
+    Separated,
+    Collapsed,
+}
+
+/// A border candidate supplied by a row or row group to collapsed-border
+/// conflict resolution. It cannot be constructed for separated tables.
+#[derive(Debug, Clone)]
+pub(super) struct CollapsedBorderParticipant {
+    style: ComputedStyle,
+}
+
+impl CollapsedBorderParticipant {
+    pub(super) fn style(&self) -> &ComputedStyle {
+        &self.style
+    }
+}
+
+/// Used style for a CSS table row or row group.
+///
+/// This deliberately does not dereference to [`ComputedStyle`]. Callers may
+/// use its decoration-free table-part layout style, or obtain a separately
+/// typed collapsed-border participant. The untouched source style remains
+/// available only as a cascade parent for descendants, so `border: inherit`
+/// on a cell keeps its normal CSS meaning.
+#[derive(Debug, Clone)]
+pub(super) struct TablePartUsedStyle {
+    source: TableUsedStyle,
+    layout: ComputedStyle,
+    collapsed_border_participant: Option<CollapsedBorderParticipant>,
+}
+
+impl TablePartUsedStyle {
+    pub(super) fn from_table_used(source: TableUsedStyle) -> Self {
+        let box_model = if source.border_collapse == css::BorderCollapse::Collapse {
+            TablePartBoxModel::Collapsed
+        } else {
+            TablePartBoxModel::Separated
+        };
+        let collapsed_border_participant =
+            matches!(box_model, TablePartBoxModel::Collapsed).then(|| {
+                let mut style = source.as_computed().clone();
+                // The conflict resolver needs an authored border candidate,
+                // not an ordinary row box. Keep border declarations intact
+                // while making the ignored padding and margin unavailable to
+                // that separate layout path as well.
+                strip_table_part_margin_and_padding(&mut style);
+                CollapsedBorderParticipant { style }
+            });
+        let mut layout = source.as_computed().clone();
+        strip_table_part_margin_and_padding(&mut layout);
+        layout.border_width = 0.0;
+        layout.border_widths = css::Edges::ZERO;
+        layout.border_width_values = css::CssEdges::all(css::ComputedLengthPercentage::ZERO);
+        layout.border_styles = css::BorderStyles::NONE;
+        Self {
+            source,
+            layout,
+            collapsed_border_participant,
+        }
+    }
+
+    pub(super) fn layout(&self) -> &ComputedStyle {
+        &self.layout
+    }
+
+    pub(super) fn collapsed_border_participant(&self) -> Option<&CollapsedBorderParticipant> {
+        self.collapsed_border_participant.as_ref()
+    }
+}
+
+fn strip_table_part_margin_and_padding(style: &mut ComputedStyle) {
+    style.margin = css::Edges::ZERO;
+    style.padding = css::Edges::ZERO;
+    style.box_values.padding = css::CssEdges::all(css::ComputedLengthPercentage::ZERO);
+}
+
+impl TableStyleSource for TablePartUsedStyle {
+    fn table_source(&self) -> &ComputedStyle {
+        self.source.source()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) enum DeclaredTableWidth {
     Fixed(f32),
     Percent(f32),
-    LengthPercentage(css::ComputedLengthPercentage),
 }
 
 #[derive(Debug, Clone)]
@@ -440,5 +533,83 @@ mod tests {
         );
         assert_eq!(border_box.width(), 55.0);
         assert_eq!(border_box.rect().size.height, 25.0);
+    }
+
+    fn table_part_style(border_collapse: css::BorderCollapse) -> TableUsedStyle {
+        let edges = |value| css::Edges {
+            top: value,
+            right: value,
+            bottom: value,
+            left: value,
+        };
+        let mut style = ComputedStyle::initial();
+        style.border_collapse = border_collapse;
+        style.margin = edges(7.0);
+        style.padding = edges(5.0);
+        style.box_values.padding =
+            css::CssEdges::all(css::ComputedLengthPercentage::from_points(5.0));
+        style.border_width = 3.0;
+        style.border_widths = edges(3.0);
+        style.border_width_values =
+            css::CssEdges::all(css::ComputedLengthPercentage::from_points(3.0));
+        style.border_styles = css::BorderStyles {
+            top: css::BorderStyle::Solid,
+            right: css::BorderStyle::Solid,
+            bottom: css::BorderStyle::Solid,
+            left: css::BorderStyle::Solid,
+        };
+        let source = style.clone();
+        TableUsedStyle::from_source_and_normalized(
+            source,
+            css::LayoutStyle::from_computed(&style).into_zoomed(),
+        )
+    }
+
+    #[test]
+    fn separated_table_parts_have_no_ordinary_box_model_or_border_participant() {
+        let part =
+            TablePartUsedStyle::from_table_used(table_part_style(css::BorderCollapse::Separate));
+
+        assert_eq!(part.layout().margin, css::Edges::ZERO);
+        assert_eq!(part.layout().padding, css::Edges::ZERO);
+        assert_eq!(part.layout().border_widths, css::Edges::ZERO);
+        assert_eq!(part.layout().border_styles, css::BorderStyles::NONE);
+        assert!(part.collapsed_border_participant().is_none());
+    }
+
+    #[test]
+    fn collapsed_table_parts_only_expose_borders_to_conflict_resolution() {
+        let part =
+            TablePartUsedStyle::from_table_used(table_part_style(css::BorderCollapse::Collapse));
+
+        assert_eq!(part.layout().border_widths, css::Edges::ZERO);
+        assert_eq!(
+            part.collapsed_border_participant()
+                .expect("collapsed table part needs a border participant")
+                .style()
+                .border_widths,
+            css::Edges {
+                top: 3.0,
+                right: 3.0,
+                bottom: 3.0,
+                left: 3.0,
+            }
+        );
+    }
+
+    #[test]
+    fn table_part_keeps_its_cascade_style_for_cell_inheritance() {
+        let part =
+            TablePartUsedStyle::from_table_used(table_part_style(css::BorderCollapse::Separate));
+
+        // The decoration-free layout view must not become the cascade parent:
+        // a cell with `padding: inherit` or `border: inherit` inherits the
+        // row's computed declaration, even though that declaration cannot
+        // create row box geometry.
+        let source = part.table_source();
+        assert_eq!(source.margin.left, 7.0);
+        assert_eq!(source.padding.left, 5.0);
+        assert_eq!(source.border_widths.left, 3.0);
+        assert_eq!(source.border_styles.left, css::BorderStyle::Solid);
     }
 }

@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 fn glyph(unicode: &str, advance: f32) -> RenderedGlyph {
     RenderedGlyph {
-        kind: crate::document::RenderedGlyphKind::Paint(1),
+        kind: crate::document::paint::text::RenderedGlyphKind::Paint(1),
         x_advance: advance,
         nominal_x_advance: advance,
         x_offset: 0.0,
@@ -63,12 +63,49 @@ fn prepared_decoration_strokes_for_style(
         phase,
         color: CssColor::BLACK,
         color_override: None,
-        metrics: decoration_metrics(),
+        geometry: TextDecorationLineGeometry {
+            origin_font_size: style.font_size,
+            considered_font_size: style.font_size,
+            considered_metrics: decoration_metrics(),
+        },
     })
 }
 
 #[test]
-fn prepared_decoration_horizontal_positions_match_legacy_offsets() {
+fn decoration_uses_its_origin_font_size_for_auto_thickness() {
+    let mut decorated_style = ComputedStyle::initial();
+    decorated_style.font_size = 10.0;
+    let mut origin_style = ComputedStyle::initial();
+    origin_style.font_size = 32.0;
+    let mut decoration = origin_style.text_decoration.clone();
+    decoration.underline = true;
+
+    let strokes = prepare_text_decoration_strokes(TextDecorationPreparationInput {
+        baseline: PaintPoint::new(10.0, 20.0),
+        inline_span: TextInlineSpan::from_start_and_length(10.0, 40.0),
+        inset_start: 0.0,
+        inset_end: 0.0,
+        style: &decorated_style,
+        decoration,
+        phase: TextDecorationPaintPhase::BeforeText,
+        color: CssColor::BLACK,
+        color_override: None,
+        geometry: TextDecorationLineGeometry {
+            origin_font_size: origin_style.font_size,
+            considered_font_size: decorated_style.font_size,
+            considered_metrics: decoration_metrics(),
+        },
+    });
+
+    assert_eq!(strokes.len(), 1);
+    assert!(
+        (strokes[0].thickness - 0.625).abs() < 0.01,
+        "automatic thickness must use the selected line's considered text"
+    );
+}
+
+#[test]
+fn prepared_decoration_horizontal_underline_extends_outward_from_zero_edge() {
     let mut style = ComputedStyle::initial();
     style.font_size = 10.0;
     let mut decoration = style.text_decoration.clone();
@@ -92,7 +129,7 @@ fn prepared_decoration_horizontal_positions_match_legacy_offsets() {
     assert_eq!(before[0].axis, TextDecorationStrokeAxis::Horizontal);
     assert!((before[0].inline_span.start - 10.0).abs() < 0.01);
     assert!((before[0].inline_span.length() - 40.0).abs() < 0.01);
-    assert!((before[0].block_position - 19.0).abs() < 0.01);
+    assert!((before[0].block_position - 18.375).abs() < 0.01);
     assert!((before[1].block_position - 30.0).abs() < 0.01);
     assert!((after[0].block_position - 23.0).abs() < 0.01);
 }
@@ -184,6 +221,35 @@ fn prepared_decoration_vertical_offset_moves_away_from_text() {
 }
 
 #[test]
+fn vertical_underline_offset_does_not_move_an_overline() {
+    let mut style = ComputedStyle::initial();
+    style.font_size = 10.0;
+    style.writing_mode = WritingMode::VerticalLr;
+    let mut decoration = style.text_decoration.clone();
+    decoration.overline = true;
+
+    let without_offset = prepared_decoration_strokes_for_style(
+        &style,
+        decoration.clone(),
+        TextDecorationPaintPhase::BeforeText,
+    );
+    decoration.underline_offset =
+        TextUnderlineOffset::LengthPercentage(ComputedLengthPercentage::from_points(4.0));
+    let with_offset = prepared_decoration_strokes_for_style(
+        &style,
+        decoration,
+        TextDecorationPaintPhase::BeforeText,
+    );
+
+    assert_eq!(without_offset.len(), 1);
+    assert_eq!(with_offset.len(), 1);
+    assert!(
+        (without_offset[0].block_position - with_offset[0].block_position).abs() < 0.01,
+        "overline must ignore text-underline-offset: {without_offset:?} {with_offset:?}"
+    );
+}
+
+#[test]
 fn prepared_decoration_skip_spaces_uses_rotated_run_offsets() {
     let runs = vec![RenderedTextRun {
         text: Rc::from(" A"),
@@ -209,6 +275,33 @@ fn prepared_decoration_skip_spaces_uses_rotated_run_offsets() {
     assert_eq!(ranges.len(), 1);
     assert!((ranges[0].0 - 90.0).abs() < 0.01, "{ranges:?}");
     assert!((ranges[0].1 - 100.0).abs() < 0.01, "{ranges:?}");
+}
+
+#[test]
+fn skip_ink_auto_keeps_a_short_stroke_when_ink_covers_its_entire_span() {
+    let inputs = TextDecorationSegmentInputs {
+        axis: TextDecorationStrokeAxis::Horizontal,
+        line_x: 0.0,
+        line_y: 0.0,
+        inline_start: 0.0,
+        inline_length: 10.0,
+        block_position: 0.0,
+        thickness: 10.0,
+        skip_ink: TextDecorationSkipInk::Auto,
+        skip_spaces: TextDecorationSkipSpaces::NONE,
+    };
+    let ink = [GlyphInkBox {
+        x_min: 0.0,
+        x_max: 10.0,
+        y_min: 0.0,
+        y_max: 10.0,
+    }];
+
+    let segments = text_decoration_segments(inputs, &[], &ink);
+
+    assert_eq!(segments.len(), 1);
+    assert!((segments[0].start - 0.0).abs() < 0.01, "{segments:?}");
+    assert!((segments[0].length - 10.0).abs() < 0.01, "{segments:?}");
 }
 
 #[test]

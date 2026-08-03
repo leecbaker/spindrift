@@ -10,13 +10,15 @@ use super::{
     PdfFontValidationProfile, embedded_font_candidate_key, embedded_font_plans_with_profile,
     embedded_font_plans_with_profile_and_mode, quantized_pdf_font_size, same_embedded_font_program,
 };
+use crate::document::paint::display_list::PaintBand;
+use crate::document::paint::text::{RenderedGlyph, RenderedLine, RenderedTextRun};
 use crate::document::{
-    CssFontVerticalMetrics, DocumentFontData, FontProgramKind, OpenTypeVerticalMetrics, PaintBand,
+    CssFontVerticalMetrics, DocumentFont, DocumentFontData, FontProgramKind,
+    OpenTypeVerticalMetrics,
 };
 use crate::{
-    CssColor, Document, DocumentFont, DocumentMetadata, Error, FontEmbeddingMode, Html, Page,
-    PdfCompression, PdfOptions, PdfProfile, RenderOptions, RenderedGlyph, RenderedLine,
-    RenderedTextRun,
+    CssColor, Document, DocumentMetadata, Error, FontEmbeddingMode, Html, Page, PdfCompression,
+    PdfOptions, PdfProfile, RenderOptions,
 };
 use fontique::Blob as FontiqueBlob;
 
@@ -193,6 +195,55 @@ fn pdf_searchable_text(pdf: &[u8]) -> String {
     text
 }
 
+#[tokio::test]
+async fn static_flex_item_abspos_descendant_paints_after_item_background() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 120pt 80pt; margin: 0 }\
+         html { display: flex; height: 100% }\
+         body { background: lime; display: flex; height: 40pt; margin: 0; width: 100pt }\
+         section { flex: 1; position: relative }\
+         .destination { background: red; height: 10pt; position: absolute; right: 0; top: 0; width: 20pt }\
+         </style><section><div class=\"destination\"></div></section>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+    let rendered = pdf_searchable_text(
+        &document
+            .write_pdf_bytes(&crate::PdfOptions::default())
+            .unwrap(),
+    );
+
+    let background = rendered
+        .find("/CSsRGB cs\n0 1 0 scn")
+        .expect("flex item background should be serialized");
+    let destination = rendered
+        .find("/CSsRGB cs\n1 0 0 scn")
+        .expect("absolute descendant should be serialized");
+    assert!(destination > background);
+}
+
+#[tokio::test]
+async fn ticket_definition_list_pdf_retains_later_description_borders() {
+    let document = Html::from_file("weasyprint-samples/ticket/ticket.html")
+        .await
+        .unwrap()
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+    let rendered = pdf_searchable_text(
+        &document
+            .write_pdf_bytes(&crate::PdfOptions::default())
+            .unwrap(),
+    );
+
+    // The first description matches `dd:first-of-type` and has no border;
+    // the remaining three column descriptions each contribute a 1pt × 42pt
+    // white border rectangle to the serialized PDF paint stream.
+    assert_eq!(rendered.matches("1 42 re").count(), 3);
+}
+
 fn pdf_stream_bounds(pdf: &[u8], stream_start: usize) -> Option<(usize, usize)> {
     let length_marker = b"/Length ";
     let dictionary_start = pdf[..stream_start]
@@ -336,8 +387,13 @@ fn assert_unique_form_resource_names(pdf: &[u8]) {
     }
 }
 
-fn green_rect(x: f32, y: f32, width: f32, height: f32) -> crate::RenderedRect {
-    crate::RenderedRect::new(
+fn green_rect(
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+) -> crate::document::paint::shapes::RenderedRect {
+    crate::document::paint::shapes::RenderedRect::new(
         x,
         y,
         width,
@@ -353,16 +409,16 @@ fn rounded_rects_participate_in_paint_order_and_pdf_serialization() {
     let mut page = Page::new(100.0, 100.0);
     page.push_rounded_rect_in_band(
         PaintBand::InFlowBlock,
-        crate::RenderedRoundedRect::new(
+        crate::document::paint::shapes::RenderedRoundedRect::new(
             10.0,
             10.0,
             30.0,
             20.0,
-            crate::RenderedRoundedRectRadii {
-                top_left: crate::RenderedCornerRadius::new(4.0, 4.0),
-                top_right: crate::RenderedCornerRadius::new(4.0, 4.0),
-                bottom_right: crate::RenderedCornerRadius::new(4.0, 4.0),
-                bottom_left: crate::RenderedCornerRadius::new(4.0, 4.0),
+            crate::document::paint::shapes::RenderedRoundedRectRadii {
+                top_left: crate::document::paint::shapes::RenderedCornerRadius::new(4.0, 4.0),
+                top_right: crate::document::paint::shapes::RenderedCornerRadius::new(4.0, 4.0),
+                bottom_right: crate::document::paint::shapes::RenderedCornerRadius::new(4.0, 4.0),
+                bottom_left: crate::document::paint::shapes::RenderedCornerRadius::new(4.0, 4.0),
             },
             Some(CssColor::BLACK),
             None,
@@ -379,7 +435,7 @@ fn rounded_rects_participate_in_paint_order_and_pdf_serialization() {
 
     assert_eq!(
         document.pages[0].paint_operations().as_ref(),
-        &[crate::PaintOperation::RoundedRect(0)]
+        &[crate::document::paint::page::PaintOperation::RoundedRect(0)]
     );
     assert!(
         document
@@ -428,11 +484,92 @@ fn paint_tree_batches_disjoint_same_fill_rectangles_into_one_path() {
 }
 
 #[test]
-fn paint_tree_preserves_opaque_underpaint_covered_by_later_rectangles() {
+fn opaque_text_coverage_keeps_separate_line_paint_boundaries() {
+    fn non_painting_coverage_line() -> RenderedLine {
+        RenderedLine::new(
+            "x".to_string(),
+            0.0,
+            0.0,
+            10.0,
+            None,
+            CssColor::BLACK,
+            vec![RenderedTextRun {
+                text: Rc::from("x"),
+                actual_text: None,
+                x_offset: 0.0,
+                y_offset: 0.0,
+                text_matrix: crate::document::paint::text::RenderedTextMatrix::IDENTITY,
+                font_size: 10.0,
+                font_id: None,
+                glyphs: Some(
+                    vec![RenderedGlyph {
+                        kind: crate::document::paint::text::RenderedGlyphKind::AdvanceOnly,
+                        x_advance: 10.0,
+                        nominal_x_advance: 0.0,
+                        x_offset: 0.0,
+                        y_offset: 0.0,
+                        unicode: "x".to_string(),
+                    }]
+                    .into(),
+                ),
+            }],
+        )
+    }
+
+    fn opaque_coverage_rect(y: f32) -> crate::document::paint::paths::RenderedPath {
+        let rect = crate::document::paint::geometry::PaintRect::new(
+            crate::document::paint::geometry::PaintPoint::new(0.0, y),
+            crate::document::paint::geometry::PaintSize::new(10.0, 10.0),
+        );
+        crate::document::paint::paths::RenderedPath::new(
+            vec![
+                crate::document::paint::paths::RenderedPathCommand::move_to(
+                    crate::document::paint::geometry::PaintPoint::new(0.0, y),
+                ),
+                crate::document::paint::paths::RenderedPathCommand::line_to(
+                    crate::document::paint::geometry::PaintPoint::new(10.0, y),
+                ),
+                crate::document::paint::paths::RenderedPathCommand::line_to(
+                    crate::document::paint::geometry::PaintPoint::new(10.0, y + 10.0),
+                ),
+                crate::document::paint::paths::RenderedPathCommand::line_to(
+                    crate::document::paint::geometry::PaintPoint::new(0.0, y + 10.0),
+                ),
+                crate::document::paint::paths::RenderedPathCommand::Close,
+            ],
+            Some(CssColor::BLACK),
+            crate::document::paint::paths::RenderedPathFillRule::NonZero,
+            None,
+            crate::PaintStrokeWidth::ZERO,
+            None,
+        )
+        .with_opaque_coverage_rect(rect)
+    }
+
+    let mut page = Page::new(100.0, 100.0);
+    page.push_opaque_text_coverage_in_band(
+        PaintBand::InFlowBlock,
+        non_painting_coverage_line(),
+        vec![opaque_coverage_rect(0.0)],
+    );
+    page.push_opaque_text_coverage_in_band(
+        PaintBand::InFlowBlock,
+        non_painting_coverage_line(),
+        vec![opaque_coverage_rect(10.0)],
+    );
+
+    let rendered = rendered_pdf_for_page(page);
+
+    assert_eq!(filled_rect_count(&rendered), 2, "{rendered}");
+    assert!(!rendered.contains("0 0 10 20 re\nf"), "{rendered}");
+}
+
+#[test]
+fn pdf_realization_elides_fully_obscured_opaque_underpaint() {
     let mut page = Page::new(100.0, 100.0);
     page.push_rect_in_band(
         PaintBand::InFlowBlock,
-        crate::RenderedRect::new(
+        crate::document::paint::shapes::RenderedRect::new(
             0.0,
             0.0,
             10.0,
@@ -444,10 +581,16 @@ fn paint_tree_preserves_opaque_underpaint_covered_by_later_rectangles() {
     );
     page.push_rect_in_band(PaintBand::InFlowBlock, green_rect(0.0, 0.0, 10.0, 10.0));
 
+    assert_eq!(
+        page.rects().len(),
+        2,
+        "the retained paint tree keeps both fills"
+    );
+
     let rendered = rendered_pdf_for_page(page);
 
-    assert_eq!(filled_rect_count(&rendered), 2);
-    assert!(rendered.contains("/CSsRGB cs\n1 0 0 scn\n0 0 10 10 re\nf"));
+    assert_eq!(filled_rect_count(&rendered), 1);
+    assert!(!rendered.contains("/CSsRGB cs\n1 0 0 scn\n0 0 10 10 re\nf"));
     assert!(rendered.contains("/CSsRGB cs\n0 1 0 scn\n0 0 10 10 re\nf"));
 }
 
@@ -477,15 +620,21 @@ fn paint_tree_rect_coalescing_flushes_before_vector_paths() {
     page.push_rect_in_band(PaintBand::InFlowBlock, green_rect(0.0, 0.0, 10.0, 10.0));
     page.push_path_in_band(
         PaintBand::InFlowBlock,
-        crate::RenderedPath::new(
+        crate::document::paint::paths::RenderedPath::new(
             vec![
-                crate::RenderedPathCommand::move_to(crate::PaintPoint::new(20.0, 20.0)),
-                crate::RenderedPathCommand::line_to(crate::PaintPoint::new(25.0, 20.0)),
-                crate::RenderedPathCommand::line_to(crate::PaintPoint::new(20.0, 25.0)),
-                crate::RenderedPathCommand::Close,
+                crate::document::paint::paths::RenderedPathCommand::move_to(
+                    crate::document::paint::geometry::PaintPoint::new(20.0, 20.0),
+                ),
+                crate::document::paint::paths::RenderedPathCommand::line_to(
+                    crate::document::paint::geometry::PaintPoint::new(25.0, 20.0),
+                ),
+                crate::document::paint::paths::RenderedPathCommand::line_to(
+                    crate::document::paint::geometry::PaintPoint::new(20.0, 25.0),
+                ),
+                crate::document::paint::paths::RenderedPathCommand::Close,
             ],
             Some(CssColor::BLACK),
-            crate::RenderedPathFillRule::NonZero,
+            crate::document::paint::paths::RenderedPathFillRule::NonZero,
             None,
             crate::PaintStrokeWidth::ZERO,
             None,
@@ -504,12 +653,12 @@ fn paint_tree_rect_coalescing_flushes_before_rounded_rectangles() {
     page.push_rect_in_band(PaintBand::InFlowBlock, green_rect(0.0, 0.0, 10.0, 10.0));
     page.push_rounded_rect_in_band(
         PaintBand::InFlowBlock,
-        crate::RenderedRoundedRect::new(
+        crate::document::paint::shapes::RenderedRoundedRect::new(
             20.0,
             20.0,
             10.0,
             10.0,
-            crate::RenderedRoundedRectRadii::ZERO,
+            crate::document::paint::shapes::RenderedRoundedRectRadii::ZERO,
             Some(CssColor::BLACK),
             None,
             crate::PaintStrokeWidth::ZERO,
@@ -928,6 +1077,34 @@ async fn non_positioned_opacity_emits_transparency_group_form_xobject() {
     assert!(rendered.contains("/Subtype /Form"));
     assert_transparency_group(&rendered);
     assert!(rendered.contains("/GSalpha500 gs"));
+}
+
+#[tokio::test]
+async fn inline_and_first_letter_opacity_emit_transparency_groups() {
+    let first_letter_pdf = Html::from_string(
+        "<style>@page { size: 100pt 100pt; margin: 0 } body, p { margin: 0 }\
+         p::first-letter { opacity: 0 }</style><p>First</p>",
+    )
+    .write_pdf_bytes(&RenderOptions::default(), &crate::PdfOptions::default())
+    .await
+    .unwrap();
+    let inline_pdf = Html::from_string(
+        "<style>@page { size: 100pt 100pt; margin: 0 } body, p { margin: 0 }\
+         fl { opacity: 0 }</style><p><fl>F</fl>irst</p>",
+    )
+    .write_pdf_bytes(&RenderOptions::default(), &crate::PdfOptions::default())
+    .await
+    .unwrap();
+    let first_letter_rendered = pdf_searchable_text(&first_letter_pdf);
+    let inline_rendered = pdf_searchable_text(&inline_pdf);
+
+    // The ordinary inline and the typographic pseudo both retain an atomic
+    // compositing boundary. A zero-opacity group is intentionally kept in the
+    // PDF rather than dropping its descendants during layout.
+    for rendered in [&first_letter_rendered, &inline_rendered] {
+        assert_transparency_group(rendered);
+        assert!(rendered.contains("/GSalpha000 gs"), "{rendered}");
+    }
 }
 
 #[tokio::test]
@@ -1576,6 +1753,37 @@ async fn opaque_css_background_gradients_emit_native_shadings_at_tile_geometry()
 }
 
 #[tokio::test]
+async fn generated_content_gradients_use_native_pdf_shadings_when_object_fit_is_fill() {
+    let pdf = Html::from_string(
+        "<style>@page { size: 200pt 120pt; margin: 0 } body { margin: 0 }\
+         .linear { width: 100pt; height: 40pt; content: linear-gradient(90deg in srgb, red, blue) }\
+         .radial { width: 100pt; height: 40pt; content: radial-gradient(ellipse in srgb, red, blue) }</style>\
+         <div class=linear></div><div class=radial></div>",
+    )
+    .write_pdf_bytes(&RenderOptions::default(), &crate::PdfOptions::default())
+    .await
+    .unwrap();
+    let rendered = pdf_searchable_text(&pdf);
+
+    assert!(rendered.contains("/ShadingType 2"));
+    assert!(rendered.contains("/ShadingType 3"));
+}
+
+#[tokio::test]
+async fn generated_content_gradient_uses_raster_fallback_for_non_native_object_mapping() {
+    let pdf = Html::from_string(
+        "<style>@page { size: 120pt 80pt; margin: 0 } body { margin: 0 }\
+         div { width: 100pt; height: 40pt; object-fit: contain;\
+         content: linear-gradient(90deg in srgb, red, blue) }</style><div></div>",
+    )
+    .write_pdf_bytes(&RenderOptions::default(), &crate::PdfOptions::default())
+    .await
+    .unwrap();
+
+    assert!(pdf_searchable_text(&pdf).contains("/Subtype /Image"));
+}
+
+#[tokio::test]
 async fn page_box_css_background_gradient_uses_native_pdf_shading() {
     let pdf = Html::from_string(
         "<style>@page { size: 200pt 100pt; margin: 0;\
@@ -2021,7 +2229,7 @@ fn pdf_font_embedding_prunes_unused_fonts_and_merges_byte_identical_font_plans()
                 actual_text: None,
                 x_offset: 0.0,
                 y_offset: 0.0,
-                text_matrix: crate::RenderedTextMatrix::IDENTITY,
+                text_matrix: crate::document::paint::text::RenderedTextMatrix::IDENTITY,
                 font_size: 12.0,
                 font_id: Some(0),
                 glyphs: Some(vec![test_rendered_glyph(glyph_a, "A")].into()),
@@ -2031,7 +2239,7 @@ fn pdf_font_embedding_prunes_unused_fonts_and_merges_byte_identical_font_plans()
                 actual_text: None,
                 x_offset: 7.0,
                 y_offset: 0.0,
-                text_matrix: crate::RenderedTextMatrix::IDENTITY,
+                text_matrix: crate::document::paint::text::RenderedTextMatrix::IDENTITY,
                 font_size: 12.0,
                 font_id: Some(1),
                 glyphs: Some(vec![test_rendered_glyph(glyph_b, "B")].into()),
@@ -2282,7 +2490,7 @@ fn pdfa_cff_subset_fallback_embeds_the_full_cff_program() {
             actual_text: None,
             x_offset: 0.0,
             y_offset: 0.0,
-            text_matrix: crate::RenderedTextMatrix::IDENTITY,
+            text_matrix: crate::document::paint::text::RenderedTextMatrix::IDENTITY,
             font_size: 12.0,
             font_id: Some(0),
             glyphs: Some(glyphs.into()),
@@ -2578,7 +2786,7 @@ fn pdfa_font_embedding_accepts_empty_glyph_summary_covered_by_actual_text() {
             actual_text: Some(Rc::from("A")),
             x_offset: 0.0,
             y_offset: 0.0,
-            text_matrix: crate::RenderedTextMatrix::IDENTITY,
+            text_matrix: crate::document::paint::text::RenderedTextMatrix::IDENTITY,
             font_size: 12.0,
             font_id: Some(0),
             glyphs: Some(vec![test_rendered_glyph(glyph_a, "")].into()),
@@ -2640,6 +2848,93 @@ fn pdf_font_embedding_keeps_shaped_ligature_glyphs_or_falls_back() {
     assert!(rendered.contains(&format!("<{cid_ligature:04X}> <006600660069>")));
 }
 
+#[tokio::test]
+async fn pdf_ligature_runs_emit_actual_text_when_cluster_summaries_drop_source_characters() {
+    let document = Html::from_string(
+        r#"<style>
+            @font-face {
+                font-family: FiraLigatureProbe;
+                font-weight: 300;
+                src: url("weasyprint-samples/report/FiraSans-Light.ttf");
+            }
+            p { font-family: FiraLigatureProbe; font-size: 16pt; font-weight: 300; }
+        </style><p>first</p>"#,
+    )
+    .with_base_path(".")
+    .unwrap()
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let pdf = document
+        .write_pdf_bytes(&crate::PdfOptions::default())
+        .unwrap();
+    let rendered = pdf_searchable_text(&pdf);
+    assert!(
+        rendered.contains("/ActualText (first)"),
+        "the fi ligature must retain the authored source text: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn pdf_non_ligature_runs_do_not_emit_unnecessary_actual_text() {
+    let document = Html::from_string(
+        r#"<style>
+            @font-face {
+                font-family: FiraLigatureProbe;
+                font-weight: 300;
+                src: url("weasyprint-samples/report/FiraSans-Light.ttf");
+            }
+            p {
+                font-family: FiraLigatureProbe;
+                font-size: 16pt;
+                font-variant-ligatures: none;
+                font-weight: 300;
+            }
+        </style><p>first</p>"#,
+    )
+    .with_base_path(".")
+    .unwrap()
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let pdf = document
+        .write_pdf_bytes(&crate::PdfOptions::default())
+        .unwrap();
+    let rendered = pdf_searchable_text(&pdf);
+    assert!(
+        !rendered.contains("/ActualText (first)"),
+        "a source-faithful glyph sequence must not need ActualText: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn report_sample_ligatures_retain_authored_pdf_extraction_text() {
+    let document = Html::from_file("weasyprint-samples/report/report.html")
+        .await
+        .unwrap()
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(document.pages.len(), 8);
+
+    let pdf = document
+        .write_pdf_bytes(&crate::PdfOptions::default())
+        .unwrap();
+    let rendered = pdf_searchable_text(&pdf);
+    for text in [
+        "Big title on the first right page",
+        "finibus vulputate.",
+        "ac orci finibus",
+    ] {
+        assert!(
+            rendered.contains(&format!("/ActualText ({text})")),
+            "the report ligature run must retain its authored source text: {text:?}"
+        );
+    }
+}
+
 #[test]
 fn pdf_text_runs_emit_positioned_show_for_advance_adjustments() {
     let font_bytes = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
@@ -2661,7 +2956,7 @@ fn pdf_text_runs_emit_positioned_show_for_advance_adjustments() {
             actual_text: None,
             x_offset: 0.0,
             y_offset: 0.0,
-            text_matrix: crate::RenderedTextMatrix::IDENTITY,
+            text_matrix: crate::document::paint::text::RenderedTextMatrix::IDENTITY,
             font_size: 12.0,
             font_id: Some(0),
             glyphs: Some(
@@ -2714,7 +3009,7 @@ fn pdf_text_runs_apply_per_glyph_origins_without_changing_advances() {
             actual_text: None,
             x_offset: 0.0,
             y_offset: 0.0,
-            text_matrix: crate::RenderedTextMatrix::IDENTITY,
+            text_matrix: crate::document::paint::text::RenderedTextMatrix::IDENTITY,
             font_size: 12.0,
             font_id: Some(0),
             glyphs: Some(
@@ -2774,7 +3069,7 @@ fn pdf_text_runs_transform_per_glyph_origins_with_the_run_matrix() {
             actual_text: None,
             x_offset: 0.0,
             y_offset: 0.0,
-            text_matrix: crate::RenderedTextMatrix::ROTATE_CW,
+            text_matrix: crate::document::paint::text::RenderedTextMatrix::ROTATE_CW,
             font_size: 12.0,
             font_id: Some(0),
             glyphs: Some(
@@ -2824,13 +3119,13 @@ fn pdf_advance_only_tab_is_not_subset_or_painted_and_preserves_actual_text() {
             actual_text: Some(Rc::from("\tA")),
             x_offset: 0.0,
             y_offset: 0.0,
-            text_matrix: crate::RenderedTextMatrix::IDENTITY,
+            text_matrix: crate::document::paint::text::RenderedTextMatrix::IDENTITY,
             font_size: 12.0,
             font_id: Some(0),
             glyphs: Some(
                 vec![
                     RenderedGlyph {
-                        kind: crate::document::RenderedGlyphKind::AdvanceOnly,
+                        kind: crate::document::paint::text::RenderedGlyphKind::AdvanceOnly,
                         x_advance: 24.0,
                         nominal_x_advance: 0.0,
                         x_offset: 0.0,
@@ -2870,6 +3165,129 @@ fn pdf_advance_only_tab_is_not_subset_or_painted_and_preserves_actual_text() {
 }
 
 #[test]
+fn pdf_vector_path_glyph_is_invisible_but_retains_text_extraction() {
+    let font_bytes = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
+    let face = ttf_parser::Face::parse(&font_bytes, 0).unwrap();
+    let glyph_a = face.glyph_index('A').unwrap().0;
+    let font = test_document_font(0, FontiqueBlob::new(Arc::new(font_bytes)));
+    let mut vector_path_a = test_rendered_glyph(glyph_a, "A");
+    vector_path_a.kind = crate::document::paint::text::RenderedGlyphKind::VectorPath(glyph_a);
+    let mut page = Page::new(120.0, 80.0);
+    page.push_line(RenderedLine::new(
+        "A".to_string(),
+        10.0,
+        40.0,
+        12.0,
+        Some(0),
+        CssColor::BLACK,
+        vec![RenderedTextRun {
+            text: Rc::from("A"),
+            actual_text: None,
+            x_offset: 0.0,
+            y_offset: 0.0,
+            text_matrix: crate::document::paint::text::RenderedTextMatrix::IDENTITY,
+            font_size: 12.0,
+            font_id: Some(0),
+            glyphs: Some(vec![vector_path_a].into()),
+        }],
+    ));
+    let document = Document {
+        pages: vec![page],
+        metadata: DocumentMetadata::default(),
+        fonts: vec![font],
+        bookmarks: Vec::new(),
+        image_store: Box::default(),
+    };
+
+    let plans = embedded_font_plans_with_profile(&document, 1, PdfFontValidationProfile::Default);
+    let cid_a = plans.fonts[0].source_gid_to_cid[&glyph_a];
+    let pdf = document
+        .write_pdf_bytes(&PdfOptions {
+            compression: PdfCompression::Uncompressed,
+            ..PdfOptions::default()
+        })
+        .unwrap();
+    let rendered = pdf_searchable_text(&pdf);
+
+    assert!(rendered.contains("3 Tr"), "{rendered}");
+    assert!(
+        rendered.contains("0 Tr"),
+        "text rendering mode must be restored: {rendered}"
+    );
+    assert!(rendered.contains(&format!("<{cid_a:04X}>")), "{rendered}");
+    assert!(
+        rendered.contains(&format!("<{cid_a:04X}> <0041>")),
+        "the invisible glyph must remain in the ToUnicode CMap: {rendered}"
+    );
+}
+
+#[test]
+fn pdf_fully_covered_line_is_invisible_but_retains_text_extraction() {
+    let font_bytes = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
+    let face = ttf_parser::Face::parse(&font_bytes, 0).unwrap();
+    let glyph_a = face.glyph_index('A').unwrap().0;
+    let font = test_document_font(0, FontiqueBlob::new(Arc::new(font_bytes)));
+    let mut page = Page::new(120.0, 80.0);
+    page.push_line(
+        RenderedLine::new(
+            "A".to_string(),
+            10.0,
+            40.0,
+            12.0,
+            Some(0),
+            CssColor::BLACK,
+            vec![RenderedTextRun {
+                text: Rc::from("A"),
+                actual_text: None,
+                x_offset: 0.0,
+                y_offset: 0.0,
+                text_matrix: crate::document::paint::text::RenderedTextMatrix::IDENTITY,
+                font_size: 12.0,
+                font_id: Some(0),
+                glyphs: Some(vec![test_rendered_glyph(glyph_a, "A")].into()),
+            }],
+        )
+        .with_glyph_ink_bounds(Some(
+            crate::document::paint::geometry::PaintClip::from_paint_rect(
+                crate::document::paint::geometry::PaintRect::new(
+                    crate::document::paint::geometry::PaintPoint::new(10.0, 30.0),
+                    crate::document::paint::geometry::PaintSize::new(10.0, 10.0),
+                ),
+            ),
+        )),
+    );
+    page.push_rect_in_band(PaintBand::InFlowBlock, green_rect(5.0, 25.0, 20.0, 20.0));
+    let document = Document {
+        pages: vec![page],
+        metadata: DocumentMetadata::default(),
+        fonts: vec![font],
+        bookmarks: Vec::new(),
+        image_store: Box::default(),
+    };
+
+    let plans = embedded_font_plans_with_profile(&document, 1, PdfFontValidationProfile::Default);
+    let cid_a = plans.fonts[0].source_gid_to_cid[&glyph_a];
+    let pdf = document
+        .write_pdf_bytes(&PdfOptions {
+            compression: PdfCompression::Uncompressed,
+            ..PdfOptions::default()
+        })
+        .unwrap();
+    let rendered = pdf_searchable_text(&pdf);
+
+    assert!(rendered.contains("3 Tr"), "{rendered}");
+    assert!(
+        rendered.contains("0 Tr"),
+        "text rendering mode must be restored: {rendered}"
+    );
+    assert!(rendered.contains(&format!("<{cid_a:04X}>")), "{rendered}");
+    assert!(
+        rendered.contains(&format!("<{cid_a:04X}> <0041>")),
+        "the invisible glyph must remain in the ToUnicode CMap: {rendered}"
+    );
+}
+
+#[test]
 fn pdf_text_runs_emit_selected_text_matrix_and_offsets() {
     let font_bytes = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
     let face = ttf_parser::Face::parse(&font_bytes, 0).unwrap();
@@ -2889,7 +3307,7 @@ fn pdf_text_runs_emit_selected_text_matrix_and_offsets() {
             actual_text: None,
             x_offset: 3.0,
             y_offset: -5.0,
-            text_matrix: crate::RenderedTextMatrix::ROTATE_CW,
+            text_matrix: crate::document::paint::text::RenderedTextMatrix::ROTATE_CW,
             font_size: 12.0,
             font_id: Some(0),
             glyphs: Some(vec![test_rendered_glyph(glyph_a, "A")].into()),
@@ -2933,7 +3351,7 @@ fn pdf_identity_text_runs_reuse_text_state_with_relative_positioning() {
                 actual_text: None,
                 x_offset: 0.0,
                 y_offset: 0.0,
-                text_matrix: crate::RenderedTextMatrix::IDENTITY,
+                text_matrix: crate::document::paint::text::RenderedTextMatrix::IDENTITY,
                 font_size: 12.0,
                 font_id: Some(0),
                 glyphs: Some(vec![test_rendered_glyph(glyph_a, "A")].into()),
@@ -2943,7 +3361,7 @@ fn pdf_identity_text_runs_reuse_text_state_with_relative_positioning() {
                 actual_text: None,
                 x_offset: 10.0,
                 y_offset: 0.0,
-                text_matrix: crate::RenderedTextMatrix::IDENTITY,
+                text_matrix: crate::document::paint::text::RenderedTextMatrix::IDENTITY,
                 font_size: 12.0,
                 font_id: Some(0),
                 glyphs: Some(vec![test_rendered_glyph(glyph_b, "B")].into()),
@@ -2992,7 +3410,68 @@ fn test_document_font(id: usize, blob: FontiqueBlob<u8>) -> DocumentFont {
         cap_height: 660,
         italic_angle: 0,
         bbox: [-438, -293, 1142, 1034],
+        synthesis: crate::document::DocumentFontSynthesis::default(),
     }
+}
+
+/// A synthesized document use shares its subset with the regular program but
+/// emits fill-and-stroke text ink. CSS Fonts synthesis must not change glyph
+/// IDs, advances, or ToUnicode extraction.
+/// <https://www.w3.org/TR/css-fonts-4/#font-synthesis-intro>
+#[test]
+fn synthetic_bold_is_a_per_document_font_pdf_paint_state() {
+    let bytes = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
+    let face = ttf_parser::Face::parse(&bytes, 0).unwrap();
+    let glyph_a = face.glyph_index('A').unwrap().0;
+    let glyph_b = face.glyph_index('B').unwrap().0;
+    let regular = test_document_font(0, FontiqueBlob::new(Arc::new(bytes.clone())));
+    let mut synthesized = test_document_font(1, FontiqueBlob::new(Arc::new(bytes)));
+    synthesized.synthesis.embolden = true;
+
+    let mut page = Page::new(120.0, 80.0);
+    for (text, y, font_id, glyph_id) in [("A", 24.0, 0, glyph_a), ("B", 48.0, 1, glyph_b)] {
+        page.push_line(RenderedLine::new(
+            text.to_string(),
+            10.0,
+            y,
+            12.0,
+            Some(font_id),
+            CssColor::BLACK,
+            vec![RenderedTextRun {
+                text: Rc::from(text),
+                actual_text: None,
+                x_offset: 0.0,
+                y_offset: 0.0,
+                text_matrix: crate::document::paint::text::RenderedTextMatrix::IDENTITY,
+                font_size: 12.0,
+                font_id: Some(font_id),
+                glyphs: Some(vec![test_rendered_glyph(glyph_id, text)].into()),
+            }],
+        ));
+    }
+    let document = Document {
+        pages: vec![page],
+        metadata: DocumentMetadata::default(),
+        fonts: vec![regular, synthesized],
+        bookmarks: Vec::new(),
+        image_store: Box::default(),
+    };
+
+    let plans = embedded_font_plans_with_profile(&document, 1, PdfFontValidationProfile::Default);
+    assert_eq!(plans.fonts.len(), 1, "font program should be deduplicated");
+    assert_eq!(
+        plans.document_font_to_embedded_font[0], plans.document_font_to_embedded_font[1],
+        "regular and synthesized runs should use the same embedded subset"
+    );
+    let rendered = pdf_searchable_text(
+        &document
+            .write_pdf_bytes(&crate::PdfOptions::default())
+            .unwrap(),
+    );
+    assert_eq!(rendered.matches("2 Tr").count(), 1, "{rendered}");
+    assert!(rendered.contains("0.5 w"), "{rendered}");
+    assert!(rendered.contains("<0001> <0041>"), "{rendered}");
+    assert!(rendered.contains("<0002> <0042>"), "{rendered}");
 }
 
 fn document_with_single_glyph_font(font_bytes: Vec<u8>, glyph_id: u16) -> Document {
@@ -3045,7 +3524,7 @@ fn test_rendered_line(glyph_id: u16, unicode: &str, color: CssColor) -> Rendered
             actual_text: None,
             x_offset: 0.0,
             y_offset: 0.0,
-            text_matrix: crate::RenderedTextMatrix::IDENTITY,
+            text_matrix: crate::document::paint::text::RenderedTextMatrix::IDENTITY,
             font_size: 12.0,
             font_id: Some(0),
             glyphs: Some(vec![test_rendered_glyph(glyph_id, unicode)].into()),
@@ -3116,7 +3595,7 @@ fn test_rendered_glyph_with_advances(
     nominal_x_advance: f32,
 ) -> RenderedGlyph {
     RenderedGlyph {
-        kind: crate::document::RenderedGlyphKind::Paint(id),
+        kind: crate::document::paint::text::RenderedGlyphKind::Paint(id),
         x_advance,
         nominal_x_advance,
         x_offset: 0.0,

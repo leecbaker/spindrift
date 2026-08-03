@@ -1,4 +1,5 @@
 use super::*;
+use crate::layout::assets::background_image_primitives_for_style;
 
 /// Replays page-margin boxes into the page display list in stacking order.
 ///
@@ -66,34 +67,107 @@ pub(super) fn page_margin_box_paint_order(name: &str) -> usize {
         .position(|candidate| *candidate == name)
         .unwrap_or(PAINT_ORDER.len())
 }
+pub(in crate::layout) fn paint_page_margin_box(
+    page: &mut Page,
+    layout: &PageMarginBoxLayout<'_>,
+    context: PageMarginPaintContext<'_>,
+) {
+    let style = &layout.spec.style;
+    if style.visibility != Visibility::Visible {
+        return;
+    }
+    let (rects, rounded_rects, paths, strokes) = block_paint_ops(layout.border_rect, style);
+    for rect in rects {
+        page.push_rect_in_band(PaintBand::BackgroundBorder, rect);
+    }
+    for rect in rounded_rects {
+        page.push_rounded_rect_in_band(PaintBand::BackgroundBorder, rect);
+    }
+    for path in paths {
+        page.push_path_in_band(PaintBand::BackgroundBorder, path);
+    }
+    for stroke in strokes {
+        page.push_stroke_in_band(PaintBand::BackgroundBorder, stroke);
+    }
+    for primitive in background_image_primitives_for_style(
+        PaintBackgroundArea::from_paint_rect(layout.border_rect),
+        style,
+        context.base_url,
+        context.root_url,
+        context.resource_cache,
+    ) {
+        push_page_margin_primitive(page, PaintBand::BackgroundBorder, primitive);
+    }
+    for primitive in page_margin_box_outline_primitives(layout, style) {
+        push_page_margin_primitive(page, PaintBand::Outline, primitive);
+    }
+}
 
-#[cfg(test)]
-mod tests {
-    use super::page_margin_box_paint_order;
-
-    #[test]
-    fn page_margin_tree_order_is_clockwise() {
-        let names = [
-            "top-left-corner",
-            "top-left",
-            "top-center",
-            "top-right",
-            "top-right-corner",
-            "right-top",
-            "right-middle",
-            "right-bottom",
-            "bottom-right-corner",
-            "bottom-right",
-            "bottom-center",
-            "bottom-left",
-            "bottom-left-corner",
-            "left-bottom",
-            "left-middle",
-            "left-top",
-        ];
-
-        for (expected, name) in names.into_iter().enumerate() {
-            assert_eq!(page_margin_box_paint_order(name), expected);
+pub(in crate::layout) fn push_page_margin_primitive(
+    page: &mut Page,
+    band: PaintBand,
+    primitive: PaintPrimitive,
+) {
+    match primitive {
+        PaintPrimitive::Rect(rect) => page.push_rect_in_band(band, rect),
+        PaintPrimitive::RoundedRect(rect) => page.push_rounded_rect_in_band(band, rect),
+        PaintPrimitive::Path(path) => page.push_path_in_band(band, path),
+        PaintPrimitive::Stroke(stroke) => page.push_stroke_in_band(band, stroke),
+        PaintPrimitive::Image(image) => page.push_image_in_band(band, image),
+        PaintPrimitive::ImagePattern(pattern) => page.push_image_pattern_in_band(band, pattern),
+        PaintPrimitive::GradientPattern(pattern) => {
+            page.push_gradient_pattern_in_band(band, pattern)
         }
+        PaintPrimitive::SvgPattern(pattern) => page.push_svg_pattern_in_band(band, pattern),
+        PaintPrimitive::Line(line) => page.push_line_in_band(band, line),
+        PaintPrimitive::OpaqueTextCoverage { line, paths } => {
+            page.push_opaque_text_coverage_in_band(band, line, paths)
+        }
+    };
+}
+
+/// Builds outline paint for a generated page-margin box without affecting layout.
+///
+/// CSS UI defines outlines as visual paint outside the border edge that does not
+/// participate in sizing, while CSS Paged Media applies that property set in
+/// margin contexts:
+/// <https://www.w3.org/TR/css-ui-3/#outline-props> and
+/// <https://www.w3.org/TR/css-page-3/#page-properties>.
+pub(in crate::layout) fn page_margin_box_outline_primitives(
+    layout: &PageMarginBoxLayout<'_>,
+    style: &ComputedStyle,
+) -> Vec<PaintPrimitive> {
+    crate::layout::paint_ops::outline_primitives_for_border_rect(layout.border_rect, style)
+}
+
+/// Returns the top edge of the page-margin text line stack.
+///
+/// CSS Paged Media defines page-margin boxes as generated boxes with their own
+/// content area, and CSS Inline positions text through line-box baselines. The
+/// `vertical-align` value chooses where the text stack sits inside the margin
+/// box content area; baseline placement is then handled from font metrics:
+/// <https://www.w3.org/TR/css-page-3/#page-margin-boxes> and
+/// <https://www.w3.org/TR/CSS22/visudet.html#line-height>.
+pub(in crate::layout) fn page_margin_text_stack_top(
+    layout: &PageMarginBoxLayout<'_>,
+    vertical_align: VerticalAlign,
+    total_height: f32,
+) -> f32 {
+    if matches!(vertical_align.baseline_shift, BaselineShift::Bottom)
+        || matches!(
+            vertical_align.alignment_baseline,
+            AlignmentBaseline::Metric(BaselineMetric::TextBottom)
+        )
+    {
+        layout.content_y() + total_height
+    } else if matches!(vertical_align.baseline_shift, BaselineShift::Top)
+        || matches!(
+            vertical_align.alignment_baseline,
+            AlignmentBaseline::Metric(BaselineMetric::TextTop)
+        )
+    {
+        layout.content_y() + layout.content_height()
+    } else {
+        layout.content_y() + ((layout.content_height() + total_height) / 2.0)
     }
 }

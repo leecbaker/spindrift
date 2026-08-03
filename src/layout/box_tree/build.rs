@@ -2,98 +2,16 @@ use super::*;
 
 pub(crate) fn build_page_box<'a>(
     root: &'a Node,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
     parent_style: &ComputedStyle,
 ) -> MutablePageBox<'a> {
     build_page_box_inner(root, stylesheets, parent_style, None)
 }
 
-/// Install the principal-flow used axes on the root formatting box after the
-/// cascade has built its descendants and generated pseudo boxes. This is a
-/// layout-only value: child and pseudo computed styles keep the cascade they
-/// received from the actual root element.
-pub(crate) fn apply_principal_flow_to_root_layout_box(
-    page_box: &mut MutablePageBox<'_>,
-    principal_flow: DocumentPrincipalFlow,
-) {
-    fn apply_to_html_descendants(
-        boxes: &mut [MutableFormattingBox<'_>],
-        principal_flow: DocumentPrincipalFlow,
-    ) {
-        for box_ in boxes {
-            if let Some(core) = box_.element_core_mut() {
-                if core.element.document_syntax == dom::DocumentSyntax::Html
-                    && core.element.tag.eq_ignore_ascii_case("html")
-                    && matches!(&core.source, BoxSource::Principal)
-                {
-                    core.style.writing_mode = principal_flow.writing_mode;
-                    core.style.direction = principal_flow.direction;
-                    // Inline root generated content participates in the
-                    // initial principal inline flow. A block-level pseudo
-                    // establishes its own formatting context. These are
-                    // layout-only used values; the cascaded pseudo styles
-                    // remain unchanged in the DOM.
-                    for pseudo in [
-                        core.style.before_style.as_deref_mut(),
-                        core.style.after_style.as_deref_mut(),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .filter(|pseudo| !pseudo.display.is_block_level())
-                    {
-                        pseudo.writing_mode = principal_flow.writing_mode;
-                        pseudo.direction = principal_flow.direction;
-                    }
-                }
-                let is_root_principal_pseudo = core.element.document_syntax
-                    == dom::DocumentSyntax::Html
-                    && core.element.tag.eq_ignore_ascii_case("html")
-                    && !core.style.display.is_block_level()
-                    && matches!(
-                        &core.source,
-                        BoxSource::GeneratedPseudo(pseudo)
-                            if matches!(
-                                pseudo.kind,
-                                GeneratedPseudoKind::Before | GeneratedPseudoKind::After
-                            )
-                    );
-                if is_root_principal_pseudo {
-                    core.style.writing_mode = principal_flow.writing_mode;
-                    core.style.direction = principal_flow.direction;
-                }
-                apply_to_html_descendants(&mut core.children, principal_flow);
-            } else if let MutableFormattingBox::AnonymousBlock(anonymous) = box_ {
-                let wraps_root_principal_pseudo = anonymous.children.iter().any(|child| {
-                    child.element_core().is_some_and(|core| {
-                        core.element.document_syntax == dom::DocumentSyntax::Html
-                            && core.element.tag.eq_ignore_ascii_case("html")
-                            && !core.style.display.is_block_level()
-                            && matches!(
-                                &core.source,
-                                BoxSource::GeneratedPseudo(pseudo)
-                                    if matches!(
-                                        pseudo.kind,
-                                        GeneratedPseudoKind::Before | GeneratedPseudoKind::After
-                                    )
-                            )
-                    })
-                });
-                if wraps_root_principal_pseudo {
-                    anonymous.style.writing_mode = principal_flow.writing_mode;
-                    anonymous.style.direction = principal_flow.direction;
-                }
-                apply_to_html_descendants(&mut anonymous.children, principal_flow);
-            }
-        }
-    }
-
-    apply_to_html_descendants(&mut page_box.children, principal_flow);
-}
-
 #[cfg(test)]
 pub(crate) fn build_page_box_with_font_metrics<'a>(
     root: &'a Node,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
     parent_style: &ComputedStyle,
     font_system: &mut FontSystem,
 ) -> MutablePageBox<'a> {
@@ -102,7 +20,7 @@ pub(crate) fn build_page_box_with_font_metrics<'a>(
 
 fn build_page_box_inner<'a>(
     root: &'a Node,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
     parent_style: &ComputedStyle,
     font_system: Option<&mut FontSystem>,
 ) -> MutablePageBox<'a> {
@@ -144,9 +62,7 @@ fn build_page_box_inner<'a>(
 /// carry a relative deferred expression, so duplicating it would apply the
 /// expression a second time during pre-freeze resolution.
 fn inherited_text_style(parent_style: &ComputedStyle) -> Box<ComputedStyle> {
-    let mut style = parent_style.clone();
-    style.deferred_font_size = css::DeferredFontSize::Inherit;
-    Box::new(style)
+    Box::new(css::anonymous_text_style(parent_style))
 }
 
 /// Return the inherited text style for a text node flattened out of a
@@ -158,7 +74,7 @@ fn inherited_text_style(parent_style: &ComputedStyle) -> Box<ComputedStyle> {
 /// font-metric pass does not inherit again from the physical parent:
 /// <https://www.w3.org/TR/css-display-3/#valdef-display-contents>.
 fn flattened_contents_text_style(parent_style: &ComputedStyle) -> Box<ComputedStyle> {
-    let mut style = flattened_contents_inheritance_style(parent_style);
+    let mut style = css::anonymous_text_style(parent_style);
     // A `display: contents` element has no principal box and therefore cannot
     // originate typographic pseudo-elements. Its flattened text still
     // inherits ordinary values from the element, while a box-generating
@@ -180,6 +96,11 @@ fn flattened_contents_text_style(parent_style: &ComputedStyle) -> Box<ComputedSt
 /// second time against that physical parent instead of the suppressed element.
 /// <https://drafts.csswg.org/css-display-3/#valdef-display-contents>
 fn flattened_contents_inheritance_style(parent_style: &ComputedStyle) -> ComputedStyle {
+    // Element descendants still cascade against the suppressed element.
+    // Copy its complete computed style here: a declaration such as
+    // `background: inherit` must see that otherwise non-inherited property.
+    // Text nodes use `flattened_contents_text_style` above, which deliberately
+    // strips box paint because the contents element itself has no box.
     let mut style = parent_style.clone();
     // Cascading has already resolved this element's parent-relative
     // `font-size` into `font_size`; only the deferred representation remains
@@ -207,7 +128,7 @@ struct BuiltElement<'a> {
 
 pub(crate) fn build_child_boxes_with_font_metrics<'a>(
     element: &'a Element,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
     parent_style: &ComputedStyle,
     ancestors: &[ElementSignature],
     font_system: &mut FontSystem,
@@ -227,7 +148,7 @@ pub(crate) fn build_child_boxes_with_font_metrics<'a>(
 #[allow(clippy::too_many_arguments)]
 fn build_child_boxes_inner<'a>(
     element: &'a Element,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
     parent_style: &ComputedStyle,
     ancestors: &[ElementSignature],
     normalize_for_parent: bool,
@@ -366,31 +287,6 @@ fn build_child_boxes_inner<'a>(
                 // <https://drafts.csswg.org/css-tables-3/#fixup-algorithm>
                 if parent_style.display.is_flex() || parent_style.display.is_grid() {
                     style.display = style.display.blockified();
-                }
-                // A table-internal display type without a table formatting
-                // parent is represented by anonymous table structure for
-                // table layout, but it has no containment-capable principal
-                // box of its own. Use its ordinary block-flow proxy at this
-                // element boundary so positioned descendants receive the
-                // same hypothetical normal-flow position as the anonymous
-                // wrapper. The authored containment value remains available
-                // to cascade, while its inapplicable property effects are
-                // removed from the proxy's used layout style.
-                // <https://drafts.csswg.org/css-tables-3/#fixup>
-                // <https://drafts.csswg.org/css-contain-1/#containment-principal>
-                if !parent_style.display.is_table()
-                    && matches!(
-                        style.display.inner,
-                        DisplayInner::TableHeaderGroup
-                            | DisplayInner::TableRowGroup
-                            | DisplayInner::TableFooterGroup
-                            | DisplayInner::TableRow
-                    )
-                {
-                    style.display = Display::BLOCK;
-                    style.contain.size = false;
-                    style.contain.layout = false;
-                    style.contain.paint = false;
                 }
                 if style.display.is_contents() {
                     // CSS Display 3 `display: contents` suppresses the
@@ -555,7 +451,7 @@ fn display_contents_computes_to_none_for_css_layout_svg_root(
 fn suppressed_named_string_events_for_subtree(
     element: &Element,
     style: ComputedStyle,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
     ancestors: &[ElementSignature],
 ) -> Vec<SuppressedNamedStringEvent> {
     let mut events = Vec::new();
@@ -569,15 +465,12 @@ fn suppressed_named_string_events_for_subtree(
         });
     }
     let mut child_ancestors = ancestors.to_vec();
-    child_ancestors.push(ElementSignature::new(
-        element.tag.clone(),
-        element.attrs.clone(),
-    ));
+    child_ancestors.push(element_signature(element));
     for child in &element.children {
         let NodeKind::Element(child) = &child.kind else {
             continue;
         };
-        let signature = ElementSignature::new(child.tag.clone(), child.attrs.clone());
+        let signature = element_signature(child);
         let child_style = style_for_layout_element(
             child,
             signature,
@@ -600,10 +493,7 @@ fn suppressed_counter_event_for_subtree<'a>(
     ancestors: &[ElementSignature],
 ) -> CounterEventNode<'a> {
     let mut child_ancestors = ancestors.to_vec();
-    child_ancestors.push(ElementSignature::new(
-        element.tag.clone(),
-        element.attrs.clone(),
-    ));
+    child_ancestors.push(element_signature(element));
     let children = element
         .children
         .iter()
@@ -627,14 +517,13 @@ fn build_element_box<'a>(
     element: &'a Element,
     signature: ElementSignature,
     style: ComputedStyle,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
     ancestors: &[ElementSignature],
     font_system: Option<&mut FontSystem>,
 ) -> Option<BuiltElement<'a>> {
     let mut style = Box::new(style);
     if matches!(style.position, Position::Absolute | Position::Fixed) {
-        style.abspos_static_source_was_inline_level = style.display.is_inline_level();
-        style.abspos_static_source_was_atomic_inline = style.display.is_atomic_inline();
+        style.abspos_static_source = css::StaticPositionSource::from_display(style.display);
         style.display = style.display.blockified();
     }
 
@@ -775,6 +664,7 @@ fn build_element_box<'a>(
             table_fragment: None,
         })
     } else if style.display.is_block_level() {
+        let fieldset = fieldset_formatting_box(element, &style, &children);
         MutableFormattingBox::Block(MutableBlockBox {
             core: ElementBoxCoreWith {
                 element,
@@ -785,6 +675,7 @@ fn build_element_box<'a>(
             },
             marker,
             run_in_children: Vec::new(),
+            fieldset,
         })
     } else {
         MutableFormattingBox::Inline(MutableInlineBox {
@@ -832,8 +723,7 @@ fn push_generated_pseudo_box<'a>(
     );
     let mut style = Box::new(pseudo_style.clone());
     if matches!(style.position, Position::Absolute | Position::Fixed) {
-        style.abspos_static_source_was_inline_level = style.display.is_inline_level();
-        style.abspos_static_source_was_atomic_inline = style.display.is_atomic_inline();
+        style.abspos_static_source = css::StaticPositionSource::from_display(style.display);
         style.display = style.display.blockified();
     }
     // Tree-abiding generated boxes are direct flex/grid children just like
@@ -935,6 +825,7 @@ fn build_generated_pseudo_box<'a>(
             table_fragment: None,
         }))
     } else if style.display.is_block_level() {
+        let fieldset = fieldset_formatting_box(originating_element, &style, &children);
         Some(MutableFormattingBox::Block(MutableBlockBox {
             core: ElementBoxCoreWith {
                 element: originating_element,
@@ -945,6 +836,7 @@ fn build_generated_pseudo_box<'a>(
             },
             marker,
             run_in_children: Vec::new(),
+            fieldset,
         }))
     } else {
         Some(MutableFormattingBox::Inline(MutableInlineBox {
@@ -959,6 +851,24 @@ fn build_generated_pseudo_box<'a>(
             fragment_edges: InlineBoxFragmentEdges::ALL,
         }))
     }
+}
+
+/// Select the rendered-legend candidate while the direct child formatting
+/// boxes still retain their source order.
+///
+/// HTML promotes the first direct `legend` box that remains in normal flow;
+/// generated pseudo boxes and nested legends are ordinary anonymous fieldset
+/// content instead.
+/// <https://html.spec.whatwg.org/multipage/rendering.html#the-fieldset-and-legend-elements>
+fn fieldset_formatting_box(
+    element: &Element,
+    style: &ComputedStyle,
+    children: &[MutableFormattingBox<'_>],
+) -> Option<FieldsetFormattingBox> {
+    if !element.tag.eq_ignore_ascii_case("fieldset") || !style.display.is_block_level() {
+        return None;
+    }
+    Some(FieldsetFormattingBox::from_children(children))
 }
 
 /// Applies CSS Display root-element display fixups during box-tree construction.
@@ -1317,10 +1227,18 @@ fn anonymous_table_fragment_cell_style_and_children<'a>(
 fn anonymous_table_fragment_cell_parent_style(
     children: &[MutableFormattingBox<'_>],
 ) -> ComputedStyle {
-    let mut style = children
+    let inherited_parent_style = children
         .first()
         .map(table_fragment_child_style)
         .unwrap_or_else(|| css::default_style_for_tag("td"));
+    // CSS Tables' generated cell inherits through the table structure, not
+    // by cloning a preceding improper child as its principal box. Retain the
+    // inherited typographic values available from that child, but reset all
+    // non-inherited decoration before the anonymous cell later wraps a
+    // trailing inline run.
+    // <https://drafts.csswg.org/css-tables/#fixup-algorithm>
+    // <https://www.w3.org/TR/CSS22/visuren.html#anonymous>
+    let mut style = css::anonymous_block_style(&inherited_parent_style);
     style.display = Display::TABLE_CELL;
     style
 }

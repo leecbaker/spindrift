@@ -127,7 +127,23 @@ pub(super) fn load_image_source_with_request(
     }
 }
 
-/// Used CSS size and decoded pixels for an HTML image replaced element.
+/// Source identity retained by a used replacement box.
+///
+/// A CSS `content` image can be a raster, SVG, or generated gradient.  Keep
+/// this distinction after sizing so painting can use the same concrete object
+/// geometry without forcing a vector-capable gradient through a raster image.
+/// The raster member of [`Self::Gradient`] is a bounded fallback for paint
+/// backends that cannot represent the CSS interpolation exactly.
+/// <https://drafts.csswg.org/css-content-3/#content-property>
+/// <https://drafts.csswg.org/css-images-3/#sizing>
+#[derive(Debug, Clone)]
+pub(super) enum UsedReplacementImageSource {
+    Raster,
+    Svg,
+    Gradient { image: Box<BackgroundImage> },
+}
+
+/// Used CSS size and paint payload for an HTML image replaced element.
 ///
 /// CSS Images defines raster images as replaced elements with intrinsic
 /// dimensions, while CSS Sizing/Box Sizing define how `width`, `height`,
@@ -137,6 +153,7 @@ pub(super) fn load_image_source_with_request(
 pub(super) struct UsedImage {
     pub(super) decoded: DecodedPngImage,
     pub(super) svg: Option<SharedSvgAsset>,
+    pub(super) source: UsedReplacementImageSource,
     pub(super) content_size: ContentBoxSize,
     pub(super) border_box_size: BorderBoxSize,
 }
@@ -294,6 +311,7 @@ impl UsedImage {
         Self {
             decoded,
             svg: None,
+            source: UsedReplacementImageSource::Raster,
             content_size,
             border_box_size,
         }
@@ -303,14 +321,36 @@ impl UsedImage {
         Self {
             decoded,
             svg: None,
+            source: UsedReplacementImageSource::Raster,
             content_size: geometry.content_size,
             border_box_size: geometry.border_box_size,
         }
     }
 
     fn with_svg(mut self, svg: Option<SharedSvgAsset>) -> Self {
+        if svg.is_some() {
+            self.source = UsedReplacementImageSource::Svg;
+        }
         self.svg = svg;
         self
+    }
+
+    fn with_generated_gradient(mut self, image: BackgroundImage) -> Self {
+        self.source = UsedReplacementImageSource::Gradient {
+            image: Box::new(image),
+        };
+        self
+    }
+
+    pub(super) fn into_inline_atom_content(self) -> InlineAtomContent {
+        match self.source {
+            UsedReplacementImageSource::Raster => InlineAtomContent::Image(self.decoded),
+            UsedReplacementImageSource::Svg => InlineAtomContent::Svg { asset: self.svg },
+            UsedReplacementImageSource::Gradient { image } => InlineAtomContent::Gradient {
+                image: *image,
+                fallback: self.decoded,
+            },
+        }
     }
 }
 
@@ -326,8 +366,6 @@ pub(super) struct IntrinsicImageSize {
     pub(super) svg: Option<SharedSvgAsset>,
     pub(super) width: ContentBoxLength,
     pub(super) height: ContentBoxLength,
-    pub(super) attr_width: Option<ContentBoxLength>,
-    pub(super) attr_height: Option<ContentBoxLength>,
 }
 
 impl IntrinsicImageSize {
@@ -351,8 +389,13 @@ impl IntrinsicImageSize {
                 let dimensions = asset.intrinsic_dimensions();
                 dimensions.width.is_some() || dimensions.height.is_some()
             }),
-            attr_width: self.attr_width,
-            attr_height: self.attr_height,
+            // HTML image dimensions are CSS presentational hints, emitted by
+            // the cascade. Keeping a second layout-time copy would make an
+            // author `width: auto` revive the attribute after it had won the
+            // cascade.
+            // <https://html.spec.whatwg.org/multipage/rendering.html#attributes-for-embedded-content-and-images>
+            attr_width: None,
+            attr_height: None,
         }
     }
 }
@@ -389,6 +432,25 @@ pub(super) fn intrinsic_default_replaced_size(element: &Element) -> IntrinsicRep
     }
 }
 
+/// CSS default-object geometry for an unavailable image-like resource whose
+/// HTML dimension attributes have already entered the CSS cascade.
+///
+/// Do not read `width`/`height` here: the cascade must remain the only source
+/// of these presentational hints so an author declaration of `auto` can
+/// override an attribute instead of silently reintroducing it during layout.
+/// <https://html.spec.whatwg.org/multipage/rendering.html#attributes-for-embedded-content-and-images>
+/// <https://drafts.csswg.org/css-images-3/#default-sizing>
+pub(super) fn intrinsic_unavailable_image_size() -> IntrinsicReplacedSize {
+    IntrinsicReplacedSize {
+        width: content_box_pt(300.0 * css::CSS_PX_TO_PT),
+        height: content_box_pt(150.0 * css::CSS_PX_TO_PT),
+        preferred_aspect_ratio: None,
+        has_intrinsic_size: false,
+        attr_width: None,
+        attr_height: None,
+    }
+}
+
 /// Return default iframe geometry without inventing a preferred ratio.
 ///
 /// HTML's 300 by 150 fallback dimensions for an embedded browsing context
@@ -398,9 +460,8 @@ pub(super) fn intrinsic_default_replaced_size(element: &Element) -> IntrinsicRep
 /// <https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-width>
 /// <https://www.w3.org/TR/css-sizing-3/#intrinsic-sizes>
 pub(super) fn intrinsic_iframe_size(element: &Element) -> IntrinsicReplacedSize {
-    let mut size = intrinsic_default_replaced_size(element);
-    size.preferred_aspect_ratio = None;
-    size
+    let _ = element;
+    intrinsic_unavailable_image_size()
 }
 
 /// Return the intrinsic dimensions supplied by an HTML `<canvas>` element.
@@ -444,11 +505,7 @@ pub(super) fn intrinsic_image_size(
     resource_cache: &ResourceCache,
 ) -> Option<IntrinsicImageSize> {
     let (src, intrinsic_resolution) = match element.tag.as_str() {
-        "object" => element
-            .attrs
-            .get("data")
-            .or_else(|| element.attrs.get("src"))
-            .map(|src| (src.as_str(), 1.0))?,
+        "object" => element.attrs.get("data").map(|src| (src.as_str(), 1.0))?,
         "video" => element.attrs.get("poster").map(|src| (src.as_str(), 1.0))?,
         "img" => element
             .attrs
@@ -480,12 +537,6 @@ pub(super) fn intrinsic_image_size(
     if width <= 0.0 || height <= 0.0 {
         return None;
     }
-    let attr_width = element.attrs.get("width").and_then(|value| {
-        parse_html_length(value).filter(|width| *width > 0.0 && !value.contains('%'))
-    });
-    let attr_height = element.attrs.get("height").and_then(|value| {
-        parse_html_length(value).filter(|height| *height > 0.0 && !value.contains('%'))
-    });
     let (decoded, svg) = match asset {
         ResolvedImageAsset::Raster(decoded) => (decoded, None),
         ResolvedImageAsset::Svg(svg) => (
@@ -498,8 +549,6 @@ pub(super) fn intrinsic_image_size(
         svg,
         width: content_box_pt(width),
         height: content_box_pt(height),
-        attr_width: attr_width.map(content_box_pt),
-        attr_height: attr_height.map(content_box_pt),
     })
 }
 
@@ -546,10 +595,10 @@ pub(super) fn used_image(
         // has no media-frame decoder, so represent its unavailable frame with
         // one transparent pixel while retaining its CSS object geometry.
         // <https://html.spec.whatwg.org/multipage/media.html#the-video-element>
-        None if unavailable_image_establishes_replaced_box(element) => (
+        None if unavailable_image_establishes_replaced_box(element, style) => (
             transparent_replaced_fallback_pixel(),
             None,
-            intrinsic_default_replaced_size(element),
+            intrinsic_unavailable_image_size(),
         ),
         None => return None,
     };
@@ -592,10 +641,14 @@ pub(super) fn used_image_with_inline_percentage_basis(
             let replaced_size = intrinsic.replaced_size();
             (intrinsic.decoded, intrinsic.svg, replaced_size)
         }
-        None if unavailable_image_establishes_replaced_box(element) => (
+        None if unavailable_image_establishes_replaced_box(element, style) => (
             transparent_replaced_fallback_pixel(),
             None,
-            intrinsic_default_replaced_size(element),
+            unavailable_image_intrinsic_size_for_inline_basis(
+                element,
+                style,
+                sizing.inline_percentage_basis,
+            ),
         ),
         None => return None,
     };
@@ -607,6 +660,45 @@ pub(super) fn used_image_with_inline_percentage_basis(
         sizing.height_basis,
     );
     Some(UsedImage::from_geometry(decoded, geometry).with_svg(svg))
+}
+
+/// Return fallback image geometry for an unavailable resource during intrinsic
+/// inline measurement.
+///
+/// A cyclic percentage width has no intrinsic table-column contribution: using
+/// HTML's 300×150 default object size here would turn `width: 100%` into a
+/// spurious table minimum. Once the table commits a cell width, normal image
+/// layout calls [`used_image`] with a definite basis and restores the ordinary
+/// broken-image fallback geometry.
+/// <https://drafts.csswg.org/css-tables-3/#computing-cell-measures>
+/// <https://drafts.csswg.org/css-sizing-3/#intrinsic-sizes>
+fn unavailable_image_intrinsic_size_for_inline_basis(
+    element: &Element,
+    style: &ComputedStyle,
+    inline_percentage_basis: IntrinsicInlinePercentageBasis,
+) -> IntrinsicReplacedSize {
+    let cyclic_inline_percentage = !inline_percentage_basis.is_definite()
+        && element.tag == "img"
+        && element
+            .attrs
+            .get("src")
+            .is_none_or(|source| source.trim().is_empty())
+        && matches!(
+            style.box_values.width,
+            css::ComputedLengthPercentageOrAuto::LengthPercentage(ref value)
+                if value.needs_percentage_basis()
+        );
+    if !cyclic_inline_percentage {
+        return intrinsic_unavailable_image_size();
+    }
+    IntrinsicReplacedSize {
+        width: content_box_pt(0.0),
+        height: content_box_pt(0.0),
+        preferred_aspect_ratio: None,
+        has_intrinsic_size: false,
+        attr_width: None,
+        attr_height: None,
+    }
 }
 
 /// Return an invisible stand-in for a replaced element whose visual resource
@@ -623,13 +715,13 @@ fn transparent_replaced_fallback_pixel() -> DecodedPngImage {
 /// replaced box.
 ///
 /// A media element has an HTML default object size without decoded media, and
-/// an `<img>` with a source or explicit dimensions retains a broken-image box.
-/// A bare `<img>` without either has no image request or intrinsic geometry;
-/// treating it as the 300×150 default object would incorrectly contribute to
-/// intrinsic sizing.
+/// an `<img>` with a source, HTML dimensions, or a definite CSS size retains a
+/// broken-image box. A bare auto-sized `<img>` has no image request or
+/// intrinsic geometry; treating it as the 300×150 default object would
+/// incorrectly contribute to intrinsic sizing.
 /// <https://html.spec.whatwg.org/multipage/images.html#the-img-element>
 /// <https://www.w3.org/TR/css-images-3/#default-sizing>
-fn unavailable_image_establishes_replaced_box(element: &Element) -> bool {
+fn unavailable_image_establishes_replaced_box(element: &Element, style: &ComputedStyle) -> bool {
     if element.tag == "video" {
         return true;
     }
@@ -639,7 +731,9 @@ fn unavailable_image_establishes_replaced_box(element: &Element) -> bool {
             .get("src")
             .is_some_and(|source| !source.trim().is_empty())
             || element.attrs.contains_key("width")
-            || element.attrs.contains_key("height"))
+            || element.attrs.contains_key("height")
+            || !style.box_values.width.is_auto()
+            || !style.box_values.height.is_auto())
 }
 
 /// Resolve a replaced element's intrinsic dimensions into CSS content and
@@ -890,7 +984,15 @@ pub(super) fn used_generated_image(
         resource_cache,
         style.image_orientation == css::ImageOrientation::FromImage,
     )?;
-    let intrinsic_resolution = intrinsic_resolution.max(f32::MIN_POSITIVE);
+    // CSS Images applies an image-set resolution descriptor to the natural
+    // resolution of raster candidates only. Vector SVG candidates retain
+    // their own intrinsic CSS dimensions.
+    // <https://drafts.csswg.org/css-images-4/#image-set-notation>
+    let intrinsic_resolution = match &asset {
+        ResolvedImageAsset::Raster(_) => intrinsic_resolution,
+        ResolvedImageAsset::Svg(_) => 1.0,
+    }
+    .max(f32::MIN_POSITIVE);
     let raw_intrinsic_size = match &asset {
         ResolvedImageAsset::Raster(image) => image.natural_layout_size(),
         // Generated `content: url(...)` SVGs are still CSS replaced images.
@@ -1143,57 +1245,25 @@ pub(super) fn used_generated_image_value(
         );
     }
 
-    let borders = used_border_widths(style);
-    let horizontal_non_content =
-        borders.left + borders.right + style.padding.left + style.padding.right;
-    let vertical_non_content =
-        borders.top + borders.bottom + style.padding.top + style.padding.bottom;
-    let available_content_width = (available_width - horizontal_non_content).max(0.0);
-    let width = used_content_box_width_or_auto(
+    // Gradients have no natural dimensions or preferred aspect ratio.  They
+    // therefore negotiate CSS's 300 by 150px default object size rather than
+    // inheriting an arbitrary font-sized square.
+    // <https://drafts.csswg.org/css-images-3/#default-sizing>
+    let geometry = used_replaced_box(
+        IntrinsicReplacedSize {
+            width: content_box_pt(300.0 * css::CSS_PX_TO_PT),
+            height: content_box_pt(150.0 * css::CSS_PX_TO_PT),
+            preferred_aspect_ratio: None,
+            has_intrinsic_size: false,
+            attr_width: None,
+            attr_height: None,
+        },
         style,
-        layout_pt(available_width),
-        non_content_pt(horizontal_non_content),
-    )
-    .map(SemanticLengthExt::points);
-    let height = definite_image_content_height_without_percent(style, vertical_non_content);
-    let width_is_auto = width.is_none();
-    let height_is_auto = height.is_none();
-    let default_size = style.font_size.max(1.0);
-    let (mut content_width, mut content_height) = match (width, height) {
-        (Some(width_value), None) => (width_value, width_value),
-        (None, Some(height_value)) => (height_value, height_value),
-        (None, None) => (default_size, default_size),
-        (Some(width_value), Some(height_value)) => (width_value, height_value),
-    };
-    constrain_replaced_size_with_aspect_ratio(
-        &mut content_width,
-        &mut content_height,
-        1.0,
-        ReplacedAutoAxes {
-            width: width_is_auto,
-            height: height_is_auto,
-        },
-        ReplacedSizeConstraints {
-            min_width: used_min_width(style, PercentageBasis::definite(layout_pt(available_width)))
-                .map(SemanticLengthExt::points),
-            max_width: used_max_width(style, PercentageBasis::definite(layout_pt(available_width)))
-                .map(|width| width.points().min(available_content_width)),
-            min_height: used_min_height(
-                style,
-                PercentageBasis::definite(layout_pt(available_width)),
-            )
-            .map(SemanticLengthExt::points),
-            max_height: used_max_height(
-                style,
-                PercentageBasis::definite(layout_pt(available_width)),
-            )
-            .map(SemanticLengthExt::points),
-        },
+        content_box_pt(available_width),
+        PercentageBasis::indefinite(),
     );
-    content_width = content_width.min(available_content_width);
-    if width_is_auto && !height_is_auto {
-        content_height = content_width;
-    }
+    let content_width = geometry.content_size.width;
+    let content_height = geometry.content_size.height;
     let decoded = rasterize_generated_css_image(
         image,
         PaintSize::new(content_width, content_height),
@@ -1202,12 +1272,7 @@ pub(super) fn used_generated_image_value(
         fallback_root_url,
         resource_cache,
     )?;
-    Some(UsedImage::new(
-        decoded,
-        content_box_size_pt(content_width, content_height),
-        non_content_pt(horizontal_non_content),
-        non_content_pt(vertical_non_content),
-    ))
+    Some(UsedImage::from_geometry(decoded, geometry).with_generated_gradient(image.clone()))
 }
 
 /// Used size for an invalid CSS `content: url(...)` replacement image.
@@ -2037,9 +2102,9 @@ mod tests {
         assert_eq!(asset.intrinsic_size(), LayoutSize::new(15.0, 7.5));
         assert_eq!(
             asset
-                .paint_paths(crate::PaintRect::new(
-                    crate::PaintPoint::new(0.0, 0.0),
-                    crate::PaintSize::new(15.0, 7.5),
+                .paint_paths(crate::document::paint::geometry::PaintRect::new(
+                    crate::document::paint::geometry::PaintPoint::new(0.0, 0.0),
+                    crate::document::paint::geometry::PaintSize::new(15.0, 7.5),
                 ))
                 .len(),
             1
@@ -2224,8 +2289,10 @@ mod tests {
         );
 
         let mut explicit_height = ComputedStyle::initial();
-        explicit_height.box_values.height = css::ComputedLengthPercentageOrAuto::LengthPercentage(
-            css::ComputedLengthPercentage::from_points(15.0),
+        explicit_height.box_values.height.replace_with_used(
+            css::ComputedLengthPercentageOrAuto::LengthPercentage(
+                css::ComputedLengthPercentage::from_points(15.0),
+            ),
         );
         let height_geometry = used_replaced_box(
             intrinsic,

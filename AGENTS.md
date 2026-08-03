@@ -39,7 +39,10 @@ Note that we aim to be much more spec compliant and performant than weasyprint. 
 ## Development guidelines
 
 - With every significant change, consider if the architecture of the components being modified is appropriate to support the full feature set. For example, when designing a module, ensure the design is appropriate for when we have the full set of features implemented.
-- Ensure that `cargo clippy` passes with no warnings at the end of each change, and format with `cargo +nightly fmt`.
+- At the end of each change:
+  - Ensure that `cargo clippy` passes with no warnings
+  - All tests must pass
+  - Format with `cargo +nightly fmt`.
 - Before adding a crate, the user must approve. Don't avoid asking the user; if it's the best solution, recommend it to the user.
 - For functions or structs implementing a feature, cite the relevant W3C specs, or PDF specs in the Rustdoc.
 - When fixing a WPT, don't implement stopgaps; make sure to fix the underlying problem, and do it in the best way.
@@ -53,7 +56,7 @@ Tests can be found at `~/projects/quire-wpt/third_party/wpt`.
 
 The latest results for each web platform test are in `~/projects/quire-wpt/results/engine-cache/`. Use those to figure out pass rate for a group or to find tests to work on.
 
-Use `quire-wpt evaluate-test <path>` to render and evaluate one WPT test by its exact path across every configured engine, producing the normal PDFs, raster artifacts, diffs, and report. It is exact selection rather than a prefix filter; add --include-scripts only when evaluating a script-driven test.
+Use `quire-wpt evaluate-test <path>` to render and evaluate one WPT test by its exact path across every configured engine, producing the normal PDFs, raster artifacts, diffs, and report. It is exact selection rather than a prefix filter; add `--include-scripts` only when evaluating a script-driven test. `quire-wpt` can be run with cargo inside `~/projects/quire-wpt/`.
 
 ## Tests
 

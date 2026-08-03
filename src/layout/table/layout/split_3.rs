@@ -88,8 +88,10 @@ pub(in crate::layout::table) struct TableBodyRowsInput<'table, 'ctx> {
     pub(in crate::layout::table) grid: &'ctx TableGrid,
     pub(in crate::layout::table) columns: &'ctx [TableColumn<'table>],
     pub(in crate::layout::table) style: &'ctx ComputedStyle,
-    pub(in crate::layout::table) stylesheets: &'ctx [Stylesheet],
+    pub(in crate::layout::table) stylesheets: &'ctx Stylesheets<'ctx>,
     pub(in crate::layout::table) table_x: f32,
+    /// Immutable unfragmented table grid used as the source paint space.
+    pub(in crate::layout::table) source_grid_placement: TableGridPlacement,
     pub(in crate::layout::table) logical_inline_extent: LogicalInlineContentSize,
     pub(in crate::layout::table) physical_grid_width: PhysicalContentWidth,
     pub(in crate::layout::table) table_cellpadding: Option<f32>,
@@ -111,13 +113,34 @@ pub(in crate::layout::table) struct TableBodyRowsInput<'table, 'ctx> {
     pub(in crate::layout::table) row_group_break_after: &'ctx [PageBreak],
 }
 
+/// A table wrapper's physical X offset within its active content column.
+///
+/// Page-area origins are stable across synthetic multicolumn fragmentainers,
+/// whereas the content-column origin changes. Retaining only this signed local
+/// offset prevents continuation painting from accidentally anchoring to the
+/// page area instead of its destination column.
+/// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout::table) struct TableContinuationInlineOffset(f32);
+
+impl TableContinuationInlineOffset {
+    pub(in crate::layout::table) fn capture(table_x: f32, content_left: f32) -> Self {
+        Self(table_x - content_left)
+    }
+
+    pub(in crate::layout::table) fn resolve(self, content_left: f32) -> f32 {
+        content_left + self.0
+    }
+}
+
 pub(in crate::layout::table) struct TableBodyFragmentCommitContext<'table, 'ctx> {
     pub(in crate::layout::table) rows: &'ctx [TableRow<'table>],
     pub(in crate::layout::table) grid: &'ctx TableGrid,
     pub(in crate::layout::table) columns: &'ctx [TableColumn<'table>],
     pub(in crate::layout::table) style: &'ctx ComputedStyle,
-    pub(in crate::layout::table) stylesheets: &'ctx [Stylesheet],
+    pub(in crate::layout::table) stylesheets: &'ctx Stylesheets<'ctx>,
     pub(in crate::layout::table) table_x: f32,
+    pub(in crate::layout::table) continuation_inline_offset: TableContinuationInlineOffset,
     pub(in crate::layout::table) logical_inline_extent: LogicalInlineContentSize,
     pub(in crate::layout::table) physical_grid_width: PhysicalContentWidth,
     pub(in crate::layout::table) table_cellpadding: Option<f32>,
@@ -130,4 +153,26 @@ pub(in crate::layout::table) struct TableBodyFragmentCommitContext<'table, 'ctx>
     pub(in crate::layout::table) table_is_document_canvas: bool,
     pub(in crate::layout::table) repeating_header_rows: &'ctx [usize],
     pub(in crate::layout::table) repeating_footer_rows: &'ctx [usize],
+}
+
+impl TableBodyFragmentCommitContext<'_, '_> {
+    pub(in crate::layout::table) fn rebase_to_content_left(&mut self, content_left: f32) {
+        self.table_x = self.continuation_inline_offset.resolve(content_left);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TableContinuationInlineOffset;
+
+    #[test]
+    fn table_continuation_offset_preserves_local_inline_placement() {
+        let offset = TableContinuationInlineOffset::capture(28.0, 20.0);
+
+        // A page continuation can retain the same active content origin.
+        let same_page_x = offset.resolve(20.0);
+        assert_eq!(same_page_x, 28.0);
+        // A multicolumn continuation must use its new column origin.
+        assert_eq!(offset.resolve(120.0), 128.0);
+    }
 }

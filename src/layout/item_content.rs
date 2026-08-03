@@ -27,8 +27,7 @@ pub(in crate::layout) fn replayed_item_fragmentation_base_style(
 ) -> ComputedStyle {
     let mut style = independent_formatting_context_item_style(source.clone());
     suppress_replayed_item_margins(&mut style);
-    style.page_name_specified = false;
-    style.page_name = None;
+    style.page = css::PageAssignment::Unspecified;
     style.break_before = PageBreak::Auto;
     style.break_after = PageBreak::Auto;
 
@@ -183,7 +182,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         child: &FormattingContextChild<'_>,
         placed_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
     ) {
         if let Some((child_element, signature, child_boxes)) = child.element_parts() {
             self.push_ancestor_signature(signature.clone());
@@ -245,8 +244,7 @@ mod tests {
             css::CssEdges::all(css::ComputedLengthPercentageOrAuto::LengthPercentage(
                 css::ComputedLengthPercentage::from_points(4.0),
             ));
-        style.page_name_specified = true;
-        style.page_name = Some("chapter".to_string());
+        style.page = css::PageAssignment::Named(css::PageName::new("chapter".to_string()));
         style.break_before = PageBreak::Page;
         style.break_after = PageBreak::Page;
         style.break_inside_avoid = true;
@@ -260,8 +258,8 @@ mod tests {
             style.box_values.margin,
             css::CssEdges::all(css::ComputedLengthPercentageOrAuto::ZERO)
         );
-        assert!(!style.page_name_specified);
-        assert_eq!(style.page_name, None);
+        assert!(!style.page.is_specified());
+        assert_eq!(style.page, css::PageAssignment::Unspecified);
         assert_eq!(style.break_before, PageBreak::Auto);
         assert_eq!(style.break_after, PageBreak::Auto);
     }

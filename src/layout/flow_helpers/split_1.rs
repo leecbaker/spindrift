@@ -2,9 +2,11 @@ use super::*;
 
 pub(in crate::layout) fn is_default_block_container_tag(tag: &str) -> bool {
     // CSS Display defines block containers by computed display, while HTML only
-    // supplies the default display values through the UA stylesheet.
+    // supplies the default display values through the UA stylesheet. The
+    // cascade-derived result is cached per tag because inline-text collection
+    // performs this classification for every nested element.
     // https://www.w3.org/TR/css-display-3/#block-container
-    css::default_style_for_tag(tag).display.is_block_level()
+    css::default_display_is_block_level_for_tag(tag)
 }
 
 pub(in crate::layout) fn element_sibling_signature_list(
@@ -84,7 +86,7 @@ impl<'a> DomStyleResolver<'a> {
         &mut self,
         element: &Element,
         signature: ElementSignature,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         parent: Option<&ComputedStyle>,
         ancestors: &[ElementSignature],
     ) -> ComputedStyle {
@@ -138,7 +140,7 @@ impl<'a> DomStyleResolver<'a> {
 pub(in crate::layout) fn definition_list_column_groups_with_font_metrics<'a>(
     element: &'a Element,
     parent_style: &ComputedStyle,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
     ancestors: &[ElementSignature],
     font_system: &mut FontSystem,
 ) -> Vec<Vec<DefinitionListColumnItem<'a>>> {
@@ -155,7 +157,7 @@ pub(in crate::layout) fn definition_list_column_groups_with_font_metrics<'a>(
 pub(in crate::layout) fn definition_list_column_groups_with_resolver<'a>(
     element: &'a Element,
     parent_style: &ComputedStyle,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
     ancestors: &[ElementSignature],
     resolver: &mut DomStyleResolver<'_>,
 ) -> Vec<Vec<DefinitionListColumnItem<'a>>> {
@@ -325,12 +327,13 @@ pub(in crate::layout) enum PageBoundaryValue {
 
 impl PageBoundaryValue {
     pub(in crate::layout) fn from_style(style: &ComputedStyle) -> Self {
-        if !style.page_name_specified {
+        if !style.page.is_specified() {
             return Self::Inherited;
         }
         style
-            .page_name
-            .clone()
+            .page
+            .specified_name()
+            .map(|name| name.as_str().to_string())
             .map(Self::Named)
             .unwrap_or(Self::Auto)
     }
@@ -363,14 +366,14 @@ pub(in crate::layout) struct ResolvedPageBoundaryValues {
 }
 
 impl ResolvedPageBoundaryValues {
-    fn uniform(page_name: Option<String>) -> Self {
+    pub(in crate::layout) fn uniform(page_name: Option<String>) -> Self {
         Self {
             start: page_name.clone(),
             end: page_name,
         }
     }
 
-    fn inapplicable() -> Self {
+    pub(in crate::layout) fn inapplicable() -> Self {
         Self::uniform(None)
     }
 }
@@ -451,7 +454,7 @@ pub(in crate::layout) fn page_value_sources_from_element_style_and_children(
     child_boxes: &[box_tree::FormattingBox<'_>],
 ) -> PageBoundaryValues {
     let mut sources = page_value_sources_from_style_and_children(style, child_boxes);
-    if !style.page_name_specified && element_has_leading_direct_inline_content(element, style) {
+    if !style.page.is_specified() && element_has_leading_direct_inline_content(element, style) {
         sources.start = PageBoundaryValue::Inherited;
     }
     sources
@@ -487,41 +490,43 @@ pub(in crate::layout) fn formatting_box_page_value_sources(
             &box_.core.style,
             &box_.core.children,
         ),
+        // `page` does not apply to inline boxes. Keep their normal-flow
+        // descendants, which may themselves establish class-A boundaries,
+        // but discard the inline box's authored value.
+        // <https://www.w3.org/TR/css-page-3/#using-named-pages>
         box_tree::FormattingBox::Inline(box_) => {
+            let mut descendant_style = box_.core.style.as_ref().clone();
+            descendant_style.page = css::PageAssignment::Unspecified;
             page_value_sources_from_element_style_and_children(
                 box_.core.element,
-                &box_.core.style,
+                &descendant_style,
                 &box_.core.children,
             )
         }
         box_tree::FormattingBox::InlineSplitBlockContext(box_) => {
+            let mut descendant_style = box_.core.style.as_ref().clone();
+            descendant_style.page = css::PageAssignment::Unspecified;
             page_value_sources_from_element_style_and_children(
                 box_.core.element,
-                &box_.core.style,
+                &descendant_style,
                 &box_.core.children,
             )
         }
-        // `page` does not apply to an atomic inline box itself, but a nested
-        // normal-flow descendant can still carry the first/last class-A
-        // boundary values for the atomic formatting context. Suppress only
-        // the atomic box's own value; discarding its children loses named
-        // page transitions inside inline blocks and tables.
-        // In particular, an inline `<canvas style="page:b">` must not
-        // select the document's first page, while an inline-block containing
-        // `page:a` then `page:b` descendants propagates `(a, b)`.
+        // Atomic inline formatting contexts do not establish class-A page
+        // boundaries in their parent flow. Their descendants remain atomic
+        // with the inline box rather than propagating page groups outward.
         // <https://drafts.csswg.org/css-page-3/#using-named-pages>
-        box_tree::FormattingBox::AtomicInline(box_) => {
-            let mut descendant_style = box_.core.style.as_ref().clone();
-            descendant_style.page_name_specified = false;
-            descendant_style.page_name = None;
-            page_value_sources_from_style_and_children(&descendant_style, &box_.core.children)
-        }
+        box_tree::FormattingBox::AtomicInline(_) => PageBoundaryValues::inapplicable(),
         box_tree::FormattingBox::Flex(box_) => PageBoundaryValues::from_style(&box_.core.style),
-        box_tree::FormattingBox::Table(box_) => page_value_sources_from_element_style_and_children(
-            box_.core.element,
-            &box_.core.style,
-            &box_.core.children,
-        ),
+        // A table's durable fragment is the CSS table formatting tree. Its
+        // generic core children still describe the pre-fixup element tree and
+        // can therefore omit or mis-order the effective row boundaries.
+        // Named-page propagation must follow the same row sequence table
+        // layout fragments.
+        // <https://www.w3.org/TR/css-page-3/#using-named-pages>
+        box_tree::FormattingBox::Table(box_) => {
+            table::table_page_boundary_summary(&box_.fragment, &box_.core.style, None).sources
+        }
         box_tree::FormattingBox::Replaced(box_) => PageBoundaryValues::from_style(&box_.core.style),
         box_tree::FormattingBox::AnonymousBlock(box_) => {
             page_value_sources_from_style_and_children(&box_.style, &box_.children)
@@ -539,14 +544,9 @@ fn resolved_page_name_for_style(
     style: &ComputedStyle,
     inherited_page_name: Option<&str>,
 ) -> Option<String> {
-    if style.page_name_specified {
-        style
-            .page_name
-            .clone()
-            .or_else(|| inherited_page_name.map(str::to_string))
-    } else {
-        inherited_page_name.map(str::to_string)
-    }
+    style
+        .page
+        .effective_name(inherited_page_name.map(str::to_string))
 }
 
 /// Resolves start/end page types for a style and its formatting-tree children.
@@ -604,7 +604,7 @@ pub(in crate::layout) fn resolved_formatting_box_page_boundary_values(
                 &box_.core.children,
                 inherited_page_name,
             );
-            if !box_.core.style.page_name_specified
+            if !box_.core.style.page.is_specified()
                 && element_has_leading_direct_inline_content(box_.core.element, &box_.core.style)
             {
                 values.start = resolved_page_name_for_style(&box_.core.style, inherited_page_name);
@@ -612,58 +612,42 @@ pub(in crate::layout) fn resolved_formatting_box_page_boundary_values(
             values
         }
         box_tree::FormattingBox::Inline(box_) => {
+            let mut style = box_.core.style.as_ref().clone();
+            style.page = css::PageAssignment::Unspecified;
             let mut values = resolved_page_boundary_values_from_style_and_children(
-                &box_.core.style,
+                &style,
                 &box_.core.children,
                 inherited_page_name,
             );
-            if !box_.core.style.page_name_specified
-                && element_has_leading_direct_inline_content(box_.core.element, &box_.core.style)
-            {
-                values.start = resolved_page_name_for_style(&box_.core.style, inherited_page_name);
+            if element_has_leading_direct_inline_content(box_.core.element, &style) {
+                values.start = resolved_page_name_for_style(&style, inherited_page_name);
             }
             values
         }
         box_tree::FormattingBox::InlineSplitBlockContext(box_) => {
-            let mut values = resolved_page_boundary_values_from_style_and_children(
-                &box_.core.style,
-                &box_.core.children,
-                inherited_page_name,
-            );
-            if !box_.core.style.page_name_specified
-                && element_has_leading_direct_inline_content(box_.core.element, &box_.core.style)
-            {
-                values.start = resolved_page_name_for_style(&box_.core.style, inherited_page_name);
-            }
-            values
-        }
-        // Atomic inline boxes do not supply their own `page` value. Their
-        // descendants nevertheless retain the surrounding lexical scope.
-        box_tree::FormattingBox::AtomicInline(box_) => {
             let mut style = box_.core.style.as_ref().clone();
-            style.page_name_specified = false;
-            style.page_name = None;
-            resolved_page_boundary_values_from_style_and_children(
+            style.page = css::PageAssignment::Unspecified;
+            let mut values = resolved_page_boundary_values_from_style_and_children(
                 &style,
                 &box_.core.children,
                 inherited_page_name,
-            )
+            );
+            if element_has_leading_direct_inline_content(box_.core.element, &style) {
+                values.start = resolved_page_name_for_style(&style, inherited_page_name);
+            }
+            values
         }
+        box_tree::FormattingBox::AtomicInline(_) => ResolvedPageBoundaryValues::inapplicable(),
         box_tree::FormattingBox::Flex(box_) => ResolvedPageBoundaryValues::uniform(
             resolved_page_name_for_style(&box_.core.style, inherited_page_name),
         ),
         box_tree::FormattingBox::Table(box_) => {
-            let mut values = resolved_page_boundary_values_from_style_and_children(
+            table::table_page_boundary_summary(
+                &box_.fragment,
                 &box_.core.style,
-                &box_.core.children,
                 inherited_page_name,
-            );
-            if !box_.core.style.page_name_specified
-                && element_has_leading_direct_inline_content(box_.core.element, &box_.core.style)
-            {
-                values.start = resolved_page_name_for_style(&box_.core.style, inherited_page_name);
-            }
-            values
+            )
+            .resolved
         }
         box_tree::FormattingBox::Replaced(box_) => ResolvedPageBoundaryValues::uniform(
             resolved_page_name_for_style(&box_.core.style, inherited_page_name),
@@ -758,7 +742,7 @@ pub(in crate::layout) fn formatting_box_is_zero_height_page_boundary(
         return false;
     };
     formatting_box_is_in_normal_flow(box_)
-        && style.page_name_specified
+        && style.page.is_specified()
         && style
             .box_values
             .height
@@ -795,9 +779,9 @@ pub(in crate::layout) fn coalesced_zero_height_page_start(
 
 pub(in crate::layout) fn style_is_in_normal_flow(style: &ComputedStyle) -> bool {
     !style.display.is_none()
-        && !matches!(style.position, Position::Absolute | Position::Fixed)
+        && style.position.is_normal_flow()
         && style.float == Float::None
-        && style.running_element_name.is_none()
+        && !style.position.is_running()
 }
 
 pub(in crate::layout) fn formatting_box_has_inline_content(
@@ -916,25 +900,27 @@ pub(in crate::layout) fn collect_inline_text_from_formatting_boxes(
 pub(in crate::layout) fn has_styled_inline_descendant_with_font_metrics(
     element: &Element,
     parent_style: &ComputedStyle,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
     ancestors: &[ElementSignature],
     font_system: &mut FontSystem,
 ) -> bool {
     let mut resolver = DomStyleResolver::with_font_system(font_system);
-    has_styled_inline_descendant_with_resolver(
+    has_styled_inline_descendant_with_inline_flow_scope(
         element,
         parent_style,
         stylesheets,
         ancestors,
+        false,
         &mut resolver,
     )
 }
 
-pub(in crate::layout) fn has_styled_inline_descendant_with_resolver(
+fn has_styled_inline_descendant_with_inline_flow_scope(
     element: &Element,
     parent_style: &ComputedStyle,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
     ancestors: &[ElementSignature],
+    _inside_inline_flow: bool,
     resolver: &mut DomStyleResolver<'_>,
 ) -> bool {
     let sibling_tags = element_sibling_signature_list(element);
@@ -966,17 +952,53 @@ pub(in crate::layout) fn has_styled_inline_descendant_with_resolver(
         if child_style.display.is_none() {
             return true;
         }
+        // Absolute and fixed descendants are blockified for their own layout,
+        // but they remain at this inline source boundary for static-position
+        // selection. The plain-text fast path would discard that boundary and
+        // never materialize their positioned paint.
+        // <https://www.w3.org/TR/css-position-3/#static-position>
+        if matches!(child_style.position, Position::Absolute | Position::Fixed) {
+            return true;
+        }
         if child_style.display.is_block_level() {
             return false;
+        }
+        // Ruby is a non-atomic inline-level formatting context whose base
+        // content participates in the parent line. Its annotations cannot be
+        // represented by this scalar-text shortcut, so force the inline-item
+        // collector even when its inherited typography matches the parent.
+        // <https://drafts.csswg.org/css-ruby-1/#ruby-layout>
+        if child_style.display.is_ruby() {
+            return true;
+        }
+        // Link annotations belong to the inline fragment sequence. The
+        // scalar text fast path can paint the glyphs but has no source range
+        // on which to record the hyperlink rectangle.
+        // <https://www.w3.org/TR/css-ui-4/#cursor>
+        if child_element.attrs.contains_key("href") {
+            return true;
+        }
+        // Atomic inline-level boxes contribute their own dimensions and
+        // baseline even when their descendants share the parent's font
+        // metrics. Route them through inline-item collection rather than
+        // collapsing the fragment to a plain text run.
+        // <https://drafts.csswg.org/css-display-3/#atomic-inline>
+        if (child_style.display.is_atomic_inline() || is_replaced_element(child_element))
+            && child_style.display.is_inline_level()
+            || (child_style.display.is_table() && child_style.display.is_inline_or_run_in_level())
+        {
+            return true;
         }
         inline_style_affects_line(parent_style, &child_style) || {
             let mut child_ancestors = ancestors.to_vec();
             child_ancestors.push(signature);
-            has_styled_inline_descendant_with_resolver(
+            has_styled_inline_descendant_with_inline_flow_scope(
                 child_element,
                 &child_style,
                 stylesheets,
                 &child_ancestors,
+                _inside_inline_flow
+                    || (child_style.display.is_inline_level() && child_style.display.is_flow()),
                 resolver,
             )
         }
@@ -989,6 +1011,12 @@ pub(in crate::layout) fn inline_style_affects_line(
 ) -> bool {
     child.before_style.is_some()
         || child.after_style.is_some()
+        // A scalar text run has no lexical boundary at which to emit the UAX
+        // #9 controls required by an inline CSS bidi scope. In particular,
+        // `unicode-bidi: isolate` must be externally represented as one
+        // neutral object instead of flattening its text into the paragraph.
+        // <https://drafts.csswg.org/css-writing-modes-4/#unicode-bidi>
+        || inline_bidi_scope_affects_line_ordering(child)
         || child.float != Float::None
         || child.color != parent.color
         || child.font_family != parent.font_family
@@ -1002,6 +1030,27 @@ pub(in crate::layout) fn inline_style_affects_line(
         || child.text_transform != parent.text_transform
         || child.vertical_align != parent.vertical_align
         || child.white_space != parent.white_space
+        // A non-inherited inline decoration needs the item collector even
+        // when its typography is identical to the parent.  The plain-text
+        // fast path has no inline box fragments on which to paint these
+        // backgrounds/borders or relative visual offsets.
+        // <https://www.w3.org/TR/CSS22/visuren.html#inline-boxes>
+        // <https://www.w3.org/TR/css-position-3/#relative-positioning>
+        || child.background_color.is_potentially_visible()
+        || child.background_image.is_image()
+        || child.background_layers.iter().any(|layer| layer.image.is_image())
+        || used_border_width(child) > layout_pt(0.0)
+        || child.margin != parent.margin
+        || child.padding != parent.padding
+        || child.box_values.margin != parent.box_values.margin
+        || child.box_values.padding != parent.box_values.padding
+        || matches!(child.position, Position::Relative | Position::Sticky)
+        // Opacity establishes an atomic compositing group. Retain the
+        // lexical inline scope so its text, decorations, and descendants are
+        // painted into that group instead of being flattened into the parent
+        // text run.
+        // <https://www.w3.org/TR/css-color-4/#transparency>
+        || child.opacity < 1.0
 }
 
 pub(in crate::layout) fn has_direct_inline_replaced_child(element: &Element) -> bool {
@@ -1013,7 +1062,7 @@ pub(in crate::layout) fn has_direct_inline_replaced_child(element: &Element) -> 
 pub(in crate::layout) fn has_direct_flow_child_with_font_metrics(
     element: &Element,
     parent_style: &ComputedStyle,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
     font_system: &mut FontSystem,
 ) -> bool {
     let mut resolver = DomStyleResolver::with_font_system(font_system);
@@ -1023,7 +1072,7 @@ pub(in crate::layout) fn has_direct_flow_child_with_font_metrics(
 pub(in crate::layout) fn has_direct_flow_child_with_resolver(
     element: &Element,
     parent_style: &ComputedStyle,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
     resolver: &mut DomStyleResolver<'_>,
 ) -> bool {
     let sibling_tags = element_sibling_signature_list(element);
@@ -1056,7 +1105,7 @@ pub(in crate::layout) fn has_direct_flow_child_with_resolver(
 pub(in crate::layout) fn has_ordered_mixed_flow_content_with_font_metrics(
     element: &Element,
     parent_style: &ComputedStyle,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
     ancestors: &[ElementSignature],
     font_system: &mut FontSystem,
 ) -> bool {
@@ -1070,10 +1119,359 @@ pub(in crate::layout) fn has_ordered_mixed_flow_content_with_font_metrics(
     )
 }
 
+/// Returns whether direct-DOM block layout must materialize its child
+/// formatting tree to perform CSS block-in-inline splitting.
+///
+/// A normal-flow block descendant of an inline flow wrapper is not an inline
+/// item. CSS 2.2 splits the inline wrapper around it, then places the block
+/// between anonymous block boxes in the enclosing block flow. The DOM inline
+/// collector intentionally does not lay out ordinary block descendants, so
+/// this structural boundary must use the normalized formatting-tree path.
+///
+/// <https://www.w3.org/TR/CSS22/visuren.html#anonymous-block-level>
+pub(in crate::layout) fn has_block_in_inline_split_boundary_with_font_metrics(
+    element: &Element,
+    parent_style: &ComputedStyle,
+    stylesheets: &Stylesheets<'_>,
+    ancestors: &[ElementSignature],
+    font_system: &mut FontSystem,
+) -> bool {
+    let mut resolver = DomStyleResolver::with_font_system(font_system);
+    has_block_in_inline_split_boundary_with_resolver(
+        element,
+        parent_style,
+        stylesheets,
+        ancestors,
+        false,
+        &mut resolver,
+    )
+}
+
+/// Returns whether a block's inline source contains a ruby formatting
+/// context. Ruby layout has its own anonymous box generation and pairing
+/// phase, so its subtree cannot use the scalar DOM-text fast path.
+///
+/// <https://drafts.csswg.org/css-ruby-1/#anon-gen-ruby>
+/// <https://drafts.csswg.org/css-ruby-1/#ruby-layout>
+pub(in crate::layout) fn has_ruby_formatting_descendant_with_font_metrics(
+    element: &Element,
+    parent_style: &ComputedStyle,
+    stylesheets: &Stylesheets<'_>,
+    ancestors: &[ElementSignature],
+    font_system: &mut FontSystem,
+    cached_descendants: &mut HashMap<ElementId, bool>,
+) -> bool {
+    let mut resolver = DomStyleResolver::with_font_system(font_system);
+    has_ruby_formatting_descendant_with_resolver(
+        element,
+        parent_style,
+        stylesheets,
+        ancestors,
+        &mut resolver,
+        cached_descendants,
+    )
+}
+
+/// Return whether a descendant table-internal box needs CSS Tables anonymous
+/// wrapper construction before normal block layout can dispatch it.
+///
+/// A `table-row`, `table-cell`, and the other table-internal display types do
+/// not independently establish a table formatting context. When encountered
+/// by the direct DOM traversal, they would otherwise be treated as ordinary
+/// block/inline content and their table fixup—including anonymous cell block
+/// container normalization—would be skipped.
+/// <https://drafts.csswg.org/css-tables-3/#fixup-algorithm>
+pub(in crate::layout) fn has_unwrapped_table_internal_descendant_with_font_metrics(
+    element: &Element,
+    parent_style: &ComputedStyle,
+    stylesheets: &Stylesheets<'_>,
+    ancestors: &[ElementSignature],
+    font_system: &mut FontSystem,
+) -> bool {
+    let mut resolver = DomStyleResolver::with_font_system(font_system);
+    has_unwrapped_table_internal_descendant_with_resolver(
+        element,
+        parent_style,
+        stylesheets,
+        ancestors,
+        &mut resolver,
+    )
+}
+
+/// Return whether direct child normalization must resolve a CSS `run-in`
+/// sequence before block layout chooses its child traversal.
+///
+/// Run-in placement depends on the following in-flow sibling, so the direct
+/// DOM walker cannot decide it one child at a time. It must first use the
+/// block-container's normalized formatting tree.
+/// <https://drafts.csswg.org/css-display-3/#run-in-layout>
+pub(in crate::layout) fn has_direct_run_in_child_with_font_metrics(
+    element: &Element,
+    parent_style: &ComputedStyle,
+    stylesheets: &Stylesheets<'_>,
+    ancestors: &[ElementSignature],
+    font_system: &mut FontSystem,
+) -> bool {
+    let sibling_tags = element_sibling_signature_list(element);
+    let mut resolver = DomStyleResolver::with_font_system(font_system);
+    let mut element_index = 0usize;
+    element.children.iter().any(|child| {
+        let NodeKind::Element(child_element) = &child.kind else {
+            return false;
+        };
+        let signature = ElementSignature::with_sibling_list(
+            child_element.tag.clone(),
+            child_element.attrs.clone(),
+            element_index,
+            sibling_tags.clone(),
+        );
+        element_index += 1;
+        resolver
+            .style_for_element(
+                child_element,
+                signature,
+                stylesheets,
+                Some(parent_style),
+                ancestors,
+            )
+            .display
+            .is_run_in()
+    })
+}
+
+fn has_unwrapped_table_internal_descendant_with_resolver(
+    element: &Element,
+    parent_style: &ComputedStyle,
+    stylesheets: &Stylesheets<'_>,
+    ancestors: &[ElementSignature],
+    resolver: &mut DomStyleResolver<'_>,
+) -> bool {
+    let sibling_tags = element_sibling_signature_list(element);
+    let mut element_index = 0usize;
+    for child in &element.children {
+        let NodeKind::Element(child_element) = &child.kind else {
+            continue;
+        };
+        let signature = ElementSignature::with_sibling_list(
+            child_element.tag.clone(),
+            child_element.attrs.clone(),
+            element_index,
+            sibling_tags.clone(),
+        );
+        element_index += 1;
+        let child_style = resolver.style_for_element(
+            child_element,
+            signature.clone(),
+            stylesheets,
+            Some(parent_style),
+            ancestors,
+        );
+        if child_style.display.is_none() {
+            continue;
+        }
+        if is_table_internal_display(child_style.display) {
+            return true;
+        }
+        // A proper table root owns its descendants' table fixup. Requiring a
+        // parent structural rebuild for it would only bypass the direct table
+        // layout path without adding information.
+        if child_style.display.is_table() {
+            continue;
+        }
+        let mut child_ancestors = ancestors.to_vec();
+        child_ancestors.push(signature);
+        if has_unwrapped_table_internal_descendant_with_resolver(
+            child_element,
+            &child_style,
+            stylesheets,
+            &child_ancestors,
+            resolver,
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_table_internal_display(display: Display) -> bool {
+    matches!(
+        display.inner,
+        DisplayInner::TableCaption
+            | DisplayInner::TableColumnGroup
+            | DisplayInner::TableColumn
+            | DisplayInner::TableHeaderGroup
+            | DisplayInner::TableRowGroup
+            | DisplayInner::TableFooterGroup
+            | DisplayInner::TableRow
+            | DisplayInner::TableCell
+    )
+}
+
+fn has_block_in_inline_split_boundary_with_resolver(
+    element: &Element,
+    parent_style: &ComputedStyle,
+    stylesheets: &Stylesheets<'_>,
+    ancestors: &[ElementSignature],
+    inside_inline_flow: bool,
+    resolver: &mut DomStyleResolver<'_>,
+) -> bool {
+    let sibling_tags = element_sibling_signature_list(element);
+    let mut element_index = 0usize;
+
+    for child in &element.children {
+        let NodeKind::Element(child_element) = &child.kind else {
+            continue;
+        };
+        let signature = ElementSignature::with_sibling_list(
+            child_element.tag.clone(),
+            child_element.attrs.clone(),
+            element_index,
+            sibling_tags.clone(),
+        );
+        element_index += 1;
+        let child_style = resolver.style_for_element(
+            child_element,
+            signature.clone(),
+            stylesheets,
+            Some(parent_style),
+            ancestors,
+        );
+        if child_style.display.is_none() {
+            continue;
+        }
+        if inside_inline_flow && is_normal_block_flow_child(child_element, &child_style) {
+            return true;
+        }
+        // Atomic inline boxes establish their own formatting context and
+        // therefore do not take part in their parent's block-in-inline
+        // transformation. Display-contents contributes no box, so it
+        // preserves an enclosing inline-flow scope for its descendants.
+        // Ruby layout-internal boxes establish a separate formatting model,
+        // rather than an ordinary inline flow.  They nevertheless need the
+        // same structural-tree boundary here: a direct in-flow block child is
+        // inlinified by CSS Ruby before CSS Display's block-in-inline split
+        // can inspect the enclosing tree.
+        // <https://drafts.csswg.org/css-ruby-1/#anon-gen-inlinize>
+        let continues_inline_flow = child_style.display.is_contents()
+            || ((child_style.display.is_inline_level() && child_style.display.is_flow())
+                || child_style.display.is_ruby()
+                || child_style.display.is_ruby_internal())
+                && child_style.float == Float::None
+                && matches!(
+                    child_style.position,
+                    Position::Static | Position::Relative | Position::Running(_)
+                );
+        if continues_inline_flow {
+            let mut child_ancestors = ancestors.to_vec();
+            child_ancestors.push(signature);
+            if has_block_in_inline_split_boundary_with_resolver(
+                child_element,
+                &child_style,
+                stylesheets,
+                &child_ancestors,
+                true,
+                resolver,
+            ) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn has_ruby_formatting_descendant_with_resolver(
+    element: &Element,
+    parent_style: &ComputedStyle,
+    stylesheets: &Stylesheets<'_>,
+    ancestors: &[ElementSignature],
+    resolver: &mut DomStyleResolver<'_>,
+    cached_descendants: &mut HashMap<ElementId, bool>,
+) -> bool {
+    if let Some(&contains_ruby) = cached_descendants.get(&element.id) {
+        return contains_ruby;
+    }
+    let sibling_tags = element_sibling_signature_list(element);
+    let mut element_index = 0usize;
+    for child in &element.children {
+        let NodeKind::Element(child_element) = &child.kind else {
+            continue;
+        };
+        let signature = ElementSignature::with_sibling_list(
+            child_element.tag.clone(),
+            child_element.attrs.clone(),
+            element_index,
+            sibling_tags.clone(),
+        );
+        element_index += 1;
+        let child_style = resolver.style_for_element(
+            child_element,
+            signature.clone(),
+            stylesheets,
+            Some(parent_style),
+            ancestors,
+        );
+        if child_style.display.is_none() {
+            continue;
+        }
+        if child_style.display.is_ruby() {
+            cached_descendants.insert(element.id, true);
+            return true;
+        }
+        // Ruby's anonymous-box construction affects the inline formatting
+        // context that contains it. A descendant block, float, or atomic
+        // inline establishes its own relevant formatting context and checks
+        // its own source when it is laid out; walking through it here would
+        // make every ancestor repeatedly cascade an unrelated subtree.
+        // `display: contents` and ordinary inline flow preserve the current
+        // inline formatting context, while ruby-internal boxes remain part of
+        // the ruby structure that owns it.
+        // <https://drafts.csswg.org/css-display-3/#block-in-inline>
+        // <https://drafts.csswg.org/css-ruby-1/#anon-gen-ruby>
+        let continues_inline_flow = child_style.display.is_contents()
+            || ((child_style.display.is_inline_level() && child_style.display.is_flow())
+                || child_style.display.is_ruby_internal())
+                && child_style.float == Float::None
+                && matches!(
+                    child_style.position,
+                    Position::Static | Position::Relative | Position::Running(_)
+                );
+        if !continues_inline_flow {
+            continue;
+        }
+        let mut child_ancestors = ancestors.to_vec();
+        child_ancestors.push(signature);
+        if has_ruby_formatting_descendant_with_resolver(
+            child_element,
+            &child_style,
+            stylesheets,
+            &child_ancestors,
+            resolver,
+            cached_descendants,
+        ) {
+            cached_descendants.insert(element.id, true);
+            return true;
+        }
+    }
+    cached_descendants.insert(element.id, false);
+    false
+}
+
+/// Whether a block needs the ordered mixed inline/block child traversal.
+///
+/// This is a normal-flow classification, not a source-order classification:
+/// absolutely and fixed positioned descendants get their static-position
+/// handling from positioned layout, but cannot establish an auto-height
+/// parent's fragmentainer-local flow end. Letting such a descendant select
+/// this traversal would make its provisional/static geometry participate in
+/// the cursor used to decide whether the next in-flow sibling overflows.
+///
+/// <https://www.w3.org/TR/css-position-3/#absolute-positioning>
+/// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
 pub(in crate::layout) fn has_ordered_mixed_flow_content_with_resolver(
     element: &Element,
     parent_style: &ComputedStyle,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
     ancestors: &[ElementSignature],
     resolver: &mut DomStyleResolver<'_>,
 ) -> bool {
@@ -1085,6 +1483,7 @@ pub(in crate::layout) fn has_ordered_mixed_flow_content_with_resolver(
     let mut element_index = 0usize;
     let mut has_inline = false;
     let mut has_flow = false;
+    let mut has_positioned_static_boundary = false;
 
     for child in &element.children {
         match &child.kind {
@@ -1103,26 +1502,54 @@ pub(in crate::layout) fn has_ordered_mixed_flow_content_with_resolver(
                 element_index += 1;
                 let child_style = resolver.style_for_element(
                     child_element,
-                    signature,
+                    signature.clone(),
                     stylesheets,
                     Some(parent_style),
                     ancestors,
                 );
-                // A float or out-of-flow positioned child does not contribute
-                // a normal-flow block, but it still selects placement at its
-                // source position amongst adjacent inline content. It
-                // therefore needs the same ordered traversal boundary as a
-                // flow child: collecting the entire inline run before DOM
-                // traversal would place it after text that follows it in
-                // source order (and can replay the float twice).
+                if matches!(child_style.position, Position::Absolute | Position::Fixed) {
+                    // Out-of-flow boxes retain source order only for static
+                    // positioning. They do not contribute an in-flow
+                    // endpoint to an otherwise block-only auto-height parent.
+                    // An inline-origin source nevertheless needs the ordered
+                    // traversal at a preceding or following block boundary:
+                    // its hypothetical inline line is the input to its
+                    // static-position rectangle, even though the box itself
+                    // has been blockified for layout.
+                    // <https://drafts.csswg.org/css-position-3/#static-position>
+                    has_positioned_static_boundary |= child_style.display.is_block_level();
+                    has_inline |= child_style.display.is_inline_level();
+                    continue;
+                }
+                // Floats need a source boundary in the parent block flow.
                 // <https://www.w3.org/TR/css-position-3/#static-position>
-                let is_flow_child = child_style.float != Float::None
+                let is_flow_child = child_style.float == Float::Footnote
+                    || (child_style.float != Float::None && child_style.display.is_block_level())
                     || is_normal_block_flow_child(child_element, &child_style)
-                    || is_replaced_element(child_element)
-                    || matches!(child_style.position, Position::Absolute | Position::Fixed);
+                    // HTML table structure still needs source-order traversal
+                    // around block siblings, but its computed outer display
+                    // decides whether the table itself is dispatched as block
+                    // flow or collected as an atomic inline.
+                    // <https://drafts.csswg.org/css-display-3/#box-generation>
+                    || is_html_table_element(child_element)
+                    || (is_replaced_element(child_element)
+                        && child_style.display.is_block_level());
                 if is_flow_child {
                     has_flow = true;
-                } else if is_line_break_element(child_element)
+                } else if child_style.display.is_contents() {
+                    let mut child_ancestors = ancestors.to_vec();
+                    child_ancestors.push(signature);
+                    if display_contents_has_inline_flow_contribution_with_resolver(
+                        child_element,
+                        &child_style,
+                        stylesheets,
+                        &child_ancestors,
+                        resolver,
+                    ) {
+                        has_inline = true;
+                    }
+                } else if child_style.display.is_inline_level()
+                    || is_line_break_element(child_element)
                     || !inline_text(child_element).is_empty()
                 {
                     has_inline = true;
@@ -1130,8 +1557,98 @@ pub(in crate::layout) fn has_ordered_mixed_flow_content_with_resolver(
             }
         }
 
-        if has_inline && has_flow {
+        if has_inline && (has_flow || has_positioned_static_boundary) {
             return true;
+        }
+    }
+
+    false
+}
+
+/// Return whether a `display: contents` subtree contributes inline source to
+/// its parent's formatting context.
+///
+/// A `display: contents` element has no principal box, so its in-flow
+/// descendants and tree-abiding generated pseudo-elements retain their source
+/// position in the parent's mixed block/inline sequence.  Looking only at DOM
+/// text loses generated `::before`/`::after` content and causes the generic
+/// parent-inline collector to replay that content before preceding block
+/// siblings.
+///
+/// <https://drafts.csswg.org/css-display-3/#valdef-display-contents>
+/// <https://drafts.csswg.org/css-pseudo-4/#treelike>
+fn display_contents_has_inline_flow_contribution_with_resolver(
+    element: &Element,
+    parent_style: &ComputedStyle,
+    stylesheets: &Stylesheets<'_>,
+    ancestors: &[ElementSignature],
+    resolver: &mut DomStyleResolver<'_>,
+) -> bool {
+    let sibling_tags = element_sibling_signature_list(element);
+    let mut element_index = 0usize;
+
+    for child in &element.children {
+        match &child.kind {
+            NodeKind::Text(text) => {
+                if !normalize_inline_text(text).is_empty() {
+                    return true;
+                }
+            }
+            NodeKind::Element(child_element) => {
+                let signature = ElementSignature::with_sibling_list(
+                    child_element.tag.clone(),
+                    child_element.attrs.clone(),
+                    element_index,
+                    sibling_tags.clone(),
+                );
+                element_index += 1;
+                let child_style = resolver.style_for_element(
+                    child_element,
+                    signature.clone(),
+                    stylesheets,
+                    Some(parent_style),
+                    ancestors,
+                );
+                if child_style.display.is_none() {
+                    continue;
+                }
+
+                let preserves_parent_inline_context = child_style.display.is_contents()
+                    || (child_style.display.is_inline_level()
+                        && child_style.float == Float::None
+                        && matches!(
+                            child_style.position,
+                            Position::Static | Position::Relative | Position::Running(_)
+                        ));
+                if !preserves_parent_inline_context {
+                    continue;
+                }
+
+                let has_generated_inline_content = child_style
+                    .before_style
+                    .as_deref()
+                    .is_some_and(generated_content_has_non_phantom_inline_content)
+                    || child_style
+                        .after_style
+                        .as_deref()
+                        .is_some_and(generated_content_has_non_phantom_inline_content);
+                if has_generated_inline_content || child_style.display.is_inline_level() {
+                    return true;
+                }
+
+                debug_assert!(child_style.display.is_contents());
+                let mut child_ancestors = ancestors.to_vec();
+                child_ancestors.push(signature);
+                if display_contents_has_inline_flow_contribution_with_resolver(
+                    child_element,
+                    &child_style,
+                    stylesheets,
+                    &child_ancestors,
+                    resolver,
+                ) {
+                    return true;
+                }
+            }
         }
     }
 
@@ -1153,6 +1670,7 @@ pub(in crate::layout) fn has_ordered_mixed_flow_content_with_resolver(
 /// <https://www.w3.org/TR/css-display-3/#valdef-display-flow-root>
 /// <https://www.w3.org/TR/css-contain-1/#containment-layout>
 pub(in crate::layout) fn can_collapse_block_start_margin(
+    element: &Element,
     style: &ComputedStyle,
     border_edges: UsedEdges,
     has_direct_inline_content: bool,
@@ -1161,8 +1679,7 @@ pub(in crate::layout) fn can_collapse_block_start_margin(
     style.display.is_flow()
         && !style.display.establishes_block_formatting_context()
         && !style_establishes_multicol_formatting_context(style)
-        && !style.contain.layout
-        && !style.contain.paint
+        && !property_containment_establishes_independent_formatting_context(element, style)
         && style.float == Float::None
         && !has_direct_inline_content
         && used_overflow == css::Overflow::Visible
@@ -1181,6 +1698,7 @@ pub(in crate::layout) fn can_collapse_block_start_margin(
 /// <https://www.w3.org/TR/css-display-3/#valdef-display-flow-root>
 /// <https://www.w3.org/TR/css-contain-1/#containment-layout>
 pub(in crate::layout) fn can_collapse_block_end_margin(
+    element: &Element,
     style: &ComputedStyle,
     border_edges: UsedEdges,
     has_direct_inline_content: bool,
@@ -1189,8 +1707,7 @@ pub(in crate::layout) fn can_collapse_block_end_margin(
     style.display.is_flow()
         && !style.display.establishes_block_formatting_context()
         && !style_establishes_multicol_formatting_context(style)
-        && !style.contain.layout
-        && !style.contain.paint
+        && !property_containment_establishes_independent_formatting_context(element, style)
         && style.float == Float::None
         && !has_direct_inline_content
         && used_overflow == css::Overflow::Visible
@@ -1209,9 +1726,35 @@ pub(in crate::layout) fn can_collapse_block_end_margin(
 pub(in crate::layout) fn style_establishes_multicol_formatting_context(
     style: &ComputedStyle,
 ) -> bool {
-    style.column_count.is_some()
+    matches!(style.column_count, css::ColumnCount::Count(_))
         || matches!(style.column_width, css::ComputedColumnWidth::Length(_))
         || matches!(style.column_height, css::ComputedColumnHeight::Length(_))
+}
+
+/// Resolve the clamp state consumed by inline layout for this block container.
+///
+/// The computed declaration stays untouched; an ancestor traversal may supply
+/// a smaller layout budget through `used_line_clamp`. A multicol container is
+/// deliberately ineligible because `continue: collapse` behaves as `auto`
+/// there.
+/// <https://drafts.csswg.org/css-overflow-4/#continue>
+pub(in crate::layout) fn used_line_clamp_for_style(
+    style: &ComputedStyle,
+) -> Option<css::InlineLineClamp<'_>> {
+    style
+        .used_line_clamp
+        .as_ref()
+        .map(css::InlineLineClamp::Used)
+        .or_else(|| {
+            (!style_establishes_multicol_formatting_context(style))
+                .then(|| {
+                    style
+                        .line_clamp
+                        .as_ref()
+                        .map(css::InlineLineClamp::Computed)
+                })
+                .flatten()
+        })
 }
 
 /// Returns whether a child participates in normal block flow for margin collapse.
@@ -1221,39 +1764,41 @@ pub(in crate::layout) fn style_establishes_multicol_formatting_context(
 /// <https://www.w3.org/TR/CSS22/visuren.html#positioning-scheme> and
 /// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>.
 pub(in crate::layout) fn is_normal_block_flow_child(
-    element: &Element,
+    _element: &Element,
     style: &ComputedStyle,
 ) -> bool {
-    !matches!(style.position, Position::Absolute | Position::Fixed)
-        && style.float == Float::None
-        && (style.display.is_block_level() || is_html_table_element(element))
+    style.position.is_normal_flow() && style.float == Float::None && style.display.is_block_level()
 }
 
+/// Returns whether a normal-flow block child's outer margins can adjoin its parent.
+///
+/// A flex container prevents its items' margins from collapsing through it,
+/// but its own block-start and block-end margins remain eligible to collapse
+/// with an adjoining block parent:
+/// <https://www.w3.org/TR/css-flexbox-1/#flex-containers> and
+/// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>.
 pub(in crate::layout) fn is_collapsible_block_child(
     element: &Element,
     style: &ComputedStyle,
 ) -> bool {
-    is_normal_block_flow_child(element, style)
-        && !style.display.is_flex()
-        && !is_replaced_element(element)
+    is_normal_block_flow_child(element, style) && !is_replaced_element(element)
 }
 
-/// Returns whether a normal-flow block-level child's outer margins can adjoin siblings.
+/// Returns whether a block's outer margins can adjoin an in-flow block sibling.
 ///
-/// CSS margin collapse applies only to adjoining block-flow boxes. Grid
-/// containers establish an independent formatting context, so their outer
-/// block margins remain separate from adjacent normal-flow siblings. This is
-/// also what keeps a sequence of scrollable Grid containers from losing each
-/// later block-start margin during parent-flow preprocessing:
-/// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins> and
-/// <https://www.w3.org/TR/css-grid-1/#grid-containers>.
-pub(in crate::layout) fn is_sibling_margin_collapsible_block_child(
+/// An independent formatting context prevents margins from collapsing through
+/// its own edges with its children. It does not isolate the principal box's
+/// outer margins from an adjacent sibling in the parent's block formatting
+/// context. Consequently, block-level Grid, Flex, and flow-root containers
+/// remain eligible here; their inner formatting contexts are handled only by
+/// the parent/child margin-collapse predicates.
+///
+/// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
+pub(in crate::layout) fn outer_margins_adjoin_block_siblings(
     element: &Element,
     style: &ComputedStyle,
 ) -> bool {
-    is_normal_block_flow_child(element, style)
-        && !style.display.is_grid()
-        && !is_replaced_element(element)
+    is_normal_block_flow_child(element, style) && !is_replaced_element(element)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1407,7 +1952,7 @@ pub(in crate::layout) fn has_later_normal_block_flow_child_with_font_metrics(
     start_element_index: usize,
     sibling_tags: &ElementSiblingSignatureList,
     parent_style: &ComputedStyle,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
     ancestors: &[ElementSignature],
     font_system: &mut FontSystem,
 ) -> bool {

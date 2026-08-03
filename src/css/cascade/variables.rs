@@ -7,11 +7,26 @@ use std::borrow::Cow;
 pub(super) fn apply_cascaded_custom_property_declarations(
     style: &mut ComputedStyle,
     declarations: &[CascadedDeclaration<'_>],
+    inheritance_source: &ComputedStyle,
 ) {
+    style.custom_properties.retain(|name, _| {
+        style
+            .registered_custom_properties
+            .by_name
+            .get(name)
+            .is_none_or(|registration| registration.inherits)
+    });
+    for (name, registration) in &style.registered_custom_properties.by_name {
+        style
+            .custom_properties
+            .entry(name.clone())
+            .or_insert_with(|| ComputedCustomPropertyValue::Color(registration.initial_color));
+    }
     for declaration in declarations {
         let name = declaration.name.as_ref();
         if is_custom_property_name(name) {
             let value = trim_css_value(&declaration.value);
+            let registration = style.registered_custom_properties.by_name.get(name);
             match value.to_ascii_lowercase().as_str() {
                 // CSS-wide keywords have their ordinary cascade meaning for
                 // custom properties. `initial` produces the guaranteed-invalid
@@ -20,18 +35,124 @@ pub(super) fn apply_cascaded_custom_property_declarations(
                 // retain the already-inherited map entry.
                 // <https://www.w3.org/TR/css-variables-1/#defining-variables>
                 "initial" => {
-                    style.custom_properties.remove(name);
+                    if let Some(registration) = registration {
+                        style.custom_properties.insert(
+                            name.to_string(),
+                            ComputedCustomPropertyValue::Color(registration.initial_color),
+                        );
+                    } else {
+                        style.custom_properties.remove(name);
+                    }
                 }
-                "inherit" | "unset" => {}
+                "inherit" => {
+                    if let Some(registration) = registration
+                        && !registration.inherits
+                    {
+                        let value = inheritance_source
+                            .custom_properties
+                            .get(name)
+                            .cloned()
+                            .unwrap_or(ComputedCustomPropertyValue::Color(
+                                registration.initial_color,
+                            ));
+                        style.custom_properties.insert(name.to_string(), value);
+                    }
+                }
+                "unset" if registration.is_some_and(|registration| !registration.inherits) => {
+                    style.custom_properties.insert(
+                        name.to_string(),
+                        ComputedCustomPropertyValue::Color(
+                            registration.expect("checked").initial_color,
+                        ),
+                    );
+                }
+                "unset" => {}
                 _ => {
-                    style
-                        .custom_properties
-                        .insert(name.to_string(), value.to_string());
+                    style.custom_properties.insert(
+                        name.to_string(),
+                        ComputedCustomPropertyValue::Tokens(value.to_string()),
+                    );
                 }
             }
         }
     }
     resolve_custom_properties_at_computed_value_time(style);
+}
+
+/// Applies `<color>` registration syntax after the owning element's used color
+/// scheme is known. Invalid values reset to the registered initial value.
+pub(super) fn compute_registered_custom_property_values(style: &mut ComputedStyle) {
+    let registrations = std::sync::Arc::clone(&style.registered_custom_properties);
+    for (name, registration) in &registrations.by_name {
+        let value = style
+            .custom_properties
+            .get(name)
+            .map(ComputedCustomPropertyValue::substitution_tokens);
+        let color = value.as_deref().and_then(|value| {
+            parse_color_from_currentcolor_in_scheme(value, style.color, style.used_color_scheme)
+                .or_else(|| parse_color(value))
+        });
+        style.custom_properties.insert(
+            name.clone(),
+            color.map(ComputedCustomPropertyValue::Color).unwrap_or(
+                ComputedCustomPropertyValue::Color(registration.initial_color),
+            ),
+        );
+    }
+}
+
+/// Computes the inherited `color-scheme` property before colors are parsed.
+/// A `light-dark()` color must observe the scheme of its owning element, not
+/// the renderer's print default.
+/// <https://www.w3.org/TR/css-color-adjust-1/#color-scheme-prop>
+pub(super) fn apply_cascaded_color_scheme_declarations(
+    style: &mut ComputedStyle,
+    declarations: &[CascadedDeclaration<'_>],
+    inheritance_source: &ComputedStyle,
+    color_scheme_preference: ColorSchemePreference,
+) {
+    for declaration in declarations
+        .iter()
+        .rev()
+        .filter(|declaration| declaration.name.as_ref() == "color-scheme")
+    {
+        let raw = trim_css_value(&declaration.value);
+        let resolved;
+        let value = if contains_css_variable_reference(raw) {
+            let Some(value) = resolve_css_variables(raw, &style.custom_properties) else {
+                style.color_scheme = inheritance_source.color_scheme.clone();
+                style.used_color_scheme = inheritance_source.used_color_scheme;
+                return;
+            };
+            resolved = value;
+            trim_css_value(&resolved)
+        } else {
+            raw
+        };
+        match value.to_ascii_lowercase().as_str() {
+            "initial" => {
+                style.color_scheme = ComputedColorScheme::Normal;
+                // The initial `normal` value uses the page's scheme, rather
+                // than a fixed light scheme. This matters on descendants of a
+                // root whose used scheme is dark.
+                style.used_color_scheme = style.page_color_scheme;
+                return;
+            }
+            "inherit" | "unset" => {
+                style.color_scheme = inheritance_source.color_scheme.clone();
+                style.used_color_scheme = inheritance_source.used_color_scheme;
+                return;
+            }
+            _ => {}
+        }
+        if let Some(color_scheme) = ComputedColorScheme::parse(value) {
+            let page_scheme = style.page_color_scheme;
+            style.used_color_scheme =
+                color_scheme.used_scheme(color_scheme_preference, page_scheme);
+            style.color_scheme = color_scheme;
+            return;
+        }
+    }
 }
 
 /// Resolves custom properties before they are inherited by descendants.
@@ -52,14 +173,15 @@ fn resolve_custom_properties_at_computed_value_time(style: &mut ComputedStyle) {
     let resolved = custom_properties
         .iter()
         .filter_map(|(name, value)| {
-            resolve_css_variables(value, &custom_properties).map(|value| (name.clone(), value))
+            resolve_css_variables(&value.substitution_tokens(), &custom_properties)
+                .map(|value| (name.clone(), ComputedCustomPropertyValue::Tokens(value)))
         })
         .collect();
     style.custom_properties = resolved;
 }
 
 fn cyclic_custom_properties(
-    custom_properties: &std::collections::HashMap<String, String>,
+    custom_properties: &std::collections::HashMap<String, ComputedCustomPropertyValue>,
 ) -> std::collections::HashSet<String> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Visit {
@@ -69,7 +191,7 @@ fn cyclic_custom_properties(
 
     fn visit(
         name: &str,
-        custom_properties: &std::collections::HashMap<String, String>,
+        custom_properties: &std::collections::HashMap<String, ComputedCustomPropertyValue>,
         states: &mut std::collections::HashMap<String, Visit>,
         stack: &mut Vec<String>,
         cycles: &mut std::collections::HashSet<String>,
@@ -89,7 +211,11 @@ fn cyclic_custom_properties(
         };
         states.insert(name.to_string(), Visit::Visiting);
         stack.push(name.to_string());
-        for dependency in custom_property_dependencies(value) {
+        for dependency in value
+            .token_stream()
+            .map(custom_property_dependencies)
+            .unwrap_or_default()
+        {
             if custom_properties.contains_key(&dependency) {
                 visit(&dependency, custom_properties, states, stack, cycles);
             }
@@ -229,9 +355,13 @@ pub(super) fn apply_cascaded_color_declarations(
             }
             _ => {}
         }
-        if let Some(color) = parse_color_from_currentcolor(value, inheritance_source.color)
-            .or_else(|| parse_color_mix(value, inheritance_source.color))
-            .or_else(|| parse_color(value))
+        if let Some(color) = parse_color_from_currentcolor_in_scheme(
+            value,
+            inheritance_source.color,
+            style.used_color_scheme,
+        )
+        .or_else(|| parse_color_mix(value, inheritance_source.color))
+        .or_else(|| parse_color(value))
         {
             style.color = color;
             return;
@@ -254,7 +384,7 @@ pub(super) fn apply_cascaded_color_declarations(
 /// <https://www.w3.org/TR/css-variables-1/#variables-in-shorthands>.
 pub(super) fn declarations_after_variable_substitution_and_shorthand_expansion<'a>(
     declarations: &[CascadedDeclaration<'a>],
-    custom_properties: &std::collections::HashMap<String, String>,
+    custom_properties: &std::collections::HashMap<String, ComputedCustomPropertyValue>,
     direction: Direction,
     writing_mode: WritingMode,
 ) -> Vec<CascadedDeclaration<'a>> {
@@ -323,7 +453,7 @@ pub(super) fn declarations_after_variable_substitution_and_shorthand_expansion<'
 /// <https://www.w3.org/TR/css-cascade-5/#invalid-at-computed-value-time>.
 pub(super) fn resolve_css_variables(
     value: &str,
-    custom_properties: &std::collections::HashMap<String, String>,
+    custom_properties: &std::collections::HashMap<String, ComputedCustomPropertyValue>,
 ) -> Option<String> {
     if !custom_property_value_is_valid(value) {
         return None;
@@ -339,7 +469,7 @@ pub(in crate::css) fn contains_css_variable_reference(value: &str) -> bool {
 
 fn resolve_css_variables_inner(
     value: &str,
-    custom_properties: &std::collections::HashMap<String, String>,
+    custom_properties: &std::collections::HashMap<String, ComputedCustomPropertyValue>,
     stack: &mut Vec<String>,
 ) -> Option<String> {
     let mut input = ParserInput::new(value);
@@ -357,7 +487,7 @@ fn resolve_css_variables_inner(
 /// <https://www.w3.org/TR/css-syntax-3/#tokenization>.
 fn resolve_component_values(
     parser: &mut Parser<'_, '_>,
-    custom_properties: &std::collections::HashMap<String, String>,
+    custom_properties: &std::collections::HashMap<String, ComputedCustomPropertyValue>,
     stack: &mut Vec<String>,
 ) -> Result<String, ()> {
     let source_start = parser.position();
@@ -422,7 +552,7 @@ fn resolve_component_values(
 
 fn resolve_var_function(
     parser: &mut Parser<'_, '_>,
-    custom_properties: &std::collections::HashMap<String, String>,
+    custom_properties: &std::collections::HashMap<String, ComputedCustomPropertyValue>,
     stack: &mut Vec<String>,
 ) -> Option<String> {
     let name = parser.expect_ident().ok()?.to_string();
@@ -450,7 +580,8 @@ fn resolve_var_function(
     }
     if let Some(replacement) = custom_properties.get(&name) {
         stack.push(name);
-        let replacement = resolve_css_variables_inner(replacement, custom_properties, stack);
+        let replacement = replacement.substitution_tokens();
+        let replacement = resolve_css_variables_inner(&replacement, custom_properties, stack);
         stack.pop();
         replacement.or(fallback)
     } else {

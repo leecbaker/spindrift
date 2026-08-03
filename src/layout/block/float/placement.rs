@@ -165,7 +165,7 @@ impl FloatContext {
         mut measure: F,
     ) -> FloatAvoidingBfcPlacement
     where
-        F: FnMut(FloatBand, PageTopBlockPosition) -> FloatAvoidingBfcMeasurement,
+        F: FnMut(FloatBand, PageTopBlockPosition) -> FloatAvoidanceCandidate,
     {
         let mut top = self.clearance_top(clear, writing_mode, direction, page_index, top);
         let inline_span = PageInlineSpan::from_edges(left, right);
@@ -180,7 +180,10 @@ impl FloatContext {
             let mut stable = false;
 
             for _ in 0..self.shapes.len().saturating_add(3) {
-                let height = measured.border_box_block_size.points().max(FLOAT_EPSILON);
+                let height = measured
+                    .normal_flow_border_box_block_size
+                    .points()
+                    .max(FLOAT_EPSILON);
                 let next_band = self.content_band(
                     page_index,
                     PageBlockSpan::new(top.points(), height),
@@ -189,12 +192,12 @@ impl FloatContext {
                 let next_measured = measure(next_band, top);
                 stable = (next_band.left() - band.left()).abs() <= FLOAT_EPSILON
                     && (next_band.width() - band.width()).abs() <= FLOAT_EPSILON
-                    && (next_measured.border_box_inline_span.width()
-                        - measured.border_box_inline_span.width())
+                    && (next_measured.normal_flow_border_box_inline_span.width()
+                        - measured.normal_flow_border_box_inline_span.width())
                     .abs()
                         <= FLOAT_EPSILON
-                    && (next_measured.border_box_block_size.points()
-                        - measured.border_box_block_size.points())
+                    && (next_measured.normal_flow_border_box_block_size.points()
+                        - measured.normal_flow_border_box_block_size.points())
                     .abs()
                         <= FLOAT_EPSILON;
                 band = next_band;
@@ -206,8 +209,7 @@ impl FloatContext {
 
             let placement = FloatAvoidingBfcPlacement {
                 placement: FloatBandPlacement::new(band, top),
-                border_box_inline_span: measured.border_box_inline_span,
-                border_box_block_size: measured.border_box_block_size,
+                candidate: measured,
             };
             last_placement = Some(placement);
             // A BFC root avoids float margin boxes with its normal-flow border
@@ -217,10 +219,13 @@ impl FloatContext {
             // float. Test actual rectangle collision rather than comparing
             // the box to the band's two edges.
             // <https://www.w3.org/TR/CSS22/visuren.html#floats>
-            let border_box_span = measured.border_box_inline_span;
+            let border_box_span = measured.normal_flow_border_box_inline_span;
             let border_box_block_span = PageBlockSpan::new(
                 top.points(),
-                measured.border_box_block_size.points().max(FLOAT_EPSILON),
+                measured
+                    .normal_flow_border_box_block_size
+                    .points()
+                    .max(FLOAT_EPSILON),
             );
             let avoids_active_floats =
                 self.active_shapes(page_index, border_box_block_span)
@@ -250,9 +255,9 @@ impl FloatContext {
             // box outside the containing block while it remains adjacent to
             // the float.
             // <https://www.w3.org/TR/CSS22/visuren.html#floats>
-            let fits_containing_inline_span = (measured.permits_inline_start_overflow
+            let fits_containing_inline_span = (measured.permits_inline_start_overflow()
                 || border_box_span.left_x() >= left - FLOAT_EPSILON)
-                && (measured.permits_inline_end_overflow
+                && (measured.permits_inline_end_overflow()
                     || border_box_span.right_x() <= right + FLOAT_EPSILON);
             if stable && avoids_active_floats && fits_containing_inline_span {
                 return placement;
@@ -260,7 +265,10 @@ impl FloatContext {
 
             let block_span = PageBlockSpan::new(
                 top.points(),
-                measured.border_box_block_size.points().max(FLOAT_EPSILON),
+                measured
+                    .normal_flow_border_box_block_size
+                    .points()
+                    .max(FLOAT_EPSILON),
             );
             let rectangular_next_top = self
                 .active_shapes(page_index, block_span)
@@ -270,7 +278,7 @@ impl FloatContext {
                 page_index,
                 block_span,
                 inline_span,
-                measured.border_box_inline_span.width(),
+                measured.normal_flow_border_box_inline_span.width(),
             );
             let next_top = shaped_next_top
                 .filter(|next_top| next_top.points() < top.points() - FLOAT_EPSILON)
@@ -290,8 +298,7 @@ impl FloatContext {
             let measured = measure(band, top);
             FloatAvoidingBfcPlacement {
                 placement: FloatBandPlacement::new(band, top),
-                border_box_inline_span: measured.border_box_inline_span,
-                border_box_block_size: measured.border_box_block_size,
+                candidate: measured,
             }
         })
     }

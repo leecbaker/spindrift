@@ -81,36 +81,15 @@ pub(in crate::layout) fn block_paint_ops_with_phases(
     if paint_outer_shadows {
         paint_box_shadows(&mut rects, &mut paths, geometry, style, false);
     }
-    if paint_backgrounds
-        && let Some(fill) = style.background_color
-        && fill.is_visible()
-    {
+    if paint_backgrounds && let Some(fill) = style.background_color.visible_color(style.color) {
         let color_clip = style.background_color_clip();
-        let mut area = background_rect_area_for_box(rect, style, border_insets, color_clip);
-        // An opaque, solid rectangular border completely hides the matching
-        // strip of an opaque background-color layer. Emit only the visible
-        // background interior so PDF edge antialiasing cannot retain a seam
-        // between two CSS paints whose final coverage is disjoint. Rounded,
-        // patterned, translucent, and image borders retain the normal
-        // background geometry because their coverage is not a rectangle.
-        //
-        // CSS Backgrounds and Borders paints the background below the border:
+        // CSS paints the background over the selected clip box before it
+        // paints the border.  Keep that complete paint area even if an opaque
+        // border will cover part of it later: replacing it with a padding-box
+        // fill loses the specified background layer geometry and changes the
+        // observable fragment paint stack.
         // <https://www.w3.org/TR/css-backgrounds-3/#layering>
-        if fill.alpha() >= 1.0
-            && color_clip == css::BackgroundBox::Border
-            && style.border_radius.clone().is_zero()
-            && border_shape.is_none()
-            && !style.border_image.source.is_image()
-        {
-            let borders = used_border(style);
-            let hidden_by_border = css::Edges {
-                top: opaque_solid_border_width(borders.top),
-                right: opaque_solid_border_width(borders.right),
-                bottom: opaque_solid_border_width(borders.bottom),
-                left: opaque_solid_border_width(borders.left),
-            };
-            area = inset_paint_rect(area, hidden_by_border);
-        }
+        let area = background_rect_area_for_box(rect, style, border_insets, color_clip);
         if area.size.width <= 0.0 || area.size.height <= 0.0 {
             // Nothing to paint for the solid color layer after clipping.
         } else if let Some(pair) = border_shape_pair.clone() {
@@ -126,8 +105,12 @@ pub(in crate::layout) fn block_paint_ops_with_phases(
                 PaintStrokeWidth::ZERO,
                 None,
             ));
-            let ring_fill = if style.svg_fill_overridden {
-                style.svg_fill.unwrap_or(CssColor::TRANSPARENT)
+            let ring_fill = if style.svg_fill.is_overridden() {
+                style
+                    .svg_fill
+                    .paint
+                    .resolve(style.color)
+                    .unwrap_or(CssColor::TRANSPARENT)
             } else {
                 relevant_border_shape_color(style).unwrap_or(fill)
             };
@@ -228,9 +211,13 @@ pub(in crate::layout) fn block_paint_ops_with_phases(
         // Outline synthesis clears backgrounds before reusing this paint
         // helper. Its two-shape contour is still an annular border and must
         // therefore paint from the relevant synthetic outline side.
-        if style.background_color.is_none() {
-            let ring_fill = if style.svg_fill_overridden {
-                style.svg_fill.unwrap_or(CssColor::TRANSPARENT)
+        if style.background_color.is_transparent() {
+            let ring_fill = if style.svg_fill.is_overridden() {
+                style
+                    .svg_fill
+                    .paint
+                    .resolve(style.color)
+                    .unwrap_or(CssColor::TRANSPARENT)
             } else {
                 relevant_border_shape_color(style).unwrap_or(CssColor::TRANSPARENT)
             };
@@ -270,14 +257,6 @@ pub(in crate::layout) fn block_paint_ops_with_phases(
         );
     }
     (rects, rounded_rects, paths, strokes)
-}
-
-fn opaque_solid_border_width(border: UsedBorderSide) -> f32 {
-    if border.style == BorderStyle::Solid && border.color.alpha() >= 1.0 {
-        border.used_width.get()
-    } else {
-        0.0
-    }
 }
 
 /// Used paint geometry for one CSS Borders 4 circular `border-shape`.
@@ -1391,6 +1370,35 @@ pub(in crate::layout) fn linear_gradient_hard_stop_paths(
     {
         return None;
     }
+    linear_gradient_hard_stop_paths_in_gradient_box(gradient, area, clip, rounded_clip)
+}
+
+/// Paint an angled hard-stop gradient whose `area` is its resolved generated
+/// image tile. Unlike box-decoration painting, this path receives the used
+/// `background-size` tile directly and therefore does not require the layer's
+/// size or position to be initial values.
+/// <https://www.w3.org/TR/css-backgrounds-3/#the-background-size>
+pub(in crate::layout) fn linear_gradient_hard_stop_tile_paths(
+    gradient: &css::LinearGradient,
+    area: PaintRect,
+    clip: PaintRect,
+    rounded_clip: Option<RenderedPathClip>,
+) -> Option<Vec<RenderedPath>> {
+    if gradient.repeating
+        || !gradient.hints.is_empty()
+        || axis_aligned_gradient_direction(gradient.direction).is_some()
+    {
+        return None;
+    }
+    linear_gradient_hard_stop_paths_in_gradient_box(gradient, area, clip, rounded_clip)
+}
+
+fn linear_gradient_hard_stop_paths_in_gradient_box(
+    gradient: &css::LinearGradient,
+    area: PaintRect,
+    clip: PaintRect,
+    rounded_clip: Option<RenderedPathClip>,
+) -> Option<Vec<RenderedPath>> {
     let line = angled_gradient_line(gradient.direction, area);
     let stops = fixed_gradient_stops(gradient, line.axis_length)?;
     if !fixed_gradient_is_hard_stop(&stops) {
@@ -1442,30 +1450,30 @@ pub(in crate::layout) fn linear_gradient_can_paint_as_vector(
         && layer.position == css::BackgroundPosition::INITIAL
 }
 
-/// Whether [`block_paint_ops_with_phases`] emits this layer as exact
-/// axis-aligned hard-stop vector bands rather than delegating it to the
-/// generic generated-image painter.
+/// Whether the box-decoration painter already emits this hard-stop layer as
+/// exact vector geometry, so the generic generated-image painter must not
+/// paint it a second time.
 pub(in crate::layout) fn linear_gradient_is_painted_by_box_decoration(
     gradient: &css::LinearGradient,
     layer: &css::BackgroundLayer,
     size: PaintSize,
 ) -> bool {
-    let Some(direction) = axis_aligned_gradient_direction(gradient.direction) else {
+    if !linear_gradient_can_paint_as_vector(gradient, layer) {
         return false;
-    };
-    linear_gradient_can_paint_as_vector(gradient, layer)
-        && gradient
+    }
+    let gradient_box = PaintRect::new(PaintPoint::new(0.0, 0.0), size);
+    if let Some(direction) = axis_aligned_gradient_direction(gradient.direction) {
+        return gradient
             .stops
             .iter()
             .all(|stop| stop.color.as_color().is_some_and(CssColor::is_opaque))
-        && fixed_gradient_stops(
-            gradient,
-            axis_aligned_gradient_length(
-                direction,
-                PaintRect::new(PaintPoint::new(0.0, 0.0), size),
-            ),
-        )
-        .is_some_and(|stops| fixed_gradient_is_hard_stop(&stops))
+            && fixed_gradient_stops(
+                gradient,
+                axis_aligned_gradient_length(direction, gradient_box),
+            )
+            .is_some_and(|stops| fixed_gradient_is_hard_stop(&stops));
+    }
+    linear_gradient_hard_stop_paths(gradient, layer, gradient_box, gradient_box, None).is_some()
 }
 
 pub(in crate::layout) fn gradient_stop_position(

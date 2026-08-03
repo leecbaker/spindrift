@@ -1,7 +1,7 @@
 use super::super::*;
 
 mod block_layout;
-mod children;
+pub(in crate::layout) mod children;
 mod fragmentation;
 mod geometry;
 mod intrinsic;

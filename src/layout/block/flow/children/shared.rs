@@ -1,5 +1,73 @@
 use super::*;
 
+/// Whether the current in-flow block child owns the container's trimmed
+/// block-end edge.
+///
+/// CSS Box Model Level 4 trims the block-end margin of the last in-flow
+/// block-level child of a block container.  Deciding this before child layout
+/// is essential: the child layout consumes its used margin as part of the
+/// normal block-flow cursor advance, so a later paint-only correction would
+/// leave both cursor geometry and collapsed-margin state inconsistent.
+///
+/// This applies only to the selected child's own adjoining edge. Descendant
+/// margins are handled by the normal CSS 2.2 collapsing path while that edge
+/// remains open.
+///
+/// <https://drafts.csswg.org/css-box-4/#margin-trim-block>
+/// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) enum BlockEndMarginTrim {
+    Preserve,
+    Trim,
+}
+
+impl BlockEndMarginTrim {
+    pub(in crate::layout) fn for_child(
+        parent_style: &ComputedStyle,
+        is_in_flow_block_child: bool,
+        has_later_in_flow_block_child: bool,
+    ) -> Self {
+        if parent_style.margin_trim.block_end
+            && is_in_flow_block_child
+            && !has_later_in_flow_block_child
+        {
+            Self::Trim
+        } else {
+            Self::Preserve
+        }
+    }
+
+    /// Apply the selected container-edge rule before the child's used block
+    /// margins are frozen for layout.
+    pub(in crate::layout) fn apply_to_child(self, child_style: &mut ComputedStyle) {
+        if self == Self::Trim {
+            child_style.margin.bottom = 0.0;
+        }
+    }
+}
+
+/// Remove a previously consumed adjoining sibling margin when a following
+/// self-collapsing last child joins that margin to a trimmed block-end edge.
+///
+/// The traversal normally consumes a block child's block-end margin before it
+/// can discover that a later self-collapsing sibling makes that margin part of
+/// the final adjoining set. Restore that provisional cursor advance at the
+/// moment the set is closed; the container's own block-end margin remains
+/// untouched and is consumed by its normal block layout. A fresh fragmentainer
+/// has no preceding cursor advance to restore, so it is intentionally left to
+/// the existing margin-at-break behavior.
+///
+/// <https://drafts.csswg.org/css-box-4/#margin-trim-block>
+/// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
+pub(in crate::layout) fn discard_consumed_adjoining_block_end_margin(
+    layout: &mut LayoutBuilder<'_>,
+    previous_margin: Option<f32>,
+) {
+    if let Some(margin) = previous_margin.filter(|_| !layout.cursor_is_at_page_top()) {
+        layout.cursor_y += margin;
+    }
+}
+
 /// Returns whether an unresolved percentage height computes as `auto` for a
 /// margin-collapse predicate.
 ///
@@ -13,7 +81,7 @@ pub(in crate::layout) fn percentage_height_is_auto_for_margin_collapse(
 ) -> bool {
     matches!(basis, PercentageBasis::Indefinite)
         && matches!(
-            &style.box_values.height,
+            &*style.box_values.height,
             css::ComputedLengthPercentageOrAuto::LengthPercentage(value)
                 if value.needs_percentage_basis()
         )
@@ -39,7 +107,7 @@ impl<'a> LayoutBuilder<'a> {
         child_boxes: &[box_tree::FormattingBox<'_>],
         child_box_index: usize,
         block_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
     ) -> Option<f32> {
         let previous = (0..child_box_index).rev().find_map(|index| {
             let previous = child_boxes.get(index)?;
@@ -58,7 +126,7 @@ impl<'a> LayoutBuilder<'a> {
                 baseline_shift: 0.0,
                 visual_offset: InlineVisualOffset::zero(),
                 block_style,
-                propagated_decoration: block_style.text_decoration.clone(),
+                propagated_decoration_layers: block_style.text_decoration_layers.clone(),
             },
             &mut items,
         );
@@ -135,7 +203,7 @@ impl<'a> LayoutBuilder<'a> {
         element: &Element,
         sibling_tags: &ElementSiblingSignatureList,
         parent_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         block_start: bool,
         find_last: bool,
     ) -> Option<usize> {
@@ -199,13 +267,36 @@ pub(in crate::layout) fn formatting_box_is_out_of_flow_positioned(
 }
 
 pub(in crate::layout) fn block_avoid_break_flow_child(
-    parent_element: &Element,
+    _parent_element: &Element,
     child_element: &Element,
     child_style: &ComputedStyle,
 ) -> bool {
     is_normal_block_flow_child(child_element, child_style)
-        || is_document_canvas_element(parent_element)
-        || is_replaced_element(child_element)
+}
+
+impl<'a> LayoutBuilder<'a> {
+    /// Whether an in-flow child contributes descendant line boxes to its
+    /// parent's line-clamp stream.
+    ///
+    /// A line clamp counts only line boxes in its own block formatting
+    /// context. Independent formatting contexts, scroll containers, and the
+    /// fieldset formatting structure therefore remain visible but neither
+    /// receive nor spend the ancestor's line budget.
+    /// <https://drafts.csswg.org/css-overflow-4/#max-lines>
+    pub(in crate::layout) fn child_shares_line_clamp_formatting_context(
+        &self,
+        child_element: &Element,
+        child_style: &ComputedStyle,
+    ) -> bool {
+        if !style_is_in_normal_flow(child_style)
+            || child_style.display.establishes_block_formatting_context()
+            || child_element.tag.eq_ignore_ascii_case("fieldset")
+        {
+            return false;
+        }
+        let overflow = self.used_overflow_axes_for_element(child_element, child_style);
+        !overflow.horizontal.is_scroll_container() && !overflow.vertical.is_scroll_container()
+    }
 }
 
 /// Returns the class-A break values a formatting box exposes to its block-flow
@@ -274,7 +365,7 @@ impl<'a> LayoutBuilder<'a> {
         next_element_index: usize,
         sibling_tags: &ElementSiblingSignatureList,
         parent_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
     ) -> Option<PageBreak> {
         for child in parent_element.children.iter().skip(current_node_index + 1) {
             let NodeKind::Element(child_element) = &child.kind else {
@@ -319,7 +410,7 @@ impl<'a> LayoutBuilder<'a> {
         replay: &AdjoiningFloatReplayCandidate,
         child_element: &Element,
         child_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         replay_origin_y: f32,
     ) -> AdjoiningFloatReplaySeparation {
@@ -458,22 +549,7 @@ impl<'a> LayoutBuilder<'a> {
                     - candidate_style.margin.top
                     - candidate_style.margin.bottom)
                     .max(0.0);
-                FloatAvoidingBfcMeasurement {
-                    border_box_inline_span: PageInlineSpan::new(
-                        candidate_geometry.outer_inline().span().left_x()
-                            - candidate_geometry.relative_offset.x(),
-                        candidate_geometry.outer_inline().span().width(),
-                    ),
-                    border_box_block_size: border_box_pt(border_box_height),
-                    permits_inline_start_overflow: match candidate_style.direction {
-                        Direction::Ltr => candidate_style.margin.left < -FLOAT_EPSILON,
-                        Direction::Rtl => candidate_style.margin.right < -FLOAT_EPSILON,
-                    },
-                    permits_inline_end_overflow: match candidate_style.direction {
-                        Direction::Ltr => candidate_style.margin.right < -FLOAT_EPSILON,
-                        Direction::Rtl => candidate_style.margin.left < -FLOAT_EPSILON,
-                    },
-                }
+                candidate_geometry.float_avoidance_candidate(border_box_pt(border_box_height))
             },
         );
 

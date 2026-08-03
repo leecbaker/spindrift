@@ -1,4 +1,5 @@
 use super::*;
+use crate::css::component_values::split_css_component_values;
 use palette::{
     Lab, Oklab, Xyz,
     convert::FromColorUnclamped,
@@ -71,6 +72,16 @@ pub(crate) fn parse_color(value: &str) -> Option<CssColor> {
 /// inheritance and resolves its origin at used-value time:
 /// <https://www.w3.org/TR/css-color-5/#relative-colors>.
 pub(crate) fn parse_color_from_currentcolor(value: &str, current: CssColor) -> Option<CssColor> {
+    parse_color_from_currentcolor_in_scheme(value, current, UsedColorScheme::Light)
+}
+
+/// Parses a color whose computed value depends on the owning element's used
+/// `color-scheme`.
+pub(crate) fn parse_color_from_currentcolor_in_scheme(
+    value: &str,
+    current: CssColor,
+    used_color_scheme: UsedColorScheme,
+) -> Option<CssColor> {
     let value = normalize_css_comments(trim_css_value(value));
     let value = value.trim().to_ascii_lowercase();
     if value == "currentcolor" {
@@ -79,7 +90,7 @@ pub(crate) fn parse_color_from_currentcolor(value: &str, current: CssColor) -> O
     if let Some(contrast_color) = parse_contrast_color(&value, current) {
         return Some(contrast_color);
     }
-    if let Some(color) = parse_light_dark(&value, current) {
+    if let Some(color) = parse_light_dark(&value, current, used_color_scheme) {
         return Some(color);
     }
     if let Some(color_mix) = parse_color_mix(&value, current) {
@@ -189,16 +200,24 @@ fn relative_luminance(color: CssColor) -> f32 {
 /// Resolve the light branch of `light-dark()` in Quire's fixed light print
 /// color scheme. CSS CssColor Adjustment selects the branch from the used
 /// `color-scheme`: <https://www.w3.org/TR/css-color-adjust-1/#color-scheme-effect>.
-fn parse_light_dark(value: &str, current: CssColor) -> Option<CssColor> {
+fn parse_light_dark(
+    value: &str,
+    current: CssColor,
+    used_color_scheme: UsedColorScheme,
+) -> Option<CssColor> {
     let inner = crate::css::component_values::css_function_body(value, "light-dark")?;
     let components = split_top_level_commas(inner);
-    let [light, _dark] = components.as_slice() else {
+    let [light, dark] = components.as_slice() else {
         return None;
     };
-    if light.eq_ignore_ascii_case("currentcolor") {
+    let selected = match used_color_scheme {
+        UsedColorScheme::Light => light,
+        UsedColorScheme::Dark => dark,
+    };
+    if selected.eq_ignore_ascii_case("currentcolor") {
         Some(current)
     } else {
-        parse_color(light)
+        parse_color(selected)
     }
 }
 

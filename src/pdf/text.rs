@@ -11,7 +11,7 @@ pub(super) struct PdfTextRun<'a> {
 }
 
 pub(super) fn pdf_text_runs(
-    line: &crate::RenderedLine,
+    line: &crate::document::paint::text::RenderedLine,
     document_font_count: usize,
 ) -> impl Iterator<Item = PdfTextRun<'_>> {
     line.runs.iter().filter_map(move |run| {

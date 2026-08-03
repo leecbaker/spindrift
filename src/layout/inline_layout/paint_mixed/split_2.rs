@@ -206,16 +206,6 @@ pub(in crate::layout) fn inline_atom_horizontal_content_y(
     containing_style: &ComputedStyle,
     placement: InlineAtomHorizontalPlacement,
 ) -> f32 {
-    if !atom.exports_internal_baseline() {
-        // Layout containment removes an atom's exported baseline. Its
-        // synthesized baseline is the principal box's block-end edge, so the
-        // atom is positioned as a block-end-aligned line participant rather
-        // than against an internal descendant line.
-        // <https://www.w3.org/TR/css-contain-1/#containment-layout>
-        return placement.line_top - placement.line_height
-            + inline_atom_logical_block_end_margin(atom, containing_style)
-            + atom.baseline_shift;
-    }
     match atom.style().vertical_align.baseline_shift {
         BaselineShift::Top => {
             placement.line_top
@@ -260,7 +250,11 @@ pub(in crate::layout) fn inline_atom_horizontal_content_y(
                     | BaselineMetric::Mathematical
                     | BaselineMetric::Hanging,
                 ) => {
-                    placement.line_top - placement.line_baseline_offset + atom.baseline_offset
+                    let baseline = inline_atom_logical_content_placement_baseline_offset(
+                        atom,
+                        containing_style,
+                    );
+                    placement.line_top - placement.line_baseline_offset + baseline
                         - placement.content_block_size
                         + atom.baseline_shift
                         - placement.line_rendered_baseline_shift
@@ -278,6 +272,7 @@ pub(in crate::layout) fn inline_atom_content_preserves_adjacent_space_summary(
         InlineAtomContent::Canvas
             | InlineAtomContent::Iframe(_)
             | InlineAtomContent::Image(_)
+            | InlineAtomContent::Gradient { .. }
             | InlineAtomContent::Svg { .. }
             | InlineAtomContent::InlineBox { .. }
             | InlineAtomContent::TextCombineUpright { .. }
@@ -443,6 +438,8 @@ mod tests {
         PreparedInlineTextGroup {
             bounds: PhysicalInlineTextBounds::new(InlinePoint::new(0.0, 0.0), 0.0),
             style: ComputedStyle::initial(),
+            paint_opacity: 1.0,
+            paint_scope_ancestry: Rc::from(Vec::new().into_boxed_slice()),
             link_target: None,
             link_paint_rect: None,
             decoration_paint_rect: None,
@@ -475,5 +472,90 @@ mod tests {
         position_horizontal_text_group_at_content_bottom(&mut group, 100.0, metrics);
 
         assert_eq!(group.y(), 108.0);
+    }
+
+    #[test]
+    fn baseline_placement_keeps_the_atomic_block_start_margin() {
+        let mut style = ComputedStyle::initial();
+        style.margin.top = 50.0;
+        let atom = InlineAtom::new(
+            InlineAtomContent::Canvas,
+            style.clone(),
+            None,
+            InlineSize::new(20.0, 100.0),
+            40.0,
+            0.0,
+            None,
+            None,
+        );
+        let parent_metrics = InlineTextBoxMetrics {
+            content_block_size: 16.0,
+            content_baseline_offset: 12.0,
+            line_block_size: 16.0,
+            block_start_leading: 0.0,
+            block_end_leading: 0.0,
+            line_baseline_offset: 12.0,
+        };
+
+        let content_bottom = inline_atom_horizontal_content_y(
+            &atom,
+            &style,
+            InlineAtomHorizontalPlacement {
+                line_top: 200.0,
+                line_height: 100.0,
+                line_baseline_offset: 90.0,
+                line_rendered_baseline_shift: 0.0,
+                content_block_size: 50.0,
+                parent_metrics,
+            },
+        );
+
+        // The line baseline is the margin-box baseline (50 + 40).  The
+        // border box therefore begins after the 50px block-start margin,
+        // rather than cancelling that margin during paint placement.
+        assert_eq!(content_bottom, 150.0);
+    }
+
+    #[test]
+    fn inline_table_placement_does_not_reapply_wrapper_margin() {
+        let mut style = ComputedStyle::initial();
+        style.margin.top = 50.0;
+        let atom = InlineAtom::new(
+            InlineAtomContent::Canvas,
+            style.clone(),
+            None,
+            InlineSize::new(20.0, 100.0),
+            40.0,
+            0.0,
+            None,
+            None,
+        )
+        .with_exported_table_box_baseline();
+        let parent_metrics = InlineTextBoxMetrics {
+            content_block_size: 16.0,
+            content_baseline_offset: 12.0,
+            line_block_size: 16.0,
+            block_start_leading: 0.0,
+            block_end_leading: 0.0,
+            line_baseline_offset: 12.0,
+        };
+
+        let content_bottom = inline_atom_horizontal_content_y(
+            &atom,
+            &style,
+            InlineAtomHorizontalPlacement {
+                line_top: 200.0,
+                line_height: 100.0,
+                line_baseline_offset: 40.0,
+                line_rendered_baseline_shift: 0.0,
+                content_block_size: 50.0,
+                parent_metrics,
+            },
+        );
+
+        // The line aligns to the table-box baseline (40). The inline-table's
+        // captured fragment owns its wrapper margin, so this border-box
+        // placement must not add the 50px margin again.
+        assert_eq!(content_bottom, 150.0);
     }
 }

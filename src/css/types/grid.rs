@@ -1,4 +1,5 @@
 use super::*;
+use std::num::{NonZeroI32, NonZeroU16};
 
 /// Computed CSS Grid explicit track list.
 ///
@@ -306,26 +307,76 @@ impl GridMaxTrackBreadth {
 /// <https://www.w3.org/TR/css-grid-1/#auto-tracks>.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct GridAutoTrackList {
-    pub(crate) tracks: Vec<GridTrackSize>,
+    representation: GridAutoTrackListRepresentation,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum GridAutoTrackListRepresentation {
+    /// The overwhelmingly common one-track form, including the initial
+    /// `auto` value. Keeping it inline avoids an allocation for each axis of
+    /// every computed style.
+    Single(GridTrackSize),
+    Multiple(Vec<GridTrackSize>),
 }
 
 impl GridAutoTrackList {
     pub(crate) fn initial() -> Self {
         Self {
-            tracks: vec![GridTrackSize::AUTO],
+            representation: GridAutoTrackListRepresentation::Single(GridTrackSize::AUTO),
+        }
+    }
+
+    /// Builds a non-empty auto-track list, keeping a singleton inline.
+    pub(crate) fn from_tracks(mut tracks: Vec<GridTrackSize>) -> Option<Self> {
+        match tracks.len() {
+            0 => None,
+            1 => Some(Self {
+                representation: GridAutoTrackListRepresentation::Single(
+                    tracks.pop().expect("checked singleton track"),
+                ),
+            }),
+            _ => Some(Self {
+                representation: GridAutoTrackListRepresentation::Multiple(tracks),
+            }),
+        }
+    }
+
+    pub(crate) fn as_slice(&self) -> &[GridTrackSize] {
+        match &self.representation {
+            GridAutoTrackListRepresentation::Single(track) => std::slice::from_ref(track),
+            GridAutoTrackListRepresentation::Multiple(tracks) => tracks,
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    pub(crate) fn get(&self, index: usize) -> Option<&GridTrackSize> {
+        self.as_slice().get(index)
+    }
+
+    pub(crate) fn iter(&self) -> std::slice::Iter<'_, GridTrackSize> {
+        self.as_slice().iter()
+    }
+
+    fn iter_mut(&mut self) -> impl Iterator<Item = &mut GridTrackSize> {
+        match &mut self.representation {
+            GridAutoTrackListRepresentation::Single(track) => {
+                std::slice::from_mut(track).iter_mut()
+            }
+            GridAutoTrackListRepresentation::Multiple(tracks) => tracks.iter_mut(),
         }
     }
 
     pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
-        for track in &mut self.tracks {
+        for track in self.iter_mut() {
             track.resolve_font_metric_lengths(ch_advance);
         }
     }
 
     pub(crate) fn requires_ch_advance(&self) -> bool {
-        self.tracks
-            .iter()
-            .any(|track| track.clone().requires_ch_advance())
+        self.iter().any(|track| track.clone().requires_ch_advance())
     }
 
     /// Scale fixed implicit-track breadth components while retaining their
@@ -333,7 +384,7 @@ impl GridAutoTrackList {
     /// <https://drafts.csswg.org/css-viewport/#zoom-property>
     /// <https://www.w3.org/TR/css-grid-1/#implicit-grids>
     pub(crate) fn scale_fixed_length_components(&mut self, factor: f32) {
-        for track in &mut self.tracks {
+        for track in self.iter_mut() {
             track.scale_fixed_length_components(factor);
         }
     }
@@ -372,25 +423,23 @@ impl GridAutoFlow {
 /// reverses the stacking-axis fill direction:
 /// <https://drafts.csswg.org/css-grid-3/#grid-lanes-direction-property>.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct GridLanesDirection {
-    pub(crate) axis: GridLanesDirectionAxis,
-    pub(crate) track_reverse: bool,
-    pub(crate) fill_reverse: bool,
+pub(crate) enum GridLanesDirection {
+    Normal,
+    Axis {
+        axis: GridLanesAxis,
+        track_reverse: bool,
+        fill_reverse: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GridLanesDirectionAxis {
-    Normal,
+pub(crate) enum GridLanesAxis {
     Row,
     Column,
 }
 
 impl GridLanesDirection {
-    pub(crate) const NORMAL: Self = Self {
-        axis: GridLanesDirectionAxis::Normal,
-        track_reverse: false,
-        fill_reverse: false,
-    };
+    pub(crate) const NORMAL: Self = Self::Normal;
 }
 
 /// Tie threshold used by Grid Lanes auto-placement.
@@ -427,15 +476,53 @@ impl GridPlacement {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct GridLinePlacement {
-    pub(crate) name: Option<String>,
-    pub(crate) index: Option<i32>,
+pub(crate) enum GridLinePlacement {
+    Number(NonZeroI32),
+    Named {
+        name: String,
+        occurrence: Option<NonZeroI32>,
+    },
+}
+
+impl GridLinePlacement {
+    pub(crate) fn name(&self) -> Option<&str> {
+        match self {
+            Self::Number(_) => None,
+            Self::Named { name, .. } => Some(name),
+        }
+    }
+
+    pub(crate) fn index(&self) -> Option<i32> {
+        match self {
+            Self::Number(index) => Some(index.get()),
+            Self::Named { occurrence, .. } => occurrence.map(NonZeroI32::get),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct GridSpanPlacement {
-    pub(crate) name: Option<String>,
-    pub(crate) span: Option<u16>,
+pub(crate) enum GridSpanPlacement {
+    Count(NonZeroU16),
+    Named {
+        name: String,
+        count: Option<NonZeroU16>,
+    },
+}
+
+impl GridSpanPlacement {
+    pub(crate) fn name(&self) -> Option<&str> {
+        match self {
+            Self::Count(_) => None,
+            Self::Named { name, .. } => Some(name),
+        }
+    }
+
+    pub(crate) fn count(&self) -> Option<u16> {
+        match self {
+            Self::Count(count) => Some(count.get()),
+            Self::Named { count, .. } => count.map(NonZeroU16::get),
+        }
+    }
 }
 
 impl ResolveViewportLengths for GridTrackList {
@@ -493,7 +580,7 @@ impl ResolveViewportLengths for GridMaxTrackBreadth {
 
 impl ResolveViewportLengths for GridAutoTrackList {
     fn resolve_viewport_lengths(&mut self, basis: ViewportLengthBasis) {
-        for track in &mut self.tracks {
+        for track in self.iter_mut() {
             track.resolve_viewport_lengths(basis);
         }
     }
@@ -504,5 +591,61 @@ impl ResolveViewportLengths for GridLanesFlowTolerance {
         if let Self::LengthPercentage(value) = self {
             value.resolve_viewport_lengths(basis);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grid_auto_track_lists_keep_single_tracks_inline() {
+        let initial = GridAutoTrackList::initial();
+        let parsed_single = GridAutoTrackList::from_tracks(vec![GridTrackSize::AUTO])
+            .expect("single test track is non-empty");
+        let multiple = GridAutoTrackList::from_tracks(vec![
+            GridTrackSize::AUTO,
+            GridTrackSize {
+                min: GridMinTrackBreadth::MinContent,
+                max: GridMaxTrackBreadth::MaxContent,
+            },
+        ])
+        .expect("multiple test tracks are non-empty");
+
+        assert!(matches!(
+            &initial.representation,
+            GridAutoTrackListRepresentation::Single(_)
+        ));
+        assert!(matches!(
+            &parsed_single.representation,
+            GridAutoTrackListRepresentation::Single(_)
+        ));
+        assert!(matches!(
+            &multiple.representation,
+            GridAutoTrackListRepresentation::Multiple(_)
+        ));
+        assert_eq!(initial.as_slice(), [GridTrackSize::AUTO]);
+        assert_eq!(multiple.len(), 2);
+        assert_eq!(GridAutoTrackList::from_tracks(Vec::new()), None);
+    }
+
+    #[test]
+    fn inline_grid_auto_tracks_resolve_fixed_lengths() {
+        let mut tracks = GridAutoTrackList::from_tracks(vec![GridTrackSize {
+            min: GridMinTrackBreadth::LengthPercentage(ComputedLengthPercentage::from_points(3.0)),
+            max: GridMaxTrackBreadth::LengthPercentage(ComputedLengthPercentage::from_points(3.0)),
+        }])
+        .expect("single test track is non-empty");
+
+        tracks.scale_fixed_length_components(2.0);
+
+        let GridMinTrackBreadth::LengthPercentage(minimum) = &tracks
+            .get(0)
+            .expect("inline test track remains present")
+            .min
+        else {
+            panic!("minimum remains a length percentage");
+        };
+        assert_eq!(minimum.length_points(), 6.0);
     }
 }

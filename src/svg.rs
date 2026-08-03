@@ -6,8 +6,12 @@
 //! only when a replaced SVG is painted.
 
 use crate::css::{self, CssColor};
-use crate::document::{
-    PaintBlendMode, PaintClip, PaintPoint, PaintRect, PaintSize, PaintStrokeWidth, PaintTransform,
+use crate::document::PaintStrokeWidth;
+use crate::document::paint::effects::PaintBlendMode;
+use crate::document::paint::geometry::{
+    PaintClip, PaintPoint, PaintRect, PaintSize, PaintTransform,
+};
+use crate::document::paint::paths::{
     RenderedGradient, RenderedGradientKind, RenderedGradientStop, RenderedPath, RenderedPathClip,
     RenderedPathClipPath, RenderedPathCommand, RenderedPathFillRule, RenderedPathLineCap,
     RenderedPathLineJoin, RenderedPathPaint, RenderedPathPaintOrder, RenderedPathStrokeStyle,
@@ -36,7 +40,93 @@ pub(crate) type SvgSourcePoint = euclid::Point2D<f32, SvgSourceSpace>;
 pub(crate) type SvgSourceSize = euclid::Size2D<f32, SvgSourceSpace>;
 pub(crate) type SvgSourceRect = euclid::Rect<f32, SvgSourceSpace>;
 type SvgSourceToPaintTransform =
-    euclid::ScaleOffset2D<f32, SvgSourceSpace, crate::document::PaintSpace>;
+    euclid::ScaleOffset2D<f32, SvgSourceSpace, crate::document::paint::geometry::PaintSpace>;
+
+/// Maps one normalized SVG shape's local geometry into page paint space.
+///
+/// Keeping this distinct from [`SvgPaintServerToPaintTransform`] prevents a
+/// marker's placement transform from being mistaken for the coordinate system
+/// of a `context-fill` or `context-stroke` paint server. SVG requires those
+/// paint servers to use the context element's coordinate system and bounding
+/// box, not the marker child's:
+/// <https://www.w3.org/TR/SVG2/painting.html#SpecifyingPaint>.
+#[derive(Debug, Clone, Copy)]
+struct SvgGeometryToPaintTransform(PaintTransform);
+
+/// Maps a normalized SVG paint server into page paint space.
+///
+/// A `usvg` context paint server retains the inverse marker placement needed
+/// to return to its context element. This transform composes that server-local
+/// mapping with the current SVG viewport exactly once, independently of the
+/// geometry transform used to place the marker child.
+#[derive(Debug, Clone, Copy)]
+struct SvgPaintServerToPaintTransform(PaintTransform);
+
+/// Geometry and paint for one SVG fill-like operation before it crosses the
+/// SVG/PDF coordinate-system boundary.
+///
+/// SVG paths retain local commands until this boundary so a marker can have a
+/// different geometry placement from its context paint server. Materializing
+/// both sides in page paint space makes the PDF pattern matrix independent of
+/// the path's transient CTM, as required for a pattern resource on a page.
+struct SvgPaintOperation {
+    geometry: SvgPathGeometry,
+    paint: SvgPaintServer,
+    fill_rule: RenderedPathFillRule,
+    clip: Option<RenderedPathClip>,
+}
+
+struct SvgPathGeometry {
+    commands: Vec<RenderedPathCommand>,
+    to_paint: SvgGeometryToPaintTransform,
+}
+
+struct SvgPaintServer {
+    paint: RenderedPathPaint,
+    to_paint: SvgPaintServerToPaintTransform,
+}
+
+impl SvgPaintOperation {
+    /// Materialize an SVG paint operation into canonical page paint space.
+    ///
+    /// SVG 2 defines a complex stroke as the equivalent stroked outline filled
+    /// by its stroke paint. At this point both ordinary fills and those stroke
+    /// outlines therefore share the same page-space path representation:
+    /// <https://www.w3.org/TR/SVG2/painting.html#StrokeShape>.
+    fn materialize(mut self) -> RenderedPath {
+        let commands = self
+            .geometry
+            .commands
+            .into_iter()
+            .map(|command| transform_path_command(command, self.geometry.to_paint.0))
+            .collect::<Vec<_>>();
+        self.paint.materialize_to_paint_space();
+        let clip = remove_redundant_svg_clips(self.clip, &commands);
+        RenderedPath::new(
+            commands,
+            None,
+            self.fill_rule,
+            None,
+            PaintStrokeWidth::ZERO,
+            clip,
+        )
+        .with_paints(Some(self.paint.paint), None)
+    }
+}
+
+impl SvgPaintServer {
+    fn materialize_to_paint_space(&mut self) {
+        match &mut self.paint {
+            RenderedPathPaint::Solid(_) => {}
+            RenderedPathPaint::Gradient(gradient) => {
+                gradient.transform = self.to_paint.0.multiply(gradient.transform);
+            }
+            RenderedPathPaint::SvgPattern(pattern) => {
+                pattern.transform = self.to_paint.0.multiply(pattern.transform);
+            }
+        }
+    }
+}
 
 /// Host-document CSS presentation values selected for one inline SVG node.
 ///
@@ -283,7 +373,10 @@ impl SvgAsset {
             return Vec::new();
         }
         let transform = ViewportTransform::new(destination, source, true);
-        collect_svg_group(self.tree.root(), transform, &[]).into_paths()
+        let mut group = collect_svg_group(self.tree.root(), transform, &[]);
+        canonicalize_svg_paint_servers(&mut group);
+        elide_redundant_svg_paints(&mut group);
+        group.into_paths()
     }
 
     /// Materialize the SVG as an ordered vector paint group.
@@ -340,7 +433,10 @@ impl SvgAsset {
             return SvgPaintGroup::empty();
         }
         let viewport = ViewportTransform::new(destination, source, clip_viewport);
-        collect_svg_group(self.tree.root(), viewport, &[])
+        let mut group = collect_svg_group(self.tree.root(), viewport, &[]);
+        canonicalize_svg_paint_servers(&mut group);
+        elide_redundant_svg_paints(&mut group);
+        group
     }
 
     /// Return the color when the SVG is exactly one opaque rectangle spanning
@@ -467,6 +563,233 @@ impl SvgPaintGroup {
     }
 }
 
+/// Maximum transform drift introduced by `usvg`'s f32 context-paint
+/// round-trip through a marker placement and its inverse.
+///
+/// This is not a general paint-server snapping tolerance. It is used only
+/// after matching the complete non-transform server definition, then shares
+/// the first equivalent page-space server matrix so PDF emits one continuous
+/// shading for an owner shape and its marker descendants.
+const SVG_CONTEXT_PAINT_TRANSFORM_EPSILON: f32 = 0.002;
+
+fn canonicalize_svg_paint_servers(group: &mut SvgPaintGroup) {
+    let mut servers = HashMap::<String, Vec<PaintTransform>>::new();
+    canonicalize_svg_paint_group(group, &mut servers);
+}
+
+fn canonicalize_svg_paint_group(
+    group: &mut SvgPaintGroup,
+    servers: &mut HashMap<String, Vec<PaintTransform>>,
+) {
+    for item in &mut group.items {
+        match item {
+            SvgPaintItem::Path(path) => {
+                for paint in [&mut path.fill_paint, &mut path.stroke_paint]
+                    .into_iter()
+                    .flatten()
+                {
+                    canonicalize_svg_paint_server(paint, servers);
+                }
+            }
+            SvgPaintItem::Group(group) => canonicalize_svg_paint_group(group, servers),
+        }
+    }
+}
+
+fn canonicalize_svg_paint_server(
+    paint: &mut RenderedPathPaint,
+    servers: &mut HashMap<String, Vec<PaintTransform>>,
+) {
+    let (signature, transform) = match paint {
+        RenderedPathPaint::Solid(_) => return,
+        RenderedPathPaint::Gradient(gradient) => (
+            format!(
+                "gradient:{:?}:{:?}:{:?}:{:?}",
+                gradient.kind, gradient.color_space, gradient.stops, gradient.periodic
+            ),
+            &mut gradient.transform,
+        ),
+        RenderedPathPaint::SvgPattern(pattern) => {
+            let mut signature = pattern.clone();
+            signature.transform = PaintTransform::identity();
+            (format!("pattern:{signature:?}"), &mut pattern.transform)
+        }
+    };
+    let candidates = servers.entry(signature).or_default();
+    if let Some(canonical) = candidates
+        .iter()
+        .copied()
+        .find(|candidate| svg_paint_transforms_match(*candidate, *transform))
+    {
+        *transform = canonical;
+    } else {
+        candidates.push(*transform);
+    }
+}
+
+fn svg_paint_transforms_match(left: PaintTransform, right: PaintTransform) -> bool {
+    [
+        left.a() - right.a(),
+        left.b() - right.b(),
+        left.c() - right.c(),
+        left.d() - right.d(),
+        left.e() - right.e(),
+        left.f() - right.f(),
+    ]
+    .into_iter()
+    .all(|difference| {
+        difference.is_finite() && difference.abs() <= SVG_CONTEXT_PAINT_TRANSFORM_EPSILON
+    })
+}
+
+/// Opaque coverage from an earlier SVG fill in one compositing context.
+///
+/// This is intentionally limited to convex, line-only paths and completely
+/// opaque solid/gradient paints. Within that subset, painting an equal paint
+/// over geometry already covered by it is exactly redundant. Eliding it avoids
+/// the second antialiased source-over operation that PDF rasterizers can round
+/// differently at marker viewport edges.
+#[derive(Clone)]
+struct OpaqueSvgPaintCoverage {
+    paint: RenderedPathPaint,
+    polygon: Vec<PaintPoint>,
+}
+
+fn elide_redundant_svg_paints(group: &mut SvgPaintGroup) {
+    let mut coverage = Vec::new();
+    elide_redundant_svg_paints_in_group(group, &mut coverage);
+}
+
+fn elide_redundant_svg_paints_in_group(
+    group: &mut SvgPaintGroup,
+    coverage: &mut Vec<OpaqueSvgPaintCoverage>,
+) {
+    let mut retained = Vec::with_capacity(group.items.len());
+    for mut item in std::mem::take(&mut group.items) {
+        match &mut item {
+            SvgPaintItem::Path(path) => {
+                if !svg_path_has_redundant_opaque_paint(path, coverage) {
+                    if let Some(path_coverage) = opaque_svg_paint_coverage(path) {
+                        coverage.push(path_coverage);
+                    }
+                    retained.push(item);
+                }
+            }
+            SvgPaintItem::Group(child) => {
+                if svg_group_is_compositing_neutral(child) {
+                    elide_redundant_svg_paints_in_group(child, coverage);
+                } else {
+                    let mut nested_coverage = Vec::new();
+                    elide_redundant_svg_paints_in_group(child, &mut nested_coverage);
+                }
+                if !child.items.is_empty() {
+                    retained.push(item);
+                }
+            }
+        }
+    }
+    group.items = retained;
+}
+
+fn svg_group_is_compositing_neutral(group: &SvgPaintGroup) -> bool {
+    (group.opacity - 1.0).abs() <= f32::EPSILON
+        && group.blend_mode == PaintBlendMode::Normal
+        && !group.isolation
+}
+
+fn svg_path_has_redundant_opaque_paint(
+    path: &RenderedPath,
+    coverage: &[OpaqueSvgPaintCoverage],
+) -> bool {
+    let Some(paint) = path
+        .fill_paint
+        .as_ref()
+        .filter(|paint| svg_paint_is_opaque(paint))
+    else {
+        return false;
+    };
+    let Some(polygon) = svg_convex_polygon(&path.commands) else {
+        return false;
+    };
+    coverage.iter().any(|covered| {
+        covered.paint == *paint
+            && polygon
+                .iter()
+                .all(|point| convex_polygon_contains(&covered.polygon, *point))
+    })
+}
+
+fn opaque_svg_paint_coverage(path: &RenderedPath) -> Option<OpaqueSvgPaintCoverage> {
+    let paint = path.fill_paint.as_ref()?.clone();
+    if !svg_paint_is_opaque(&paint) {
+        return None;
+    }
+    Some(OpaqueSvgPaintCoverage {
+        paint,
+        polygon: svg_convex_polygon(&path.commands)?,
+    })
+}
+
+fn svg_paint_is_opaque(paint: &RenderedPathPaint) -> bool {
+    match paint {
+        RenderedPathPaint::Solid(color) => color.is_opaque(),
+        RenderedPathPaint::Gradient(gradient) => !gradient.has_transparent_stop(),
+        // Pattern cells can have transparent gaps even if each child path is
+        // opaque, so they cannot prove full coverage without tile analysis.
+        RenderedPathPaint::SvgPattern(_) => false,
+    }
+}
+
+fn svg_convex_polygon(commands: &[RenderedPathCommand]) -> Option<Vec<PaintPoint>> {
+    let mut points = Vec::new();
+    for command in commands {
+        match command {
+            RenderedPathCommand::MoveTo(point) | RenderedPathCommand::LineTo(point) => {
+                points.push(*point)
+            }
+            RenderedPathCommand::Close => {}
+            RenderedPathCommand::CurveTo { .. } => return None,
+        }
+    }
+    if points.len() < 3 || !matches!(commands.last(), Some(RenderedPathCommand::Close)) {
+        return None;
+    }
+    let mut sign = 0.0_f32;
+    for index in 0..points.len() {
+        let first = points[index];
+        let second = points[(index + 1) % points.len()];
+        let third = points[(index + 2) % points.len()];
+        let cross = (second.x - first.x) * (third.y - second.y)
+            - (second.y - first.y) * (third.x - second.x);
+        if cross.abs() <= 0.000_001 {
+            continue;
+        }
+        if sign != 0.0 && cross.signum() != sign {
+            return None;
+        }
+        sign = cross.signum();
+    }
+    (sign != 0.0).then_some(points)
+}
+
+fn convex_polygon_contains(polygon: &[PaintPoint], point: PaintPoint) -> bool {
+    let mut sign = 0.0_f32;
+    for index in 0..polygon.len() {
+        let first = polygon[index];
+        let second = polygon[(index + 1) % polygon.len()];
+        let cross =
+            (second.x - first.x) * (point.y - first.y) - (second.y - first.y) * (point.x - first.x);
+        if cross.abs() <= 0.000_001 {
+            continue;
+        }
+        if sign != 0.0 && cross.signum() != sign {
+            return false;
+        }
+        sign = cross.signum();
+    }
+    true
+}
+
 /// Return the sole path of an SVG group only when no group-level compositing
 /// can affect its color or coverage.
 fn single_opaque_path(group: &SvgPaintGroup) -> Option<&RenderedPath> {
@@ -501,6 +824,66 @@ fn simple_group_paths(group: &SvgPaintGroup) -> Option<Vec<&RenderedPath>> {
         }
     }
     Some(paths)
+}
+
+/// Drop rectangular SVG clips that cannot affect the already materialized
+/// path.  In particular, a marker's viewport clip frequently coincides with a
+/// marker child edge. Applying that redundant clip causes PDF rasterizers to
+/// antialias an otherwise identical `context-fill` over its owner a second
+/// time, creating a visible seam.
+///
+/// Only convex axis-aligned rectangles are removed, and only when every path
+/// control point lies inside them. Bézier curves lie in the convex hull of
+/// their control points, so this is a conservative proof for the supported
+/// path commands.
+fn remove_redundant_svg_clips(
+    clip: Option<RenderedPathClip>,
+    commands: &[RenderedPathCommand],
+) -> Option<RenderedPathClip> {
+    let clip = clip?;
+    let mut candidates = Vec::with_capacity(1 + clip.additional_clips.len());
+    candidates.push(RenderedPathClipPath::new(clip.commands, clip.fill_rule));
+    candidates.extend(clip.additional_clips);
+    let mut retained = candidates
+        .into_iter()
+        .filter(|candidate| !svg_rectangular_clip_contains_path(candidate, commands));
+    let primary = retained.next()?;
+    Some(RenderedPathClip::new(
+        primary.commands,
+        primary.fill_rule,
+        retained.collect(),
+    ))
+}
+
+fn svg_rectangular_clip_contains_path(
+    clip: &RenderedPathClipPath,
+    commands: &[RenderedPathCommand],
+) -> bool {
+    if clip.fill_rule != RenderedPathFillRule::NonZero {
+        return false;
+    }
+    let Some(bounds) = axis_aligned_rectangle_bounds(&clip.commands) else {
+        return false;
+    };
+    path_command_points(commands)
+        .all(|point| rectangle_contains(bounds, (point.x, point.y, point.x, point.y)))
+}
+
+fn path_command_points(commands: &[RenderedPathCommand]) -> impl Iterator<Item = PaintPoint> + '_ {
+    commands
+        .iter()
+        .flat_map(|command| match command {
+            RenderedPathCommand::MoveTo(point) | RenderedPathCommand::LineTo(point) => {
+                [Some(*point), None, None]
+            }
+            RenderedPathCommand::CurveTo {
+                control_1,
+                control_2,
+                end,
+            } => [Some(*control_1), Some(*control_2), Some(*end)],
+            RenderedPathCommand::Close => [None, None, None],
+        })
+        .flatten()
 }
 
 /// Recognize a solid path which exactly covers a unit SVG viewport.
@@ -674,7 +1057,7 @@ fn collect_svg_group(
                 }
             }
             usvg::Node::Path(path) => {
-                if let Some(path) = render_path_with_clips(path, viewport, &clips) {
+                for path in render_path_with_clips(path, viewport, &clips) {
                     rendered.items.push(SvgPaintItem::Path(Box::new(path)));
                 }
             }
@@ -768,46 +1151,47 @@ fn render_path_with_clips(
     path: &usvg::Path,
     viewport: ViewportTransform,
     additional_clips: &[RenderedPathClipPath],
-) -> Option<RenderedPath> {
+) -> Vec<RenderedPath> {
     if !path.is_visible() {
-        return None;
+        return Vec::new();
     }
-    let path_transform = svg_path_transform(path.abs_transform(), viewport);
-    let fill = path
-        .fill()
-        .map(|fill| svg_paint_for_path(fill.paint(), fill.opacity().get(), path_transform));
-    let stroke = path
-        .stroke()
-        .map(|stroke| svg_paint_for_path(stroke.paint(), stroke.opacity().get(), path_transform));
+    let geometry_to_paint =
+        SvgGeometryToPaintTransform(svg_path_transform(path.abs_transform(), viewport));
+    let fill = path.fill().map(|fill| {
+        svg_paint_server(
+            fill.paint(),
+            fill.opacity().get(),
+            SvgPaintServerToPaintTransform(geometry_to_paint.0),
+        )
+    });
+    let stroke = path.stroke().map(|stroke| {
+        svg_paint_server(
+            stroke.paint(),
+            stroke.opacity().get(),
+            SvgPaintServerToPaintTransform(geometry_to_paint.0),
+        )
+    });
     // A path's fill and stroke share its geometry. Drawing only the supported
     // half of a gradient/pattern path would be a visually plausible but
     // incorrect substitute, so omit the affected path as a whole.
     if fill.as_ref().is_some_and(|paint| paint.is_none())
         || stroke.as_ref().is_some_and(|paint| paint.is_none())
     {
-        return None;
+        return Vec::new();
     }
     let fill = fill.flatten();
     let stroke = stroke.flatten();
     if fill.is_none() && stroke.is_none() {
-        return None;
+        return Vec::new();
     }
-    let commands = path_commands(path.data());
-    if commands.is_empty() {
-        return None;
+    let fill_commands = path_commands(path.data());
+    if fill_commands.is_empty() {
+        return Vec::new();
     }
     let fill_rule = match path.fill().map(usvg::Fill::rule) {
         Some(usvg::FillRule::EvenOdd) => RenderedPathFillRule::EvenOdd,
         _ => RenderedPathFillRule::NonZero,
     };
-    // PDF stroke widths are in transformed user space. The geometric mean is
-    // exact for uniform scale and is the least-distorting interim mapping for
-    // non-uniform SVG viewports until paths carry a local PDF CTM.
-    let stroke_width = PaintStrokeWidth::new(
-        path.stroke()
-            .map(|stroke| stroke.width().get())
-            .unwrap_or(0.0),
-    );
     let clip = if viewport.clip_viewport {
         let mut clip = viewport_clip(viewport);
         clip.additional_clips.extend_from_slice(additional_clips);
@@ -820,32 +1204,46 @@ fn render_path_with_clips(
             clip
         })
     };
-    let rendered = RenderedPath::new(commands, None, fill_rule, None, stroke_width, clip)
-        .with_paints(fill, stroke)
-        .with_transform(path_transform);
-    let rendered = if let Some(stroke) = path.stroke() {
-        rendered.with_stroke_style(RenderedPathStrokeStyle {
-            line_cap: match stroke.linecap() {
-                usvg::LineCap::Butt => RenderedPathLineCap::Butt,
-                usvg::LineCap::Round => RenderedPathLineCap::Round,
-                usvg::LineCap::Square => RenderedPathLineCap::Square,
+
+    let fill = fill.map(|paint| SvgPaintOperation {
+        geometry: SvgPathGeometry {
+            commands: fill_commands.clone(),
+            to_paint: geometry_to_paint,
+        },
+        paint,
+        fill_rule,
+        clip: clip.clone(),
+    });
+    let stroke = path.stroke().and_then(|stroke_style| {
+        let paint = stroke?;
+        let outline = path.data().stroke(
+            &stroke_style.to_tiny_skia(),
+            svg_stroke_resolution_scale(geometry_to_paint),
+        )?;
+        Some(SvgPaintOperation {
+            geometry: SvgPathGeometry {
+                commands: path_commands(&outline),
+                to_paint: geometry_to_paint,
             },
-            line_join: match stroke.linejoin() {
-                usvg::LineJoin::Miter | usvg::LineJoin::MiterClip => RenderedPathLineJoin::Miter,
-                usvg::LineJoin::Round => RenderedPathLineJoin::Round,
-                usvg::LineJoin::Bevel => RenderedPathLineJoin::Bevel,
-            },
-            miter_limit: stroke.miterlimit().get(),
-            dash_array: stroke.dasharray().unwrap_or_default().to_vec(),
-            dash_offset: stroke.dashoffset(),
+            paint,
+            fill_rule: RenderedPathFillRule::NonZero,
+            clip: clip.clone(),
         })
-    } else {
-        rendered
-    };
-    Some(rendered.with_paint_order(match path.paint_order() {
-        usvg::PaintOrder::FillAndStroke => RenderedPathPaintOrder::FillThenStroke,
-        usvg::PaintOrder::StrokeAndFill => RenderedPathPaintOrder::StrokeThenFill,
-    }))
+    });
+
+    let mut rendered =
+        Vec::with_capacity(usize::from(fill.is_some()) + usize::from(stroke.is_some()));
+    match path.paint_order() {
+        usvg::PaintOrder::FillAndStroke => {
+            rendered.extend(fill.map(SvgPaintOperation::materialize));
+            rendered.extend(stroke.map(SvgPaintOperation::materialize));
+        }
+        usvg::PaintOrder::StrokeAndFill => {
+            rendered.extend(stroke.map(SvgPaintOperation::materialize));
+            rendered.extend(fill.map(SvgPaintOperation::materialize));
+        }
+    }
+    rendered
 }
 
 /// Convert a normalized `usvg` paint into the vector paint tree.
@@ -865,27 +1263,23 @@ fn svg_paint(paint: &usvg::Paint, opacity: f32) -> Option<RenderedPathPaint> {
     }
 }
 
-/// Convert an SVG paint server into the page coordinate system of its path.
+/// Resolve an SVG paint server separately from its target geometry.
 ///
-/// PDF pattern matrices are evaluated in the default user space, while the
-/// path itself is emitted under a local SVG viewport transform. Compose that
-/// transform into the paint server so both path and gradient share the same
-/// coordinate system. SVG paint servers are defined in the geometry's user
-/// coordinate system before the element's CTM is applied.
-/// <https://www.w3.org/TR/SVG2/pservers.html#LinearGradientElement>
-fn svg_paint_for_path(
+/// The transform records how the paint server's context element maps into the
+/// page. Its eventual path can be a marker child with a different geometry
+/// transform, so this function deliberately does not mutate the generic paint
+/// representation yet.
+fn svg_paint_server(
     paint: &usvg::Paint,
     opacity: f32,
-    path_transform: PaintTransform,
-) -> Option<RenderedPathPaint> {
+    to_paint: SvgPaintServerToPaintTransform,
+) -> Option<SvgPaintServer> {
     if let usvg::Paint::Pattern(pattern) = paint {
-        return svg_pattern(pattern, opacity, path_transform).map(RenderedPathPaint::SvgPattern);
+        return svg_pattern(pattern, opacity)
+            .map(RenderedPathPaint::SvgPattern)
+            .map(|paint| SvgPaintServer { paint, to_paint });
     }
-    let mut rendered = svg_paint(paint, opacity)?;
-    if let RenderedPathPaint::Gradient(gradient) = &mut rendered {
-        gradient.transform = path_transform.multiply(gradient.transform);
-    }
-    Some(rendered)
+    svg_paint(paint, opacity).map(|paint| SvgPaintServer { paint, to_paint })
 }
 
 /// Convert the supported vector subset of an SVG pattern into a PDF tiling
@@ -895,11 +1289,7 @@ fn svg_paint_for_path(
 ///
 /// SVG 2, 13.4 defines pattern content and `patternTransform` in this user
 /// coordinate system: <https://www.w3.org/TR/SVG2/pservers.html#Patterns>.
-fn svg_pattern(
-    pattern: &usvg::Pattern,
-    opacity: f32,
-    path_transform: PaintTransform,
-) -> Option<RenderedSvgPathPattern> {
+fn svg_pattern(pattern: &usvg::Pattern, opacity: f32) -> Option<RenderedSvgPathPattern> {
     if !opacity.is_finite() || opacity <= 0.0 || opacity > 1.0 {
         return None;
     }
@@ -916,7 +1306,7 @@ fn svg_pattern(
     Some(RenderedSvgPathPattern {
         tile_size: PaintSize::new(tile_width, tile_height),
         origin: PaintPoint::new(rect.x(), rect.y()),
-        transform: path_transform.multiply(svg_gradient_transform(pattern.transform())),
+        transform: svg_gradient_transform(pattern.transform()),
         paths,
         opacity,
     })
@@ -1113,6 +1503,24 @@ fn svg_gradient_transform(transform: usvg::Transform) -> PaintTransform {
         transform.tx,
         transform.ty,
     )
+}
+
+/// Return the target-resolution scale used while expanding an SVG stroke.
+///
+/// The path stroker operates in SVG user space, while the resulting outline
+/// is later projected into page paint space. Supplying the maximum affine
+/// scale keeps curved joins accurate after non-uniform SVG and viewport
+/// transforms without introducing a raster fallback.
+fn svg_stroke_resolution_scale(transform: SvgGeometryToPaintTransform) -> f32 {
+    let transform = transform.0;
+    tiny_skia_path::PathStroker::compute_resolution_scale(&tiny_skia_path::Transform::from_row(
+        transform.a(),
+        transform.b(),
+        transform.c(),
+        transform.d(),
+        transform.e(),
+        transform.f(),
+    ))
 }
 
 fn transform_path_command(
@@ -1581,9 +1989,7 @@ fn svg_tree_has_unsupported_content(group: &usvg::Group) -> bool {
 
 fn svg_paint_is_supported(paint: &usvg::Paint, opacity: f32) -> bool {
     match paint {
-        usvg::Paint::Pattern(pattern) => {
-            svg_pattern(pattern, opacity, PaintTransform::identity()).is_some()
-        }
+        usvg::Paint::Pattern(pattern) => svg_pattern(pattern, opacity).is_some(),
         _ => svg_paint(paint, opacity).is_some(),
     }
 }
@@ -1994,12 +2400,11 @@ mod tests {
         let [path] = paths.as_slice() else {
             panic!("expected one path");
         };
-        assert!(path.transform.a().abs() < 1e-5);
-        assert_eq!(path.transform.b(), -0.75);
-        assert_eq!(path.transform.c(), -0.75);
-        assert!(path.transform.d().abs() < 1e-5);
-        assert_eq!(path.transform.e(), 112.5);
-        assert_eq!(path.transform.f(), 150.0);
+        assert_eq!(path.transform, PaintTransform::identity());
+        assert_eq!(
+            path.commands.first(),
+            Some(&RenderedPathCommand::move_to(PaintPoint::new(112.5, 150.0)))
+        );
     }
 
     #[test]
@@ -2018,6 +2423,7 @@ mod tests {
             namespace_attrs: Vec::new(),
             children: Vec::new(),
             is_target: false,
+            object_rendering: crate::dom::ObjectRendering::Fallback,
         };
         let mut overrides = SvgPresentationOverrides::new();
         overrides.insert(
@@ -2049,6 +2455,7 @@ mod tests {
             namespace_attrs: Vec::new(),
             children: Vec::new(),
             is_target: false,
+            object_rendering: crate::dom::ObjectRendering::Fallback,
         };
         let mut overrides = SvgPresentationOverrides::new();
         overrides.insert(
@@ -2080,6 +2487,7 @@ mod tests {
             namespace_attrs: Vec::new(),
             children: vec![Node::text("P")],
             is_target: false,
+            object_rendering: crate::dom::ObjectRendering::Fallback,
         };
         let group = Element {
             id: ElementId::next(),
@@ -2092,6 +2500,7 @@ mod tests {
                 kind: NodeKind::Element(text),
             }],
             is_target: false,
+            object_rendering: crate::dom::ObjectRendering::Fallback,
         };
         let mut overrides = SvgPresentationOverrides::new();
         overrides.insert(
@@ -2489,8 +2898,8 @@ mod tests {
                 .iter()
                 .any(|command| matches!(command, RenderedPathCommand::CurveTo { .. }))
         );
-        assert_ne!(paths[0].transform, PaintTransform::identity());
-        assert!(paths[0].clip.is_some());
+        assert_eq!(paths[0].transform, PaintTransform::identity());
+        assert!(paths[0].clip.is_none());
     }
 
     #[test]
@@ -2523,7 +2932,8 @@ mod tests {
 
         assert_eq!(pattern.tile_size, PaintSize::new(50.0, 100.0));
         assert_eq!(pattern.paths.len(), 4);
-        assert_eq!(pattern.transform, path.transform);
+        assert_eq!(path.transform, PaintTransform::identity());
+        assert_ne!(pattern.transform, PaintTransform::identity());
         assert_eq!(pattern.paths[0].fill, Some(CssColor::new(0, 128, 0)));
         assert_eq!(pattern.paths[3].fill, Some(CssColor::new(0, 0, 255)));
     }
@@ -2584,8 +2994,8 @@ mod tests {
 
         assert_eq!(paths.len(), 1);
         assert_eq!(
-            paths[0].transform.apply_point(PaintPoint::new(5.0, 2.0)),
-            PaintPoint::new(100.0, 208.0)
+            paths[0].commands.first(),
+            Some(&RenderedPathCommand::move_to(PaintPoint::new(90.0, 212.0)))
         );
         assert_eq!(
             paths[0].clip.as_ref().map(|clip| &clip.commands),
@@ -2642,7 +3052,8 @@ mod tests {
         let [SvgPaintItem::Path(path)] = child.items.as_slice() else {
             panic!("expected clipped path");
         };
-        assert_eq!(path.clip.as_ref().unwrap().additional_clips.len(), 1);
+        assert!(path.clip.is_some());
+        assert!(path.clip.as_ref().unwrap().additional_clips.is_empty());
     }
 
     #[test]
@@ -2656,13 +3067,74 @@ mod tests {
         assert!(
             paths
                 .iter()
-                .any(|path| path.stroke == Some(CssColor::new(0, 0, 255)))
+                .any(|path| path.fill == Some(CssColor::new(0, 0, 255)))
         );
         assert!(
             paths
                 .iter()
                 .any(|path| path.fill == Some(CssColor::new(255, 0, 0)))
         );
+    }
+
+    #[test]
+    fn context_fill_markers_share_the_owner_gradient_in_page_space() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900"><defs><linearGradient id="gradient"><stop stop-color="red"/><stop offset="1" stop-color="blue"/></linearGradient><marker id="marker" refX="-10" refY="-10" markerWidth="600" markerHeight="400"><rect width="200" height="100" fill="context-fill"/><rect x="250" y="270" width="300" height="100" fill="context-fill"/></marker></defs><path fill="url(#gradient)" d="M 10 10 h 600 v 400 h -600 Z" marker-start="url(#marker)"/><g transform="translate(300 450) scale(.75 .5) rotate(60)"><path fill="url(#gradient)" d="M 10 10 h 600 v 400 h -600 Z" marker-start="url(#marker)"/></g><g transform="translate(600 450) scale(1.5 .5) rotate(-30)"><path fill="url(#gradient)" d="M 10 10 h 600 v 400 h -600 Z" marker-start="url(#marker)"/></g></svg>"#,
+        )
+        .unwrap();
+        let paths = asset.paint_paths(paint_rect(0.0, 0.0, 225.0, 112.5));
+        let gradients = paths
+            .iter()
+            .map(|path| {
+                assert_eq!(path.transform, PaintTransform::identity());
+                let Some(RenderedPathPaint::Gradient(gradient)) = path.fill_paint.as_ref() else {
+                    panic!("expected context-fill to retain its gradient");
+                };
+                gradient.transform
+            })
+            .collect::<Vec<_>>();
+
+        // Each marker rectangle is already completely covered by its owner
+        // path with the same opaque context paint, so it is omitted as an
+        // equivalence-preserving paint operation.
+        assert_eq!(gradients.len(), 3);
+        assert_ne!(gradients[0], gradients[1]);
+        assert_ne!(gradients[1], gradients[2]);
+    }
+
+    #[test]
+    fn context_stroke_marker_uses_an_outlined_page_space_stroke() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100"><defs><linearGradient id="gradient"><stop stop-color="red"/><stop offset="1" stop-color="blue"/></linearGradient><marker id="marker" markerWidth="30" markerHeight="30" refX="15" refY="15"><rect x="5" y="5" width="20" height="20" fill="context-stroke"/></marker></defs><g transform="scale(1.5 .5) rotate(30)"><path d="M 20 20 H 100 V 60 H 20 Z" fill="none" stroke="url(#gradient)" stroke-width="12" marker-end="url(#marker)"/></g></svg>"#,
+        )
+        .unwrap();
+        let paths = asset.paint_paths(paint_rect(0.0, 0.0, 150.0, 75.0));
+        let gradients = paths
+            .iter()
+            .map(|path| {
+                assert_eq!(path.transform, PaintTransform::identity());
+                let Some(RenderedPathPaint::Gradient(gradient)) = path.fill_paint.as_ref() else {
+                    panic!("expected outlined context-stroke gradient");
+                };
+                gradient.transform
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(gradients.len(), 2);
+        assert_eq!(gradients[0], gradients[1]);
+        assert!(paths.iter().all(|path| path.stroke.is_none()));
+    }
+
+    #[test]
+    fn svg_stroke_outline_respects_paint_order() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40"><rect x="5" y="5" width="30" height="30" fill="red" stroke="blue" stroke-width="6" paint-order="stroke fill"/></svg>"#,
+        )
+        .unwrap();
+        let paths = asset.paint_paths(paint_rect(0.0, 0.0, 30.0, 30.0));
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0].fill, Some(CssColor::new(0, 0, 255)));
+        assert_eq!(paths[1].fill, Some(CssColor::new(255, 0, 0)));
+        assert!(paths.iter().all(|path| path.stroke.is_none()));
     }
 
     #[test]

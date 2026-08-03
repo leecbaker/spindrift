@@ -1,4 +1,5 @@
 use super::*;
+use crate::css::{TextLayoutPolicy, TextOrientation};
 use std::rc::Rc;
 
 /// Return whether a block container's own bidi value needs inline controls.
@@ -36,13 +37,13 @@ pub(in crate::layout) struct InlineElementScopeOptions {
 impl InlineElementScopeOptions {
     pub(in crate::layout) const DOM_INTRINSIC: Self = Self {
         push_page_scope: false,
-        push_inside_marker: false,
+        push_inside_marker: true,
         mark_hanging_edges: true,
         fragment_edges: box_tree::InlineBoxFragmentEdges::ALL,
     };
     pub(in crate::layout) const DOM_PAINT: Self = Self {
         push_page_scope: true,
-        push_inside_marker: false,
+        push_inside_marker: true,
         mark_hanging_edges: true,
         fragment_edges: box_tree::InlineBoxFragmentEdges::ALL,
     };
@@ -197,13 +198,22 @@ pub(in crate::layout) fn mark_inline_box_ancestor_decorations(
     style: &ComputedStyle,
     positioning_containing_block_id: Option<InlinePositioningContainingBlockId>,
 ) {
-    if !inline_box_has_paintable_decoration(style) && positioning_containing_block_id.is_none() {
+    let has_paint_effect_scope = style.opacity < 1.0;
+    // Allocate once per lexical inline box, then copy that opaque identity to
+    // every descendant word.  The copied metadata survives source slicing and
+    // bidi reordering without making equal-opacity siblings coalesce.
+    let paint_effect_scope_id = has_paint_effect_scope.then(InlinePaintScopeId::allocate);
+    if !inline_box_has_paintable_decoration(style)
+        && !has_paint_effect_scope
+        && positioning_containing_block_id.is_none()
+    {
         return;
     }
     // Scope edges carry lexical nesting independently of the computed-style
-    // snapshots used for painting. Use the edge nesting to distinguish the
-    // scope's direct words (which already paint their own background) from
-    // descendants (which need this ancestor decoration).
+    // snapshots used for painting. A direct text node carries its owning
+    // inline's computed background and border itself; only an *outer* inline
+    // scope is an ancestor decoration. Nested scopes retain that chain in
+    // source order.
     // <https://www.w3.org/TR/CSS22/visuren.html#relative-positioning>
     let mut scope_depth = 0usize;
     for item in &mut output[inline_box_start..] {
@@ -224,8 +234,19 @@ pub(in crate::layout) fn mark_inline_box_ancestor_decorations(
         let Some(word) = visible_hanging_edge_word_mut(item) else {
             continue;
         };
-        let paints_background_or_border = scope_depth > 1;
-        if !paints_background_or_border && positioning_containing_block_id.is_none() {
+        // DOM collection gives a direct text run the inline element's style,
+        // whereas frozen atomic subtrees can retain the enclosing formatting
+        // context's text style.  In the former case the word already paints
+        // this background itself; in the latter, retain it as an ancestor
+        // decoration even at the first lexical scope.
+        let word_owns_scope_background = style.background_color.is_potentially_visible()
+            && word.style.background_color == style.background_color;
+        let paints_background_or_border =
+            scope_depth > 1 || (scope_depth > 0 && !word_owns_scope_background);
+        if !paints_background_or_border
+            && !has_paint_effect_scope
+            && positioning_containing_block_id.is_none()
+        {
             continue;
         }
         let mut decorations = word.ancestor_inline_decorations.to_vec();
@@ -234,13 +255,14 @@ pub(in crate::layout) fn mark_inline_box_ancestor_decorations(
             hanging_edges: InlineHangingEdges::default(),
             paints_background_or_border,
             positioning_containing_block_id,
+            paint_effect_scope_id,
         });
         word.ancestor_inline_decorations = Rc::from(decorations.into_boxed_slice());
     }
 }
 
 pub(in crate::layout) fn inline_box_has_paintable_decoration(style: &ComputedStyle) -> bool {
-    style.background_color.is_some()
+    style.background_color.is_potentially_visible()
         || style.background_image.is_image()
         || used_border_width(style).points() > 0.0
 }
@@ -363,7 +385,9 @@ pub(in crate::layout) fn push_autospaced_word(
             && text_autospace_boundary_needs_spacing(
                 &word.style.text_autospace,
                 previous,
+                &word.style,
                 character,
+                &word.style,
             )
         {
             push_autospaced_word_run(
@@ -441,12 +465,16 @@ pub(in crate::layout) fn push_autospace_boundary(
         && text_autospace_boundary_needs_spacing(
             &previous.style.text_autospace,
             previous.character,
+            &previous.style,
             current_character,
+            &word.style,
         )
         && text_autospace_boundary_needs_spacing(
             &word.style.text_autospace,
             previous.character,
+            &previous.style,
             current_character,
+            &word.style,
         )
     {
         push_text_autospace_atom(
@@ -503,7 +531,9 @@ pub(in crate::layout) fn default_quote_pair() -> (String, String) {
 pub(in crate::layout) fn text_autospace_boundary_needs_spacing(
     autospace: &TextAutospace,
     first: char,
+    first_style: &ComputedStyle,
     second: char,
+    second_style: &ComputedStyle,
 ) -> bool {
     if autospace.is_none() {
         return false;
@@ -513,9 +543,37 @@ pub(in crate::layout) fn text_autospace_boundary_needs_spacing(
     if first_is_ideograph == second_is_ideograph {
         return false;
     }
-    let other = if first_is_ideograph { second } else { first };
-    (autospace.ideograph_alpha && character_is_autospace_alpha(other))
-        || (autospace.ideograph_numeric && character_is_autospace_numeric(other))
+    let (other, other_style) = if first_is_ideograph {
+        (second, second_style)
+    } else {
+        (first, first_style)
+    };
+    !autospace_character_is_upright_in_vertical_text(other, other_style)
+        && ((autospace.ideograph_alpha && character_is_autospace_alpha(other))
+            || (autospace.ideograph_numeric && character_is_autospace_numeric(other)))
+}
+
+/// Return whether `character` is upright under its own vertical text policy.
+///
+/// CSS Text excludes characters that are upright through `text-orientation`
+/// from the non-ideographic letter and numeral classes used by
+/// `text-autospace`. The character's own style is significant at inline
+/// element boundaries: the containing element can own the autospace property
+/// while a descendant makes the adjacent character upright.
+/// <https://drafts.csswg.org/css-text-4/#text-autospace-property>
+pub(in crate::layout) fn autospace_character_is_upright_in_vertical_text(
+    character: char,
+    style: &ComputedStyle,
+) -> bool {
+    match style.text_layout_policy() {
+        TextLayoutPolicy::Vertical(TextOrientation::Upright) => true,
+        TextLayoutPolicy::Vertical(TextOrientation::Mixed) => {
+            typographic_unit_is_upright_in_mixed_orientation(character.encode_utf8(&mut [0; 4]))
+        }
+        TextLayoutPolicy::Horizontal
+        | TextLayoutPolicy::Vertical(TextOrientation::Sideways)
+        | TextLayoutPolicy::Sideways(_) => false,
+    }
 }
 
 #[derive(Clone)]
@@ -724,6 +782,67 @@ mod tests {
             | InlineItem::PageScopeEnd => None,
         });
         assert_eq!(width, Some(expected_width));
+    }
+
+    #[test]
+    fn autospace_excludes_upright_vertical_letters_and_numerals() {
+        fn word(text: &str, style: &ComputedStyle) -> InlineItem {
+            InlineItem::Word(Box::new(InlineWord {
+                text: text.to_string(),
+                style: inline_style(style),
+                baseline_shift: 0.0,
+                visual_offset: InlineVisualOffset::zero(),
+                link_target: None,
+                mergeable: true,
+                source: InlineTextSource::Normal,
+                hanging_edges: InlineHangingEdges::default(),
+                ancestor_inline_decorations: Vec::new().into(),
+            }))
+        }
+
+        fn autospace_count(items: &[InlineItem]) -> usize {
+            items
+                .iter()
+                .filter(|item| {
+                    matches!(
+                        item,
+                        InlineItem::Atom(atom)
+                            if matches!(
+                                atom.content(),
+                                InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace)
+                            )
+                    )
+                })
+                .count()
+        }
+
+        let mut upright_style = ComputedStyle::initial();
+        upright_style.writing_mode = WritingMode::VerticalRl;
+        upright_style.text_orientation = TextOrientation::Upright;
+        upright_style.text_autospace = TextAutospace::NORMAL;
+        let mut font_system = FontSystem::new();
+
+        for text in ["国X国", "国1国"] {
+            let mut items = vec![word(text, &upright_style)];
+            insert_text_autospace_items(&mut font_system, &mut items);
+            assert_eq!(autospace_count(&items), 0, "{text}: {items:?}");
+        }
+
+        let mut mixed_style = upright_style.clone();
+        mixed_style.text_orientation = TextOrientation::Mixed;
+        let mut mixed_items = vec![word("国X国", &mixed_style)];
+        insert_text_autospace_items(&mut font_system, &mut mixed_items);
+        assert_eq!(autospace_count(&mixed_items), 2, "{mixed_items:?}");
+
+        for text in ["X", "1"] {
+            let mut items = vec![
+                word("国", &mixed_style),
+                word(text, &upright_style),
+                word("国", &mixed_style),
+            ];
+            insert_text_autospace_items(&mut font_system, &mut items);
+            assert_eq!(autospace_count(&items), 0, "{text}: {items:?}");
+        }
     }
 
     #[test]

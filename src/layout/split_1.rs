@@ -322,6 +322,9 @@ pub struct RenderOptions {
     pub media_type: crate::css::MediaType,
     /// Forced-colors palette used for CSS CssColor Adjustment and media queries.
     pub forced_colors: crate::css::ForcedColorsMode,
+    /// Device pixel density exposed to CSS resolution media queries and used
+    /// to select CSS Images `image-set()` candidates.
+    pub(crate) device_resolution_dppx: f32,
     /// The physical page size.
     pub page_size: PageSize,
     /// A compatibility margin applied uniformly unless `page_margins` is set.
@@ -332,10 +335,11 @@ pub struct RenderOptions {
     pub(crate) font_size: LayoutLength,
     /// The initial line height in layout units.
     pub(crate) line_height: LayoutLength,
-    /// Enable HTML presentational hints as zero-specificity author CSS.
+    /// Apply HTML presentational hints as zero-specificity author CSS.
     ///
-    /// WeasyPrint exposes this as an opt-in compatibility feature. HTML maps
-    /// these attributes into the CSS cascade as presentational hints:
+    /// HTML maps these legacy attributes into the CSS cascade as
+    /// presentational hints. They are enabled by default for HTML documents;
+    /// callers that need CSS-only compatibility can explicitly disable them:
     /// <https://html.spec.whatwg.org/multipage/rendering.html#presentational-hints>.
     pub presentational_hints: bool,
     /// URL fragment target used by Selectors `:target` and `:target-within`.
@@ -347,6 +351,24 @@ pub struct RenderOptions {
 }
 
 impl RenderOptions {
+    /// Returns the configured device density in CSS dots per pixel.
+    pub fn device_resolution_dppx(&self) -> f32 {
+        self.device_resolution_dppx
+    }
+
+    /// Sets the device density used by CSS resolution-dependent features.
+    ///
+    /// A static PDF has no intrinsic screen density, so callers choose this
+    /// rendering input explicitly when higher-density image assets are wanted.
+    pub fn set_device_resolution_dppx(&mut self, resolution_dppx: f32) -> crate::Result<()> {
+        if !resolution_dppx.is_finite() || resolution_dppx <= 0.0 {
+            return Err(crate::Error::InvalidInput(
+                "device resolution must be finite and greater than zero".to_string(),
+            ));
+        }
+        self.device_resolution_dppx = resolution_dppx;
+        Ok(())
+    }
     /// Sets an equal margin on all page edges.
     pub(crate) fn set_margin(&mut self, margin: LayoutLength) {
         self.margin = margin;
@@ -430,6 +452,7 @@ impl RenderOptions {
                 self.page_size.height() / crate::css::CSS_PX_TO_PT,
             ),
         )
+        .with_resolution_dppx(self.device_resolution_dppx)
         .with_forced_colors(self.forced_colors)
     }
 }
@@ -440,12 +463,13 @@ impl Default for RenderOptions {
         Self {
             media_type: crate::css::MediaType::Print,
             forced_colors: crate::css::ForcedColorsMode::Inactive,
+            device_resolution_dppx: 1.0,
             page_size: PageSize::A4_POINTS,
             margin: layout_pt(PageMargins::WEASYPRINT_DEFAULT_POINTS),
             page_margins: PageMargins::DEFAULT,
             font_size: layout_pt(font_size),
             line_height: layout_pt(font_size * 1.2),
-            presentational_hints: false,
+            presentational_hints: true,
             target_fragment: None,
         }
     }
@@ -570,6 +594,7 @@ impl PageContext {
     /// This is deliberately separate from `area_height()`: in a vertical or
     /// sideways flow, page fragmentation progresses across physical width.
     /// <https://www.w3.org/TR/css-writing-modes-4/#block-flow>.
+    #[cfg(test)]
     pub(in crate::layout) fn logical_block_size(self, writing_mode: WritingMode) -> f32 {
         if WritingModeAxes::new(writing_mode, Direction::Ltr).swaps_physical_axes() {
             self.area_width()
@@ -584,7 +609,14 @@ pub(crate) fn start_font_system_load() -> FontSystemLoad {
 }
 
 pub(in crate::layout) enum LayoutResult {
-    Document(Document),
+    Document(LayoutPass),
+}
+
+/// Output from one complete fresh layout pass.
+pub(in crate::layout) struct LayoutPass {
+    pub(in crate::layout) document: Document,
+    pub(in crate::layout) target_references: TargetReferenceSnapshot,
+    pub(in crate::layout) has_normal_flow_target_references: bool,
 }
 
 /// Lay out an already prepared DOM with an already loaded font system.
@@ -596,7 +628,7 @@ pub(in crate::layout) enum LayoutResult {
 /// <https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element>
 pub(crate) struct PreparedDomLayout<'a> {
     pub(crate) root: &'a Node,
-    pub(crate) stylesheets: &'a [Stylesheet],
+    pub(crate) stylesheets: Stylesheets<'a>,
     pub(crate) options: &'a RenderOptions,
     pub(crate) base_url: Option<&'a url::Url>,
     pub(crate) root_url: Option<&'a url::Url>,
@@ -631,35 +663,32 @@ pub(crate) fn layout_prepared_dom(config: PreparedDomLayout<'_>) -> Document {
         deferred_font_size: css::DeferredFontSize::Absolute(options.font_size()),
         line_height_value: css::ComputedLineHeight::Number(default_line_height_multiplier),
         line_height: options.line_height(),
-        line_height_multiplier: Some(default_line_height_multiplier),
-        line_height_is_normal: false,
         color: CssColor::BLACK,
         ..ComputedStyle::initial()
     });
     resource_cache.set_inline_svg_presentation_overrides(inline_svg_presentation_overrides(
         root,
-        stylesheets,
+        &stylesheets,
         parent_style.as_ref(),
     ));
     let mut page_margin_inherited_style = {
         let _timer = DebugTimer::start("building deferred page-margin inheritance");
-        document_root_style(root, stylesheets, parent_style.as_ref())
+        document_root_style(root, &stylesheets, parent_style.as_ref())
     };
-    let principal_flow = document_principal_flow(
-        root,
-        stylesheets,
-        parent_style.as_ref(),
-        &page_margin_inherited_style,
-    );
-    let page_progression_direction = principal_flow.direction;
     let page_box = {
         let _timer = DebugTimer::start("building deferred formatting box tree");
         Box::new(box_tree::build_page_box(
             root,
-            stylesheets,
+            &stylesheets,
             parent_style.as_ref(),
         ))
     };
+    // Resolve every root/body document-canvas special case from the same
+    // cascaded formatting tree. This remains immutable while font metrics
+    // and layout-only principal-flow values are subsequently resolved.
+    let document_canvas_resolution = DocumentCanvasResolution::from_page_box(page_box.as_ref());
+    let principal_flow = document_canvas_resolution.principal_flow();
+    let page_progression_direction = principal_flow.used_direction();
     let parent_ch_advance = if page_margin_inherited_style
         .deferred_font_size
         .requires_parent_ch_advance(parent_style.font_size)
@@ -678,24 +707,63 @@ pub(crate) fn layout_prepared_dom(config: PreparedDomLayout<'_>) -> Document {
         css::fallback_ch_advance_for_style(&page_margin_inherited_style)
     };
     page_margin_inherited_style.resolve_font_metric_lengths(root_ch_advance);
-    let layout_result = layout_dom_with_font_system(
-        root,
-        stylesheets,
-        options,
-        base_url,
-        root_url,
-        resource_cache,
-        iframe_documents,
-        iframe_viewport,
-        parent_style,
-        font_system,
-        page_progression_direction,
-        principal_flow,
-        page_margin_inherited_style,
-        page_box,
+    // Cross-reference values are determined at the target end of a link and
+    // can therefore change the size of normal-flow generated content. Rebuild
+    // the immutable formatting tree for each pass so the resolved text takes
+    // part in line selection and fragmentation instead of being patched into
+    // paint output. CSS Generated Content Level 3 intentionally permits page
+    // counters in these references: <https://www.w3.org/TR/css-content-3/#target-counter>.
+    const MAX_TARGET_REFERENCE_PASSES: usize = 8;
+    let mut target_references = TargetReferenceSnapshot::default();
+    let mut seen_target_snapshots = Vec::new();
+    let mut last_pass = None;
+    for pass_index in 0..MAX_TARGET_REFERENCE_PASSES {
+        let page_box = Box::new(box_tree::build_page_box(
+            root,
+            &stylesheets,
+            parent_style.as_ref(),
+        ));
+        let LayoutResult::Document(pass) = layout_dom_with_font_system(
+            root,
+            &stylesheets,
+            options,
+            base_url,
+            root_url,
+            resource_cache,
+            iframe_documents,
+            iframe_viewport,
+            parent_style.clone(),
+            font_system.clone(),
+            page_progression_direction,
+            principal_flow,
+            document_canvas_resolution,
+            page_margin_inherited_style.clone(),
+            page_box,
+            target_references.clone(),
+        );
+        if !pass.has_normal_flow_target_references || pass.target_references == target_references {
+            return pass.document;
+        }
+        if seen_target_snapshots
+            .iter()
+            .any(|previous| previous == &pass.target_references)
+        {
+            log::warn!(
+                "normal-flow generated target references did not converge after {} layout passes; retaining the last complete pass",
+                pass_index + 1
+            );
+            return pass.document;
+        }
+        seen_target_snapshots.push(target_references);
+        target_references = pass.target_references.clone();
+        last_pass = Some(pass);
+    }
+    log::warn!(
+        "normal-flow generated target references exceeded {MAX_TARGET_REFERENCE_PASSES} layout passes; retaining the last complete pass"
     );
-    let LayoutResult::Document(document) = layout_result;
-    document
+    last_pass
+        .expect("a target-reference layout loop always produces a first pass")
+        .document
 }
 
 /// Cascades document CSS onto inline SVG descendants that are painted by the
@@ -709,7 +777,7 @@ pub(crate) fn layout_prepared_dom(config: PreparedDomLayout<'_>) -> Document {
 /// §7.3; SVG 2 defines `transform` presentation attributes in §6.6.
 fn inline_svg_presentation_overrides(
     root: &Node,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
     parent_style: &ComputedStyle,
 ) -> crate::svg::SvgPresentationOverrides {
     let NodeKind::Element(root_element) = &root.kind else {
@@ -752,7 +820,7 @@ fn inline_svg_presentation_overrides(
 fn collect_inline_svg_presentation_overrides(
     element: &Element,
     signature: ElementSignature,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
     parent_style: &ComputedStyle,
     ancestors: &[ElementSignature],
     inside_inline_svg: bool,
@@ -791,30 +859,27 @@ fn collect_inline_svg_presentation_overrides(
                 .map(|palette| svg_presentation_paint(Some(palette.canvas_text)))
                 .or_else(|| {
                     style
-                        .svg_fill_overridden
-                        .then(|| svg_presentation_paint(style.svg_fill))
+                        .svg_fill
+                        .is_overridden()
+                        .then(|| svg_presentation_paint(style.svg_fill.paint.resolve(style.color)))
                 }),
             stroke: force_colors
-                .filter(|_| style.svg_stroke.is_some())
+                .filter(|_| !matches!(style.svg_stroke.paint, css::SvgPaint::None))
                 .map(|palette| svg_presentation_paint(Some(palette.canvas_text)))
                 .or_else(|| {
-                    style
-                        .svg_stroke_overridden
-                        .then(|| svg_presentation_paint(style.svg_stroke))
+                    style.svg_stroke.is_overridden().then(|| {
+                        svg_presentation_paint(style.svg_stroke.paint.resolve(style.color))
+                    })
                 })
                 .or_else(|| {
-                    enters_inline_svg
-                        .then(|| {
-                            style
-                                .svg_stroke
-                                .map(|color| svg_presentation_paint(Some(color)))
-                        })
-                        .flatten()
+                    enters_inline_svg.then(|| {
+                        svg_presentation_paint(style.svg_stroke.paint.resolve(style.color))
+                    })
                 }),
-            stroke_width: style.svg_stroke_width_overridden.then(|| {
+            stroke_width: style.svg_stroke_width.is_overridden().then(|| {
                 format!(
                     "{}px",
-                    style.svg_stroke_width.length_points() / css::CSS_PX_TO_PT
+                    style.svg_stroke_width.value().length_points() / css::CSS_PX_TO_PT
                 )
             }),
             remove_filter: force_colors.is_some()
@@ -1201,7 +1266,7 @@ mod svg_css_transform_tests {
 )]
 fn layout_dom_with_font_system(
     _root: &Node,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
     options: &RenderOptions,
     base_url: Option<&url::Url>,
     root_url: Option<&url::Url>,
@@ -1212,13 +1277,15 @@ fn layout_dom_with_font_system(
     font_system: FontSystem,
     page_progression_direction: Direction,
     principal_flow: DocumentPrincipalFlow,
+    document_canvas_resolution: DocumentCanvasResolution,
     page_margin_inherited_style: ComputedStyle,
     mut page_box: Box<box_tree::MutablePageBox<'_>>,
+    target_references: TargetReferenceSnapshot,
 ) -> LayoutResult {
     let _timer = DebugTimer::start("building and flowing page box content");
     let mut builder = Box::new(LayoutBuilder::new(LayoutBuilderConfig {
         options,
-        stylesheets,
+        stylesheets: *stylesheets,
         base_url,
         root_url,
         resource_cache,
@@ -1226,6 +1293,7 @@ fn layout_dom_with_font_system(
         iframe_viewport,
         page_progression_direction,
         page_counter_initial_values: HashMap::new(),
+        target_references,
         font_system,
     }));
     // The initial page context is created with builder defaults. Rebuild it
@@ -1236,12 +1304,13 @@ fn layout_dom_with_font_system(
     // https://www.w3.org/TR/css-logical-1/#flow-relative-mapping
     builder.page_margin_inherited_style = page_margin_inherited_style;
     builder.principal_flow = principal_flow;
+    builder.document_canvas_overflow = document_canvas_resolution;
     builder.initial_containing_block_writing_mode = principal_flow.writing_mode;
     builder.containing_block_writing_mode = principal_flow.writing_mode;
-    builder.containing_block_direction = principal_flow.direction;
+    builder.containing_block_direction = principal_flow.used_direction();
     builder.document_root_generates_box = !builder.page_margin_inherited_style.display.is_none();
     builder.rebuild_empty_current_page_context();
-    if inline_start_side(principal_flow.writing_mode, principal_flow.direction)
+    if inline_start_side(principal_flow.writing_mode, principal_flow.used_direction())
         == PhysicalSide::Bottom
     {
         builder.cursor_y = builder.current_page_context.bottom();
@@ -1262,11 +1331,6 @@ fn layout_dom_with_font_system(
         for child in &mut page_box.children {
             builder.resolve_font_metric_lengths_in_box(child);
         }
-        // Font-metric resolution may reconstruct formatting-box cores. Apply
-        // the root's layout-only principal-flow values after that pass so the
-        // flowing tree, rather than only its deferred precursor, receives the
-        // initial containing block's axes.
-        box_tree::apply_principal_flow_to_root_layout_box(page_box.as_mut(), principal_flow);
     }
     let page_box = {
         let _timer = DebugTimer::start("freezing formatting box tree");
@@ -1282,31 +1346,64 @@ fn layout_dom_with_font_system(
             builder.layout_page_box(page_box.as_ref(), stylesheets);
         } else {
             let initial_snapshot = builder.snapshot();
-            let mut reservations = HashMap::new();
-            let mut measurements = Vec::new();
-            // Footnote bodies reduce a page's available block size, which can move
-            // their calls to a later page. Iterate the page assignment to a fixed
-            // point before the paint-producing pass.
-            for _ in 0..8 {
-                builder.footnote_layout_mode = FootnoteLayoutMode::Measure;
+            builder.install_footnotes(page_box.as_ref());
+            let initial_measurement =
+                builder.initial_single_footnote_measurement(page_box.as_ref());
+            builder.restore(initial_snapshot.clone());
+            // Obtain the first committed call assignment without painting.
+            // Each later render pass validates its own committed assignments,
+            // so a stable document takes one measure and one paint pass rather
+            // than a measure-only confirmation followed by a third full
+            // layout.  A changed assignment is rolled back and rendered again
+            // with its newly reserved page-local footnote area.
+            // <https://www.w3.org/TR/css-gcpm-3/#footnote-policy>
+            let (mut measurements, mut reservations) =
+                if let Some(measurement) = initial_measurement {
+                    let measurements = vec![measurement];
+                    let reservations =
+                        LayoutBuilder::footnote_reservations_from_measurements(&measurements);
+                    (measurements, reservations)
+                } else {
+                    builder.footnote_layout_mode = FootnoteLayoutMode::Measure;
+                    builder.footnote_reservations.clear();
+                    builder.footnote_measurements.clear();
+                    builder.layout_page_box(page_box.as_ref(), stylesheets);
+                    let measurements = std::mem::take(&mut builder.footnote_measurements);
+                    let reservations =
+                        LayoutBuilder::footnote_reservations_from_measurements(&measurements);
+                    builder.restore(initial_snapshot.clone());
+                    (measurements, reservations)
+                };
+
+            for attempt in 0..8 {
+                builder.footnote_layout_mode = FootnoteLayoutMode::Render;
                 builder.footnote_reservations = reservations.clone();
-                builder.footnote_measurements.clear();
+                builder.footnote_measurements = measurements.clone();
+                builder.rendered_footnote_measurements.clear();
                 builder.layout_page_box(page_box.as_ref(), stylesheets);
-                let next_measurements = std::mem::take(&mut builder.footnote_measurements);
+                let next_measurements = std::mem::take(&mut builder.rendered_footnote_measurements);
                 let next_reservations =
                     LayoutBuilder::footnote_reservations_from_measurements(&next_measurements);
-                builder.restore(initial_snapshot.clone());
-                measurements = next_measurements;
                 if next_reservations == reservations {
-                    reservations = next_reservations;
                     break;
                 }
+
+                // The rendered page belongs to the rejected reservation
+                // state. Restore all paint and page-local event state before
+                // retrying from the document's fragmentainer boundary.
+                builder.restore(initial_snapshot.clone());
+                measurements = next_measurements;
                 reservations = next_reservations;
+
+                if attempt == 7 {
+                    builder.footnote_layout_mode = FootnoteLayoutMode::Render;
+                    builder.footnote_reservations = reservations;
+                    builder.footnote_measurements = measurements;
+                    builder.rendered_footnote_measurements.clear();
+                    builder.layout_page_box(page_box.as_ref(), stylesheets);
+                    break;
+                }
             }
-            builder.footnote_layout_mode = FootnoteLayoutMode::Render;
-            builder.footnote_reservations = reservations;
-            builder.footnote_measurements = measurements;
-            builder.layout_page_box(page_box.as_ref(), stylesheets);
         }
     }
     if !builder.has_renderable_content() {
@@ -1330,7 +1427,7 @@ fn layout_dom_with_font_system(
 /// <https://www.w3.org/TR/css-page-3/#page-context>
 pub(in crate::layout) fn document_root_style(
     root: &Node,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
     parent_style: &ComputedStyle,
 ) -> ComputedStyle {
     let NodeKind::Element(root_element) = &root.kind else {
@@ -1368,11 +1465,8 @@ pub(in crate::layout) fn document_root_style(
 pub(in crate::layout) struct DocumentPrincipalFlow {
     pub(in crate::layout) writing_mode: WritingMode,
     pub(in crate::layout) direction: Direction,
+    pub(in crate::layout) text_orientation: TextOrientation,
     pub(in crate::layout) source: PrincipalFlowSource,
-    /// Whether selecting the body changes the root's used principal axes.
-    /// A body that merely inherits those axes remains a normal root child for
-    /// canvas-flow placement.
-    pub(in crate::layout) propagates_axes: bool,
 }
 
 /// The element that supplies the document's used principal flow.
@@ -1435,31 +1529,30 @@ impl DocumentPrincipalFlow {
     pub(in crate::layout) fn from_style(style: &ComputedStyle) -> Self {
         Self {
             writing_mode: style.writing_mode,
-            // The principal flow establishes physical logical-axis mapping,
-            // so use Writing Modes' used `direction`. In particular,
-            // `text-orientation: upright` makes a vertical root flow LTR
-            // without mutating its computed style.
+            // Keep the computed direction separately from the used direction:
+            // text-orientation can force the latter in vertical flow without
+            // changing the root's computed direction.
             // <https://drafts.csswg.org/css-writing-modes-4/#text-orientation>
-            direction: style.used_direction(),
+            direction: style.direction,
+            text_orientation: style.text_orientation,
             source: PrincipalFlowSource::Root,
-            propagates_axes: false,
         }
     }
 
-    /// Returns whether `element` is the HTML body that supplies the root's
-    /// used principal flow.
+    /// Returns whether `element` supplies the used principal flow.
     pub(in crate::layout) fn is_source_body(self, element: &Element) -> bool {
         self.source == PrincipalFlowSource::Body(element.id)
     }
 
-    /// Returns whether an eligible HTML body supplies the used principal flow.
-    pub(in crate::layout) fn is_body_sourced(self) -> bool {
-        matches!(self.source, PrincipalFlowSource::Body(_))
-    }
-
-    /// Returns whether body-specific canvas-flow placement is required.
-    pub(in crate::layout) fn has_propagated_axes(self) -> bool {
-        self.propagates_axes
+    /// Returns the used inline base direction of the resolved principal flow.
+    pub(in crate::layout) fn used_direction(self) -> Direction {
+        if self.writing_mode.has_vertical_lines()
+            && self.text_orientation == TextOrientation::Upright
+        {
+            Direction::Ltr
+        } else {
+            self.direction
+        }
     }
 
     /// Produces the root's layout-only flow style.
@@ -1472,6 +1565,7 @@ impl DocumentPrincipalFlow {
         let mut used = root_style.clone();
         used.writing_mode = self.writing_mode;
         used.direction = self.direction;
+        used.text_orientation = self.text_orientation;
         // Inline root generated content participates in the principal inline
         // flow. A block-level pseudo establishes its own formatting context,
         // so it retains its computed writing mode as an orthogonal child.
@@ -1486,87 +1580,67 @@ impl DocumentPrincipalFlow {
         {
             pseudo.writing_mode = self.writing_mode;
             pseudo.direction = self.direction;
+            pseudo.text_orientation = self.text_orientation;
         }
         used
     }
 }
 
-/// Resolves the CSS Writing Modes principal-flow propagation from an HTML
-/// `body` child to the initial containing block.
+/// The document-root font-metric state during layout.
 ///
-/// Property containment prevents this special propagation. The body style is
-/// fully cascaded with the root as its parent so selectors and inherited
-/// values participate exactly as they do during normal box-tree construction.
-/// <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
-pub(in crate::layout) fn document_principal_flow(
-    root: &Node,
-    stylesheets: &[Stylesheet],
-    parent_style: &ComputedStyle,
-    root_style: &ComputedStyle,
-) -> DocumentPrincipalFlow {
-    let default_flow = DocumentPrincipalFlow::from_style(root_style);
-    if style_has_property_containment(root_style) {
-        return default_flow;
-    }
-    let NodeKind::Element(document) = &root.kind else {
-        return default_flow;
-    };
-    let document_children = element_sibling_signature_list(document);
-    let mut document_element_index = 0;
-    for child in &document.children {
-        let NodeKind::Element(html) = &child.kind else {
-            continue;
-        };
-        let html_signature = ElementSignature::with_sibling_list(
-            html.tag.clone(),
-            html.attrs.clone(),
-            document_element_index,
-            document_children.clone(),
-        );
-        document_element_index += 1;
-        if !has_html_rendering_semantics(html) || html.tag != "html" {
-            continue;
-        }
+/// Root-relative font units must use the root element's selected font, even
+/// when the root itself has no local metric-relative value. Keeping the
+/// bootstrap state distinct prevents an ordinary style's fallback metrics from
+/// becoming the document-wide root basis.
+/// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout) enum RootMetricState {
+    Bootstrapping,
+    Resolved(ResolvedRootFontMetrics),
+}
 
-        let html_signature = layout_element_signature(html, html_signature, Some(parent_style));
-        let body_children = element_sibling_signature_list(html);
-        let mut body_element_index = 0;
-        for body_child in &html.children {
-            let NodeKind::Element(body) = &body_child.kind else {
-                continue;
-            };
-            let body_signature = ElementSignature::with_sibling_list(
-                body.tag.clone(),
-                body.attrs.clone(),
-                body_element_index,
-                body_children.clone(),
-            );
-            body_element_index += 1;
-            if !has_html_rendering_semantics(body) || body.tag != "body" {
-                continue;
-            }
-            let body_style = style_for_layout_element(
-                body,
-                body_signature,
-                stylesheets,
-                Some(root_style),
-                std::slice::from_ref(&html_signature),
-            );
-            return if style_has_property_containment(&body_style) {
-                default_flow
-            } else {
-                DocumentPrincipalFlow {
-                    writing_mode: body_style.writing_mode,
-                    direction: body_style.used_direction(),
-                    source: PrincipalFlowSource::Body(body.id),
-                    propagates_axes: body_style.writing_mode != root_style.writing_mode
-                        || body_style.used_direction() != root_style.used_direction(),
-                }
-            };
+impl RootMetricState {
+    pub(in crate::layout) const fn font_size_basis(self) -> Option<css::RootFontMetricLengthBasis> {
+        match self {
+            Self::Bootstrapping => None,
+            Self::Resolved(metrics) => Some(metrics.basis()),
         }
-        return default_flow;
     }
-    default_flow
+
+    pub(in crate::layout) fn resolved(self) -> ResolvedRootFontMetrics {
+        match self {
+            Self::Bootstrapping => {
+                unreachable!("the document root must establish font metrics before descendants")
+            }
+            Self::Resolved(metrics) => metrics,
+        }
+    }
+
+    pub(in crate::layout) fn establish(&mut self, metrics: ResolvedRootFontMetrics) {
+        debug_assert!(matches!(self, Self::Bootstrapping));
+        *self = Self::Resolved(metrics);
+    }
+}
+
+/// Root-font metrics measured after resolving the document root's used font.
+///
+/// The traversal APIs accept this wrapper rather than raw metrics, so a
+/// descendant cannot accidentally receive a metric basis from an intervening
+/// ancestor.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout) struct ResolvedRootFontMetrics(css::RootFontMetricLengthBasis);
+
+impl ResolvedRootFontMetrics {
+    /// Records metrics measured from the document root's selected font.
+    pub(in crate::layout) const fn measured_for_document_root(
+        basis: css::RootFontMetricLengthBasis,
+    ) -> Self {
+        Self(basis)
+    }
+
+    pub(in crate::layout) const fn basis(self) -> css::RootFontMetricLengthBasis {
+        self.0
+    }
 }
 
 /// Captures root counter resets that seed page-context counters.
@@ -1578,7 +1652,7 @@ pub(in crate::layout) fn document_principal_flow(
 /// <https://www.w3.org/TR/css-lists-3/#auto-numbering>.
 pub(in crate::layout) struct LayoutBuilder<'a> {
     pub(in crate::layout) options: &'a RenderOptions,
-    pub(in crate::layout) stylesheets: &'a [Stylesheet],
+    pub(in crate::layout) stylesheets: Stylesheets<'a>,
     pub(in crate::layout) base_url: Option<&'a url::Url>,
     pub(in crate::layout) root_url: Option<&'a url::Url>,
     pub(in crate::layout) resource_cache: &'a ResourceCache,
@@ -1605,13 +1679,16 @@ pub(in crate::layout) struct LayoutBuilder<'a> {
         HashMap<ElementId, Vec<box_tree::SuppressedNamedStringEvent>>,
     pub(in crate::layout) page_anchors: HashMap<String, usize>,
     pub(in crate::layout) page_anchor_text: HashMap<String, AnchorText>,
+    pub(in crate::layout) page_anchor_counters: HashMap<String, HashMap<String, Vec<i32>>>,
+    pub(in crate::layout) target_references: TargetReferenceSnapshot,
+    pub(in crate::layout) has_normal_flow_target_references: bool,
     pub(in crate::layout) document_canvas_background: Option<DocumentCanvasBackground>,
-    pub(in crate::layout) document_canvas_overflow: DocumentCanvasOverflowContext,
+    pub(in crate::layout) document_canvas_overflow: DocumentCanvasResolution,
     /// Insets introduced by active document-canvas (`html`/`body`) boxes.
     ///
-    /// They position the first-page canvas contents, but are not continuation
-    /// insets of an ordinary fragmented containing block. A destination page
-    /// must restart them from its own page area.
+    /// Their inline components re-enter every page fragment, while their
+    /// block-start components belong only to the first fragment. A
+    /// destination page recomputes them from its own page area.
     pub(in crate::layout) document_canvas_fragment_insets: Vec<FragmentOffsets>,
     /// Whether the document root generates its principal box.
     ///
@@ -1624,6 +1701,16 @@ pub(in crate::layout) struct LayoutBuilder<'a> {
     /// Whether the current fragment has in-flow content eligible to form a
     /// CSS Fragmentation class-A boundary for named-page selection.
     pub(in crate::layout) current_page_has_named_page_flow_content: bool,
+    /// The named page type directly selected by a Class-A source on the
+    /// current page.
+    ///
+    /// This is separate from normal-flow occupancy: a Class-A box can select
+    /// a named page whose only document paint is out-of-flow. Empty
+    /// continuation pages deliberately clear this marker, even when their
+    /// provisional context inherits that page type, so a succeeding Class-A
+    /// boundary can replace the provisional context rather than emit an extra
+    /// named blank page.
+    pub(in crate::layout) current_page_selected_name: Option<String>,
     pub(in crate::layout) last_block_layout_outcome: BlockLayoutOutcome,
     pub(in crate::layout) current_page_name: Option<String>,
     pub(in crate::layout) current_page_context: PageContext,
@@ -1638,7 +1725,38 @@ pub(in crate::layout) struct LayoutBuilder<'a> {
     pub(in crate::layout) page_descriptor_viewport_size: PageSize,
     pub(in crate::layout) fragmentainer_override: Option<FragmentainerOverride>,
     pub(in crate::layout) footnote_bodies: HashMap<ElementId, box_tree::FootnoteBox<'a>>,
+    /// Whether each immutable source subtree contains a ruby formatting
+    /// context. This structural fact survives fragmentainer retries.
+    pub(in crate::layout) ruby_formatting_descendants: HashMap<ElementId, bool>,
+    /// Named-page boundary summaries are a pure property of an immutable
+    /// source subtree and its inherited page name. Replaying a rejected
+    /// fragmentainer must not re-cascade that subtree.
+    pub(in crate::layout) dom_page_boundary_summaries:
+        HashMap<(ElementId, Option<String>), (ResolvedPageBoundaryValues, PageBoundaryValues)>,
+    /// Pure auto-height table estimates reused by speculative pagination
+    /// probes. The key includes the source table and its containing inline
+    /// span; rollback never changes either input.
+    pub(in crate::layout) speculative_table_height_estimates: HashMap<(ElementId, u32), f32>,
+    /// Row-height plans produced while probing an avoid-constrained table.
+    /// They are reusable by the accepted table layout when its source rows
+    /// and resolved track width are unchanged.
+    pub(in crate::layout) speculative_table_height_plans:
+        HashMap<(ElementId, u32), table::TableHeightPlan>,
     pub(in crate::layout) footnote_measurements: Vec<FootnoteMeasurement>,
+    /// Measurements captured from the paint-producing pagination pass. They
+    /// validate that the committed call-to-page assignment matches the page
+    /// reservation that selected this pass.
+    pub(in crate::layout) rendered_footnote_measurements: Vec<FootnoteMeasurement>,
+    /// Calls committed during the current measurement pass. This prevents a
+    /// replayed selected line from reserving the same detached body twice.
+    pub(in crate::layout) measured_footnotes: HashSet<ElementId>,
+    /// Source-order inline floats already committed by inline line selection.
+    ///
+    /// The ordinary block-child traversal later reaches the same DOM element.
+    /// It consumes this record instead of laying out and painting the float a
+    /// second time.  The record retains the marker, selected source row, and
+    /// the durable page-local exclusion that owns the captured paint subtree.
+    pub(in crate::layout) committed_inline_floats: HashMap<ElementId, CommittedInlineFloat>,
     pub(in crate::layout) footnote_reservations: HashMap<usize, f32>,
     pub(in crate::layout) footnote_layout_mode: FootnoteLayoutMode,
     pub(in crate::layout) footnote_measurement_depth: usize,
@@ -1673,9 +1791,6 @@ pub(in crate::layout) struct LayoutBuilder<'a> {
     /// its own isolated measurement. This second stack prevents the estimator
     /// from recursively invoking itself through an intervening floated child.
     pub(in crate::layout) active_auto_float_measurement_fallbacks: Vec<ElementId>,
-    /// Fragmentainer scopes across which descendant forced breaks must not
-    /// propagate because of layout containment.
-    pub(in crate::layout) forced_break_containment_scopes: Vec<Option<FragmentainerOverride>>,
     pub(in crate::layout) cursor_y: f32,
     pub(in crate::layout) content_left: f32,
     pub(in crate::layout) content_right: f32,
@@ -1725,6 +1840,8 @@ pub(in crate::layout) struct LayoutBuilder<'a> {
     /// export the correct atomic inline baseline:
     /// <https://www.w3.org/TR/CSS22/visudet.html#inlineblock-width>.
     pub(in crate::layout) last_in_flow_line_baseline_y: Option<f32>,
+    /// Outside list markers awaiting their first accepted in-flow line.
+    pub(in crate::layout) pending_outside_marker_anchors: Vec<PendingOutsideMarkerAnchor>,
     pub(in crate::layout) block_static_position_y_offset: Option<f32>,
     pub(in crate::layout) absolute_static_position: Option<AbsoluteStaticPosition>,
     /// Final-geometry grid scopes used by positioned descendants that retain
@@ -1736,6 +1853,9 @@ pub(in crate::layout) struct LayoutBuilder<'a> {
     pub(in crate::layout) pending_subgrid_contexts: Vec<Option<grid::ResolvedSubgridContext>>,
     pub(in crate::layout) escaped_atom_positioning_depth: usize,
     pub(in crate::layout) escaped_atom_containing_block: Option<ContainingBlock>,
+    /// The outer absolute-position containing block and scratch-local static
+    /// rectangle of the active escaped atomic inline, when applicable.
+    pub(in crate::layout) escaped_atom_positioning_context: Option<EscapedAtomPositioningContext>,
     pub(in crate::layout) containing_block_direction: Direction,
     pub(in crate::layout) containing_block_writing_mode: WritingMode,
     /// Principal-flow axes of the initial containing block.
@@ -1809,6 +1929,11 @@ pub(in crate::layout) struct LayoutBuilder<'a> {
     pub(in crate::layout) page_declarations: Declarations,
     pub(in crate::layout) counter_styles: HashMap<String, CounterStyleRule>,
     pub(in crate::layout) first_page_declarations: Declarations,
+    /// The single document-root snapshot used by eager and lazily built boxes.
+    pub(in crate::layout) root_metric_state: RootMetricState,
+    /// Whether any eagerly built style consumes root-relative selected-font
+    /// metrics, which determines whether the root must intern a font.
+    pub(in crate::layout) root_metrics_require_selected_font: bool,
     pub(in crate::layout) font_system: Box<FontSystem>,
     pub(in crate::layout) bookmarks: Vec<Bookmark>,
     pub(in crate::layout) positioned_layers: Vec<PositionedPaintLayer>,
@@ -1820,6 +1945,12 @@ pub(in crate::layout) struct LayoutBuilder<'a> {
     /// Nesting depth of temporary multicolumn layout that captures positioned
     /// flex descendants. Only the outermost owner may replay the queue.
     pub(in crate::layout) multicol_positioned_replay_capture_depth: usize,
+    /// Furthest page reached by a committed absolutely positioned margin box.
+    ///
+    /// This is deliberately separate from `pending_positioned_page_span_target`:
+    /// transparent abspos geometry normally does not create blank pages, but a
+    /// viewport-fixed layer must replay across its complete final page span.
+    pub(in crate::layout) absolute_positioned_page_span_target: Option<usize>,
     pub(in crate::layout) pending_positioned_page_span_target: Option<usize>,
     pub(in crate::layout) next_paint_source_order: usize,
     pub(in crate::layout) overflow_clips: Vec<OverflowClip>,
@@ -1998,8 +2129,34 @@ pub(in crate::layout) struct BlockLayoutOutcome {
     /// when the child paints nothing. Keeping it in the layout outcome avoids
     /// deriving flow geometry from optional paint fragments.
     pub(in crate::layout) physical_border_box_inline_span: BorderBoxLength,
+    /// The source-fragment, untransformed border box resolved by normal-flow
+    /// layout.  Parent special rendering models (notably HTML's rendered
+    /// legend) use this layout geometry rather than painted-ink bounds.
+    ///
+    /// <https://html.spec.whatwg.org/multipage/rendering.html#the-fieldset-and-legend-elements>
+    /// <https://www.w3.org/TR/css-writing-modes-4/#logical-to-physical>
+    pub(in crate::layout) static_border_box: Option<PaintRect>,
     /// Line-selection slots produced by this block's in-flow contents.
     pub(in crate::layout) clamp_line_slots: usize,
+    /// The last destination fragment committed by an in-flow child before
+    /// this block applies its own used block-size constraints.
+    ///
+    /// A parent formatting context can use this endpoint when it owns an
+    /// independently fragmenting child's continuation. This is the
+    /// authoritative auto-height flow endpoint: a frozen flex-item border
+    /// box, positioned descendant, or provisional source-global used height
+    /// must not replace the child's final fragmentainer-local cursor before
+    /// the parent tests its next normal-flow sibling for overflow.
+    /// <https://www.w3.org/TR/css-break-3/#box-splitting>
+    pub(in crate::layout) in_flow_child_fragment_end: Option<InFlowFragmentEnd>,
+}
+
+/// A destination-page flow endpoint committed by a descendant formatting
+/// context before its parent applies a separate used-size constraint.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct InFlowFragmentEnd {
+    pub(in crate::layout) page_index: usize,
+    pub(in crate::layout) cursor: PageTopBlockPosition,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2012,7 +2169,7 @@ pub(in crate::layout) struct BlockEndMarginCollapse {
 
 pub(in crate::layout) struct LayoutBuilderConfig<'a> {
     pub(in crate::layout) options: &'a RenderOptions,
-    pub(in crate::layout) stylesheets: &'a [Stylesheet],
+    pub(in crate::layout) stylesheets: Stylesheets<'a>,
     pub(in crate::layout) base_url: Option<&'a url::Url>,
     pub(in crate::layout) root_url: Option<&'a url::Url>,
     pub(in crate::layout) resource_cache: &'a ResourceCache,
@@ -2020,6 +2177,7 @@ pub(in crate::layout) struct LayoutBuilderConfig<'a> {
     pub(in crate::layout) iframe_viewport: Option<PageSize>,
     pub(in crate::layout) page_progression_direction: Direction,
     pub(in crate::layout) page_counter_initial_values: HashMap<String, i32>,
+    pub(in crate::layout) target_references: TargetReferenceSnapshot,
     pub(in crate::layout) font_system: FontSystem,
 }
 
@@ -2048,6 +2206,28 @@ impl FragmentOffsets {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_options_enable_html_presentational_hints_by_default() {
+        assert!(RenderOptions::default().presentational_hints);
+
+        let options = RenderOptions {
+            presentational_hints: false,
+            ..RenderOptions::default()
+        };
+        assert!(!options.presentational_hints);
+    }
+
+    #[test]
+    fn render_options_validate_and_expose_device_resolution() {
+        let mut options = RenderOptions::default();
+        assert_eq!(options.device_resolution_dppx(), 1.0);
+        options.set_device_resolution_dppx(2.0).unwrap();
+        assert_eq!(options.device_resolution_dppx(), 2.0);
+        assert_eq!(options.media_environment().resolution_dppx, 2.0);
+        assert!(options.set_device_resolution_dppx(0.0).is_err());
+        assert!(options.set_device_resolution_dppx(f32::NAN).is_err());
+    }
 
     #[test]
     fn page_size_converts_to_a_physical_layout_size() {

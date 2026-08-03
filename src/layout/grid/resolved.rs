@@ -168,15 +168,15 @@ impl ResolvedSubgridAxis {
             grid_line_index(placement, &self.line_names).map(|line| line.clamp(1, last_line))
         };
         let span = |placement: &css::GridPlacement| match placement {
-            css::GridPlacement::Span(span) => i32::from(span.span.unwrap_or(1)).max(1),
+            css::GridPlacement::Span(span) => i32::from(span.count().unwrap_or(1)).max(1),
             _ => 1,
         };
         let named_span_end = |start: i32, placement: &css::GridPlacement| {
             let css::GridPlacement::Span(span) = placement else {
                 return None;
             };
-            let name = span.name.as_ref()?;
-            let target = usize::from(span.span.unwrap_or(1));
+            let name = span.name()?;
+            let target = usize::from(span.count().unwrap_or(1));
             self.line_names
                 .iter()
                 .enumerate()
@@ -189,8 +189,8 @@ impl ResolvedSubgridAxis {
             let css::GridPlacement::Span(span) = placement else {
                 return None;
             };
-            let name = span.name.as_ref()?;
-            let target = usize::from(span.span.unwrap_or(1));
+            let name = span.name()?;
+            let target = usize::from(span.count().unwrap_or(1));
             self.line_names
                 .iter()
                 .enumerate()
@@ -241,7 +241,7 @@ impl ResolvedSubgridAxis {
         let resolve = |placement: &css::GridPlacement| match placement {
             css::GridPlacement::Line(line) => grid_line_index(placement, &self.line_names)
                 .unwrap_or_else(|| {
-                    if line.index.unwrap_or(1) < 0 {
+                    if line.index().unwrap_or(1) < 0 {
                         1
                     } else {
                         last_line
@@ -253,8 +253,8 @@ impl ResolvedSubgridAxis {
         let start_line = resolve(start);
         let end_line = resolve(end);
         let span = |placement: &css::GridPlacement| match placement {
-            css::GridPlacement::Span(span) if span.name.is_none() => {
-                i32::from(span.span.unwrap_or(1)).max(1)
+            css::GridPlacement::Span(span) if span.name().is_none() => {
+                i32::from(span.count().unwrap_or(1)).max(1)
             }
             _ => 1,
         };
@@ -612,9 +612,9 @@ mod tests {
             gutter_sizes: vec![0.0; 4],
             line_names: vec![vec!["y".into()]; 6],
         };
-        let start = css::GridPlacement::Line(css::GridLinePlacement {
-            name: Some("y".into()),
-            index: Some(3),
+        let start = css::GridPlacement::Line(css::GridLinePlacement::Named {
+            name: "y".into(),
+            occurrence: std::num::NonZeroI32::new(3),
         });
         assert_eq!(
             axis.clamped_taffy_line(&start, &css::GridPlacement::Auto),
@@ -644,13 +644,12 @@ mod tests {
         let auto = axis.resolved_range(&css::GridPlacement::Auto, &css::GridPlacement::Auto, 99);
         assert_eq!(auto, ResolvedSubgridPlacement { start: 5, end: 6 });
         let named_span = axis.resolved_range(
-            &css::GridPlacement::Line(css::GridLinePlacement {
-                name: None,
-                index: Some(1),
-            }),
-            &css::GridPlacement::Span(css::GridSpanPlacement {
-                name: Some("y".into()),
-                span: Some(2),
+            &css::GridPlacement::Line(css::GridLinePlacement::Number(
+                std::num::NonZeroI32::new(1).unwrap(),
+            )),
+            &css::GridPlacement::Span(css::GridSpanPlacement::Named {
+                name: "y".into(),
+                count: std::num::NonZeroU16::new(2),
             }),
             1,
         );

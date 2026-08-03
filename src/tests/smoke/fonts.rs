@@ -8,6 +8,85 @@ const NON_EM_ASCENDER_PREPARED_PAINT_FIXTURE: &str =
     "tests/fixtures/wpt/css/css-fonts/non-em-ascender-prepared-paint.html";
 const FONT_SIZE_ADJUST_MIXED_FALLBACK_BASELINE_FIXTURE: &str =
     "tests/fixtures/wpt/css/css-fonts/font-size-adjust-mixed-fallback-baseline.html";
+const ROOT_FONT_METRICS_IN_MONOSPACE_FIXTURE: &str =
+    "tests/fixtures/wpt/css/css-fonts/root-font-metrics-in-monospace.html";
+const FONT_SYNTHESIS_WEIGHT_PDF_FIXTURE: &str =
+    "tests/fixtures/wpt/css/css-fonts/font-synthesis-weight-pdf.html";
+
+/// A selected faux-bold face changes PDF paint only when CSS permits weight
+/// synthesis; an authored bold face must remain an ordinary fill-only font.
+/// <https://www.w3.org/TR/css-fonts-4/#font-synthesis-intro>
+#[tokio::test]
+async fn font_synthesis_weight_is_retained_per_selected_document_font() {
+    let document = Html::from_file(FONT_SYNTHESIS_WEIGHT_PDF_FIXTURE)
+        .await
+        .unwrap()
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+    let font_for = |text: &str| {
+        let line = document.pages[0]
+            .lines()
+            .iter()
+            .find(|line| line.text == text)
+            .unwrap_or_else(|| {
+                panic!(
+                    "fixture line {text:?} should paint; got {:?}",
+                    document.pages[0]
+                        .lines()
+                        .iter()
+                        .map(|line| line.text.as_str())
+                        .collect::<Vec<_>>()
+                )
+            });
+        line_font(&document, line)
+    };
+
+    assert!(font_for("synthesized").synthesis.embolden);
+    assert!(!font_for("not synthesized").synthesis.embolden);
+    assert!(!font_for("authored bold").synthesis.embolden);
+}
+
+/// Root-relative font metrics are selected from the document root, not from
+/// an enlarged ancestor of the element using the unit.
+/// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>
+#[tokio::test]
+async fn root_font_metric_units_ignore_an_intervening_monospace_ancestor() {
+    let document = Html::from_file(ROOT_FONT_METRICS_IN_MONOSPACE_FIXTURE)
+        .await
+        .unwrap()
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+    let page = &document.pages[0];
+
+    for unit in ["rex", "rcap", "ric"] {
+        let nested = page
+            .lines()
+            .iter()
+            .find(|line| line.text == format!("nested-{unit}"))
+            .expect("nested root-relative metric sample");
+        let root = page
+            .lines()
+            .iter()
+            .find(|line| line.text == format!("root-{unit}"))
+            .expect("root-relative metric control sample");
+        let ordinary_unit = unit.strip_prefix('r').expect("root unit prefix");
+        let ordinary = page
+            .lines()
+            .iter()
+            .find(|line| line.text == format!("parent-r{ordinary_unit}"))
+            .expect("ordinary parent-metric control sample");
+        assert!(
+            (nested.font_size - root.font_size).abs() < 0.01,
+            "1{unit} must use the root selected font rather than the monospace ancestor: nested={nested:?}, root={root:?}"
+        );
+        assert!(
+            (root.font_size - ordinary.font_size).abs() < 0.01,
+            "1{unit} must equal the corresponding parent-font 1{ordinary_unit}: root={root:?}, ordinary={ordinary:?}"
+        );
+    }
+}
 
 #[tokio::test]
 async fn native_non_em_ascender_does_not_raise_a_following_block_into_the_previous_one() {
@@ -905,6 +984,80 @@ async fn local_alreq_text_encoding_subset_matches_presentation_forms() {
 }
 
 #[tokio::test]
+async fn explicit_cross_font_zwnj_table_cells_match_presentation_forms() {
+    let variant = AlreqVariant::explicit(
+        "shaping-no-join-003",
+        AlreqExpectation::NoJoin,
+        AlreqSpecialFont::JoinControls,
+    );
+    let rows = variant
+        .cases()
+        .into_iter()
+        .map(|(actual, reference)| {
+            format!(
+                "<tr><td>{}<td>{}",
+                variant.markup(actual),
+                variant.markup(reference)
+            )
+        })
+        .collect::<String>();
+    let html = format!(
+        r#"<style>
+            @font-face {{ font-family: AlreqArabic; src: url('tests/resources/fonts/NotoNaskhArabic-regular.woff2') format('woff2'); }}
+            @font-face {{ font-family: AlreqJoinControls; src: url('tests/resources/fonts/noto-sans-v8-latin-regular.woff') format('woff'); }}
+            table {{ font-family: AlreqArabic; font-size: 3em; border-spacing: 0 3px; }}
+            td {{ padding: 0 0.5ch; line-height: 1; border: 1px solid; }}
+            .special {{ font-family: AlreqJoinControls; line-height: 0; }}
+           </style><table dir=rtl lang=ar>{rows}</table>"#,
+    );
+    let document = Html::from_string(html)
+        .with_base_path(".")
+        .unwrap()
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+    let lines = document
+        .pages
+        .iter()
+        .flat_map(|page| page.lines().iter())
+        .filter_map(|line| {
+            let visible_glyphs = line
+                .runs
+                .iter()
+                .flat_map(|run| run.glyphs.as_deref().unwrap_or_default())
+                .filter(|glyph| glyph.x_advance != 0.0)
+                .map(|glyph| glyph.painted_id().expect("paintable glyph"))
+                .collect::<Vec<_>>();
+            (!visible_glyphs.is_empty()).then(|| {
+                let unicode = line
+                    .runs
+                    .iter()
+                    .flat_map(|run| run.glyphs.as_deref().unwrap_or_default())
+                    .filter(|glyph| glyph.x_advance != 0.0)
+                    .map(|glyph| glyph.unicode.clone())
+                    .collect::<Vec<_>>();
+                AlreqLineGlyphs {
+                    visible_glyphs,
+                    unicode,
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(lines.len(), 12, "six actual/reference table-cell pairs");
+    for (index, pair) in lines.as_chunks::<2>().0.iter().enumerate() {
+        assert_eq!(
+            pair[0].visible_glyphs, pair[1].visible_glyphs,
+            "table row {index} should match its presentation-form reference"
+        );
+        assert!(
+            !pair[0].unicode.iter().any(|text| text.contains('\u{200c}')),
+            "table row {index} must not emit a visible ZWNJ glyph"
+        );
+    }
+}
+
+#[tokio::test]
 async fn uses_later_font_family_for_missing_glyph_runs() {
     let Some((primary_font, fallback_font, fallback_character)) = fallback_font_fixture() else {
         eprintln!("no standalone system TrueType fallback-font fixture available");
@@ -1321,7 +1474,7 @@ impl AlreqVariant {
              @font-face {{ font-family: AlreqArabic; src: url('tests/resources/fonts/NotoNaskhArabic-regular.woff2') format('woff2'); }}\
              body {{ margin: 0; }}\
              .case {{ margin: 0; font-family: {stack}; font-size: 20pt; line-height: 24pt; }}\
-             .special {{ font-family: AlreqSpecial; }}\
+             .special {{ font-family: AlreqSpecial; line-height: 0; }}\
              </style>{case}",
             match special_font {
                 AlreqSpecialFont::JoinControls => {

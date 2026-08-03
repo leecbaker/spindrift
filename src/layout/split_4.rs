@@ -2,16 +2,18 @@
 mod tests {
     use super::super::*;
     use crate::css::{
-        BoxDecorationBreak, ComputedLengthPercentage, Hyphens, TextAlignLast, TextBoxEdge,
-        TextBoxTrim, TextEdgeMetric, TextEdgePair, TextOrientation,
+        BoxDecorationBreak, ComputedLengthPercentage, Hyphens, StylesheetCollection, TextAlignLast,
+        TextBoxEdge, TextBoxTrim, TextEdgeMetric, TextEdgePair, TextOrientation,
     };
+    use crate::layout::inline_collect::{InlineElementScopeOptions, InlinePlacement};
     use std::rc::Rc;
 
-    fn test_layout_builder<'a>(
+    fn test_layout_builder<'a, Collection: StylesheetCollection + ?Sized>(
         options: &'a RenderOptions,
-        stylesheets: &'a [Stylesheet],
+        stylesheets: &'a Collection,
         resource_cache: &'a ResourceCache,
     ) -> LayoutBuilder<'a> {
+        let stylesheets = stylesheets.stylesheet_view();
         LayoutBuilder::new(LayoutBuilderConfig {
             options,
             stylesheets,
@@ -24,6 +26,7 @@ mod tests {
             iframe_viewport: None,
             page_progression_direction: Direction::Ltr,
             page_counter_initial_values: HashMap::new(),
+            target_references: crate::layout::TargetReferenceSnapshot::default(),
             font_system: FontSystem::new(),
         })
     }
@@ -287,10 +290,11 @@ mod tests {
         tall.font_family = css::FontFamily::SansSerif;
         tall.font_size = 50.0;
         tall.line_height = 200.0;
-        tall.line_height_is_normal = false;
+        tall.line_height_value = css::ComputedLineHeight::from_points(200.0);
 
         let mut short = tall.clone();
         short.line_height = 30.0;
+        short.line_height_value = css::ComputedLineHeight::from_points(30.0);
 
         let tall_metrics = builder.inline_text_box_metrics(&tall, None, 0.0);
         let short_metrics = builder.inline_text_box_metrics(&short, None, 0.0);
@@ -309,8 +313,11 @@ mod tests {
         );
     }
 
+    /// CSS 2.2 §10.6.1 keeps the inline content area stable while a
+    /// `line-height: normal` line box encloses fallback-font metrics.
+    /// <https://www.w3.org/TR/CSS22/visudet.html#line-height>
     #[tokio::test]
-    async fn normal_inline_metrics_union_shaped_fallback_font_runs() {
+    async fn normal_inline_metrics_keep_primary_content_and_union_fallback_line_runs() {
         let stylesheet = css::parse_stylesheet(
             &crate::css::Css::from_string(
                 r#"@font-face {
@@ -337,7 +344,7 @@ mod tests {
         let iframe_documents = HashMap::new();
         let mut builder = LayoutBuilder::new(LayoutBuilderConfig {
             options: &options,
-            stylesheets: &stylesheets,
+            stylesheets: Stylesheets::document_only(&stylesheets),
             base_url: None,
             root_url: None,
             resource_cache: &resource_cache,
@@ -345,13 +352,13 @@ mod tests {
             iframe_viewport: None,
             page_progression_direction: Direction::Ltr,
             page_counter_initial_values: HashMap::new(),
+            target_references: crate::layout::TargetReferenceSnapshot::default(),
             font_system,
         });
 
         let mut high = ComputedStyle::initial();
         high.font_family = css::FontFamily::Names(vec!["HighOnly".to_string()]);
         high.font_size = 100.0;
-        high.line_height_is_normal = true;
         let mut deep = high.clone();
         deep.font_family = css::FontFamily::Names(vec!["DeepOnly".to_string()]);
         let mut mixed = high.clone();
@@ -385,12 +392,6 @@ mod tests {
         let deep_metrics = builder.inline_text_box_metrics(&deep, Some(&deep_shaped), 0.0);
         let mixed_metrics = builder.inline_text_box_metrics(&mixed, Some(&mixed_shaped), 0.0);
 
-        let expected_content_above = high_metrics
-            .content_baseline_offset
-            .max(deep_metrics.content_baseline_offset);
-        let expected_content_below = (high_metrics.content_block_size
-            - high_metrics.content_baseline_offset)
-            .max(deep_metrics.content_block_size - deep_metrics.content_baseline_offset);
         let expected_line_above = high_metrics
             .line_baseline_offset
             .max(deep_metrics.line_baseline_offset);
@@ -398,12 +399,11 @@ mod tests {
             - high_metrics.line_baseline_offset)
             .max(deep_metrics.line_block_size - deep_metrics.line_baseline_offset);
 
-        assert!((mixed_metrics.content_baseline_offset - expected_content_above).abs() < 0.01);
         assert!(
-            (mixed_metrics.content_block_size - (expected_content_above + expected_content_below))
-                .abs()
+            (mixed_metrics.content_baseline_offset - high_metrics.content_baseline_offset).abs()
                 < 0.01
         );
+        assert!((mixed_metrics.content_block_size - high_metrics.content_block_size).abs() < 0.01);
         assert!((mixed_metrics.line_baseline_offset - expected_line_above).abs() < 0.01);
         assert!(
             (mixed_metrics.line_block_size - (expected_line_above + expected_line_below)).abs()
@@ -494,6 +494,32 @@ mod tests {
         items.iter().map(inline_item_boundary_role).collect()
     }
 
+    fn inline_scope_item_shape(items: &[InlineItem]) -> Vec<(&'static str, String)> {
+        items
+            .iter()
+            .map(|item| match item {
+                InlineItem::Word(word) if word.source == InlineTextSource::BidiControl => {
+                    ("bidi-control", word.text.clone())
+                }
+                InlineItem::Word(word) => ("text", word.text.clone()),
+                InlineItem::Atom(atom) => match atom.content() {
+                    InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge)) => {
+                        let edge = match edge.logical_edge {
+                            InlineLogicalEdge::Start => "start",
+                            InlineLogicalEdge::End => "end",
+                        };
+                        ("inline-edge", edge.to_string())
+                    }
+                    _ => ("atom", String::new()),
+                },
+                InlineItem::Break(_) => ("break", String::new()),
+                InlineItem::Float(_) => ("float", String::new()),
+                InlineItem::PageScopeStart(_) => ("page-scope-start", String::new()),
+                InlineItem::PageScopeEnd => ("page-scope-end", String::new()),
+            })
+            .collect()
+    }
+
     fn normalized_inline_item_text(items: &mut Vec<InlineItem>) -> String {
         inline_collect::normalize_inline_whitespace_items(items);
         items
@@ -518,6 +544,27 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn scalar_inline_text_collection_does_not_insert_element_boundary_spaces() {
+        let NodeKind::Element(mut bdi) = Node::element("bdi").kind else {
+            unreachable!("element constructor should create an element")
+        };
+        bdi.children.push(Node::text("壱、"));
+        let NodeKind::Element(mut container) = Node::element("div").kind else {
+            unreachable!("element constructor should create an element")
+        };
+        container.children.push(Node {
+            kind: NodeKind::Element(bdi),
+        });
+        container.children.push(Node::text("壱、"));
+
+        assert_eq!(
+            inline_text_for_style(&container, &ComputedStyle::initial()),
+            "壱、壱、",
+            "an inline element boundary is not a source U+0020"
+        );
     }
 
     fn raw_text_sequence(
@@ -908,7 +955,7 @@ mod tests {
 
         assert_eq!(
             normalized_inline_item_text(&mut items),
-            format!("A \u{fffc} B")
+            "A \u{fffc} B".to_string()
         );
     }
 
@@ -923,7 +970,7 @@ mod tests {
 
         assert_eq!(
             normalized_inline_item_text(&mut items),
-            format!("\u{fffc} \u{fffc}")
+            "\u{fffc} \u{fffc}".to_string()
         );
     }
 
@@ -1327,6 +1374,34 @@ mod tests {
     }
 
     #[test]
+    fn break_spaces_anywhere_uses_fitting_break_before_overflowing_space() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let mut style = ComputedStyle::initial();
+        style.white_space = WhiteSpace::BreakSpaces;
+        style.overflow_wrap = css::OverflowWrap::Anywhere;
+        style.font_family = css::FontFamily::Monospace;
+        style.font_size = 16.0;
+        // `4ch` resolves from the selected font's zero advance. The WPT uses
+        // that measure, which is also exactly the advance of `PASS` for its
+        // `monospace` face.
+        let available_width = 4.0 * builder.font_system.measure_text("0", &style);
+        let sequence = raw_text_sequence(&mut builder, "PASS FAIL", &style, available_width);
+        let fragments = sequence_fragment_texts(&sequence);
+
+        assert_eq!(fragments.first().map(String::as_str), Some("PASS"));
+        assert!(
+            fragments
+                .get(1)
+                .is_some_and(|fragment| fragment.starts_with(' ')),
+            "the emergency break must leave the preserved space on the next line: {fragments:?}"
+        );
+        assert_eq!(fragments.concat(), "PASS FAIL");
+    }
+
+    #[test]
     fn break_spaces_min_content_uses_after_each_preserved_space_break() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
@@ -1565,9 +1640,58 @@ mod tests {
 
         assert_eq!(
             inline_item_boundary_roles(&items),
-            vec![InlineBoundaryRole::Text, InlineBoundaryRole::Text]
+            vec![
+                InlineBoundaryRole::TransparentTextBoundary,
+                InlineBoundaryRole::Text,
+                InlineBoundaryRole::TransparentTextBoundary,
+                InlineBoundaryRole::Text,
+            ]
         );
-        assert_eq!(normalized_inline_item_text(&mut items), "中文");
+        assert_eq!(normalized_inline_word_text(&mut items), "中文");
+    }
+
+    #[test]
+    fn inside_marker_uses_the_same_scope_items_as_an_authored_isolate() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let mut style = ComputedStyle::initial();
+        style.font_family = css::FontFamily::SansSerif;
+        style.unicode_bidi = UnicodeBidi::Isolate;
+        let marker = list_marker_text("壱、", &style, false);
+        let mut automatic_marker = Vec::new();
+        builder.push_inside_marker_items(&marker, &style, None, &mut automatic_marker);
+
+        let mut authored_isolate = Vec::new();
+        let NodeKind::Element(authored_bdi) = Node::element("bdi").kind else {
+            unreachable!("element constructor should create an element")
+        };
+        let scope = builder.begin_inline_element_scope(
+            &authored_bdi,
+            &style,
+            None,
+            InlinePlacement::zero(),
+            InlineElementScopeOptions::DOM_INTRINSIC,
+            &mut authored_isolate,
+        );
+        authored_isolate.push(inline_word("壱、", &style));
+        builder.end_inline_element_scope(scope, &style, &mut authored_isolate);
+
+        assert_eq!(
+            inline_scope_item_shape(&automatic_marker),
+            inline_scope_item_shape(&authored_isolate),
+            "automatic marker provenance must not change its inline-scope structure"
+        );
+        assert!(
+            automatic_marker.iter().all(|item| !matches!(item,
+                InlineItem::Word(word) if word.text == " ")),
+            "a counter-style U+3001 suffix is not followed by a generated U+0020"
+        );
+        assert!(matches!(
+            &automatic_marker[2],
+            InlineItem::Word(word) if word.source == InlineTextSource::Marker
+        ));
     }
 
     #[test]
@@ -1651,6 +1775,52 @@ mod tests {
             visual
                 .iter()
                 .all(|text| !text.chars().any(character_is_bidi_format_control))
+        );
+    }
+
+    #[test]
+    fn isolate_scope_is_neutral_to_its_outer_rtl_line() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let mut outer = ComputedStyle::initial();
+        outer.font_family = css::FontFamily::SansSerif;
+        outer.direction = Direction::Rtl;
+        outer.display = Display::BLOCK;
+        outer.unicode_bidi = UnicodeBidi::Isolate;
+        let mut isolate = outer.clone();
+        isolate.display = Display::INLINE;
+        isolate.direction = Direction::Ltr;
+        isolate.unicode_bidi = UnicodeBidi::Isolate;
+        let mut items = vec![inline_word("a - ", &outer)];
+
+        builder.push_inline_scope_start_items(
+            &isolate,
+            None,
+            0.0,
+            InlineVisualOffset::zero(),
+            None,
+            true,
+            &mut items,
+        );
+        items.push(inline_word("[1]", &isolate));
+        builder.push_inline_scope_end_items(
+            &isolate,
+            None,
+            0.0,
+            InlineVisualOffset::zero(),
+            None,
+            true,
+            &mut items,
+        );
+        items.push(inline_word("...", &outer));
+
+        let sequence = builder.collect_inline_line_sequence(items, &outer, 100.0, 0.0, 0.0);
+
+        assert_eq!(
+            prepared_visual_texts_for_sequence(&mut builder, &sequence, &outer),
+            vec!["...[1] - a"]
         );
     }
 
@@ -1749,8 +1919,6 @@ mod tests {
         style.font_size = 12.0;
         style.line_height = 10.0;
         style.line_height_value = css::ComputedLineHeight::from_points(10.0);
-        style.line_height_multiplier = None;
-        style.line_height_is_normal = false;
         let items = vec![
             inline_word("A", &style),
             InlineItem::Break(InlineBreak::default()),
@@ -1780,8 +1948,6 @@ mod tests {
         style.font_size = 12.0;
         style.line_height = 10.0;
         style.line_height_value = css::ComputedLineHeight::from_points(10.0);
-        style.line_height_multiplier = None;
-        style.line_height_is_normal = false;
         let sequence = builder.collect_inline_line_sequence(
             vec![InlineItem::Break(InlineBreak::default())],
             &style,
@@ -1814,8 +1980,6 @@ mod tests {
         style.font_size = 12.0;
         style.line_height = 10.0;
         style.line_height_value = css::ComputedLineHeight::from_points(10.0);
-        style.line_height_multiplier = None;
-        style.line_height_is_normal = false;
         style.white_space = WhiteSpace::PreLine;
         let mut generated_items = vec![InlineItem::Word(Box::new(InlineWord {
             text: "\n".to_string(),
@@ -1853,8 +2017,6 @@ mod tests {
         style.font_size = 0.0;
         style.line_height = 0.0;
         style.line_height_value = css::ComputedLineHeight::from_points(0.0);
-        style.line_height_multiplier = None;
-        style.line_height_is_normal = false;
         style.white_space = WhiteSpace::Pre;
 
         let sequence = builder.collect_inline_line_sequence(
@@ -2170,6 +2332,37 @@ mod tests {
     }
 
     #[test]
+    fn word_break_change_does_not_break_boundary_shaping() {
+        let mut style = ComputedStyle::initial();
+        style.font_family = css::FontFamily::SansSerif;
+        style.font_size = 16.0;
+        style.line_height = 20.0;
+        let left = inline_fragment("A", style.clone());
+        let mut right = inline_fragment("BC", style.clone());
+        right.style_mut().word_break = css::WordBreak::BreakAll;
+
+        assert!(can_shape_inline_fragments_together(&left, &right));
+
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let normal = builder
+            .prepare_inline_text_group(&[left.clone(), inline_fragment("BC", style)], 12.0)
+            .expect("normal text group should shape");
+        let styled = builder
+            .prepare_inline_text_group(&[left, right], 12.0)
+            .expect("word-break styled text group should shape");
+
+        // `word-break` is graph policy, not an unwrapped shaping input. A
+        // transparent style span must therefore leave the source-shaped text,
+        // its advance, and its line-start placement unchanged.
+        assert_eq!(styled.x(), normal.x());
+        assert_eq!(styled.shaped.text, normal.shaped.text);
+        assert!((styled.width() - normal.width()).abs() < 0.01);
+    }
+
+    #[test]
     fn tatweel_only_inline_fragments_preserve_shaping_group() {
         let left = inline_fragment("\u{0640}", ComputedStyle::initial());
         let mut right = left.clone();
@@ -2322,7 +2515,7 @@ mod tests {
         let iframe_documents = HashMap::new();
         let mut builder = LayoutBuilder::new(LayoutBuilderConfig {
             options: &options,
-            stylesheets: &stylesheets,
+            stylesheets: Stylesheets::document_only(&stylesheets),
             base_url: None,
             root_url: None,
             resource_cache: &resource_cache,
@@ -2330,6 +2523,7 @@ mod tests {
             iframe_viewport: None,
             page_progression_direction: Direction::Ltr,
             page_counter_initial_values: HashMap::new(),
+            target_references: crate::layout::TargetReferenceSnapshot::default(),
             font_system,
         });
         builder.cursor_y = 100.0;
@@ -2770,7 +2964,11 @@ mod tests {
         let author = css::parse_stylesheet(&crate::css::Css::from_string(
             "body > span { border: 3px solid blue }",
         ));
-        let stylesheets = vec![css::html5_user_agent_stylesheet(), author];
+        let stylesheets = Stylesheets::for_document(
+            css::html5_user_agent_stylesheet(),
+            None,
+            std::slice::from_ref(&author),
+        );
         let parent_style = ComputedStyle {
             font_size: 12.0,
             line_height: 14.4,
@@ -2804,7 +3002,7 @@ mod tests {
             0.0,
             InlineVisualOffset::zero(),
             &anonymous.style,
-            anonymous.style.text_decoration.clone(),
+            anonymous.style.text_decoration_layers.clone(),
             &mut items,
         );
 
@@ -2899,7 +3097,9 @@ mod tests {
     ) -> InlineParagraphContext<'a> {
         InlineParagraphContext {
             block_style: style,
-            stylesheets: &[],
+            line_clamp: used_line_clamp_for_style(style),
+            clamp_continuation: css::ClampContinuation::None,
+            stylesheets: &css::EMPTY_STYLESHEETS,
             initial_first_formatted_line: true,
             available_width,
             padding_left: 0.0,
@@ -3582,15 +3782,27 @@ mod tests {
         );
     }
 
+    fn resolved_document_principal_flow(
+        root: &Node,
+        stylesheets: &Stylesheets<'_>,
+        parent_style: &ComputedStyle,
+    ) -> DocumentPrincipalFlow {
+        let page_box = box_tree::build_page_box(root, stylesheets, parent_style);
+        DocumentCanvasResolution::from_page_box(&page_box).principal_flow()
+    }
+
     #[test]
     fn html_body_principal_flow_supplies_initial_containing_block_axes() {
         let root = dom::parse("<html><body>content</body></html>");
         let author = css::parse_stylesheet(&crate::css::Css::from_string(
             "body { writing-mode: vertical-rl; direction: rtl }",
         ));
-        let stylesheets = vec![css::html5_user_agent_stylesheet(), author];
+        let stylesheets = Stylesheets::for_document(
+            css::html5_user_agent_stylesheet(),
+            None,
+            std::slice::from_ref(&author),
+        );
         let parent_style = ComputedStyle::initial();
-        let root_style = document_root_style(&root, &stylesheets, &parent_style);
         let document = root
             .as_element()
             .expect("parsed document root should be an element");
@@ -3607,19 +3819,18 @@ mod tests {
             .find(|element| element.tag == "body")
             .expect("HTML element should contain a body");
 
+        let page_box = box_tree::build_page_box(&root, &stylesheets, &parent_style);
+        let (_, _, root_style, _) = page_box.children[0]
+            .element_parts()
+            .expect("HTML root should generate a principal box");
         assert_eq!(root_style.writing_mode, WritingMode::HorizontalTb);
         assert_eq!(
-            super::super::split_1::document_principal_flow(
-                &root,
-                &stylesheets,
-                &parent_style,
-                &root_style,
-            ),
+            resolved_document_principal_flow(&root, &stylesheets, &parent_style),
             super::super::split_1::DocumentPrincipalFlow {
                 writing_mode: WritingMode::VerticalRl,
                 direction: Direction::Rtl,
+                text_orientation: TextOrientation::Mixed,
                 source: PrincipalFlowSource::Body(body.id),
-                propagates_axes: true,
             }
         );
     }
@@ -3631,9 +3842,12 @@ mod tests {
         let author = css::parse_stylesheet(&crate::css::Css::from_string(
             "#first { writing-mode: vertical-lr } #second { writing-mode: sideways-rl }",
         ));
-        let stylesheets = vec![css::html5_user_agent_stylesheet(), author];
+        let stylesheets = Stylesheets::for_document(
+            css::html5_user_agent_stylesheet(),
+            None,
+            std::slice::from_ref(&author),
+        );
         let parent_style = ComputedStyle::initial();
-        let root_style = document_root_style(&root, &stylesheets, &parent_style);
         let document = root
             .as_element()
             .expect("parsed document root should be an element");
@@ -3650,12 +3864,7 @@ mod tests {
             .find(|element| element.tag == "body")
             .expect("HTML element should contain a body");
 
-        let flow = super::super::split_1::document_principal_flow(
-            &root,
-            &stylesheets,
-            &parent_style,
-            &root_style,
-        );
+        let flow = resolved_document_principal_flow(&root, &stylesheets, &parent_style);
 
         assert_eq!(flow.writing_mode, WritingMode::VerticalLr);
         assert_eq!(flow.source, PrincipalFlowSource::Body(first_body.id));
@@ -3667,15 +3876,13 @@ mod tests {
         let author = css::parse_stylesheet(&crate::css::Css::from_string(
             "body { writing-mode: vertical-lr; direction: rtl }",
         ));
-        let stylesheets = vec![css::html5_user_agent_stylesheet(), author];
-        let parent_style = ComputedStyle::initial();
-        let root_style = document_root_style(&root, &stylesheets, &parent_style);
-        let principal_flow = super::super::split_1::document_principal_flow(
-            &root,
-            &stylesheets,
-            &parent_style,
-            &root_style,
+        let stylesheets = Stylesheets::for_document(
+            css::html5_user_agent_stylesheet(),
+            None,
+            std::slice::from_ref(&author),
         );
+        let parent_style = ComputedStyle::initial();
+        let principal_flow = resolved_document_principal_flow(&root, &stylesheets, &parent_style);
         let page = box_tree::build_page_box(&root, &stylesheets, &parent_style);
         let (_, _, html_style, _) = page.children[0]
             .element_parts()
@@ -3688,7 +3895,7 @@ mod tests {
     }
 
     #[test]
-    fn upright_principal_flow_uses_its_ltr_direction() {
+    fn upright_principal_flow_derives_its_ltr_used_direction() {
         let mut style = ComputedStyle::initial();
         style.writing_mode = WritingMode::VerticalRl;
         style.direction = Direction::Rtl;
@@ -3696,7 +3903,8 @@ mod tests {
 
         let principal = super::super::split_1::DocumentPrincipalFlow::from_style(&style);
 
-        assert_eq!(principal.direction, Direction::Ltr);
+        assert_eq!(principal.direction, Direction::Rtl);
+        assert_eq!(principal.used_direction(), Direction::Ltr);
     }
 
     #[test]
@@ -3707,8 +3915,8 @@ mod tests {
         let principal = super::super::split_1::DocumentPrincipalFlow {
             writing_mode: WritingMode::SidewaysRl,
             direction: Direction::Rtl,
+            text_orientation: TextOrientation::Mixed,
             source: PrincipalFlowSource::Root,
-            propagates_axes: false,
         };
 
         let used = principal.root_layout_style(&root_style);
@@ -3747,8 +3955,8 @@ mod tests {
         let principal = super::super::split_1::DocumentPrincipalFlow {
             writing_mode: WritingMode::HorizontalTb,
             direction: Direction::Ltr,
+            text_orientation: TextOrientation::Mixed,
             source: PrincipalFlowSource::Root,
-            propagates_axes: false,
         };
 
         let used = principal.root_layout_style(&root_style);
@@ -3769,19 +3977,89 @@ mod tests {
         let author = css::parse_stylesheet(&crate::css::Css::from_string(
             "html { contain: paint } body { writing-mode: vertical-rl; direction: rtl }",
         ));
-        let stylesheets = vec![css::html5_user_agent_stylesheet(), author];
+        let stylesheets = Stylesheets::for_document(
+            css::html5_user_agent_stylesheet(),
+            None,
+            std::slice::from_ref(&author),
+        );
         let parent_style = ComputedStyle::initial();
         let root_style = document_root_style(&root, &stylesheets, &parent_style);
+        let flow = resolved_document_principal_flow(&root, &stylesheets, &parent_style);
+        assert_eq!(flow.writing_mode, root_style.writing_mode);
+        assert_eq!(flow.direction, root_style.used_direction());
+        assert_eq!(flow.source, PrincipalFlowSource::Root);
+    }
 
-        assert_eq!(
-            super::super::split_1::document_principal_flow(
-                &root,
-                &stylesheets,
-                &parent_style,
-                &root_style,
-            ),
-            super::super::split_1::DocumentPrincipalFlow::from_style(&root_style)
+    #[test]
+    fn every_non_none_contain_value_blocks_body_principal_flow_propagation() {
+        for contain in [
+            "size",
+            "inline-size",
+            "layout",
+            "style",
+            "paint",
+            "strict",
+            "content",
+        ] {
+            let root = dom::parse("<html><body>content</body></html>");
+            let author = css::parse_stylesheet(&crate::css::Css::from_string(format!(
+                "body {{ contain: {contain}; writing-mode: vertical-rl; }}"
+            )));
+            let stylesheets = Stylesheets::for_document(
+                css::html5_user_agent_stylesheet(),
+                None,
+                std::slice::from_ref(&author),
+            );
+            let parent_style = ComputedStyle::initial();
+            let flow = resolved_document_principal_flow(&root, &stylesheets, &parent_style);
+            assert_eq!(flow.source, PrincipalFlowSource::Root, "contain: {contain}");
+        }
+    }
+
+    #[test]
+    fn content_visibility_alone_does_not_block_body_principal_flow_propagation() {
+        let root = dom::parse("<html><body>content</body></html>");
+        let author = css::parse_stylesheet(&crate::css::Css::from_string(
+            "body { content-visibility: hidden; writing-mode: vertical-rl; }",
+        ));
+        let stylesheets = Stylesheets::for_document(
+            css::html5_user_agent_stylesheet(),
+            None,
+            std::slice::from_ref(&author),
         );
+        let parent_style = ComputedStyle::initial();
+        let body = root
+            .as_element()
+            .expect("parsed document root should be an element")
+            .children
+            .iter()
+            .filter_map(Node::as_element)
+            .find(|element| element.tag == "html")
+            .expect("parsed document should contain an HTML element")
+            .children
+            .iter()
+            .filter_map(Node::as_element)
+            .find(|element| element.tag == "body")
+            .expect("HTML element should contain a body");
+
+        let flow = resolved_document_principal_flow(&root, &stylesheets, &parent_style);
+        assert_eq!(flow.source, PrincipalFlowSource::Body(body.id));
+    }
+
+    #[test]
+    fn hidden_body_is_not_an_eligible_principal_flow_source() {
+        let root = dom::parse("<html><body hidden>content</body></html>");
+        let author = css::parse_stylesheet(&crate::css::Css::from_string(
+            "body { writing-mode: vertical-lr; }",
+        ));
+        let stylesheets = Stylesheets::for_document(
+            css::html5_user_agent_stylesheet(),
+            None,
+            std::slice::from_ref(&author),
+        );
+        let parent_style = ComputedStyle::initial();
+        let flow = resolved_document_principal_flow(&root, &stylesheets, &parent_style);
+        assert_eq!(flow.source, PrincipalFlowSource::Root);
     }
 
     #[test]
@@ -4610,8 +4888,6 @@ mod tests {
         style.font_size = 12.0;
         style.line_height = 14.0;
         style.line_height_value = css::ComputedLineHeight::from_points(14.0);
-        style.line_height_multiplier = None;
-        style.line_height_is_normal = false;
         let mut first_letter = style.clone();
         // CSS Inline derives an initial letter's used font size from the
         // surrounding line geometry, rather than clamping it to the authored
@@ -4752,6 +5028,59 @@ mod tests {
     }
 
     #[test]
+    fn inline_floats_do_not_split_an_unbroken_text_continuation() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let mut style = ComputedStyle::initial();
+        style.font_family = css::FontFamily::SansSerif;
+        style.font_size = 12.0;
+        style.line_height = 14.0;
+        let items = vec![
+            inline_word("un", &style),
+            inline_test_float(&style),
+            inline_word("bro", &style),
+            inline_test_float(&style),
+            inline_word("ken", &style),
+        ];
+
+        let graph = builder.build_inline_opportunity_graph(&items, &style);
+
+        assert_eq!(
+            graph
+                .runs
+                .iter()
+                .filter_map(|run| match &run.item {
+                    InlineLineItem::Fragment(fragment) => Some(fragment.text()),
+                    InlineLineItem::Atom(_) | InlineLineItem::Float(_) => None,
+                })
+                .collect::<String>(),
+            "unbroken"
+        );
+        assert_eq!(
+            graph
+                .opportunities
+                .iter()
+                .filter(|opportunity| {
+                    matches!(
+                        opportunity.kind,
+                        inline_layout::InlineBreakKind::FloatPlacement
+                    )
+                })
+                .count(),
+            2
+        );
+        assert!(
+            !graph.opportunities.iter().any(|opportunity| {
+                matches!(opportunity.kind, inline_layout::InlineBreakKind::SoftWrap)
+                    && matches!(opportunity.position.run_index, 1 | 3)
+            }),
+            "a float marker must not manufacture a CSS Text soft wrap"
+        );
+    }
+
+    #[test]
     fn inline_opportunity_graph_intrinsic_contribution_uses_segments_and_atoms() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
@@ -4836,7 +5165,7 @@ mod tests {
         assert_eq!(graph.runs.len(), 1);
         assert!(graph.opportunities.iter().any(|opportunity| {
             opportunity.kind == inline_layout::InlineBreakKind::Hyphenation
-                && opportunity.soft_hyphen
+                && opportunity.is_discretionary()
                 && opportunity.position.run_index == 0
                 && opportunity.position.byte_offset > 0
         }));
@@ -4869,8 +5198,11 @@ mod tests {
 
         assert_eq!(graph.runs.len(), 1);
         assert!(graph.opportunities.iter().any(|opportunity| {
-            opportunity.kind == inline_layout::InlineBreakKind::SoftWrap
-                && opportunity.position.run_index == 0
+            matches!(
+                opportunity.kind,
+                inline_layout::InlineBreakKind::SoftWrap
+                    | inline_layout::InlineBreakKind::ExplicitVirtual
+            ) && opportunity.position.run_index == 0
                 && opportunity.position.byte_offset > 0
         }));
         assert!(contribution.max_content.points() > contribution.min_content.points());
@@ -4892,7 +5224,7 @@ mod tests {
             .opportunities
             .iter()
             .cloned()
-            .find(|opportunity| opportunity.soft_hyphen)
+            .find(|opportunity| opportunity.is_discretionary())
             .expect("soft hyphen should create a graph opportunity");
 
         let unbroken = graph.materialize_line(
@@ -4914,8 +5246,40 @@ mod tests {
             &style,
         );
 
-        assert_eq!(unbroken.text, "hyphenation");
-        assert_eq!(broken.text, "hyphen-");
+        assert_eq!(unbroken.used_text(), "hyphenation");
+        assert_eq!(broken.used_text(), "hyphen-");
+    }
+
+    #[test]
+    fn monotonic_source_measurement_matches_materialized_partial_break_all_range() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let mut style = ComputedStyle::initial();
+        style.font_family = css::FontFamily::SansSerif;
+        style.font_size = 12.0;
+        style.line_height = 14.0;
+        style.word_break = css::WordBreak::BreakAll;
+        let graph =
+            builder.build_inline_opportunity_graph(&[inline_word("abcdefgh", &style)], &style);
+        let range = inline_layout::InlineGraphRange {
+            start: inline_layout::InlineGraphPosition {
+                run_index: 0,
+                byte_offset: 2,
+            },
+            end: inline_layout::InlineGraphPosition {
+                run_index: 0,
+                byte_offset: 6,
+            },
+        };
+
+        let materialized = graph.materialize_line(range, None, &mut builder.font_system, &style);
+        let measured = graph
+            .monotonic_source_range_width(range)
+            .expect("ASCII break-all source range should retain glyph provenance");
+
+        assert!((measured - materialized.fitting_width).abs() < 0.01);
     }
 
     #[test]
@@ -4945,7 +5309,7 @@ mod tests {
             .opportunities
             .iter()
             .copied()
-            .filter(|opportunity| opportunity.soft_hyphen)
+            .filter(|opportunity| opportunity.is_discretionary())
             .nth(1)
             .expect("the second soft hyphen is an opportunity");
         let unbroken_second_line = graph.materialize_line(
@@ -4999,8 +5363,8 @@ mod tests {
             &style,
         );
 
-        assert_eq!(materialized.text, "abcdef");
-        assert!(!materialized.text.contains('\u{200b}'));
+        assert_eq!(materialized.used_text(), "abcdef");
+        assert!(!materialized.used_text().contains('\u{200b}'));
         assert!(materialized.content_width > 0.0);
     }
 
@@ -5042,7 +5406,7 @@ mod tests {
             &untracked,
         );
 
-        assert_eq!(tracked_line.text, "12三");
+        assert_eq!(tracked_line.used_text(), "12三");
         assert!(
             (tracked_line.content_width - (untracked_line.content_width + 20.0)).abs() < 0.01,
             "a zero-width space must not contribute a glyph or tracking advance"
@@ -5120,7 +5484,7 @@ mod tests {
             &style,
         );
 
-        assert_eq!(materialized.text, "A");
+        assert_eq!(materialized.used_text(), "A");
         assert!(materialized.edge_effects.collapsed_end_trim_width > 0.0);
         assert_eq!(materialized.items.len(), 2);
     }
@@ -5171,7 +5535,7 @@ mod tests {
         // Phase II hanging changes the line advance, not its source items.
         // The preserved spaces remain available to bidi, painting, extraction,
         // and inline decoration processing.
-        assert_eq!(broken.text, "A   ");
+        assert_eq!(broken.used_text(), "A   ");
         assert!(broken.edge_effects.pre_wrap_hanging_width > 0.0);
         assert_eq!(broken.edge_effects.source_effects.len(), 1);
         assert_eq!(
@@ -5180,7 +5544,7 @@ mod tests {
         );
         assert_eq!(broken.edge_effects.source_effects[0].item_index, 1);
         assert_eq!(broken.edge_effects.source_effects[0].source_range, 0..3);
-        assert_eq!(unbroken.text, "A   B");
+        assert_eq!(unbroken.used_text(), "A   B");
         assert_eq!(unbroken.edge_effects.pre_wrap_hanging_width, 0.0);
     }
 
@@ -5392,7 +5756,7 @@ mod tests {
 
         assert!(candidate.content_width < materialized.content_width);
         assert_eq!(materialized.edge_effects.pre_wrap_hanging_width, 0.0);
-        assert_eq!(materialized.text, "X   ");
+        assert_eq!(materialized.used_text(), "X   ");
     }
 
     #[test]
@@ -5419,7 +5783,7 @@ mod tests {
             &style,
         );
 
-        assert_eq!(materialized.text, "A ");
+        assert_eq!(materialized.used_text(), "A ");
         assert_eq!(materialized.items.len(), 2);
         assert_eq!(materialized.edge_effects.collapsed_end_trim_width, 0.0);
     }
@@ -5455,7 +5819,7 @@ mod tests {
 
         // The graph retains the collapsed source item, while the used text
         // summary represents the selected line after Phase II end trimming.
-        assert_eq!(materialized.text, "A");
+        assert_eq!(materialized.used_text(), "A");
         assert_eq!(materialized.items.len(), 3);
         assert!(materialized.edge_effects.collapsed_end_trim_width > 0.0);
     }
@@ -5477,7 +5841,7 @@ mod tests {
 
         assert!(graph.opportunities.iter().any(|opportunity| {
             opportunity.kind == inline_layout::InlineBreakKind::Emergency
-                && opportunity.emergency
+                && opportunity.availability.is_fallback()
                 && opportunity.position.run_index == 1
                 && opportunity.position.byte_offset == 0
         }));
@@ -5500,7 +5864,7 @@ mod tests {
 
         assert!(graph.opportunities.iter().any(|opportunity| {
             opportunity.kind == inline_layout::InlineBreakKind::Emergency
-                && opportunity.emergency
+                && opportunity.availability.is_fallback()
                 && opportunity.position.run_index == 1
                 && opportunity.position.byte_offset == 0
         }));
@@ -5619,7 +5983,7 @@ mod tests {
         assert!(anywhere_graph.opportunities.iter().any(|opportunity| {
             opportunity.position.run_index == 0
                 && opportunity.position.byte_offset > 0
-                && opportunity.min_content
+                && opportunity.availability.participates_in_min_content()
         }));
         assert!(
             anywhere_contribution.max_content.points() > anywhere_contribution.min_content.points()
@@ -5648,7 +6012,7 @@ mod tests {
             opportunity.kind == inline_layout::InlineBreakKind::Emergency
                 && opportunity.position.run_index == 0
                 && opportunity.position.byte_offset > 0
-                && !opportunity.min_content
+                && !opportunity.availability.participates_in_min_content()
         }));
         assert!(
             (break_word_contribution.max_content.points()
@@ -5684,7 +6048,7 @@ mod tests {
                     opportunity.kind == inline_layout::InlineBreakKind::Emergency
                         && opportunity.position.run_index == 0
                         && opportunity.position.byte_offset > 0
-                        && opportunity.min_content
+                        && opportunity.availability.participates_in_min_content()
                 })
         );
         assert!(
@@ -5940,7 +6304,9 @@ mod tests {
         let graph = builder.build_inline_opportunity_graph(&items, &style);
         let context = InlineParagraphContext {
             block_style: &style,
-            stylesheets: &[],
+            line_clamp: used_line_clamp_for_style(&style),
+            clamp_continuation: css::ClampContinuation::None,
+            stylesheets: &css::EMPTY_STYLESHEETS,
             initial_first_formatted_line: true,
             available_width: 200.0,
             padding_left: 0.0,
@@ -5977,7 +6343,9 @@ mod tests {
         );
         let context = InlineParagraphContext {
             block_style: &style,
-            stylesheets: &[],
+            line_clamp: used_line_clamp_for_style(&style),
+            clamp_continuation: css::ClampContinuation::None,
+            stylesheets: &css::EMPTY_STYLESHEETS,
             initial_first_formatted_line: true,
             available_width: graph.runs.iter().take(2).map(|run| run.width).sum::<f32>() + 0.5,
             padding_left: 0.0,

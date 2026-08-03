@@ -248,7 +248,7 @@ fn anonymous_item_style(tag: &'static str, source: &box_tree::FormattingBox<'_>)
     let mut style = css::style_for_element_with_signature(
         ElementSignature::new(tag, HashMap::new()),
         None,
-        &[],
+        &css::Stylesheets::document_only(&[]),
         Some(source.style()),
         &[],
     );
@@ -265,7 +265,7 @@ fn strip_blockified_inline_text_paint(children: &mut [box_tree::MutableFormattin
 }
 
 fn strip_text_fragment_paint(style: &mut ComputedStyle) {
-    style.background_color = None;
+    style.background_color = css::BackgroundColor::TRANSPARENT;
     style.background_image = css::ComputedImage::None;
     style.background_layers.clear();
     style.border_width = 0.0;

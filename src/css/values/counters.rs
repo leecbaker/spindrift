@@ -31,7 +31,7 @@ pub(crate) fn parse_counter_changes(
             return None;
         }
         let amount = parser
-            .try_parse(|input| input.expect_integer())
+            .try_parse(parse_counter_integer)
             .unwrap_or(default_value);
         result.push(CounterChange {
             name: name.to_string(),
@@ -92,7 +92,7 @@ pub(crate) fn parse_counter_resets(value: &str) -> Option<Vec<CounterReset>> {
             }
             _ => return None,
         };
-        let explicit = parser.try_parse(|input| input.expect_integer()).ok();
+        let explicit = parser.try_parse(parse_counter_integer).ok();
         let kind = if reversed {
             CounterResetKind::Reversed(explicit.map(CounterValue::new))
         } else {
@@ -108,6 +108,41 @@ pub(crate) fn parse_counter_resets(value: &str) -> Option<Vec<CounterReset>> {
         result.push(reset);
     }
     Some(result)
+}
+
+/// Parse the `<integer>` grammar shared by the CSS counter properties.
+///
+/// CSS Values permits a `calc()` expression wherever a property accepts an
+/// integer, provided its computed value is finite and integral.  Keeping this
+/// at the counter grammar boundary prevents lengths and percentages from
+/// leaking into the counter model.
+/// <https://drafts.csswg.org/css-values-4/#calc-notation>
+/// <https://drafts.csswg.org/css-lists-3/#counter-properties>
+fn parse_counter_integer<'i, 't>(
+    input: &mut Parser<'i, 't>,
+) -> Result<i32, cssparser::ParseError<'i, ()>> {
+    if let Ok(value) = input.try_parse(|input| input.expect_integer()) {
+        return Ok(value);
+    }
+
+    let function = input.expect_function()?.clone();
+    if !function.eq_ignore_ascii_case("calc") {
+        return Err(input.new_custom_error(()));
+    }
+    input.parse_nested_block(|input| {
+        let Some(MathValue::Number(value)) = parse_math_sum(input, 0.0, ROOT_FONT_SIZE_PT) else {
+            return Err(input.new_custom_error(()));
+        };
+        if !input.is_exhausted()
+            || !value.is_finite()
+            || value.fract() != 0.0
+            || value < i32::MIN as f32
+            || value > i32::MAX as f32
+        {
+            return Err(input.new_custom_error(()));
+        }
+        Ok(value as i32)
+    })
 }
 
 pub(crate) fn is_counter_name(value: &str) -> bool {

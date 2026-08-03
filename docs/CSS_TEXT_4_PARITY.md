@@ -1,5 +1,28 @@
 # CSS Text Level 4 Parity
 
+## `word-break: auto-phrase`
+
+Quire represents `auto-phrase` as its own inherited `word-break` value. Thai
+analysis uses `kham-core` token byte spans plus its named-entity merger, which
+also tailors normal Thai complex-context wrapping so named entities remain one
+word unit. Japanese retains particle tailoring. Phrase boundaries are source
+offsets mapped directly into the inline graph; source text is never rewritten.
+Mistagged and unsupported content falls back to `normal`.
+
+Break candidates record both their visible effect and typed availability. Line
+fitting follows ordinary, relaxed phrase/keep-all wrapping, deferred phrase
+hyphenation, then `overflow-wrap`; min-content includes ordinary candidates and
+`overflow-wrap:anywhere`. Literal hyphen punctuation remains ordinary under
+`keep-all`; its relaxed candidates are only normal word-unit opportunities that
+`keep-all` suppressed. `auto-phrase` defers instead of destroying authored
+and automatic hyphen candidates, while `break-all` and `hyphens:none` remain
+unconditional suppression:
+<https://drafts.csswg.org/css-text-4/#word-break-property>.
+
+The language coverage is deliberately narrow and not yet a complete
+language-specific phrase analyzer. Residual language coverage is tracked in
+`SPEC_DIVERGENCES.md`.
+
 ## `word-break: manual`
 
 Quire parses `manual` as a distinct computed value. The shared break resolver
@@ -25,9 +48,11 @@ preformatted grids.
 
 Autospace advances use one-eighth of the selected font's used `ic` advance
 (U+6C34 with the CSS font-metric fallback), rather than a font-size
-approximation. Remaining work includes punctuation and replacement semantics,
-vertical edge cases, and complete selected-line line-break ownership for
-autospace edges: <https://drafts.csswg.org/css-text-4/#text-autospace-property>.
+approximation. The character classes account for the owning text orientation,
+so upright letters and numerals in vertical text do not create inter-script
+spacing. Remaining work includes punctuation and replacement semantics, and
+complete selected-line line-break ownership for autospace edges:
+<https://drafts.csswg.org/css-text-4/#text-autospace-property>.
 
 ## `text-spacing-trim` and `text-spacing`
 
@@ -41,9 +66,14 @@ committed line, paint, and intrinsic measurements, so a narrowed opening
 punctuation mark can change where a line wraps.
 
 The selector preserves source text and uses only copied fragments with changed
-used glyph advances. It implements start and forced-break-start treatment,
-closing-edge trimming, unconditional `trim-both` ends, `trim-all`, and the
-adjacent punctuation-pair rules. CJK
+used glyph advances. Selected-line edge discovery uses the physical visible
+text sequence of the selected formatted line, crossing generated-marker and
+authored inline scopes while ignoring their UAX #9 controls. Thus generated
+marker provenance does not itself create or suppress a punctuation edge; marker
+text participates both in eligible adjacent-punctuation pairs and at a genuine
+selected-line edge. It implements start and
+forced-break-start treatment, closing-edge trimming, unconditional `trim-both`
+ends, `trim-all`, and the adjacent punctuation-pair rules. CJK
 colon and dot behavior is selected from the inherited language, including the
 Japanese/simplified/traditional Chinese distinctions:
 <https://drafts.csswg.org/css-text-4/#text-spacing-trim-property>.
@@ -59,7 +89,12 @@ mode introduced by legacy `white-space: pre` or `nowrap`.
 graph. For forced-break groups of two through ten lines, it keeps the normal
 line count and searches legal break sequences using the actual remaining
 inline space of every line, including per-line float exclusions and indents.
-It preserves ordinary selection on a tie and does not change
+Each candidate retains its selected source endpoints through source-order
+float placement. When a later inline float changes the candidate's physical
+row, Quire restores the pre-float layout state, replays the float at the
+selected source-row boundary, and preserves the winning plan rather than
+falling back to a greedy end. It preserves ordinary selection on a tie and
+does not change
 `text-wrap-style: auto` or `stable` selection.
 
 Tree-abiding block `::before` and `::after` boxes with generated `content`
@@ -75,8 +110,10 @@ fragmentainer cursor movement; avoid-break replay restores the same remaining
 budget. The typed computed value retains the default, suppressed, or authored
 block ellipsis and legacy-WebKit provenance; the final marker is reserved
 before selecting the final line and uses the clamp container's root-inline
-style. Remaining work is `line-clamp:auto`, positioned/floated and
-pseudo-element boundaries, and fragmentation ordering. These are required by
+style. A trailing collapsible source separator does not create an ellipsis,
+and only an ancestor clamp budget can make a descendant’s later sibling
+continue the clamp. Remaining work is `line-clamp:auto`, positioned/floated
+and pseudo-element boundaries, and fragmentation ordering. These are required by
 CSS Text 4's
 clamp-before-balance ordering:
 <https://drafts.csswg.org/css-text-4/#text-wrap-style>.
@@ -105,9 +142,11 @@ The inherited typed computed value and `@supports` grammar now cover `none`,
 explicit virtual word separators from authored U+200B and the HTML `<wbr>` UA
 rule are held through transparent inline edges until their neighboring context
 is known, then converted to the selected replacement before graph
-construction. Separators adjacent to a forced break or an independent inline
-formatting context are discarded rather than expanded; eligible separators
-acquire ordinary layout width and legal wrapping behavior.
+construction. An untransformed separator owns exactly one zero-advance,
+ordinary graph boundary after its source control, instead of competing with a
+generic text-run edge. Separators adjacent to a forced break or an independent
+inline formatting context are discarded rather than expanded; eligible
+separators acquire ordinary layout width and legal wrapping behavior.
 
 Remaining work is source-range ownership for non-selectable PDF extraction,
 the no-collapse guarantee when a transformed ASCII space abuts authored white

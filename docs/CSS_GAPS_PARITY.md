@@ -55,6 +55,10 @@ decorations, plus complex intersection and writing-mode cases.
   `*-rule-visibility-items`, honors `rule-overlap`, and paints the CSS line
   styles used by borders. Double gap rules paint two symmetric stripes around
   the gap-rule centerline rather than reusing a box-edge border orientation.
+- Wrapped multicolumn rows now construct an owned gap topology containing both
+  rule axes and abutting row-gap crossings. This preserves logical rule
+  assignment and junction endpoints across row replay, and emits both axes in
+  one `rule-overlap`-ordered batch rather than ordering them by replay timing.
 
 ## Remaining Gaps
 
@@ -68,8 +72,10 @@ decorations, plus complex intersection and writing-mode cases.
   multicol layout.
 - Fragmented grid containers still need layout-owned fragment metadata for
   exact CSS Grid and CSS Break behavior across named-page/page-size changes and
-  complex item fragmentation. Multicolumn containers, plus remaining flex edge
-  cases outside the normal-flow fragment replay path, need fragment-local
+  complex item fragmentation. Multicolumn spanner boundaries and nested
+  fragmentainers still need one container-wide topology and fragment map;
+  wrapped-row endpoint replay is covered. Remaining flex edge cases outside
+  the normal-flow fragment replay path need fragment-local
   gap-rule clipping and replay.
 
 ## Next Steps

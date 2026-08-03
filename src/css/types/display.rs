@@ -24,6 +24,12 @@ pub(crate) enum DisplayInner {
     /// context.
     /// <https://drafts.csswg.org/css-grid-3/#establishing-grid-lanes-layout>
     GridLanes,
+    /// CSS Ruby's inline formatting context with attached annotation levels.
+    ///
+    /// Ruby is an inner display type: `inline ruby` remains non-atomic,
+    /// whereas `block ruby` produces an outer block wrapper around the ruby
+    /// container. <https://drafts.csswg.org/css-ruby-1/#ruby-formatting-context>
+    Ruby,
     Table,
     TableCaption,
     TableColumnGroup,
@@ -33,6 +39,13 @@ pub(crate) enum DisplayInner {
     TableFooterGroup,
     TableRow,
     TableCell,
+    /// Layout-internal ruby roles. These have no independently meaningful
+    /// outer display role and are blockified to ordinary block flow.
+    /// <https://drafts.csswg.org/css-display-3/#layout-internal>
+    RubyBase,
+    RubyText,
+    RubyBaseContainer,
+    RubyTextContainer,
     Replaced,
 }
 
@@ -101,6 +114,11 @@ impl Display {
         inner: DisplayInner::GridLanes,
         list_item: false,
     };
+    pub const RUBY: Self = Self {
+        outer: DisplayOuter::Inline,
+        inner: DisplayInner::Ruby,
+        list_item: false,
+    };
     pub const TABLE: Self = Self {
         outer: DisplayOuter::Block,
         inner: DisplayInner::Table,
@@ -149,6 +167,26 @@ impl Display {
     pub const TABLE_CELL: Self = Self {
         outer: DisplayOuter::Block,
         inner: DisplayInner::TableCell,
+        list_item: false,
+    };
+    pub const RUBY_BASE: Self = Self {
+        outer: DisplayOuter::Inline,
+        inner: DisplayInner::RubyBase,
+        list_item: false,
+    };
+    pub const RUBY_TEXT: Self = Self {
+        outer: DisplayOuter::Inline,
+        inner: DisplayInner::RubyText,
+        list_item: false,
+    };
+    pub const RUBY_BASE_CONTAINER: Self = Self {
+        outer: DisplayOuter::Inline,
+        inner: DisplayInner::RubyBaseContainer,
+        list_item: false,
+    };
+    pub const RUBY_TEXT_CONTAINER: Self = Self {
+        outer: DisplayOuter::Inline,
+        inner: DisplayInner::RubyTextContainer,
         list_item: false,
     };
     pub const INLINE_REPLACED: Self = Self {
@@ -230,6 +268,20 @@ impl Display {
         self.inner == DisplayInner::Table
     }
 
+    pub fn is_ruby(self) -> bool {
+        self.inner == DisplayInner::Ruby
+    }
+
+    pub fn is_ruby_internal(self) -> bool {
+        matches!(
+            self.inner,
+            DisplayInner::RubyBase
+                | DisplayInner::RubyText
+                | DisplayInner::RubyBaseContainer
+                | DisplayInner::RubyTextContainer
+        )
+    }
+
     pub fn is_table_caption(self) -> bool {
         self.inner == DisplayInner::TableCaption
     }
@@ -267,6 +319,27 @@ impl Display {
         self.inner == DisplayInner::TableCell
     }
 
+    /// Whether this is a CSS table-internal display type rather than an
+    /// independently participating block-level box.
+    ///
+    /// Table-internal boxes use a block outer display for legacy computed
+    /// display serialization, but their placement is defined by the table
+    /// formatting context rather than ordinary block-flow boundaries.
+    /// <https://drafts.csswg.org/css-display-3/#layout-internal>
+    pub fn is_table_internal(self) -> bool {
+        matches!(
+            self.inner,
+            DisplayInner::TableCaption
+                | DisplayInner::TableColumnGroup
+                | DisplayInner::TableColumn
+                | DisplayInner::TableHeaderGroup
+                | DisplayInner::TableRowGroup
+                | DisplayInner::TableFooterGroup
+                | DisplayInner::TableRow
+                | DisplayInner::TableCell
+        )
+    }
+
     pub fn is_replaced(self) -> bool {
         self.inner == DisplayInner::Replaced
     }
@@ -278,7 +351,12 @@ impl Display {
     // CSS Display 3 defines inline-block/inline-flex as inline-level boxes that
     // participate atomically in the parent inline formatting context.
     pub fn is_atomic_inline(self) -> bool {
-        self.is_inline_level() && !self.is_flow()
+        // CSS Ruby explicitly makes inline ruby containers non-atomic: their
+        // bases take part in the surrounding inline formatting context and
+        // may fragment across lines with their annotations. The other
+        // non-flow inline display types are atomic formatting contexts.
+        // <https://drafts.csswg.org/css-ruby-1/#ruby-formatting-context>
+        self.is_inline_level() && !self.is_flow() && !self.is_ruby() && !self.is_ruby_internal()
     }
 
     // CSS Display: flow-root, flex, grid, table, and replaced boxes establish
@@ -341,17 +419,14 @@ impl Display {
     }
 
     fn is_layout_internal(self) -> bool {
-        matches!(
-            self.inner,
-            DisplayInner::TableCaption
-                | DisplayInner::TableColumnGroup
-                | DisplayInner::TableColumn
-                | DisplayInner::TableHeaderGroup
-                | DisplayInner::TableRowGroup
-                | DisplayInner::TableFooterGroup
-                | DisplayInner::TableRow
-                | DisplayInner::TableCell
-        )
+        self.is_table_internal()
+            || matches!(
+                self.inner,
+                DisplayInner::RubyBase
+                    | DisplayInner::RubyText
+                    | DisplayInner::RubyBaseContainer
+                    | DisplayInner::RubyTextContainer
+            )
     }
 }
 

@@ -10,7 +10,7 @@ impl<'a> LayoutBuilder<'a> {
         style: &ComputedStyle,
         children: &[box_tree::FormattingBox<'_>],
         table_fragment: Option<&box_tree::TableFragment<'_>>,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         baseline_shift: f32,
         visual_offset: InlineVisualOffset,
         link_target: Option<String>,
@@ -55,14 +55,11 @@ impl<'a> LayoutBuilder<'a> {
             )?;
             let border_box_width = image.border_box_size.width;
             let border_box_height = image.border_box_size.height;
-            let content = image
-                .svg
-                .map(|asset| InlineAtomContent::Svg { asset: Some(asset) })
-                .unwrap_or(InlineAtomContent::Image(image.decoded));
+            let content = image.into_inline_atom_content();
             return Some(
                 InlineAtom::new(
                     content,
-                    style.clone(),
+                    style.as_computed().clone(),
                     None,
                     InlineSize::new(
                         border_box_width
@@ -158,35 +155,22 @@ impl<'a> LayoutBuilder<'a> {
                 )
             }
             None if style.display.is_table() => {
-                let fragment = table_fragment?;
-                let box_metrics = intrinsic_box_metrics(style);
-                let horizontal_extras = box_metrics.horizontal_non_content_length().points();
-                let (min_width, width) = self.table_parent_intrinsic_content_widths_from_fragment(
-                    element,
-                    style,
-                    stylesheets,
-                    fragment,
-                    available_width,
-                );
-                let content_width = intrinsic::shrink_to_fit_width(
-                    content_box_pt(min_width),
-                    content_box_pt(width),
-                    content_box_pt((available_width - horizontal_extras).max(0.0)),
-                )
-                .points();
-                (
-                    constrain_content_width(
+                // An inline table is an atomic inline with table-specific
+                // sizing, painting, and baseline export.  A generic
+                // intrinsic atom loses the first-row baseline and replaces
+                // the captured table with an empty SVG placeholder.
+                // <https://www.w3.org/TR/CSS22/tables.html#table-display>
+                return self
+                    .inline_table_atom_for_element(
+                        element,
                         style,
-                        content_box_pt(content_width),
-                        PercentageBasis::definite(layout_pt(available_width)),
+                        children,
+                        table_fragment?,
+                        stylesheets,
+                        baseline_shift,
+                        link_target,
                     )
-                    .points()
-                        + horizontal_extras
-                        + box_metrics.margin.left.points()
-                        + box_metrics.margin.right.points(),
-                    style.line_height,
-                    style.line_height,
-                )
+                    .map(|atom| atom.with_visual_offset(visual_offset));
             }
             None if style.display.is_flex() && style.display.is_inline_level() => {
                 let box_metrics = intrinsic_box_metrics(style);
@@ -285,32 +269,44 @@ impl<'a> LayoutBuilder<'a> {
                 } else {
                     content_width
                 };
-                let (measured_content_height, measured_physical_height) = if children.is_empty() {
-                    let text = inline_text_for_style(element, style);
-                    let measurement =
-                        self.intrinsic_inline_measurement_for_text(&text, style, content_width);
-                    (
-                        measurement.height().max(style.line_height),
-                        measurement.physical_height(style),
-                    )
-                } else {
-                    self.definite_block_size_stack
-                        .push(block_size_percentage_basis_from_points(
-                            definite_content_height,
-                            BlockSizeBasisSource::InlineBlock,
-                        ));
-                    let measurement = self.intrinsic_inline_measurement_for_element(
-                        element,
-                        style,
-                        stylesheets,
-                        Some(children),
-                        content_width,
-                    );
-                    (
-                        measurement.height().max(style.line_height),
-                        measurement.physical_height(style),
-                    )
-                };
+                let (measured_content_height, measured_physical_height, line_baseline_offset) =
+                    if children.is_empty() {
+                        let text = inline_text_for_style(element, style);
+                        let measurement =
+                            self.intrinsic_inline_measurement_for_text(&text, style, content_width);
+                        (
+                            measurement.height().max(style.line_height),
+                            measurement.physical_height(style),
+                            self.inline_box_sequence_baseline_offset(
+                                &measurement.sequence,
+                                style,
+                                intrinsic_metrics.border.to_css_edges(),
+                            ),
+                        )
+                    } else {
+                        self.definite_block_size_stack.push(
+                            block_size_percentage_basis_from_points(
+                                definite_content_height,
+                                BlockSizeBasisSource::InlineBlock,
+                            ),
+                        );
+                        let measurement = self.intrinsic_inline_measurement_for_element(
+                            element,
+                            style,
+                            stylesheets,
+                            Some(children),
+                            content_width,
+                        );
+                        (
+                            measurement.height().max(style.line_height),
+                            measurement.physical_height(style),
+                            self.inline_box_sequence_baseline_offset(
+                                &measurement.sequence,
+                                style,
+                                intrinsic_metrics.border.to_css_edges(),
+                            ),
+                        )
+                    };
                 if !children.is_empty() {
                     self.definite_block_size_stack.pop();
                 }
@@ -342,6 +338,12 @@ impl<'a> LayoutBuilder<'a> {
                     })
                 };
                 let border_box_height = content_height + vertical_extras;
+                let baseline_offset = Self::inline_block_baseline_offset(
+                    style,
+                    used_property_containment(element, style).layout,
+                    border_box_height,
+                    line_baseline_offset,
+                );
                 (
                     constrain_content_width(
                         style,
@@ -355,7 +357,7 @@ impl<'a> LayoutBuilder<'a> {
                     border_box_height
                         + box_metrics.margin.top.points()
                         + box_metrics.margin.bottom.points(),
-                    border_box_height,
+                    baseline_offset,
                 )
             }
             None => return None,
@@ -363,7 +365,7 @@ impl<'a> LayoutBuilder<'a> {
         Some(
             InlineAtom::new(
                 InlineAtomContent::Svg { asset: None },
-                style.clone(),
+                style.as_computed().clone(),
                 None,
                 InlineSize::new(width, height),
                 baseline_offset,
@@ -386,14 +388,17 @@ impl<'a> LayoutBuilder<'a> {
         }) {
             let borders = used_border_widths(atom.style());
             let atom_baseline_offset =
-                atom.style().margin.top + atom.baseline_offset - atom.baseline_shift;
+                inline_atom_logical_margin_box_baseline_offset(atom, fallback_style)
+                    - atom.baseline_shift;
             let parent_baseline_offset = self
                 .font_system
                 .rendered_first_line_baseline_offset(atom.style())
                 .points();
             let line_baseline_offset = atom_baseline_offset.max(parent_baseline_offset);
             return self.cursor_y - line_baseline_offset
-                + atom.baseline_offset
+                + atom.baseline_offset_from_border_box_block_start(
+                    inline_atom_logical_border_block_size(atom, fallback_style),
+                )
                 + atom.baseline_shift
                 - borders.top
                 - atom.style().padding.top
@@ -665,8 +670,41 @@ impl<'a> LayoutBuilder<'a> {
                     output,
                 );
             }
-            GeneratedContentPart::TargetCounter { .. }
-            | GeneratedContentPart::TargetText { .. } => {}
+            GeneratedContentPart::TargetCounter {
+                target,
+                name,
+                style: counter_style,
+            } => {
+                self.has_normal_flow_target_references = true;
+                if let Some(text) = self.resolve_generated_target_counter(
+                    element,
+                    target,
+                    name,
+                    counter_style.clone(),
+                ) {
+                    push_generated_inline_words_for_style(
+                        &text,
+                        style,
+                        link_target,
+                        baseline_shift,
+                        visual_offset,
+                        output,
+                    );
+                }
+            }
+            GeneratedContentPart::TargetText { target, keyword } => {
+                self.has_normal_flow_target_references = true;
+                if let Some(text) = self.resolve_generated_target_text(element, target, *keyword) {
+                    push_generated_inline_words_for_style(
+                        &text,
+                        style,
+                        link_target,
+                        baseline_shift,
+                        visual_offset,
+                        output,
+                    );
+                }
+            }
             GeneratedContentPart::Quote(quote) => {
                 let text = self.generated_quote_text(*quote, style);
                 push_generated_inline_words_for_style(
@@ -722,9 +760,9 @@ impl<'a> LayoutBuilder<'a> {
     ) -> Option<InlineAtom> {
         let available_width = (self.content_right - self.content_left).max(1.0);
         let mut used_style = self.style_with_current_viewport_lengths(style);
-        apply_used_box_metrics(
+        apply_used_box_metrics_for_logical_inline_basis(
             &mut used_style,
-            PercentageBasis::definite(layout_pt(available_width)),
+            self.current_content_logical_inline_percentage_basis(),
         );
         let style = &used_style;
         let image = used_generated_image_value(
@@ -737,14 +775,11 @@ impl<'a> LayoutBuilder<'a> {
         )?;
         let border_box_width = image.border_box_size.width;
         let border_box_height = image.border_box_size.height;
-        let content = image
-            .svg
-            .map(|asset| InlineAtomContent::Svg { asset: Some(asset) })
-            .unwrap_or(InlineAtomContent::Image(image.decoded));
+        let content = image.into_inline_atom_content();
         Some(
             InlineAtom::new(
                 content,
-                style.clone(),
+                style.as_computed().clone(),
                 None,
                 InlineSize::new(
                     border_box_width + style.margin.left + style.margin.right,
@@ -814,32 +849,12 @@ impl<'a> LayoutBuilder<'a> {
         visual_offset: InlineVisualOffset,
         output: &mut Vec<InlineItem>,
     ) {
-        self.push_bidi_scope_start_with_source(
-            style,
-            link_target,
-            baseline_shift,
-            visual_offset,
-            InlineTextSource::Normal,
-            output,
-        );
-    }
-
-    pub(in crate::layout) fn push_bidi_scope_start_with_source(
-        &mut self,
-        style: &ComputedStyle,
-        link_target: Option<String>,
-        baseline_shift: f32,
-        visual_offset: InlineVisualOffset,
-        source: InlineTextSource,
-        output: &mut Vec<InlineItem>,
-    ) {
         if let Some((start, _)) = bidi_control_scope_for_style(style) {
             self.push_bidi_control_text(
                 start,
                 style,
                 link_target,
                 InlinePlacement::new(baseline_shift, visual_offset),
-                source,
                 output,
             );
         }
@@ -859,32 +874,12 @@ impl<'a> LayoutBuilder<'a> {
         visual_offset: InlineVisualOffset,
         output: &mut Vec<InlineItem>,
     ) {
-        self.push_bidi_scope_end_with_source(
-            style,
-            link_target,
-            baseline_shift,
-            visual_offset,
-            InlineTextSource::Normal,
-            output,
-        );
-    }
-
-    pub(in crate::layout) fn push_bidi_scope_end_with_source(
-        &mut self,
-        style: &ComputedStyle,
-        link_target: Option<String>,
-        baseline_shift: f32,
-        visual_offset: InlineVisualOffset,
-        source: InlineTextSource,
-        output: &mut Vec<InlineItem>,
-    ) {
         if let Some((_, end)) = bidi_control_scope_for_style(style) {
             self.push_bidi_control_text(
                 end,
                 style,
                 link_target,
                 InlinePlacement::new(baseline_shift, visual_offset),
-                source,
                 output,
             );
         }
@@ -901,7 +896,6 @@ impl<'a> LayoutBuilder<'a> {
         style: &ComputedStyle,
         link_target: Option<String>,
         placement: InlinePlacement,
-        _source: InlineTextSource,
         output: &mut Vec<InlineItem>,
     ) {
         if !text.is_empty() {
@@ -949,7 +943,7 @@ impl<'a> LayoutBuilder<'a> {
         style: &ComputedStyle,
         children: &[box_tree::FormattingBox<'_>],
         table_fragment: Option<&box_tree::TableFragment<'_>>,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         baseline_shift: f32,
         visual_offset: InlineVisualOffset,
         link_target: Option<String>,
@@ -975,9 +969,9 @@ impl<'a> LayoutBuilder<'a> {
             Some(ReplacedElementKind::Canvas) => {
                 let available_width = (self.content_right - self.content_left).max(1.0);
                 let mut style = self.style_with_current_viewport_lengths(style);
-                let metrics = apply_used_box_metrics(
+                let metrics = apply_used_box_metrics_for_logical_inline_basis(
                     &mut style,
-                    PercentageBasis::definite(layout_pt(available_width)),
+                    self.current_content_logical_inline_percentage_basis(),
                 );
                 let containing_block_height = self
                     .definite_block_size_stack
@@ -1002,7 +996,7 @@ impl<'a> LayoutBuilder<'a> {
                 Some(
                     InlineAtom::new(
                         content,
-                        style,
+                        style.into_computed(),
                         None,
                         InlineSize::new(
                             atom_width,
@@ -1021,9 +1015,9 @@ impl<'a> LayoutBuilder<'a> {
             Some(ReplacedElementKind::Image) => {
                 let available_width = (self.content_right - self.content_left).max(1.0);
                 let mut used_style = self.style_with_current_viewport_lengths(style);
-                apply_used_box_metrics(
+                apply_used_box_metrics_for_logical_inline_basis(
                     &mut used_style,
-                    PercentageBasis::definite(layout_pt(available_width)),
+                    self.current_content_logical_inline_percentage_basis(),
                 );
                 let style = &used_style;
                 let image = used_image(
@@ -1047,7 +1041,7 @@ impl<'a> LayoutBuilder<'a> {
                 Some(
                     InlineAtom::new(
                         content,
-                        style.clone(),
+                        style.as_computed().clone(),
                         None,
                         InlineSize::new(
                             border_box_width + style.margin.left + style.margin.right,
@@ -1065,9 +1059,9 @@ impl<'a> LayoutBuilder<'a> {
                 let asset = self.resource_cache.inline_svg_asset(element)?;
                 let available_width = (self.content_right - self.content_left).max(1.0);
                 let mut style = self.style_with_current_viewport_lengths(style);
-                let metrics = apply_used_box_metrics(
+                let metrics = apply_used_box_metrics_for_logical_inline_basis(
                     &mut style,
-                    PercentageBasis::definite(layout_pt(available_width)),
+                    self.current_content_logical_inline_percentage_basis(),
                 );
                 let svg = used_svg(
                     element,
@@ -1083,7 +1077,7 @@ impl<'a> LayoutBuilder<'a> {
                 Some(
                     InlineAtom::new(
                         InlineAtomContent::Svg { asset: Some(asset) },
-                        style,
+                        style.into_computed(),
                         None,
                         InlineSize::new(
                             width + metrics.margin.left.points() + metrics.margin.right.points(),
@@ -1155,9 +1149,9 @@ impl<'a> LayoutBuilder<'a> {
                     - style.margin.right)
                     .max(0.0);
                 let mut used_style = self.style_with_current_used_lengths(style);
-                let box_metrics = apply_used_box_metrics(
+                let box_metrics = apply_used_box_metrics_for_logical_inline_basis(
                     &mut used_style,
-                    PercentageBasis::definite(layout_pt(available_width)),
+                    self.current_content_logical_inline_percentage_basis(),
                 );
                 let style = &used_style;
                 let border_widths = box_metrics.border.to_css_edges();
@@ -1256,7 +1250,7 @@ impl<'a> LayoutBuilder<'a> {
                         0.0,
                         InlineVisualOffset::zero(),
                         style,
-                        style.text_decoration.clone(),
+                        style.text_decoration_layers.clone(),
                         &mut sequence_items,
                     );
                 } else {
@@ -1267,7 +1261,7 @@ impl<'a> LayoutBuilder<'a> {
                         0.0,
                         InlineVisualOffset::zero(),
                         style,
-                        style.text_decoration.clone(),
+                        style.text_decoration_layers.clone(),
                         &mut sequence_items,
                     );
                 }
@@ -1339,7 +1333,7 @@ impl<'a> LayoutBuilder<'a> {
                     definite_content_height.unwrap_or_else(|| {
                         constrain_content_height(
                             style,
-                            content_box_pt(if style.contain.size {
+                            content_box_pt(if used_property_containment(element, style).size {
                                 0.0
                             } else {
                                 measured_logical_block_size
@@ -1354,28 +1348,35 @@ impl<'a> LayoutBuilder<'a> {
                     self.inline_box_sequence_baseline_offset(&sequence, style, border_widths);
                 let baseline_offset = Self::inline_block_baseline_offset(
                     style,
+                    used_property_containment(element, style).layout,
                     border_box_height,
                     line_baseline_offset,
                 );
+                let mut atom = InlineAtom::new(
+                    InlineAtomContent::InlineBox { sequence },
+                    style.as_computed().clone(),
+                    None,
+                    InlineSize::new(
+                        content_width + horizontal_extras + style.margin.left + style.margin.right,
+                        border_box_height + style.margin.top + style.margin.bottom,
+                    ),
+                    baseline_offset,
+                    baseline_shift,
+                    link_target,
+                    None,
+                );
+                // An empty inline-block has no last in-flow line box from
+                // which to export a baseline.  Defer its synthesized
+                // border-box-end baseline to the containing inline context,
+                // whose logical block axis can differ from this box's
+                // physical height in vertical writing modes.
+                // <https://www.w3.org/TR/CSS22/visudet.html#propdef-vertical-align>
+                if line_baseline_offset.is_none() {
+                    atom = atom.with_synthesized_border_box_block_end_baseline();
+                }
                 Some(
-                    InlineAtom::new(
-                        InlineAtomContent::InlineBox { sequence },
-                        style.clone(),
-                        None,
-                        InlineSize::new(
-                            content_width
-                                + horizontal_extras
-                                + style.margin.left
-                                + style.margin.right,
-                            border_box_height + style.margin.top + style.margin.bottom,
-                        ),
-                        baseline_offset,
-                        baseline_shift,
-                        link_target,
-                        None,
-                    )
-                    .with_outside_marker(outside_marker)
-                    .with_visual_offset(visual_offset),
+                    atom.with_outside_marker(outside_marker)
+                        .with_visual_offset(visual_offset),
                 )
             }
             None => None,

@@ -1,11 +1,13 @@
 use super::*;
 use crate::css::FontPaletteDefinition;
+use crate::css::PropertyRegistrationRule;
+use crate::css::component_values::find_matching_brace;
 
 pub(super) fn expand_nested_rules(source: &str) -> String {
     let mut output = String::with_capacity(source.len());
     let mut position = 0usize;
     while let Some(open) = find_next_top_level_open_brace(source, position) {
-        let Some(close) = find_matching_brace(source, open) else {
+        let Some(close) = find_matching_brace(source, open, false) else {
             break;
         };
         let prelude_start = last_top_level_statement_end(source, position, open);
@@ -66,7 +68,7 @@ pub(super) fn split_nested_rules(body: &str) -> (String, Vec<NestedRule>) {
     let mut position = 0usize;
 
     while let Some(open) = find_next_top_level_open_brace(body, position) {
-        let Some(close) = find_matching_brace(body, open) else {
+        let Some(close) = find_matching_brace(body, open, false) else {
             break;
         };
         let selector_start = last_top_level_statement_end(body, segment_start, open);
@@ -206,6 +208,7 @@ pub(super) fn flatten_rule(
     counter_styles: &mut Vec<CounterStyleRule>,
     font_feature_values: &mut Vec<FontFeatureValuesRule>,
     font_palette_values: &mut Vec<(String, FontPaletteDefinition)>,
+    property_registrations: &mut Vec<PropertyRegistrationRule>,
 ) {
     match rule {
         ParsedCssRule::Style(rule) => rules.push(rule),
@@ -226,6 +229,7 @@ pub(super) fn flatten_rule(
         ParsedCssRule::FontPaletteValues(name, definition) => {
             font_palette_values.push((name, definition));
         }
+        ParsedCssRule::Property(rule) => property_registrations.push(rule),
         ParsedCssRule::Nested(nested) => {
             for rule in nested {
                 flatten_rule(
@@ -246,6 +250,7 @@ pub(super) fn flatten_rule(
                     counter_styles,
                     font_feature_values,
                     font_palette_values,
+                    property_registrations,
                 );
             }
         }

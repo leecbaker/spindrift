@@ -46,6 +46,7 @@ icu_provider = { version = "2.2", features = ["logging"] }
 icu_segmenter = "2.2"
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 jxl-oxide = { version = "0.12.6", features = ["image", "moxcms"] }
+kham-core = "0.8.2"
 log = "0.4"
 moxcms = { version = "0.9", features = ["extended_range"] }
 palette = { version = "0.7.6", default-features = false, features = ["std"] }
@@ -87,6 +88,7 @@ missing_docs = "deny"
 missing_doc_code_examples = "deny"
 
 [lints.clippy]
+unused_async = "warn"
 redundant_clone = "warn"
 needless_collect = "warn"
 unnecessary_to_owned = "warn"

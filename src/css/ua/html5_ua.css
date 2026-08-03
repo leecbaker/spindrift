@@ -34,6 +34,17 @@ tr, tr[hidden] { display: table-row }
 td, th, td[hidden], th[hidden] { display: table-cell }
 :is(colgroup, col, thead, tbody, tfoot, tr, td, th)[hidden] { visibility: collapse }
 
+/* CSS Ruby Level 1 Appendix A. Ruby containers share their base-level inline
+   formatting context with the parent while annotation levels are laid out by
+   the ruby formatter. */
+ruby { display: ruby }
+rb { display: ruby-base; white-space: nowrap }
+rt { display: ruby-text; line-height: 1; white-space: nowrap; text-emphasis: none }
+rbc { display: ruby-base-container }
+rtc { display: ruby-text-container; line-height: 1; white-space: nowrap; text-emphasis: none }
+rtc, :not(rtc) > rt { font-size: 50% }
+rp { display: none }
+
 /* Margins and padding */
 
 /* These are block-flow margins: use logical properties so their physical
@@ -167,7 +178,13 @@ table, input, select, option, optgroup, button, textarea, keygen { text-indent: 
 
 center { text-align: center }
 iframe:not([seamless]) { border: 2px inset }
-img, svg { overflow: clip }
+/* CSS Overflow Level 4 extends overflow to replaced elements.  Keep this in
+   the UA cascade, rather than special-casing layout, so authors can opt out.
+   The content-box default retains the historical clipping behavior. */
+img, iframe, video, embed, object, canvas, svg {
+  overflow: clip;
+  overflow-clip-margin: content-box;
+}
 
 /* CSS Color Adjustment recommends this UA behavior so inline SVG preserves
    illustration colors while inheriting an adjusted outer text color. */
@@ -199,16 +216,13 @@ ol, ul { break-before: avoid }
 
 /* Form fields */
 
-button, input, select, textarea { border: 1px solid black; box-sizing: border-box; font-size: .85em; padding: .2em; white-space: pre }
+button, input, select { border: 1px solid black; box-sizing: border-box; font-size: .85em; padding: .2em; white-space: pre }
+textarea { border: 1px solid black; font-size: .85em; padding: .2em; white-space: pre }
 input, select, textarea { height: 1.2em; width: 20em }
 input:is([type=button i], [type=reset i], [type=submit i]), button { background: lightgrey; border-radius: .25em; text-align: center }
 input:is([type=button i], [type=reset i], [type=submit i])[value], button[value] { max-width: 100%; width: auto }
-input[type=submit i]:not([value])::before { content: "Submit" }
-input[type=reset i]:not([value])::before { content: "Reset" }
 input:is([type=checkbox i], [type=radio i]) { height: .7em; vertical-align: -.2em; width: .7em }
-input:is([type=checkbox i], [type=radio i])[checked]::before { background: black; content: ""; display: block; height: 100% }
-input[type=radio i], input[type=radio][checked]:before { border-radius: 50% }
-input[value]:not([type=checkbox i], [type=radio i])::before { content: attr(value); display: block; overflow: hidden }
+input[type=radio i] { border-radius: 50% }
 :is(input, input[value=""], input[type=checkbox i], input[type=radio i]) { content: ""; display: block }
 select { background: lightgrey; border-radius: .25em .25em; overflow: hidden; position: relative; white-space: normal }
 select[multiple] { height: 3.6em }
@@ -218,7 +232,11 @@ select:not([multiple]):is(:not([size]), [size="1"]) option { display: none }
 select[multiple] option, select:not([multiple]):is(:not([size]), [size="1"]):not(:has(option[selected])) option:first-of-type, select:not([multiple]):is(:not([size]), [size="1"]) option[selected]:not(option[selected] ~ option[selected]) { display: block; overflow: hidden }
 textarea { height: 3em; margin: .1em 0; overflow: hidden; overflow-wrap: break-word; padding: .2em; white-space: pre-wrap }
 textarea:empty { height: 3em }
-fieldset { border: groove 2px; margin-left: 2px; margin-right: 2px; padding: .35em .625em .75em }
+fieldset { border: groove 2px; margin-left: 2px; margin-right: 2px; padding: .35em .625em .75em; min-inline-size: min-content }
+legend { padding-inline: 2px }
+legend[align=left i] { justify-self: left }
+legend[align=center i] { justify-self: center }
+legend[align=right i] { justify-self: right }
 
 /* Pages */
 

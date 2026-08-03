@@ -7,10 +7,10 @@ pub(super) fn grid_line_index(
     let css::GridPlacement::Line(line) = placement else {
         return None;
     };
-    if let Some(name) = &line.name {
-        named_grid_line_index(line_names, name, line.index.unwrap_or(1))
+    if let Some(name) = line.name() {
+        named_grid_line_index(line_names, name, line.index().unwrap_or(1))
     } else {
-        explicit_grid_line_index(line.index?, i32::try_from(line_names.len()).ok()?)
+        explicit_grid_line_index(line.index()?, i32::try_from(line_names.len()).ok()?)
     }
 }
 
@@ -142,8 +142,8 @@ pub(super) fn grid_line_static_offset_index(
         return None;
     };
     if all_auto_tracks_are_definite(auto_tracks, container_size) {
-        if line.name.is_none() {
-            let index = line.index?;
+        if line.name().is_none() {
+            let index = line.index()?;
             if index == 0 {
                 return None;
             }
@@ -153,22 +153,22 @@ pub(super) fn grid_line_static_offset_index(
             let explicit_line_count = i32::try_from(line_names.len()).ok()?;
             return explicit_line_count.checked_add(index)?.checked_add(1);
         }
-        if let Some(name) = &line.name
-            && line.index.unwrap_or(1) > 0
+        if let Some(name) = line.name()
+            && line.index().unwrap_or(1) > 0
         {
             return positive_named_implicit_grid_line_index(
                 line_names,
                 name,
-                line.index.unwrap_or(1),
+                line.index().unwrap_or(1),
             );
         }
-        if let Some(name) = &line.name
-            && line.index.unwrap_or(1) < 0
+        if let Some(name) = line.name()
+            && line.index().unwrap_or(1) < 0
         {
             return negative_named_implicit_grid_line_index(
                 line_names,
                 name,
-                line.index.unwrap_or(1),
+                line.index().unwrap_or(1),
             );
         }
     }
@@ -269,7 +269,7 @@ fn grid_static_line_offsets(
     if before_track_count == 0 && after_track_count == 0 {
         return Some(GridStaticLineOffsets {
             first_line_index: 1,
-            offsets: line_offsets_from_sizes_and_gap(explicit_track_sizes, gap),
+            offsets: grid_line_offsets_from_track_sizes(explicit_track_sizes, gap),
         });
     }
 
@@ -293,11 +293,16 @@ fn grid_static_line_offsets(
     );
     Some(GridStaticLineOffsets {
         first_line_index: 1 - i32::try_from(before_track_count).ok()?,
-        offsets: line_offsets_from_sizes_and_gap(&track_sizes, gap),
+        offsets: grid_line_offsets_from_track_sizes(&track_sizes, gap),
     })
 }
 
-fn line_offsets_from_sizes_and_gap(track_sizes: &[f32], gap: f32) -> Vec<f32> {
+/// Build Grid line offsets from already-resolved track sizes and gutters.
+///
+/// Static-position fallback and ordinary line resolution share this final
+/// geometry step; their track-list expansion policies deliberately remain
+/// separate.
+pub(super) fn grid_line_offsets_from_track_sizes(track_sizes: &[f32], gap: f32) -> Vec<f32> {
     let mut offsets = Vec::with_capacity(track_sizes.len() + 1);
     let mut offset = 0.0;
     offsets.push(offset);
@@ -312,11 +317,9 @@ fn line_offsets_from_sizes_and_gap(track_sizes: &[f32], gap: f32) -> Vec<f32> {
 }
 
 fn all_auto_tracks_are_definite(auto_tracks: &css::GridAutoTrackList, container_size: f32) -> bool {
-    !auto_tracks.tracks.is_empty()
-        && auto_tracks
-            .tracks
-            .iter()
-            .all(|track| definite_grid_track_size(track.clone(), container_size).is_some())
+    auto_tracks
+        .iter()
+        .all(|track| definite_grid_track_size(track.clone(), container_size).is_some())
 }
 
 pub(in crate::layout::grid) fn cycled_definite_auto_track_size_after(
@@ -324,7 +327,7 @@ pub(in crate::layout::grid) fn cycled_definite_auto_track_size_after(
     index: usize,
     container_size: f32,
 ) -> Option<f32> {
-    let track = auto_tracks.tracks.get(index % auto_tracks.tracks.len())?;
+    let track = auto_tracks.get(index % auto_tracks.len())?;
     definite_grid_track_size(track.clone(), container_size)
 }
 
@@ -333,10 +336,8 @@ pub(in crate::layout::grid) fn cycled_definite_auto_track_size_before(
     index: usize,
     container_size: f32,
 ) -> Option<f32> {
-    let track_count = auto_tracks.tracks.len();
-    let track = auto_tracks
-        .tracks
-        .get(track_count.checked_sub(1 + index % track_count)?)?;
+    let track_count = auto_tracks.len();
+    let track = auto_tracks.get(track_count.checked_sub(1 + index % track_count)?)?;
     definite_grid_track_size(track.clone(), container_size)
 }
 
@@ -498,22 +499,21 @@ mod tests {
     }
 
     fn line(index: i32) -> css::GridPlacement {
-        css::GridPlacement::Line(css::GridLinePlacement {
-            name: None,
-            index: Some(index),
-        })
+        css::GridPlacement::Line(css::GridLinePlacement::Number(
+            std::num::NonZeroI32::new(index).unwrap(),
+        ))
     }
 
     fn named(name: &str, occurrence: i32) -> css::GridPlacement {
-        css::GridPlacement::Line(css::GridLinePlacement {
-            name: Some(name.to_string()),
-            index: Some(occurrence),
+        css::GridPlacement::Line(css::GridLinePlacement::Named {
+            name: name.to_string(),
+            occurrence: std::num::NonZeroI32::new(occurrence),
         })
     }
 
     fn auto_tracks(points: &[f32]) -> css::GridAutoTrackList {
-        css::GridAutoTrackList {
-            tracks: points
+        css::GridAutoTrackList::from_tracks(
+            points
                 .iter()
                 .map(|points| css::GridTrackSize {
                     min: css::GridMinTrackBreadth::LengthPercentage(
@@ -524,7 +524,8 @@ mod tests {
                     ),
                 })
                 .collect(),
-        }
+        )
+        .expect("test grid auto-track list is non-empty")
     }
 
     #[test]
@@ -534,7 +535,6 @@ mod tests {
         assert_eq!(grid_line_index(&line(4), &lines), Some(4));
         assert_eq!(grid_line_index(&line(-1), &lines), Some(4));
         assert_eq!(grid_line_index(&line(-4), &lines), Some(1));
-        assert_eq!(grid_line_index(&line(0), &lines), None);
         assert_eq!(grid_line_index(&line(5), &lines), None);
     }
 
@@ -550,7 +550,6 @@ mod tests {
         assert_eq!(grid_line_index(&named("a", 2), &lines), Some(2));
         assert_eq!(grid_line_index(&named("a", -1), &lines), Some(3));
         assert_eq!(grid_line_index(&named("b", -1), &lines), Some(4));
-        assert_eq!(grid_line_index(&named("a", 0), &lines), None);
     }
 
     #[test]
@@ -586,6 +585,15 @@ mod tests {
                 200.0,
             ),
             Some(60.0)
+        );
+    }
+
+    #[test]
+    fn shared_line_offsets_preserve_track_and_gap_boundaries() {
+        assert_eq!(grid_line_offsets_from_track_sizes(&[], 5.0), vec![0.0]);
+        assert_eq!(
+            grid_line_offsets_from_track_sizes(&[10.0, 20.0, 30.0], 5.0),
+            vec![0.0, 15.0, 40.0, 70.0]
         );
     }
 

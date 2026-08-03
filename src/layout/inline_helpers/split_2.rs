@@ -13,13 +13,14 @@ pub(in crate::layout) fn inline_fragment_has_visible_text_paint(
     fragment: &(impl InlineFragmentAccess + ?Sized),
 ) -> bool {
     fragment.style().color.is_visible()
-        || (fragment.style().text_decoration.clone().has_visible_line()
-            && fragment
-                .style()
-                .text_decoration
-                .color
-                .unwrap_or(fragment.style().color)
-                .is_visible())
+        || fragment.style().text_decoration_layers.iter().any(|layer| {
+            layer.decoration.has_visible_line()
+                && layer
+                    .decoration
+                    .color
+                    .unwrap_or(fragment.style().color)
+                    .is_visible()
+        })
         || fragment.style().text_shadow.iter().any(|shadow| {
             !shadow.inset && shadow.color.resolve(fragment.style().color).is_visible()
         })
@@ -344,6 +345,7 @@ pub(in crate::layout) fn inline_atom_is_inter_character_unit(atom: &InlineAtom) 
         InlineAtomContent::Canvas
             | InlineAtomContent::Iframe(_)
             | InlineAtomContent::Image(_)
+            | InlineAtomContent::Gradient { .. }
             | InlineAtomContent::Svg { .. }
             | InlineAtomContent::InlineBox { .. }
             | InlineAtomContent::TextCombineUpright { .. }
@@ -365,10 +367,38 @@ pub(in crate::layout) fn apply_first_line_pseudos_to_line_items(
 ) {
     if let Some(first_line_style) = block_style.first_line_style.as_deref() {
         for item in items.iter_mut() {
-            if let InlineLineItem::Fragment(fragment) = item
-                && apply_first_line_style_delta(fragment.style_mut(), block_style, first_line_style)
-            {
-                fragment.set_force_inline_background_paint(true);
+            match item {
+                InlineLineItem::Fragment(fragment) => {
+                    if apply_first_line_style_delta(
+                        fragment.style_mut(),
+                        block_style,
+                        first_line_style,
+                    ) {
+                        fragment.set_force_inline_background_paint(true);
+                    }
+                }
+                InlineLineItem::Atom(atom) => {
+                    let content = Rc::make_mut(&mut atom.data);
+                    let InlineAtomContent::Ruby {
+                        base,
+                        annotations,
+                        annotation_sides,
+                        ..
+                    } = &mut content.content
+                    else {
+                        continue;
+                    };
+                    apply_first_line_style_to_ruby_level(base, block_style, first_line_style);
+                    for (annotation, side) in annotations.iter_mut().zip(annotation_sides) {
+                        apply_first_line_style_to_ruby_level(
+                            annotation,
+                            block_style,
+                            first_line_style,
+                        );
+                        *side = annotation.style.ruby_position.interlinear_side();
+                    }
+                }
+                InlineLineItem::Float(_) => {}
             }
         }
     }
@@ -376,6 +406,39 @@ pub(in crate::layout) fn apply_first_line_pseudos_to_line_items(
         && let Some(first_letter_style) = block_style.first_letter_style.as_deref()
     {
         apply_first_letter_pseudo_to_line_items(items, first_letter_style);
+    }
+}
+
+/// Replay the originating block's first-line inheritance into a ruby level's
+/// already-selected inner line records. Ruby collection captures these records
+/// before the parent line has been selected, so changing only the level style
+/// would leave its text fragments with stale inherited values at paint time.
+///
+/// CSS Pseudo specifies that inherited first-line values apply to the first
+/// line's descendants, rather than creating a new `ruby::first-line` scope.
+/// <https://drafts.csswg.org/css-pseudo-4/#first-line-pseudo>
+fn apply_first_line_style_to_ruby_level(
+    level: &mut RubyInlineLevel,
+    originating_style: &ComputedStyle,
+    first_line_style: &ComputedStyle,
+) {
+    apply_first_line_style_delta(&mut level.style, originating_style, first_line_style);
+    for record in &mut level.sequence.records {
+        let Some(fragment) = &mut record.fragment else {
+            continue;
+        };
+        for measured in Rc::make_mut(&mut fragment.items).iter_mut() {
+            match &mut measured.item {
+                InlineLineItem::Fragment(fragment) => {
+                    apply_first_line_style_delta(
+                        fragment.style_mut(),
+                        originating_style,
+                        first_line_style,
+                    );
+                }
+                InlineLineItem::Atom(_) | InlineLineItem::Float(_) => {}
+            }
+        }
     }
 }
 
@@ -387,7 +450,7 @@ pub(in crate::layout) fn apply_first_line_pseudos_to_line_items(
 /// property whose pseudo computed value differs from its originating value:
 /// that difference represents the pseudo rule's cascaded effect.
 /// <https://drafts.csswg.org/css-pseudo-4/#first-line-pseudo>
-fn apply_first_line_style_delta(
+pub(in crate::layout) fn apply_first_line_style_delta(
     fragment_style: &mut ComputedStyle,
     originating_style: &ComputedStyle,
     first_line_style: &ComputedStyle,
@@ -407,14 +470,7 @@ fn apply_first_line_style_delta(
         fragment_style.text_fill_color = first_line_style.text_fill_color;
     }
     if first_line_style.background_color != originating_style.background_color {
-        fragment_style.background_color = first_line_style.background_color;
-        background_changed = true;
-    }
-    if first_line_style.background_color_is_current_color
-        != originating_style.background_color_is_current_color
-    {
-        fragment_style.background_color_is_current_color =
-            first_line_style.background_color_is_current_color;
+        fragment_style.background_color = first_line_style.background_color.clone();
         background_changed = true;
     }
     if first_line_style.font_weight != originating_style.font_weight {
@@ -443,6 +499,11 @@ fn apply_first_line_style_delta(
     }
     if first_line_style.vertical_align != originating_style.vertical_align {
         fragment_style.vertical_align = first_line_style.vertical_align.clone();
+    }
+    if first_line_style.ruby_position != originating_style.ruby_position
+        && fragment_style.ruby_position == originating_style.ruby_position
+    {
+        fragment_style.ruby_position = first_line_style.ruby_position;
     }
     background_changed
 }
@@ -492,36 +553,101 @@ pub(in crate::layout) fn split_fragment_for_first_letter(
 }
 
 pub(in crate::layout) fn first_letter_byte_range(text: &str) -> Option<std::ops::Range<usize>> {
-    let mut start = None;
-    let mut end = None;
-    let mut saw_letter = false;
-    for (index, character) in text.char_indices() {
-        if start.is_none() && character.is_whitespace() {
+    /// Classify a complete CSS typographic character unit by its visible base
+    /// character. Combining marks and default-ignorable controls remain in
+    /// the selected unit rather than creating their own first-letter choice.
+    fn unit_base(unit: &str) -> Option<char> {
+        unit.chars().find(|character| {
+            !character_is_unicode_mark(*character)
+                && !character_is_default_ignorable_code_point(*character)
+        })
+    }
+
+    let units = typographic_unit_ranges(text);
+    let mut prefix_start = None;
+    let mut selected_start = None;
+    let mut selected_end = None;
+    let mut pending_suffix_space_start = None;
+
+    for range in units {
+        let unit = &text[range.clone()];
+        let Some(base) = unit_base(unit) else {
             continue;
-        }
-        let is_punctuation = character_is_unicode_punctuation(character);
-        if !saw_letter {
-            if is_punctuation {
-                start.get_or_insert(index);
-                end = Some(index + character.len_utf8());
+        };
+
+        let selected = selected_start.is_some();
+        if !selected {
+            if character_is_first_letter_associated_space(base) && prefix_start.is_some() {
                 continue;
             }
-            if character_is_unicode_alphanumeric(character) {
-                start.get_or_insert(index);
-                end = Some(index + character.len_utf8());
-                saw_letter = true;
+            if base.is_whitespace() && prefix_start.is_none() {
+                // Leading white space is selected separately when preserved;
+                // ordinary collapsed space cannot create first-letter text.
                 continue;
             }
-            if start.is_some() {
+            if character_is_unicode_punctuation(base) {
+                prefix_start.get_or_insert(range.start);
+                continue;
+            }
+            if character_is_unicode_first_letter_base(base) {
+                selected_start = Some(prefix_start.unwrap_or(range.start));
+                selected_end = Some(range.end);
+                continue;
+            }
+            // A non-punctuation, non-base unit between an associated prefix
+            // and a prospective initial prevents that prefix from attaching.
+            if prefix_start.is_some() {
                 return None;
             }
             continue;
         }
-        if is_punctuation {
-            end = Some(index + character.len_utf8());
-        } else {
-            break;
+
+        if character_is_first_letter_associated_space(base) {
+            pending_suffix_space_start.get_or_insert(range.start);
+            continue;
+        }
+        if character_is_first_letter_suffix_punctuation(base) {
+            if let Some(space_start) = pending_suffix_space_start.take() {
+                selected_end = Some(range.end.max(space_start));
+            } else {
+                selected_end = Some(range.end);
+            }
+            continue;
+        }
+        break;
+    }
+
+    selected_start
+        .zip(selected_end)
+        .map(|(start, end)| start..end)
+}
+
+#[cfg(test)]
+mod first_letter_tests {
+    use super::first_letter_byte_range;
+
+    #[test]
+    fn selects_symbol_first_letters_and_associated_punctuation() {
+        for (text, expected) in [
+            ("$1,234.56", "$"),
+            ("(£)78.90", "(£)"),
+            ("₹10,000", "₹"),
+            ("©2021", "©"),
+        ] {
+            let range = first_letter_byte_range(text).expect("expected first-letter text");
+            assert_eq!(&text[range], expected, "{text}");
         }
     }
-    saw_letter.then(|| start.unwrap_or(0)..end.unwrap_or(0))
+
+    #[test]
+    fn preserves_complete_typographic_units_and_associated_spaces() {
+        let text = "“\u{00a0}e\u{301}”x";
+        let range = first_letter_byte_range(text).expect("expected first-letter text");
+        assert_eq!(&text[range], "“\u{00a0}e\u{301}”");
+    }
+
+    #[test]
+    fn rejects_unassociated_prefix_punctuation() {
+        assert_eq!(first_letter_byte_range("(\u{3000}A"), None);
+    }
 }

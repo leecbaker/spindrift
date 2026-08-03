@@ -56,6 +56,11 @@ impl<'a> LayoutBuilder<'a> {
         emphasis_style.text_decoration = ComputedStyle::initial().text_decoration;
         emphasis_style.text_shadow.clear();
         emphasis_style.text_emphasis_style = TextEmphasisStyle::None;
+        // Emphasis marks are independently shaped annotations. They inherit
+        // the text's font selection but never the inter-character spacing
+        // that belongs between the annotated source characters.
+        // <https://drafts.csswg.org/css-text-decor-4/#emphasis-marks>
+        emphasis_style.letter_spacing = crate::css::ComputedLengthPercentage::ZERO;
         emphasis_style.color = style.text_emphasis_color.unwrap_or(style.color);
         emphasis_style.font_size = (style.font_size * 0.5).max(1.0);
         let mark_width = self.font_system.measure_text(mark, &emphasis_style);
@@ -73,8 +78,38 @@ impl<'a> LayoutBuilder<'a> {
         runs: &[RenderedTextRun],
         phase: TextDecorationPaintPhase,
     ) {
-        self.paint_text_decoration_lines_for_phase_with_color(
-            x, baseline_y, width, style, runs, phase, None,
+        self.paint_text_decoration_lines_for_phase_with_color_and_line_geometries(
+            x,
+            baseline_y,
+            width,
+            style,
+            runs,
+            phase,
+            None,
+            &[],
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::layout) fn paint_text_decoration_lines_for_phase_with_line_geometries(
+        &mut self,
+        x: f32,
+        baseline_y: f32,
+        width: f32,
+        style: &ComputedStyle,
+        runs: &[RenderedTextRun],
+        phase: TextDecorationPaintPhase,
+        line_geometries: &[TextDecorationOriginLineGeometry],
+    ) {
+        self.paint_text_decoration_lines_for_phase_with_color_and_line_geometries(
+            x,
+            baseline_y,
+            width,
+            style,
+            runs,
+            phase,
+            None,
+            line_geometries,
         );
     }
 
@@ -89,11 +124,38 @@ impl<'a> LayoutBuilder<'a> {
         phase: TextDecorationPaintPhase,
         color_override: Option<CssColor>,
     ) {
+        self.paint_text_decoration_lines_for_phase_with_color_and_line_geometries(
+            x,
+            baseline_y,
+            width,
+            style,
+            runs,
+            phase,
+            color_override,
+            &[],
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_text_decoration_lines_for_phase_with_color_and_line_geometries(
+        &mut self,
+        x: f32,
+        baseline_y: f32,
+        width: f32,
+        style: &ComputedStyle,
+        runs: &[RenderedTextRun],
+        phase: TextDecorationPaintPhase,
+        color_override: Option<CssColor>,
+        line_geometries: &[TextDecorationOriginLineGeometry],
+    ) {
         let decorations = active_text_decoration_layers(style);
         if decorations.is_empty() || width <= 0.0 {
             return;
         }
-        for decoration in decorations {
+        for decoration in &decorations {
+            let line_geometry = line_geometries.iter().find(|geometry| {
+                std::rc::Rc::ptr_eq(&geometry.origin_style, &decoration.origin_style)
+            });
             self.paint_text_decoration_layer(
                 x,
                 baseline_y,
@@ -103,6 +165,7 @@ impl<'a> LayoutBuilder<'a> {
                 decoration,
                 phase,
                 color_override,
+                line_geometry,
             );
         }
     }
@@ -115,31 +178,79 @@ impl<'a> LayoutBuilder<'a> {
         width: f32,
         style: &ComputedStyle,
         runs: &[RenderedTextRun],
-        decoration: TextDecoration,
+        decoration: &TextDecorationLayer,
         phase: TextDecorationPaintPhase,
         color_override: Option<CssColor>,
+        line_geometry: Option<&TextDecorationOriginLineGeometry>,
     ) {
-        if !decoration.has_visible_line() || width <= 0.0 {
+        if !decoration.decoration.has_visible_line() || width <= 0.0 {
             return;
         }
-        let color = color_override.or(decoration.color).unwrap_or(style.color);
-        let (inset_start, inset_end) = decoration.inset.clone().used(style.font_size);
-        let font_id = self.font_system.resolve_style(style);
-        let metrics = self.font_system.text_decoration_metrics(font_id, style);
-        let ink_boxes = self.font_system.glyph_ink_boxes_for_runs(runs, baseline_y);
+        // A line decoration's declared values belong to its origin. The
+        // current selected text contributes the considered-text metrics used
+        // by this per-line geometry adapter; line-level aggregation extends
+        // the same representation across adjacent prepared groups.
+        //
+        // CSS Text Decoration Level 3 § 2, Line Decoration.
+        // <https://www.w3.org/TR/css-text-decor-3/#line-decoration>
+        let origin_style = decoration.origin_style.as_ref();
+        let color = color_override.unwrap_or_else(|| {
+            decoration
+                .decoration
+                .color
+                .resolve(decoration.origin_style.color)
+        });
+        let (inset_start, inset_end) = decoration
+            .decoration
+            .inset
+            .clone()
+            .used(origin_style.font_size);
+        let (baseline, geometry) = if let Some(line_geometry) = line_geometry {
+            let baseline = match style.writing_mode {
+                WritingMode::HorizontalTb => PaintPoint::new(x, line_geometry.line_reference.y),
+                WritingMode::VerticalRl
+                | WritingMode::VerticalLr
+                | WritingMode::SidewaysRl
+                | WritingMode::SidewaysLr => {
+                    PaintPoint::new(line_geometry.line_reference.x, baseline_y)
+                }
+            };
+            (baseline, line_geometry.geometry)
+        } else {
+            let considered_font_id = self.font_system.resolve_style(style);
+            let considered_metrics = self
+                .font_system
+                .text_decoration_metrics(considered_font_id, style);
+            (
+                PaintPoint::new(x, baseline_y),
+                TextDecorationLineGeometry::from_origin_and_considered_text(
+                    origin_style,
+                    style,
+                    considered_metrics,
+                ),
+            )
+        };
+        let ink_boxes = self.font_system.glyph_ink_boxes_for_runs(runs, baseline.y);
+        let selected_glyphs =
+            line_geometry.map(|geometry| geometry.glyph_sequence.glyphs.as_slice());
         for stroke in prepare_text_decoration_strokes(TextDecorationPreparationInput {
-            baseline: PaintPoint::new(x, baseline_y),
+            baseline,
             inline_span: TextInlineSpan::from_start_and_length(x, width),
             inset_start,
             inset_end,
             style,
-            decoration,
+            decoration: decoration.decoration.clone(),
             phase,
             color,
             color_override,
-            metrics,
+            geometry,
         }) {
-            self.paint_text_decoration_stroke(stroke, runs, &ink_boxes);
+            self.paint_text_decoration_stroke_with_selected_glyphs(
+                stroke,
+                runs,
+                &ink_boxes,
+                selected_glyphs,
+            );
         }
     }
 
@@ -149,11 +260,22 @@ impl<'a> LayoutBuilder<'a> {
     /// decoration styles; PDF paths/strokes are the backend representation for
     /// non-rectangular strokes:
     /// <https://www.w3.org/TR/css-text-decor-3/#text-decoration-style-property>.
+    #[allow(dead_code)]
     pub(in crate::layout) fn paint_text_decoration_stroke(
         &mut self,
         stroke: PreparedTextDecorationStroke,
         runs: &[RenderedTextRun],
         ink_boxes: &[GlyphInkBox],
+    ) {
+        self.paint_text_decoration_stroke_with_selected_glyphs(stroke, runs, ink_boxes, None);
+    }
+
+    fn paint_text_decoration_stroke_with_selected_glyphs(
+        &mut self,
+        stroke: PreparedTextDecorationStroke,
+        runs: &[RenderedTextRun],
+        ink_boxes: &[GlyphInkBox],
+        selected_glyphs: Option<&[TextDecorationPositionedGlyph]>,
     ) {
         let PreparedTextDecorationStroke {
             axis,
@@ -170,7 +292,7 @@ impl<'a> LayoutBuilder<'a> {
         let line_y = baseline.y;
         let inline_start = inline_span.start;
         let inline_length = inline_span.length();
-        let segments = text_decoration_segments(
+        let segments = text_decoration_segments_with_selected_glyphs(
             TextDecorationSegmentInputs {
                 axis,
                 line_x,
@@ -184,6 +306,7 @@ impl<'a> LayoutBuilder<'a> {
             },
             runs,
             ink_boxes,
+            selected_glyphs,
         );
         match style {
             TextDecorationStyle::Double if thickness >= 1.5 => {

@@ -1,5 +1,5 @@
 use super::*;
-use crate::css::{TextDecoration, TextDecorationSkipSelf};
+use crate::css::{TextDecorationLayer, TextDecorationSkipSelf};
 
 mod glyphs;
 mod paint;
@@ -12,14 +12,11 @@ pub(in crate::layout) use self::segments::*;
 
 pub(in crate::layout) fn active_text_decoration_layers(
     style: &ComputedStyle,
-) -> Vec<TextDecoration> {
-    if !style.text_decoration_layers.is_empty() {
-        return style.text_decoration_layers.clone();
-    }
-    if style.text_decoration.clone().has_visible_line() {
-        return vec![style.text_decoration.clone()];
-    }
-    Vec::new()
+) -> Vec<TextDecorationLayer> {
+    // Every decoration origin is finalized when its computed style is
+    // created.  Using the raw longhands as a fallback here would let an
+    // ancestor's values leak across an atomic inline boundary.
+    style.text_decoration_layers.clone()
 }
 
 pub(in crate::layout) fn text_decoration_skip_self_suppresses(

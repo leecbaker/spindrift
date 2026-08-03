@@ -61,26 +61,66 @@ impl ComputedGap {
 /// <https://drafts.csswg.org/css-gaps-1/#lists-repeat> and
 /// <https://drafts.csswg.org/css-gaps-1/#assigning>.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct GapRuleList<T> {
-    pub(crate) leading: Rc<[GapRuleListComponent<T>]>,
-    pub(crate) auto: Option<Rc<[T]>>,
-    pub(crate) trailing: Rc<[GapRuleListComponent<T>]>,
+pub(crate) enum GapRuleList<T> {
+    /// The common non-repeating one-value form. Keeping this inline is
+    /// important because every computed style starts with six rule lists.
+    Single(T),
+    /// A list with fixed components and/or an automatic repeater. The `Rc`
+    /// slices preserve cheap inherited-style cloning while width resolution
+    /// can still use copy-on-write mutation.
+    Pattern {
+        leading: Option<Rc<[GapRuleListComponent<T>]>>,
+        auto: Option<Rc<[T]>>,
+        trailing: Option<Rc<[GapRuleListComponent<T>]>>,
+    },
 }
 
 impl<T> GapRuleList<T> {
     pub(crate) fn single(value: T) -> Self {
-        Self::from_parts(vec![GapRuleListComponent::Value(value)], None, Vec::new())
+        Self::Single(value)
     }
 
     pub(crate) fn from_parts(
-        leading: Vec<GapRuleListComponent<T>>,
+        mut leading: Vec<GapRuleListComponent<T>>,
         auto: Option<Vec<T>>,
         trailing: Vec<GapRuleListComponent<T>>,
     ) -> Self {
-        Self {
-            leading: Rc::from(leading.into_boxed_slice()),
+        if auto.is_none() && trailing.is_empty() && leading.len() == 1 {
+            let component = leading.pop().expect("checked singleton component");
+            if let GapRuleListComponent::Value(value) = component {
+                return Self::Single(value);
+            }
+            leading.push(component);
+        }
+
+        Self::Pattern {
+            leading: (!leading.is_empty()).then(|| Rc::from(leading.into_boxed_slice())),
             auto: auto.map(|values| Rc::from(values.into_boxed_slice())),
-            trailing: Rc::from(trailing.into_boxed_slice()),
+            trailing: (!trailing.is_empty()).then(|| Rc::from(trailing.into_boxed_slice())),
+        }
+    }
+
+    pub(crate) fn map<U>(&self, map: impl Fn(&T) -> U + Copy) -> GapRuleList<U> {
+        match self {
+            Self::Single(value) => GapRuleList::single(map(value)),
+            Self::Pattern {
+                leading,
+                auto,
+                trailing,
+            } => GapRuleList::from_parts(
+                leading
+                    .iter()
+                    .flat_map(|components| components.iter())
+                    .map(|component| map_gap_rule_list_component(component, map))
+                    .collect(),
+                auto.as_deref()
+                    .map(|values| values.iter().map(map).collect()),
+                trailing
+                    .iter()
+                    .flat_map(|components| components.iter())
+                    .map(|component| map_gap_rule_list_component(component, map))
+                    .collect(),
+            ),
         }
     }
 }
@@ -90,18 +130,32 @@ impl<T: Clone> GapRuleList<T> {
         if index >= count {
             return None;
         }
-        let leading_len = expanded_gap_rule_components_len(&self.leading);
-        let trailing_len = expanded_gap_rule_components_len(&self.trailing);
-        let Some(auto) = &self.auto else {
-            if leading_len == 0 {
-                return None;
-            }
-            return gap_rule_components_value_at(&self.leading, index % leading_len);
+
+        let Self::Pattern {
+            leading,
+            auto,
+            trailing,
+        } = self
+        else {
+            let Self::Single(value) = self else {
+                unreachable!();
+            };
+            return Some(value.clone());
+        };
+
+        let leading = leading.as_deref().unwrap_or_default();
+        let trailing = trailing.as_deref().unwrap_or_default();
+        let leading_len = expanded_gap_rule_components_len(leading);
+        let trailing_len = expanded_gap_rule_components_len(trailing);
+        let Some(auto) = auto else {
+            return (leading_len != 0)
+                .then(|| gap_rule_components_value_at(leading, index % leading_len))
+                .flatten();
         };
 
         let leading_count = leading_len.min(count);
         if index < leading_count {
-            return gap_rule_components_value_at(&self.leading, index);
+            return gap_rule_components_value_at(leading, index);
         }
 
         let trailing_count = trailing_len.min(count.saturating_sub(leading_count));
@@ -115,7 +169,7 @@ impl<T: Clone> GapRuleList<T> {
         }
 
         let trailing_index = auto_index - auto_count;
-        gap_rule_components_value_at(&self.trailing, trailing_index)
+        gap_rule_components_value_at(trailing, trailing_index)
     }
 
     #[cfg(test)]
@@ -123,6 +177,19 @@ impl<T: Clone> GapRuleList<T> {
         (0..count)
             .filter_map(|index| self.value_for_index(index, count))
             .collect()
+    }
+}
+
+fn map_gap_rule_list_component<T, U>(
+    component: &GapRuleListComponent<T>,
+    map: impl Fn(&T) -> U + Copy,
+) -> GapRuleListComponent<U> {
+    match component {
+        GapRuleListComponent::Value(value) => GapRuleListComponent::Value(map(value)),
+        GapRuleListComponent::Repeat { count, values } => GapRuleListComponent::Repeat {
+            count: *count,
+            values: values.iter().map(map).collect(),
+        },
     }
 }
 
@@ -279,60 +346,36 @@ fn scale_gap_rule_width_list_fixed_components(
     list: &mut GapRuleList<ComputedLengthPercentage>,
     factor: f32,
 ) {
-    for component in Rc::make_mut(&mut list.leading)
-        .iter_mut()
-        .chain(Rc::make_mut(&mut list.trailing).iter_mut())
-    {
-        match component {
-            GapRuleListComponent::Value(value) => value.scale_fixed_length_components(factor),
-            GapRuleListComponent::Repeat { values, .. } => {
-                for value in values {
-                    value.scale_fixed_length_components(factor);
-                }
-            }
-        }
-    }
-    if let Some(values) = &mut list.auto {
-        for value in Rc::make_mut(values) {
-            value.scale_fixed_length_components(factor);
-        }
-    }
+    for_each_gap_rule_width_mut(list, |value| value.scale_fixed_length_components(factor));
 }
 
 fn resolve_gap_rule_width_list_font_lengths(
     list: &mut GapRuleList<ComputedLengthPercentage>,
     ch_advance: LayoutLength,
 ) {
-    for component in Rc::make_mut(&mut list.leading)
-        .iter_mut()
-        .chain(Rc::make_mut(&mut list.trailing).iter_mut())
-    {
-        match component {
-            GapRuleListComponent::Value(value) => value.resolve_font_metric_lengths(ch_advance),
-            GapRuleListComponent::Repeat { values, .. } => {
-                for value in values {
-                    value.resolve_font_metric_lengths(ch_advance);
-                }
-            }
-        }
-    }
-    if let Some(values) = &mut list.auto {
-        for value in Rc::make_mut(values) {
-            value.resolve_font_metric_lengths(ch_advance);
-        }
-    }
+    for_each_gap_rule_width_mut(list, |value| value.resolve_font_metric_lengths(ch_advance));
 }
 
 fn gap_rule_width_list_requires_ch_advance(list: &GapRuleList<ComputedLengthPercentage>) -> bool {
-    list.leading
-        .iter()
-        .chain(list.trailing.iter())
-        .any(gap_rule_component_requires_ch_advance)
-        || list.auto.as_deref().is_some_and(|values| {
-            values
+    match list {
+        GapRuleList::Single(value) => value.requires_ch_advance(),
+        GapRuleList::Pattern {
+            leading,
+            auto,
+            trailing,
+        } => {
+            leading
                 .iter()
-                .any(ComputedLengthPercentage::requires_ch_advance)
-        })
+                .flat_map(|components| components.iter())
+                .chain(trailing.iter().flat_map(|components| components.iter()))
+                .any(gap_rule_component_requires_ch_advance)
+                || auto.as_deref().is_some_and(|values| {
+                    values
+                        .iter()
+                        .any(ComputedLengthPercentage::requires_ch_advance)
+                })
+        }
+    }
 }
 
 fn gap_rule_component_requires_ch_advance(
@@ -350,22 +393,37 @@ fn resolve_gap_rule_width_list_viewport_lengths(
     list: &mut GapRuleList<ComputedLengthPercentage>,
     basis: ViewportLengthBasis,
 ) {
-    for component in Rc::make_mut(&mut list.leading)
-        .iter_mut()
-        .chain(Rc::make_mut(&mut list.trailing).iter_mut())
-    {
-        match component {
-            GapRuleListComponent::Value(value) => value.resolve_viewport_lengths(basis),
-            GapRuleListComponent::Repeat { values, .. } => {
-                for value in values {
-                    value.resolve_viewport_lengths(basis);
+    for_each_gap_rule_width_mut(list, |value| value.resolve_viewport_lengths(basis));
+}
+
+fn for_each_gap_rule_width_mut(
+    list: &mut GapRuleList<ComputedLengthPercentage>,
+    mut apply: impl FnMut(&mut ComputedLengthPercentage),
+) {
+    match list {
+        GapRuleList::Single(value) => apply(value),
+        GapRuleList::Pattern {
+            leading,
+            auto,
+            trailing,
+        } => {
+            for components in [leading, trailing].into_iter().flatten() {
+                for component in Rc::make_mut(components) {
+                    match component {
+                        GapRuleListComponent::Value(value) => apply(value),
+                        GapRuleListComponent::Repeat { values, .. } => {
+                            for value in values {
+                                apply(value);
+                            }
+                        }
+                    }
                 }
             }
-        }
-    }
-    if let Some(values) = &mut list.auto {
-        for value in Rc::make_mut(values) {
-            value.resolve_viewport_lengths(basis);
+            if let Some(values) = auto {
+                for value in Rc::make_mut(values) {
+                    apply(value);
+                }
+            }
         }
     }
 }
@@ -399,6 +457,64 @@ impl ResolveViewportLengths for GapRuleAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::LayoutSize;
+
+    #[test]
+    fn singleton_gap_rule_lists_are_inline() {
+        let direct = GapRuleList::single(1);
+        let canonicalized =
+            GapRuleList::from_parts(vec![GapRuleListComponent::Value(2)], None, Vec::new());
+
+        assert!(matches!(direct, GapRuleList::Single(1)));
+        assert!(matches!(canonicalized, GapRuleList::Single(2)));
+    }
+
+    #[test]
+    fn shared_gap_rule_width_lists_copy_on_write_during_zoom_resolution() {
+        let mut original = GapRuleList::from_parts(
+            vec![
+                GapRuleListComponent::Value(ComputedLengthPercentage::from_points(2.0)),
+                GapRuleListComponent::Value(ComputedLengthPercentage::from_points(4.0)),
+            ],
+            None,
+            Vec::new(),
+        );
+        let inherited = original.clone();
+
+        scale_gap_rule_width_list_fixed_components(&mut original, 2.0);
+
+        assert_eq!(original.value_for_index(0, 2).unwrap().length_points(), 4.0);
+        assert_eq!(
+            inherited.value_for_index(0, 2).unwrap().length_points(),
+            2.0
+        );
+    }
+
+    #[test]
+    fn inline_gap_rule_widths_resolve_font_and_viewport_lengths() {
+        let mut font_relative = GapRuleList::single(ComputedLengthPercentage::from_ch(2.0));
+        resolve_gap_rule_width_list_font_lengths(&mut font_relative, layout_pt(3.0));
+        assert_eq!(
+            font_relative.value_for_index(0, 1).unwrap().length_points(),
+            6.0
+        );
+
+        let mut viewport_relative = GapRuleList::single(ComputedLengthPercentage::from_vw(10.0));
+        resolve_gap_rule_width_list_viewport_lengths(
+            &mut viewport_relative,
+            ViewportLengthBasis::for_writing_mode(
+                LayoutSize::new(200.0, 100.0),
+                WritingMode::HorizontalTb,
+            ),
+        );
+        assert_eq!(
+            viewport_relative
+                .value_for_index(0, 1)
+                .unwrap()
+                .length_points(),
+            20.0
+        );
+    }
 
     #[test]
     fn auto_gap_rule_list_truncates_excess_trailing_values_at_the_end() {

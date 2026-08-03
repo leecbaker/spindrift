@@ -178,11 +178,11 @@ impl DeferredFontSize {
                 if let Some(basis) = viewport {
                     value.resolve_viewport_lengths(basis);
                 }
-                value.resolve_font_relative_lengths(FontRelativeLengthBasis::new(
-                    layout_pt(parent_font_size),
-                    parent_ch_advance,
-                ));
+                value.resolve_font_relative_lengths(parent);
                 value.resolve_font_metric_lengths(parent_ch_advance);
+                value.resolve_ic_relative_lengths(parent.ic_advance());
+                value.resolve_ex_relative_lengths(parent.x_height().points());
+                value.resolve_cap_relative_lengths(parent.cap_height().points());
                 if let Some(root_metrics) = root_metrics {
                     value.resolve_root_font_relative_lengths(root_metrics.font_size.points());
                     value.resolve_root_font_metric_lengths(root_metrics);
@@ -193,11 +193,10 @@ impl DeferredFontSize {
                     value.resolve_root_font_relative_lengths(ROOT_FONT_SIZE_PT);
                 }
                 // `font-size` resolves its font-relative units against the
-                // parent font. `ex` has a 0.5em fallback while the selected
-                // font's x-height is unavailable to the computed-value
-                // cascade:
+                // parent selected font. `FontRelativeLengthBasis` retains the
+                // CSS metric fallbacks for cascade-time callers that have not
+                // selected a font yet:
                 // <https://www.w3.org/TR/css-values-4/#ex>.
-                value.resolve_ex_relative_lengths(parent_font_size * 0.5);
                 value
                     .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(
                         parent_font_size,
@@ -222,6 +221,20 @@ impl DeferredFontSize {
             Self::Absolute(_) | Self::Inherit | Self::ParentLineHeight(_) => false,
             Self::RelativeToParent(value) => value.requires_ch_advance(),
         }
+    }
+
+    /// Whether this `font-size` must receive the document-root metric
+    /// snapshot after cascade has produced its provisional value.
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        match self {
+            Self::Absolute(_) | Self::Inherit | Self::ParentLineHeight(_) => false,
+            Self::RelativeToParent(value) => value.requires_root_font_metrics(),
+        }
+    }
+
+    /// Whether this `font-size` needs the parent selected font's metrics.
+    pub(crate) fn requires_parent_selected_font_metrics(&self) -> bool {
+        matches!(self, Self::RelativeToParent(value) if value.requires_parent_selected_font_metrics())
     }
 }
 

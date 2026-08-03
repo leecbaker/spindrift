@@ -1,6 +1,6 @@
 use super::font_loading::post_script_name_for_face;
 use super::*;
-use crate::document::{CssFontVerticalMetrics, OpenTypeVerticalMetrics};
+use crate::document::{CssFontVerticalMetrics, DocumentFontSynthesis, OpenTypeVerticalMetrics};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FontSupportKind {
@@ -19,6 +19,7 @@ struct DocumentFontMetadata {
     italic_angle: i16,
     bbox: [i16; 4],
     size_adjust: Option<f32>,
+    synthesis: DocumentFontSynthesis,
 }
 
 impl DocumentFontRegistry {
@@ -179,6 +180,7 @@ impl DocumentFontRegistry {
         font: FontiqueQueryFont,
         family_override: Option<&str>,
         request: &FontRequest,
+        synthesize_weight: bool,
     ) -> Option<usize> {
         let registered_face = RegisteredFontFaceKey {
             family_id: font.family.0.to_u64(),
@@ -193,6 +195,7 @@ impl DocumentFontRegistry {
             family_index: font.family.1,
             face_index: font.index,
             request: request.attributes,
+            synthesize_weight,
         };
         if family_override.is_none()
             && let Some(id) = self.font_cache.get(&key)
@@ -216,6 +219,7 @@ impl DocumentFontRegistry {
             registered_face,
             family_label: Some(family.clone()),
             request: Some(request.clone()),
+            synthesize_weight,
         };
         if let Some(id) = self.font_blob_cache.get(&resolved_key) {
             return Some(*id);
@@ -229,7 +233,7 @@ impl DocumentFontRegistry {
             data,
             font.index,
             family,
-            font.synthesis.embolden() || request.attributes.weight >= FontWeight::BOLD.0,
+            synthesize_weight && font.synthesis.embolden(),
             font.synthesis.skew().is_some() || request.attributes.style != 0,
             size_adjust,
         )?;
@@ -260,6 +264,7 @@ impl DocumentFontRegistry {
             registered_face: None,
             family_label: Some(family.clone()),
             request: None,
+            synthesize_weight: false,
         };
         if let Some(id) = self.font_blob_cache.get(&resolved_key) {
             return Some(*id);
@@ -275,12 +280,14 @@ impl DocumentFontRegistry {
         &self,
         font_data: &parley::FontData,
         request: &FontRequest,
+        synthesize_weight: bool,
     ) -> Option<usize> {
         self.parley_font_cache
             .get(&ParleyFontRequestKey {
                 blob_id: font_data.data.id(),
                 face_index: font_data.index,
                 request: request.clone(),
+                synthesize_weight,
             })
             .cloned()
     }
@@ -289,6 +296,7 @@ impl DocumentFontRegistry {
         &mut self,
         font_data: &parley::FontData,
         request: &FontRequest,
+        synthesize_weight: bool,
         font_id: usize,
     ) {
         self.parley_font_cache.insert(
@@ -296,6 +304,7 @@ impl DocumentFontRegistry {
                 blob_id: font_data.data.id(),
                 face_index: font_data.index,
                 request: request.clone(),
+                synthesize_weight,
             },
             font_id,
         );
@@ -346,6 +355,15 @@ impl DocumentFontRegistry {
         })
     }
 
+    /// Whether a face provides emoji presentation for a run. Platform emoji
+    /// fonts commonly use bitmap/SVG tables that `ttf-parser` cannot report as
+    /// COLR color glyphs, so their registered emoji identity is part of the
+    /// presentation capability as well.
+    pub(super) fn run_has_emoji_presentation_glyph(&self, font_id: usize, text: &str) -> bool {
+        self.run_has_color_glyph(font_id, text)
+            || self.support_kind_for_run(font_id, text) == FontSupportKind::ColorOrEmojiOnlyFallback
+    }
+
     fn push_document_font(
         &mut self,
         metadata: DocumentFontMetadata,
@@ -367,6 +385,7 @@ impl DocumentFontRegistry {
             cap_height: metadata.cap_height,
             italic_angle: metadata.italic_angle,
             bbox: metadata.bbox,
+            synthesis: metadata.synthesis,
         });
         if let Some(size_adjust) = metadata.size_adjust {
             self.font_size_adjust.insert(id, size_adjust);
@@ -432,6 +451,9 @@ fn document_font_metadata(
         italic_angle: face.italic_angle().round() as i16,
         bbox,
         size_adjust,
+        synthesis: DocumentFontSynthesis {
+            embolden: synthesize_bold,
+        },
     })
 }
 

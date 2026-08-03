@@ -1,18 +1,5 @@
 use super::*;
-
-pub(super) fn taffy_box_sizing(value: BoxSizing) -> taffy_layout::BoxSizing {
-    match value {
-        BoxSizing::BorderBox => taffy_layout::BoxSizing::BorderBox,
-        BoxSizing::ContentBox => taffy_layout::BoxSizing::ContentBox,
-    }
-}
-
-pub(super) fn taffy_direction(value: Direction) -> taffy::style::Direction {
-    match value {
-        Direction::Ltr => taffy::style::Direction::Ltr,
-        Direction::Rtl => taffy::style::Direction::Rtl,
-    }
-}
+use crate::layout::taffy_bridge;
 
 pub(super) fn taffy_dimension(
     value: css::ComputedLengthPercentageOrAuto,
@@ -51,27 +38,70 @@ pub(super) fn taffy_grid_item_dimension(
     min_content: ContentBoxLength,
     max_content: ContentBoxLength,
 ) -> taffy_layout::Dimension {
+    taffy_grid_item_dimension_for_purpose(
+        value,
+        percentage_basis,
+        min_content,
+        max_content,
+        GridTaffyDimensionPurpose::UsedItemSize,
+    )
+}
+
+/// Selects the CSS Grid phase that consumes the converted Taffy dimension.
+///
+/// A grid item's used size may retain a pure percentage until its final grid
+/// area is known. A min/max constraint instead participates in track sizing,
+/// where Taffy would otherwise resolve the percentage against its available
+/// sizing input. CSS Grid gives those phases different percentage bases:
+/// <https://www.w3.org/TR/css-grid-1/#grid-item-sizing> and
+/// <https://www.w3.org/TR/css-grid-1/#algo-track-sizing>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GridTaffyDimensionPurpose {
+    UsedItemSize,
+    TrackSizingConstraint,
+}
+
+/// Convert a Grid item size or constraint into Taffy's scalar dimension model.
+///
+/// The CSS sizing keywords have identical behavior in Grid's item-layout and
+/// track-sizing phases. Only the `<length-percentage>` branch differs, because
+/// pure percentages must remain tied to the final grid area for a used item
+/// size but must not be resolved by Taffy's track-sizing available space.
+fn taffy_grid_item_dimension_for_purpose(
+    value: css::ComputedLengthPercentageOrAuto,
+    percentage_basis: GridPercentageBasis,
+    min_content: ContentBoxLength,
+    max_content: ContentBoxLength,
+    purpose: GridTaffyDimensionPurpose,
+) -> taffy_layout::Dimension {
     let min_content = min_content.points().max(0.0);
     let max_content = max_content.points().max(min_content);
     match value {
         css::ComputedLengthPercentageOrAuto::Auto
         | css::ComputedLengthPercentageOrAuto::Stretch => taffy_layout::Dimension::auto(),
         css::ComputedLengthPercentageOrAuto::LengthPercentage(value) => {
-            // A grid item's percentage size resolves against its final grid
-            // area, not the grid container. Preserve a pure percentage for
-            // Taffy's grid-item resolution instead of eagerly turning it
-            // into a container-relative length:
-            // <https://www.w3.org/TR/css-grid-1/#grid-item-sizing>.
-            if let Some(percent) = value
-                .pure_percentage_coefficient()
-                .filter(|percent| *percent != 0.0)
-            {
-                percentage_basis
-                    .points()
-                    .map(|_| taffy_layout::Dimension::percent(percent))
-                    .unwrap_or_else(taffy_layout::Dimension::auto)
-            } else {
-                taffy_dimension_from_length_percentage_with_basis(value, percentage_basis)
+            match purpose {
+                GridTaffyDimensionPurpose::UsedItemSize => {
+                    // A grid item's percentage size resolves against its final grid
+                    // area, not the grid container. Preserve a pure percentage for
+                    // Taffy's grid-item resolution instead of eagerly turning it
+                    // into a container-relative length:
+                    // <https://www.w3.org/TR/css-grid-1/#grid-item-sizing>.
+                    if let Some(percent) = value
+                        .pure_percentage_coefficient()
+                        .filter(|percent| *percent != 0.0)
+                    {
+                        percentage_basis
+                            .points()
+                            .map(|_| taffy_layout::Dimension::percent(percent))
+                            .unwrap_or_else(taffy_layout::Dimension::auto)
+                    } else {
+                        taffy_dimension_from_length_percentage_with_basis(value, percentage_basis)
+                    }
+                }
+                GridTaffyDimensionPurpose::TrackSizingConstraint => {
+                    taffy_dimension_from_length_percentage_with_basis(value, percentage_basis)
+                }
             }
         }
         css::ComputedLengthPercentageOrAuto::MinContent => {
@@ -124,49 +154,13 @@ pub(super) fn taffy_grid_item_constraint_dimension(
     min_content: ContentBoxLength,
     max_content: ContentBoxLength,
 ) -> taffy_layout::Dimension {
-    let min_content = min_content.points().max(0.0);
-    let max_content = max_content.points().max(min_content);
-    match value {
-        css::ComputedLengthPercentageOrAuto::Auto
-        | css::ComputedLengthPercentageOrAuto::Stretch => taffy_layout::Dimension::auto(),
-        css::ComputedLengthPercentageOrAuto::LengthPercentage(value) => {
-            taffy_dimension_from_length_percentage_with_basis(value, percentage_basis)
-        }
-        css::ComputedLengthPercentageOrAuto::MinContent => {
-            taffy_layout::Dimension::length(min_content)
-        }
-        css::ComputedLengthPercentageOrAuto::MaxContent => {
-            taffy_layout::Dimension::length(max_content)
-        }
-        css::ComputedLengthPercentageOrAuto::FitContent(limit) => {
-            let limit = limit
-                .and_then(|limit| {
-                    percentage_basis.points().map(|basis| {
-                        used_length_percentage(limit, PercentageBasis::definite(layout_pt(basis)))
-                            .points()
-                    })
-                })
-                .unwrap_or(max_content);
-            taffy_layout::Dimension::length(max_content.min(min_content.max(limit)).max(0.0))
-        }
-        css::ComputedLengthPercentageOrAuto::CalcSize(value) => {
-            let percentage_basis = percentage_basis.points().unwrap_or(0.0);
-            let fit_content = max_content.min(min_content.max(percentage_basis));
-            taffy_layout::Dimension::length(
-                value
-                    .used_value(
-                        max_content,
-                        min_content,
-                        max_content,
-                        fit_content,
-                        percentage_basis,
-                        PercentageBasis::definite(layout_pt(percentage_basis)),
-                    )
-                    .max(layout_pt(0.0))
-                    .points(),
-            )
-        }
-    }
+    taffy_grid_item_dimension_for_purpose(
+        value,
+        percentage_basis,
+        min_content,
+        max_content,
+        GridTaffyDimensionPurpose::TrackSizingConstraint,
+    )
 }
 
 pub(super) fn taffy_dimension_from_length_percentage(
@@ -224,39 +218,6 @@ pub(super) fn taffy_dimension_from_length_percentage_with_basis(
     taffy_layout::Dimension::auto()
 }
 
-pub(super) fn taffy_margin(
-    style: &ComputedStyle,
-) -> taffy_layout::Rect<taffy_layout::LengthPercentageAuto> {
-    let edges = style.box_values.margin.clone();
-    taffy_layout::Rect {
-        left: taffy_length_percentage_auto(edges.left),
-        right: taffy_length_percentage_auto(edges.right),
-        top: taffy_length_percentage_auto(edges.top),
-        bottom: taffy_length_percentage_auto(edges.bottom),
-    }
-}
-
-pub(super) fn taffy_padding(
-    style: &ComputedStyle,
-) -> taffy_layout::Rect<taffy_layout::LengthPercentage> {
-    let edges = style.box_values.padding.clone();
-    taffy_layout::Rect {
-        left: taffy_length_percentage(edges.left),
-        right: taffy_length_percentage(edges.right),
-        top: taffy_length_percentage(edges.top),
-        bottom: taffy_length_percentage(edges.bottom),
-    }
-}
-
-pub(super) fn taffy_edges(edges: css::Edges) -> taffy_layout::Rect<taffy_layout::LengthPercentage> {
-    taffy_layout::Rect {
-        left: taffy_layout::LengthPercentage::length(edges.left),
-        right: taffy_layout::LengthPercentage::length(edges.right),
-        top: taffy_layout::LengthPercentage::length(edges.top),
-        bottom: taffy_layout::LengthPercentage::length(edges.bottom),
-    }
-}
-
 pub(super) fn taffy_length_percentage(
     value: css::ComputedLengthPercentage,
 ) -> taffy_layout::LengthPercentage {
@@ -267,65 +228,6 @@ pub(super) fn taffy_length_percentage(
         taffy_layout::LengthPercentage::percent(percent)
     } else {
         taffy_layout::LengthPercentage::length(value.length_points())
-    }
-}
-
-pub(super) fn taffy_length_percentage_auto(
-    value: css::ComputedLengthPercentageOrAuto,
-) -> taffy_layout::LengthPercentageAuto {
-    match value {
-        css::ComputedLengthPercentageOrAuto::Auto
-        | css::ComputedLengthPercentageOrAuto::Stretch => {
-            taffy_layout::LengthPercentageAuto::auto()
-        }
-        css::ComputedLengthPercentageOrAuto::LengthPercentage(value) => {
-            taffy_length_percentage(value).into()
-        }
-        css::ComputedLengthPercentageOrAuto::MinContent
-        | css::ComputedLengthPercentageOrAuto::MaxContent
-        | css::ComputedLengthPercentageOrAuto::FitContent(_) => {
-            taffy_layout::LengthPercentageAuto::auto()
-        }
-        css::ComputedLengthPercentageOrAuto::CalcSize(_) => {
-            taffy_layout::LengthPercentageAuto::auto()
-        }
-    }
-}
-
-/// Convert a grid gap to a Taffy length using the CSS percentage basis.
-///
-/// CSS Grid resolves percentage gaps against the corresponding content-box
-/// size when that size is definite. Cyclic percentages contribute zero during
-/// intrinsic sizing, so an indefinite basis preserves only the non-percentage
-/// length component:
-/// <https://www.w3.org/TR/css-align-3/#gap-percent>.
-pub(super) fn taffy_grid_gap(
-    value: css::ComputedGap,
-    percentage_basis: GridPercentageBasis,
-) -> taffy_layout::LengthPercentage {
-    match value {
-        css::ComputedGap::Normal => taffy_layout::LengthPercentage::length(0.0),
-        css::ComputedGap::LengthPercentage(value) => percentage_basis
-            .points()
-            .map(|basis| {
-                taffy_layout::LengthPercentage::length(
-                    used_length_percentage(
-                        value.clone(),
-                        PercentageBasis::definite(layout_pt(basis.max(0.0))),
-                    )
-                    .points(),
-                )
-            })
-            .unwrap_or_else(|| {
-                taffy_layout::LengthPercentage::length(value.length_max_zero().points())
-            }),
-    }
-}
-
-pub(super) fn taffy_grid_safety(safety: AlignmentSafety) -> taffy_layout::AlignmentSafety {
-    match safety {
-        AlignmentSafety::Default | AlignmentSafety::Unsafe => taffy_layout::AlignmentSafety::Unsafe,
-        AlignmentSafety::Safe => taffy_layout::AlignmentSafety::Safe,
     }
 }
 
@@ -341,44 +243,22 @@ pub(super) fn taffy_grid_content_alignment(
     keyword: ContentAlignmentKeyword,
     safety: AlignmentSafety,
 ) -> taffy_layout::AlignContent {
-    let safety = taffy_grid_safety(safety);
     match keyword {
-        ContentAlignmentKeyword::Normal | ContentAlignmentKeyword::Stretch => {
-            taffy_layout::AlignContent {
-                keyword: taffy_layout::AlignContentKeyword::Stretch,
-                safety,
-            }
-        }
-        ContentAlignmentKeyword::Start => taffy_layout::AlignContent {
+        // Taffy has no Grid content-baseline mode. CSS Align falls a
+        // first/last baseline content-alignment request back to the
+        // corresponding safe start/end alignment when no shared baseline can
+        // be formed. Grid's own baseline resolver supplies sharing later;
+        // preserve the two distinct fallback edges at this adapter boundary.
+        // <https://www.w3.org/TR/css-align-3/#baseline-align-content>
+        ContentAlignmentKeyword::Baseline => taffy_layout::AlignContent {
             keyword: taffy_layout::AlignContentKeyword::Start,
-            safety,
+            safety: taffy_layout::AlignmentSafety::Safe,
         },
-        ContentAlignmentKeyword::End => taffy_layout::AlignContent {
+        ContentAlignmentKeyword::LastBaseline => taffy_layout::AlignContent {
             keyword: taffy_layout::AlignContentKeyword::End,
-            safety,
+            safety: taffy_layout::AlignmentSafety::Safe,
         },
-        ContentAlignmentKeyword::FlexStart | ContentAlignmentKeyword::Left => {
-            taffy_layout::AlignContent {
-                keyword: taffy_layout::AlignContentKeyword::FlexStart,
-                safety,
-            }
-        }
-        ContentAlignmentKeyword::FlexEnd | ContentAlignmentKeyword::Right => {
-            taffy_layout::AlignContent {
-                keyword: taffy_layout::AlignContentKeyword::FlexEnd,
-                safety,
-            }
-        }
-        ContentAlignmentKeyword::Center => taffy_layout::AlignContent {
-            keyword: taffy_layout::AlignContentKeyword::Center,
-            safety,
-        },
-        ContentAlignmentKeyword::SpaceBetween => taffy_layout::AlignContent::SPACE_BETWEEN,
-        ContentAlignmentKeyword::SpaceAround => taffy_layout::AlignContent::SPACE_AROUND,
-        ContentAlignmentKeyword::SpaceEvenly => taffy_layout::AlignContent::SPACE_EVENLY,
-        ContentAlignmentKeyword::Baseline | ContentAlignmentKeyword::LastBaseline => {
-            taffy_layout::AlignContent::FLEX_START
-        }
+        _ => taffy_bridge::content_alignment(keyword, safety),
     }
 }
 
@@ -392,7 +272,7 @@ mod tests {
 
     #[test]
     fn grid_item_dimension_extracts_typed_min_and_max_content_points() {
-        let indefinite_basis = PercentageBasis::indefinite();
+        let indefinite_basis: GridPercentageBasis = PercentageBasis::indefinite();
         let min_content = taffy_grid_item_dimension(
             css::ComputedLengthPercentageOrAuto::MinContent,
             indefinite_basis,
@@ -430,6 +310,82 @@ mod tests {
     }
 
     #[test]
+    fn grid_used_sizes_and_track_constraints_keep_percentage_phases_distinct() {
+        let percent = css::ComputedLengthPercentageOrAuto::LengthPercentage(
+            css::ComputedLengthPercentage::from_percent(0.5),
+        );
+        let definite_basis = grid_percentage_basis(
+            Some(content_box_pt(80.0)),
+            GridAvailableSizeSource::ContainerInlineSize,
+        );
+        let indefinite_basis = PercentageBasis::indefinite();
+
+        assert_eq!(
+            taffy_grid_item_dimension(
+                percent.clone(),
+                definite_basis,
+                content_box_pt(12.0),
+                content_box_pt(48.0),
+            ),
+            taffy_layout::Dimension::percent(0.5),
+        );
+        assert_eq!(
+            taffy_grid_item_constraint_dimension(
+                percent.clone(),
+                definite_basis,
+                content_box_pt(12.0),
+                content_box_pt(48.0),
+            ),
+            taffy_layout::Dimension::length(40.0),
+        );
+        assert!(
+            taffy_grid_item_dimension(
+                percent.clone(),
+                indefinite_basis,
+                content_box_pt(12.0),
+                content_box_pt(48.0),
+            )
+            .is_auto()
+        );
+        assert!(
+            taffy_grid_item_constraint_dimension(
+                percent,
+                indefinite_basis,
+                content_box_pt(12.0),
+                content_box_pt(48.0),
+            )
+            .is_auto()
+        );
+    }
+
+    #[test]
+    fn grid_dimension_purposes_share_intrinsic_keyword_and_calc_size_resolution() {
+        let basis = grid_percentage_basis(
+            Some(content_box_pt(80.0)),
+            GridAvailableSizeSource::ContainerInlineSize,
+        );
+        let min_content = content_box_pt(12.0);
+        let max_content = content_box_pt(48.0);
+        let fit_content = css::ComputedLengthPercentageOrAuto::FitContent(Some(
+            css::ComputedLengthPercentage::from_points(20.0),
+        ));
+        let calc_size = css::ComputedLengthPercentageOrAuto::CalcSize(css::CalcSize {
+            basis: css::CalcSizeBasis::Auto,
+            size_multiplier: 0.5,
+            additive: css::ComputedLengthPercentage::from_points(4.0),
+            lower_bound: None,
+            upper_bound: None,
+        });
+
+        for value in [fit_content, calc_size] {
+            assert_eq!(
+                taffy_grid_item_dimension(value.clone(), basis, min_content, max_content),
+                taffy_grid_item_constraint_dimension(value, basis, min_content, max_content),
+            );
+        }
+    }
+
+    #[test]
     fn grid_dimension_does_not_treat_unresolved_metrics_as_zero() {
         let deferred = css::ComputedLengthPercentage::sum(
             css::ComputedLengthPercentage::from_points(10.0),
@@ -461,33 +417,77 @@ mod tests {
     }
 
     #[test]
+    fn grid_dimension_purposes_keep_zero_percentage_definite_without_a_basis() {
+        let zero_percent = css::ComputedLengthPercentageOrAuto::LengthPercentage(
+            css::ComputedLengthPercentage::from_percent(0.0),
+        );
+        let indefinite_basis = PercentageBasis::indefinite();
+
+        assert_eq!(
+            taffy_grid_item_dimension(
+                zero_percent.clone(),
+                indefinite_basis,
+                content_box_pt(12.0),
+                content_box_pt(48.0),
+            ),
+            taffy_layout::Dimension::length(0.0),
+        );
+        assert_eq!(
+            taffy_grid_item_constraint_dimension(
+                zero_percent,
+                indefinite_basis,
+                content_box_pt(12.0),
+                content_box_pt(48.0),
+            ),
+            taffy_layout::Dimension::length(0.0),
+        );
+    }
+
+    #[test]
     fn grid_gap_resolves_percentages_only_with_definite_basis() {
         let percent_gap =
             css::ComputedGap::LengthPercentage(css::ComputedLengthPercentage::from_percent(0.5));
         let mixed = css::ComputedLengthPercentage::from_affine(layout_pt(4.0), 0.5, true);
         let mixed_gap = css::ComputedGap::LengthPercentage(mixed);
-        let indefinite_basis = PercentageBasis::indefinite();
+        let indefinite_basis: GridPercentageBasis = PercentageBasis::indefinite();
         let definite_basis = grid_percentage_basis(
             Some(content_box_pt(40.0)),
             GridAvailableSizeSource::ContainerInlineSize,
         );
 
         assert_eq!(
-            taffy_grid_gap(percent_gap.clone(), indefinite_basis),
+            taffy_bridge::gap(percent_gap.clone(), indefinite_basis),
             taffy_layout::LengthPercentage::length(0.0)
         );
         assert_eq!(
-            taffy_grid_gap(percent_gap, definite_basis),
+            taffy_bridge::gap(percent_gap, definite_basis),
             taffy_layout::LengthPercentage::length(20.0)
         );
         assert_eq!(
-            taffy_grid_gap(mixed_gap.clone(), indefinite_basis),
+            taffy_bridge::gap(mixed_gap.clone(), indefinite_basis),
             taffy_layout::LengthPercentage::length(4.0)
         );
         assert_eq!(
-            taffy_grid_gap(mixed_gap, definite_basis),
+            taffy_bridge::gap(mixed_gap, definite_basis),
             taffy_layout::LengthPercentage::length(24.0)
         );
+    }
+
+    #[test]
+    fn grid_content_baseline_fallback_preserves_first_and_last_edges() {
+        let first = taffy_grid_content_alignment(
+            ContentAlignmentKeyword::Baseline,
+            AlignmentSafety::Default,
+        );
+        let last = taffy_grid_content_alignment(
+            ContentAlignmentKeyword::LastBaseline,
+            AlignmentSafety::Default,
+        );
+
+        assert_eq!(first.keyword, taffy_layout::AlignContentKeyword::Start);
+        assert_eq!(last.keyword, taffy_layout::AlignContentKeyword::End);
+        assert_eq!(first.safety, taffy_layout::AlignmentSafety::Safe);
+        assert_eq!(last.safety, taffy_layout::AlignmentSafety::Safe);
     }
 
     #[test]
@@ -524,38 +524,7 @@ pub(super) fn taffy_grid_justify_content(
 /// <https://www.w3.org/TR/css-align-3/#self-alignment> and
 /// <https://www.w3.org/TR/css-grid-1/#alignment>.
 pub(super) fn taffy_grid_items_alignment(alignment: AlignItems) -> taffy_layout::AlignItems {
-    let safety = taffy_grid_safety(alignment.safety);
-    match alignment.keyword {
-        SelfAlignmentKeyword::Auto
-        | SelfAlignmentKeyword::Normal
-        | SelfAlignmentKeyword::Stretch => taffy_layout::AlignItems {
-            keyword: taffy_layout::AlignItemsKeyword::Stretch,
-            safety,
-        },
-        SelfAlignmentKeyword::Start | SelfAlignmentKeyword::SelfStart => taffy_layout::AlignItems {
-            keyword: taffy_layout::AlignItemsKeyword::Start,
-            safety,
-        },
-        SelfAlignmentKeyword::End | SelfAlignmentKeyword::SelfEnd => taffy_layout::AlignItems {
-            keyword: taffy_layout::AlignItemsKeyword::End,
-            safety,
-        },
-        SelfAlignmentKeyword::FlexStart | SelfAlignmentKeyword::Left => taffy_layout::AlignItems {
-            keyword: taffy_layout::AlignItemsKeyword::FlexStart,
-            safety,
-        },
-        SelfAlignmentKeyword::FlexEnd | SelfAlignmentKeyword::Right => taffy_layout::AlignItems {
-            keyword: taffy_layout::AlignItemsKeyword::FlexEnd,
-            safety,
-        },
-        SelfAlignmentKeyword::Center => taffy_layout::AlignItems {
-            keyword: taffy_layout::AlignItemsKeyword::Center,
-            safety,
-        },
-        SelfAlignmentKeyword::Baseline | SelfAlignmentKeyword::LastBaseline => {
-            taffy_layout::AlignItems::BASELINE
-        }
-    }
+    taffy_bridge::item_alignment(alignment, taffy_bridge::TaffyAutoAlignment::Stretch)
 }
 
 pub(super) fn taffy_grid_self_alignment(alignment: AlignSelf) -> taffy_layout::AlignSelf {
@@ -641,12 +610,14 @@ pub(super) fn taffy_grid_template_tracks(
         return components;
     };
     let area_track_count = grid_template_area_track_count(areas, axis);
-    if area_track_count <= track_count || auto_tracks.tracks.is_empty() {
+    if area_track_count <= track_count {
         return components;
     }
     components.extend((0..area_track_count - track_count).map(|index| {
         taffy_layout::GridTemplateComponent::Single(taffy_track_size(
-            &auto_tracks.tracks[index % auto_tracks.tracks.len()],
+            auto_tracks
+                .get(index % auto_tracks.len())
+                .expect("grid auto-track list is non-empty"),
         ))
     }));
     components
@@ -1182,13 +1153,10 @@ fn startward_auto_track_size(
     auto_tracks: &css::GridAutoTrackList,
     distance_from_explicit: usize,
 ) -> Option<css::GridTrackSize> {
-    let len = auto_tracks.tracks.len();
-    if len == 0 {
-        return None;
-    }
+    let len = auto_tracks.len();
     let offset = distance_from_explicit % len;
     let index = (len - offset) % len;
-    auto_tracks.tracks.get(index).cloned()
+    auto_tracks.get(index).cloned()
 }
 
 fn expanded_grid_template_tracks_with_auto_repeat_count(
@@ -1211,10 +1179,12 @@ fn expanded_grid_template_tracks_with_auto_repeat_count(
             .collect(),
     };
     let area_track_count = grid_template_area_track_count(areas, axis);
-    if components.len() < area_track_count && !auto_tracks.tracks.is_empty() {
+    if components.len() < area_track_count {
         components.extend((0..area_track_count - components.len()).map(|index| {
             taffy_layout::GridTemplateComponent::Single(taffy_track_size(
-                &auto_tracks.tracks[index % auto_tracks.tracks.len()],
+                auto_tracks
+                    .get(index % auto_tracks.len())
+                    .expect("grid auto-track list is non-empty"),
             ))
         }));
     }
@@ -1569,7 +1539,7 @@ fn grid_template_area_is_rectangular(
 pub(super) fn taffy_grid_auto_tracks(
     value: &css::GridAutoTrackList,
 ) -> Vec<taffy_layout::TrackSizingFunction> {
-    value.tracks.iter().map(taffy_track_size).collect()
+    value.iter().map(taffy_track_size).collect()
 }
 
 pub(super) fn taffy_track_size(value: &css::GridTrackSize) -> taffy_layout::TrackSizingFunction {
@@ -1674,8 +1644,8 @@ fn backward_named_span_startward_line_range(
     let css::GridPlacement::Span(span) = start else {
         return None;
     };
-    let name = span.name.as_ref()?;
-    let target = span.span.unwrap_or(1);
+    let name = span.name()?;
+    let target = span.count().unwrap_or(1);
     if target == 0 {
         return None;
     }
@@ -1711,8 +1681,8 @@ fn negative_named_line_startward_line_range(
     let css::GridPlacement::Line(line) = start else {
         return None;
     };
-    let name = line.name.as_ref()?;
-    let occurrence = line.index.unwrap_or(1);
+    let name = line.name()?;
+    let occurrence = line.index().unwrap_or(1);
     if occurrence >= 0 {
         return None;
     }
@@ -1724,8 +1694,8 @@ fn negative_named_line_startward_line_range(
     let end_line = match end {
         css::GridPlacement::Auto => start_line.checked_add(1)?,
         css::GridPlacement::Line(_) => grid_line_index(end, explicit_line_names)?,
-        css::GridPlacement::Span(span) if span.name.is_none() => {
-            start_line.checked_add(i32::from(span.span.unwrap_or(1)))?
+        css::GridPlacement::Span(span) if span.name().is_none() => {
+            start_line.checked_add(i32::from(span.count().unwrap_or(1)))?
         }
         css::GridPlacement::Span(_) => return None,
     };
@@ -1737,8 +1707,8 @@ fn taffy_grid_placement_with_positive_line_shift(
     shift: i32,
 ) -> taffy_layout::GridPlacement<String> {
     match value {
-        css::GridPlacement::Line(line) if line.name.is_none() => line
-            .index
+        css::GridPlacement::Line(line) if line.name().is_none() => line
+            .index()
             .and_then(|index| {
                 let shifted = if index > 0 {
                     index.checked_add(shift)?
@@ -1765,25 +1735,26 @@ pub(super) fn taffy_grid_placement(
 ) -> taffy_layout::GridPlacement<String> {
     match value {
         css::GridPlacement::Auto => taffy_layout::GridPlacement::Auto,
-        css::GridPlacement::Line(line) => match (&line.name, line.index) {
-            (Some(name), Some(index)) => i16::try_from(index)
-                .ok()
-                .map(|index| taffy_layout::GridPlacement::NamedLine(name.clone(), index))
-                .unwrap_or(taffy_layout::GridPlacement::Auto),
-            (Some(name), None) => taffy_layout::GridPlacement::NamedLine(name.clone(), 0),
-            (None, Some(index)) => i16::try_from(index)
+        css::GridPlacement::Line(line) => match line {
+            css::GridLinePlacement::Number(index) => i16::try_from(index.get())
                 .ok()
                 .map(taffy_layout::line)
                 .unwrap_or(taffy_layout::GridPlacement::Auto),
-            (None, None) => taffy_layout::GridPlacement::Auto,
+            css::GridLinePlacement::Named { name, occurrence } => occurrence
+                .map(|occurrence| occurrence.get())
+                .map(i16::try_from)
+                .transpose()
+                .ok()
+                .flatten()
+                .map(|index| taffy_layout::GridPlacement::NamedLine(name.clone(), index))
+                .unwrap_or_else(|| taffy_layout::GridPlacement::NamedLine(name.clone(), 0)),
         },
-        css::GridPlacement::Span(span) => match (&span.name, span.span) {
-            (Some(name), Some(count)) => {
-                taffy_layout::GridPlacement::NamedSpan(name.clone(), count)
-            }
-            (Some(name), None) => taffy_layout::GridPlacement::NamedSpan(name.clone(), 0),
-            (None, Some(count)) => taffy_layout::GridPlacement::Span(count),
-            (None, None) => taffy_layout::GridPlacement::Auto,
+        css::GridPlacement::Span(span) => match span {
+            css::GridSpanPlacement::Count(count) => taffy_layout::GridPlacement::Span(count.get()),
+            css::GridSpanPlacement::Named { name, count } => count
+                .map(|count| count.get())
+                .map(|count| taffy_layout::GridPlacement::NamedSpan(name.clone(), count))
+                .unwrap_or_else(|| taffy_layout::GridPlacement::NamedSpan(name.clone(), 0)),
         },
     }
 }

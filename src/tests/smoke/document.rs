@@ -1039,13 +1039,18 @@ async fn page_border_paints_below_document_content() {
         .operations()
         .iter()
         .position(|operation| {
-            matches!(operation, quire::PaintOperation::Rect(index) if *index == border_rect_index)
+            matches!(operation, crate::document::paint::page::PaintOperation::Rect(index) if *index == border_rect_index)
         })
         .expect("green page border rect should participate in paint order");
     let line_operation = page
         .operations()
         .iter()
-        .position(|operation| matches!(operation, quire::PaintOperation::Line(0)))
+        .position(|operation| {
+            matches!(
+                operation,
+                crate::document::paint::page::PaintOperation::Line(0)
+            )
+        })
         .expect("document line should participate in paint order");
 
     assert!(border_operation < line_operation);
@@ -1074,7 +1079,7 @@ async fn renders_page_margin_box_counters() {
     assert!(document.pages[0].operations().iter().any(|operation| {
         matches!(
             operation,
-            quire::PaintOperation::Rect(index)
+            crate::document::paint::page::PaintOperation::Rect(index)
                 if document.pages[0]
                     .rects()
                     .get(*index)
@@ -1096,7 +1101,7 @@ async fn renders_page_margin_box_counters() {
     assert!(document.pages[0].operations().iter().any(|operation| {
         matches!(
             operation,
-            quire::PaintOperation::Line(index)
+            crate::document::paint::page::PaintOperation::Line(index)
                 if document.pages[0]
                     .lines()
                     .get(*index)
@@ -1961,7 +1966,7 @@ async fn string_set_can_capture_generated_gradient_images_for_page_margin_conten
         "<style>\
          @page { size: 160pt 80pt; margin: 12pt; @top-left { content: string(label); font-size: 8pt; height: 10pt } }\
          body, h1 { margin: 0; font-size: 10pt; line-height: 10pt }\
-         h1 { string-set: label \"Grad\" linear-gradient(red, blue) radial-gradient(circle, white, black) }\
+         h1 { string-set: label \"Grad\" linear-gradient(in srgb, red, blue) radial-gradient(in srgb circle, white, black) }\
          </style><h1>Heading</h1>",
     )
     .render(&RenderOptions::default())
@@ -1976,11 +1981,8 @@ async fn string_set_can_capture_generated_gradient_images_for_page_margin_conten
         "{:?}",
         document.pages[0].lines()
     );
-    let margin_images = document.pages[0]
-        .images()
-        .iter()
-        .filter(|image| image.y() > 65.0);
-    assert_eq!(margin_images.count(), 2);
+    assert_eq!(document.pages[0].gradient_patterns().len(), 2);
+    assert_eq!(document.pages[0].images().len(), 0);
 }
 
 #[tokio::test]
@@ -1988,7 +1990,7 @@ async fn page_margin_content_supports_generated_gradient_images() {
     let document = Html::from_string(
         "<style>\
          @page { size: 160pt 80pt; margin: 12pt;\
-           @top-left { content: \"G\" linear-gradient(red, blue) radial-gradient(circle, white, black); font-size: 8pt; height: 10pt } }\
+           @top-left { content: \"G\" linear-gradient(in srgb, red, blue) radial-gradient(in srgb circle, white, black); font-size: 8pt; height: 10pt } }\
          body, p { margin: 0; font-size: 10pt; line-height: 10pt }\
          </style><p>Body</p>",
     )
@@ -2002,11 +2004,8 @@ async fn page_margin_content_supports_generated_gradient_images() {
             .iter()
             .any(|line| line.text == "G" && line.y() > 65.0)
     );
-    let margin_images = document.pages[0]
-        .images()
-        .iter()
-        .filter(|image| image.y() > 65.0);
-    assert_eq!(margin_images.count(), 2);
+    assert_eq!(document.pages[0].gradient_patterns().len(), 2);
+    assert_eq!(document.pages[0].images().len(), 0);
 }
 
 #[tokio::test]
@@ -2640,12 +2639,11 @@ async fn named_page_transition_reenters_normalized_destination_canvas() {
     assert_eq!(document.pages.len(), 2);
     assert_eq!(first_rect.x(), 26.0);
     assert_eq!(first_rect.y(), 84.0);
-    // The destination page has no page margin, but a named transition reuses
-    // the normalized continuation origin of the root/body canvas. This is
-    // the same offset an explicit page break applies before the body's next
-    // fragment is entered.
+    // A named-page transition re-enters the destination page's canvas rather
+    // than retaining the first page's page inset. The UA body's 8px margin
+    // still applies inside that zero-margin page area.
     // <https://www.w3.org/TR/css-break-3/#box-splitting>
-    assert_eq!(second_rect.x(), -6.0);
+    assert_eq!(second_rect.x(), 6.0);
     assert_eq!(second_rect.y(), 110.0);
 }
 
@@ -2744,6 +2742,94 @@ async fn page_auto_margins_center_and_pin_specified_page_area() {
 }
 
 #[tokio::test]
+async fn page_sized_flex_item_preserves_definite_size_and_auto_margins() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 20em 7em; margin: 0 }\
+         body { margin: 0 }\
+         .pagebox { display: flex; width: 20em; height: 7em }\
+         .pagebox > div { width: 12em; height: 3em; margin: auto; background: yellow }\
+         </style><div class=\"pagebox\"><div>center / middle</div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let yellow = document.pages[0]
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(255, 255, 0)))
+        .unwrap();
+    assert_eq!(
+        (yellow.x(), yellow.y(), yellow.width(), yellow.height()),
+        (48.0, 24.0, 144.0, 36.0)
+    );
+}
+
+#[tokio::test]
+async fn definite_viewport_height_block_fragments_its_background_and_following_flow() {
+    let document = Html::from_string(
+        "<style>\
+         body { margin: 0 }\
+         .outer { display: flex; flex-flow: column; background: yellow }\
+         .tall { contain: size; width: 20pt; height: 350vh; background: hotpink }\
+         </style><div class=\"outer\"><div class=\"tall\"></div>Yellow</div>White",
+    );
+    let mut options = RenderOptions::default();
+    options.set_margin_points(0.0);
+    let document = document.render(&options).await.unwrap();
+
+    assert_eq!(document.pages.len(), 4);
+    let last_page_rects = document.pages[3].rects();
+    assert!(
+        last_page_rects.iter().any(|rect| {
+            rect.fill == Some(CssColor::new(255, 105, 180))
+                && (rect.width() - 20.0).abs() < 0.01
+                && rect.height() > 400.0
+        }),
+        "last-page rectangles: {last_page_rects:?}"
+    );
+    assert!(
+        document.pages[3]
+            .lines()
+            .iter()
+            .any(|line| line.text.contains("Yellow"))
+    );
+    assert!(
+        document.pages[3]
+            .lines()
+            .iter()
+            .any(|line| line.text.contains("White"))
+    );
+}
+
+#[tokio::test]
+async fn empty_size_contained_flex_item_replays_one_principal_slice_per_page() {
+    let document = Html::from_string(
+        r#"<style>:root { print-color-adjust: exact } body { margin: 0 }</style>
+        <div style="display:flex; flex-flow:column; background:yellow">
+          <div style="contain:size; height:350vh; width:50px; background:hotpink"></div>
+          Yellow background, page 4.
+        </div>
+        White background, page 4."#,
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+    assert_eq!(document.pages.len(), 4);
+    for page in &document.pages {
+        assert_eq!(
+            page.rects()
+                .iter()
+                .filter(|rect| rect.fill == Some(CssColor::new(255, 105, 180)))
+                .count(),
+            1,
+            "the flex fragment span, rather than its scratch replay, owns the empty item's principal background",
+        );
+    }
+}
+
+#[tokio::test]
 async fn page_auto_margins_with_border_and_padding_center_specified_page_area() {
     let document = Html::from_string(
         "<style>\
@@ -2800,7 +2886,7 @@ async fn negative_page_margins_expand_page_area_beyond_page_box() {
 }
 
 #[tokio::test]
-async fn leading_inline_named_page_content_matches_named_first_page_rule() {
+async fn inline_page_assignment_does_not_select_a_named_page() {
     let document = Html::from_string(
         "<style>\
          @page { size: 100pt 100pt; margin: 10pt; @bottom-center { content: \"base\" } }\
@@ -2829,14 +2915,14 @@ async fn leading_inline_named_page_content_matches_named_first_page_rule() {
         document.pages[0]
             .lines()
             .iter()
-            .any(|line| line.text == "report first"),
+            .any(|line| line.text == "base"),
         "{lines:?}"
     );
     assert!(
         !document.pages[0]
             .lines()
             .iter()
-            .any(|line| line.text == "base")
+            .any(|line| line.text == "report first")
     );
 }
 
@@ -2911,6 +2997,74 @@ async fn positioned_only_box_before_right_break_owns_its_source_page() {
 }
 
 #[tokio::test]
+async fn named_page_with_only_positioned_content_selects_its_page_context() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 100pt 100pt; margin: 10pt }\
+         @page full { background: black; margin: 0 }\
+         body, section, p { margin: 0; font-size: 10pt; line-height: 10pt }\
+         .cover { height: 0; page: full; break-after: right }\
+         .cover > div { position: absolute; top: 0; left: 0; width: 10pt; height: 10pt; background: red }\
+         </style><section class=\"cover\"><div></div></section><p>After</p>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(document.pages.len(), 3);
+    assert!(
+        document.pages[0]
+            .rects()
+            .iter()
+            .any(|rect| rect.fill == Some(CssColor::BLACK)),
+        "the out-of-flow-only Class-A box must still select @page full"
+    );
+    assert!(
+        document.pages[2]
+            .lines()
+            .iter()
+            .any(|line| line.text == "After")
+    );
+}
+
+#[tokio::test]
+async fn root_absolute_explicit_insets_remain_on_initial_page() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 100pt 100pt; margin: 0 }\
+         body, p, section { margin: 0; font-size: 10pt; line-height: 10pt }\
+         .source { break-before: page; height: 0 }\
+         .source > div { position: absolute; top: 0; left: 0; width: 10pt; height: 10pt; background: red }\
+         </style><p>First</p><section class=\"source\"><div></div></section><p>After</p>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let red = CssColor::rgba(255, 0, 0, 1.0);
+    assert_eq!(document.pages.len(), 2);
+    assert!(
+        document.pages[0]
+            .rects()
+            .iter()
+            .any(|rect| rect.fill == Some(red))
+    );
+    assert!(
+        !document.pages[1]
+            .rects()
+            .iter()
+            .any(|rect| rect.fill == Some(red)),
+        "an explicit root absolute inset remains anchored to the first page's initial containing block"
+    );
+    assert!(
+        document.pages[1]
+            .lines()
+            .iter()
+            .any(|line| line.text == "After")
+    );
+}
+
+#[tokio::test]
 async fn book_sample_companion_stylesheet_preserves_right_page_breaks() {
     let stylesheet = Css::from_file("weasyprint-samples/book/book.css")
         .await
@@ -2923,7 +3077,21 @@ async fn book_sample_companion_stylesheet_preserves_right_page_breaks() {
         .await
         .unwrap();
 
-    assert_eq!(document.pages.len(), 56);
+    // Correctly including the chapter figure caption in its flex line removes
+    // the prior overlap. The remaining two-page delta from the reference is
+    // the separately tracked text-flow / font-metric divergence.
+    assert_eq!(document.pages.len(), 58);
+    assert!(
+        document.pages[0]
+            .rects()
+            .iter()
+            .any(|rect| rect.fill == Some(CssColor::BLACK)),
+        "the first full-page source must materialize @page full"
+    );
+    assert!(
+        !document.pages[0].images().is_empty(),
+        "the cover's positioned image must remain paintable on the selected full page"
+    );
     assert!(
         document.pages[2]
             .lines()
@@ -2935,6 +3103,189 @@ async fn book_sample_companion_stylesheet_preserves_right_page_breaks() {
             .lines()
             .iter()
             .any(|line| line.text.contains("La course"))
+    );
+    let chapter_caption = document.pages[6]
+        .lines()
+        .iter()
+        .find(|line| line.text == "Poire")
+        .expect("chapter character caption");
+    let first_paragraph = document.pages[6]
+        .lines()
+        .iter()
+        .find(|line| line.text.starts_with("Et dire que je dois encore"))
+        .expect("first chapter paragraph line");
+    assert!(
+        first_paragraph.y() <= chapter_caption.y() - 9.0,
+        "caption_y={}, paragraph_y={}",
+        chapter_caption.y(),
+        first_paragraph.y()
+    );
+    let contents = document.pages[4]
+        .lines()
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for entry in [
+        "1. La course",
+        "2. Dos au mur",
+        "3. Le temple",
+        "4. Le grondement",
+    ] {
+        assert!(contents.contains(entry), "missing {entry:?}: {contents:?}");
+    }
+}
+
+#[tokio::test]
+async fn auto_height_row_flex_uses_final_block_stack_cross_contribution() {
+    let document = Html::from_string(
+        r#"<style>
+             @page { size: 160pt 160pt; margin: 0 }
+             html, body { margin: 0; font: 10pt/10pt sans-serif }
+             #row { display: flex; width: 100pt }
+             figure { margin: 0; padding: 0 }
+             .portrait { width: 20pt; height: 40pt }
+             figcaption, p { display: block; margin: 0; line-height: 10pt }
+           </style>
+           <div id="row"><figure><div class="portrait"></div><figcaption>Caption</figcaption></figure></div>
+           <p>Following</p>"#,
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(document.pages.len(), 1);
+    let caption = document.pages[0]
+        .lines()
+        .iter()
+        .find(|line| line.text == "Caption")
+        .expect("caption line");
+    let following = document.pages[0]
+        .lines()
+        .iter()
+        .find(|line| line.text == "Following")
+        .expect("following line");
+    assert!(
+        following.y() <= caption.y() - 9.9,
+        "caption_y={}, following_y={}",
+        caption.y(),
+        following.y()
+    );
+}
+
+#[tokio::test]
+async fn auto_height_row_flex_remeasures_wrapped_caption_after_flexing() {
+    let document = Html::from_string(
+        r#"<style>
+             @page { size: 160pt 160pt; margin: 0 }
+             html, body { margin: 0; font: 10pt/10pt sans-serif }
+             #row { display: flex; width: 90pt }
+             figure { flex: 1; margin: 0; padding: 0 }
+             .side { flex: none; width: 40pt; height: 1pt }
+             figcaption, p { display: block; margin: 0; line-height: 10pt }
+           </style>
+           <div id="row"><figure><figcaption>one two three four five</figcaption></figure><div class="side"></div></div>
+           <p>Following</p>"#,
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(document.pages.len(), 1);
+    let lines = document.pages[0].lines();
+    let caption_lines = lines
+        .iter()
+        .filter(|line| matches!(line.text.as_str(), "one two" | "three four" | "five"))
+        .collect::<Vec<_>>();
+    let following = lines
+        .iter()
+        .find(|line| line.text == "Following")
+        .expect("following line");
+    assert!(caption_lines.len() >= 2, "lines={lines:?}");
+    let last_caption = caption_lines
+        .iter()
+        .min_by(|left, right| left.y().partial_cmp(&right.y()).unwrap())
+        .expect("caption lines");
+    assert!(
+        following.y() <= last_caption.y() - 9.9,
+        "the following sibling must begin below the wrapped caption: lines={lines:?}"
+    );
+}
+
+#[tokio::test]
+async fn normal_generated_target_references_converge_with_target_page_and_counter() {
+    let document = Html::from_string(
+        "<nav><a href=\"#chapter\"></a><a class=\"external\" href=\"https://example.test/chapter\"></a></nav><section><h2 id=\"chapter\">Destination</h2></section>\
+         <style>@page { size: 120pt 80pt; margin: 10pt }\
+         body, nav, section, h2 { margin: 0; font: 10pt/10pt sans-serif }\
+         section { counter-reset: chapter 10 }\
+         h2 { counter-increment: chapter; break-before: page }\
+         h2::before { content: \"Before\" } h2::after { content: \"After\" }\
+         a::before { content: target-counter(attr(href), chapter) \": \" target-text(attr(href)) \" / \" target-text(attr(href), before) \" / \" target-text(attr(href), after) }\
+         a.external::before { content: \"external=\" target-text(attr(href)) }\
+         a::after { content: \" @\" target-counter(attr(href), page) }</style>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(document.pages.len(), 2);
+    let contents = document.pages[0]
+        .lines()
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>()
+        .join("");
+    assert!(
+        contents.contains("11: Destination /")
+            && contents.contains("Before / After")
+            && contents.contains("@2")
+            && contents.contains("external= @"),
+        "contents={contents:?}"
+    );
+}
+
+#[tokio::test]
+async fn report_sample_cover_preserves_page_height_flex_line_packing() {
+    let document = Html::from_file("weasyprint-samples/report/report.html")
+        .await
+        .unwrap()
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+
+    assert_eq!(document.pages.len(), 8);
+    let contents = document.pages[2]
+        .lines()
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for entry in [
+        "Big title on left page, with text on columns",
+        "This is another big title, on a page full of work presentation",
+        "Big title on the first right page",
+        "About some typography features",
+    ] {
+        assert!(contents.contains(entry), "missing {entry:?}: {contents:?}");
+    }
+    let page = &document.pages[0];
+    assert!((page.width() - 595.2756).abs() < 0.01, "page={page:?}");
+    assert!((page.height() - 841.8898).abs() < 0.01, "page={page:?}");
+
+    let orange_addresses = page
+        .rects()
+        .iter()
+        .filter(|rect| rect.fill == Some(CssColor::new(251, 200, 71)) && rect.height() > 100.0)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        orange_addresses.len(),
+        2,
+        "the cover has two independently painted address backgrounds: {orange_addresses:?}"
+    );
+    assert!(
+        orange_addresses.iter().all(|rect| rect.y().abs() < 0.01),
+        "the address line must retain its align-content: space-between block-end placement: {orange_addresses:?}"
     );
 }
 
@@ -3025,7 +3376,7 @@ async fn page_margin_boxes_default_to_document_font_size() {
 
 fn line_has_font_containing(
     document: &quire::Document,
-    line: &quire::RenderedLine,
+    line: &crate::document::paint::text::RenderedLine,
     needle: &str,
 ) -> bool {
     line.runs.iter().any(|run| {
@@ -3725,6 +4076,98 @@ async fn page_margin_generated_text_uses_sequence_for_forced_breaks_and_zwsp() {
     assert!(
         a.y() > b.y() + 15.0,
         "forced empty page-margin line should affect line positions: {margin_lines:?}"
+    );
+}
+
+#[tokio::test]
+async fn footnote_follows_the_fragment_containing_its_committed_call_line() {
+    let document = Html::from_string(
+        r#"<style>
+              @page { size: 200pt 200pt; margin: 20pt; }
+              body, p { margin: 0 }
+              .lead { height: 145pt }
+              .note { float: footnote }
+              .note::footnote-call { content: "*" }
+            </style>
+            <p class="lead">lead</p><p>Call<span class="note">second-page note</span></p>"#,
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(document.pages.len(), 2);
+    let first_page_text = document.pages[0]
+        .lines()
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let second_page_text = document.pages[1]
+        .lines()
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !first_page_text.contains("second-page note"),
+        "{first_page_text:?}"
+    );
+    assert_eq!(second_page_text.matches("second-page note").count(), 1);
+}
+
+#[tokio::test]
+async fn table_footnote_commits_once_after_speculative_cell_layout() {
+    let document = Html::from_string(
+        r#"<style>
+              @page { size: 200pt 200pt; margin: 20pt; }
+              body, table { margin: 0; border-spacing: 0 }
+              td { padding: 0; font: 10pt/12pt sans-serif }
+              .note { float: footnote }
+              .note::footnote-call { content: "*" }
+            </style>
+            <table>
+              <tr><td>Alpha<span class="note">table note</span></td></tr>
+              <tr><td>Beta</td></tr>
+              <tr><td>Gamma</td></tr>
+            </table>"#,
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(document.pages.len(), 1);
+    let text = document.pages[0]
+        .lines()
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(text.matches("table note").count(), 1, "{text:?}");
+}
+
+#[tokio::test]
+async fn taiwanese_numerals_footnote_does_not_fragment_the_table() {
+    let document = Html::from_string(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/taiwanese-numerals.html"
+    )))
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(document.pages.len(), 1);
+    let text = document.pages[0]
+        .lines()
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>()
+        .join("");
+    assert_eq!(
+        text.matches(
+            "表中熟蕃種族名ノ左肩ニ＊ノ記號ヲ施セルハ其ノ言語ノ殆ンド死語トナルコトヲ示ス"
+        )
+        .count(),
+        1
     );
 }
 

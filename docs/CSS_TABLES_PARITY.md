@@ -1,6 +1,6 @@
 # CSS Tables Parity
 
-Last updated: 2026-07-27
+Last updated: 2026-08-01
 
 CSS 2.2 table layout, CSS Tables Level 3, CSS Sizing Level 3, CSS
 Fragmentation Level 3, and HTML table semantics are the conformance targets.
@@ -9,23 +9,26 @@ but spec conformance takes priority when behavior differs.
 
 ## Current Level
 
-- The latest full `css/css-tables` WPT report records **121 / 123**
-  non-tentative tests passing. Exact re-evaluation passes the repaired
-  content-box min/max wrapper, collapsed-row rowspan clipping, anonymous-cell
-  whitespace, vertical cell baselines, positioned-cell static-position,
-  vertical-rl RTL column backgrounds, and collapsed-border `width: 0` track
-  allocation. The only remaining non-tentative failures are
-  `row-group-margin-border-padding.html` and
-  `row-margin-border-padding.html`, whose residual raster differences are
-  isolated to table-internal box-model no-op handling.
+- The last full `css/css-tables` WPT report recorded **121 / 123**
+  non-tentative tests passing. Exact re-evaluation now passes
+  `html-display-table.html`,
+  `percent-height-replaced-in-percent-cell.tentative.html`,
+  `row-margin-border-padding.html`, and
+  `row-group-margin-border-padding.html`. A fresh full-suite run is still
+  needed before publishing an updated aggregate count.
 
 - Table formatting is implemented under `src/layout/table/` with durable row,
   row-group, column, caption, span, and collapsed-border structures.
+- Row and row-group used styles have a dedicated table-part boundary: their
+  ordinary margin, padding, and border-box metrics are unavailable to grid
+  layout, while collapsed borders are exposed only as conflict-resolution
+  participants. Their original cascaded styles remain available as parents for
+  cell inheritance.
 - HTML table span attributes use one shared parser for durable fragments and
   layout grids: leading ASCII digits are parsed, trailing junk is ignored,
   invalid values default to 1, `rowspan=0` spans to the row-group end, and
   column/row spans are clamped to the HTML table-model bounds.
-- Enabled HTML presentational hints map table dimensions, border color,
+- HTML presentational hints are enabled by default and map table dimensions, border color,
   cell spacing, cell padding, and legacy structural `background` URLs through
   the ordinary author-origin cascade. Author CSS therefore overrides the hints,
   and resource URLs retain the document URL context.
@@ -40,6 +43,9 @@ but spec conformance takes priority when behavior differs.
 - Generated anonymous table cells apply normal block-container normalization,
   so an inline descendant split by an in-flow block retains separate preceding
   and following block-flow content.
+- A table-internal box encountered below ordinary block flow materializes the
+  same normalized formatting tree before layout, so an orphan `table-row`
+  cannot bypass anonymous-cell fixup through the direct DOM inline collector.
 - Nested row groups inside a row group participate in the enclosing anonymous
   row fixup, and their misparented inner row groups generate nested anonymous
   tables so sibling cells remain in the same generated row.
@@ -62,13 +68,14 @@ but spec conformance takes priority when behavior differs.
   percentage height during the second pass.
   Intrinsic table-cell sizing now follows normal-flow descendants through those
   unresolved percentage-height wrappers for both row height and column width.
-- The final table-cell relayout carries the committed, typed cell block-size
+- The final table-cell relayout carries a committed, typed cell block-size
   percentage basis through intrinsic measurement, inline sequence planning,
-  baseline alignment, and painting. Replaced canvas descendants therefore
-  resolve percentage `height`/`min-height`/`max-height` constraints in the
-  final pass, including block-level canvases preserved through block-in-inline
-  normalization, without making those percentages definite during row-minimum
-  sizing. When a cell has a definite height, automatic-width replaced
+  baseline alignment, and painting. The row-minimum and final-relayout passes
+  are distinct internal types, so only the latter can resolve percentage
+  `height`/`min-height`/`max-height`. Replaced image, canvas, and SVG
+  descendants share that final sizing boundary, including block-level
+  descendants preserved through block-in-inline normalization. When a cell has
+  a definite height, automatic-width replaced
   descendants also contribute their percentage-resolved aspect-ratio width to
   intrinsic column sizing, including through inline wrappers.
 - Table-cell row minimum sizing accounts for CSS 2.2 margin collapsing among
@@ -124,10 +131,11 @@ but spec conformance takes priority when behavior differs.
   height with horizontal-axis baselines. Row sizing and painting consume the
   same non-text content-bottom fallback, including below-baseline space from
   peer text cells.
-- Committed table-row painting retains the table fragment's logical grid
-  placement through the cell boundary. This prevents vertical tables from
-  applying their block-direction projection twice, and keeps vertical root
-  baseline/intrinsic-size layout on the table's logical axes.
+- Committed table-row painting retains one `TableGridFragmentViewport`: its
+  source-grid placement and source row bounds remain coupled while the table
+  fragment plan records the visible row pieces. This prevents vertical tables
+  from applying their block-direction projection twice and keeps structural
+  paint from confusing a fragment-local page origin with a source-grid offset.
 - Column and column-group generated backgrounds retain a logical table-grid
   positioning area until the final root-writing-mode transform. In particular,
   hard-stop linear gradients rotate with their vertical/RTL grid clips instead
@@ -139,7 +147,10 @@ but spec conformance takes priority when behavior differs.
   rather than the narrower grid content box.
 - Inline tables contribute their full margin box to line layout, so vertical
   alignment and negative block-axis margins position nested table fragments
-  without changing their internal collapsed-border paint order.
+  without changing their internal collapsed-border paint order. Their exported
+  first-row baseline is measured from the table box rather than the
+  inline-level wrapper, as required by CSS 2.2, so wrapper block-start margins
+  do not displace baseline-aligned siblings.
 - Inline-table atom construction uses an unfragmented isolated canvas, so an
   oversized atomic table remains intact and overflows its containing line/page
   instead of producing discarded scratch page continuations.
@@ -175,10 +186,21 @@ but spec conformance takes priority when behavior differs.
 - Collapsed tables ignore table-root padding and `border-spacing`, derive
   wrapper insets from the widest resolved outer grid-edge half-width across
   all displayed row segments, derive cell content insets from resolved
-  grid-edge border half-widths, subtract those resolved outer insets from
+  grid-edge border half-widths, and treat the outer half-widths as wrapper
+  border-box insets. A `border-box` table width therefore converts to the grid
+  width by subtracting those insets exactly once; a `content-box` width retains
+  its declared grid width and allows the half-borders to extend the wrapper.
+  The same conversion is used by absolute-position inset equations and their
+  positioned border boxes, clips, containing blocks, and scroll-snap areas.
+  A positioned table that extends through a negative margin is clipped only
+  to the physical page box, so its wrapper background remains visible in page
+  margins rather than being truncated to the initial containing block.
+  An automatic table height remains its row-grid height; the resolved outer
+  block-edge half-insets are added only when constructing the wrapper border
+  box. Collapsed tables also subtract the resolved outer insets from
   border-box table height targets, and paint collapsed `inset`/`outset` as
-  `ridge`/`groove` with side-aware two-tone 3D borders. Collapsed borders
-  paint after table/cell and in-flow block background/border paint but before
+  `ridge`/`groove` with side-aware two-tone 3D borders. Collapsed borders paint
+  after table/cell and in-flow block background/border paint but before
   floating, inline, and positioned foreground phases, so collapsed borders can
   cover block child backgrounds while overflowing inline-block cell content can
   cover border paint as required by CSS 2.2 Appendix E. Collapsed-border
@@ -269,7 +291,11 @@ but spec conformance takes priority when behavior differs.
   overflow, oversized-row slicing, forced row breaks, or named-page row
   transitions commits an incoming repeat policy. The resulting outgoing and
   incoming choices are paired into one committed
-  table-fragment transition. Row-overflow advances use the shared fragment
+  table-fragment transition. A typed table-wrapper fragment-chrome model feeds
+  cloned border-and-padding reservations into both fresh and current body
+  capacity, so an oversized row cannot repeatedly pre-break with a zero-height
+  cell slice when the nominal page area overstates the destination space.
+  Row-overflow advances use the shared fragment
   advance gate after table-local repeated-footer and oversized-row overflow
   checks determine whether the row overflows the current body fragment. The
   final source row reserves the table's typed trailing non-content (the
@@ -397,10 +423,6 @@ but spec conformance takes priority when behavior differs.
   the XML parser treats simultaneous `xml:lang` and `lang` attributes as a
   duplicate attribute. Parser replacement work is deliberately deferred.
 
-- Absolutely positioned collapsed tables preserve their authored grid width
-  while resolving the inset equation: collapsed grid-edge borders are not
-  subtracted as ordinary wrapper insets. Broader table-wrapper sizing cases
-  still need coverage.
 - Anonymous table object construction still needs a malformed-markup audit
   beyond the covered common fixup, inline-wrapper, consecutive non-cell
   whitespace, empty-row, and span-parsing cases.
@@ -414,18 +436,15 @@ but spec conformance takes priority when behavior differs.
   vertical-writing or fragmented tables. CSS Tables 3 requires their
   backgrounds to use cell-derived geometry and clipping across all spans and
   fragment boundaries.
-- Fragmentation still needs full cloned decoration semantics and broader
-  coverage for rare spanning-cell/collapsed-track combinations, complex
-  repeated header/footer interactions, rare rowspanning assignment propagation
-  interactions, complex table-root running-element descendants, and complex
-  nested table/flex descendants across page boundaries.
+- Fragmentation still needs complete cloned table-wrapper margin/background and
+  decoration-truncation semantics, plus broader coverage for rare
+  spanning-cell/collapsed-track combinations, complex repeated header/footer
+  interactions, rare rowspanning assignment propagation interactions, complex
+  table-root running-element descendants, and complex nested table/flex
+  descendants across page boundaries.
 - Table direction and writing-mode support still needs broader WPT coverage for
   full vertical table row/cell placement, mixed writing modes, and unusual
   column-group/span combinations.
-- CSS 2.2 table-internal row and row-group margins, borders, and padding need
-  a final no-op audit. The two remaining local non-tentative WPT failures are
-  `row-margin-border-padding.html` and
-  `row-group-margin-border-padding.html`.
 - Height and baseline coverage should be broadened with WPT and local
   WeasyPrint cases for full horizontal-axis baseline positioning in mixed
   writing modes, complex floats inside cells, large percentage matrices,

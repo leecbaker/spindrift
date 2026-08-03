@@ -1,5 +1,7 @@
 use super::*;
+use crate::layout::inline_collect::TextDecorationPropagationContext;
 use crate::units::LayoutSize;
+use std::collections::HashSet;
 
 impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn new(config: LayoutBuilderConfig<'a>) -> Self {
@@ -7,7 +9,7 @@ impl<'a> LayoutBuilder<'a> {
         let mut page_rules = Vec::new();
         let mut page_declarations = Declarations::new();
         let mut first_page_declarations = Declarations::new();
-        for stylesheet in config.stylesheets {
+        for stylesheet in config.stylesheets.iter() {
             for rule in &stylesheet.rules {
                 if rule.selector_text.trim() == ":root" {
                     page_declarations.extend(
@@ -48,13 +50,17 @@ impl<'a> LayoutBuilder<'a> {
             suppressed_named_strings_after: HashMap::new(),
             page_anchors: HashMap::new(),
             page_anchor_text: HashMap::new(),
+            page_anchor_counters: HashMap::new(),
+            target_references: config.target_references,
+            has_normal_flow_target_references: false,
             document_canvas_background: None,
-            document_canvas_overflow: DocumentCanvasOverflowContext::default(),
+            document_canvas_overflow: DocumentCanvasResolution::default(),
             document_canvas_fragment_insets: Vec::new(),
             document_root_generates_box: true,
             current_page: page_for_context(page_context),
             current_page_has_flow_content: false,
             current_page_has_named_page_flow_content: false,
+            current_page_selected_name: None,
             last_block_layout_outcome: BlockLayoutOutcome::default(),
             current_page_name: None,
             current_page_context: page_context,
@@ -62,7 +68,14 @@ impl<'a> LayoutBuilder<'a> {
             page_descriptor_viewport_size: page_context.size,
             fragmentainer_override: None,
             footnote_bodies: HashMap::new(),
+            ruby_formatting_descendants: HashMap::new(),
+            dom_page_boundary_summaries: HashMap::new(),
+            speculative_table_height_estimates: HashMap::new(),
+            speculative_table_height_plans: HashMap::new(),
             footnote_measurements: Vec::new(),
+            rendered_footnote_measurements: Vec::new(),
+            measured_footnotes: HashSet::new(),
+            committed_inline_floats: HashMap::new(),
             footnote_reservations: HashMap::new(),
             footnote_layout_mode: FootnoteLayoutMode::Measure,
             footnote_measurement_depth: 0,
@@ -75,7 +88,6 @@ impl<'a> LayoutBuilder<'a> {
             speculative_auto_float_margin_box_heights: HashMap::new(),
             active_auto_float_measurements: Vec::new(),
             active_auto_float_measurement_fallbacks: Vec::new(),
-            forced_break_containment_scopes: Vec::new(),
             cursor_y: page_context.top(),
             content_left: page_context.left(),
             content_right: page_context.right(),
@@ -93,20 +105,22 @@ impl<'a> LayoutBuilder<'a> {
             clamp_line_slot_captures: Vec::new(),
             positioned_inline_layout_suppression_depth: 0,
             last_in_flow_line_baseline_y: None,
+            pending_outside_marker_anchors: Vec::new(),
             block_static_position_y_offset: None,
             absolute_static_position: None,
             grid_positioning_scopes: Vec::new(),
             pending_subgrid_contexts: Vec::new(),
             escaped_atom_positioning_depth: 0,
             escaped_atom_containing_block: None,
+            escaped_atom_positioning_context: None,
             containing_block_direction: Direction::Ltr,
             containing_block_writing_mode: WritingMode::HorizontalTb,
             initial_containing_block_writing_mode: WritingMode::HorizontalTb,
             principal_flow: DocumentPrincipalFlow {
                 writing_mode: WritingMode::HorizontalTb,
                 direction: Direction::Ltr,
+                text_orientation: TextOrientation::Mixed,
                 source: PrincipalFlowSource::Root,
-                propagates_axes: false,
             },
             fragment_top_offsets: Vec::new(),
             child_available_space_stack: Vec::new(),
@@ -138,12 +152,15 @@ impl<'a> LayoutBuilder<'a> {
             page_declarations,
             counter_styles,
             first_page_declarations,
+            root_metric_state: RootMetricState::Bootstrapping,
+            root_metrics_require_selected_font: false,
             font_system: Box::new(config.font_system),
             bookmarks: Vec::new(),
             positioned_layers: Vec::new(),
             fixed_layers: Vec::new(),
             deferred_multicol_positioned_children: Vec::new(),
             multicol_positioned_replay_capture_depth: 0,
+            absolute_positioned_page_span_target: None,
             pending_positioned_page_span_target: None,
             next_paint_source_order: 1,
             overflow_clips: Vec::new(),
@@ -168,12 +185,16 @@ impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn layout_page_box(
         &mut self,
         page_box: &box_tree::PageBox<'a>,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
     ) {
         self.prepare_counter_plan(&page_box.counter_events);
         self.install_footnotes(page_box);
-        if self.footnote_layout_mode == FootnoteLayoutMode::Render {
-            self.rendered_footnotes.clear();
+        match self.footnote_layout_mode {
+            FootnoteLayoutMode::Measure => self.measured_footnotes.clear(),
+            FootnoteLayoutMode::Render => {
+                self.rendered_footnotes.clear();
+                self.rendered_footnote_measurements.clear();
+            }
         }
         self.suppressed_named_strings_before.clear();
         self.suppressed_named_strings_after.clear();
@@ -212,7 +233,6 @@ impl<'a> LayoutBuilder<'a> {
                     .collect()
             })
             .unwrap_or_default();
-        self.document_canvas_overflow = DocumentCanvasOverflowContext::from_page_box(page_box);
         for child in &page_box.children {
             // The document root has the initial containing block as its
             // percentage-height containing block. That definite page-area
@@ -245,7 +265,8 @@ impl<'a> LayoutBuilder<'a> {
                 // <https://www.w3.org/TR/css-backgrounds-3/#special-backgrounds>
                 if let Some((_, _, style, _)) = child.element_parts()
                     && style.visibility == Visibility::Visible
-                    && (style.background_color.is_some_and(CssColor::is_visible)
+                    && (style.background_color.visible_color(style.color).is_some()
+                        || style.background_image.is_image()
                         || style
                             .background_layers
                             .iter()
@@ -276,12 +297,12 @@ impl<'a> LayoutBuilder<'a> {
                 let root_layout_style = self.principal_flow.root_layout_style(style);
                 // The page-box root bypasses ordinary block-child traversal,
                 // but its own positioning scheme is still resolved against
-                // the initial containing block.  Dispatch it through the
-                // normal positioned principal-box path so definite insets,
-                // borders, and fixed-layer ownership are preserved.
+                // the initial containing block. Preserve the hypothetical
+                // normal-flow source while dispatching it so auto insets use
+                // the root's static position, including signed margins.
                 // <https://drafts.csswg.org/css-position-3/#absolute-positioning>
                 // and <https://drafts.csswg.org/css-position-3/#fixed-positioning>
-                self.layout_positioned_block(
+                self.layout_positioned_block_with_static_source(
                     element,
                     &root_layout_style,
                     stylesheets,
@@ -362,43 +383,48 @@ impl<'a> LayoutBuilder<'a> {
                 self.box_requires_parent_ch_advance(child, document_root_parent.font_size)
             }),
         );
-        let mut root_font_metrics = None;
+        self.root_metrics_require_selected_font = page_box
+            .children
+            .iter()
+            .any(Self::box_requires_root_font_metrics);
+        let mut root_metrics = self.root_metric_state;
+        let document_root_parent_metrics = css::FontRelativeLengthBasis::new(
+            layout_pt(document_root_parent.font_size),
+            parent_ch_advance,
+        );
         for child in &mut page_box.children {
             self.resolve_deferred_font_metrics_in_box(
                 child,
-                document_root_parent.font_size,
-                parent_ch_advance,
-                &mut root_font_metrics,
+                document_root_parent_metrics,
+                &mut root_metrics,
             );
         }
+        self.root_metric_state = root_metrics;
     }
 
     fn resolve_deferred_font_metrics_in_style(
         &mut self,
         style: &mut ComputedStyle,
-        parent_font_size: f32,
-        parent_ch_advance: LayoutLength,
-        root_font_metrics: &mut Option<css::RootFontMetricLengthBasis>,
-    ) -> (f32, LayoutLength) {
+        parent_metrics: css::FontRelativeLengthBasis,
+        root_metrics: &mut RootMetricState,
+    ) -> css::FontRelativeLengthBasis {
+        let establishes_root_metrics = matches!(*root_metrics, RootMetricState::Bootstrapping);
         let box_edges_require_ch_advance = style.box_values.requires_ch_advance();
         style.resolve_deferred_font_size_with_viewport_and_root_metrics(
-            css::FontRelativeLengthBasis::new(layout_pt(parent_font_size), parent_ch_advance),
+            parent_metrics,
             LayoutSize::new(
-                self.current_page_context.area_width(),
+                self.initial_viewport_context.area_width(),
                 self.current_page_context.area_height(),
             ),
-            *root_font_metrics,
+            root_metrics.font_size_basis(),
         );
         style
             .line_height_value
             .resolve_em_relative_lengths(layout_pt(style.font_size));
-        let (line_height, multiplier, is_normal) =
-            style.line_height_value.clone().projected(style.font_size);
+        let (line_height, _, _) = style.line_height_value.clone().projected(style.font_size);
         style.line_height = line_height;
-        style.line_height_multiplier = multiplier;
-        style.line_height_is_normal = is_normal;
-        style.root_font_size = root_font_metrics
-            .as_ref()
+        style.root_font_size = root_metrics
+            .font_size_basis()
             .map_or(style.font_size, |basis| basis.font_size.points());
         style.finalize_computed_font_relative_lengths();
         let pseudo_requires_parent_ch = [
@@ -417,7 +443,9 @@ impl<'a> LayoutBuilder<'a> {
         });
         let ch_advance = self.ch_advance_for_style(
             style,
-            style.requires_ch_advance() || pseudo_requires_parent_ch,
+            (establishes_root_metrics && self.root_metrics_require_selected_font)
+                || style.requires_ch_advance()
+                || pseudo_requires_parent_ch,
         );
         // The selected `ch` metric is the existing horizontal basis except
         // where vertical upright text supplies a distinct vertical advance.
@@ -442,7 +470,9 @@ impl<'a> LayoutBuilder<'a> {
         // The existing metric-dependency traversal covers every `ch`-based
         // term, and selected-font metric expressions share that used-value
         // resolution path.
-        let requires_selected_font_metrics = style.requires_selected_font_metrics();
+        let requires_selected_font_metrics = (establishes_root_metrics
+            && self.root_metrics_require_selected_font)
+            || style.requires_selected_font_metrics();
         let ic_advance = if requires_selected_font_metrics {
             self.font_system.ic_advance_for_style(style)
         } else {
@@ -477,67 +507,48 @@ impl<'a> LayoutBuilder<'a> {
         };
         style.resolve_cap_relative_lengths(cap_height);
         style.resolve_line_height_relative_lengths();
-        let root_font_metrics =
-            *root_font_metrics.get_or_insert_with(|| css::RootFontMetricLengthBasis {
-                font_size: layout_pt(style.font_size),
-                ch_advance,
-                x_height: layout_pt(x_height),
-                cap_height: layout_pt(cap_height),
-                ic_advance,
-                line_height: layout_pt(style.line_height),
-            });
+        if establishes_root_metrics {
+            root_metrics.establish(ResolvedRootFontMetrics::measured_for_document_root(
+                css::RootFontMetricLengthBasis {
+                    font_size: layout_pt(style.font_size),
+                    ch_advance,
+                    x_height: layout_pt(x_height),
+                    cap_height: layout_pt(cap_height),
+                    ic_advance,
+                    line_height: layout_pt(style.line_height),
+                },
+            ));
+        }
+        let root_font_metrics = root_metrics.resolved().basis();
         style.root_font_size = root_font_metrics.font_size.points();
         style.resolve_root_font_metric_lengths(root_font_metrics);
         if box_edges_require_ch_advance {
             synchronize_resolved_fixed_box_edge_cache(style);
         }
-        let font_size = style.font_size;
+        let font_metrics =
+            css::FontRelativeLengthBasis::new(layout_pt(style.font_size), ch_advance)
+                .with_selected_font_metrics(layout_pt(x_height), layout_pt(cap_height), ic_advance);
         if let Some(style) = &mut style.marker_style {
-            self.resolve_deferred_font_metrics_in_style(
-                style,
-                font_size,
-                ch_advance,
-                &mut Some(root_font_metrics),
-            );
+            self.resolve_deferred_font_metrics_in_style(style, font_metrics, root_metrics);
         }
         if let Some(style) = &mut style.before_style {
-            self.resolve_deferred_font_metrics_in_style(
-                style,
-                font_size,
-                ch_advance,
-                &mut Some(root_font_metrics),
-            );
+            self.resolve_deferred_font_metrics_in_style(style, font_metrics, root_metrics);
         }
         if let Some(style) = &mut style.after_style {
-            self.resolve_deferred_font_metrics_in_style(
-                style,
-                font_size,
-                ch_advance,
-                &mut Some(root_font_metrics),
-            );
+            self.resolve_deferred_font_metrics_in_style(style, font_metrics, root_metrics);
         }
         if let Some(style) = &mut style.first_line_style {
-            self.resolve_deferred_font_metrics_in_style(
-                style,
-                font_size,
-                ch_advance,
-                &mut Some(root_font_metrics),
-            );
+            self.resolve_deferred_font_metrics_in_style(style, font_metrics, root_metrics);
         }
         if let Some(style) = &mut style.first_letter_style {
-            self.resolve_deferred_font_metrics_in_style(
-                style,
-                font_size,
-                ch_advance,
-                &mut Some(root_font_metrics),
-            );
+            self.resolve_deferred_font_metrics_in_style(style, font_metrics, root_metrics);
         }
         // All font-, root-font-, viewport-, and selected-font-metric terms
         // above are still in ordinary CSS units. Apply zoom only once they
         // have their concrete used-length values, so inherited text styles
         // and percentage bases retain their CSS semantics.
         // <https://drafts.csswg.org/css-viewport/#zoom-property>
-        (font_size, ch_advance)
+        font_metrics
     }
 
     pub(in crate::layout) fn ch_advance_for_style(
@@ -573,63 +584,247 @@ impl<'a> LayoutBuilder<'a> {
             .any(|child| self.box_requires_parent_ch_advance(child, parent_font_size))
     }
 
+    fn children_require_parent_selected_font_metrics(
+        &self,
+        children: &[box_tree::MutableFormattingBox<'_>],
+    ) -> bool {
+        children
+            .iter()
+            .any(Self::box_requires_parent_selected_font_metrics)
+    }
+
+    fn box_requires_parent_selected_font_metrics(
+        formatting_box: &box_tree::MutableFormattingBox<'_>,
+    ) -> bool {
+        let children_require = |children: &[box_tree::MutableFormattingBox<'_>]| {
+            children
+                .iter()
+                .any(Self::box_requires_parent_selected_font_metrics)
+        };
+        match formatting_box {
+            box_tree::MutableFormattingBox::Block(box_) => {
+                box_.core
+                    .style
+                    .deferred_font_size
+                    .requires_parent_selected_font_metrics()
+                    || children_require(&box_.run_in_children)
+                    || children_require(&box_.core.children)
+            }
+            box_tree::MutableFormattingBox::Inline(box_) => {
+                box_.core
+                    .style
+                    .deferred_font_size
+                    .requires_parent_selected_font_metrics()
+                    || children_require(&box_.core.children)
+            }
+            box_tree::MutableFormattingBox::InlineSplitBlockContext(box_) => {
+                box_.core
+                    .style
+                    .deferred_font_size
+                    .requires_parent_selected_font_metrics()
+                    || children_require(&box_.core.children)
+            }
+            box_tree::MutableFormattingBox::Flex(box_) => {
+                box_.core
+                    .style
+                    .deferred_font_size
+                    .requires_parent_selected_font_metrics()
+                    || children_require(&box_.core.children)
+            }
+            box_tree::MutableFormattingBox::Replaced(box_) => {
+                box_.core
+                    .style
+                    .deferred_font_size
+                    .requires_parent_selected_font_metrics()
+                    || children_require(&box_.core.children)
+            }
+            box_tree::MutableFormattingBox::AnonymousBlock(box_) => {
+                box_.style
+                    .deferred_font_size
+                    .requires_parent_selected_font_metrics()
+                    || children_require(&box_.children)
+            }
+            box_tree::MutableFormattingBox::AtomicInline(box_) => {
+                box_.core
+                    .style
+                    .deferred_font_size
+                    .requires_parent_selected_font_metrics()
+                    || children_require(&box_.core.children)
+            }
+            box_tree::MutableFormattingBox::Text(box_) => box_
+                .style
+                .deferred_font_size
+                .requires_parent_selected_font_metrics(),
+            box_tree::MutableFormattingBox::Table(box_) => {
+                box_.core
+                    .style
+                    .deferred_font_size
+                    .requires_parent_selected_font_metrics()
+                    || children_require(&box_.core.children)
+            }
+        }
+    }
+
+    fn selected_font_metric_basis_for_style(
+        &mut self,
+        style: &ComputedStyle,
+    ) -> css::FontRelativeLengthBasis {
+        let ch_advance = self.font_system.ch_advance(style);
+        let x_height = self.font_system.used_x_height_for_style(style);
+        let cap_height = self.font_system.used_cap_height_for_style(style);
+        let ic_advance = self.font_system.ic_advance_for_style(style);
+        css::FontRelativeLengthBasis::new(layout_pt(style.font_size), ch_advance)
+            .with_selected_font_metrics(x_height, cap_height, ic_advance)
+    }
+
+    /// Finds root-relative selected-font units before resolving the root
+    /// style, so a metric-free document does not intern a font merely to
+    /// create a fallback snapshot.
+    fn box_requires_root_font_metrics(formatting_box: &box_tree::MutableFormattingBox<'_>) -> bool {
+        let children_require = |children: &[box_tree::MutableFormattingBox<'_>]| {
+            children.iter().any(Self::box_requires_root_font_metrics)
+        };
+        match formatting_box {
+            box_tree::MutableFormattingBox::Block(box_) => {
+                box_.core.style.requires_root_font_metrics()
+                    || children_require(&box_.run_in_children)
+                    || children_require(&box_.core.children)
+            }
+            box_tree::MutableFormattingBox::Inline(box_) => {
+                box_.core.style.requires_root_font_metrics()
+                    || children_require(&box_.core.children)
+            }
+            box_tree::MutableFormattingBox::InlineSplitBlockContext(box_) => {
+                box_.core.style.requires_root_font_metrics()
+                    || children_require(&box_.core.children)
+            }
+            box_tree::MutableFormattingBox::Flex(box_) => {
+                box_.core.style.requires_root_font_metrics()
+                    || children_require(&box_.core.children)
+            }
+            box_tree::MutableFormattingBox::Replaced(box_) => {
+                box_.core.style.requires_root_font_metrics()
+                    || children_require(&box_.core.children)
+            }
+            box_tree::MutableFormattingBox::AnonymousBlock(box_) => {
+                box_.style.requires_root_font_metrics() || children_require(&box_.children)
+            }
+            box_tree::MutableFormattingBox::AtomicInline(box_) => {
+                box_.core.style.requires_root_font_metrics()
+                    || children_require(&box_.core.children)
+                    || box_
+                        .table_fragment
+                        .as_ref()
+                        .is_some_and(Self::table_fragment_requires_root_font_metrics)
+            }
+            box_tree::MutableFormattingBox::Text(box_) => box_.style.requires_root_font_metrics(),
+            box_tree::MutableFormattingBox::Table(box_) => {
+                box_.core.style.requires_root_font_metrics()
+                    || children_require(&box_.core.children)
+                    || Self::table_fragment_requires_root_font_metrics(&box_.fragment)
+            }
+        }
+    }
+
+    fn table_fragment_requires_root_font_metrics(
+        fragment: &box_tree::MutableTableFragment<'_>,
+    ) -> bool {
+        fragment.rows.iter().any(|row| {
+            row.row_groups
+                .iter()
+                .filter_map(|group| group.style.as_deref())
+                .any(ComputedStyle::requires_root_font_metrics)
+                || row
+                    .style
+                    .as_deref()
+                    .is_some_and(ComputedStyle::requires_root_font_metrics)
+                || row.cells.iter().any(|cell| {
+                    cell.style
+                        .as_deref()
+                        .is_some_and(ComputedStyle::requires_root_font_metrics)
+                        || cell
+                            .children
+                            .iter()
+                            .any(Self::box_requires_root_font_metrics)
+                })
+        }) || fragment.captions.iter().any(|caption| {
+            caption
+                .style
+                .as_deref()
+                .is_some_and(ComputedStyle::requires_root_font_metrics)
+                || caption
+                    .children
+                    .iter()
+                    .any(Self::box_requires_root_font_metrics)
+        }) || fragment.columns.iter().any(|column| {
+            column
+                .group
+                .as_ref()
+                .and_then(|group| group.style.as_deref())
+                .is_some_and(ComputedStyle::requires_root_font_metrics)
+                || column
+                    .style
+                    .as_deref()
+                    .is_some_and(ComputedStyle::requires_root_font_metrics)
+        })
+    }
+
     fn resolve_deferred_font_metrics_in_box(
         &mut self,
         formatting_box: &mut box_tree::MutableFormattingBox<'_>,
-        parent_font_size: f32,
-        parent_ch_advance: LayoutLength,
-        root_font_metrics: &mut Option<css::RootFontMetricLengthBasis>,
+        parent_metrics: css::FontRelativeLengthBasis,
+        root_metrics: &mut RootMetricState,
     ) {
         let mut recurse = |builder: &mut Self,
                            children: &mut Vec<box_tree::MutableFormattingBox<'_>>,
                            style: &mut ComputedStyle| {
-            let (font_size, _ch_advance) = builder.resolve_deferred_font_metrics_in_style(
-                style,
-                parent_font_size,
-                parent_ch_advance,
-                root_font_metrics,
-            );
+            let font_metrics =
+                builder.resolve_deferred_font_metrics_in_style(style, parent_metrics, root_metrics);
+            let font_size = font_metrics.font_size().points();
+            let child_requires_selected_metrics =
+                builder.children_require_parent_selected_font_metrics(children);
             let ch_advance = builder.ch_advance_for_style(
                 style,
-                builder.children_require_parent_ch_advance(children, font_size),
+                child_requires_selected_metrics
+                    || builder.children_require_parent_ch_advance(children, font_size),
             );
+            let child_metrics = if child_requires_selected_metrics {
+                builder.selected_font_metric_basis_for_style(style)
+            } else {
+                font_metrics.with_ch_advance(ch_advance)
+            };
             for child in children {
-                builder.resolve_deferred_font_metrics_in_box(
-                    child,
-                    font_size,
-                    ch_advance,
-                    root_font_metrics,
-                );
+                builder.resolve_deferred_font_metrics_in_box(child, child_metrics, root_metrics);
             }
         };
         match formatting_box {
             box_tree::MutableFormattingBox::Block(box_) => {
-                let (font_size, _ch_advance) = self.resolve_deferred_font_metrics_in_style(
+                let font_metrics = self.resolve_deferred_font_metrics_in_style(
                     &mut box_.core.style,
-                    parent_font_size,
-                    parent_ch_advance,
-                    root_font_metrics,
+                    parent_metrics,
+                    root_metrics,
                 );
+                let font_size = font_metrics.font_size().points();
                 let child_requires_parent_ch = self
                     .children_require_parent_ch_advance(&box_.run_in_children, font_size)
                     || self.children_require_parent_ch_advance(&box_.core.children, font_size);
-                let ch_advance =
-                    self.ch_advance_for_style(&box_.core.style, child_requires_parent_ch);
+                let child_requires_selected_metrics = self
+                    .children_require_parent_selected_font_metrics(&box_.run_in_children)
+                    || self.children_require_parent_selected_font_metrics(&box_.core.children);
+                let ch_advance = self.ch_advance_for_style(
+                    &box_.core.style,
+                    child_requires_parent_ch || child_requires_selected_metrics,
+                );
+                let child_metrics = if child_requires_selected_metrics {
+                    self.selected_font_metric_basis_for_style(&box_.core.style)
+                } else {
+                    font_metrics.with_ch_advance(ch_advance)
+                };
                 for child in &mut box_.run_in_children {
-                    self.resolve_deferred_font_metrics_in_box(
-                        child,
-                        font_size,
-                        ch_advance,
-                        root_font_metrics,
-                    );
+                    self.resolve_deferred_font_metrics_in_box(child, child_metrics, root_metrics);
                 }
                 for child in &mut box_.core.children {
-                    self.resolve_deferred_font_metrics_in_box(
-                        child,
-                        font_size,
-                        ch_advance,
-                        root_font_metrics,
-                    );
+                    self.resolve_deferred_font_metrics_in_box(child, child_metrics, root_metrics);
                 }
             }
             box_tree::MutableFormattingBox::Inline(box_) => {
@@ -642,65 +837,70 @@ impl<'a> LayoutBuilder<'a> {
                 recurse(self, &mut box_.children, &mut box_.style)
             }
             box_tree::MutableFormattingBox::AtomicInline(box_) => {
-                let (font_size, _ch_advance) = self.resolve_deferred_font_metrics_in_style(
+                let font_metrics = self.resolve_deferred_font_metrics_in_style(
                     &mut box_.core.style,
-                    parent_font_size,
-                    parent_ch_advance,
-                    root_font_metrics,
+                    parent_metrics,
+                    root_metrics,
                 );
+                let font_size = font_metrics.font_size().points();
                 let child_requires_parent_ch =
                     self.children_require_parent_ch_advance(&box_.core.children, font_size);
-                let ch_advance =
-                    self.ch_advance_for_style(&box_.core.style, child_requires_parent_ch);
+                let child_requires_selected_metrics =
+                    self.children_require_parent_selected_font_metrics(&box_.core.children);
+                let ch_advance = self.ch_advance_for_style(
+                    &box_.core.style,
+                    child_requires_parent_ch || child_requires_selected_metrics,
+                );
+                let child_metrics = if child_requires_selected_metrics {
+                    self.selected_font_metric_basis_for_style(&box_.core.style)
+                } else {
+                    font_metrics.with_ch_advance(ch_advance)
+                };
                 if let Some(fragment) = &mut box_.table_fragment {
                     self.resolve_deferred_font_metrics_in_table_fragment(
                         fragment,
-                        font_size,
-                        ch_advance,
-                        root_font_metrics,
+                        child_metrics,
+                        root_metrics,
                     );
                 }
                 for child in &mut box_.core.children {
-                    self.resolve_deferred_font_metrics_in_box(
-                        child,
-                        font_size,
-                        ch_advance,
-                        root_font_metrics,
-                    );
+                    self.resolve_deferred_font_metrics_in_box(child, child_metrics, root_metrics);
                 }
             }
             box_tree::MutableFormattingBox::Text(box_) => {
                 self.resolve_deferred_font_metrics_in_style(
                     &mut box_.style,
-                    parent_font_size,
-                    parent_ch_advance,
-                    root_font_metrics,
+                    parent_metrics,
+                    root_metrics,
                 );
             }
             box_tree::MutableFormattingBox::Table(box_) => {
-                let (font_size, _ch_advance) = self.resolve_deferred_font_metrics_in_style(
+                let font_metrics = self.resolve_deferred_font_metrics_in_style(
                     &mut box_.core.style,
-                    parent_font_size,
-                    parent_ch_advance,
-                    root_font_metrics,
+                    parent_metrics,
+                    root_metrics,
                 );
+                let font_size = font_metrics.font_size().points();
                 let child_requires_parent_ch =
                     self.children_require_parent_ch_advance(&box_.core.children, font_size);
-                let ch_advance =
-                    self.ch_advance_for_style(&box_.core.style, child_requires_parent_ch);
+                let child_requires_selected_metrics =
+                    self.children_require_parent_selected_font_metrics(&box_.core.children);
+                let ch_advance = self.ch_advance_for_style(
+                    &box_.core.style,
+                    child_requires_parent_ch || child_requires_selected_metrics,
+                );
+                let child_metrics = if child_requires_selected_metrics {
+                    self.selected_font_metric_basis_for_style(&box_.core.style)
+                } else {
+                    font_metrics.with_ch_advance(ch_advance)
+                };
                 self.resolve_deferred_font_metrics_in_table_fragment(
                     &mut box_.fragment,
-                    font_size,
-                    ch_advance,
-                    root_font_metrics,
+                    child_metrics,
+                    root_metrics,
                 );
                 for child in &mut box_.core.children {
-                    self.resolve_deferred_font_metrics_in_box(
-                        child,
-                        font_size,
-                        ch_advance,
-                        root_font_metrics,
-                    );
+                    self.resolve_deferred_font_metrics_in_box(child, child_metrics, root_metrics);
                 }
             }
             box_tree::MutableFormattingBox::Flex(box_) => {
@@ -722,102 +922,71 @@ impl<'a> LayoutBuilder<'a> {
     fn resolve_deferred_font_metrics_in_table_fragment(
         &mut self,
         fragment: &mut box_tree::MutableTableFragment<'_>,
-        parent_font_size: f32,
-        parent_ch_advance: LayoutLength,
-        root_font_metrics: &mut Option<css::RootFontMetricLengthBasis>,
+        parent_metrics: css::FontRelativeLengthBasis,
+        root_metrics: &mut RootMetricState,
     ) {
         for row in &mut fragment.rows {
-            let mut row_parent_font_size = parent_font_size;
-            let mut row_parent_ch_advance = parent_ch_advance;
+            let mut row_parent_metrics = parent_metrics;
             for group in &mut row.row_groups {
                 if let Some(style) = &mut group.style {
-                    (row_parent_font_size, row_parent_ch_advance) = self
-                        .resolve_deferred_font_metrics_in_style(
-                            style,
-                            row_parent_font_size,
-                            row_parent_ch_advance,
-                            root_font_metrics,
-                        );
+                    row_parent_metrics = self.resolve_deferred_font_metrics_in_style(
+                        style,
+                        row_parent_metrics,
+                        root_metrics,
+                    );
                 }
             }
-            let (row_font_size, row_ch_advance) = row
+            let row_metrics = row
                 .style
                 .as_deref_mut()
                 .map(|style| {
                     self.resolve_deferred_font_metrics_in_style(
                         style,
-                        row_parent_font_size,
-                        row_parent_ch_advance,
-                        root_font_metrics,
+                        row_parent_metrics,
+                        root_metrics,
                     )
                 })
-                .unwrap_or((row_parent_font_size, row_parent_ch_advance));
+                .unwrap_or(row_parent_metrics);
             for cell in &mut row.cells {
-                let (cell_font_size, cell_ch_advance) = cell
+                let cell_metrics = cell
                     .style
                     .as_deref_mut()
                     .map(|style| {
                         self.resolve_deferred_font_metrics_in_style(
                             style,
-                            row_font_size,
-                            row_ch_advance,
-                            root_font_metrics,
+                            row_metrics,
+                            root_metrics,
                         )
                     })
-                    .unwrap_or((row_font_size, row_ch_advance));
+                    .unwrap_or(row_metrics);
                 for child in &mut cell.children {
-                    self.resolve_deferred_font_metrics_in_box(
-                        child,
-                        cell_font_size,
-                        cell_ch_advance,
-                        root_font_metrics,
-                    );
+                    self.resolve_deferred_font_metrics_in_box(child, cell_metrics, root_metrics);
                 }
             }
         }
         for caption in &mut fragment.captions {
-            let (font_size, ch_advance) = caption
+            let caption_metrics = caption
                 .style
                 .as_deref_mut()
                 .map(|style| {
-                    self.resolve_deferred_font_metrics_in_style(
-                        style,
-                        parent_font_size,
-                        parent_ch_advance,
-                        root_font_metrics,
-                    )
+                    self.resolve_deferred_font_metrics_in_style(style, parent_metrics, root_metrics)
                 })
-                .unwrap_or((parent_font_size, parent_ch_advance));
+                .unwrap_or(parent_metrics);
             for child in &mut caption.children {
-                self.resolve_deferred_font_metrics_in_box(
-                    child,
-                    font_size,
-                    ch_advance,
-                    root_font_metrics,
-                );
+                self.resolve_deferred_font_metrics_in_box(child, caption_metrics, root_metrics);
             }
         }
         for column in &mut fragment.columns {
-            let (group_font_size, group_ch_advance) = column
+            let group_metrics = column
                 .group
                 .as_mut()
                 .and_then(|group| group.style.as_deref_mut())
                 .map(|style| {
-                    self.resolve_deferred_font_metrics_in_style(
-                        style,
-                        parent_font_size,
-                        parent_ch_advance,
-                        root_font_metrics,
-                    )
+                    self.resolve_deferred_font_metrics_in_style(style, parent_metrics, root_metrics)
                 })
-                .unwrap_or((parent_font_size, parent_ch_advance));
+                .unwrap_or(parent_metrics);
             if let Some(style) = &mut column.style {
-                self.resolve_deferred_font_metrics_in_style(
-                    style,
-                    group_font_size,
-                    group_ch_advance,
-                    root_font_metrics,
-                );
+                self.resolve_deferred_font_metrics_in_style(style, group_metrics, root_metrics);
             }
         }
     }
@@ -841,18 +1010,17 @@ impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn style_with_current_viewport_lengths(
         &self,
         style: &ComputedStyle,
-    ) -> ComputedStyle {
-        let mut style = style.clone();
+    ) -> css::ZoomedLayoutStyle {
+        let mut style = css::LayoutStyle::from_computed(style);
         self.resolve_style_current_viewport_lengths(&mut style);
-        style.apply_effective_zoom();
-        style
+        style.into_zoomed()
     }
 
     pub(in crate::layout) fn style_with_current_used_lengths(
         &mut self,
         style: &ComputedStyle,
-    ) -> ComputedStyle {
-        let mut style = style.clone();
+    ) -> css::ZoomedLayoutStyle {
+        let mut style = css::LayoutStyle::from_computed(style);
         self.resolve_style_current_viewport_lengths(&mut style);
         // A frozen box tree can retain an `em`/`rem` expression until it is
         // replayed for intrinsic sizing or an isolated formatting context.
@@ -861,7 +1029,7 @@ impl<'a> LayoutBuilder<'a> {
         // <https://www.w3.org/TR/css-values-4/#font-relative-lengths>
         style.finalize_computed_font_relative_lengths();
         self.resolve_style_font_metric_lengths(&mut style);
-        style.apply_effective_zoom();
+        let mut style = style.into_zoomed();
         // Viewport and font-relative units can turn an authored box edge into
         // a fixed computed length after cascading. Keep the legacy used-edge
         // cache synchronized so its fixed-edge fast path does not retain the
@@ -876,19 +1044,25 @@ impl<'a> LayoutBuilder<'a> {
         &self,
         style: &mut ComputedStyle,
     ) {
-        // Every page fragmentainer establishes its own paged-media viewport.
-        // Resolve viewport-relative used values only after a prebreak has
-        // selected the destination page context; otherwise a box moved from a
-        // `:first` sheet can retain that sheet's `vw`/`vh` size on the next
-        // page.
+        // Document viewport-relative lengths resolve against the immutable
+        // initial containing block. An embedded document instead has the
+        // iframe's finite browsing-context viewport, even though its static
+        // layout surface is deliberately made tall to avoid fragmentation.
+        // A destination page may otherwise have a different used page area
+        // through a named or spread `@page` rule, but that changes layout
+        // geometry rather than the document viewport.
         // <https://www.w3.org/TR/css-page-3/#page-model>
         // <https://www.w3.org/TR/css-values-4/#viewport-relative-lengths>
         Self::resolve_style_viewport_lengths(
             style,
-            LayoutSize::new(
-                self.current_page_context.area_width(),
-                self.current_page_context.area_height(),
-            ),
+            self.iframe_viewport
+                .map(PageSize::layout_size)
+                .unwrap_or_else(|| {
+                    LayoutSize::new(
+                        self.initial_viewport_context.area_width(),
+                        self.initial_viewport_context.area_height(),
+                    )
+                }),
         );
     }
 
@@ -1003,7 +1177,7 @@ impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn build_frozen_child_boxes_with_font_metrics<'b>(
         &mut self,
         element: &'b Element,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         parent_style: &ComputedStyle,
         ancestors: &[ElementSignature],
     ) -> Vec<box_tree::FrozenFormattingBox<'b>> {
@@ -1023,7 +1197,7 @@ impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn build_frozen_child_boxes_with_current_ancestors<'b>(
         &mut self,
         element: &'b Element,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         parent_style: &ComputedStyle,
     ) -> Vec<box_tree::FrozenFormattingBox<'b>> {
         let ancestors = self.ancestors.clone();
@@ -1039,6 +1213,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         style: &mut ComputedStyle,
     ) {
+        self.resolve_deferred_root_font_metric_font_size(style);
         let box_edges_require_ch_advance = style.box_values.requires_ch_advance();
         let pseudo_requires_parent_ch = [
             style.marker_style.as_deref(),
@@ -1103,6 +1278,65 @@ impl<'a> LayoutBuilder<'a> {
         }
     }
 
+    /// Correct a lazily built descendant's provisional `font-size` once the
+    /// document root has established its selected-font metric snapshot.
+    ///
+    /// CSS cascade intentionally retains a deferred font size while a box is
+    /// being built. A child constructed after the structural prepass has not
+    /// passed through that prepass, so root-relative terms must consume the
+    /// typed snapshot retained by the builder instead of their provisional
+    /// parent-sized fallback.
+    /// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>
+    fn resolve_deferred_root_font_metric_font_size(&mut self, style: &mut ComputedStyle) {
+        if !style.deferred_font_size.requires_root_font_metrics() {
+            return;
+        }
+        let RootMetricState::Resolved(root_metrics) = self.root_metric_state else {
+            // The document-root structural pass establishes this state before
+            // ordinary lazy child construction begins.
+            debug_assert!(false, "root-relative font size before root metrics");
+            return;
+        };
+        let provisional_parent_font_size = style.font_size;
+        style.resolve_deferred_font_size_with_viewport_and_root_metrics(
+            css::FontRelativeLengthBasis::new(
+                layout_pt(provisional_parent_font_size),
+                css::fallback_ch_advance_for_style(style),
+            ),
+            LayoutSize::new(
+                self.initial_viewport_context.area_width(),
+                self.current_page_context.area_height(),
+            ),
+            Some(root_metrics.basis()),
+        );
+    }
+
+    /// Resolves lazily cascaded `font-size` values that depend on the parent
+    /// selected font. Structural traversal normally performs this work, but
+    /// positioned and replayed boxes are constructed after that traversal.
+    /// <https://www.w3.org/TR/css-fonts-4/#font-size-prop>
+    fn resolve_deferred_parent_font_metric_font_size(
+        &mut self,
+        style: &mut ComputedStyle,
+        parent_style: &ComputedStyle,
+    ) {
+        if !style
+            .deferred_font_size
+            .requires_parent_selected_font_metrics()
+        {
+            return;
+        }
+        let parent_metrics = self.selected_font_metric_basis_for_style(parent_style);
+        style.resolve_deferred_font_size_with_viewport_and_root_metrics(
+            parent_metrics,
+            LayoutSize::new(
+                self.initial_viewport_context.area_width(),
+                self.current_page_context.area_height(),
+            ),
+            self.root_metric_state.font_size_basis(),
+        );
+    }
+
     pub(in crate::layout) fn resolve_table_cell_style_font_metric_lengths(
         &mut self,
         style: &mut ComputedStyle,
@@ -1151,7 +1385,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         signature: ElementSignature,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         parent: Option<&ComputedStyle>,
     ) -> ComputedStyle {
         let ancestors = self.ancestors.clone();
@@ -1168,7 +1402,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         signature: ElementSignature,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         parent: Option<&ComputedStyle>,
         ancestors: &[ElementSignature],
     ) -> ComputedStyle {
@@ -1215,6 +1449,21 @@ impl<'a> LayoutBuilder<'a> {
                 pseudo_parent_ch_advance,
             );
         }
+        self.resolve_deferred_parent_font_metric_font_size(&mut style, &inheritance_source);
+        // Computed styles deliberately do not inherit text-decoration
+        // longhands.  At this layout boundary, materialize the decorating
+        // ancestors as used-style paint layers instead.  Keeping this after
+        // pseudo and font-metric resolution preserves the decorating box's
+        // resolved paint parameters while allowing descendant text to retain
+        // its own computed style.
+        //
+        // CSS Text Decoration Level 4 § 2.1, Line Decoration: text
+        // decorations propagate through in-flow descendants, rather than
+        // behaving as inherited CSS properties.
+        if let Some(parent_style) = parent {
+            style =
+                TextDecorationPropagationContext::from_style(parent_style).used_child_style(&style);
+        }
         style
     }
 
@@ -1222,7 +1471,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         signature: ElementSignature,
         inline_style: Option<&str>,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         parent: Option<&ComputedStyle>,
         ancestors: &[ElementSignature],
     ) -> ComputedStyle {
@@ -1268,16 +1517,38 @@ impl<'a> LayoutBuilder<'a> {
                 pseudo_parent_ch_advance,
             );
         }
+        self.resolve_deferred_parent_font_metric_font_size(&mut style, &inheritance_source);
         style
     }
 
     pub(in crate::layout) fn layout_formatting_box(
         &mut self,
         formatting_box: &box_tree::FormattingBox<'_>,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
     ) {
+        self.layout_formatting_box_with_parent_decoration(formatting_box, stylesheets, None);
+    }
+
+    /// Lay out a frozen formatting box with the decoration origins propagated
+    /// by its in-flow parent.
+    ///
+    /// Frozen box trees retain computed styles, so normal CSS inheritance
+    /// cannot carry line-decoration provenance across this boundary. Resolve
+    /// the layout-only propagation context here before dispatching the box's
+    /// formatting algorithm.
+    /// <https://drafts.csswg.org/css-text-decor-4/#line-decoration>
+    pub(in crate::layout) fn layout_formatting_box_with_parent_decoration(
+        &mut self,
+        formatting_box: &box_tree::FormattingBox<'_>,
+        stylesheets: &Stylesheets<'_>,
+        parent_style: Option<&ComputedStyle>,
+    ) {
+        let decoration_context = parent_style
+            .map(TextDecorationPropagationContext::from_style)
+            .unwrap_or_default();
         match formatting_box {
             box_tree::FormattingBox::Block(box_) => {
+                let used_style = decoration_context.used_child_style(&box_.core.style);
                 // The document box can recur through an anonymous root-flow
                 // wrapper before it reaches its own descendants. Keep the
                 // stored style computed, but apply the principal-flow axes at
@@ -1289,10 +1560,10 @@ impl<'a> LayoutBuilder<'a> {
                     .eq_ignore_ascii_case("html")
                     .then_some(())
                     .filter(|_| matches!(&box_.core.source, box_tree::BoxSource::Principal))
-                    .map(|_| self.principal_flow.root_layout_style(&box_.core.style));
+                    .map(|_| self.principal_flow.root_layout_style(&used_style));
                 self.layout_element_box(
                     box_.core.element,
-                    layout_style.as_ref().unwrap_or(&box_.core.style),
+                    layout_style.as_ref().unwrap_or(&used_style),
                     stylesheets,
                     box_.core.signature.clone(),
                     &box_.core.source,
@@ -1300,34 +1571,45 @@ impl<'a> LayoutBuilder<'a> {
                     &box_.core.children,
                 );
             }
-            box_tree::FormattingBox::Inline(box_) => self.layout_element_box(
-                box_.core.element,
-                &box_.core.style,
-                stylesheets,
-                box_.core.signature.clone(),
-                &box_.core.source,
-                &[],
-                &box_.core.children,
-            ),
+            box_tree::FormattingBox::Inline(box_) => {
+                let used_style = decoration_context.used_child_style(&box_.core.style);
+                self.layout_element_box(
+                    box_.core.element,
+                    &used_style,
+                    stylesheets,
+                    box_.core.signature.clone(),
+                    &box_.core.source,
+                    &[],
+                    &box_.core.children,
+                )
+            }
             box_tree::FormattingBox::AnonymousBlock(box_) => {
-                self.layout_anonymous_block(&box_.style, &box_.children, stylesheets, None);
+                let used_style = decoration_context.used_child_style(&box_.style);
+                self.layout_anonymous_block(&used_style, &box_.children, stylesheets, None);
             }
-            box_tree::FormattingBox::InlineSplitBlockContext(box_) => {
-                self.layout_inline_split_block_context(box_, stylesheets)
+            box_tree::FormattingBox::InlineSplitBlockContext(box_) => self
+                .layout_inline_split_block_context_with_parent_decoration(
+                    box_,
+                    stylesheets,
+                    parent_style,
+                ),
+            box_tree::FormattingBox::AtomicInline(box_) => {
+                let used_style = decoration_context.used_child_style(&box_.core.style);
+                self.layout_element_box(
+                    box_.core.element,
+                    &used_style,
+                    stylesheets,
+                    box_.core.signature.clone(),
+                    &box_.core.source,
+                    &[],
+                    &box_.core.children,
+                )
             }
-            box_tree::FormattingBox::AtomicInline(box_) => self.layout_element_box(
-                box_.core.element,
-                &box_.core.style,
-                stylesheets,
-                box_.core.signature.clone(),
-                &box_.core.source,
-                &[],
-                &box_.core.children,
-            ),
             box_tree::FormattingBox::Table(box_) => {
+                let used_style = decoration_context.used_child_style(&box_.core.style);
                 self.layout_table_box(
                     box_.core.element,
-                    &box_.core.style,
+                    &used_style,
                     stylesheets,
                     box_.core.signature.clone(),
                     &box_.core.source,
@@ -1335,28 +1617,35 @@ impl<'a> LayoutBuilder<'a> {
                     &box_.fragment,
                 );
             }
-            box_tree::FormattingBox::Flex(box_) => self.layout_element_box(
-                box_.core.element,
-                &box_.core.style,
-                stylesheets,
-                box_.core.signature.clone(),
-                &box_.core.source,
-                &[],
-                &box_.core.children,
-            ),
-            box_tree::FormattingBox::Replaced(box_) => self.layout_element_box(
-                box_.core.element,
-                &box_.core.style,
-                stylesheets,
-                box_.core.signature.clone(),
-                &box_.core.source,
-                &[],
-                &box_.core.children,
-            ),
+            box_tree::FormattingBox::Flex(box_) => {
+                let used_style = decoration_context.used_child_style(&box_.core.style);
+                self.layout_element_box(
+                    box_.core.element,
+                    &used_style,
+                    stylesheets,
+                    box_.core.signature.clone(),
+                    &box_.core.source,
+                    &[],
+                    &box_.core.children,
+                )
+            }
+            box_tree::FormattingBox::Replaced(box_) => {
+                let used_style = decoration_context.used_child_style(&box_.core.style);
+                self.layout_element_box(
+                    box_.core.element,
+                    &used_style,
+                    stylesheets,
+                    box_.core.signature.clone(),
+                    &box_.core.source,
+                    &[],
+                    &box_.core.children,
+                )
+            }
             box_tree::FormattingBox::Text(box_) => {
-                let text = normalized_text_for_style(&box_.text, &box_.style);
+                let used_style = decoration_context.used_child_style(&box_.style);
+                let text = normalized_text_for_style(&box_.text, &used_style);
                 if !text.is_empty() {
-                    self.layout_text_block(&text, &box_.style, 0.0, 0.0, None);
+                    self.layout_text_block(&text, &used_style, 0.0, 0.0, None);
                 }
             }
         }
@@ -1367,7 +1656,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         signature: ElementSignature,
         source: &box_tree::BoxSource<'_>,
         run_in_children: &[box_tree::FormattingBox<'_>],
@@ -1415,7 +1704,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         signature: ElementSignature,
         source: &box_tree::BoxSource<'_>,
         children: &[box_tree::FormattingBox<'_>],
@@ -1456,7 +1745,7 @@ impl<'a> LayoutBuilder<'a> {
         element: &Element,
         style: &ComputedStyle,
         source: box_tree::CounterEventSource,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         run_in_children: &[box_tree::FormattingBox<'_>],
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
@@ -1491,7 +1780,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
     ) {
         self.layout_element_with_child_boxes(element, style, stylesheets, None);
     }
@@ -1500,7 +1789,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
     ) {
         self.layout_element_with_child_boxes_and_run_ins(
@@ -1516,7 +1805,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         run_in_children: &[box_tree::FormattingBox<'_>],
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
     ) {
@@ -1534,7 +1823,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
     ) {
@@ -1552,7 +1841,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         run_in_children: &[box_tree::FormattingBox<'_>],
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
@@ -1573,7 +1862,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         run_in_children: &[box_tree::FormattingBox<'_>],
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
@@ -1749,7 +2038,7 @@ impl<'a> LayoutBuilder<'a> {
         if style.display.is_none()
             || matches!(style.position, Position::Absolute | Position::Fixed)
             || style.float != Float::None
-            || style.running_element_name.is_some()
+            || style.position.is_running()
         {
             return None;
         }
@@ -1770,7 +2059,7 @@ impl<'a> LayoutBuilder<'a> {
             | PageBoundaryValue::Inherited
             | PageBoundaryValue::Auto => None,
         };
-        if !style.page_name_specified && start_page_name.is_none() && end_page_name.is_none() {
+        if !style.page.is_specified() && start_page_name.is_none() && end_page_name.is_none() {
             return None;
         }
         // Element scopes establish lexical `page` used-value resolution, but

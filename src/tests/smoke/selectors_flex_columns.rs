@@ -1,6 +1,46 @@
 use super::*;
 
 #[tokio::test]
+async fn definition_list_columns_preserve_description_borders() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 180pt 100pt; margin: 10pt }\
+         html { align-items: center; display: flex; height: 100% }\
+         body { display: flex; height: 40pt; margin: 0; width: 160pt }\
+         section { flex: 1; position: relative }\
+         aside { background: white; width: 40pt }\
+         h1 { margin: 0; position: absolute; right: 0; top: 0 }\
+         dl { background: black; columns: 4; column-gap: 0; margin: 0; padding: 1cm 0 }\
+         dt, dd { box-sizing: border-box; margin: 0 }\
+         dt { font-size: 9pt; font-weight: 700 }\
+         dd { font-size: 35pt }\
+         dl { dd { border-left: 2pt solid white } dd:first-of-type { border-left: 0 } }\
+         </style>\
+         <section><h1>Heading</h1><dl>\
+           <dt>Term one</dt><dd>First description</dd>\
+           <dt>Term two</dt><dd>Second description</dd>\
+           <dt>Term three</dt><dd>Third description</dd>\
+           <dt>Term four</dt><dd>Fourth description</dd>\
+         </dl></section><aside></aside>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let borders = document.pages[0]
+        .rects()
+        .iter()
+        .filter(|rect| {
+            rect.fill == Some(CssColor::WHITE)
+                && (rect.width() - 2.0).abs() < 0.01
+                && rect.height() > 10.0
+        })
+        .count();
+
+    assert_eq!(borders, 3);
+}
+
+#[tokio::test]
 async fn supports_structural_pseudo_class_selectors() {
     let document = Html::from_string(
         "<style>p:first-child { color: red } p:nth-child(2) { color: blue } p:last-child { font-size: 16pt }</style><div><p>First</p><p>Second</p></div>",
@@ -927,7 +967,7 @@ async fn size_containment_sizes_as_empty_but_lays_out_contents_in_place() {
 }
 
 #[tokio::test]
-async fn layout_containment_traps_forced_column_break_in_shrink_to_fit_multicol() {
+async fn layout_containment_allows_forced_column_break_in_shrink_to_fit_multicol() {
     let document = Html::from_string(
         "<style>\
          @page { size: 260pt 460pt; margin: 10pt }\
@@ -953,17 +993,15 @@ async fn layout_containment_traps_forced_column_break_in_shrink_to_fit_multicol(
     let yellow = rect(CssColor::new(255, 255, 0));
     let blue = rect(CssColor::new(0, 0, 255));
     let orange = rect(CssColor::new(255, 165, 0));
-    for square in [yellow, blue, orange] {
-        assert!((square.width() - 100.0).abs() < 0.01, "{square:?}");
-    }
     assert!(
         (blue.y() - yellow.y() + 100.0).abs() < 0.01,
         "{yellow:?} {blue:?}"
     );
     assert!(
-        (orange.y() - blue.y() + 100.0).abs() < 0.01,
-        "{blue:?} {orange:?}"
+        orange.x() > blue.x() + 0.01,
+        "the contained child must consume its forced column break locally: {blue:?} {orange:?}"
     );
+    assert!(orange.y() > blue.y() + 0.01, "{blue:?} {orange:?}");
 }
 
 #[tokio::test]

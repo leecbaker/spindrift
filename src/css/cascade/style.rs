@@ -1,5 +1,44 @@
 use super::*;
 use crate::css::html5_user_agent_stylesheet;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::{Mutex, OnceLock};
+
+/// Whether an attribute-free element with `tag` has a block-level default
+/// display in Quire's HTML UA stylesheet.
+///
+/// This is intentionally derived through the ordinary UA cascade rather than
+/// duplicating the stylesheet's display selector list. Inline-text collection
+/// calls this for every nested element, however, and cloning the complete UA
+/// stylesheet for each call is needlessly expensive. The CSS is process-wide
+/// immutable, so caching this tag-only cascade result preserves its semantics.
+pub(crate) fn default_display_is_block_level_for_tag(tag: &str) -> bool {
+    // This cache is process-wide. Bound it so documents with attacker-chosen
+    // custom element names cannot retain arbitrary input indefinitely.
+    const MAXIMUM_CACHED_TAGS: usize = 128;
+    static BLOCK_LEVEL_BY_TAG: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+
+    let cache = BLOCK_LEVEL_BY_TAG.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(&is_block_level) = cache
+        .lock()
+        .expect("default display cache mutex must not be poisoned")
+        .get(tag)
+    {
+        return is_block_level;
+    }
+
+    // Do the cascade outside the cache lock. A concurrent first lookup may
+    // duplicate this one-time calculation, but no steady-state lookup waits on
+    // a full cascade.
+    let is_block_level = default_style_for_tag(tag).display.is_block_level();
+    let mut cache = cache
+        .lock()
+        .expect("default display cache mutex must not be poisoned");
+    if cache.len() < MAXIMUM_CACHED_TAGS {
+        cache.insert(tag.to_owned(), is_block_level);
+    }
+    is_block_level
+}
 
 pub(crate) fn default_style_for_tag(tag: &str) -> ComputedStyle {
     // HTML's suggested rendering is expressed as a user-agent stylesheet, not
@@ -7,13 +46,30 @@ pub(crate) fn default_style_for_tag(tag: &str) -> ComputedStyle {
     // as DOM elements so defaults stay aligned with `css/ua/html5_ua.css`.
     // https://html.spec.whatwg.org/multipage/rendering.html#rendering
     let ua = html5_user_agent_stylesheet();
+    let stylesheets = Stylesheets::for_document(ua, None, &[]);
     style_for_element_with_signature(
         ElementSignature::new(tag, HashMap::new()),
         None,
-        std::slice::from_ref(&ua),
+        &stylesheets,
         None,
         &[],
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cached_default_display_classification_matches_the_ua_cascade() {
+        for tag in ["p", "span", "table", "custom-element"] {
+            assert_eq!(
+                default_display_is_block_level_for_tag(tag),
+                default_style_for_tag(tag).display.is_block_level(),
+                "{tag}"
+            );
+        }
+    }
 }
 
 /// Build the style for a generated anonymous block box.
@@ -29,19 +85,32 @@ pub(crate) fn anonymous_block_style(parent: &ComputedStyle) -> ComputedStyle {
     style
 }
 
-pub(crate) fn style_for_element_with_signature(
+/// Build the style carried by text in an anonymous inline box.
+///
+/// A DOM text node does not inherit non-inherited box properties from its
+/// parent. In particular, copying a parent's background onto a text run turns
+/// an otherwise transparent anonymous table cell into a painted inline-sized
+/// rectangle. Keep this distinct from [`anonymous_block_style`]: text has no
+/// generated principal box, so its `display` value is not meaningful here.
+/// <https://www.w3.org/TR/CSS22/visuren.html#anonymous>
+pub(crate) fn anonymous_text_style(parent: &ComputedStyle) -> ComputedStyle {
+    inherited_base_style(parent)
+}
+
+pub(crate) fn style_for_element_with_signature<Collection: StylesheetCollection + ?Sized>(
     current: ElementSignature,
     inline_style: Option<&str>,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Collection,
     parent: Option<&ComputedStyle>,
     ancestors: &[ElementSignature],
 ) -> ComputedStyle {
+    let stylesheets = stylesheets.stylesheet_view();
     let initial_style = ComputedStyle::initial();
     let parent_ch_advance = fallback_ch_advance_for_style(parent.unwrap_or(&initial_style));
     style_for_element_with_signature_inner(
         current,
         inline_style,
-        stylesheets,
+        &stylesheets,
         parent,
         ancestors,
         parent_ch_advance,
@@ -49,18 +118,21 @@ pub(crate) fn style_for_element_with_signature(
     )
 }
 
-pub(crate) fn style_for_element_with_signature_and_parent_ch_advance(
+pub(crate) fn style_for_element_with_signature_and_parent_ch_advance<
+    Collection: StylesheetCollection + ?Sized,
+>(
     current: ElementSignature,
     inline_style: Option<&str>,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Collection,
     parent: Option<&ComputedStyle>,
     ancestors: &[ElementSignature],
     parent_ch_advance: LayoutLength,
 ) -> ComputedStyle {
+    let stylesheets = stylesheets.stylesheet_view();
     style_for_element_with_signature_inner(
         current,
         inline_style,
-        stylesheets,
+        &stylesheets,
         parent,
         ancestors,
         parent_ch_advance,
@@ -79,7 +151,7 @@ struct ElementCascadeContext<'a> {
 impl<'a> ElementCascadeContext<'a> {
     fn new(
         current: &'a ElementSignature,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         ancestors: &'a [ElementSignature],
     ) -> Self {
         Self {
@@ -97,7 +169,7 @@ impl<'a> ElementCascadeContext<'a> {
 
     fn collect_matching_rules(
         &mut self,
-        stylesheets: &'a [Stylesheet],
+        stylesheets: &'a Stylesheets<'a>,
         rule_set: fn(&Stylesheet) -> &[StyleRule],
     ) {
         self.matching_rules.clear();
@@ -142,7 +214,7 @@ impl<'a> ElementCascadeContext<'a> {
 fn style_for_element_with_signature_inner(
     mut current: ElementSignature,
     inline_style: Option<&str>,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
     parent: Option<&ComputedStyle>,
     ancestors: &[ElementSignature],
     parent_ch_advance: LayoutLength,
@@ -167,6 +239,7 @@ fn style_for_element_with_signature_inner(
             .map(inherited_base_style)
             .unwrap_or_else(ComputedStyle::initial)
     };
+    style.registered_custom_properties = Arc::new(stylesheets.registered_custom_properties());
     let resolved_language = current
         .attrs
         .get("lang")
@@ -193,7 +266,11 @@ fn style_for_element_with_signature_inner(
     cascade.rebuild_cascaded_declarations();
     let user_agent_stylesheet_index = stylesheets
         .iter()
-        .rposition(|stylesheet| stylesheet.origin == StylesheetOrigin::UserAgent)
+        .enumerate()
+        .filter_map(|(index, stylesheet)| {
+            (stylesheet.origin == StylesheetOrigin::UserAgent).then_some(index)
+        })
+        .last()
         .unwrap_or(0);
     push_dynamic_html_list_user_agent_declarations(
         &mut cascade.cascaded_declarations,
@@ -205,8 +282,11 @@ fn style_for_element_with_signature_inner(
             &mut cascade.cascaded_declarations,
             &current,
             stylesheet_index,
-            &stylesheets[stylesheet_index],
+            stylesheets
+                .get(stylesheet_index)
+                .expect("matched stylesheet index must refer to the stylesheet collection"),
             ancestors,
+            stylesheets.html_container_frame_body_margins(),
         );
     }
     if let Some(inline_declarations) = &inline_declarations {
@@ -242,9 +322,12 @@ fn style_for_element_with_signature_inner(
         inheritance_source,
         parent_ch_advance,
         is_document_root,
+        stylesheets.color_scheme_preference(),
     );
+    select_style_image_sets(&mut style, stylesheets.image_set_resolution_dppx());
     if is_document_root {
         style.root_font_size = style.font_size;
+        style.page_color_scheme = style.used_color_scheme;
     }
     if display_contents_computes_to_none_for_html_element(&current, &style) {
         style.display = Display::NONE;
@@ -255,8 +338,7 @@ fn style_for_element_with_signature_inner(
     };
     style.quotes.resolve_auto_language(quotes_auto_language);
     if matches!(style.position, Position::Absolute | Position::Fixed) {
-        style.abspos_static_source_was_inline_level = style.display.is_inline_level();
-        style.abspos_static_source_was_atomic_inline = style.display.is_atomic_inline();
+        style.abspos_static_source = StaticPositionSource::from_display(style.display);
     }
     resolve_ua_relative_margins(&mut style);
     if apply_pseudos {
@@ -267,10 +349,39 @@ fn style_for_element_with_signature_inner(
             &mut cascade,
             pseudo_parent_ch_advance,
         );
+        suppress_generated_pseudos_for_html_replaced_control(&mut style, &current);
     }
     finalize_text_decoration_layers(&mut style);
     apply_forced_color_used_values(&mut style, &current, parent, stylesheets);
     style
+}
+
+/// Resolve image-set candidate lists after declaration parsing, variable
+/// substitution, and cascade have produced one computed style. CSS Images
+/// selection is a rendering-environment decision, not declaration parsing.
+/// <https://drafts.csswg.org/css-images-4/#image-set-notation>
+fn select_style_image_sets(style: &mut ComputedStyle, resolution_dppx: f32) {
+    style.background_image.select_image_set(resolution_dppx);
+    for layer in &mut style.background_layers {
+        layer.image.select_image_set(resolution_dppx);
+    }
+    style.border_image.source.select_image_set(resolution_dppx);
+    style.list_style_image.select_image_set(resolution_dppx);
+    match &mut style.content {
+        Content::List { parts, .. } => select_generated_content_image_sets(parts, resolution_dppx),
+        Content::Replacement { image, .. } => {
+            select_generated_content_image_sets(std::slice::from_mut(image), resolution_dppx)
+        }
+        Content::Normal | Content::None => {}
+    }
+}
+
+fn select_generated_content_image_sets(parts: &mut [GeneratedContentPart], resolution_dppx: f32) {
+    for part in parts {
+        if let GeneratedContentPart::Image { image } = part {
+            image.select_image_set(resolution_dppx);
+        }
+    }
 }
 
 /// Apply CSS CssColor Adjustment's forced-colors substitutions at the boundary
@@ -282,7 +393,7 @@ fn apply_forced_color_used_values(
     style: &mut ComputedStyle,
     current: &ElementSignature,
     parent: Option<&ComputedStyle>,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
 ) {
     let Some(palette) = stylesheets
         .iter()
@@ -300,14 +411,6 @@ fn apply_forced_color_used_values(
             style.color = parent.color;
         } else {
             style.color = palette.canvas_text;
-        }
-        if current.namespace_url == "http://www.w3.org/2000/svg" {
-            if style.svg_fill_is_current_color {
-                style.svg_fill = Some(style.color);
-            }
-            if style.svg_stroke_is_current_color {
-                style.svg_stroke = Some(style.color);
-            }
         }
         resolve_style_system_colors(style, palette);
         return;
@@ -327,9 +430,9 @@ fn apply_forced_color_used_values(
         palette.canvas_text
     };
     style.color = resolve_or(style.color, foreground);
-    style.text_fill_color = style
-        .text_fill_color
-        .map(|color| resolve_or(color, style.color));
+    if let CssColorOrCurrentColor::Color(color) = style.text_fill_color {
+        style.text_fill_color = CssColorOrCurrentColor::Color(resolve_or(color, style.color));
+    }
     let had_nondefault_border_color = style.border_color != CssColor::BLACK
         || [
             style.border_colors.top,
@@ -371,33 +474,38 @@ fn apply_forced_color_used_values(
         style.border_width = CSS_PX_TO_PT;
     }
     style.outline_color = resolve_or(style.outline_color, palette.canvas_text);
-    style.background_color = style
-        .background_color
-        .map(|color| match color.system_color() {
+    style.background_color = BackgroundColor::Color(
+        match style
+            .background_color
+            .resolved_color(style.color)
+            .system_color()
+        {
             Some(system) => palette.color(system),
-            None => palette.canvas.with_alpha(color.alpha()),
-        });
-    style.background_color_is_current_color = false;
-    style.background_color_current_color_expression = None;
+            None => palette
+                .canvas
+                .with_alpha(style.background_color.resolved_color(style.color).alpha()),
+        },
+    );
     if current.namespace_url == "http://www.w3.org/2000/svg" {
-        style.svg_fill = style
-            .svg_fill
-            .map(|color| resolve_or(color, palette.canvas_text));
-        style.svg_stroke = style
-            .svg_stroke
-            .map(|color| resolve_or(color, palette.canvas_text));
+        for paint in [&mut style.svg_fill, &mut style.svg_stroke] {
+            if let SvgPaint::Color(color) = paint.paint {
+                paint.paint = SvgPaint::Color(resolve_or(color, palette.canvas_text));
+            }
+        }
     }
-    style.text_emphasis_color = style
-        .text_emphasis_color
-        .map(|color| resolve_or(color, palette.canvas_text));
-    style.text_decoration.color = style
-        .text_decoration
-        .color
-        .map(|color| resolve_or(color, palette.canvas_text));
-    for decoration in &mut style.text_decoration_layers {
-        decoration.color = decoration
-            .color
-            .map(|color| resolve_or(color, palette.canvas_text));
+    if let CssColorOrCurrentColor::Color(color) = style.text_emphasis_color {
+        style.text_emphasis_color =
+            CssColorOrCurrentColor::Color(resolve_or(color, palette.canvas_text));
+    }
+    if let CssColorOrCurrentColor::Color(color) = style.text_decoration.color {
+        style.text_decoration.color =
+            CssColorOrCurrentColor::Color(resolve_or(color, palette.canvas_text));
+    }
+    for layer in &mut style.text_decoration_layers {
+        if let CssColorOrCurrentColor::Color(color) = layer.decoration.color {
+            layer.decoration.color =
+                CssColorOrCurrentColor::Color(resolve_or(color, palette.canvas_text));
+        }
     }
     style.row_rule.colors = GapRuleList::single(palette.canvas_text);
     style.column_rule.colors = GapRuleList::single(palette.canvas_text);
@@ -434,9 +542,11 @@ fn apply_forced_color_used_values_to_pseudos(
     {
         if pseudo.forced_color_adjust == ForcedColorAdjust::Auto {
             pseudo.color = palette.canvas_text;
-            pseudo.background_color = pseudo
-                .background_color
-                .map(|color| palette.canvas.with_alpha(color.alpha()));
+            pseudo.background_color = BackgroundColor::Color(
+                palette
+                    .canvas
+                    .with_alpha(pseudo.background_color.resolved_color(pseudo.color).alpha()),
+            );
             pseudo.border_color = palette.canvas_text;
             pseudo.border_colors = BorderColors {
                 top: palette.canvas_text,
@@ -465,12 +575,23 @@ fn resolve_style_system_colors(style: &mut ComputedStyle, palette: ForcedColorPa
     style.border_colors.bottom = resolve(style.border_colors.bottom);
     style.border_colors.left = resolve(style.border_colors.left);
     style.outline_color = resolve(style.outline_color);
-    style.background_color = style.background_color.map(resolve);
-    style.svg_fill = style.svg_fill.map(resolve);
-    style.svg_stroke = style.svg_stroke.map(resolve);
-    style.text_fill_color = style.text_fill_color.map(resolve);
-    style.text_emphasis_color = style.text_emphasis_color.map(resolve);
-    style.text_decoration.color = style.text_decoration.color.map(resolve);
+    if let BackgroundColor::Color(color) = style.background_color {
+        style.background_color = BackgroundColor::Color(resolve(color));
+    }
+    for paint in [&mut style.svg_fill, &mut style.svg_stroke] {
+        if let SvgPaint::Color(color) = paint.paint {
+            paint.paint = SvgPaint::Color(resolve(color));
+        }
+    }
+    for color in [
+        &mut style.text_fill_color,
+        &mut style.text_emphasis_color,
+        &mut style.text_decoration.color,
+    ] {
+        if let CssColorOrCurrentColor::Color(value) = *color {
+            *color = CssColorOrCurrentColor::Color(resolve(value));
+        }
+    }
 }
 
 fn background_image_contains_url(image: &ComputedImage) -> bool {
@@ -509,7 +630,7 @@ struct AnimationSnapshot {
 /// <https://www.w3.org/TR/css-animations-1/#keyframes>.
 fn animation_snapshot_declarations(
     declarations: &[CascadedDeclaration<'_>],
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
 ) -> Declarations {
     let Some(animation) = animation_snapshot_from_declarations(declarations) else {
         return Declarations::new();
@@ -688,7 +809,7 @@ fn interpolate_keyframe_value(from: &str, to: &str, progress: f32) -> String {
 fn resolve_typed_attr_references(
     declarations: &mut [CascadedDeclaration<'_>],
     element: &ElementSignature,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
 ) {
     for declaration in declarations {
         // Generated-content properties have their own `attr()` grammar.  In
@@ -962,29 +1083,30 @@ fn display_contents_computes_to_none_for_html_element(
     style: &ComputedStyle,
 ) -> bool {
     style.display.is_contents()
-        && element.document_is_html
-        && matches!(
-            element.namespace_url.as_str(),
-            "" | "http://www.w3.org/1999/xhtml"
-        )
-        && matches!(
-            element.tag.as_str(),
-            "br" | "wbr"
-                | "meter"
-                | "progress"
-                | "canvas"
-                | "embed"
-                | "object"
-                | "audio"
-                | "iframe"
-                | "img"
-                | "video"
-                | "frame"
-                | "frameset"
-                | "input"
-                | "textarea"
-                | "select"
-        )
+        && (matches!(style.content, Content::Replacement { .. })
+            || (element.document_is_html
+                && matches!(
+                    element.namespace_url.as_str(),
+                    "" | "http://www.w3.org/1999/xhtml"
+                )
+                && matches!(
+                    element.tag.as_str(),
+                    "br" | "wbr"
+                        | "meter"
+                        | "progress"
+                        | "canvas"
+                        | "embed"
+                        | "object"
+                        | "audio"
+                        | "iframe"
+                        | "img"
+                        | "video"
+                        | "frame"
+                        | "frameset"
+                        | "input"
+                        | "textarea"
+                        | "select"
+                )))
 }
 
 /// Add value-dependent HTML presentational hints for the current element.
@@ -999,8 +1121,17 @@ fn push_dynamic_html_presentational_hint_declarations<'a>(
     stylesheet_index: usize,
     stylesheet: &'a Stylesheet,
     ancestors: &[ElementSignature],
+    container_frame_body_margins: Option<HtmlContainerFrameBodyMargins>,
 ) {
     let mut declaration_order = 0usize;
+    push_dynamic_body_margin_presentational_hint_declarations(
+        output,
+        element,
+        stylesheet_index,
+        stylesheet,
+        &mut declaration_order,
+        container_frame_body_margins,
+    );
     if element.tag == "hr" {
         push_dynamic_hr_presentational_hint_declarations(
             output,
@@ -1010,6 +1141,13 @@ fn push_dynamic_html_presentational_hint_declarations<'a>(
             &mut declaration_order,
         );
     }
+    push_dynamic_replaced_element_dimension_hint_declarations(
+        output,
+        element,
+        stylesheet_index,
+        stylesheet,
+        &mut declaration_order,
+    );
     push_dynamic_table_presentational_hint_declarations(
         output,
         element,
@@ -1018,6 +1156,195 @@ fn push_dynamic_html_presentational_hint_declarations<'a>(
         ancestors,
         &mut declaration_order,
     );
+}
+
+/// Inject HTML's width, height, and aspect-ratio presentational hints for
+/// replaced embedded content.
+///
+/// These are ordinary author-origin, zero-specificity CSS declarations.  They
+/// must be produced by the cascade rather than by a particular image layout
+/// path so `content: <image>` replacements retain the same outer-box sizing
+/// and author declarations can override the attributes uniformly.
+/// <https://html.spec.whatwg.org/multipage/rendering.html#attributes-for-embedded-content-and-images>
+fn push_dynamic_replaced_element_dimension_hint_declarations<'a>(
+    output: &mut Vec<CascadedDeclaration<'a>>,
+    element: &ElementSignature,
+    stylesheet_index: usize,
+    stylesheet: &'a Stylesheet,
+    declaration_order: &mut usize,
+) {
+    if !element.document_is_html {
+        return;
+    }
+    let is_image_button = element.tag == "input"
+        && element
+            .attrs
+            .get("type")
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("image"));
+    let maps_dimensions = matches!(
+        element.tag.as_str(),
+        "img" | "embed" | "iframe" | "object" | "video"
+    ) || is_image_button;
+    if !maps_dimensions {
+        return;
+    }
+
+    let width = element
+        .attrs
+        .get("width")
+        .and_then(|value| html_non_negative_length_property_value(value));
+    let height = element
+        .attrs
+        .get("height")
+        .and_then(|value| html_non_negative_length_property_value(value));
+    if let Some(width) = &width {
+        push_dynamic_html_presentational_hint_declaration(
+            output,
+            stylesheet_index,
+            stylesheet,
+            declaration_order,
+            "width",
+            width.clone(),
+        );
+    }
+    if let Some(height) = &height {
+        push_dynamic_html_presentational_hint_declaration(
+            output,
+            stylesheet_index,
+            stylesheet,
+            declaration_order,
+            "height",
+            height.clone(),
+        );
+    }
+
+    // HTML maps the paired dimensions to `auto <ratio>` only for image and
+    // video elements (and image buttons). Percentages cannot form that hint.
+    if matches!(element.tag.as_str(), "img" | "video") || is_image_button {
+        let ratio =
+            element
+                .attrs
+                .get("width")
+                .and_then(|value| html_dimension_number(value))
+                .zip(
+                    element
+                        .attrs
+                        .get("height")
+                        .and_then(|value| html_dimension_number(value)),
+                )
+                .filter(|(width, height)| {
+                    *width > 0.0
+                        && *height > 0.0
+                        && element.attrs.get("width").is_some_and(|value| {
+                            !value.trim_start_matches(is_html_space).contains('%')
+                        })
+                        && element.attrs.get("height").is_some_and(|value| {
+                            !value.trim_start_matches(is_html_space).contains('%')
+                        })
+                });
+        if let Some((width, height)) = ratio {
+            push_dynamic_html_presentational_hint_declaration(
+                output,
+                stylesheet_index,
+                stylesheet,
+                declaration_order,
+                "aspect-ratio",
+                format!("auto {width} / {height}"),
+            );
+        }
+    }
+}
+
+/// Inject the legacy body-margin hints from HTML's page rendering rules.
+///
+/// These values have a source precedence that is distinct from ordinary CSS:
+/// a present-but-invalid body attribute suppresses every later legacy source,
+/// leaving the UA's 8px body margin in effect. Valid results enter the normal
+/// cascade as author-origin, zero-specificity declarations, so authored CSS
+/// remains authoritative:
+/// <https://html.spec.whatwg.org/multipage/rendering.html#the-page>.
+fn push_dynamic_body_margin_presentational_hint_declarations<'a>(
+    output: &mut Vec<CascadedDeclaration<'a>>,
+    element: &ElementSignature,
+    stylesheet_index: usize,
+    stylesheet: &'a Stylesheet,
+    declaration_order: &mut usize,
+    container_frame_body_margins: Option<HtmlContainerFrameBodyMargins>,
+) {
+    if element.tag != "body" || !element.document_is_html {
+        return;
+    }
+
+    let horizontal = body_margin_hint_value(
+        element,
+        "marginwidth",
+        "leftmargin",
+        container_frame_body_margins.and_then(|margins| margins.horizontal),
+    );
+    let vertical = body_margin_hint_value(
+        element,
+        "marginheight",
+        "topmargin",
+        container_frame_body_margins.and_then(|margins| margins.vertical),
+    );
+
+    if let Some(value) = horizontal {
+        let value = format!("{value}px");
+        push_dynamic_html_presentational_hint_declaration(
+            output,
+            stylesheet_index,
+            stylesheet,
+            declaration_order,
+            "margin-left",
+            value.clone(),
+        );
+        push_dynamic_html_presentational_hint_declaration(
+            output,
+            stylesheet_index,
+            stylesheet,
+            declaration_order,
+            "margin-right",
+            value,
+        );
+    }
+    if let Some(value) = vertical {
+        let value = format!("{value}px");
+        push_dynamic_html_presentational_hint_declaration(
+            output,
+            stylesheet_index,
+            stylesheet,
+            declaration_order,
+            "margin-top",
+            value.clone(),
+        );
+        push_dynamic_html_presentational_hint_declaration(
+            output,
+            stylesheet_index,
+            stylesheet,
+            declaration_order,
+            "margin-bottom",
+            value,
+        );
+    }
+}
+
+/// Resolve one physical pair of legacy body-margin sources.
+///
+/// Once either body attribute exists, its parsed result (including failure) is
+/// final. The container frame can be used only when neither body attribute is
+/// present, as required by HTML's ordered source table.
+fn body_margin_hint_value(
+    element: &ElementSignature,
+    preferred_body_attribute: &str,
+    fallback_body_attribute: &str,
+    container_frame_value: Option<i32>,
+) -> Option<i32> {
+    for attribute in [preferred_body_attribute, fallback_body_attribute] {
+        if let Some(value) = element.attrs.get(attribute) {
+            return parse_html_non_negative_integer(value);
+        }
+    }
+    container_frame_value
 }
 
 fn push_dynamic_hr_presentational_hint_declarations<'a>(
@@ -1349,21 +1676,6 @@ fn html_dimension_property_value(value: &str) -> Option<String> {
     }
 }
 
-fn parse_html_non_negative_integer(value: &str) -> Option<i32> {
-    let value = value.trim_start_matches(is_html_space);
-    let (sign, rest) = match value.as_bytes().first().cloned() {
-        Some(b'+') => (1, &value[1..]),
-        Some(b'-') => (-1, &value[1..]),
-        _ => (1, value),
-    };
-    let digit_len = rest.bytes().take_while(u8::is_ascii_digit).count();
-    if digit_len == 0 {
-        return None;
-    }
-    let integer = rest[..digit_len].parse::<i32>().ok()? * sign;
-    (integer >= 0).then_some(integer)
-}
-
 fn html_legacy_color_hint_value(value: &str) -> Option<String> {
     let trimmed = value.trim_matches(is_html_space);
     if trimmed.eq_ignore_ascii_case("transparent") || trimmed.eq_ignore_ascii_case("currentcolor") {
@@ -1405,13 +1717,14 @@ fn is_html_space(character: char) -> bool {
 /// computed longhands while preserving the decorating box's used values:
 /// <https://drafts.csswg.org/css-text-decor-4/#line-decoration>.
 pub(super) fn finalize_text_decoration_layers(style: &mut ComputedStyle) {
-    if style.text_emphasis_color.is_none() {
-        style.text_emphasis_color = Some(style.color);
-    }
     if style.text_decoration.clone().has_visible_line() {
-        let mut decoration = style.text_decoration.clone();
-        decoration.color.get_or_insert(style.color);
-        style.text_decoration_layers.push(decoration);
+        let decoration = style.text_decoration.clone();
+        let mut origin_style = style.clone();
+        origin_style.text_decoration_layers.clear();
+        style.text_decoration_layers.push(TextDecorationLayer {
+            decoration,
+            origin_style: Rc::new(origin_style),
+        });
     }
 }
 
@@ -1507,17 +1820,39 @@ pub(super) fn resolve_ua_relative_margins(style: &mut ComputedStyle) {
 pub(crate) fn apply_pseudo_rules_with_parent_ch_advance(
     style: &mut ComputedStyle,
     current: &ElementSignature,
-    stylesheets: &[Stylesheet],
+    stylesheets: &Stylesheets<'_>,
     ancestors: &[ElementSignature],
     parent_ch_advance: LayoutLength,
 ) {
     let mut cascade = ElementCascadeContext::new(current, stylesheets, ancestors);
     apply_pseudo_rules_with_context(style, stylesheets, &mut cascade, parent_ch_advance);
+    suppress_generated_pseudos_for_html_replaced_control(style, current);
+}
+
+/// Suppress generated-content pseudo-elements on HTML controls rendered as
+/// replaced elements.
+///
+/// HTML's rendering rules treat `input` and `textarea` as replaced for CSS
+/// rendering. CSS Pseudo-Elements therefore suppresses their `::before` and
+/// `::after` boxes, even when selectors and the cascade would otherwise
+/// produce generated content:
+/// <https://html.spec.whatwg.org/multipage/dom.html#rendering>
+/// <https://drafts.csswg.org/css-pseudo-4/#generated-content>
+fn suppress_generated_pseudos_for_html_replaced_control(
+    style: &mut ComputedStyle,
+    current: &ElementSignature,
+) {
+    let is_html_element =
+        current.document_is_html || current.namespace_url == "http://www.w3.org/1999/xhtml";
+    if is_html_element && matches!(current.tag.as_str(), "input" | "textarea") {
+        style.before_style = None;
+        style.after_style = None;
+    }
 }
 
 fn apply_pseudo_rules_with_context<'a>(
     style: &mut ComputedStyle,
-    stylesheets: &'a [Stylesheet],
+    stylesheets: &'a Stylesheets<'a>,
     cascade: &mut ElementCascadeContext<'a>,
     parent_ch_advance: LayoutLength,
 ) {
@@ -1529,7 +1864,7 @@ fn apply_pseudo_rules_with_context<'a>(
 
 fn apply_marker_rules_with_context<'a>(
     style: &mut ComputedStyle,
-    stylesheets: &'a [Stylesheet],
+    stylesheets: &'a Stylesheets<'a>,
     cascade: &mut ElementCascadeContext<'a>,
     parent_ch_advance: LayoutLength,
 ) {
@@ -1544,7 +1879,7 @@ fn apply_marker_rules_with_context<'a>(
 
 fn apply_marker_rules_from_rule_set<'a>(
     style: &mut ComputedStyle,
-    stylesheets: &'a [Stylesheet],
+    stylesheets: &'a Stylesheets<'a>,
     cascade: &mut ElementCascadeContext<'a>,
     parent_ch_advance: LayoutLength,
     rule_set: fn(&Stylesheet) -> &[StyleRule],
@@ -1579,7 +1914,9 @@ fn apply_marker_rules_from_rule_set<'a>(
         &cascade.cascaded_declarations,
         style,
         parent_ch_advance,
+        stylesheets.color_scheme_preference(),
     );
+    select_style_image_sets(&mut marker_style, stylesheets.image_set_resolution_dppx());
     marker_style
         .quotes
         .resolve_auto_language(style.language.as_deref());
@@ -1588,7 +1925,7 @@ fn apply_marker_rules_from_rule_set<'a>(
 
 fn apply_generated_pseudo_rules_with_context<'a>(
     style: &mut ComputedStyle,
-    stylesheets: &'a [Stylesheet],
+    stylesheets: &'a Stylesheets<'a>,
     cascade: &mut ElementCascadeContext<'a>,
     parent_ch_advance: LayoutLength,
 ) {
@@ -1614,7 +1951,7 @@ fn apply_generated_pseudo_rules_with_context<'a>(
 
 fn generated_pseudo_style_with_context<'a>(
     originating_style: &ComputedStyle,
-    stylesheets: &'a [Stylesheet],
+    stylesheets: &'a Stylesheets<'a>,
     cascade: &mut ElementCascadeContext<'a>,
     rule_set: fn(&Stylesheet) -> &[StyleRule],
     marker_rule_set: fn(&Stylesheet) -> &[StyleRule],
@@ -1649,7 +1986,9 @@ fn generated_pseudo_style_with_context<'a>(
         originating_style,
         parent_ch_advance,
         false,
+        stylesheets.color_scheme_preference(),
     );
+    select_style_image_sets(&mut pseudo_style, stylesheets.image_set_resolution_dppx());
     pseudo_style
         .quotes
         .resolve_auto_language(originating_style.language.as_deref());
@@ -1665,7 +2004,7 @@ fn generated_pseudo_style_with_context<'a>(
 
 fn apply_footnote_pseudo_rules_with_context<'a>(
     style: &mut ComputedStyle,
-    stylesheets: &'a [Stylesheet],
+    stylesheets: &'a Stylesheets<'a>,
     cascade: &mut ElementCascadeContext<'a>,
     parent_ch_advance: LayoutLength,
 ) {
@@ -1714,7 +2053,7 @@ fn apply_footnote_pseudo_rules_with_context<'a>(
 
 fn footnote_pseudo_style_with_context<'a>(
     originating_style: &ComputedStyle,
-    stylesheets: &'a [Stylesheet],
+    stylesheets: &'a Stylesheets<'a>,
     cascade: &mut ElementCascadeContext<'a>,
     rule_set: fn(&Stylesheet) -> &[StyleRule],
     default_content: Content,
@@ -1744,6 +2083,7 @@ fn footnote_pseudo_style_with_context<'a>(
         originating_style,
         parent_ch_advance,
         false,
+        stylesheets.color_scheme_preference(),
     );
     pseudo_style
         .quotes
@@ -1753,7 +2093,7 @@ fn footnote_pseudo_style_with_context<'a>(
 
 fn apply_typographic_pseudo_rules_with_context<'a>(
     style: &mut ComputedStyle,
-    stylesheets: &'a [Stylesheet],
+    stylesheets: &'a Stylesheets<'a>,
     cascade: &mut ElementCascadeContext<'a>,
     parent_ch_advance: LayoutLength,
 ) {
@@ -1779,7 +2119,7 @@ fn apply_typographic_pseudo_rules_with_context<'a>(
 
 fn typographic_pseudo_style_with_context<'a>(
     originating_style: &ComputedStyle,
-    stylesheets: &'a [Stylesheet],
+    stylesheets: &'a Stylesheets<'a>,
     cascade: &mut ElementCascadeContext<'a>,
     rule_set: fn(&Stylesheet) -> &[StyleRule],
     allows_property: fn(&str) -> bool,
@@ -1817,6 +2157,7 @@ fn typographic_pseudo_style_with_context<'a>(
         originating_style,
         parent_ch_advance,
         false,
+        stylesheets.color_scheme_preference(),
     );
     pseudo_style
         .quotes
@@ -1861,6 +2202,7 @@ fn is_first_line_allowed_property(name: &str) -> bool {
                 | "text-transform"
                 | "vertical-align"
                 | "word-spacing"
+                | "ruby-position"
         )
 }
 
@@ -1966,9 +2308,9 @@ impl RuleCascadeMeta {
 /// first declaration order. Origin sorting is handled separately, so sharing
 /// this map across UA and author sheets does not change origin precedence:
 /// <https://www.w3.org/TR/css-cascade-5/#layer-order>.
-fn global_layer_order(stylesheets: &[Stylesheet]) -> HashMap<String, usize> {
+fn global_layer_order(stylesheets: &Stylesheets<'_>) -> HashMap<String, usize> {
     let mut result = HashMap::new();
-    for stylesheet in stylesheets {
+    for stylesheet in stylesheets.iter() {
         for layer_name in &stylesheet.layer_names {
             let next_order = result.len();
             result.entry(layer_name.clone()).or_insert(next_order);

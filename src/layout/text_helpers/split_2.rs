@@ -40,7 +40,17 @@ pub(in crate::layout) fn normalized_text_for_style(text: &str, style: &ComputedS
 
 pub(in crate::layout) fn inline_text_for_style(element: &Element, style: &ComputedStyle) -> String {
     let text = match style.white_space {
-        WhiteSpace::Normal | WhiteSpace::NoWrap => inline_text(element),
+        WhiteSpace::Normal | WhiteSpace::NoWrap => {
+            if element_suppresses_direct_text_children(element) {
+                String::new()
+            } else {
+                let mut output = String::new();
+                for child in &element.children {
+                    collect_inline_text(child, &mut output);
+                }
+                normalize_inline_text_for_style(&output, style)
+            }
+        }
         WhiteSpace::PreLine => pre_line_inline_text_for_style(element, style),
         WhiteSpace::Pre | WhiteSpace::PreWrap | WhiteSpace::BreakSpaces => {
             pre_wrap_inline_text_for_style(element, style)
@@ -49,30 +59,24 @@ pub(in crate::layout) fn inline_text_for_style(element: &Element, style: &Comput
     text_with_visible_control_characters(&text)
 }
 
-pub(in crate::layout) fn own_inline_text(element: &Element) -> String {
-    if element_suppresses_direct_text_children(element) {
-        return String::new();
-    }
-    let mut output = String::new();
-    for child in &element.children {
-        match &child.kind {
-            NodeKind::Text(text) => {
-                output.push_str(text);
-                output.push(' ');
-            }
-            NodeKind::Element(child) if is_line_break_element(child) => output.push(INLINE_BREAK),
-            _ => {}
-        }
-    }
-    normalize_inline_text(&output)
-}
-
 pub(in crate::layout) fn own_inline_text_for_style(
     element: &Element,
     style: &ComputedStyle,
 ) -> String {
     let text = match style.white_space {
-        WhiteSpace::Normal | WhiteSpace::NoWrap => own_inline_text(element),
+        WhiteSpace::Normal | WhiteSpace::NoWrap => {
+            let mut output = String::new();
+            for child in &element.children {
+                match &child.kind {
+                    NodeKind::Text(text) => output.push_str(text),
+                    NodeKind::Element(child) if is_line_break_element(child) => {
+                        output.push(INLINE_BREAK)
+                    }
+                    _ => {}
+                }
+            }
+            normalize_inline_text_for_style(&output, style)
+        }
         WhiteSpace::PreLine => {
             let mut output = String::new();
             for child in &element.children {
@@ -97,6 +101,57 @@ pub(in crate::layout) fn own_inline_text_for_style(
         }
     };
     text_with_visible_control_characters(&text)
+}
+
+/// Collapse normal white space while preserving CSS Text's context-sensitive
+/// segment-break transformation. This is the scalar counterpart to the
+/// inline-item whitespace processor used when a block selects the direct DOM
+/// text path before building line items.
+fn normalize_inline_text_for_style(text: &str, style: &ComputedStyle) -> String {
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    let characters = text.chars().collect::<Vec<_>>();
+    let mut output = String::new();
+    let mut index = 0;
+    while index < characters.len() {
+        let character = characters[index];
+        if character == INLINE_BREAK {
+            while output.ends_with(' ') {
+                output.pop();
+            }
+            output.push('\n');
+            index += 1;
+            continue;
+        }
+        if !is_css_collapsible_whitespace(character) {
+            output.push(character);
+            index += 1;
+            continue;
+        }
+
+        let mut contains_segment_break = false;
+        while index < characters.len() && is_css_collapsible_whitespace(characters[index]) {
+            contains_segment_break |= characters[index] == '\n';
+            index += 1;
+        }
+        let before = output.chars().rev().find(|character| *character != ' ');
+        let after = characters[index..]
+            .iter()
+            .copied()
+            .find(|character| !is_css_collapsible_whitespace(*character));
+        let removes_break = contains_segment_break
+            && before.zip(after).is_some_and(|(before, after)| {
+                crate::text::segment_break_is_removable(crate::text::SegmentBreakContext {
+                    before,
+                    after,
+                    before_is_currency_amount: false,
+                    language: style.language.as_deref(),
+                })
+            });
+        if !removes_break && !output.is_empty() && !output.ends_with(' ') {
+            output.push(' ');
+        }
+    }
+    crate::text::trim_css_collapsible_whitespace(&output).to_string()
 }
 
 /// Replaces non-whitespace Unicode control characters with a visible glyph.
@@ -160,7 +215,6 @@ pub(in crate::layout) fn collect_inline_text(node: &Node, output: &mut String) {
     match &node.kind {
         NodeKind::Text(text) => {
             output.push_str(text);
-            output.push(' ');
         }
         NodeKind::Element(element) if is_line_break_element(element) => output.push(INLINE_BREAK),
         NodeKind::Element(element) if element_suppresses_direct_text_children(element) => {}

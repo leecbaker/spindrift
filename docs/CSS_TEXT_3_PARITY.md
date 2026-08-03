@@ -11,6 +11,14 @@ except where existing code already implements draft properties.
   `overflow-wrap`/`word-wrap`, `line-break`, `hyphens`, `text-align`,
   `text-align-all`, `text-align-last`, `text-justify`, `text-indent`, and
   `hanging-punctuation`.
+- `text-transform: full-width` applies after CSS whitespace collapsing, so a
+  collapsed U+0020 becomes the single remaining U+3000 while preserved spaces
+  transform individually. Its opaque full-em test glyph coverage now remains
+  visually correct when a negative stacking-level reference is fully hidden
+  beneath later text paint.
+- `text-indent` preserves its selected line geometry through PDF emission:
+  opaque full-em coverage is batched only within one text-paint record, so
+  adjacent indented lines retain their individual fractional-edge coverage.
 - Legacy `white-space` is represented as preservation/collapse behavior plus
   its wrapping-mode component. The inherited `text-wrap`, `text-wrap-mode`,
   and `text-wrap-style` declarations are also parsed, so an inline descendant
@@ -46,11 +54,17 @@ except where existing code already implements draft properties.
   atomics, preserves the NBSP compatibility opportunity, and suppresses GL,
   `WORD JOINER`, and ZWJ boundaries. Out-of-flow static-position placeholders
   and regular inline box edges are transparent to the surrounding text stream
-  and never create U+FFFC-style opportunities.
+  and never create U+FFFC-style opportunities. Whitespace normalization keeps
+  `box-decoration-break: slice` start/end ownership only on source-adjacent
+  visible text, so a soft-wrapped continuation cannot repaint either side.
 - Horizontal mixed inline bidi reordering now operates on measured inline
   items, preserving neutral text fragments such as collapsed spaces and keeping
   regular inline box edge atoms attached to the adjacent visual content that
   owns their decoration.
+- Inline `unicode-bidi` scopes force the structured inline-item collector
+  instead of the scalar-text shortcut. This preserves the generated UAX #9
+  boundaries for HTML `<bdi>` and CSS isolates, so the enclosing paragraph
+  resolves each scope as one neutral isolate object.
 - Non-text inline edges are transparent to UAX #9: both regular box edges and
   CSS Text autospace edges split the selected visual ranges and are reinserted
   at their owned visual boundary. Autospace therefore contributes its selected
@@ -68,6 +82,10 @@ except where existing code already implements draft properties.
   marks.
 - Forced segment breaks now flush before following zero-width bidi controls,
   so an inline isolate or override begins on its own post-`br` line.
+- Soft-wrapped selected lines replay both authored and CSS-generated UAX #9
+  isolate, embedding, and override controls around the sliced source range.
+  This preserves the original bidi scope without creating a glyph, advance, or
+  justification opportunity for the controls themselves.
   Block-level `unicode-bidi: plaintext` instead keeps its inline stream free
   of synthetic FSI/PDI controls and resolves each selected bidi paragraph with
   UAX #9 P2/P3. This preserves contextual Arabic shaping through forced
@@ -144,6 +162,12 @@ except where existing code already implements draft properties.
   document-space advance separately; U+00A0 remains a no-break inter-word
   separator rather than a hanging edge space; `break-spaces` remains
   non-hanging.
+- A selected `break-spaces` after-space boundary retains its full advance even
+  when it intentionally overflows the available measure, but only after every
+  fitting ordinary or overflow-wrap boundary has been exhausted. In RTL, the
+  selected logical line-end space gets bidi-only context before UAX #9 visual
+  ordering, keeping it at the visual inline start without changing source
+  text, extraction, or the formatted measure.
 - A collapsible document-space suffix is traversed as already removed before
   the same scan identifies a preceding Unicode other-space separator. That
   exposes the remaining visual line edge to Phase II hanging for fitting,
@@ -196,15 +220,20 @@ except where existing code already implements draft properties.
   same forced-empty-line representation as ordinary DOM text.
 - Inline boundary semantics are centralized in an internal policy shared by
   whitespace normalization, intrinsic measurement splitting, and reusable line
-  sequence construction. Bidi controls, inline box edges, and page-scope
-  controls are transparent to text context, while real atoms, floats, and
-  independent nested formatting contexts reset that context explicitly.
+  sequence construction. Bidi controls, inline box edges, page-scope controls,
+  and out-of-flow float markers are transparent to the in-flow text context,
+  while real atoms and independent nested formatting contexts reset that
+  context explicitly. Float markers remain distinct source-order placement
+  checkpoints for CSS 2.2 float layout.
 - Float markers are out-of-flow positioning participants rather than CSS Text
   soft-wrap opportunities. The graph records a distinct float-placement
   checkpoint, which lets mixed inline layout establish exclusions without
   splitting `white-space: nowrap` or an ordinary unbroken word at that source
-  boundary. The selector consults legal soft-wrap opportunities separately
-  before choosing its unbreakable-float path.
+  boundary. Zero-width line bands remain valid float-placement contexts: empty
+  floats retain their zero geometry and oversized floats overflow the band,
+  while the selector keeps the complete source range intact. The selector
+  consults legal soft-wrap opportunities separately before choosing its
+  unbreakable-float path.
 - When a temporary float band cannot contain a selected graph range that fits
   the unexcluded containing block, selection records each skipped physical
   line and retries that same range below the exclusion. Inline collection,
@@ -231,6 +260,10 @@ except where existing code already implements draft properties.
   remains unchanged until the selected line edge is materialized, so Dutch
   `cafee&shy;tje` can use `café-` / `tje` without changing unbroken text or
   extraction.
+- A selected discretionary marker is a separate measured paint item. Its
+  style is owned by the generated dictionary boundary or by the authored
+  U+00AD fragment itself, so a styled control retains its `hyphenate-character`
+  and advance through fitting, vertical writing, and shaping.
 - Graph-backed `letter-spacing` retains shaper glyph selection while resolving
   all advances at final visual typographic boundaries. Terminal backend
   advances are removed from both fitting and durable glyph data; nested inline
@@ -353,14 +386,25 @@ except where existing code already implements draft properties.
   zero-width space, and trailing tracking stay graph-owned rather than being
   suppressed during paint preparation. Atomic inline break discovery also sees
   adjacent zero-advance separator text through `U+FFFC` graph context instead
-  of relying on the separator's measured width. Zero-font separator fragments
-  retain those break opportunities without contributing stale shaped-font
-  baseline extents when their used line-height is zero.
+  of relying on the separator's measured width. Every replaced element and
+  other atomic inline now supplies ordinary wrap opportunities on both sides
+  when the nearest common ancestor permits wrapping, including next to
+  punctuation, `word-break: keep-all`, and NBSP; only non-NBSP `GL`, `WJ`,
+  and `ZWJ` neighbors suppress that compatibility override. Zero-font
+  separator fragments retain those break opportunities without contributing
+  stale shaped-font baseline extents when their used line-height is zero.
 - Prepared inline lines now use an internal logical inline-axis geometry before
   mapping fragments, text groups, atoms, backgrounds, and links to physical PDF
   coordinates. Horizontal LTR/RTL output remains the compatibility baseline,
   while vertical writing-mode indentation and line-edge placement no longer
   rely on physical-left assumptions.
+- Text-decoration origins are carried as layout-only provenance through
+  eligible in-flow DOM, frozen block, table-cell, and block-in-inline
+  boundaries. The decorating box retains its own color and declared line
+  values, while the decoration adapter keeps origin-relative percentage bases
+  separate from selected considered-text metrics and paints underline
+  thickness outward from its offset edge; floats, out-of-flow boxes, and
+  atomic inline contents start a fresh decoration context.
 - Non-replaced inline backgrounds and borders paint from the CSS inline content
   area, using selected-font content height plus owned padding and border
   extents for single-font and explicit-line-height text, and the union of
@@ -395,8 +439,9 @@ except where existing code already implements draft properties.
   vertical baselines.
 - Text emphasis marks are prepared as annotations on typographic character
   units before painting. The annotation path uses Unicode skip policy,
-  writing-mode-aware rendered-run placement, and normal shaped text emission
-  for horizontal, vertical, generated, page-margin, and inline-block text.
+  writing-mode-aware rendered-run placement, and an untracked annotation style
+  so inherited `letter-spacing` does not widen the emphasis glyph. It supports
+  horizontal, vertical, generated, page-margin, and inline-block text.
 - Text decoration strokes are prepared as inline-line annotations before PDF
   primitive emission. The stroke model uses logical inline axes, writing-mode
   side placement, rendered-run matrices for skip-space positioning, and shared
@@ -404,6 +449,12 @@ except where existing code already implements draft properties.
   inline-block, horizontal, and vertical text. Text decoration length fields
   such as thickness, underline offset, and inset preserve `ch` until selected
   font metric resolution.
+- Decoration propagation retains each decorating box's identity through
+  in-flow descendant collection. Consequently, equal nested declarations
+  remain independent origins. Each prepared line groups eligible text by that
+  identity and resolves one shared considered-text geometry before its spans
+  paint; automatic metrics use that selected line text without converting
+  origin-relative values to a descendant percentage basis.
 - Text and box shadow geometry preserves metric-dependent lengths through
   computed style resolution, so `ch` offsets, blur radii, and spread distances
   use the selected font's zero advance before paint consumes absolute lengths.
@@ -487,11 +538,10 @@ except where existing code already implements draft properties.
 - Broaden WPT coverage for `word-break: keep-all`, CJK unit-boundary
   min-content policy, emergency wrapping, hyphenation contributions, and
   sequence-backed block/flex/table estimate consumers.
-- The current local `css/css-text/line-break/` result is **51/51 passing**.
-  Selected `pre-wrap` and Unicode-space tails remain represented by graph
-  source ranges and retain background paint while their advances are excluded
-  from fitting. PDF text extraction still needs a dedicated source-range
-  emission path.
+- The locally evaluated non-script `line-break:anywhere` family is **41/41
+  passing**. Typographic-character-unit opportunities, automatic-hyphen
+  suppression, and opaque PDF coverage serialization match the renderable
+  family while retained text remains extractable.
 - Finish fallback transformed vertical glyph forms beyond font-provided
   `vert`/`vrt2` alternates, text-emphasis collision/line-box expansion,
   full `text-decoration-skip-box`/`text-decoration-skip-self` edge cases,
@@ -513,7 +563,10 @@ except where existing code already implements draft properties.
   text breaker.
 - Local smoke coverage mirrors the nine ALReq CSS Text text-encoding cases for
   `shaping-join-001/002/003`, `shaping-no-join-001/002/003`, and
-  `shaping-tatweel-001/002/003` using repo-local WPT font fixtures.
+  `shaping-tatweel-001/002/003` using repo-local WPT font fixtures. The
+  explicit cross-font ZWNJ path also retains its logical source-shaped slice
+  through RTL visual ordering, while emitting neither a control glyph nor a
+  control advance.
 - Smoke tests under `tests/smoke/text.rs` cover many CSS Text rendering paths,
   including white-space modes, `text-align*`, justification, `tab-size`,
   `text-transform`, `word-break`, `line-break`, `hyphens`, `wbr`, bidi, and

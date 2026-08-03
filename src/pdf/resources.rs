@@ -2,7 +2,7 @@ use super::*;
 
 pub(super) fn image_source(image: &RenderedImage) -> ImageResourceSource {
     match &image.source {
-        crate::document::RenderedImageSource::Stored {
+        crate::document::paint::images::RenderedImageSource::Stored {
             image_id,
             source_rect,
             ..
@@ -11,7 +11,7 @@ pub(super) fn image_source(image: &RenderedImage) -> ImageResourceSource {
             source_rect: *source_rect,
             interpolate: image.interpolate,
         },
-        crate::document::RenderedImageSource::Inline { raster, .. } => {
+        crate::document::paint::images::RenderedImageSource::Inline { raster, .. } => {
             ImageResourceSource::Inline {
                 pixel_width: raster.pixel_width,
                 pixel_height: raster.pixel_height,
@@ -26,7 +26,7 @@ pub(super) fn image_source(image: &RenderedImage) -> ImageResourceSource {
 
 pub(super) fn image_pattern_source(pattern: &RenderedImagePattern) -> ImageResourceSource {
     match &pattern.source {
-        crate::document::RenderedImageSource::Stored {
+        crate::document::paint::images::RenderedImageSource::Stored {
             image_id,
             source_rect,
             ..
@@ -35,7 +35,7 @@ pub(super) fn image_pattern_source(pattern: &RenderedImagePattern) -> ImageResou
             source_rect: *source_rect,
             interpolate: pattern.interpolate,
         },
-        crate::document::RenderedImageSource::Inline { raster, .. } => {
+        crate::document::paint::images::RenderedImageSource::Inline { raster, .. } => {
             ImageResourceSource::Inline {
                 pixel_width: raster.pixel_width,
                 pixel_height: raster.pixel_height,
@@ -123,6 +123,9 @@ pub(super) fn prepare_image_resource(
     solid_fill_eligible: bool,
 ) -> PreparedImageResource {
     let mut image = materialize_image_resource(image_store, source, color_mode);
+    if image_resource_is_fully_transparent(&image) {
+        return PreparedImageResource::Transparent;
+    }
     convert_image_resource_to_output_color(&mut image, color_mode);
     if super::PROMOTE_SOLID_RASTER_IMAGES_TO_VECTOR_FILLS
         && solid_fill_eligible
@@ -134,6 +137,21 @@ pub(super) fn prepare_image_resource(
     }
 }
 
+/// Return whether no source sample contributes paint after source cropping.
+///
+/// Emitting an interpolated all-zero PDF soft mask can create a rasterizer
+/// fringe despite having no visible CSS paint. Model that state explicitly so
+/// the writer can omit the image and any pattern that would reference it.
+fn image_resource_is_fully_transparent(image: &ImageResource) -> bool {
+    matches!(
+        &image.payload,
+        ImagePayload::Samples {
+            alpha: Some(alpha),
+            ..
+        } if alpha.iter().all(|alpha| *alpha == 0)
+    )
+}
+
 /// Convert decoded image samples to the output image color space selected by
 /// the document profile. JPEG passthrough intentionally retains its source
 /// profile and therefore cannot become a direct graphics fill.
@@ -143,10 +161,6 @@ fn convert_image_resource_to_output_color(
 ) {
     let target_space = match (color_mode, &image.color_space) {
         (super::colors::PdfColorMode::SrgbOutputIntent, _) => Some(crate::css::CssColorSpace::Srgb),
-        (
-            super::colors::PdfColorMode::PreserveCssSpace,
-            crate::color::RasterColorSpace::BuiltIn(crate::css::CssColorSpace::XyzD50),
-        ) => Some(crate::css::CssColorSpace::DisplayP3),
         (super::colors::PdfColorMode::PreserveCssSpace, _) => None,
     };
     if let (Some(target_space), ImagePayload::Samples { rgb, .. }) =
@@ -168,13 +182,13 @@ fn convert_image_resource_to_output_color(
 }
 
 /// Return the exact direct-fill representation for an opaque uniform decoded
-/// image. Embedded image profiles are deliberately excluded because page
-/// graphics resources only expose Quire's built-in calibrated CSS spaces.
+/// image. Its retained component space is emitted through the matching PDF
+/// ICCBased resource, including an ordinary-PDF embedded source profile.
 fn solid_fill_from_image_resource(image: &ImageResource) -> Option<SolidImageFill> {
     let ImageResource {
         pixel_width,
         pixel_height,
-        color_space: crate::color::RasterColorSpace::BuiltIn(color_space),
+        color_space,
         payload: ImagePayload::Samples { rgb, alpha },
         ..
     } = image
@@ -192,11 +206,13 @@ fn solid_fill_from_image_resource(image: &ImageResource) -> Option<SolidImageFil
         return None;
     }
     let first = [rgb[0], rgb[1], rgb[2]];
-    rgb.chunks_exact(3)
-        .all(|sample| sample == first)
+    rgb.as_chunks::<3>()
+        .0
+        .iter()
+        .all(|sample| sample == &first)
         .then_some(SolidImageFill {
-            color_space: *color_space,
-            components: first.map(|sample| sample as f32 / 255.0),
+            color_space: color_space.clone(),
+            components: first,
         })
 }
 
@@ -236,7 +252,7 @@ pub(super) fn image_resource_data(
     image: &RenderedImage,
 ) -> ImageResourceData {
     let (pixel_width, pixel_height, rgb, alpha) = match &image.source {
-        crate::document::RenderedImageSource::Stored { image_id, .. } => {
+        crate::document::paint::images::RenderedImageSource::Stored { image_id, .. } => {
             match image_store.with_rasterized(*image_id, |raster| {
                 (
                     raster.metadata.pixel_width,
@@ -256,7 +272,7 @@ pub(super) fn image_resource_data(
                 }
             }
         }
-        crate::document::RenderedImageSource::Inline { raster, .. } => (
+        crate::document::paint::images::RenderedImageSource::Inline { raster, .. } => (
             raster.pixel_width,
             raster.pixel_height,
             raster.rgb.to_vec(),
@@ -359,6 +375,16 @@ pub(super) fn paint_alpha_resource_name(color: CssColor) -> Option<String> {
     alpha_key(color).map(|key| format!("GSalpha{key:03}"))
 }
 
+/// Return the PDF graphics-state resource name for CSS group opacity.
+///
+/// Unlike an individual transparent paint color, `opacity: 0` still needs a
+/// graphics state: it suppresses an otherwise paintable transparency group.
+/// ISO 32000 permits zero for both constant-alpha entries:
+/// ISO 32000-1:2008, 11.7.4.3 "Constant Shape and Opacity".
+pub(super) fn paint_opacity_resource_name(opacity: f32) -> Option<String> {
+    opacity_key(opacity).map(|key| format!("GSalpha{key:03}"))
+}
+
 /// Plan a page-local `/ExtGState` resource for alpha paints.
 ///
 /// PDF page resource dictionaries name ExtGState resources, and content streams
@@ -373,7 +399,7 @@ pub(super) enum ExtGStateResource {
     },
     Blend {
         name: String,
-        mode: crate::document::PaintBlendMode,
+        mode: crate::document::paint::effects::PaintBlendMode,
     },
 }
 
@@ -420,13 +446,13 @@ pub(super) fn page_ext_gstate_resources(page: &Page) -> Vec<ExtGStateResource> {
             .flatten()
         {
             match paint {
-                crate::document::RenderedPathPaint::Solid(color) => {
+                crate::document::paint::paths::RenderedPathPaint::Solid(color) => {
                     collect_alpha_key(&mut alpha_keys, *color);
                 }
-                crate::document::RenderedPathPaint::SvgPattern(pattern) => {
+                crate::document::paint::paths::RenderedPathPaint::SvgPattern(pattern) => {
                     collect_opacity_key(&mut alpha_keys, pattern.opacity);
                 }
-                crate::document::RenderedPathPaint::Gradient(_) => {}
+                crate::document::paint::paths::RenderedPathPaint::Gradient(_) => {}
             }
         }
     }
@@ -463,30 +489,32 @@ fn collect_alpha_key(alpha_keys: &mut BTreeMap<u16, ()>, color: CssColor) {
 }
 
 fn collect_opacity_key(alpha_keys: &mut BTreeMap<u16, ()>, opacity: f32) {
-    collect_alpha_key(alpha_keys, CssColor::TRANSPARENT.with_alpha(opacity));
+    if let Some(key) = opacity_key(opacity) {
+        alpha_keys.insert(key, ());
+    }
 }
 
 fn collect_paint_tree_ext_gstates(
     alpha_keys: &mut BTreeMap<u16, ()>,
-    blend_modes: &mut BTreeMap<crate::document::PaintBlendMode, ()>,
-    context: &crate::document::PaintStackingContext,
+    blend_modes: &mut BTreeMap<crate::document::paint::effects::PaintBlendMode, ()>,
+    context: &crate::document::paint::stacking::PaintStackingContext,
 ) {
     collect_opacity_key(alpha_keys, context.effects.opacity);
-    if context.effects.blend_mode != crate::document::PaintBlendMode::Normal {
+    if context.effects.blend_mode != crate::document::paint::effects::PaintBlendMode::Normal {
         blend_modes.insert(context.effects.blend_mode, ());
     }
-    for band in crate::document::PaintBand::ORDER {
+    for band in crate::document::paint::display_list::PaintBand::ORDER {
         for item in &context.bands.bands[band.index()] {
             match item {
-                crate::document::PaintDisplayItem::StackingContext(child) => {
+                crate::document::paint::display_list::PaintDisplayItem::StackingContext(child) => {
                     collect_paint_tree_ext_gstates(alpha_keys, blend_modes, child);
                 }
-                crate::document::PaintDisplayItem::EffectScope(scope) => {
+                crate::document::paint::display_list::PaintDisplayItem::EffectScope(scope) => {
                     collect_effect_scope_ext_gstates(alpha_keys, blend_modes, scope);
                 }
-                crate::document::PaintDisplayItem::Operation(_)
-                | crate::document::PaintDisplayItem::Primitive(_)
-                | crate::document::PaintDisplayItem::Link(_) => {}
+                crate::document::paint::display_list::PaintDisplayItem::Operation(_)
+                | crate::document::paint::display_list::PaintDisplayItem::Primitive(_)
+                | crate::document::paint::display_list::PaintDisplayItem::Link(_) => {}
             }
         }
     }
@@ -494,34 +522,40 @@ fn collect_paint_tree_ext_gstates(
 
 fn collect_effect_scope_ext_gstates(
     alpha_keys: &mut BTreeMap<u16, ()>,
-    blend_modes: &mut BTreeMap<crate::document::PaintBlendMode, ()>,
-    scope: &crate::document::PaintEffectScope,
+    blend_modes: &mut BTreeMap<crate::document::paint::effects::PaintBlendMode, ()>,
+    scope: &crate::document::paint::effects::PaintEffectScope,
 ) {
     collect_opacity_key(alpha_keys, scope.effects.opacity);
-    if scope.effects.blend_mode != crate::document::PaintBlendMode::Normal {
+    if scope.effects.blend_mode != crate::document::paint::effects::PaintBlendMode::Normal {
         blend_modes.insert(scope.effects.blend_mode, ());
     }
     for item in &scope.items {
         match item {
-            crate::document::PaintDisplayItem::StackingContext(child) => {
+            crate::document::paint::display_list::PaintDisplayItem::StackingContext(child) => {
                 collect_paint_tree_ext_gstates(alpha_keys, blend_modes, child);
             }
-            crate::document::PaintDisplayItem::EffectScope(child) => {
+            crate::document::paint::display_list::PaintDisplayItem::EffectScope(child) => {
                 collect_effect_scope_ext_gstates(alpha_keys, blend_modes, child);
             }
-            crate::document::PaintDisplayItem::Operation(_)
-            | crate::document::PaintDisplayItem::Primitive(_)
-            | crate::document::PaintDisplayItem::Link(_) => {}
+            crate::document::paint::display_list::PaintDisplayItem::Operation(_)
+            | crate::document::paint::display_list::PaintDisplayItem::Primitive(_)
+            | crate::document::paint::display_list::PaintDisplayItem::Link(_) => {}
         }
     }
 }
 
 fn alpha_key(color: CssColor) -> Option<u16> {
-    if color.is_visible() && !color.is_opaque() {
-        Some((color.alpha() * 1000.0).round().clamp(1.0, 999.0) as u16)
-    } else {
-        None
-    }
+    // Fully transparent colors still issue normal paint operations, so they
+    // need an explicit zero-alpha graphics state. Omitting it makes CSS
+    // `color: transparent` paint with the previously active PDF color.
+    // <https://www.w3.org/TR/css-color-4/#transparency> and ISO 32000-1:2008,
+    // 11.7.4.3 "Constant Shape and Opacity".
+    opacity_key(color.alpha())
+}
+
+fn opacity_key(opacity: f32) -> Option<u16> {
+    (opacity.is_finite() && (0.0..1.0).contains(&opacity))
+        .then(|| (opacity * 1000.0).round().clamp(0.0, 999.0) as u16)
 }
 
 #[cfg(test)]
@@ -551,9 +585,12 @@ mod tests {
         source_rect: Option<RenderedImageSourceRect>,
     ) -> RenderedImage {
         RenderedImage::from_paint_rect(
-            crate::document::PaintRect::new(
-                crate::document::PaintPoint::new(0.0, 0.0),
-                crate::document::PaintSize::new(pixel_width as f32, pixel_height as f32),
+            crate::document::paint::geometry::PaintRect::new(
+                crate::document::paint::geometry::PaintPoint::new(0.0, 0.0),
+                crate::document::paint::geometry::PaintSize::new(
+                    pixel_width as f32,
+                    pixel_height as f32,
+                ),
             ),
             false,
             pixel_width,
@@ -635,8 +672,40 @@ mod tests {
         assert_eq!(
             prepared,
             PreparedImageResource::SolidFill(SolidImageFill {
-                color_space: crate::css::CssColorSpace::Srgb,
-                components: [0.0, 128.0 / 255.0, 0.0],
+                color_space: crate::color::RasterColorSpace::SRGB,
+                components: [0, 128, 0],
+            })
+        );
+    }
+
+    #[test]
+    fn opaque_uniform_embedded_profile_samples_promote_in_ordinary_pdf() {
+        let profile = Rc::from(
+            crate::color::icc_profile_bytes(crate::css::CssColorSpace::DisplayP3)
+                .unwrap()
+                .into_boxed_slice(),
+        );
+        let source = ImageResourceSource::Inline {
+            pixel_width: 2,
+            pixel_height: 1,
+            interpolate: false,
+            color_space: crate::color::RasterColorSpace::EmbeddedRgb(Rc::clone(&profile)),
+            rgb: Rc::from([153_u8, 0, 0, 153, 0, 0]),
+            alpha: None,
+        };
+
+        let prepared = prepare_image_resource(
+            &crate::image_store::DocumentImageStore::default(),
+            &source,
+            super::super::colors::PdfColorMode::PreserveCssSpace,
+            true,
+        );
+
+        assert_eq!(
+            prepared,
+            PreparedImageResource::SolidFill(SolidImageFill {
+                color_space: crate::color::RasterColorSpace::EmbeddedRgb(profile),
+                components: [153, 0, 0],
             })
         );
     }
@@ -666,6 +735,27 @@ mod tests {
 
         assert_eq!(solid_fill_from_image_resource(&non_uniform), None);
         assert_eq!(solid_fill_from_image_resource(&transparent), None);
+    }
+
+    #[test]
+    fn fully_transparent_interpolated_samples_are_omitted_from_pdf_paint() {
+        let image = test_image(
+            1,
+            1,
+            Rc::from([255_u8, 255, 255]),
+            Some(Rc::from([0_u8])),
+            None,
+        );
+
+        assert_eq!(
+            prepare_image_resource(
+                &crate::image_store::DocumentImageStore::default(),
+                &image_source(&image),
+                super::super::colors::PdfColorMode::SrgbOutputIntent,
+                false,
+            ),
+            PreparedImageResource::Transparent
+        );
     }
 
     #[test]

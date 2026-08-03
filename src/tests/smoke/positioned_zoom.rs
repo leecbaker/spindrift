@@ -1,6 +1,9 @@
 use super::*;
 
-fn rect_with_fill(page: &quire::Page, fill: CssColor) -> &quire::RenderedRect {
+fn rect_with_fill(
+    page: &quire::Page,
+    fill: CssColor,
+) -> &crate::document::paint::shapes::RenderedRect {
     page.rects()
         .iter()
         .find(|rect| rect.fill == Some(fill))
@@ -35,4 +38,59 @@ async fn zoomed_relative_absolute_and_fixed_boxes_use_one_positioned_scale() {
         assert!((rect.height() - 10.0).abs() < 0.01, "rect={rect:?}");
     }
     assert!((relative.x() - 10.0).abs() < 0.01, "rect={relative:?}");
+}
+
+/// CSS Ruby layout-internal boxes remain part of their ruby formatting
+/// context, but a positioned ruby/rbc still establishes the containing block
+/// for an absolutely positioned descendant.
+/// <https://drafts.csswg.org/css-ruby-1/#formatting-context>
+/// <https://drafts.csswg.org/css-position-3/#def-cb>
+#[tokio::test]
+async fn positioned_descendant_of_ruby_base_container_is_painted() {
+    let document = Html::from_string(
+        "<!doctype html><style>
+         @page { size: 200pt 200pt; margin: 0 }
+         body { margin: 8px; font: 50px/3 serif }
+         .rel { position: relative; unicode-bidi: isolate }
+         .abs { position: absolute; left: 0; top: -1em; background: rgb(255 0 0) }
+         </style>X<ruby><rbc class=\"rel\"><rb><span class=\"abs\">X</span></rb></rbc></ruby>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let positioned = document.pages[0]
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
+        .expect("the positioned ruby descendant must produce a paint fragment");
+    assert!(
+        positioned.x() > 20.0,
+        "the ruby/rbc containing block starts after the preceding glyph: {positioned:?}"
+    );
+}
+
+/// Ruby inlinification turns a direct in-flow block child into an inline
+/// flow-root, retaining both its independent formatting context and its box
+/// paint.
+/// <https://drafts.csswg.org/css-ruby-1/#anon-gen-inlinize>
+#[tokio::test]
+async fn direct_block_child_of_ruby_is_an_inline_flow_root_atom() {
+    let document = Html::from_string(
+        "<!doctype html><style>
+         @page { size: 200pt 200pt; margin: 0 }
+         .inline { display: block; background-color: rgb(255 255 0); width: 30px; height: 30px }
+         </style><div><ruby>a<div class=\"inline\">b</div>c</ruby></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert!(
+        document.pages[0]
+            .rects()
+            .iter()
+            .any(|rect| rect.fill == Some(CssColor::new(255, 255, 0))),
+        "the inlinified direct block must retain its background paint"
+    );
 }

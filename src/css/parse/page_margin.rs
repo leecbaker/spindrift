@@ -1,5 +1,6 @@
 use super::*;
 use crate::css::MediaEnvironment;
+use crate::css::component_values::find_matching_brace;
 
 /// Parses CSS Paged Media rules while preserving full raw `@page` bodies.
 ///
@@ -68,7 +69,7 @@ fn parse_page_rules_in_block<'a>(
 ) {
     let mut position = 0usize;
     while let Some(open) = find_next_top_level_open_brace(source, position) {
-        let Some(close) = find_matching_brace_or_eof(source, open) else {
+        let Some(close) = find_matching_brace(source, open, true) else {
             break;
         };
         let segment_start = source[position..open]
@@ -173,7 +174,7 @@ pub(super) fn parse_page_rule_margin_boxes(
                 break;
             };
             let box_open = box_start + at_name.len() + box_open_offset;
-            let Some(box_close) = find_matching_brace(body_rest, box_open) else {
+            let Some(box_close) = find_matching_brace(body_rest, box_open, false) else {
                 break;
             };
             boxes
@@ -210,7 +211,7 @@ pub(super) fn parse_page_rule_footnote_area(
             break;
         };
         let area_open = area_start + at_name.len() + area_open_offset;
-        let Some(area_close) = find_matching_brace(body_rest, area_open) else {
+        let Some(area_close) = find_matching_brace(body_rest, area_open, false) else {
             break;
         };
         declarations.extend(parse_declarations_with_urls(
@@ -543,7 +544,7 @@ pub(super) fn strip_nested_page_rules(body: &str) -> String {
             continue;
         };
         let open = at_start + open_offset;
-        let Some(close) = find_matching_brace(body, open) else {
+        let Some(close) = find_matching_brace(body, open, false) else {
             position = at_start + 1;
             continue;
         };

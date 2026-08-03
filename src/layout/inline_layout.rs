@@ -10,7 +10,7 @@ pub(in crate::layout) use graph::{
 };
 pub(in crate::layout) use items::{
     InlineLayoutOutcome, InlineLineRecord, InlineLineSequence, InlineLineStackCursor,
-    MulticolumnInlinePaintGeometry, inline_line_fragment_is_phantom,
+    inline_line_fragment_is_phantom,
 };
 
 #[cfg(test)]

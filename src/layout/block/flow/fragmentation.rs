@@ -64,6 +64,16 @@ impl AvoidBreakRunCandidate {
         self
     }
 
+    /// A class-A avoid retry must not move a run that begins on an empty
+    /// page: the destination has the same available geometry, so doing so
+    /// would only manufacture a blank fragmentainer. This is stronger than a
+    /// cursor-at-top comparison because leading margins may have collapsed
+    /// before the first in-flow box is committed.
+    /// <https://www.w3.org/TR/css-break-3/#breaking-rules>
+    pub(in crate::layout) fn starts_on_empty_page(&self) -> bool {
+        !self.snapshot.current_page_has_flow_content
+    }
+
     pub(in crate::layout) fn restore(
         self,
         builder: &mut LayoutBuilder<'_>,

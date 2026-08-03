@@ -60,7 +60,7 @@ impl<'a> LayoutBuilder<'a> {
         rows: &[TableRow<'_>],
         grid: &TableGrid,
         table_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         columns: &[TableColumn<'_>],
         column_count: usize,
     ) -> css::Edges {
@@ -68,19 +68,19 @@ impl<'a> LayoutBuilder<'a> {
             .outer_insets
     }
 
-    /// Resolve vertical border-box insets for absolutely positioned collapsed tables.
+    /// Resolve the collapsed table wrapper's conflict-resolved outer insets.
     ///
-    /// CSS Positioned Layout uses the border box in vertical inset equations,
-    /// while CSS 2.2 collapsed borders contribute resolved outer grid insets
-    /// rather than the authored full table border widths:
+    /// CSS Positioned Layout consumes the wrapper border box, while CSS 2.2
+    /// collapsed borders contribute the resolved outer grid insets rather than
+    /// the authored full table border widths:
     /// <https://www.w3.org/TR/css-position-3/#abs-non-replaced-height> and
     /// <https://www.w3.org/TR/CSS22/tables.html#collapsing-borders>.
-    pub(in crate::layout) fn collapsed_table_outer_vertical_insets(
+    pub(in crate::layout) fn resolved_collapsed_table_wrapper_insets(
         &mut self,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         fragment: Option<&box_tree::TableFragment<'_>>,
-    ) -> Option<f32> {
+    ) -> Option<ResolvedTableWrapperInsets> {
         if style.border_collapse != css::BorderCollapse::Collapse {
             return None;
         }
@@ -88,7 +88,7 @@ impl<'a> LayoutBuilder<'a> {
         let input = TableLayoutInput::from_fragment(fragment);
         let rows = input.rows.as_slice();
         if rows.is_empty() {
-            return Some(vertical_border_width(style));
+            return Some(ResolvedTableWrapperInsets::ZERO);
         }
         let grid = table_grid(rows);
         let column_count = grid.column_count.max(1);
@@ -100,7 +100,20 @@ impl<'a> LayoutBuilder<'a> {
             &input.columns,
             column_count,
         );
-        Some(insets.top + insets.bottom)
+        Some(ResolvedTableWrapperInsets {
+            border_widths: insets,
+        })
+    }
+
+    /// Resolve vertical border-box insets for absolutely positioned collapsed tables.
+    pub(in crate::layout) fn collapsed_table_outer_vertical_insets(
+        &mut self,
+        style: &ComputedStyle,
+        stylesheets: &Stylesheets<'_>,
+        fragment: Option<&box_tree::TableFragment<'_>>,
+    ) -> Option<f32> {
+        self.resolved_collapsed_table_wrapper_insets(style, stylesheets, fragment)
+            .map(ResolvedTableWrapperInsets::vertical_non_content)
     }
 
     /// Resolve horizontal border-box insets for parent-facing collapsed table sizing.
@@ -112,29 +125,11 @@ impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn collapsed_table_outer_horizontal_insets(
         &mut self,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         fragment: Option<&box_tree::TableFragment<'_>>,
     ) -> Option<f32> {
-        if style.border_collapse != css::BorderCollapse::Collapse {
-            return None;
-        }
-        let fragment = fragment?;
-        let input = TableLayoutInput::from_fragment(fragment);
-        let rows = input.rows.as_slice();
-        if rows.is_empty() {
-            return Some(horizontal_border_width(style));
-        }
-        let grid = table_grid(rows);
-        let column_count = grid.column_count.max(1);
-        let insets = self.collapsed_border_outer_insets(
-            rows,
-            &grid,
-            style,
-            stylesheets,
-            &input.columns,
-            column_count,
-        );
-        Some(insets.left + insets.right)
+        self.resolved_collapsed_table_wrapper_insets(style, stylesheets, fragment)
+            .map(ResolvedTableWrapperInsets::horizontal_non_content)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -149,7 +144,7 @@ impl<'a> LayoutBuilder<'a> {
         rows: &[TableRow<'_>],
         grid: &TableGrid,
         table_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         columns: &[TableColumn<'_>],
         _table_width: f32,
         table_cellpadding: Option<f32>,
@@ -377,7 +372,7 @@ impl<'a> LayoutBuilder<'a> {
         rows: &[TableRow<'_>],
         grid: &TableGrid,
         table_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         columns: &[TableColumn<'_>],
         available_outer_width: f32,
         table_cellpadding: Option<f32>,
@@ -385,52 +380,8 @@ impl<'a> LayoutBuilder<'a> {
         collapsed_geometry: Option<&CollapsedTableGeometry>,
         table_width: &mut UsedTableWidth,
     ) {
-        let measures = self.table_column_measures(
-            rows,
-            grid,
-            table_style,
-            stylesheets,
-            columns,
-            table_width.content_width.points(),
-            table_cellpadding,
-            table_metrics,
-            collapsed_geometry,
-        );
-        let min_content = measures.table_min_content_width().max(0.0);
-        let max_content = measures.table_max_content_width().max(min_content);
-        let horizontal_border_non_content =
-            if table_style.border_collapse == css::BorderCollapse::Collapse {
-                0.0
-            } else {
-                table_width.border_widths.left + table_width.border_widths.right
-            };
-        let horizontal_non_content =
-            horizontal_border_non_content + table_width.padding.left + table_width.padding.right;
+        let horizontal_non_content = table_width.horizontal_non_content().points();
         let mut content_width = table_width.content_width.points();
-        // In the collapsed-border model, a specified table inline size is the
-        // wrapper's used size, including the resolved outer border halves.
-        // Track distribution, however, operates on the grid content span.
-        // Remove those insets exactly once before the free inline span is
-        // assigned to unconstrained columns.  Auto tables keep their
-        // intrinsic grid width, so there is no specified wrapper span to
-        // convert here.
-        // <https://www.w3.org/TR/CSS22/tables.html#collapsing-borders>
-        // <https://drafts.csswg.org/css-tables-3/#computing-the-table-width>
-        if !table_root_inline_size(table_style).is_auto()
-            && let Some(geometry) = collapsed_geometry
-        {
-            let axes = TableAxes::for_style(table_style);
-            let inline_outer_half_insets = if axes.flow.writing_mode().has_vertical_lines() {
-                geometry.outer_insets.top + geometry.outer_insets.bottom
-            } else {
-                geometry.outer_insets.left + geometry.outer_insets.right
-            };
-            // `CollapsedTableGeometry` stores the visual outer half at each
-            // edge.  Together those halves are wrapper non-content rather
-            // than column-track space, so remove the combined inset before
-            // distributing the specified wrapper width to tracks.
-            content_width = (content_width - inline_outer_half_insets).max(0.0);
-        }
         // `used_table_width` starts an auto table from the available inline
         // span so the ordinary intrinsic path can shrink it. A non-zero
         // wrapper min-inline constraint instead establishes the grid's
@@ -446,6 +397,34 @@ impl<'a> LayoutBuilder<'a> {
         {
             content_width = min_inline_size.points().max(0.0);
         }
+
+        // CSS 2.2's fixed table-layout algorithm needs the used table width,
+        // declared column widths, and at most the first row.  It must not
+        // inspect every cell merely to derive an automatic-layout
+        // min-content floor.  Keep the auto-width case on the existing
+        // measuring path: CSS 2.2 falls back to automatic table layout when
+        // a fixed-layout table has no specified width.
+        // <https://www.w3.org/TR/CSS22/tables.html#fixed-table-layout>
+        if table_style.table_layout == TableLayout::Fixed
+            && !table_root_inline_size(table_style).is_auto()
+        {
+            table_width.content_width = content_box_pt(content_width);
+            return;
+        }
+
+        let measures = self.table_column_measures(
+            rows,
+            grid,
+            table_style,
+            stylesheets,
+            columns,
+            table_width.content_width.points(),
+            table_cellpadding,
+            table_metrics,
+            collapsed_geometry,
+        );
+        let min_content = measures.table_min_content_width().max(0.0);
+        let max_content = measures.table_max_content_width().max(min_content);
         if let Some(width) = intrinsic::intrinsic_content_box_width_keyword(
             table_root_inline_size(table_style),
             content_box_pt(min_content),
@@ -476,7 +455,7 @@ impl<'a> LayoutBuilder<'a> {
         rows: &[TableRow<'_>],
         grid: &TableGrid,
         table_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         columns: &[TableColumn<'_>],
         table_width: LogicalInlineContentSize,
         distribute_extra_width: bool,
@@ -546,7 +525,7 @@ impl<'a> LayoutBuilder<'a> {
         rows: &[TableRow<'_>],
         grid: &TableGrid,
         table_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         columns: &[TableColumn<'_>],
         table_width: LogicalInlineContentSize,
         distribute_extra_width: bool,
@@ -699,7 +678,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         columns: &[TableColumn<'_>],
         table_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         column_count: usize,
     ) -> Vec<bool> {
         let mut collapsed = vec![false; column_count];
@@ -731,11 +710,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         source: &ComputedStyle,
     ) -> TableUsedStyle {
-        let used = if source.zoom_applied {
-            source.clone()
-        } else {
-            self.style_with_current_used_lengths(source)
-        };
+        let used = self.style_with_current_used_lengths(source);
         TableUsedStyle::from_source_and_normalized(source.clone(), used)
     }
 
@@ -743,7 +718,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         row: &TableRow<'_>,
         table_style: &(impl TableStyleSource + ?Sized),
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
     ) -> TableUsedStyle {
         if let Some(style) = &row.style {
             return self.table_used_style(style.as_ref());
@@ -779,7 +754,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         row_group: &TableRowGroup<'_>,
         table_style: &(impl TableStyleSource + ?Sized),
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
     ) -> TableUsedStyle {
         if let Some(style) = &row_group.style {
             return self.table_used_style(style.as_ref());
@@ -799,7 +774,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         column: &TableColumn<'_>,
         table_style: &(impl TableStyleSource + ?Sized),
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
     ) -> TableUsedStyle {
         if let Some(style) = &column.style {
             return self.table_used_style(style.as_ref());
@@ -826,7 +801,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         group: &TableColumnGroup<'_>,
         table_style: &(impl TableStyleSource + ?Sized),
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
     ) -> TableUsedStyle {
         if let Some(style) = &group.style {
             return self.table_used_style(style.as_ref());
@@ -847,7 +822,7 @@ impl<'a> LayoutBuilder<'a> {
         cell: &TableCell<'_>,
         row: &TableRow<'_>,
         row_style: &(impl TableStyleSource + ?Sized),
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
     ) -> TableUsedStyle {
         if cell.anonymous {
             let mut style = cell
@@ -862,7 +837,7 @@ impl<'a> LayoutBuilder<'a> {
             style.border_widths = css::Edges::ZERO;
             style.border_width_values = css::CssEdges::all(css::ComputedLengthPercentage::ZERO);
             style.border_styles = css::BorderStyles::NONE;
-            style.background_color = None;
+            style.background_color = css::BackgroundColor::TRANSPARENT;
             set_style_auto_width(&mut style);
             set_style_auto_height(&mut style);
             style.box_values.min_width = css::ComputedLengthPercentageOrAuto::Auto;
@@ -901,7 +876,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         caption: &TableCaption<'_>,
         table_style: &(impl TableStyleSource + ?Sized),
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
     ) -> TableUsedStyle {
         if let Some(style) = &caption.style {
             return self.table_used_style(style.as_ref());
@@ -1059,7 +1034,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         cell: &TableCell<'_>,
         cell_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         border_insets: css::Edges,
         available_block_width: f32,
     ) -> f32 {

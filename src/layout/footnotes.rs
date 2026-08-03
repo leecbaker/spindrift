@@ -11,27 +11,83 @@ impl<'a> LayoutBuilder<'a> {
             .collect();
     }
 
-    pub(in crate::layout) fn handle_footnote_call(&mut self, element: &Element) {
+    /// Provides an initial fixed-point reservation for a document with one
+    /// detached body. The first page is only a seed: render validates the
+    /// committed call assignment and retries from the document boundary if it
+    /// belongs on a different page.
+    pub(in crate::layout) fn initial_single_footnote_measurement(
+        &mut self,
+        page_box: &box_tree::PageBox<'a>,
+    ) -> Option<FootnoteMeasurement> {
+        let [footnote] = page_box.footnotes.as_slice() else {
+            return None;
+        };
+        let area = self.footnote_area_geometry(0);
+        Some(FootnoteMeasurement {
+            element: footnote.element.id,
+            page_index: 0,
+            area_vertical_non_content: area.vertical_non_content,
+            height: self.measure_footnote_height(footnote, area.content_inline_span),
+        })
+    }
+
+    /// Assign a footnote to the fragmentainer that committed its call line.
+    ///
+    /// CSS GCPM footnote calls participate in inline layout, so collection and
+    /// intrinsic sizing can encounter them before line fragmentation decides
+    /// their page. Callers must therefore invoke this only from committed-line
+    /// layout, not while building an inline item stream.
+    /// <https://www.w3.org/TR/css-gcpm-3/#footnote-calls>
+    pub(in crate::layout) fn handle_footnote_call(&mut self, element: ElementId) {
         if self.footnote_measurement_depth > 0 {
             return;
         }
-        let Some(footnote) = self.footnote_bodies.get(&element.id).cloned() else {
+        let Some(footnote) = self.footnote_bodies.get(&element).cloned() else {
             return;
         };
         match self.footnote_layout_mode {
             FootnoteLayoutMode::Measure => {
+                if !self.measured_footnotes.insert(element) {
+                    return;
+                }
                 let area = self.footnote_area_geometry(self.pages.len());
                 let height = self.measure_footnote_height(&footnote, area.content_inline_span);
                 self.footnote_measurements.push(FootnoteMeasurement {
-                    element: element.id,
+                    element,
                     page_index: self.pages.len(),
                     area_vertical_non_content: area.vertical_non_content,
                     height,
                 });
             }
             FootnoteLayoutMode::Render => {
-                if self.rendered_footnotes.insert(element.id) {
-                    self.pending_page_footnotes.push(footnote.element.id);
+                if self.rendered_footnotes.insert(element) {
+                    let area = self.footnote_area_geometry(self.pages.len());
+                    // A fixed-point render starts with measurements for its
+                    // reserved page-local areas. Reuse that exact body
+                    // measurement when the committed call remained on the
+                    // same page; a changed assignment still measures against
+                    // its destination page and drives another iteration.
+                    let height = self
+                        .footnote_measurements
+                        .iter()
+                        .find(|measurement| {
+                            measurement.element == element
+                                && measurement.page_index == self.pages.len()
+                                && measurement.area_vertical_non_content
+                                    == area.vertical_non_content
+                        })
+                        .map(|measurement| measurement.height)
+                        .unwrap_or_else(|| {
+                            self.measure_footnote_height(&footnote, area.content_inline_span)
+                        });
+                    self.rendered_footnote_measurements
+                        .push(FootnoteMeasurement {
+                            element,
+                            page_index: self.pages.len(),
+                            area_vertical_non_content: area.vertical_non_content,
+                            height,
+                        });
+                    self.pending_page_footnotes.push(element);
                 }
             }
         }
@@ -58,7 +114,8 @@ impl<'a> LayoutBuilder<'a> {
         self.cursor_y = start;
         self.footnote_measurement_depth += 1;
         self.fragmentation_suppression_depth += 1;
-        self.layout_formatting_box(&footnote.body, self.stylesheets);
+        let stylesheets = self.stylesheets;
+        self.layout_formatting_box(&footnote.body, &stylesheets);
         let height = (start - self.cursor_y).max(0.0);
         self.footnote_measurement_depth -= 1;
         self.fragmentation_suppression_depth -= 1;
@@ -107,7 +164,8 @@ impl<'a> LayoutBuilder<'a> {
                 self.layout_text_block(&marker, marker_style, 0.0, 0.0, None);
             }
         }
-        self.layout_formatting_box(&footnote.body, self.stylesheets);
+        let stylesheets = self.stylesheets;
+        self.layout_formatting_box(&footnote.body, &stylesheets);
         self.footnote_measurement_depth -= 1;
         self.cursor_y = saved_cursor;
         self.last_in_flow_line_baseline_y = saved_baseline;

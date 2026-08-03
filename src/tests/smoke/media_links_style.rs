@@ -3,6 +3,59 @@ use super::*;
 const GREEN_100_PNG: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAGQAAABkCAIAAAD/gAIDAAAAkElEQVR42u3QMQ0AAAjAsElHOhb4eJpUQWviSoEsWbJkyUKBLFmyZMlCgSxZsmTJQoEsWbJkyUKBLFmyZMlCgSxZsmTJQoEsWbJkyUKBLFmyZMlCgSxZsmTJQoEsWbJkyUKBLFmyZMlCgSxZsmTJQoEsWbJkyUKBLFmyZMlCgSxZsmTJQoEsWbJkyUKBLFnfFhDniR6UCYQPAAAAAElFTkSuQmCC";
 
 #[tokio::test]
+async fn object_uses_fallback_for_missing_empty_and_unsupported_resources() {
+    let document = Html::from_string(format!(
+        "<object>missing</object><object data=\"\">empty</object><object type=\"application/pdf\" data=\"{GREEN_100_PNG}\">unsupported</object>"
+    ))
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let visible_text = document
+        .pages
+        .iter()
+        .flat_map(|page| page.lines())
+        .map(|line| line.text.as_str())
+        .collect::<String>();
+
+    assert!(
+        visible_text.contains("missingemptyunsupported"),
+        "{visible_text:?}"
+    );
+    assert!(
+        document.pages.iter().all(|page| page.images().is_empty()),
+        "fallback objects must not emit their unavailable resource"
+    );
+}
+
+#[tokio::test]
+async fn object_with_supported_image_suppresses_fallback_content() {
+    let document = Html::from_string(format!(
+        "<object data=\"{GREEN_100_PNG}\">fallback text must be hidden</object>"
+    ))
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let visible_text = document
+        .pages
+        .iter()
+        .flat_map(|page| page.lines())
+        .map(|line| line.text.as_str())
+        .collect::<String>();
+
+    assert!(!visible_text.contains("fallback text"), "{visible_text:?}");
+    assert_eq!(
+        document
+            .pages
+            .iter()
+            .map(|page| page.images().len())
+            .sum::<usize>(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn display_contents_on_unusual_html_elements_computes_to_none() {
     let document = Html::from_string(
         r#"<!DOCTYPE html>
@@ -223,7 +276,7 @@ async fn baseline_shift_center_centers_inline_images_in_line_box() {
 #[tokio::test]
 async fn renders_png_data_uri_images() {
     let html = Html::from_string(
-        "<img src=\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC\" height=\"10pt\">",
+        "<img src=\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC\" style=\"height: 10pt\">",
     );
     let document = html.render(&RenderOptions::default()).await.unwrap();
 
@@ -275,7 +328,8 @@ async fn renders_only_the_first_frame_of_an_animated_gif_data_uri() {
     let rendered_image = &document.pages[0].images()[0];
     assert_eq!(rendered_image.pixel_width(), 2);
     assert_eq!(rendered_image.pixel_height(), 1);
-    let crate::document::RenderedImageSource::Stored { image_id, .. } = &rendered_image.source
+    let crate::document::paint::images::RenderedImageSource::Stored { image_id, .. } =
+        &rendered_image.source
     else {
         panic!("HTML GIF should retain a store-backed source");
     };
@@ -308,7 +362,8 @@ async fn renders_only_the_first_frame_of_an_animated_webp_data_uri() {
     let rendered_image = &document.pages[0].images()[0];
     assert_eq!(rendered_image.pixel_width(), 2);
     assert_eq!(rendered_image.pixel_height(), 1);
-    let crate::document::RenderedImageSource::Stored { image_id, .. } = &rendered_image.source
+    let crate::document::paint::images::RenderedImageSource::Stored { image_id, .. } =
+        &rendered_image.source
     else {
         panic!("HTML WebP should retain a store-backed source");
     };
@@ -482,7 +537,9 @@ async fn floated_non_replaced_block_intrinsic_width_honors_definite_max_width() 
         .collect::<Vec<_>>();
     right_borders.sort_by(|a, b| b.y().total_cmp(&a.y()).then(a.x().total_cmp(&b.x())));
     let right_borders = right_borders
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|row| row[1].x())
         .collect::<Vec<_>>();
 

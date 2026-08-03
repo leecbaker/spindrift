@@ -63,6 +63,21 @@ fn benchmark_weasyprint_samples(c: &mut Criterion) {
         });
     });
 
+    let break_all_document = format!(
+        "<!doctype html><meta charset=\"utf-8\"><style>@page {{ size: 80pt 120pt; margin: 8pt }} p {{ margin: 0; width: 20pt; font: 10pt/10pt sans-serif; word-break: break-all }}</style><p>{}</p>",
+        "abcdefghijklmnopqrstuvwxyz0123456789".repeat(512),
+    );
+    group.bench_function("inline_break_all_long", |b| {
+        b.iter(|| {
+            let bytes = runtime.block_on(render_inline_break_all_pdf(
+                &break_all_document,
+                &options,
+                &pdf_options,
+            ));
+            black_box(bytes.len())
+        });
+    });
+
     for sample in SAMPLES {
         let benchmark_id = BenchmarkId::from_parameter(format!("sample_{}", sample.name));
         group.bench_with_input(benchmark_id, sample, |b, sample| {
@@ -81,6 +96,17 @@ async fn render_empty_pdf(options: &RenderOptions, pdf_options: &PdfOptions) -> 
         .write_pdf_bytes(options, pdf_options)
         .await
         .expect("render empty document to PDF")
+}
+
+async fn render_inline_break_all_pdf(
+    source: &str,
+    options: &RenderOptions,
+    pdf_options: &PdfOptions,
+) -> Vec<u8> {
+    Html::from_string(source)
+        .write_pdf_bytes(options, pdf_options)
+        .await
+        .expect("render long break-all benchmark document to PDF")
 }
 
 async fn render_sample_pdf(

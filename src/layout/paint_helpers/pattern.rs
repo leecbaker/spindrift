@@ -297,7 +297,7 @@ pub(crate) fn push_border_rect(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::RenderedPathCommandPoints;
+    use crate::document::paint::paths::RenderedPathCommandPoints;
 
     fn rectangular_clip() -> RenderedPathClip {
         RenderedPathClip::new(

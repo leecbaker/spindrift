@@ -371,11 +371,20 @@ fn parse_named_string_target_text_keyword(value: &str) -> Option<NamedStringTarg
     }
 }
 
-fn parse_target_reference(value: &str) -> Option<String> {
+fn parse_target_reference(value: &str) -> Option<TargetReference> {
+    if let Some((attribute, tail)) = parse_generated_attr_token(value)
+        && tail.trim().is_empty()
+        && let GeneratedContentPart::Attr {
+            name,
+            fallback: None,
+        } = attribute
+    {
+        return Some(TargetReference::Attribute(name));
+    }
     if let Some((text, tail)) = parse_css_string_token(value)
         && tail.trim().is_empty()
     {
-        return Some(text);
+        return Some(TargetReference::Fragment(text));
     }
     let body = strip_ascii_function(value, "url")?;
     let (argument, tail) = split_function_argument(body)?;
@@ -385,10 +394,10 @@ fn parse_target_reference(value: &str) -> Option<String> {
     if let Some((text, tail)) = parse_css_string_token(argument.trim())
         && tail.trim().is_empty()
     {
-        return Some(text);
+        return Some(TargetReference::Fragment(text));
     }
     let target = argument.trim();
-    (!target.is_empty()).then(|| target.to_string())
+    (!target.is_empty()).then(|| TargetReference::Fragment(target.to_string()))
 }
 
 fn parse_generated_attr_token(value: &str) -> Option<(GeneratedContentPart, &str)> {
@@ -404,11 +413,12 @@ fn parse_generated_attr_token(value: &str) -> Option<(GeneratedContentPart, &str
         if fallback.is_empty() {
             None
         } else {
-            let (text, tail) = parse_css_string_token(fallback)?;
-            if !tail.trim().is_empty() {
-                return None;
-            }
-            Some(text)
+            // An untyped `attr()` remains valid when its fallback is not a
+            // string. If that fallback is selected the function becomes
+            // guaranteed-invalid at computed-value time; a present attribute
+            // must still be usable.
+            parse_css_string_token(fallback)
+                .and_then(|(text, tail)| tail.trim().is_empty().then_some(text))
         }
     } else {
         None
@@ -584,7 +594,9 @@ pub(crate) fn parse_quotes(value: &str, inherited: &Quotes) -> Option<Quotes> {
         return None;
     }
     let pairs = strings
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| (pair[0].clone(), pair[1].clone()))
         .collect::<Vec<_>>();
     Some(Quotes::Pairs(pairs))

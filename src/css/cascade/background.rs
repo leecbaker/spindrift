@@ -14,18 +14,26 @@ pub(super) fn apply_background_shorthand(
     else {
         return;
     };
-    style.background_color_current_color_expression = None;
-    style.background_color_is_current_color = background_tokens(value)
+    style.background_color = if background_tokens(value)
         .iter()
-        .any(|token| token.eq_ignore_ascii_case("currentcolor"));
-    style.background_color = if style.background_color_is_current_color {
-        Some(style.color)
+        .any(|token| token.eq_ignore_ascii_case("currentcolor"))
+    {
+        BackgroundColor::CurrentColor
     } else {
-        parse_color(value).or_else(|| {
-            background_tokens(value)
-                .iter()
-                .find_map(|token| parse_color(token))
-        })
+        parse_color_from_currentcolor_in_scheme(value, style.color, style.used_color_scheme)
+            .or_else(|| parse_color(value))
+            .or_else(|| {
+                background_tokens(value).iter().find_map(|token| {
+                    parse_color_from_currentcolor_in_scheme(
+                        token,
+                        style.color,
+                        style.used_color_scheme,
+                    )
+                    .or_else(|| parse_color(token))
+                })
+            })
+            .map(BackgroundColor::Color)
+            .unwrap_or(BackgroundColor::TRANSPARENT)
     };
     style.background_layers = layers;
     style.background_image_layer_count = style.background_layers.len().max(1);
@@ -468,6 +476,18 @@ pub(crate) fn parse_css_image(
         ParsedImage::NotAnImage => {}
         image => return image,
     }
+    parse_css_image_without_image_set(value, base_url, root_url)
+}
+
+/// Parse a supported concrete `<image>` while deliberately excluding
+/// `image-set()`. Image-set candidates use this entry point so a set cannot
+/// directly or indirectly contain another image-set.
+/// <https://drafts.csswg.org/css-images-4/#image-set-notation>
+fn parse_css_image_without_image_set(
+    value: &str,
+    base_url: Option<&url::Url>,
+    root_url: Option<&url::Url>,
+) -> ParsedImage {
     if let Some(gradient) = parse_conic_gradient(value) {
         return ParsedImage::Image(ComputedImage::image(BackgroundImage::ConicGradient(
             gradient,
@@ -574,7 +594,7 @@ fn parse_conic_prelude(
         return Some((
             0.0,
             radial_gradient_center_position(),
-            GradientInterpolationMethod::default(),
+            GradientInterpolationMethod::CSS_IMAGES_3,
             false,
         ));
     }
@@ -598,7 +618,12 @@ fn parse_conic_prelude(
             position = parsed;
         }
     }
-    Some((angle, position, interpolation.unwrap_or_default(), true))
+    Some((
+        angle,
+        position,
+        interpolation.unwrap_or(GradientInterpolationMethod::CSS_IMAGES_3),
+        true,
+    ))
 }
 
 fn parse_conic_gradient_stop(value: &str) -> Option<Vec<ConicGradientStop>> {
@@ -649,101 +674,63 @@ fn parse_conic_angle_percentage(value: &str) -> Option<f32> {
     })
 }
 
-/// Select the resource appropriate for Quire's fixed 1dppx rendering
-/// environment from a CSS Images `image-set()`.
-///
-/// CSS Images Level 4 resolves an image set by discarding candidates whose
-/// image type is unsupported, then choosing the lowest resolution not below
-/// the output resolution (or the highest available lower resolution). A
-/// malformed candidate invalidates the whole image-set value. Keeping that
-/// selection at image-value parsing time means every existing consumer of
-/// `BackgroundImage` (backgrounds and generated content) shares exactly the
-/// same selected resource without a second, property-specific image-set
-/// implementation. A valid set with no supported candidates is represented
-/// directly as [`ComputedImage::Invalid`], separate from syntax failure.
-/// <https://drafts.csswg.org/css-images-4/#image-set-notation>
 /// Parse a CSS `image-set()` image while preserving the distinction between a
-/// malformed value and a valid set for which this renderer supports no image
-/// source. The former invalidates its declaration; the latter computes to a
-/// missing image and therefore paints nothing.
+/// malformed value and a valid set for which the selected rendering
+/// environment supports no image source. Candidate negotiation happens after
+/// cascade, not while parsing a declaration.
 /// <https://drafts.csswg.org/css-images-4/#image-set-notation>
 fn parse_image_set(
     value: &str,
     base_url: Option<&url::Url>,
     root_url: Option<&url::Url>,
 ) -> ParsedImage {
-    let Some(body) = strip_ascii_function(trim_css_value(value), "image-set") else {
+    let value = trim_css_value(value);
+    let Some((name, body, tail)) = crate::css::component_values::css_leading_function(value) else {
         return ParsedImage::NotAnImage;
     };
-    let (body, tail) = match split_function_argument(body) {
-        Some(value) => value,
-        None => return ParsedImage::SyntaxError,
-    };
+    if !name.eq_ignore_ascii_case("image-set") && !name.eq_ignore_ascii_case("-webkit-image-set") {
+        return ParsedImage::NotAnImage;
+    }
     if !tail.trim().is_empty() {
         return ParsedImage::SyntaxError;
     }
     let mut options = Vec::new();
-    for option in split_background_layer_values(body) {
+    for option in crate::css::component_values::split_css_top_level_delimiter(body, ',') {
         match parse_image_set_option(option, base_url, root_url) {
-            Ok(Some(option)) => options.push(option),
-            Ok(None) => {}
+            Ok(option) => options.push(option),
             Err(()) => return ParsedImage::SyntaxError,
         }
     }
     if options.is_empty() {
-        return ParsedImage::Image(ComputedImage::Invalid);
+        return ParsedImage::SyntaxError;
     }
-    options.sort_by(|left, right| left.0.total_cmp(&right.0));
-    let selected = options
-        .iter()
-        .find(|(resolution, _)| *resolution >= 1.0)
-        .or_else(|| {
-            // Among candidates below the output resolution, select the
-            // greatest resolution. Equal-resolution candidates preserve
-            // source order, so this keeps the first matching candidate.
-            // <https://drafts.csswg.org/css-images-4/#image-set-resolution>
-            options.iter().fold(None, |best, candidate| match best {
-                Some(best) if best.0 >= candidate.0 => Some(best),
-                _ => Some(candidate),
-            })
-        });
-    let (resolution, image) =
-        selected.expect("a non-empty image-set option list has a selected candidate");
-    ParsedImage::Image(ComputedImage::image(BackgroundImage::ImageSet {
-        image: Box::new(image.clone()),
-        resolution: *resolution,
-    }))
+    ParsedImage::Image(ComputedImage::image(BackgroundImage::ImageSet(ImageSet {
+        options,
+    })))
 }
 
 fn parse_image_set_option(
     value: &str,
     base_url: Option<&url::Url>,
     root_url: Option<&url::Url>,
-) -> Result<Option<(f32, BackgroundImage)>, ()> {
+) -> Result<ImageSetOption, ()> {
     let value = trim_css_value(value);
     let (image, tail) = parse_image_set_option_image(value, base_url, root_url).ok_or(())?;
     let (resolution_descriptor, mime_type) = parse_image_set_option_descriptors(tail).ok_or(())?;
     let resolution = parse_image_set_resolution(resolution_descriptor).ok_or(())?;
-    if !resolution.is_finite() || resolution < 0.0 {
-        let descriptor = resolution_descriptor;
-        // A negative literal is a parse-time grammar error, while a valid
-        // `calc()` descriptor that computes negative is an invalid candidate.
-        // The latter leaves a valid image-set whose result is an invalid image
-        // when no other candidate survives.
-        if strip_ascii_function(descriptor, "calc").is_some() {
-            return Ok(None);
-        }
+    if !resolution.is_finite() {
         return Err(());
     }
-    if resolution == 0.0 {
-        return Ok(None);
+    if resolution < 0.0 && strip_ascii_function(resolution_descriptor, "calc").is_none() {
+        // Literal negative values are outside the grammar. Calculated
+        // non-positive values are valid syntax but do not define an option.
+        return Err(());
     }
-    if let Some(mime_type) = mime_type
-        && !crate::image_store::supports_declared_image_mime_type(&mime_type)
-    {
-        return Ok(None);
-    }
-    Ok(Some((resolution, image)))
+    Ok(ImageSetOption {
+        image: Box::new(image),
+        resolution_dppx: resolution,
+        mime_type,
+    })
 }
 
 /// Split the optional resolution and `type()` descriptors of one
@@ -759,15 +746,16 @@ fn parse_image_set_option_descriptors(value: &str) -> Option<(&str, Option<Strin
     let mut resolution = None;
     let mut mime_type = None;
     for token in tokens {
-        if let Some(body) = strip_ascii_function(token, "type") {
+        if let Some((name, body, tail)) = crate::css::component_values::css_leading_function(token)
+            && name.eq_ignore_ascii_case("type")
+        {
             if mime_type.is_some() {
                 return None;
             }
-            let (argument, tail) = split_function_argument(body)?;
             if !tail.trim().is_empty() {
                 return None;
             }
-            let (mime, tail) = parse_css_string_token(argument.trim())?;
+            let (mime, tail) = parse_css_string_token(body.trim())?;
             if !tail.trim().is_empty() {
                 return None;
             }
@@ -806,20 +794,25 @@ fn parse_image_set_option_image<'a>(
             tail,
         ));
     }
-    for name in [
+    let (name, arguments, tail) = crate::css::component_values::css_leading_function(value)?;
+    if [
+        "image",
         "linear-gradient",
         "repeating-linear-gradient",
         "radial-gradient",
         "repeating-radial-gradient",
         "conic-gradient",
         "repeating-conic-gradient",
-    ] {
-        let Some(body) = strip_ascii_function(value, name) else {
-            continue;
+    ]
+    .iter()
+    .any(|known| name.eq_ignore_ascii_case(known))
+    {
+        let ParsedImage::Image(ComputedImage::Image(image)) =
+            parse_css_image_without_image_set(&format!("{name}({arguments})"), base_url, root_url)
+        else {
+            return None;
         };
-        let (arguments, tail) = split_function_argument(body)?;
-        let image = parse_background_image(&format!("{name}({arguments})"), base_url, root_url)?;
-        return Some((image, tail));
+        return Some((*image, tail));
     }
     None
 }
@@ -830,50 +823,27 @@ fn parse_image_set_resolution(value: &str) -> Option<f32> {
         // <https://drafts.csswg.org/css-images-4/#image-set-notation>
         return Some(1.0);
     }
-    let resolution = if let Some(body) = strip_ascii_function(value, "calc") {
-        let (expression, tail) = split_function_argument(body)?;
-        tail.trim().is_empty().then_some(())?;
-        parse_simple_image_set_resolution_expression(expression)?
+    let calculated =
+        crate::css::component_values::css_leading_function(value).is_some_and(|(name, _, tail)| {
+            tail.trim().is_empty()
+                && matches!(
+                    name.to_ascii_lowercase().as_str(),
+                    "calc" | "min" | "max" | "clamp" | "sign"
+                )
+        });
+    let resolution = crate::css::values::parse_math_resolution(value)?;
+    // CSS Values range checking happens after a top-level calculation. A
+    // literal negative `<resolution>` is syntax-invalid, whereas a calculated
+    // negative value computes to the closed lower bound of zero.
+    // <https://drafts.csswg.org/css-values-4/#calc-range>
+    if !calculated && resolution < 0.0 {
+        return None;
+    }
+    Some(if calculated {
+        resolution.max(0.0)
     } else {
-        parse_image_set_resolution_dimension(value)?
-    };
-    Some(resolution)
-}
-
-fn parse_simple_image_set_resolution_expression(value: &str) -> Option<f32> {
-    let compact = value
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .collect::<String>();
-    if let Some((left, right)) = compact.split_once('*') {
-        let left =
-            parse_image_set_resolution_dimension(left).or_else(|| left.parse::<f32>().ok())?;
-        let right =
-            parse_image_set_resolution_dimension(right).or_else(|| right.parse::<f32>().ok())?;
-        return Some(left * right);
-    }
-    if let Some((left, right)) = compact.split_once('/') {
-        let left =
-            parse_image_set_resolution_dimension(left).or_else(|| left.parse::<f32>().ok())?;
-        let right =
-            parse_image_set_resolution_dimension(right).or_else(|| right.parse::<f32>().ok())?;
-        return (right != 0.0).then_some(left / right);
-    }
-    parse_image_set_resolution_dimension(&compact)
-}
-
-fn parse_image_set_resolution_dimension(value: &str) -> Option<f32> {
-    for (unit, factor) in [
-        ("dppx", 1.0),
-        ("dpi", 1.0 / 96.0),
-        ("dpcm", 2.54 / 96.0),
-        ("x", 1.0),
-    ] {
-        if let Some(number) = value.strip_suffix(unit) {
-            return Some(number.trim().parse::<f32>().ok()? * factor);
-        }
-    }
-    None
+        resolution
+    })
 }
 
 pub(super) fn sync_background_layers_from_single_fields(style: &mut ComputedStyle) {
@@ -1152,7 +1122,7 @@ pub(crate) fn parse_linear_gradient(value: &str) -> Option<LinearGradient> {
         }
         None => (
             LinearGradientDirection::Angle(180.0),
-            GradientInterpolationMethod::default(),
+            GradientInterpolationMethod::CSS_IMAGES_3,
         ),
     };
     let mut stops = Vec::new();
@@ -1222,7 +1192,7 @@ pub(crate) fn parse_radial_gradient(value: &str) -> Option<RadialGradient> {
             RadialGradientShape::Ellipse,
             RadialGradientSize::Extent(RadialGradientExtent::FarthestCorner),
             radial_gradient_center_position(),
-            GradientInterpolationMethod::default(),
+            GradientInterpolationMethod::CSS_IMAGES_3,
         ),
     };
     let mut stops = Vec::new();
@@ -1270,7 +1240,7 @@ fn parse_radial_gradient_prelude(
         shape,
         size,
         position,
-        interpolation.unwrap_or_default(),
+        interpolation.unwrap_or(GradientInterpolationMethod::CSS_IMAGES_3),
     )))
 }
 
@@ -1541,7 +1511,7 @@ fn parse_linear_gradient_prelude(
     }
     Some(
         parse_linear_gradient_direction(&geometry)
-            .map(|direction| (direction, GradientInterpolationMethod::default())),
+            .map(|direction| (direction, GradientInterpolationMethod::CSS_IMAGES_3)),
     )
 }
 

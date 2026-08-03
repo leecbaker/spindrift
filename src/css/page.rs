@@ -1,13 +1,15 @@
+use super::component_values::trim_css_value;
 use super::parse::parse_stylesheet;
 use super::types::{
     ComputedLengthPercentage, ComputedLengthPercentageOrAuto, ComputedStyle, Css, Declarations,
     Direction, Edges, PhysicalSide, ResolveViewportLengths, ViewportLengthBasis, WritingMode,
     block_end_side, block_start_side, inline_end_side, inline_start_side,
 };
+#[cfg(test)]
+use super::values::fallback_ch_advance_for_style;
 use super::values::{
-    fallback_ch_advance_for_style, parse_computed_length_percentage,
-    parse_computed_length_percentage_auto, parse_computed_line_height, parse_font_size,
-    parse_line_height, trim_css_value,
+    parse_computed_length_percentage, parse_computed_length_percentage_auto,
+    parse_computed_line_height, parse_font_size, parse_line_height,
 };
 use crate::units::{PercentageBasis, layout_points};
 use crate::{
@@ -18,23 +20,15 @@ use crate::{
 pub(crate) fn apply_stylesheet_options(css: &Css, options: &mut RenderOptions) {
     let stylesheet = parse_stylesheet(css);
 
-    // Page rules with viewport units must be resolved by
-    // `LayoutBuilder::resolved_page_context`, which retains the immutable
-    // initial page box required as their viewport basis. Applying them here
-    // would turn the authored page size into the next pass's default and make
-    // `@page` viewport units recursively depend on themselves. Static page
-    // declarations retain the existing initial-context fast path.
+    // `RenderOptions` is the caller-provided initial viewport, not a cache
+    // for author-origin `@page` declarations.  Mutating it here makes an
+    // unqualified page rule become the next rule's fallback geometry, which
+    // loses the immutable viewport required by CSS Paged Media and makes
+    // named, first, and spread pages depend on materialization order.  Every
+    // page rule is instead resolved by `LayoutBuilder::resolved_page_context`
+    // against this unchanged input.
     // https://www.w3.org/TR/css-page-3/#page-model
-    if !page_declarations_use_viewport_units(&stylesheet.page_declarations) {
-        if stylesheet.page_declarations.get("size").is_some() {
-            options.page_size = page_size_from(&stylesheet.page_declarations, options.page_size);
-        }
-        options.set_page_margins(page_margins_from_for_size(
-            &stylesheet.page_declarations,
-            options.page_margins(),
-            options.page_size,
-        ));
-    }
+    // https://www.w3.org/TR/css-values-4/#viewport-relative-lengths
 
     for selector in ["body", "html", "p"] {
         for rule in stylesheet
@@ -68,15 +62,6 @@ pub(crate) fn apply_stylesheet_options(css: &Css, options: &mut RenderOptions) {
 /// page size. CSS Values defines all small/large/dynamic viewport variants in
 /// terms of these physical unit suffixes.
 /// <https://www.w3.org/TR/css-values-4/#viewport-relative-lengths>
-fn page_declarations_use_viewport_units(declarations: &Declarations) -> bool {
-    declarations.iter().any(|(_, value)| {
-        let value = value.to_ascii_lowercase();
-        ["vw", "vh", "vi", "vb", "vmin", "vmax"]
-            .iter()
-            .any(|unit| value.contains(unit))
-    })
-}
-
 fn font_size_value_depends_on_ch(value: &str, parent_font_size: f32) -> bool {
     parse_computed_length_percentage(value, parent_font_size)
         .is_some_and(|length| length.requires_ch_advance())
@@ -89,6 +74,7 @@ fn line_height_value_depends_on_ch(value: &str, font_size: f32) -> bool {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn page_size_from(declarations: &Declarations, base: PageSize) -> PageSize {
     let style = page_style_for_declarations(declarations);
     page_size_from_with_ch_advance(declarations, base, fallback_ch_advance_for_style(&style))
@@ -375,6 +361,7 @@ pub(crate) fn page_margins_from(declarations: &Declarations, base: PageMargins) 
 /// inside the containing page sheet:
 /// <https://www.w3.org/TR/css-page-3/#page-properties> and
 /// <https://www.w3.org/TR/CSS22/visudet.html#blockwidth>.
+#[cfg(test)]
 pub(crate) fn page_margins_from_for_size(
     declarations: &Declarations,
     base: PageMargins,
@@ -391,6 +378,7 @@ pub(crate) fn page_margins_from_for_size(
 /// `auto` margins:
 /// <https://www.w3.org/TR/css-page-3/#page-properties> and
 /// <https://www.w3.org/TR/CSS22/visudet.html#blockwidth>.
+#[cfg(test)]
 pub(crate) fn page_margins_from_for_size_and_edges(
     declarations: &Declarations,
     base: PageMargins,

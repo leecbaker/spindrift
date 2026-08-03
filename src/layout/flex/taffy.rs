@@ -1,4 +1,7 @@
 use super::*;
+use crate::layout::taffy_bridge;
+
+type FlexLogicalInlinePercentageBasis = LogicalInlinePercentageBasis<FlexAvailableSizeSource>;
 
 /// Wraps a raw Taffy layout result in the Taffy coordinate space.
 ///
@@ -25,60 +28,12 @@ pub(super) fn taffy_margin(
     containing_style: &ComputedStyle,
     available: FlexAvailableSpace,
 ) -> taffy_layout::Rect<taffy_layout::LengthPercentageAuto> {
-    let edges = style.box_values.margin.clone();
-    // CSS Box resolves every margin percentage, including physical margins,
-    // against the containing block's logical inline size. Taffy's physical
-    // edge percentages cannot represent a mixed `calc()` value or an
-    // orthogonal containing block, so resolve against that typed basis before
-    // crossing the adapter boundary whenever possible.
-    // <https://www.w3.org/TR/css-box-3/#margin-physical>
     let percentage_basis = logical_inline_percentage_basis(containing_style, available);
-    taffy_layout::Rect {
-        left: taffy_margin_length_percentage_auto(edges.left, percentage_basis),
-        right: taffy_margin_length_percentage_auto(edges.right, percentage_basis),
-        top: taffy_margin_length_percentage_auto(edges.top, percentage_basis),
-        bottom: taffy_margin_length_percentage_auto(edges.bottom, percentage_basis),
-    }
-}
-
-/// Converts CSS flex item margins without applying size non-negativity clamps.
-///
-/// CSS Flexbox lays out and paints flex items in order-modified document order,
-/// so negative margins must survive the Taffy bridge in order for overlapping
-/// flex items to paint in the correct `order` sequence:
-/// <https://www.w3.org/TR/css-flexbox-1/#order-property>.
-fn taffy_margin_length_percentage_auto(
-    value: css::ComputedLengthPercentageOrAuto,
-    percentage_basis: FlexAvailablePercentageBasis,
-) -> taffy_layout::LengthPercentageAuto {
-    match value {
-        css::ComputedLengthPercentageOrAuto::Auto => taffy_layout::LengthPercentageAuto::auto(),
-        css::ComputedLengthPercentageOrAuto::LengthPercentage(value) => {
-            if value.needs_percentage_basis()
-                && let Some(resolved) = used_length_percentage_or_auto_with_basis(
-                    css::ComputedLengthPercentageOrAuto::LengthPercentage(value.clone()),
-                    percentage_basis,
-                )
-            {
-                return taffy_layout::LengthPercentageAuto::length(resolved.points());
-            }
-            if let Some(percent) = value
-                .pure_percentage_coefficient()
-                .filter(|percent| *percent != 0.0)
-            {
-                taffy_layout::LengthPercentageAuto::percent(percent)
-            } else {
-                taffy_layout::LengthPercentageAuto::length(value.length_points())
-            }
-        }
-        css::ComputedLengthPercentageOrAuto::MinContent
-        | css::ComputedLengthPercentageOrAuto::MaxContent
-        | css::ComputedLengthPercentageOrAuto::FitContent(_)
-        | css::ComputedLengthPercentageOrAuto::Stretch
-        | css::ComputedLengthPercentageOrAuto::CalcSize(_) => {
-            taffy_layout::LengthPercentageAuto::auto()
-        }
-    }
+    taffy_bridge::margin(
+        style,
+        percentage_basis,
+        taffy_bridge::TaffyCyclicPercentage::PreservePurePercentage,
+    )
 }
 
 /// Converts computed CSS padding to Taffy's flex-item padding representation.
@@ -92,19 +47,13 @@ pub(super) fn taffy_padding(
     containing_style: &ComputedStyle,
     available: FlexAvailableSpace,
 ) -> taffy_layout::Rect<taffy_layout::LengthPercentage> {
-    let edges = style.box_values.padding.clone();
     // CSS Box resolves every physical padding percentage against the
     // containing block's logical inline size. Resolve it at this typed
     // physical/logical adapter boundary instead of letting Taffy apply a
     // physical-width percentage in vertical writing modes:
     // <https://www.w3.org/TR/css-box-3/#padding-physical>.
     let percentage_basis = logical_inline_percentage_basis(containing_style, available);
-    taffy_layout::Rect {
-        left: taffy_padding_length_percentage(edges.left, percentage_basis),
-        right: taffy_padding_length_percentage(edges.right, percentage_basis),
-        top: taffy_padding_length_percentage(edges.top, percentage_basis),
-        bottom: taffy_padding_length_percentage(edges.bottom, percentage_basis),
-    }
+    taffy_bridge::padding(style, percentage_basis)
 }
 
 /// Resolve a flex item's padding for replay and box-model calculations.
@@ -118,12 +67,13 @@ pub(super) fn flex_item_used_padding(
     available: FlexAvailableSpace,
 ) -> css::Edges {
     let percentage_basis = logical_inline_percentage_basis(containing_style, available);
-    percentage_basis
-        .points()
-        .map(|basis| {
-            used_padding_edges(style, PercentageBasis::definite(layout_pt(basis))).to_css_edges()
-        })
-        .unwrap_or(style.padding)
+    if percentage_basis.is_definite() {
+        used_box_metrics_for_logical_inline_basis(style, percentage_basis.map_source(|_| ()))
+            .padding
+            .to_css_edges()
+    } else {
+        style.padding
+    }
 }
 
 /// Resolve a flex item's physical margins using its container's logical inline
@@ -136,33 +86,13 @@ pub(super) fn flex_item_used_margin(
     available: FlexAvailableSpace,
 ) -> css::Edges {
     let percentage_basis = logical_inline_percentage_basis(containing_style, available);
-    percentage_basis
-        .points()
-        .map(|basis| {
-            used_box_metrics(style, PercentageBasis::definite(layout_pt(basis)))
-                .margin
-                .to_css_edges()
-        })
-        .unwrap_or(style.margin)
-}
-
-/// Convert padding at the physical Taffy boundary without changing its CSS
-/// logical-inline percentage basis.
-fn taffy_padding_length_percentage(
-    value: css::ComputedLengthPercentage,
-    percentage_basis: FlexAvailablePercentageBasis,
-) -> taffy_layout::LengthPercentage {
-    if value.needs_percentage_basis()
-        && let Some(basis) = percentage_basis.points()
-    {
-        return taffy_layout::LengthPercentage::length(
-            used_length_percentage(value, PercentageBasis::definite(layout_pt(basis))).points(),
-        );
+    if percentage_basis.is_definite() {
+        used_box_metrics_for_logical_inline_basis(style, percentage_basis.map_source(|_| ()))
+            .margin
+            .to_css_edges()
+    } else {
+        style.margin
     }
-    // During intrinsic/cyclic sizing an indefinite percentage contributes no
-    // percentage component; preserving only its absolute length avoids
-    // accidentally resolving it against Taffy's physical width.
-    taffy_layout::LengthPercentage::length(value.length_points())
 }
 
 /// Return the percentage basis for physical box edges in a flex container.
@@ -173,7 +103,7 @@ fn taffy_padding_length_percentage(
 fn logical_inline_percentage_basis(
     containing_style: &ComputedStyle,
     available: FlexAvailableSpace,
-) -> FlexAvailablePercentageBasis {
+) -> FlexLogicalInlinePercentageBasis {
     if WritingModeAxes::new(
         containing_style.writing_mode,
         containing_style.used_direction(),
@@ -184,6 +114,7 @@ fn logical_inline_percentage_basis(
     } else {
         available.width_basis
     }
+    .map_value(LogicalInlineContentSize::new)
 }
 
 /// Converts used border widths to Taffy's length-only edge representation.
@@ -192,12 +123,7 @@ fn logical_inline_percentage_basis(
 /// CSS box model:
 /// <https://www.w3.org/TR/css-flexbox-1/#box-model>.
 pub(super) fn taffy_edges(edges: css::Edges) -> taffy_layout::Rect<taffy_layout::LengthPercentage> {
-    taffy_layout::Rect {
-        left: taffy_layout::LengthPercentage::length(edges.left),
-        right: taffy_layout::LengthPercentage::length(edges.right),
-        top: taffy_layout::LengthPercentage::length(edges.top),
-        bottom: taffy_layout::LengthPercentage::length(edges.bottom),
-    }
+    taffy_bridge::border_edges(edges)
 }
 
 /// Converts computed CSS gaps to Taffy's flex gap representation.
@@ -211,23 +137,7 @@ pub(super) fn taffy_gap(
     value: css::ComputedGap,
     percentage_basis: FlexAvailablePercentageBasis,
 ) -> taffy_layout::LengthPercentage {
-    match value {
-        css::ComputedGap::Normal => taffy_layout::LengthPercentage::length(0.0),
-        css::ComputedGap::LengthPercentage(value) => percentage_basis
-            .points()
-            .map(|basis| {
-                taffy_layout::LengthPercentage::length(
-                    used_length_percentage(
-                        value.clone(),
-                        PercentageBasis::definite(layout_pt(basis.max(0.0))),
-                    )
-                    .points(),
-                )
-            })
-            .unwrap_or_else(|| {
-                taffy_layout::LengthPercentage::length(value.length_max_zero().points())
-            }),
-    }
+    taffy_bridge::gap(value, percentage_basis)
 }
 
 /// Converts a flex item's physical size for Taffy while preserving auto cross sizes.
@@ -357,37 +267,76 @@ pub(super) fn taffy_optional_dimension_with_basis(
     value: css::ComputedLengthPercentageOrAuto,
     percentage_basis: FlexAvailablePercentageBasis,
 ) -> taffy_layout::Dimension {
-    let percentage_basis = percentage_basis.points();
+    taffy_flex_optional_dimension(
+        value,
+        FlexTaffyPercentagePolicy::ResolveAgainstDefiniteBasis(percentage_basis),
+    )
+}
+
+/// Selects whether a flex size may remain a symbolic Taffy percentage.
+///
+/// Flex item's used size resolution needs a definite containing-block basis,
+/// while the flex container's own optional maximum constraint may preserve a
+/// pure percentage for Taffy's later resolution. These are separate CSS
+/// sizing phases, not interchangeable representations:
+/// <https://www.w3.org/TR/css-sizing-3/#percentage-sizing> and
+/// <https://www.w3.org/TR/css-flexbox-1/#layout-algorithm>.
+#[derive(Debug, Clone, Copy)]
+enum FlexTaffyPercentagePolicy {
+    PreservePurePercentage,
+    ResolveAgainstDefiniteBasis(FlexAvailablePercentageBasis),
+}
+
+/// Convert a Flex optional size through the policy selected by its CSS phase.
+///
+/// The value grammar is shared between the symbolic container constraint and
+/// the definite-basis item sizing path. The policy governs only the
+/// `<length-percentage>` arm; Flex's higher-level flex-basis, stretch-fit, and
+/// automatic minimum-size logic remains with its callers.
+fn taffy_flex_optional_dimension(
+    value: css::ComputedLengthPercentageOrAuto,
+    percentage_policy: FlexTaffyPercentagePolicy,
+) -> taffy_layout::Dimension {
     match value {
         css::ComputedLengthPercentageOrAuto::Auto
         | css::ComputedLengthPercentageOrAuto::Stretch => taffy_layout::Dimension::auto(),
         css::ComputedLengthPercentageOrAuto::LengthPercentage(value) => {
-            if let Some(basis) = percentage_basis
-                && let Some(resolved) = value.used_length_with_percentage_basis(
-                    PercentageBasis::definite(layout_pt(basis.max(0.0))),
-                )
-            {
-                return taffy_layout::Dimension::length(resolved.points());
-            }
-            if value.needs_percentage_basis() && percentage_basis.is_none() {
-                return taffy_layout::Dimension::auto();
-            }
-            if !value.is_definitely_absolute()
-                && value
-                    .used_length_with_percentage_basis(
-                        PercentageBasis::<ContentBoxLength>::indefinite(),
-                    )
-                    .is_none()
-            {
-                return taffy_layout::Dimension::auto();
-            }
-            taffy_dimension_from_length_percentage(value)
+            taffy_flex_length_percentage_dimension(value, percentage_policy)
         }
         css::ComputedLengthPercentageOrAuto::MinContent
         | css::ComputedLengthPercentageOrAuto::MaxContent
         | css::ComputedLengthPercentageOrAuto::FitContent(_)
         | css::ComputedLengthPercentageOrAuto::CalcSize(_) => taffy_layout::Dimension::auto(),
     }
+}
+
+fn taffy_flex_length_percentage_dimension(
+    value: css::ComputedLengthPercentage,
+    percentage_policy: FlexTaffyPercentagePolicy,
+) -> taffy_layout::Dimension {
+    let FlexTaffyPercentagePolicy::ResolveAgainstDefiniteBasis(percentage_basis) =
+        percentage_policy
+    else {
+        return taffy_dimension_from_length_percentage(value);
+    };
+    let percentage_basis = percentage_basis.points();
+    if let Some(basis) = percentage_basis
+        && let Some(resolved) = value
+            .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(basis.max(0.0))))
+    {
+        return taffy_layout::Dimension::length(resolved.points());
+    }
+    if value.needs_percentage_basis() && percentage_basis.is_none() {
+        return taffy_layout::Dimension::auto();
+    }
+    if !value.is_definitely_absolute()
+        && value
+            .used_length_with_percentage_basis(PercentageBasis::<ContentBoxLength>::indefinite())
+            .is_none()
+    {
+        return taffy_layout::Dimension::auto();
+    }
+    taffy_dimension_from_length_percentage(value)
 }
 
 /// Converts a CSS size constraint to Taffy when intrinsic contributions are known.
@@ -526,17 +475,7 @@ pub(super) fn measure_flex_item(
 pub(super) fn taffy_optional_dimension(
     value: css::ComputedLengthPercentageOrAuto,
 ) -> taffy_layout::Dimension {
-    match value {
-        css::ComputedLengthPercentageOrAuto::Auto
-        | css::ComputedLengthPercentageOrAuto::Stretch => taffy_layout::Dimension::auto(),
-        css::ComputedLengthPercentageOrAuto::LengthPercentage(value) => {
-            taffy_dimension_from_length_percentage(value)
-        }
-        css::ComputedLengthPercentageOrAuto::MinContent
-        | css::ComputedLengthPercentageOrAuto::MaxContent
-        | css::ComputedLengthPercentageOrAuto::FitContent(_)
-        | css::ComputedLengthPercentageOrAuto::CalcSize(_) => taffy_layout::Dimension::auto(),
-    }
+    taffy_flex_optional_dimension(value, FlexTaffyPercentagePolicy::PreservePurePercentage)
 }
 
 fn taffy_dimension_from_length_percentage(
@@ -926,7 +865,7 @@ pub(super) fn taffy_flex_basis(
     } else if !style.box_values.height.is_auto() {
         taffy_flex_basis_from_main_size(
             style,
-            style.box_values.height.clone(),
+            style.box_values.height.value().clone(),
             estimate,
             context.main_size_basis,
             FlexDirection::Column,
@@ -1401,26 +1340,36 @@ mod tests {
 
     #[test]
     fn flex_margin_adapter_preserves_negative_lengths_and_percentages() {
-        let length = taffy_margin_length_percentage_auto(
-            css::ComputedLengthPercentageOrAuto::LengthPercentage(
-                css::ComputedLengthPercentage::from_points(-50.0),
-            ),
-            PercentageBasis::Indefinite,
+        let mut style = ComputedStyle::initial();
+        style.box_values.margin.left = css::ComputedLengthPercentageOrAuto::LengthPercentage(
+            css::ComputedLengthPercentage::from_points(-50.0),
         );
+        let length = taffy_bridge::margin(
+            &style,
+            PercentageBasis::<LogicalInlineContentSize>::indefinite(),
+            taffy_bridge::TaffyCyclicPercentage::PreservePurePercentage,
+        )
+        .left;
         assert_eq!(length.resolve_to_option(200.0, |_, _| 0.0), Some(-50.0));
 
-        let percentage = taffy_margin_length_percentage_auto(
-            css::ComputedLengthPercentageOrAuto::LengthPercentage(
-                css::ComputedLengthPercentage::from_percent(-0.25),
-            ),
-            PercentageBasis::Indefinite,
+        style.box_values.margin.left = css::ComputedLengthPercentageOrAuto::LengthPercentage(
+            css::ComputedLengthPercentage::from_percent(-0.25),
         );
+        let percentage = taffy_bridge::margin(
+            &style,
+            PercentageBasis::<LogicalInlineContentSize>::indefinite(),
+            taffy_bridge::TaffyCyclicPercentage::PreservePurePercentage,
+        )
+        .left;
         assert_eq!(percentage.resolve_to_option(200.0, |_, _| 0.0), Some(-50.0));
 
-        let auto = taffy_margin_length_percentage_auto(
-            css::ComputedLengthPercentageOrAuto::Auto,
-            PercentageBasis::Indefinite,
-        );
+        style.box_values.margin.left = css::ComputedLengthPercentageOrAuto::Auto;
+        let auto = taffy_bridge::margin(
+            &style,
+            PercentageBasis::<LogicalInlineContentSize>::indefinite(),
+            taffy_bridge::TaffyCyclicPercentage::PreservePurePercentage,
+        )
+        .left;
         assert!(auto.is_auto());
     }
 
@@ -1437,6 +1386,45 @@ mod tests {
                 -0.25
             )),
             taffy_layout::Dimension::percent(0.0)
+        );
+    }
+
+    #[test]
+    fn flex_optional_dimension_policies_preserve_or_resolve_pure_percentages() {
+        let percent = css::ComputedLengthPercentageOrAuto::LengthPercentage(
+            css::ComputedLengthPercentage::from_percent(0.5),
+        );
+        let definite_basis = flex_available_percentage_basis_from_points(
+            Some(80.0),
+            FlexAvailableSizeSource::ContainingBlock,
+        );
+        let indefinite_basis = PercentageBasis::indefinite();
+
+        assert_eq!(
+            taffy_optional_dimension(percent.clone()),
+            taffy_layout::Dimension::percent(0.5),
+        );
+        assert_eq!(
+            taffy_optional_dimension_with_basis(percent.clone(), definite_basis),
+            taffy_layout::Dimension::length(40.0),
+        );
+        assert!(taffy_optional_dimension_with_basis(percent, indefinite_basis).is_auto());
+    }
+
+    #[test]
+    fn flex_optional_dimension_policies_share_fixed_lengths() {
+        let fixed = css::ComputedLengthPercentageOrAuto::LengthPercentage(
+            css::ComputedLengthPercentage::from_points(12.0),
+        );
+        let indefinite_basis = PercentageBasis::indefinite();
+
+        assert_eq!(
+            taffy_optional_dimension(fixed.clone()),
+            taffy_layout::Dimension::length(12.0),
+        );
+        assert_eq!(
+            taffy_optional_dimension_with_basis(fixed, indefinite_basis),
+            taffy_layout::Dimension::length(12.0),
         );
     }
 

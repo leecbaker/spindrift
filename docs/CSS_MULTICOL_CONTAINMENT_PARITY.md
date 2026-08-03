@@ -19,6 +19,11 @@ CSS Containment Level 1, and their shared CSS Fragmentation behavior.
   fragmentation machinery, including forced breaks, target-specific avoid
   values, `break-inside`, widows/orphans, and rollback to an earlier class A
   boundary.
+- Inline-only multicolumn rows commit their class-B line fragments and one
+  shared column block extent before painting. This keeps fixed-height
+  sequential columns and their column rules consistent when `widows` or
+  `orphans` moves content between columns, including the CSS Break WPT
+  widows-orphans fixed-height matrices.
 - One-column multicol containers and overflow columns progress in the inline
   direction. Column boxes use isolated float contexts and column-local
   containing widths. Auto-height sequential overflow column rows continue on
@@ -55,6 +60,9 @@ CSS Containment Level 1, and their shared CSS Fragmentation behavior.
   manufacturing a stacking context. Solid rules use filled areas, and
   consecutive same-paint PDF rectangles share a compound path to avoid
   antialias seams at mathematically coincident edges.
+- Wrapped multicolumn rows build one typed gap topology for column and row
+  rules. Adjacent row gaps remain explicit crossing geometry, so endpoint
+  insets and `rule-overlap` do not depend on temporary-column replay order.
 - Definite-height multicol containers nested in an outer column separate the
   principal box's authored block size from each outer-fragment-local column-set
   height. Completed rows of inner columns continue in the next outer
@@ -96,13 +104,17 @@ CSS Containment Level 1, and their shared CSS Fragmentation behavior.
   multicol line-sequence pass, avoiding an ordinary anonymous-block pass before
   column balancing. Atomic inline formatting contexts retain their
   fragment-owned replay path and resolve percentage sizes against the
-  anonymous column box rather than the multicol principal box.
-- Direct and eligible descendant `column-span: all` boxes split a multicol
-  container into independent column sets. Ordinary intervening block and split
-  inline wrappers are sliced around the promoted spanner; adjacent spanners
-  remain in normal block flow. Empty self-collapsing wrapper fragments do not
-  synthesize a line-height column before or after a promoted spanner, and a
-  trailing normalized anonymous inline run remains in the final column set.
+  anonymous column box rather than the multicol principal box. Transparent
+  collapsed whitespace and zero-geometry inline scope markers remain available
+  to shaping and painting, but do not become fragmentation line boxes or
+  enlarge an auto-height balanced column set.
+- Direct and eligible descendant `column-span: all` boxes use one
+  source-ordered principal-flow segment planner to split a multicol container
+  into independent column sets. Ordinary intervening block and split inline
+  wrappers are sliced around the promoted spanner; adjacent spanners remain in
+  normal block flow. Empty self-collapsing wrapper fragments do not synthesize
+  a line-height column before or after a promoted spanner, and a trailing
+  normalized anonymous inline run remains in the final column set.
 - Visible descendant overflow from a fitting definite-height box is projected
   into later anonymous columns independently from the principal box's
   normal-flow end. Following siblings therefore resume after the authored
@@ -179,9 +191,8 @@ failures are classified below rather than excluded.
 ## Remaining parity work
 
 - Iterative balancing includes deferred descendant and positioned fragment
-  assignments, but more complex nested parallel flows, inline formatting
-  contexts, floats, and some widows/orphans and forced-break matrices still
-  choose a non-optimal column block size.
+  assignments, but more complex nested parallel flows, floats, and some
+  forced-break matrices still choose a non-optimal column block size.
 - Balance probes reject geometric overflow from an unbreakable line even when
   that overflow has not yet allocated another anonymous column. This preserves
   a real lower bound for per-column `text-box-trim` planning.
@@ -222,10 +233,10 @@ failures are classified below rather than excluded.
   Remaining replaced flex/table edge cases, baseline export, positioned
   overflow, and monolithic overflow through every remaining formatting context
   still need broader coverage.
-- Layout containment suppresses forced-break propagation across its boundary
-  while preserving forced breaks inside a nested fragmentation context. The
-  broader fragmented-flow trapping rule and principal writing-mode propagation
-  from contained `html`/`body` elements remain incomplete.
+- Layout containment preserves forced-break resolution in the active local
+  fragmentainer. The broader fragmented-flow trapping rule and principal
+  writing-mode propagation from contained `html`/`body` elements remain
+  incomplete.
 - Fragmented paint-containment effect-group semantics and non-polygon
   `clip-path` shapes remain part of the separate paint-effects work.
 - CSS Multicol Level 2 `column-height` and `column-wrap`, and CSS Containment

@@ -36,10 +36,9 @@ pub(in crate::layout) fn used_underline_y(
     offset: TextUnderlineOffset,
     font_size: f32,
     metrics: &TextDecorationFontMetrics,
-    thickness: f32,
 ) -> f32 {
     let font_position = metrics.underline_position;
-    let under_position = -metrics.descender_depth - thickness;
+    let under_position = -metrics.descender_depth;
     let base_offset = if position.under {
         font_position.min(under_position)
     } else {
@@ -56,10 +55,20 @@ pub(in crate::layout) fn used_underline_y(
 /// <https://drafts.csswg.org/css-text-decor-4/#text-decoration-skip-spaces-property>
 /// and
 /// <https://www.w3.org/TR/css-text-decor-4/#text-decoration-skip-ink-property>.
+#[allow(dead_code)]
 pub(in crate::layout) fn text_decoration_segments(
     inputs: TextDecorationSegmentInputs,
     runs: &[RenderedTextRun],
     ink_boxes: &[GlyphInkBox],
+) -> Vec<TextDecorationSegment> {
+    text_decoration_segments_with_selected_glyphs(inputs, runs, ink_boxes, None)
+}
+
+pub(in crate::layout) fn text_decoration_segments_with_selected_glyphs(
+    inputs: TextDecorationSegmentInputs,
+    runs: &[RenderedTextRun],
+    ink_boxes: &[GlyphInkBox],
+    selected_glyphs: Option<&[TextDecorationPositionedGlyph]>,
 ) -> Vec<TextDecorationSegment> {
     let TextDecorationSegmentInputs {
         axis,
@@ -77,15 +86,26 @@ pub(in crate::layout) fn text_decoration_segments(
     }
 
     let inline_end = inline_start + inline_length;
-    let padding = thickness.max(0.5);
-    let mut skips = text_decoration_space_skip_ranges(
-        axis,
-        line_x,
-        line_y,
-        inline_start,
-        inline_length,
-        skip_spaces,
-        runs,
+    let mut skips = selected_glyphs.map_or_else(
+        || {
+            text_decoration_space_skip_ranges(
+                axis,
+                line_x,
+                line_y,
+                inline_start,
+                inline_length,
+                skip_spaces,
+                runs,
+            )
+        },
+        |glyphs| {
+            text_decoration_space_skip_ranges_for_glyphs(
+                inline_start,
+                inline_length,
+                skip_spaces,
+                glyphs,
+            )
+        },
     );
     if skip_ink != TextDecorationSkipInk::None {
         skips.extend(
@@ -102,8 +122,14 @@ pub(in crate::layout) fn text_decoration_segments(
                 })
                 .filter_map(|ink| {
                     let (ink_start, ink_end) = text_decoration_ink_inline_range(axis, line_x, ink);
-                    let start = (ink_start - padding).max(inline_start);
-                    let end = (ink_end + padding).min(inline_end);
+                    // The stroke must avoid actual ink, not a heuristic box
+                    // inflated by the full decoration thickness.  Inflating
+                    // here can consume the entire span of a short, thick
+                    // decoration before the line painter gets a chance to
+                    // render it.
+                    // <https://www.w3.org/TR/css-text-decor-4/#text-decoration-skip-ink-property>
+                    let start = ink_start.max(inline_start);
+                    let end = ink_end.min(inline_end);
                     (end > start).then_some((start, end))
                 }),
         );
@@ -148,7 +174,18 @@ pub(in crate::layout) fn text_decoration_segments(
             length: inline_end - cursor,
         });
     }
-    segments
+    // `auto` deliberately leaves the precise avoidance policy to the UA.
+    // Retaining the line when every interval would otherwise be removed is
+    // preferable to making a short, thick decoration disappear completely;
+    // `none` has already bypassed ink clipping above.
+    if segments.is_empty() && skip_ink == TextDecorationSkipInk::Auto {
+        vec![TextDecorationSegment {
+            start: inline_start,
+            length: inline_length,
+        }]
+    } else {
+        segments
+    }
 }
 
 pub(in crate::layout) fn text_decoration_ink_intersects_cross_axis(
@@ -202,6 +239,15 @@ pub(in crate::layout) fn text_decoration_space_skip_ranges(
 
     let glyphs =
         text_decoration_positioned_glyphs(axis, line_x, line_y, inline_start, inline_length, runs);
+    text_decoration_space_skip_ranges_for_glyphs(inline_start, inline_length, skip_spaces, &glyphs)
+}
+
+pub(in crate::layout) fn text_decoration_space_skip_ranges_for_glyphs(
+    inline_start: f32,
+    inline_length: f32,
+    skip_spaces: TextDecorationSkipSpaces,
+    glyphs: &[TextDecorationPositionedGlyph],
+) -> Vec<(f32, f32)> {
     if glyphs.is_empty() {
         return Vec::new();
     }
@@ -227,7 +273,7 @@ pub(in crate::layout) fn text_decoration_space_skip_ranges(
     }
 
     if skip_spaces.skips_line_start() {
-        for glyph in &glyphs {
+        for glyph in glyphs {
             if !text_decoration_glyph_is_spacer(&glyph.unicode) {
                 break;
             }

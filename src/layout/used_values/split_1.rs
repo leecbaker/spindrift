@@ -89,10 +89,11 @@ impl UsedEdges {
 
 /// Used margin and padding edges for a box in a specific containing block.
 ///
-/// CSS 2.2 resolves margin and padding percentages against the containing
-/// block width:
-/// <https://www.w3.org/TR/CSS22/box.html#margin-properties> and
-/// <https://www.w3.org/TR/CSS22/box.html#padding-properties>.
+/// CSS Box resolves margin and padding percentages against the containing
+/// block's logical inline basis. In horizontal writing modes this is the
+/// physical width described by CSS 2.2:
+/// <https://drafts.csswg.org/css-box-3/#margin-physical> and
+/// <https://www.w3.org/TR/CSS22/box.html#margin-properties>.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::layout) struct UsedBoxEdges {
     pub(in crate::layout) margin: UsedEdges,
@@ -102,10 +103,10 @@ pub(in crate::layout) struct UsedBoxEdges {
 /// Used physical box metrics after margin and padding percentages are resolved.
 ///
 /// CSS Box Model lays out content, padding, border, and margin as nested
-/// physical edges; CSS 2.2 resolves margin and padding percentages against the
-/// containing block width before used geometry is computed:
+/// physical edges; CSS Box resolves margin and padding percentages against the
+/// containing block's logical inline basis before used geometry is computed:
 /// <https://www.w3.org/TR/css-box-3/#box-model> and
-/// <https://www.w3.org/TR/CSS22/box.html#box-dimensions>.
+/// <https://drafts.csswg.org/css-box-3/#margin-physical>.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::layout) struct UsedBoxMetrics {
     pub(in crate::layout) margin: UsedEdges,
@@ -312,7 +313,10 @@ pub(in crate::layout) fn used_multicol_column_count(
     available_width: f32,
     gap: f32,
 ) -> Option<usize> {
-    let specified_count = style.column_count.filter(|count| *count > 0);
+    let specified_count = match style.column_count {
+        css::ColumnCount::Auto => None,
+        css::ColumnCount::Count(count) => Some(count.get()),
+    };
     let specified_width = match &style.column_width {
         css::ComputedColumnWidth::Auto => None,
         css::ComputedColumnWidth::Length(width) => {
@@ -355,7 +359,10 @@ pub(in crate::layout) fn size_contained_multicol_intrinsic_inline_sizes(
             .filter(|width| *width > 0.0)
             .unwrap_or(0.0),
     };
-    let count = style.column_count.unwrap_or(1).max(1);
+    let count = match style.column_count {
+        css::ColumnCount::Auto => 1,
+        css::ColumnCount::Count(count) => count.get(),
+    };
     let gap = used_multicol_column_gap(
         style.column_gap.clone(),
         PercentageBasis::definite(content_box_pt(0.0)),
@@ -418,12 +425,12 @@ pub(in crate::layout) fn contained_intrinsic_logical_inline_size(
 
 /// Resolves used padding edges for the current containing block.
 ///
-/// CSS 2.2 says padding percentages on all sides refer to the containing
-/// block's width:
-/// <https://www.w3.org/TR/CSS22/box.html#padding-properties>.
-pub(in crate::layout) fn used_padding_edges(
+/// CSS Box says padding percentages on all sides refer to the containing
+/// block's logical inline basis (the physical width in CSS 2.2 horizontal
+/// writing): <https://drafts.csswg.org/css-box-3/#padding-physical>.
+pub(in crate::layout) fn used_padding_edges<Source: Copy>(
     style: &ComputedStyle,
-    inline_basis: PercentageBasis<LayoutLength>,
+    inline_basis: PercentageBasis<LayoutLength, Source>,
 ) -> UsedEdges {
     let padding = style.box_values.padding.clone();
     UsedEdges {
@@ -434,17 +441,29 @@ pub(in crate::layout) fn used_padding_edges(
     }
 }
 
+/// Resolve padding edges from a logical inline percentage basis without
+/// erasing its axis marker at the caller.
+pub(in crate::layout) fn used_padding_edges_for_logical_inline_basis<Source: Copy>(
+    style: &ComputedStyle,
+    inline_basis: LogicalInlinePercentageBasis<Source>,
+) -> UsedEdges {
+    used_padding_edges(
+        style,
+        inline_basis.map_value(crate::units::IntoLayoutLength::into_layout_length),
+    )
+}
+
 /// Resolves one padding edge, using the typed percentage component when present.
 ///
-/// CSS 2.2 padding percentages resolve against the containing block width:
-/// <https://www.w3.org/TR/CSS22/box.html#padding-properties>.
+/// CSS Box padding percentages resolve against the containing block's logical
+/// inline basis: <https://drafts.csswg.org/css-box-3/#padding-physical>.
 /// CSS Sizing resolves cyclic percentage contributions against zero during
 /// intrinsic sizing, while preserving fixed lengths in the same calculation:
 /// <https://drafts.csswg.org/css-sizing/#cyclic-percentage-contribution>.
-pub(in crate::layout) fn used_padding_edge(
+pub(in crate::layout) fn used_padding_edge<Source>(
     value: css::ComputedLengthPercentage,
     legacy_length: f32,
-    basis: PercentageBasis<LayoutLength>,
+    basis: PercentageBasis<LayoutLength, Source>,
 ) -> LayoutLength {
     css::clamp_used_layout_length(layout_pt(
         value
@@ -457,14 +476,14 @@ pub(in crate::layout) fn used_padding_edge(
 
 /// Resolves used margin edges for the current containing block.
 ///
-/// CSS 2.2 says margin percentages on all sides refer to the containing block's
-/// width. Auto margins are resolved by the formatting context; this helper
+/// CSS Box says margin percentages on all sides refer to the containing
+/// block's logical inline basis. Auto margins are resolved by the formatting context; this helper
 /// returns zero for auto edges when a caller only needs occupied non-auto
 /// margin space:
 /// <https://www.w3.org/TR/CSS22/box.html#margin-properties>.
-pub(in crate::layout) fn used_margin_edges(
+pub(in crate::layout) fn used_margin_edges<Source: Copy>(
     style: &ComputedStyle,
-    inline_basis: PercentageBasis<LayoutLength>,
+    inline_basis: PercentageBasis<LayoutLength, Source>,
 ) -> UsedEdges {
     let margin = style.box_values.margin.clone();
     UsedEdges {
@@ -541,15 +560,15 @@ pub(in crate::layout) fn intrinsic_margin_edge(
 
 /// Resolves one margin edge, preserving formatting-context handling for `auto`.
 ///
-/// CSS 2.2 margin percentages resolve against the containing block width:
-/// <https://www.w3.org/TR/CSS22/box.html#margin-properties>.
+/// CSS Box margin percentages resolve against the containing block's logical
+/// inline basis: <https://drafts.csswg.org/css-box-3/#margin-physical>.
 /// CSS Sizing resolves cyclic percentage contributions against zero during
 /// intrinsic sizing, while preserving fixed lengths in the same calculation:
 /// <https://drafts.csswg.org/css-sizing/#cyclic-percentage-contribution>.
-pub(in crate::layout) fn used_margin_edge(
+pub(in crate::layout) fn used_margin_edge<Source>(
     value: css::ComputedLengthPercentageOrAuto,
     legacy_length: f32,
-    basis: PercentageBasis<LayoutLength>,
+    basis: PercentageBasis<LayoutLength, Source>,
 ) -> LayoutLength {
     match value {
         css::ComputedLengthPercentageOrAuto::Auto => layout_pt(0.0),
@@ -643,9 +662,9 @@ pub(in crate::layout) fn freeze_replayed_item_padding(
 /// CSS 2.2 defines the used-value resolution for margin and padding:
 /// <https://www.w3.org/TR/CSS22/box.html#margin-properties> and
 /// <https://www.w3.org/TR/CSS22/box.html#padding-properties>.
-pub(in crate::layout) fn used_box_edges(
+pub(in crate::layout) fn used_box_edges<Source: Copy>(
     style: &ComputedStyle,
-    inline_basis: PercentageBasis<LayoutLength>,
+    inline_basis: PercentageBasis<LayoutLength, Source>,
 ) -> UsedBoxEdges {
     UsedBoxEdges {
         margin: used_margin_edges(style, inline_basis),
@@ -672,9 +691,9 @@ pub(in crate::layout) fn intrinsic_box_edges(style: &ComputedStyle) -> UsedBoxEd
 /// edges but must not overwrite the computed style carried by a formatting box.
 /// CSS separates computed and used values:
 /// <https://www.w3.org/TR/css-cascade-5/#value-stages>.
-pub(in crate::layout) fn used_box_metrics(
+pub(in crate::layout) fn used_box_metrics<Source: Copy>(
     style: &ComputedStyle,
-    inline_basis: PercentageBasis<LayoutLength>,
+    inline_basis: PercentageBasis<LayoutLength, Source>,
 ) -> UsedBoxMetrics {
     let used_edges = used_box_edges(style, inline_basis);
     UsedBoxMetrics {
@@ -682,6 +701,22 @@ pub(in crate::layout) fn used_box_metrics(
         padding: used_edges.padding,
         border: UsedEdges::from_css_edges(used_border_widths(style)),
     }
+}
+
+/// Return used box metrics from a CSS logical inline percentage basis.
+///
+/// This is the preferred boundary for layout modes that know the containing
+/// block's writing-mode projection. It prevents a physical width or height
+/// from being passed as a CSS Box edge basis by accident.
+/// <https://drafts.csswg.org/css-box-3/#margin-physical>
+pub(in crate::layout) fn used_box_metrics_for_logical_inline_basis<Source: Copy>(
+    style: &ComputedStyle,
+    inline_basis: LogicalInlinePercentageBasis<Source>,
+) -> UsedBoxMetrics {
+    used_box_metrics(
+        style,
+        inline_basis.map_value(crate::units::IntoLayoutLength::into_layout_length),
+    )
 }
 
 /// Return box metrics for intrinsic size contributions.
@@ -710,6 +745,21 @@ pub(in crate::layout) fn apply_used_box_metrics(
     inline_basis: PercentageBasis<LayoutLength>,
 ) -> UsedBoxMetrics {
     let metrics = used_box_metrics(style, inline_basis);
+    style.margin = metrics.margin.to_css_edges();
+    style.padding = metrics.padding.to_css_edges();
+    metrics
+}
+
+/// Resolve and cache box metrics from a CSS logical inline basis.
+///
+/// Formatting contexts that know their containing block's writing-mode
+/// projection should use this instead of converting through `LayoutLength` at
+/// the call site.
+pub(in crate::layout) fn apply_used_box_metrics_for_logical_inline_basis<Source: Copy>(
+    style: &mut ComputedStyle,
+    inline_basis: LogicalInlinePercentageBasis<Source>,
+) -> UsedBoxMetrics {
+    let metrics = used_box_metrics_for_logical_inline_basis(style, inline_basis);
     style.margin = metrics.margin.to_css_edges();
     style.padding = metrics.padding.to_css_edges();
     metrics
@@ -949,7 +999,7 @@ pub(in crate::layout) fn has_auto_width(style: &ComputedStyle) -> bool {
 /// CSS 2.2 block height calculations depend on whether `height` is `auto`:
 /// <https://www.w3.org/TR/CSS22/visudet.html#normal-block>.
 pub(in crate::layout) fn has_auto_height(style: &ComputedStyle) -> bool {
-    style.box_values.height.clone().is_auto()
+    style.box_values.height.is_auto()
 }
 
 /// Resolves used content width, falling back to filling available space for `auto`.
@@ -1020,7 +1070,7 @@ pub(in crate::layout) fn used_content_box_height_or_auto(
     vertical_non_content: NonContentLength,
 ) -> Option<ContentBoxLength> {
     used_content_box_size(
-        style.box_values.height.clone(),
+        style.box_values.height.value().clone(),
         style.box_sizing,
         PercentageBasis::definite(crate::units::layout_to_content_box_length(
             available_outer_height,
@@ -1036,7 +1086,7 @@ pub(in crate::layout) fn used_content_box_height_or_auto_with_basis<Source>(
     vertical_non_content: NonContentLength,
 ) -> Option<ContentBoxLength> {
     used_content_box_size_with_basis(
-        style.box_values.height.clone(),
+        style.box_values.height.value().clone(),
         style.box_sizing,
         available_outer_height,
         vertical_non_content,
@@ -1058,8 +1108,8 @@ pub(in crate::layout) fn non_replaced_aspect_ratio_content_height(
     horizontal_non_content: f32,
     vertical_non_content: f32,
 ) -> Option<f32> {
-    let calc_size = style.box_values.height.clone().calc_size_with_auto_basis();
-    if !style.box_values.height.clone().is_auto() && calc_size.is_none() {
+    let calc_size = style.box_values.height.calc_size_with_auto_basis();
+    if !style.box_values.height.is_auto() && calc_size.is_none() {
         return None;
     }
     let ratio = style.aspect_ratio.preferred_ratio_for_non_replaced(false)?;
@@ -1293,8 +1343,26 @@ pub(in crate::layout) fn used_min_height<T, Source>(
 where
     T: SemanticLengthExt,
 {
-    used_length_percentage_or_auto(style.box_values.min_height.clone(), percentage_basis)
-        .map(|value| content_box_pt(value.points().max(0.0)))
+    match style.box_values.min_height.clone() {
+        css::ComputedLengthPercentageOrAuto::LengthPercentage(value) => {
+            // A cyclic min-size percentage contributes zero, rather than
+            // discarding an accompanying fixed `calc()` term.  For example,
+            // `min-height: calc(25px + 50%)` in an auto-height containing
+            // block has a used minimum of 25px.
+            // <https://www.w3.org/TR/css-sizing-3/#cyclic-percentage-contribution>
+            Some(content_box_pt(
+                used_length_percentage(value, percentage_basis)
+                    .points()
+                    .max(0.0),
+            ))
+        }
+        css::ComputedLengthPercentageOrAuto::Auto
+        | css::ComputedLengthPercentageOrAuto::Stretch
+        | css::ComputedLengthPercentageOrAuto::MinContent
+        | css::ComputedLengthPercentageOrAuto::MaxContent
+        | css::ComputedLengthPercentageOrAuto::FitContent(_)
+        | css::ComputedLengthPercentageOrAuto::CalcSize(_) => None,
+    }
 }
 
 /// Resolves used `max-height`.
@@ -1655,7 +1723,7 @@ pub(in crate::layout) fn non_replaced_intrinsic_width_contributions(
     .then(|| {
         let vertical_non_content = intrinsic_box_metrics(style).vertical_non_content_length();
         used_content_box_size(
-            style.box_values.height.clone(),
+            style.box_values.height.value().clone(),
             style.box_sizing,
             PercentageBasis::definite(content_box_pt(0.0)),
             vertical_non_content,
@@ -2105,8 +2173,10 @@ pub(in crate::layout) fn set_style_used_width(style: &mut ComputedStyle, width: 
 /// <https://www.w3.org/TR/css-cascade-5/#value-stages>.
 pub(in crate::layout) fn set_style_used_height(style: &mut ComputedStyle, height: f32) {
     let height = height.max(0.0);
-    style.box_values.height = css::ComputedLengthPercentageOrAuto::LengthPercentage(
-        css::ComputedLengthPercentage::from_points(height),
+    style.box_values.height.replace_with_used(
+        css::ComputedLengthPercentageOrAuto::LengthPercentage(
+            css::ComputedLengthPercentage::from_points(height),
+        ),
     );
 }
 
@@ -2158,7 +2228,10 @@ pub(in crate::layout) fn set_style_auto_width(style: &mut ComputedStyle) {
 /// CSS 2.2 uses `auto` as the initial height value in normal flow:
 /// <https://www.w3.org/TR/CSS22/visudet.html#the-height-property>.
 pub(in crate::layout) fn set_style_auto_height(style: &mut ComputedStyle) {
-    style.box_values.height = css::ComputedLengthPercentageOrAuto::Auto;
+    style
+        .box_values
+        .height
+        .replace_with_used(css::ComputedLengthPercentageOrAuto::Auto);
 }
 
 /// Clears physical positioned offsets on a temporary layout style.
@@ -2257,6 +2330,21 @@ mod tests {
     }
 
     #[test]
+    fn logical_inline_box_metrics_keep_axis_identity_until_resolution() {
+        let mut style = ComputedStyle::initial();
+        style.box_values.margin.left = percent(0.1);
+        style.box_values.padding.left = css::ComputedLengthPercentage::from_percent(0.1);
+
+        let metrics = used_box_metrics_for_logical_inline_basis(
+            &style,
+            PercentageBasis::definite(LogicalInlineContentSize::new(content_box_pt(100.0))),
+        );
+
+        assert_eq!(metrics.margin.left.points(), 10.0);
+        assert_eq!(metrics.padding.left.points(), 10.0);
+    }
+
+    #[test]
     fn inline_size_containment_is_logical_for_physical_width_contributions() {
         let mut horizontal = ComputedStyle::initial();
         horizontal.contain.inline_size = true;
@@ -2268,5 +2356,27 @@ mod tests {
         assert!(intrinsic_inline_size_is_contained(&vertical));
         assert!(!intrinsic_physical_width_is_contained(&vertical));
         assert!(intrinsic_physical_height_is_contained(&vertical));
+    }
+
+    #[test]
+    fn substituting_a_used_or_auto_height_clears_deferred_font_metric_provenance() {
+        let mut style = ComputedStyle::initial();
+        style.box_values.height = css::PhysicalHeight::DeferredFontMetric(length(12.0));
+
+        set_style_used_height(&mut style, 20.0);
+        assert!(!style.box_values.height.is_deferred_font_metric());
+        assert_eq!(
+            style
+                .box_values
+                .height
+                .length_if_no_percent()
+                .expect("used height is a definite length"),
+            20.0
+        );
+
+        style.box_values.height = css::PhysicalHeight::DeferredFontMetric(length(12.0));
+        set_style_auto_height(&mut style);
+        assert!(!style.box_values.height.is_deferred_font_metric());
+        assert!(style.box_values.height.is_auto());
     }
 }

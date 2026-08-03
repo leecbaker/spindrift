@@ -1,5 +1,22 @@
 use super::{ComputedLengthPercentage, ResolveViewportLengths, ViewportLengthBasis};
 use crate::units::LayoutLength;
+use std::num::NonZeroUsize;
+
+/// Computed CSS `column-count`.
+/// <https://www.w3.org/TR/css-multicol-1/#cc>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ColumnCount {
+    Auto,
+    Count(NonZeroUsize),
+}
+
+/// Computed CSS Flexbox Level 2 `flex-line-count`.
+/// <https://drafts.csswg.org/css-flexbox-2/#flex-line-count-property>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FlexLineCount {
+    Auto,
+    Count(NonZeroUsize),
+}
 
 /// Computed CSS value for `column-width`.
 ///

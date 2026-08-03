@@ -1,6 +1,9 @@
 use super::*;
 
-fn filled_rects(page: &quire::Page, fill: CssColor) -> Vec<&quire::RenderedRect> {
+fn filled_rects(
+    page: &quire::Page,
+    fill: CssColor,
+) -> Vec<&crate::document::paint::shapes::RenderedRect> {
     page.rects()
         .iter()
         .filter(|rect| rect.fill == Some(fill))

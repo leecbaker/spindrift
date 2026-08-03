@@ -1,21 +1,5 @@
 use super::*;
 
-/// Whether the matched `@page` declarations explicitly establish paint on the
-/// page box itself. Computed page styles begin from normal initial values, so
-/// inspecting the computed background alone would mistake that default for an
-/// authored page background and prevent a propagated root/body background
-/// from reaching the page canvas.
-///
-/// <https://www.w3.org/TR/css-page-3/#painting> and
-/// <https://www.w3.org/TR/css-backgrounds-3/#special-backgrounds>
-fn page_declarations_paint_page_box(declarations: &css::Declarations) -> bool {
-    declarations.iter().any(|(name, _)| {
-        matches!(name.as_str(), "background" | "border")
-            || name.starts_with("background-")
-            || name.starts_with("border-")
-    })
-}
-
 impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn snapshot(&self) -> LayoutSnapshot {
         LayoutSnapshot {
@@ -31,22 +15,30 @@ impl<'a> LayoutBuilder<'a> {
             suppressed_named_strings_after: self.suppressed_named_strings_after.clone(),
             page_anchors: self.page_anchors.clone(),
             page_anchor_text: self.page_anchor_text.clone(),
+            page_anchor_counters: self.page_anchor_counters.clone(),
+            has_normal_flow_target_references: self.has_normal_flow_target_references,
             document_canvas_background: self.document_canvas_background.clone(),
             document_canvas_overflow: self.document_canvas_overflow,
             document_canvas_fragment_insets: self.document_canvas_fragment_insets.clone(),
             current_page: self.current_page.clone(),
             current_page_has_flow_content: self.current_page_has_flow_content,
             current_page_has_named_page_flow_content: self.current_page_has_named_page_flow_content,
+            current_page_selected_name: self.current_page_selected_name.clone(),
             last_block_layout_outcome: self.last_block_layout_outcome,
             current_page_name: self.current_page_name.clone(),
             current_page_context: self.current_page_context,
             initial_viewport_context: self.initial_viewport_context,
             fragmentainer_override: self.fragmentainer_override,
+            footnote_measurements: self.footnote_measurements.clone(),
+            rendered_footnote_measurements: self.rendered_footnote_measurements.clone(),
+            measured_footnotes: self.measured_footnotes.clone(),
+            committed_inline_floats: self.committed_inline_floats.clone(),
+            rendered_footnotes: self.rendered_footnotes.clone(),
+            footnote_measurement_depth: self.footnote_measurement_depth,
             fragmentation_suppression_depth: self.fragmentation_suppression_depth,
             multicol_spanner_fragmentation_depth: self.multicol_spanner_fragmentation_depth,
             multicol_spanner_speculation_depth: self.multicol_spanner_speculation_depth,
             multicol_balance_probe_depth: self.multicol_balance_probe_depth,
-            forced_break_containment_scopes: self.forced_break_containment_scopes.clone(),
             cursor_y: self.cursor_y,
             content_left: self.content_left,
             content_right: self.content_right,
@@ -69,12 +61,14 @@ impl<'a> LayoutBuilder<'a> {
             positioned_inline_layout_suppression_depth: self
                 .positioned_inline_layout_suppression_depth,
             last_in_flow_line_baseline_y: self.last_in_flow_line_baseline_y,
+            pending_outside_marker_anchors: self.pending_outside_marker_anchors.clone(),
             block_static_position_y_offset: self.block_static_position_y_offset,
             absolute_static_position: self.absolute_static_position,
             grid_positioning_scopes: self.grid_positioning_scopes.clone(),
             pending_subgrid_contexts: self.pending_subgrid_contexts.clone(),
             escaped_atom_positioning_depth: self.escaped_atom_positioning_depth,
             escaped_atom_containing_block: self.escaped_atom_containing_block,
+            escaped_atom_positioning_context: self.escaped_atom_positioning_context,
             containing_block_writing_mode: self.containing_block_writing_mode,
             fragment_top_offsets: self.fragment_top_offsets.clone(),
             child_available_space_stack: self.child_available_space_stack.clone(),
@@ -108,6 +102,7 @@ impl<'a> LayoutBuilder<'a> {
             bookmarks: self.bookmarks.clone(),
             positioned_layers: self.positioned_layers.clone(),
             fixed_layers: self.fixed_layers.clone(),
+            absolute_positioned_page_span_target: self.absolute_positioned_page_span_target,
             pending_positioned_page_span_target: self.pending_positioned_page_span_target,
             next_paint_source_order: self.next_paint_source_order,
             overflow_clips: self.overflow_clips.clone(),
@@ -140,6 +135,8 @@ impl<'a> LayoutBuilder<'a> {
         self.suppressed_named_strings_after = snapshot.suppressed_named_strings_after;
         self.page_anchors = snapshot.page_anchors;
         self.page_anchor_text = snapshot.page_anchor_text;
+        self.page_anchor_counters = snapshot.page_anchor_counters;
+        self.has_normal_flow_target_references = snapshot.has_normal_flow_target_references;
         self.document_canvas_background = snapshot.document_canvas_background;
         self.document_canvas_overflow = snapshot.document_canvas_overflow;
         self.document_canvas_fragment_insets = snapshot.document_canvas_fragment_insets;
@@ -147,16 +144,22 @@ impl<'a> LayoutBuilder<'a> {
         self.current_page_has_flow_content = snapshot.current_page_has_flow_content;
         self.current_page_has_named_page_flow_content =
             snapshot.current_page_has_named_page_flow_content;
+        self.current_page_selected_name = snapshot.current_page_selected_name;
         self.last_block_layout_outcome = snapshot.last_block_layout_outcome;
         self.current_page_name = snapshot.current_page_name;
         self.current_page_context = snapshot.current_page_context;
         self.initial_viewport_context = snapshot.initial_viewport_context;
         self.fragmentainer_override = snapshot.fragmentainer_override;
+        self.footnote_measurements = snapshot.footnote_measurements;
+        self.rendered_footnote_measurements = snapshot.rendered_footnote_measurements;
+        self.measured_footnotes = snapshot.measured_footnotes;
+        self.committed_inline_floats = snapshot.committed_inline_floats;
+        self.rendered_footnotes = snapshot.rendered_footnotes;
+        self.footnote_measurement_depth = snapshot.footnote_measurement_depth;
         self.fragmentation_suppression_depth = snapshot.fragmentation_suppression_depth;
         self.multicol_spanner_fragmentation_depth = snapshot.multicol_spanner_fragmentation_depth;
         self.multicol_spanner_speculation_depth = snapshot.multicol_spanner_speculation_depth;
         self.multicol_balance_probe_depth = snapshot.multicol_balance_probe_depth;
-        self.forced_break_containment_scopes = snapshot.forced_break_containment_scopes;
         self.cursor_y = snapshot.cursor_y;
         self.content_left = snapshot.content_left;
         self.content_right = snapshot.content_right;
@@ -177,12 +180,14 @@ impl<'a> LayoutBuilder<'a> {
         self.positioned_inline_layout_suppression_depth =
             snapshot.positioned_inline_layout_suppression_depth;
         self.last_in_flow_line_baseline_y = snapshot.last_in_flow_line_baseline_y;
+        self.pending_outside_marker_anchors = snapshot.pending_outside_marker_anchors;
         self.block_static_position_y_offset = snapshot.block_static_position_y_offset;
         self.absolute_static_position = snapshot.absolute_static_position;
         self.grid_positioning_scopes = snapshot.grid_positioning_scopes;
         self.pending_subgrid_contexts = snapshot.pending_subgrid_contexts;
         self.escaped_atom_positioning_depth = snapshot.escaped_atom_positioning_depth;
         self.escaped_atom_containing_block = snapshot.escaped_atom_containing_block;
+        self.escaped_atom_positioning_context = snapshot.escaped_atom_positioning_context;
         self.containing_block_writing_mode = snapshot.containing_block_writing_mode;
         self.fragment_top_offsets = snapshot.fragment_top_offsets;
         self.child_available_space_stack = snapshot.child_available_space_stack;
@@ -214,6 +219,7 @@ impl<'a> LayoutBuilder<'a> {
         self.bookmarks = snapshot.bookmarks;
         self.positioned_layers = snapshot.positioned_layers;
         self.fixed_layers = snapshot.fixed_layers;
+        self.absolute_positioned_page_span_target = snapshot.absolute_positioned_page_span_target;
         self.pending_positioned_page_span_target = snapshot.pending_positioned_page_span_target;
         self.next_paint_source_order = snapshot.next_paint_source_order;
         self.overflow_clips = snapshot.overflow_clips;
@@ -233,7 +239,7 @@ impl<'a> LayoutBuilder<'a> {
         self.pending_page_footnotes = snapshot.pending_page_footnotes;
     }
 
-    pub(in crate::layout) fn finish_boxed(mut self: Box<Self>) -> Document {
+    pub(in crate::layout) fn finish_boxed(mut self: Box<Self>) -> LayoutPass {
         self.materialize_pending_positioned_page_span();
         self.flush_positioned_layers();
         self.apply_pending_fragments_for_current_page();
@@ -293,6 +299,23 @@ impl<'a> LayoutBuilder<'a> {
         // <https://www.w3.org/TR/css-position-3/#fixed-pos>
         self.apply_fixed_layers_to_pages();
         self.discard_trailing_geometry_only_pages();
+        let target_references = TargetReferenceSnapshot {
+            anchors: self
+                .page_anchors
+                .iter()
+                .filter_map(|(name, page_index)| {
+                    Some((
+                        name.clone(),
+                        TargetAnchor {
+                            page_index: *page_index,
+                            text: self.page_anchor_text.get(name)?.clone(),
+                            counters: self.page_anchor_counters.get(name)?.clone(),
+                        },
+                    ))
+                })
+                .collect(),
+            total_pages: self.pages.len(),
+        };
         if self.document_root_generates_box {
             self.add_page_backgrounds();
             self.add_page_margin_boxes();
@@ -301,12 +324,16 @@ impl<'a> LayoutBuilder<'a> {
             page.finalize_paint_tree_for_public_view();
         }
         let fonts = (*self.font_system).into_fonts();
-        Document {
-            pages: self.pages,
-            fonts,
-            bookmarks: self.bookmarks,
-            image_store: Box::default(),
-            metadata: DocumentMetadata::default(),
+        LayoutPass {
+            document: Document {
+                pages: self.pages,
+                fonts,
+                bookmarks: self.bookmarks,
+                image_store: Box::default(),
+                metadata: DocumentMetadata::default(),
+            },
+            target_references,
+            has_normal_flow_target_references: self.has_normal_flow_target_references,
         }
     }
 
@@ -324,6 +351,7 @@ impl<'a> LayoutBuilder<'a> {
         self.current_page_has_flow_content = false;
         self.current_page_has_named_page_flow_content = false;
         self.apply_page_context(next_context, FragmentOffsets::ZERO);
+        self.current_page_selected_name = None;
         self.truncate_page_start_margins = true;
     }
 
@@ -333,10 +361,11 @@ impl<'a> LayoutBuilder<'a> {
     /// CSS Fragmentation still requires a definite box to advance the logical
     /// block cursor through every crossed fragmentainer. A static PDF need not
     /// serialize trailing page boxes when no fragment paints, owns an anchor
-    /// or bookmark, is a forced blank page, or carries generated-page state.
-    /// Selecting a named type alone is not observable without content and
-    /// therefore must not preserve a page introduced only by a trailing
-    /// class-A transition. This runs before fixed and page-context paint so those effects
+    /// or bookmark, or carries generated-page state. A forced blank page
+    /// exists only to satisfy a break before a following fragment, so a
+    /// trailing run of such pages has no generated box to retain. Selecting a
+    /// named type alone is likewise not observable without content. This runs
+    /// before fixed and page-context paint so those effects
     /// repeat only over pages established by actual paint or structural
     /// pagination.
     /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
@@ -356,7 +385,6 @@ impl<'a> LayoutBuilder<'a> {
             let page_has_retention_reason = self.pages[page_index].has_paint_content()
                 || self.pages[page_index].has_fragmentation_content()
                 || !self.pages[page_index].links().is_empty()
-                || self.page_blanks.get(page_index).cloned().unwrap_or(false)
                 || self
                     .page_named_strings
                     .get(page_index)
@@ -399,23 +427,12 @@ impl<'a> LayoutBuilder<'a> {
             let page_width = self.pages[page_index].width();
             let page_height = self.pages[page_index].height();
             let page_size = PageSize::from_points(page_width, page_height);
-            let mut page_box_owns_margin_paint = false;
             if !declarations.is_empty() {
                 let mut style = ComputedStyle::initial();
                 css::apply_declarations(&mut style, &declarations);
                 let page_ch_advance =
                     self.ch_advance_for_style(&style, style.requires_ch_advance());
                 style.resolve_font_metric_lengths(page_ch_advance);
-                page_box_owns_margin_paint = page_declarations_paint_page_box(&declarations)
-                    && (style.background_color.is_some_and(CssColor::is_visible)
-                        || style
-                            .background_layers
-                            .iter()
-                            .any(|layer| layer.image.is_image())
-                        || style.border_widths.top > 0.0
-                        || style.border_widths.right > 0.0
-                        || style.border_widths.bottom > 0.0
-                        || style.border_widths.left > 0.0);
                 if style.visibility != Visibility::Visible {
                     // `visibility` applies to the page context's own
                     // background, border, and generated margin boxes, but it
@@ -423,7 +440,7 @@ impl<'a> LayoutBuilder<'a> {
                     // document-canvas background therefore remains eligible
                     // to paint behind that content.
                     // <https://www.w3.org/TR/css-page-3/#page-properties>
-                    self.add_document_canvas_background(page_index, page_size, false);
+                    self.add_document_canvas_background(page_index, page_size);
                     continue;
                 }
                 let page_margins = PageContext::from_options(self.options).margins;
@@ -541,11 +558,18 @@ impl<'a> LayoutBuilder<'a> {
                         PaintPrimitive::Line(line) => {
                             page.push_line_in_band(PaintBand::PageBackground, line);
                         }
+                        PaintPrimitive::OpaqueTextCoverage { line, paths } => {
+                            page.push_opaque_text_coverage_in_band(
+                                PaintBand::PageBackground,
+                                line,
+                                paths,
+                            );
+                        }
                     }
                 }
 
                 let mut border_style = style;
-                border_style.background_color = None;
+                border_style.background_color = css::BackgroundColor::TRANSPARENT;
                 border_style.background_image = css::ComputedImage::None;
                 border_style.background_layers.clear();
                 let (rects, rounded_rects, paths, strokes) =
@@ -580,71 +604,19 @@ impl<'a> LayoutBuilder<'a> {
                         | PaintPrimitive::ImagePattern(_)
                         | PaintPrimitive::GradientPattern(_)
                         | PaintPrimitive::SvgPattern(_)
-                        | PaintPrimitive::Line(_) => {}
+                        | PaintPrimitive::Line(_)
+                        | PaintPrimitive::OpaqueTextCoverage { .. } => {}
                     }
                 }
             }
-            self.add_document_canvas_background(
-                page_index,
-                page_size,
-                // Page-margin boxes paint above the document canvas; their
-                // existence does not shrink the CSS canvas itself. A
-                // propagated root/body background therefore continues to the
-                // media-box edge unless an authored page-box paint owns that
-                // margin area.
-                !self.document_canvas_root_background_defined() && page_box_owns_margin_paint,
-            );
-            self.add_document_viewport_scrollbar_tracks(page_index, page_size);
+            self.add_document_canvas_background(page_index, page_size);
         }
-    }
-
-    /// Paint the classic viewport scrollbar tracks required by a propagated
-    /// overflowing `overflow:auto` root. They are viewport chrome, above CSS
-    /// outlines and document paint, rather than author backgrounds.
-    ///
-    /// CSS Overflow leaves native scrollbar appearance to the UA; the static
-    /// PDF UA uses a white 15-CSS-pixel track, matching its `Scrollbar`
-    /// system color and reserving the viewport edge for scrollable content.
-    /// <https://drafts.csswg.org/css-overflow-3/#scrollbars>
-    fn add_document_viewport_scrollbar_tracks(&mut self, page_index: usize, page_size: PageSize) {
-        if !self.document_canvas_overflow.has_auto_scrollbar_tracks() {
-            return;
-        }
-        let gutter = 15.0 * css::CSS_PX_TO_PT;
-        let width = page_size.width();
-        let height = page_size.height();
-        let page = &mut self.pages[page_index];
-        page.push_rect_in_band(
-            PaintBand::ViewportChrome,
-            RenderedRect::new(
-                width - gutter,
-                0.0,
-                gutter,
-                height,
-                Some(CssColor::WHITE),
-                None,
-                PaintStrokeWidth::ZERO,
-            ),
-        );
-        page.push_rect_in_band(
-            PaintBand::ViewportChrome,
-            RenderedRect::new(
-                0.0,
-                0.0,
-                width,
-                gutter,
-                Some(CssColor::WHITE),
-                None,
-                PaintStrokeWidth::ZERO,
-            ),
-        );
     }
 
     pub(in crate::layout) fn add_document_canvas_background(
         &mut self,
         page_index: usize,
         page_size: PageSize,
-        page_box_owns_margin_paint: bool,
     ) {
         let Some(background) = self.document_canvas_background.clone() else {
             return;
@@ -657,26 +629,18 @@ impl<'a> LayoutBuilder<'a> {
         // <https://www.w3.org/TR/css-backgrounds-3/#special-backgrounds> and
         // <https://www.w3.org/TR/css-page-3/#page-area>
         let context = self.finished_page_context(page_index + 1, page_size);
-        let (x, y, width, height) = if page_box_owns_margin_paint {
-            (
-                context.margins.left() + context.edges.border.left,
-                context.margins.bottom() + context.edges.border.bottom,
-                (page_size.width()
-                    - context.margins.left()
-                    - context.margins.right()
-                    - context.edges.border.left
-                    - context.edges.border.right)
-                    .max(0.0),
-                (page_size.height()
-                    - context.margins.top()
-                    - context.margins.bottom()
-                    - context.edges.border.top
-                    - context.edges.border.bottom)
-                    .max(0.0),
-            )
-        } else {
-            (0.0, 0.0, page_size.width(), page_size.height())
-        };
+        // In paged media the propagated document canvas is the page area.
+        // Page margins remain outside the root/body background regardless of
+        // whether the page box itself has an authored background or border.
+        // The page box's own paint is emitted separately above.
+        // https://www.w3.org/TR/css-page-3/#page-area
+        // https://www.w3.org/TR/css-backgrounds-3/#special-backgrounds
+        let (x, y, width, height) = (
+            context.left(),
+            context.bottom(),
+            context.area_width(),
+            context.area_height(),
+        );
         let page_document_bottom = self.document_canvas_page_bottom(page_index);
         let page_context = self.finished_page_context(page_index + 1, page_size);
         let clip_area =
@@ -708,7 +672,7 @@ impl<'a> LayoutBuilder<'a> {
         // page canvas. Image positioning may remain relative to html's used
         // box, but that box's padding must not clip the canvas color layer.
         // <https://www.w3.org/TR/css-backgrounds-3/#special-backgrounds>
-        if let Some(fill) = style.background_color.filter(|fill| fill.is_visible()) {
+        if let Some(fill) = style.background_color.visible_color(style.color) {
             page.push_document_canvas_rect(RenderedRect::new(
                 x,
                 y,
@@ -720,7 +684,7 @@ impl<'a> LayoutBuilder<'a> {
             ));
         }
         let mut non_color_style = style.clone();
-        non_color_style.background_color = None;
+        non_color_style.background_color = css::BackgroundColor::TRANSPARENT;
         // Image layers above are projected from the root positioning area by
         // `background_image_primitives…`. Re-running the generic box painter
         // with those layers would replay a propagated gradient/image in the
@@ -771,6 +735,9 @@ impl<'a> LayoutBuilder<'a> {
                 }
                 PaintPrimitive::Line(line) => {
                     page.push_line_in_band(PaintBand::PageBackground, line);
+                }
+                PaintPrimitive::OpaqueTextCoverage { line, paths } => {
+                    page.push_opaque_text_coverage_in_band(PaintBand::PageBackground, line, paths);
                 }
             }
         }
@@ -844,7 +811,7 @@ impl<'a> LayoutBuilder<'a> {
         if self.element_side_effect_suppression_depth > 0 {
             return;
         }
-        let Some(level) = style.bookmark_level else {
+        let css::BookmarkLevel::Level(level) = style.bookmark_level else {
             return;
         };
         if style.display.is_none() || style.visibility != Visibility::Visible {
@@ -855,7 +822,7 @@ impl<'a> LayoutBuilder<'a> {
             return;
         }
         self.bookmarks.push(Bookmark::new(
-            level,
+            level.get(),
             label,
             self.pages.len(),
             position.x,
@@ -888,12 +855,16 @@ impl<'a> LayoutBuilder<'a> {
         if !self.element_propagates_document_canvas_properties(element, style) {
             return;
         }
-        let has_background = style.background_color.is_some_and(CssColor::is_visible)
+        let has_background = style.background_color.visible_color(style.color).is_some()
+            || style.background_image.is_image()
             || style
                 .background_layers
                 .iter()
                 .any(|layer| layer.image.is_image());
-        if element.tag.eq_ignore_ascii_case("html") {
+        if self
+            .document_canvas_overflow
+            .is_root_canvas_background_source(element)
+        {
             if has_background {
                 let root_positioning_area = self
                     .document_canvas_background
@@ -905,7 +876,9 @@ impl<'a> LayoutBuilder<'a> {
                     root_positioning_area,
                 });
             }
-        } else if element.tag.eq_ignore_ascii_case("body")
+        } else if self
+            .document_canvas_overflow
+            .is_body_canvas_background_fallback_source(element)
             && !self.document_canvas_root_background_defined()
             && has_background
         {
@@ -922,7 +895,7 @@ impl<'a> LayoutBuilder<'a> {
             if style.forced_color_adjust == css::ForcedColorAdjust::None
                 && let Some(palette) = self.options.forced_colors.palette()
             {
-                canvas_style.background_color = Some(palette.canvas);
+                canvas_style.background_color = css::BackgroundColor::Color(palette.canvas);
                 canvas_style.background_image = css::ComputedImage::None;
                 canvas_style.background_layers.clear();
             }
@@ -990,25 +963,26 @@ impl<'a> LayoutBuilder<'a> {
             return;
         }
         if let Some(id) = element.attrs.get("id").filter(|value| !value.is_empty()) {
-            self.page_anchors
-                .entry(id.clone())
-                .or_insert(self.pages.len());
-            if !self.page_anchor_text.contains_key(id) {
-                let anchor_text = self.anchor_text_for_element(element, style);
-                self.page_anchor_text.insert(id.clone(), anchor_text);
-            }
+            self.record_page_anchor(id.clone(), element, style);
         }
         if element.tag.eq_ignore_ascii_case("a")
             && let Some(name) = element.attrs.get("name").filter(|value| !value.is_empty())
         {
-            self.page_anchors
-                .entry(name.clone())
-                .or_insert(self.pages.len());
-            if !self.page_anchor_text.contains_key(name) {
-                let anchor_text = self.anchor_text_for_element(element, style);
-                self.page_anchor_text.insert(name.clone(), anchor_text);
-            }
+            self.record_page_anchor(name.clone(), element, style);
         }
+    }
+
+    fn record_page_anchor(&mut self, name: String, element: &Element, style: &ComputedStyle) {
+        self.page_anchors
+            .entry(name.clone())
+            .or_insert(self.pages.len());
+        if !self.page_anchor_text.contains_key(&name) {
+            let anchor_text = self.anchor_text_for_element(element, style);
+            self.page_anchor_text.insert(name.clone(), anchor_text);
+        }
+        let counters =
+            self.counter_stacks_at_origin(element, box_tree::CounterEventSource::Principal);
+        self.page_anchor_counters.entry(name).or_insert(counters);
     }
 
     /// Captures text exposed to generated-content cross references.

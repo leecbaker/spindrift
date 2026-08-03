@@ -1,3 +1,4 @@
+use super::component_values::{parse_css_string_token, split_css_component_values, trim_css_value};
 use super::selector::{QuireSelectorImpl, QuireSelectorParser};
 use super::types::{
     ContainerRule, CounterStyleRange, CounterStyleRangeInterval, CounterStyleRule,
@@ -7,8 +8,8 @@ use super::types::{
     Stylesheet, StylesheetOrigin, UnicodeRange,
 };
 use super::values::{
-    parse_color, parse_css_string_token, parse_display, parse_font_family_names, parse_font_style,
-    parse_font_weight, parse_font_width, split_css_component_values, trim_css_value,
+    parse_color, parse_display, parse_font_family_names, parse_font_style, parse_font_weight,
+    parse_font_width,
 };
 use cssparser::{
     BasicParseErrorKind, CowRcStr, Parser, ParserInput, ParserState, RuleBodyItemParser,
@@ -43,8 +44,8 @@ pub(crate) fn parse_stylesheet_with_media_environment(
         }
     }
     let mut rule_parser = CssRuleParser {
-        base_url: css.base_url().cloned(),
-        root_url: css.root_url().cloned(),
+        base_url: css.base_url(),
+        root_url: css.root_url(),
         layers: Rc::clone(&layers),
         namespaces,
         current_layer: css.import_layer_name().map(ToOwned::to_owned),
@@ -68,6 +69,7 @@ pub(crate) fn parse_stylesheet_with_media_environment(
     let mut parsed_counter_styles = Vec::new();
     let mut parsed_font_feature_values = Vec::new();
     let mut parsed_font_palette_values = Vec::new();
+    let mut parsed_property_registrations = Vec::new();
 
     for item in StyleSheetParser::new(&mut parser, &mut rule_parser).flatten() {
         flatten_rule(
@@ -88,6 +90,7 @@ pub(crate) fn parse_stylesheet_with_media_environment(
             &mut parsed_counter_styles,
             &mut parsed_font_feature_values,
             &mut parsed_font_palette_values,
+            &mut parsed_property_registrations,
         );
     }
 
@@ -198,6 +201,7 @@ pub(crate) fn parse_stylesheet_with_media_environment(
         base_url: css.base_url().cloned(),
         root_url: css.root_url().cloned(),
         forced_colors: media_environment.forced_colors,
+        color_scheme_preference: media_environment.color_scheme_preference,
         html_presentational_hints: false,
         specificity_override: css.specificity_override(),
         layer_names,
@@ -227,6 +231,7 @@ pub(crate) fn parse_stylesheet_with_media_environment(
             values
         },
         counter_styles: parsed_counter_styles,
+        property_registrations: parsed_property_registrations,
     }
 }
 

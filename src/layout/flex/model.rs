@@ -1,4 +1,5 @@
 use super::*;
+use crate::document::paint::geometry::AxisSelectivePaintClip;
 use std::ops::{Add, Deref, DerefMut, Sub};
 
 /// A computed style after the flex formatting-context used-value boundary.
@@ -11,11 +12,10 @@ use std::ops::{Add, Deref, DerefMut, Sub};
 /// <https://drafts.csswg.org/css-viewport/#zoom-property>
 /// <https://drafts.csswg.org/css-flexbox-1/#layout-algorithm>
 #[derive(Debug, Clone)]
-pub(super) struct FlexUsedStyle(ComputedStyle);
+pub(super) struct FlexUsedStyle(css::ZoomedLayoutStyle);
 
 impl FlexUsedStyle {
-    pub(super) fn from_normalized(style: ComputedStyle) -> Self {
-        debug_assert!(style.zoom_applied);
+    pub(super) fn from_normalized(style: css::ZoomedLayoutStyle) -> Self {
         Self(style)
     }
 
@@ -668,6 +668,22 @@ pub(super) struct FlexLineLayout {
     pub(super) collapsed_struts: Vec<FlexCollapsedStrut>,
 }
 
+/// Immutable membership of one flex line, collected before flexible lengths
+/// and cross-axis reconciliation mutate item rectangles.
+///
+/// CSS Flexbox collects consecutive flex items in order-modified document
+/// order using their outer hypothetical main sizes.  The record intentionally
+/// contains no physical rectangle: later baseline, stretch, fragmentation,
+/// and paint passes must not infer membership again from their corrected
+/// geometry:
+/// <https://www.w3.org/TR/css-flexbox-1/#algo-main-item>.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct FlexLineTopology {
+    pub(super) item_indices: Vec<usize>,
+    pub(super) source_start: usize,
+    pub(super) source_end: usize,
+}
+
 impl FlexLineLayout {
     pub(super) fn cross_size(&self) -> FlexCrossSize {
         self.cross_end
@@ -1030,7 +1046,7 @@ pub(in crate::layout::flex) struct MaterializedFlexFragment {
     /// Padding-box overflow clip resolved for this committed destination
     /// fragmentainer. It is assigned after the container's final used height
     /// is known, without altering the source range or decoration ownership.
-    pub(in crate::layout::flex) contents_overflow_clip: Option<PaintClip>,
+    pub(in crate::layout::flex) contents_overflow_clip: Option<AxisSelectivePaintClip>,
     pub(in crate::layout::flex) decoration: FlexFragmentDecorationState,
     pub(in crate::layout::flex) local_to_page_translation: PaintTranslation,
     pub(in crate::layout::flex) item_fragments: Vec<MaterializedFlexItemFragment>,
@@ -1133,22 +1149,94 @@ pub(super) struct FlexItemFragmentLayout {
     pub(super) metadata: FragmentPageMetadata,
 }
 
+impl FlexItemFragmentLayout {
+    /// Source-container block start of the interval selected for this item.
+    ///
+    /// The item position and its source-content slice live in different
+    /// coordinate systems: the former is container-local and the latter is
+    /// border-box-local. Fragment materialization must combine them before
+    /// projecting the interval into a destination fragmentainer.
+    /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+    pub(super) fn selected_source_block_start(&self) -> FlexFragmentBlockOffset {
+        FlexFragmentBlockOffset::new(
+            self.source_bounds.y().points() + self.content_slice.block_start.points(),
+        )
+    }
+}
+
 /// Source and fragmentainer state for one flex item continuation.
 ///
 /// Content and decoration slices are both retained because
 /// `box-decoration-break` may choose a different decoration range without
 /// changing descendant source flow.
 /// <https://www.w3.org/TR/css-break-3/#break-decoration>
+/// <https://www.w3.org/TR/css-break-3/#box-splitting>
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(super) struct FlexItemContinuation {
     pub(super) source_content_slice: FlexFragmentSlice,
+    /// Block-start of this source canvas interval in the item's frozen
+    /// formatting-context coordinate system. This is intentionally separate
+    /// from [`Self::source_content_slice`], whose offsets are border-box-local
+    /// for clipping and continuation-end accounting.
+    pub(super) source_canvas_block_start: FlexFragmentBlockOffset,
     pub(super) decoration_slice: FlexFragmentSlice,
+    /// Coordinate system selected when replaying this committed source
+    /// interval. This belongs to the continuation itself so painting never
+    /// re-infers it from the flex direction or wrapping mode.
+    pub(super) replay_origin: FlexItemReplayOrigin,
     /// Remaining capacity in the first local fragmentainer for this item.
     pub(super) first_fragmentainer_capacity: FlexFragmentBlockSize,
     /// Capacity available to each later local fragmentainer.
     pub(super) continuation_fragmentainer_capacity: FlexFragmentBlockSize,
     pub(super) fragmentainer_index: usize,
     pub(super) continuation_ordinal: usize,
+    /// Ordinal of a fragment committed by the item's own formatting context,
+    /// when that child forced a page transition without splitting a flex break
+    /// unit. The outer flex record retains this instead of recovering a child
+    /// continuation from flex direction or source-height arithmetic.
+    pub(super) child_fragment_ordinal: Option<usize>,
+}
+
+impl FlexItemContinuation {
+    /// Commit the source-canvas origin for a replayed flex-item slice.
+    ///
+    /// `source_content_slice` is measured from the frozen used border-box
+    /// origin. A source-slice replay lays out one original formatting-context
+    /// canvas, so its destination clip must translate that canvas by the
+    /// slice's block start rather than restart it at zero on every page. The
+    /// principal box remains independently frozen in `used_bounds`; this
+    /// mapping neither changes its definite used size nor creates a child
+    /// break opportunity.
+    ///
+    /// CSS size containment lays out contents normally after sizing the box
+    /// as empty, and makes the box monolithic:
+    /// <https://www.w3.org/TR/css-contain-2/#size-containment>
+    /// <https://www.w3.org/TR/css-flexbox-1/#pagination>
+    pub(super) fn materialize_source_canvas_block_start(
+        &mut self,
+        frozen_used_bounds: &FlexItemLayout,
+    ) {
+        debug_assert!(
+            frozen_used_bounds.height().points() >= 0.0,
+            "a frozen flex item border box has a non-negative block size",
+        );
+        if self.replay_origin == FlexItemReplayOrigin::SourceSlice {
+            self.source_canvas_block_start = self.source_content_slice.block_start;
+        }
+    }
+}
+
+/// The child replay strategy owned by one materialized flex-item continuation.
+///
+/// Descendant overflow is a slice of one frozen child source canvas. A child
+/// that creates its own fragmentainers instead supplies page-local fragments
+/// selected by the continuation ordinal.
+/// <https://www.w3.org/TR/css-break-3/#box-splitting>
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum FlexItemReplayOrigin {
+    #[default]
+    ChildFragment,
+    SourceSlice,
 }
 
 /// Block-axis slice of a flex fragment relative to the source border box.
@@ -1272,8 +1360,18 @@ pub(super) struct FlexAvailableSpace {
     /// A physical content-box width, not a logical inline size.
     pub(super) width: PhysicalContentWidth,
     pub(super) width_basis: FlexAvailablePercentageBasis,
-    /// A physical content-box height, not a logical block size.
+    /// A physical content-box height constraint, not a logical block size or
+    /// a percentage basis.
+    ///
+    /// This can constrain the Flexbox algorithm even where it is not a
+    /// definite CSS percentage basis. For example, an orthogonal block's
+    /// automatic logical inline fill has a used physical height that must
+    /// pack flex lines, while percentage descendants remain indefinite.
+    /// <https://www.w3.org/TR/css-flexbox-1/#layout-algorithm>
+    /// <https://www.w3.org/TR/css-sizing-3/#definite>
     pub(super) height: Option<PhysicalContentHeight>,
+    /// Definite physical-height percentage basis, kept independent from the
+    /// numeric layout constraint above.
     pub(super) height_basis: FlexAvailablePercentageBasis,
 }
 
@@ -1286,6 +1384,14 @@ impl FlexAvailableSpace {
     /// Definite physical height percentage basis in content-box space.
     pub(super) fn height_basis_content_box_length(self) -> Option<ContentBoxLength> {
         self.height_basis.value()
+    }
+
+    /// Physical cross-axis constraint supplied to Flexbox line layout.
+    ///
+    /// Unlike [`Self::height_basis`], this answers only whether the layout
+    /// algorithm has a numeric height to use for sizing and line packing.
+    pub(super) fn height_constraint(self) -> Option<PhysicalContentHeight> {
+        self.height
     }
 
     pub(super) fn main_basis(self, direction: FlexDirection) -> FlexAvailablePercentageBasis {
@@ -1302,6 +1408,22 @@ impl FlexAvailableSpace {
         } else {
             self.width_basis
         }
+    }
+
+    /// Project Flex's physical available-space record onto the container's
+    /// logical inline axis for CSS Box percentage edges.
+    pub(super) fn logical_inline_basis(
+        self,
+        style: &ComputedStyle,
+    ) -> LogicalInlinePercentageBasis<FlexAvailableSizeSource> {
+        let physical_basis = if WritingModeAxes::new(style.writing_mode, style.used_direction())
+            .swaps_physical_axes()
+        {
+            self.height_basis
+        } else {
+            self.width_basis
+        };
+        physical_basis.map_value(LogicalInlineContentSize::new)
     }
 
     /// Return the definite physical content-box extent on the resolved main
@@ -1386,14 +1508,13 @@ pub(in crate::layout::flex) fn balanced_flex_item_measure_available_space(
     physical_direction: FlexDirection,
     available: FlexAvailableSpace,
 ) -> FlexAvailableSpace {
-    let Some(line_count) = style
-        .flex_wrap
-        .balances_lines()
-        .then_some(style.flex_line_count)
-        .flatten()
-    else {
+    let css::FlexLineCount::Count(line_count) = style.flex_line_count else {
         return available;
     };
+    if !style.flex_wrap.balances_lines() {
+        return available;
+    }
+    let line_count = line_count.get();
     if line_count <= 1 {
         return available;
     }
@@ -1811,6 +1932,29 @@ impl FlexItemEstimate {
                 .max(height.points()),
         ));
     }
+
+    /// Replace a horizontal row item's normal-flow cross contribution without
+    /// letting fragmentable descendant replay overflow become a flex-line
+    /// sizing input.
+    ///
+    /// CSS Flexbox determines a row item's hypothetical cross size by laying
+    /// it out as an in-flow block with its used main size. Fragmentation can
+    /// retain a longer descendant source extent, but that replay-only extent
+    /// must not inflate the line that owns the item's used border box:
+    /// <https://www.w3.org/TR/css-flexbox-1/#algo-cross-item> and
+    /// <https://www.w3.org/TR/css-flexbox-1/#pagination>.
+    pub(super) fn replace_row_normal_flow_cross_contribution_preserving_fragmentable_overflow(
+        &mut self,
+        remeasured: Self,
+    ) {
+        let previous_fragmentable_overflow = self.fragmentable_overflow_height;
+        self.metrics.height = remeasured.metrics.height;
+        self.metrics.min_height = remeasured.metrics.min_height;
+        self.metrics.content_height = remeasured.metrics.content_height;
+        self.baselines = remeasured.baselines;
+        self.fragmentable_overflow_height = remeasured.fragmentable_overflow_height;
+        self.merge_fragmentable_overflow_height(previous_fragmentable_overflow);
+    }
 }
 
 impl Deref for FlexItemEstimate {
@@ -2099,6 +2243,27 @@ mod tests {
         let physical = PhysicalFlexDirection::new(physical_flex_direction(&style));
         assert_eq!(specified.0, FlexDirection::Row);
         assert_eq!(physical.taffy_direction(), FlexDirection::ColumnReverse);
+    }
+
+    #[test]
+    fn logical_inline_basis_projects_vertical_available_height() {
+        let available = FlexAvailableSpace {
+            width: PhysicalContentWidth::new(content_box_pt(80.0)),
+            width_basis: PercentageBasis::definite_from(
+                content_box_pt(80.0),
+                FlexAvailableSizeSource::ContainingBlock,
+            ),
+            height: Some(PhysicalContentHeight::new(content_box_pt(100.0))),
+            height_basis: PercentageBasis::definite_from(
+                content_box_pt(100.0),
+                FlexAvailableSizeSource::ContainingBlock,
+            ),
+        };
+        let mut style = ComputedStyle::initial();
+        style.writing_mode = WritingMode::VerticalLr;
+        style.direction = Direction::Rtl;
+
+        assert_eq!(available.logical_inline_basis(&style).points(), Some(100.0));
     }
 
     #[test]
@@ -2408,7 +2573,11 @@ mod tests {
                 PaintClip::new(0.0, 0.0, 20.0, 75.0),
                 PaintTranslation::identity(),
             ));
-        materialized_first.contents_overflow_clip = Some(PaintClip::new(1.0, 2.0, 18.0, 70.0));
+        materialized_first.contents_overflow_clip = Some(AxisSelectivePaintClip::new(
+            PaintClip::new(1.0, 2.0, 18.0, 70.0),
+            true,
+            false,
+        ));
         plan.push_materialized_fragment(materialized_first);
         assert_eq!(plan.materialized_fragments.len(), 1);
         assert_eq!(
@@ -2450,7 +2619,11 @@ mod tests {
         );
         assert_eq!(
             flex_container_page_contents_overflow_clip(&plan, 3),
-            Some(PaintClip::new(1.0, 2.0, 18.0, 70.0)),
+            Some(AxisSelectivePaintClip::new(
+                PaintClip::new(1.0, 2.0, 18.0, 70.0),
+                true,
+                false,
+            )),
             "overflow clipping follows the committed destination fragment",
         );
 

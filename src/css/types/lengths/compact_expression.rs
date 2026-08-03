@@ -5,86 +5,174 @@ use std::rc::Rc;
 /// The affine subset of CSS `<length-percentage>`.
 ///
 /// This is the common representation: an absolute component plus a percentage
-/// coefficient. `has_percentage` preserves the specified-value distinction
-/// between `0` and authored `0%` where percentage presence affects layout.
-/// `percentage_requires_basis` additionally distinguishes authored zero
-/// percentages from a percentage component that CSS math has neutralized
-/// (for example, `0% * 0.5` during animation interpolation).
+/// component. The component preserves the specified-value distinction between
+/// `0` and authored `0%` where percentage presence affects layout, and also
+/// distinguishes a percentage that needs a basis from one CSS math has
+/// neutralized (for example, `0% * 0.5` during animation interpolation).
 ///
 /// CSS Values and Units Level 4, <https://www.w3.org/TR/css-values-4/#mixed-percentages>.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct AffineLengthPercentage {
     length: LayoutLength,
-    percentage: f32,
-    has_percentage: bool,
-    percentage_requires_basis: bool,
+    percentage: PercentageComponent,
+}
+
+/// The percentage component of a compact affine `<length-percentage>`.
+///
+/// `Neutralized` is always a zero coefficient. Keeping it distinct from
+/// `Absent` preserves percentage presence after CSS math has eliminated its
+/// numeric contribution.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PercentageComponent {
+    Absent,
+    RequiresBasis { coefficient: f32 },
+    Neutralized,
+}
+
+impl PercentageComponent {
+    const fn coefficient(self) -> f32 {
+        match self {
+            Self::Absent | Self::Neutralized => 0.0,
+            Self::RequiresBasis { coefficient } => coefficient,
+        }
+    }
+
+    const fn contains_percentage(self) -> bool {
+        !matches!(self, Self::Absent)
+    }
+
+    const fn needs_basis(self) -> bool {
+        matches!(self, Self::RequiresBasis { .. })
+    }
+
+    fn sum(self, other: Self) -> Self {
+        match (self, other) {
+            (
+                Self::RequiresBasis { coefficient: left },
+                Self::RequiresBasis { coefficient: right },
+            ) => Self::RequiresBasis {
+                coefficient: left + right,
+            },
+            (Self::RequiresBasis { coefficient }, _) | (_, Self::RequiresBasis { coefficient }) => {
+                Self::RequiresBasis { coefficient }
+            }
+            (Self::Neutralized, _) | (_, Self::Neutralized) => Self::Neutralized,
+            (Self::Absent, Self::Absent) => Self::Absent,
+        }
+    }
+
+    fn product(self, factor: f32) -> Self {
+        match self {
+            Self::Absent => Self::Absent,
+            Self::Neutralized => Self::Neutralized,
+            Self::RequiresBasis { coefficient } if factor != 0.0 && coefficient != 0.0 => {
+                Self::RequiresBasis {
+                    coefficient: coefficient * factor,
+                }
+            }
+            Self::RequiresBasis { .. } => Self::Neutralized,
+        }
+    }
+
+    fn negated(self) -> Self {
+        match self {
+            Self::Absent => Self::Absent,
+            Self::Neutralized => Self::Neutralized,
+            Self::RequiresBasis { coefficient } => Self::RequiresBasis {
+                coefficient: -coefficient,
+            },
+        }
+    }
+
+    fn combined_with_coefficient(
+        coefficient: f32,
+        components: impl IntoIterator<Item = Self>,
+    ) -> Self {
+        let mut combined = Self::Absent;
+        for component in components {
+            combined = match (combined, component) {
+                (Self::RequiresBasis { .. }, _) | (_, Self::RequiresBasis { .. }) => {
+                    Self::RequiresBasis { coefficient }
+                }
+                (Self::Neutralized, _) | (_, Self::Neutralized) => Self::Neutralized,
+                (Self::Absent, Self::Absent) => Self::Absent,
+            };
+        }
+        combined
+    }
+
+    fn used(self, percentage_basis: Option<f32>) -> Option<LayoutLength> {
+        match self {
+            Self::Absent | Self::Neutralized => Some(layout_pt(0.0)),
+            Self::RequiresBasis { coefficient } => {
+                percentage_basis.map(|basis| layout_pt(coefficient * basis))
+            }
+        }
+    }
+
+    fn write_cache_key(self, output: &mut String) {
+        match self {
+            Self::Absent => output.push('a'),
+            Self::RequiresBasis { coefficient } => {
+                output.push_str("b(");
+                output.push_str(&coefficient.to_bits().to_string());
+                output.push(')');
+            }
+            Self::Neutralized => output.push('n'),
+        }
+    }
 }
 
 impl AffineLengthPercentage {
     pub(crate) const ZERO: Self = Self {
         length: layout_pt(0.0),
-        percentage: 0.0,
-        has_percentage: false,
-        percentage_requires_basis: false,
+        percentage: PercentageComponent::Absent,
     };
 
     const fn length(length: LayoutLength) -> Self {
         Self {
             length,
-            percentage: 0.0,
-            has_percentage: false,
-            percentage_requires_basis: false,
+            percentage: PercentageComponent::Absent,
         }
     }
 
     const fn percentage(percentage: f32) -> Self {
         Self {
             length: layout_pt(0.0),
-            percentage,
-            has_percentage: true,
-            percentage_requires_basis: true,
+            percentage: PercentageComponent::RequiresBasis {
+                coefficient: percentage,
+            },
         }
     }
 
     fn sum(self, other: Self) -> Self {
         Self {
             length: self.length + other.length,
-            percentage: self.percentage + other.percentage,
-            has_percentage: self.has_percentage || other.has_percentage,
-            percentage_requires_basis: self.percentage_requires_basis
-                || other.percentage_requires_basis,
+            percentage: self.percentage.sum(other.percentage),
         }
     }
 
     fn product(self, factor: f32) -> Self {
         Self {
             length: self.length * factor,
-            percentage: self.percentage * factor,
-            has_percentage: self.has_percentage,
-            percentage_requires_basis: factor != 0.0
-                && self.percentage != 0.0
-                && self.percentage_requires_basis,
+            percentage: self.percentage.product(factor),
         }
     }
 
     fn negated(self) -> Self {
         Self {
             length: -self.length,
-            percentage: -self.percentage,
-            has_percentage: self.has_percentage,
             // Unary negation preserves whether an authored percentage needs
             // a basis. This differs from multiplying by a CSS number, where
             // a zero percentage coefficient is mathematically eliminated.
-            percentage_requires_basis: self.percentage_requires_basis,
+            percentage: self.percentage.negated(),
         }
     }
 
     fn used(self, percentage_basis: Option<f32>) -> Option<LayoutLength> {
-        if self.percentage == 0.0 && !self.percentage_requires_basis {
-            Some(self.length)
-        } else {
-            percentage_basis.map(|basis| self.length + layout_pt(self.percentage * basis))
-        }
+        self.percentage
+            .used(percentage_basis)
+            .map(|percentage| self.length + percentage)
     }
 }
 
@@ -170,8 +258,6 @@ impl ComputedLengthPercentage {
             Self::Affine(value) => Self::Affine(AffineLengthPercentage {
                 length: value.length * factor,
                 percentage: value.percentage,
-                has_percentage: value.has_percentage,
-                percentage_requires_basis: value.percentage_requires_basis,
             }),
             Self::Expression(expression) => Self::Expression(Rc::new(
                 scale_expression_fixed_length_components(expression, factor),
@@ -192,19 +278,21 @@ impl ComputedLengthPercentage {
     ) -> Self {
         Self::Affine(AffineLengthPercentage {
             length,
-            percentage,
-            has_percentage,
-            percentage_requires_basis: has_percentage,
+            percentage: if has_percentage {
+                PercentageComponent::RequiresBasis {
+                    coefficient: percentage,
+                }
+            } else {
+                PercentageComponent::Absent
+            },
         })
     }
 
     #[cfg(test)]
-    pub(crate) const fn from_neutralized_affine(length: LayoutLength, percentage: f32) -> Self {
+    pub(crate) const fn from_neutralized_affine(length: LayoutLength) -> Self {
         Self::Affine(AffineLengthPercentage {
             length,
-            percentage,
-            has_percentage: true,
-            percentage_requires_basis: false,
+            percentage: PercentageComponent::Neutralized,
         })
     }
 
@@ -401,20 +489,20 @@ impl ComputedLengthPercentage {
 
     pub(crate) fn contains_percentage(&self) -> bool {
         match self {
-            Self::Affine(value) => value.has_percentage,
+            Self::Affine(value) => value.percentage.contains_percentage(),
             Self::Expression(expression) => expression.contains_percentage(),
         }
     }
 
     pub(crate) fn needs_percentage_basis(&self) -> bool {
         match self {
-            Self::Affine(value) => value.percentage_requires_basis,
+            Self::Affine(value) => value.percentage.needs_basis(),
             Self::Expression(expression) => expression.needs_percentage_basis(),
         }
     }
 
     pub(crate) fn is_definitely_absolute(&self) -> bool {
-        matches!(self, Self::Affine(value) if !value.percentage_requires_basis && value.percentage == 0.0)
+        matches!(self, Self::Affine(value) if !value.percentage.needs_basis())
     }
 
     pub(crate) fn fixed_component(&self) -> LayoutLength {
@@ -451,7 +539,7 @@ impl ComputedLengthPercentage {
     }
 
     pub(crate) fn percentage_coefficient(&self) -> Option<f32> {
-        self.affine().map(|value| value.percentage)
+        self.affine().map(|value| value.percentage.coefficient())
     }
 
     pub(crate) fn percentage_coefficient_or_zero(&self) -> f32 {
@@ -462,8 +550,9 @@ impl ComputedLengthPercentage {
     /// or deferred component.  This is useful for the few grammar ranges
     /// whose percentage basis is known to be non-negative.
     pub(crate) fn pure_percentage_coefficient(&self) -> Option<f32> {
-        self.affine()
-            .and_then(|value| (value.length == layout_pt(0.0)).then_some(value.percentage))
+        self.affine().and_then(|value| {
+            (value.length == layout_pt(0.0)).then_some(value.percentage.coefficient())
+        })
     }
 
     /// Compares two expressions only when CSS permits choosing a branch at
@@ -476,7 +565,7 @@ impl ComputedLengthPercentage {
         // Percentage bases are property-specific and can be negative (for
         // example a background-position free-space basis), so unlike metric
         // lengths they cannot establish an ordering before used-value time.
-        if difference.percentage != 0.0 {
+        if difference.percentage.coefficient() != 0.0 {
             return None;
         }
         let terms = merge_linear_terms(left_terms, scale_linear_terms(right_terms, -1.0));
@@ -511,14 +600,8 @@ impl ComputedLengthPercentage {
                 output.push_str("a(");
                 output.push_str(&value.length.points().to_bits().to_string());
                 output.push(',');
-                output.push_str(&value.percentage.to_bits().to_string());
-                output.push(',');
-                output.push_str(if value.has_percentage { "1," } else { "0," });
-                output.push_str(if value.percentage_requires_basis {
-                    "1)"
-                } else {
-                    "0)"
-                });
+                value.percentage.write_cache_key(output);
+                output.push(')');
             }
             Self::Expression(expression) => expression.write_cache_key(output),
         }
@@ -537,6 +620,33 @@ impl ComputedLengthPercentage {
 
     pub(crate) fn requires_ch_advance(&self) -> bool {
         matches!(self, Self::Expression(expression) if expression.requires_term(DeferredLengthUnit::Ch))
+    }
+
+    /// Whether this value needs a metric from the document root's selected
+    /// font rather than from its element or parent font.
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        matches!(self, Self::Expression(expression) if [
+            DeferredLengthUnit::Rex,
+            DeferredLengthUnit::Rcap,
+            DeferredLengthUnit::Rch,
+            DeferredLengthUnit::Ric,
+            DeferredLengthUnit::Rlh,
+        ]
+        .into_iter()
+        .any(|unit| expression.requires_term(unit)))
+    }
+
+    /// Whether a deferred `font-size` needs a selected metric from its parent
+    /// font rather than the CSS metric fallback.
+    pub(crate) fn requires_parent_selected_font_metrics(&self) -> bool {
+        matches!(self, Self::Expression(expression) if [
+            DeferredLengthUnit::Ch,
+            DeferredLengthUnit::Ex,
+            DeferredLengthUnit::Cap,
+            DeferredLengthUnit::Ic,
+        ]
+        .into_iter()
+        .any(|unit| expression.requires_term(unit)))
     }
 
     pub(crate) fn resolve_font_relative_lengths(&mut self, basis: FontRelativeLengthBasis) {
@@ -650,8 +760,8 @@ impl ComputedLengthPercentage {
     fn sign_bounds(&self) -> Option<(bool, bool)> {
         match self {
             Self::Affine(value) => Some((
-                value.length.points() < 0.0 || value.percentage < 0.0,
-                value.length.points() > 0.0 || value.percentage > 0.0,
+                value.length.points() < 0.0 || value.percentage.coefficient() < 0.0,
+                value.length.points() > 0.0 || value.percentage.coefficient() > 0.0,
             )),
             Self::Expression(expression) => expression.sign_bounds(),
         }
@@ -683,8 +793,6 @@ fn scale_expression_fixed_length_components(
             LengthPercentageExpression::Affine(AffineLengthPercentage {
                 length: value.length * factor,
                 percentage: value.percentage,
-                has_percentage: value.has_percentage,
-                percentage_requires_basis: value.percentage_requires_basis,
             })
         }
         // Deferred font-relative components are resolved from the zoomed font
@@ -778,14 +886,8 @@ impl LengthPercentageExpression {
                 output.push_str("a(");
                 output.push_str(&value.length.points().to_bits().to_string());
                 output.push(',');
-                output.push_str(&value.percentage.to_bits().to_string());
-                output.push(',');
-                output.push_str(if value.has_percentage { "1," } else { "0," });
-                output.push_str(if value.percentage_requires_basis {
-                    "1)"
-                } else {
-                    "0)"
-                });
+                value.percentage.write_cache_key(output);
+                output.push(')');
             }
             Self::Term { unit, coefficient } => {
                 output.push_str("t(");
@@ -824,7 +926,7 @@ impl LengthPercentageExpression {
             Self::Min(left, right) => {
                 let left = left.affine()?;
                 let right = right.affine()?;
-                if left.percentage == right.percentage {
+                if left.percentage.coefficient() == right.percentage.coefficient() {
                     Some(if left.length.points() <= right.length.points() {
                         left
                     } else {
@@ -837,7 +939,7 @@ impl LengthPercentageExpression {
             Self::Max(left, right) => {
                 let left = left.affine()?;
                 let right = right.affine()?;
-                if left.percentage == right.percentage {
+                if left.percentage.coefficient() == right.percentage.coefficient() {
                     Some(if left.length.points() >= right.length.points() {
                         left
                     } else {
@@ -851,23 +953,20 @@ impl LengthPercentageExpression {
                 let min = min.affine()?;
                 let center = center.affine()?;
                 let max = max.affine()?;
-                (min.percentage == center.percentage && center.percentage == max.percentage).then(
-                    || AffineLengthPercentage {
-                        length: layout_pt(
-                            center
-                                .length
-                                .points()
-                                .clamp(min.length.points(), max.length.points()),
-                        ),
-                        percentage: center.percentage,
-                        has_percentage: min.has_percentage
-                            || center.has_percentage
-                            || max.has_percentage,
-                        percentage_requires_basis: min.percentage_requires_basis
-                            || center.percentage_requires_basis
-                            || max.percentage_requires_basis,
-                    },
-                )
+                (min.percentage.coefficient() == center.percentage.coefficient()
+                    && center.percentage.coefficient() == max.percentage.coefficient())
+                .then(|| AffineLengthPercentage {
+                    length: layout_pt(
+                        center
+                            .length
+                            .points()
+                            .clamp(min.length.points(), max.length.points()),
+                    ),
+                    percentage: PercentageComponent::combined_with_coefficient(
+                        center.percentage.coefficient(),
+                        [min.percentage, center.percentage, max.percentage],
+                    ),
+                })
             }
         }
     }
@@ -893,9 +992,11 @@ impl LengthPercentageExpression {
                     && left_affine.length == right_affine.length
                 {
                     let take_left = if matches!(self, Self::Min(..)) {
-                        left_affine.percentage <= right_affine.percentage
+                        left_affine.percentage.coefficient()
+                            <= right_affine.percentage.coefficient()
                     } else {
-                        left_affine.percentage >= right_affine.percentage
+                        left_affine.percentage.coefficient()
+                            >= right_affine.percentage.coefficient()
                     };
                     return if take_left { left } else { right };
                 }
@@ -916,15 +1017,17 @@ impl LengthPercentageExpression {
                 {
                     return Self::Affine(AffineLengthPercentage {
                         length: center_affine.length,
-                        percentage: center_affine
-                            .percentage
-                            .clamp(min_affine.percentage, max_affine.percentage),
-                        has_percentage: min_affine.has_percentage
-                            || center_affine.has_percentage
-                            || max_affine.has_percentage,
-                        percentage_requires_basis: min_affine.percentage_requires_basis
-                            || center_affine.percentage_requires_basis
-                            || max_affine.percentage_requires_basis,
+                        percentage: PercentageComponent::combined_with_coefficient(
+                            center_affine.percentage.coefficient().clamp(
+                                min_affine.percentage.coefficient(),
+                                max_affine.percentage.coefficient(),
+                            ),
+                            [
+                                min_affine.percentage,
+                                center_affine.percentage,
+                                max_affine.percentage,
+                            ],
+                        ),
                     });
                 }
                 Self::Clamp {
@@ -961,8 +1064,8 @@ impl LengthPercentageExpression {
     fn sign_bounds(&self) -> Option<(bool, bool)> {
         match self {
             Self::Affine(value) => Some((
-                value.length.points() < 0.0 || value.percentage < 0.0,
-                value.length.points() > 0.0 || value.percentage > 0.0,
+                value.length.points() < 0.0 || value.percentage.coefficient() < 0.0,
+                value.length.points() > 0.0 || value.percentage.coefficient() > 0.0,
             )),
             Self::Term { coefficient, .. } => Some((*coefficient < 0.0, *coefficient > 0.0)),
             Self::Sum(left, right) => {
@@ -990,7 +1093,7 @@ impl LengthPercentageExpression {
 
     fn contains_percentage(&self) -> bool {
         match self {
-            Self::Affine(value) => value.has_percentage,
+            Self::Affine(value) => value.percentage.contains_percentage(),
             Self::Term { .. } => false,
             Self::Sum(left, right) | Self::Min(left, right) | Self::Max(left, right) => {
                 left.contains_percentage() || right.contains_percentage()
@@ -1006,7 +1109,7 @@ impl LengthPercentageExpression {
 
     fn needs_percentage_basis(&self) -> bool {
         match self {
-            Self::Affine(value) => value.percentage_requires_basis,
+            Self::Affine(value) => value.percentage.needs_basis(),
             Self::Term { .. } => false,
             Self::Sum(left, right) => {
                 left.needs_percentage_basis() || right.needs_percentage_basis()
@@ -1015,7 +1118,7 @@ impl LengthPercentageExpression {
                 *factor != 0.0
                     && value.affine().map_or_else(
                         || value.needs_percentage_basis(),
-                        |value| value.percentage != 0.0 && value.percentage_requires_basis,
+                        |value| value.percentage.product(*factor).needs_basis(),
                     )
             }
             // A comparison can select a percentage-bearing branch only once
@@ -1173,6 +1276,55 @@ mod tests {
         assert_ne!(zero, percentage);
         assert!(percentage.contains_percentage());
         assert!(!percentage.is_definitely_absolute());
+    }
+
+    #[test]
+    fn percentage_component_state_survives_math_and_affine_clamp_reduction() {
+        let neutralized =
+            ComputedLengthPercentage::product(ComputedLengthPercentage::from_percent(0.0), 0.5);
+        assert!(matches!(
+            neutralized,
+            ComputedLengthPercentage::Affine(AffineLengthPercentage {
+                percentage: PercentageComponent::Neutralized,
+                ..
+            })
+        ));
+        assert!(neutralized.contains_percentage());
+        assert!(!neutralized.needs_percentage_basis());
+        assert_eq!(
+            neutralized
+                .used_length_with_percentage_basis(PercentageBasis::<LayoutLength>::indefinite()),
+            Some(layout_pt(0.0)),
+        );
+
+        let negated_zero_percentage = ComputedLengthPercentage::from_percent(0.0).negated();
+        assert!(matches!(
+            negated_zero_percentage,
+            ComputedLengthPercentage::Affine(AffineLengthPercentage {
+                percentage: PercentageComponent::RequiresBasis { coefficient: 0.0 },
+                ..
+            })
+        ));
+
+        let clamped = LengthPercentageExpression::Clamp {
+            min: Rc::new(LengthPercentageExpression::Affine(
+                AffineLengthPercentage::length(layout_pt(0.0)),
+            )),
+            center: Rc::new(LengthPercentageExpression::Affine(AffineLengthPercentage {
+                length: layout_pt(10.0),
+                percentage: PercentageComponent::Neutralized,
+            })),
+            max: Rc::new(LengthPercentageExpression::Affine(AffineLengthPercentage {
+                length: layout_pt(20.0),
+                percentage: PercentageComponent::RequiresBasis { coefficient: 0.0 },
+            })),
+        }
+        .affine()
+        .expect("equal percentage coefficients should reduce an affine clamp");
+        assert!(matches!(
+            clamped.percentage,
+            PercentageComponent::RequiresBasis { coefficient: 0.0 }
+        ));
     }
 
     #[test]
@@ -1382,19 +1534,25 @@ mod tests {
             absolute.clone(),
             ComputedLengthPercentage::from_percent(0.0),
         );
+        let neutralized_percentage =
+            ComputedLengthPercentage::product(ComputedLengthPercentage::from_percent(0.0), 0.5);
         let rem = ComputedLengthPercentage::from_rem(1.0);
         let em = ComputedLengthPercentage::from_em(1.0);
         let mut absolute_key = String::new();
         let mut percentage_key = String::new();
+        let mut neutralized_key = String::new();
         let mut rem_key = String::new();
         let mut em_key = String::new();
 
         absolute.write_cache_key(&mut absolute_key);
         authored_zero_percentage.write_cache_key(&mut percentage_key);
+        neutralized_percentage.write_cache_key(&mut neutralized_key);
         rem.write_cache_key(&mut rem_key);
         em.write_cache_key(&mut em_key);
 
         assert_ne!(absolute_key, percentage_key);
+        assert_ne!(absolute_key, neutralized_key);
+        assert_ne!(percentage_key, neutralized_key);
         assert_ne!(rem_key, em_key);
         assert!(absolute.is_definitely_absolute());
         assert!(!authored_zero_percentage.is_definitely_absolute());

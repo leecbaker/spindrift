@@ -26,8 +26,7 @@ pub(in crate::layout) fn push_inline_words_for_style(
     // helper first. Give every run its own used-style clone so CSS `zoom`
     // reaches shaping, line metrics, and letter/word spacing exactly once.
     // <https://drafts.csswg.org/css-viewport/#zoom-property>
-    let mut zoomed_style = style.clone();
-    zoomed_style.apply_effective_zoom();
+    let zoomed_style = css::LayoutStyle::from_computed(style).into_zoomed();
     let normalized_style;
     let style = if anonymous_inline_content_needs_normalized_style(&zoomed_style) {
         normalized_style = normalized_anonymous_inline_content_style(&zoomed_style);
@@ -79,6 +78,136 @@ mod tests {
         assert_eq!(styles.len(), 3);
         assert!(Rc::ptr_eq(&styles[0], &styles[1]));
         assert!(Rc::ptr_eq(&styles[0], &styles[2]));
+    }
+
+    #[test]
+    fn equal_nested_decoration_values_retain_distinct_origins() {
+        let ancestor_style = ComputedStyle::initial();
+        let mut ancestor_decoration = ancestor_style.text_decoration.clone();
+        ancestor_decoration.underline = true;
+        let ancestor_layer = css::TextDecorationLayer {
+            decoration: ancestor_decoration.clone(),
+            origin_style: Rc::new(ancestor_style.clone()),
+        };
+
+        let mut child_style = ComputedStyle::initial();
+        child_style
+            .text_decoration_layers
+            .push(css::TextDecorationLayer {
+                decoration: ancestor_decoration,
+                origin_style: Rc::new(ancestor_style),
+            });
+
+        let chain = propagated_decoration_layers_for_child(&[ancestor_layer], &child_style);
+        assert_eq!(chain.len(), 2);
+        assert!(!Rc::ptr_eq(&chain[0].origin_style, &chain[1].origin_style,));
+    }
+
+    #[test]
+    fn propagation_context_carries_in_flow_layers_but_stops_at_abspos() {
+        let mut ancestor_style = ComputedStyle::initial();
+        let mut decoration = ancestor_style.text_decoration.clone();
+        decoration.underline = true;
+        ancestor_style
+            .text_decoration_layers
+            .push(css::TextDecorationLayer {
+                decoration: decoration.clone(),
+                origin_style: Rc::new(ancestor_style.clone()),
+            });
+        let context = TextDecorationPropagationContext::from_style(&ancestor_style);
+
+        let in_flow_style = ComputedStyle::initial();
+        let propagated = context.used_child_style(&in_flow_style);
+        assert_eq!(propagated.text_decoration_layers.len(), 1);
+        assert!(Rc::ptr_eq(
+            &propagated.text_decoration_layers[0].origin_style,
+            &ancestor_style.text_decoration_layers[0].origin_style,
+        ));
+
+        let mut nested_style = ComputedStyle::initial();
+        nested_style
+            .text_decoration_layers
+            .push(css::TextDecorationLayer {
+                decoration,
+                origin_style: Rc::new(ComputedStyle::initial()),
+            });
+        let nested = context.used_child_style(&nested_style);
+        assert_eq!(nested.text_decoration_layers.len(), 2);
+
+        let mut positioned_style = ComputedStyle::initial();
+        positioned_style.position = Position::Absolute;
+        let positioned = context.used_child_style(&positioned_style);
+        assert!(positioned.text_decoration_layers.is_empty());
+    }
+
+    #[test]
+    fn whitespace_normalization_keeps_slice_edges_on_source_boundary_words() {
+        let style = ComputedStyle::initial();
+        let edge = |logical_edge, physical_side| {
+            InlineItem::Atom(Box::new(InlineAtom::new(
+                InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(InlineBoxEdgeFragment {
+                    logical_edge,
+                    physical_side,
+                    positioning_containing_block_id: None,
+                    advance: 0.0,
+                    paint_extent: 0.0,
+                })),
+                style.clone(),
+                None,
+                InlineSize::new(0.0, style.line_height),
+                0.0,
+                0.0,
+                None,
+                None,
+            )))
+        };
+        let mut items = vec![edge(InlineLogicalEdge::Start, PhysicalSide::Left)];
+        push_inline_text_run(
+            "target element",
+            &style,
+            None,
+            0.0,
+            InlineVisualOffset::zero(),
+            &mut items,
+        );
+        let Some(InlineItem::Word(word)) = items.last_mut() else {
+            panic!("the source text should produce one inline word")
+        };
+        word.hanging_edges = InlineHangingEdges {
+            blocks_start: true,
+            blocks_end: true,
+        };
+        items.push(edge(InlineLogicalEdge::End, PhysicalSide::Right));
+
+        normalize_inline_whitespace_items(&mut items);
+
+        let words = items
+            .iter()
+            .filter_map(|item| match item {
+                InlineItem::Word(word) => Some((word.text.as_str(), word.hanging_edges)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            words,
+            [
+                (
+                    "target",
+                    InlineHangingEdges {
+                        blocks_start: true,
+                        blocks_end: false,
+                    },
+                ),
+                (" ", InlineHangingEdges::default()),
+                (
+                    "element",
+                    InlineHangingEdges {
+                        blocks_start: false,
+                        blocks_end: true,
+                    },
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -534,7 +663,98 @@ pub(in crate::layout) fn normalize_inline_whitespace_items(items: &mut Vec<Inlin
         processor.push_item(item);
     }
     processor.flush();
+    normalize_inline_box_hanging_edge_ownership(&mut processor.output);
     *items = processor.output;
+}
+
+/// Keep inline box edge effects on the source-adjacent text after whitespace
+/// normalization splits one DOM text node into multiple inline words.
+///
+/// Collection marks the first and last visible text of an inline box before
+/// CSS Text Phase I separates collapsible spaces from their neighboring text.
+/// Copying that metadata verbatim to every resulting word makes a
+/// `box-decoration-break: slice` inline paint its start and end decorations at
+/// each soft-wrapped word boundary. Re-resolve the ownership against the
+/// retained edge atoms so only text immediately inside the corresponding
+/// source edge keeps the flag.
+/// <https://www.w3.org/TR/css-text-3/#white-space-processing>
+/// <https://www.w3.org/TR/css-break-3/#break-decoration>
+fn normalize_inline_box_hanging_edge_ownership(items: &mut [InlineItem]) {
+    for item_index in 0..items.len() {
+        let InlineItem::Word(word) = &items[item_index] else {
+            continue;
+        };
+        if !inline_word_is_visible_for_hanging_edge(word) {
+            let InlineItem::Word(word) = &mut items[item_index] else {
+                unreachable!("the item was checked as an inline word")
+            };
+            word.hanging_edges = InlineHangingEdges::default();
+            continue;
+        }
+        let hanging_edges = word.hanging_edges;
+        let keeps_start = !hanging_edges.blocks_start
+            || inline_word_is_adjacent_to_source_hanging_edge(
+                items,
+                item_index,
+                InlineLogicalEdge::Start,
+            );
+        let keeps_end = !hanging_edges.blocks_end
+            || inline_word_is_adjacent_to_source_hanging_edge(
+                items,
+                item_index,
+                InlineLogicalEdge::End,
+            );
+        let InlineItem::Word(word) = &mut items[item_index] else {
+            unreachable!("the item was checked as an inline word")
+        };
+        word.hanging_edges.blocks_start &= keeps_start;
+        word.hanging_edges.blocks_end &= keeps_end;
+    }
+}
+
+fn inline_word_is_visible_for_hanging_edge(word: &InlineWord) -> bool {
+    let text = trim_css_collapsible_whitespace(&word.text);
+    !text.is_empty() && !text.chars().all(character_is_bidi_format_control)
+}
+
+fn inline_word_is_adjacent_to_source_hanging_edge(
+    items: &[InlineItem],
+    item_index: usize,
+    edge: InlineLogicalEdge,
+) -> bool {
+    let source_edge_is_adjacent = |item: &InlineItem| match item {
+        InlineItem::Word(word) if inline_word_is_visible_for_hanging_edge(word) => Some(false),
+        InlineItem::Atom(atom)
+            if matches!(
+                atom.content(),
+                InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(box_edge))
+                    if box_edge.logical_edge == edge
+            ) =>
+        {
+            Some(true)
+        }
+        InlineItem::Word(_)
+        | InlineItem::Atom(_)
+        | InlineItem::Float(_)
+        | InlineItem::Break(_)
+        | InlineItem::PageScopeStart(_)
+        | InlineItem::PageScopeEnd => None,
+    };
+    let result = match edge {
+        InlineLogicalEdge::Start => items[..item_index]
+            .iter()
+            .rev()
+            .find_map(source_edge_is_adjacent),
+        InlineLogicalEdge::End => items[item_index + 1..]
+            .iter()
+            .find_map(source_edge_is_adjacent),
+    };
+    if let Some(result) = result {
+        return result;
+    }
+    // Split inline fragments can own only one source edge. Preserve an
+    // already-marked edge if its partner is not represented in this stream.
+    true
 }
 
 #[derive(Default)]
@@ -649,7 +869,11 @@ pub(in crate::layout) struct IntrinsicInlineCollectionContext<'a> {
     pub(in crate::layout) baseline_shift: f32,
     pub(in crate::layout) visual_offset: InlineVisualOffset,
     pub(in crate::layout) block_style: &'a ComputedStyle,
-    pub(in crate::layout) propagated_decoration: css::TextDecoration,
+    /// Decorations originating on in-flow ancestors of the box currently
+    /// being collected.  These are a box-tree paint concern, not inherited
+    /// computed CSS values.
+    /// <https://www.w3.org/TR/css-text-decor-4/#line-decoration>
+    pub(in crate::layout) propagated_decoration_layers: Vec<css::TextDecorationLayer>,
 }
 
 impl<'a> IntrinsicInlineCollectionContext<'a> {
@@ -674,15 +898,106 @@ impl<'a> IntrinsicInlineCollectionContext<'a> {
         }
     }
 
-    pub(in crate::layout) fn with_propagated_decoration(
+    pub(in crate::layout) fn with_propagated_decoration_layers(
         self,
-        propagated_decoration: css::TextDecoration,
+        propagated_decoration_layers: Vec<css::TextDecorationLayer>,
     ) -> Self {
         Self {
-            propagated_decoration,
+            propagated_decoration_layers,
             ..self
         }
     }
+}
+
+/// Extend a decoration-origin chain when entering an in-flow box.
+///
+/// The `text-decoration-*` longhands are not inherited. Instead, each box
+/// with a visible line becomes another painting origin whose values must be
+/// retained independently through eligible descendants.
+/// <https://www.w3.org/TR/css-text-decor-4/#line-decoration>
+pub(in crate::layout) fn propagated_decoration_layers_for_child(
+    ancestor_layers: &[css::TextDecorationLayer],
+    child_style: &ComputedStyle,
+) -> Vec<css::TextDecorationLayer> {
+    let mut layers = ancestor_layers.to_vec();
+    // A used inline style can already carry this exact ancestry after an
+    // earlier collection boundary. Compare provenance identity, not CSS
+    // values: two nested boxes with identical declarations are distinct line
+    // origins and must both paint.
+    // <https://drafts.csswg.org/css-text-decor-4/#line-decoration>
+    for child_layer in &child_style.text_decoration_layers {
+        if !layers.iter().any(|ancestor_layer| {
+            Rc::ptr_eq(&ancestor_layer.origin_style, &child_layer.origin_style)
+        }) {
+            layers.push(child_layer.clone());
+        }
+    }
+    layers
+}
+
+/// Decoration origins that reach one in-flow formatting-context boundary.
+///
+/// Text-decoration lines do not inherit as computed CSS values. Instead, a
+/// decorating box's used line is carried through eligible in-flow descendants,
+/// retaining the originating style needed for font-relative values. Keeping
+/// this state separate from the computed style makes crossing a block, table,
+/// or anonymous-box boundary explicit while still materializing the result
+/// only for layout and paint.
+///
+/// <https://drafts.csswg.org/css-text-decor-4/#line-decoration>
+#[derive(Debug, Clone, Default)]
+pub(in crate::layout) struct TextDecorationPropagationContext {
+    layers: Vec<css::TextDecorationLayer>,
+}
+
+impl TextDecorationPropagationContext {
+    pub(in crate::layout) fn from_style(style: &ComputedStyle) -> Self {
+        Self {
+            layers: style.text_decoration_layers.clone(),
+        }
+    }
+
+    /// Enter a child formatting context.
+    ///
+    /// Floats, out-of-flow boxes, and atomic inline/table contents do not
+    /// receive an ancestor's propagated decorations. Their own decoration
+    /// origins remain paintable, so this returns a context rooted at the
+    /// child's computed style rather than an empty used style.
+    pub(in crate::layout) fn for_child(&self, child_style: &ComputedStyle) -> Self {
+        if text_decoration_propagation_stops_at(child_style) {
+            return Self::from_style(child_style);
+        }
+        Self {
+            layers: propagated_decoration_layers_for_child(&self.layers, child_style),
+        }
+    }
+
+    pub(in crate::layout) fn apply_to(&self, style: &mut ComputedStyle) {
+        apply_propagated_decoration_layers(style, &self.layers);
+    }
+
+    pub(in crate::layout) fn used_child_style(&self, child_style: &ComputedStyle) -> ComputedStyle {
+        let context = self.for_child(child_style);
+        let mut used_style = child_style.clone();
+        context.apply_to(&mut used_style);
+        used_style
+    }
+}
+
+fn text_decoration_propagation_stops_at(style: &ComputedStyle) -> bool {
+    matches!(style.position, Position::Absolute | Position::Fixed)
+        || style.float != Float::None
+        || style.display.is_atomic_inline()
+}
+
+/// Apply the line-decoration origins reaching a text-producing box to its
+/// used inline style. This intentionally leaves computed CSS inheritance
+/// untouched.
+pub(in crate::layout) fn apply_propagated_decoration_layers(
+    style: &mut ComputedStyle,
+    layers: &[css::TextDecorationLayer],
+) {
+    style.text_decoration_layers = layers.to_vec();
 }
 
 impl InlineWhitespaceProcessor {
@@ -884,14 +1199,14 @@ impl InlineWhitespaceProcessor {
                 // lines from the latter two modes.
                 // <https://drafts.csswg.org/css-text-3/#white-space-phase-1>
                 preserve_at_end: forced
-                    || meta.source == InlineTextSource::Generated
+                    || meta.source.is_generated()
                     || meta.style.white_space.preserves_newlines(),
-                clear: if meta.source == InlineTextSource::Generated {
+                clear: if meta.source.is_generated() {
                     meta.style.clear
                 } else {
                     Clear::None
                 },
-                origin: if forced || meta.source == InlineTextSource::Generated {
+                origin: if forced || meta.source.is_generated() {
                     InlineBreakOrigin::Explicit
                 } else {
                     InlineBreakOrigin::PreservedSegment

@@ -61,7 +61,7 @@ pub(in crate::layout) fn outline_primitives_for_border_rect(
     }
 
     let mut outline_style = style.clone();
-    outline_style.background_color = None;
+    outline_style.background_color = css::BackgroundColor::TRANSPARENT;
     outline_style.background_image = css::ComputedImage::None;
     outline_style.background_layers.clear();
     outline_style.border_image = css::BorderImage::initial();
@@ -331,11 +331,51 @@ impl<'a> LayoutBuilder<'a> {
         border_rect: PaintRect,
         style: &ComputedStyle,
     ) -> Vec<PaintPrimitive> {
+        self.box_background_primitives_with_background_image_areas(border_rect, border_rect, style)
+    }
+
+    /// Paint a fragment's decoration while resolving its image layers from a
+    /// possibly different source positioning area.
+    ///
+    /// CSS Backgrounds slices a fragmented box's background image from the
+    /// unfragmented positioning area, while the fragment itself remains the
+    /// image's clip and border-paint area.  Generated pseudo-floats use this
+    /// same path as principal boxes, so their vector SVG paths and patterns
+    /// retain their normal background ordering when float paint is captured.
+    ///
+    /// <https://www.w3.org/TR/css-backgrounds-3/#background-position>
+    /// <https://www.w3.org/TR/css-backgrounds-3/#box-decoration-break>
+    /// <https://drafts.csswg.org/css-pseudo-4/#generated-content>
+    /// <https://www.w3.org/TR/CSS22/visuren.html#floats>
+    pub(super) fn box_background_primitives_with_background_image_areas(
+        &self,
+        border_rect: PaintRect,
+        positioning_border_rect: PaintRect,
+        style: &ComputedStyle,
+    ) -> Vec<PaintPrimitive> {
+        let background_images = self.background_image_primitives_with_paint_areas(
+            positioning_border_rect,
+            border_rect,
+            style,
+        );
+        self.box_background_primitives_with_resolved_images(border_rect, style, background_images)
+    }
+
+    fn box_background_primitives_with_resolved_images(
+        &self,
+        border_rect: PaintRect,
+        style: &ComputedStyle,
+        background_images: Vec<PaintPrimitive>,
+    ) -> Vec<PaintPrimitive> {
         if uses_only_raster_url_background_layers(style)
             && style.box_shadow.is_empty()
             && !style.border_image.source.is_image()
         {
-            return self.raster_background_box_primitives_in_css_paint_order(border_rect, style);
+            return self.raster_background_box_primitives_in_css_paint_order(
+                border_rect,
+                style,
+                background_images,
+            );
         }
 
         let border_paint = self.border_image_paint(border_rect, style);
@@ -354,7 +394,7 @@ impl<'a> LayoutBuilder<'a> {
         );
         primitives.extend(rounded_rects.into_iter().map(PaintPrimitive::RoundedRect));
         primitives.extend(paths.into_iter().map(PaintPrimitive::Path));
-        primitives.extend(self.background_image_primitives(border_rect, style));
+        primitives.extend(background_images);
         if let BorderPaint::ReplaceNormalBorder {
             primitives: border_primitives,
         } = border_paint
@@ -363,6 +403,81 @@ impl<'a> LayoutBuilder<'a> {
         }
         primitives.extend(strokes.into_iter().map(PaintPrimitive::Stroke));
         primitives
+    }
+
+    /// Split a box with a normal CSS border into background and border phases.
+    /// This lets HTML's rendered-legend model subtract its margin rectangle
+    /// from border primitives without clipping backgrounds beneath the legend.
+    /// Border-image replacement stays on its dedicated asset path.
+    /// <https://html.spec.whatwg.org/multipage/rendering.html#the-fieldset-and-legend-elements>
+    pub(super) fn split_background_and_normal_border_primitives(
+        &self,
+        border_rect: PaintRect,
+        style: &ComputedStyle,
+    ) -> Option<(Vec<PaintPrimitive>, Vec<PaintPrimitive>)> {
+        if style.border_image.source.is_image()
+            || matches!(
+                self.border_image_paint(border_rect, style),
+                BorderPaint::ReplaceNormalBorder { .. }
+            )
+        {
+            return None;
+        }
+        let mut normal_border_style = style.clone();
+        normal_border_style.border_image.source = css::ComputedImage::None;
+        let insets = used_border_widths(&normal_border_style);
+        let mut backgrounds = Vec::new();
+        let background_phase = block_paint_ops_with_phases(
+            border_rect,
+            &normal_border_style,
+            insets,
+            true,
+            true,
+            true,
+            false,
+        );
+        self.append_box_paint_phase(&mut backgrounds, background_phase);
+        backgrounds.extend(self.background_image_primitives(border_rect, style));
+        let mut borders = Vec::new();
+        let border_phase = block_paint_ops_with_phases(
+            border_rect,
+            &normal_border_style,
+            insets,
+            false,
+            false,
+            false,
+            true,
+        );
+        self.append_box_paint_phase(&mut borders, border_phase);
+        Some((backgrounds, borders))
+    }
+
+    /// Clip rectangular border primitives to the fieldset regions visible
+    /// around a rendered legend. Non-rectangular primitives retain their
+    /// dedicated paint paths; those paths are handled by the corresponding
+    /// rounded, patterned, and border-image exclusions as they acquire the
+    /// same phase boundary.
+    pub(super) fn clip_rectangular_border_primitives(
+        &self,
+        primitives: Vec<PaintPrimitive>,
+        visible_regions: &[PaintRect],
+    ) -> Vec<PaintPrimitive> {
+        let mut clipped = Vec::new();
+        for primitive in primitives {
+            match primitive {
+                PaintPrimitive::Rect(rect) => {
+                    for region in visible_regions {
+                        if let Some(intersection) = rect.paint_rect().intersection(region) {
+                            let mut part = rect.clone();
+                            part.set_paint_rect(intersection);
+                            clipped.push(PaintPrimitive::Rect(part));
+                        }
+                    }
+                }
+                primitive => clipped.push(primitive),
+            }
+        }
+        clipped
     }
 
     /// Emit simple raster URL backgrounds in CSS Backgrounds' decoration
@@ -376,6 +491,7 @@ impl<'a> LayoutBuilder<'a> {
         &self,
         border_rect: PaintRect,
         style: &ComputedStyle,
+        background_images: Vec<PaintPrimitive>,
     ) -> Vec<PaintPrimitive> {
         let border_insets = used_border_widths(style);
         let mut primitives = Vec::new();
@@ -391,7 +507,7 @@ impl<'a> LayoutBuilder<'a> {
                 false,
             ),
         );
-        primitives.extend(self.background_image_primitives(border_rect, style));
+        primitives.extend(background_images);
         self.append_box_paint_phase(
             &mut primitives,
             block_paint_ops_with_phases(
@@ -452,6 +568,10 @@ impl<'a> LayoutBuilder<'a> {
                 self.current_page.push_svg_pattern_in_band(band, pattern);
             }
             PaintPrimitive::Line(line) => self.push_line_in_band(band, line),
+            PaintPrimitive::OpaqueTextCoverage { line, paths } => {
+                self.current_page
+                    .push_opaque_text_coverage_in_band(band, line, paths);
+            }
         }
     }
 
@@ -510,8 +630,10 @@ impl<'a> LayoutBuilder<'a> {
     /// default position is the padding box. This helper is shared by formatting
     /// contexts that know their used content height before painting children:
     /// <https://www.w3.org/TR/css-overflow-3/#overflow-clip-edge>.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn push_padding_box_overflow_clip(
         &mut self,
+        element: &Element,
         style: &ComputedStyle,
         outer_x: f32,
         block_top: f32,
@@ -519,7 +641,8 @@ impl<'a> LayoutBuilder<'a> {
         content_width: f32,
         content_height: f32,
     ) -> bool {
-        if !style_clips_overflow(style) && !style.contain.paint {
+        let containment = used_property_containment(element, style);
+        if !style_clips_overflow(style) && !containment.clips_descendant_paint() {
             return false;
         }
         let (clip_edge_x, clip_edge_y) = overflow_clip_edge_axes(style);
@@ -530,14 +653,25 @@ impl<'a> LayoutBuilder<'a> {
             0.0
         };
         let clip_height = content_height + style.padding.top + style.padding.bottom;
+        let padding_box = PageTopRect::new(
+            outer_x + border_widths.left - margin,
+            block_top - border_widths.top + margin,
+            content_width + style.padding.left + style.padding.right + margin * 2.0,
+            clip_height + margin * 2.0,
+        )
+        .paint_clip();
+        let scrollport = ScrollportGeometry::for_padding_box(
+            padding_box,
+            style,
+            UsedOverflowAxes::from_style(style),
+            false,
+            false,
+        );
         self.push_overflow_clip(
-            OverflowClip::from_page_top_rect(PageTopRect::new(
-                outer_x + border_widths.left - margin,
-                block_top - border_widths.top + margin,
-                content_width + style.padding.left + style.padding.right + margin * 2.0,
-                clip_height + margin * 2.0,
-            ))
-            .with_axes(clip_x || style.contain.paint, clip_y || style.contain.paint),
+            OverflowClip::from_paint_rect(scrollport.scrollport.paint_rect()).with_axes(
+                clip_x || containment.clips_descendant_paint(),
+                clip_y || containment.clips_descendant_paint(),
+            ),
         );
         true
     }
@@ -605,13 +739,15 @@ fn rendered_line_clip_for_overflow_clips(
         return Some(None);
     }
 
-    let width = rendered_line_width(line);
-    let line_clip = PaintClip::new(
-        line.x(),
-        line.y() - line.font_size,
-        width,
-        line.font_size * 1.35,
-    );
+    let line_clip = line.glyph_ink_bounds.unwrap_or_else(|| {
+        let width = rendered_line_width(line);
+        PaintClip::new(
+            line.x(),
+            line.y() - line.font_size,
+            width,
+            line.font_size * 1.35,
+        )
+    });
     let mut clipped = line_clip;
     for clip in overflow_clips {
         let clip_rect = clip.paint_rect();
@@ -698,6 +834,29 @@ mod tests {
         assert_eq!(
             rendered_line_clip_for_overflow_clips(&line, &[clip]),
             Some(Some(PaintClip::new(10.0, 10.0, 30.0, 13.5)))
+        );
+    }
+
+    #[test]
+    fn glyph_ink_wholly_inside_fragment_edge_does_not_receive_synthetic_clip() {
+        let mut line = RenderedLine::new(
+            "ink fits".to_string(),
+            10.0,
+            20.0,
+            10.0,
+            None,
+            CssColor::BLACK,
+            Vec::new(),
+        );
+        // The line's conservative em box reaches y=10, but the selected glyph
+        // outlines remain above the fragment edge at y=12. A PDF clip here
+        // would introduce an antialiased edge without clipping any CSS ink.
+        line.glyph_ink_bounds = Some(PaintClip::new(10.0, 13.0, 30.0, 7.0));
+        let clip = OverflowClip::from_paint_rect(paint_space_rect(10.0, 12.0, 30.0, 28.0));
+
+        assert_eq!(
+            rendered_line_clip_for_overflow_clips(&line, &[clip]),
+            Some(None)
         );
     }
 }

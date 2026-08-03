@@ -5,7 +5,7 @@ impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout::table) fn table_cell_measured_inline_outer_height(
         &mut self,
         child: &box_tree::FormattingBox<'_>,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         available_width: f32,
     ) -> Option<f32> {
         if !table_cell_formatting_child_has_parent_percentage_block_size(child) {
@@ -84,10 +84,18 @@ impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout::table) fn table_cell_measured_inline_outer_height_with_basis(
         &mut self,
         child: &box_tree::FormattingBox<'_>,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         available_width: f32,
-        percentage_height_basis: BlockSizePercentageBasis,
+        content_pass: TableCellContentPass,
     ) -> Option<f32> {
+        let Some(final_basis) = content_pass.final_basis() else {
+            return self.table_cell_measured_inline_outer_height(
+                child,
+                stylesheets,
+                available_width,
+            );
+        };
+        let percentage_height_basis = final_basis.percentage_basis();
         let (element, style) = match child {
             box_tree::FormattingBox::AtomicInline(box_) => (box_.core.element, &box_.core.style),
             box_tree::FormattingBox::Replaced(box_) => (box_.core.element, &box_.core.style),
@@ -99,39 +107,52 @@ impl<'a> LayoutBuilder<'a> {
                 );
             }
         };
-        if replaced_element_kind(element) != Some(ReplacedElementKind::Canvas) {
-            return self.table_cell_measured_inline_outer_height(
-                child,
-                stylesheets,
-                available_width,
-            );
-        }
-
         let mut style = self
             .table_cell_content_sizing_style(style, TableCellContentSizingPolicy::FinalRelayout);
-        let box_metrics = apply_used_box_metrics(
-            &mut style,
-            PercentageBasis::definite(layout_pt(available_width.max(0.0))),
-        );
-        let (_width, height) = used_canvas_size_with_height_basis(
-            element,
-            &style,
-            available_width,
-            percentage_height_basis,
-        );
-        Some(
-            height
-                + box_metrics.vertical_non_content_length().points()
-                + style.margin.top
-                + style.margin.bottom,
-        )
+        match replaced_element_kind(element) {
+            Some(ReplacedElementKind::Canvas) => {
+                let box_metrics = apply_used_box_metrics(
+                    &mut style,
+                    PercentageBasis::definite(layout_pt(available_width.max(0.0))),
+                );
+                let (_width, height) = used_canvas_size_with_height_basis(
+                    element,
+                    &style,
+                    available_width,
+                    percentage_height_basis,
+                );
+                Some(
+                    height
+                        + box_metrics.vertical_non_content_length().points()
+                        + style.margin.top
+                        + style.margin.bottom,
+                )
+            }
+            Some(ReplacedElementKind::Image) => used_image(
+                element,
+                &style,
+                available_width,
+                percentage_height_basis,
+                self.base_url,
+                self.root_url,
+                self.resource_cache,
+            )
+            .map(|image| style.margin.top + image.border_box_size.height + style.margin.bottom),
+            Some(ReplacedElementKind::Svg) => {
+                used_svg(element, &style, available_width, percentage_height_basis)
+                    .map(|svg| style.margin.top + svg.border_box_size.height + style.margin.bottom)
+            }
+            None => {
+                self.table_cell_measured_inline_outer_height(child, stylesheets, available_width)
+            }
+        }
     }
 
     pub(in crate::layout::table) fn table_cell_row_minimum_atomic_inline_outer_height(
         &mut self,
         style: &ComputedStyle,
         children: &[box_tree::FormattingBox<'_>],
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         available_width: f32,
     ) -> f32 {
         if matches!(style.position, Position::Absolute | Position::Fixed) {
@@ -166,7 +187,7 @@ impl<'a> LayoutBuilder<'a> {
     ) -> ComputedStyle {
         let mut style = self.style_with_current_viewport_lengths(style);
         apply_table_cell_content_sizing_policy(&mut style, policy);
-        style
+        style.into_computed()
     }
 
     /// Measure a document-canvas element when it appears as table-cell content.
@@ -181,7 +202,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         style: &ComputedStyle,
         children: &[box_tree::FormattingBox<'_>],
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         available_width: f32,
     ) -> f32 {
         let mut measured_style = style.clone();
@@ -190,16 +211,24 @@ impl<'a> LayoutBuilder<'a> {
         measured_style.box_values.max_height = css::ComputedLengthPercentageOrAuto::Auto;
 
         // The root/body canvas special case is an anonymous table-cell
-        // wrapper, not a text run. Its row contribution is the contained
-        // boxes' outer geometry; appending inherited line descent beneath an
-        // atomic inline would make `html { display: table }` taller than its
-        // shrink-wrapped contents.
+        // wrapper, but its in-flow atomic children still form a line box.
+        // Include that line sequence so table row sizing retains the baseline
+        // descent below an `inline-block`, just like ordinary block layout.
         // <https://www.w3.org/TR/css-tables-3/#row-layout>
         let structural_content_height = self.table_cell_children_non_text_content_height(
             children,
             stylesheets,
             available_width,
         );
+        let inline_sequence_height = self
+            .table_cell_inline_sequence_height(
+                &measured_style,
+                children,
+                stylesheets,
+                available_width,
+                PercentageBasis::indefinite(),
+            )
+            .unwrap_or(0.0);
         let text = inline_text_from_formatting_boxes(children);
         let text_height = if text.is_empty() {
             0.0
@@ -212,7 +241,9 @@ impl<'a> LayoutBuilder<'a> {
                 measured_style.padding.right,
             )
         };
-        structural_content_height.max(text_height)
+        structural_content_height
+            .max(inline_sequence_height)
+            .max(text_height)
             + measured_style.padding.top
             + measured_style.padding.bottom
             + table_vertical_borders(&measured_style).points()
@@ -233,11 +264,14 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         cell: &TableCell<'_>,
         cell_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         available_width: f32,
         border_insets: css::Edges,
     ) -> Option<f32> {
-        if cell_style.contain.layout {
+        if cell
+            .element
+            .is_some_and(|element| layout_containment_applies_to_element(element, cell_style))
+        {
             return None;
         }
         if let Some(children) = cell.children.as_deref() {
@@ -259,7 +293,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         cell: &TableCell<'_>,
         cell_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         available_width: f32,
         border_insets: css::Edges,
     ) -> Option<f32> {
@@ -285,11 +319,14 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         cell: &TableCell<'_>,
         cell_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         available_width: f32,
         border_insets: css::Edges,
     ) -> Option<f32> {
-        if cell_style.contain.layout {
+        if cell
+            .element
+            .is_some_and(|element| layout_containment_applies_to_element(element, cell_style))
+        {
             return None;
         }
         if let Some(children) = cell.children.as_deref() {
@@ -328,7 +365,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         children: &[box_tree::FormattingBox<'_>],
         containing_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         available_width: f32,
     ) -> Option<f32> {
         self.table_cell_children_baseline_offset(
@@ -344,7 +381,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         children: &[box_tree::FormattingBox<'_>],
         containing_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         available_width: f32,
         baseline_set: TableCellBaselineSet,
     ) -> Option<f32> {
@@ -389,7 +426,7 @@ impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout::table) fn table_cell_child_baseline_offset(
         &mut self,
         child: &box_tree::FormattingBox<'_>,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         available_width: f32,
         baseline_set: TableCellBaselineSet,
     ) -> Option<f32> {
@@ -458,7 +495,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         children: &[box_tree::FormattingBox<'_>],
         inline_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         available_width: f32,
         baseline_set: TableCellBaselineSet,
     ) -> Option<f32> {
@@ -484,7 +521,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         block_style: &ComputedStyle,
         children: &[box_tree::FormattingBox<'_>],
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         available_width: f32,
         baseline_set: TableCellBaselineSet,
     ) -> Option<f32> {
@@ -506,7 +543,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         children: &[box_tree::FormattingBox<'_>],
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         available_width: f32,
         baseline_set: TableCellBaselineSet,
     ) -> Option<f32> {
@@ -527,7 +564,7 @@ impl<'a> LayoutBuilder<'a> {
                     0.0,
                     InlineVisualOffset::zero(),
                     style,
-                    style.text_decoration.clone(),
+                    style.text_decoration_layers.clone(),
                     &mut items,
                 );
             },
@@ -570,7 +607,7 @@ impl<'a> LayoutBuilder<'a> {
         element: &Element,
         style: &ComputedStyle,
         fragment: &box_tree::TableFragment<'_>,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         available_width: f32,
     ) -> Option<f32> {
         if matches!(style.position, Position::Absolute | Position::Fixed) {
@@ -579,7 +616,6 @@ impl<'a> LayoutBuilder<'a> {
 
         let input = TableLayoutInput::from_fragment(fragment);
         let rows = input.rows.as_slice();
-        let table_width = used_table_width(style, available_width.max(style.font_size));
         let table_cellpadding = element
             .attrs
             .get("cellpadding")
@@ -597,6 +633,13 @@ impl<'a> LayoutBuilder<'a> {
                     grid.column_count,
                 )
             });
+        let table_width = used_table_width(
+            style,
+            available_width.max(style.font_size),
+            collapsed_geometry
+                .as_ref()
+                .map(|geometry| geometry.outer_insets),
+        );
         let column_plan = self.table_column_plan(
             rows,
             &grid,
@@ -741,7 +784,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         available_width: f32,
         link_target: Option<&str>,
     ) -> Option<f32> {
@@ -880,7 +923,7 @@ impl<'a> LayoutBuilder<'a> {
         rowspan: usize,
         rows: &[TableRow<'_>],
         table_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         row_heights: &[f32],
         source_row_heights: &[f32],
         row_occupancy: &[bool],
@@ -949,6 +992,7 @@ impl<'a> LayoutBuilder<'a> {
     /// <https://www.w3.org/TR/css-contain-1/#containment-paint>.
     pub(in crate::layout::table) fn table_cell_content_clip(
         &self,
+        cell_element: Option<&Element>,
         cell_style: &ComputedStyle,
         border_box: TableCellBorderBox,
         placement: TableGridPlacement,
@@ -964,7 +1008,9 @@ impl<'a> LayoutBuilder<'a> {
         let (overflow_x, overflow_y) = resolved_overflow_axes(cell_style);
         let clips_scrollport_x = matches!(overflow_x, css::Overflow::Auto | css::Overflow::Scroll);
         let clips_scrollport_y = matches!(overflow_y, css::Overflow::Auto | css::Overflow::Scroll);
-        if !(clips_scrollport_x || clips_scrollport_y || cell_style.contain.paint) {
+        let paint_containment_applies = cell_element
+            .is_some_and(|element| paint_containment_applies_to_element(element, cell_style));
+        if !(clips_scrollport_x || clips_scrollport_y || paint_containment_applies) {
             return None;
         }
         let rect = padding_box.rect;
@@ -976,8 +1022,8 @@ impl<'a> LayoutBuilder<'a> {
                 rect.height().max(0.0),
             ))
             .with_axes(
-                clips_scrollport_x || cell_style.contain.paint,
-                clips_scrollport_y || cell_style.contain.paint,
+                clips_scrollport_x || paint_containment_applies,
+                clips_scrollport_y || paint_containment_applies,
             ),
         )
     }
@@ -986,7 +1032,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         captions: &[TableCaption<'_>],
         table_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         table_x: f32,
         table_width: f32,
         side: CaptionSide,
@@ -1010,7 +1056,7 @@ impl<'a> LayoutBuilder<'a> {
                     &mut caption_style,
                     (table_width - horizontal_non_content).max(0.0),
                 );
-                if caption_style.contain.size
+                if used_property_containment(caption.element, &caption_style).size
                     && caption_style.writing_mode == WritingMode::HorizontalTb
                 {
                     // Size containment fixes the caption's principal used
@@ -1098,7 +1144,7 @@ impl<'a> LayoutBuilder<'a> {
         rows: &[TableRow<'_>],
         grid: &TableGrid,
         table_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         columns: &[TableColumn<'_>],
         column_count: usize,
     ) -> CollapsedTableGeometry {
@@ -1109,7 +1155,8 @@ impl<'a> LayoutBuilder<'a> {
         collapsed_grid.add_table(table_style, rows.len(), column_count);
         for (row_index, row) in rows.iter().enumerate() {
             let row_style = self.style_for_table_row(row, table_style, stylesheets);
-            if table_row_is_collapsed(&row_style) {
+            let row_part_style = TablePartUsedStyle::from_table_used(row_style.clone());
+            if table_row_is_collapsed(row_part_style.layout()) {
                 continue;
             }
             for placement in &grid.rows[row_index] {
@@ -1126,12 +1173,17 @@ impl<'a> LayoutBuilder<'a> {
                     &cell_style,
                 );
             }
-            collapsed_grid.add_row(row_index, column_count, &row_style);
+            if let Some(participant) = row_part_style.collapsed_border_participant() {
+                collapsed_grid.add_row(row_index, column_count, participant.style());
+            }
         }
         for (start_row, end_row, row_group) in table_row_group_spans(rows) {
             let row_group_style =
                 self.style_for_table_row_group(&row_group, table_style, stylesheets);
-            collapsed_grid.add_row_group(start_row, end_row, column_count, &row_group_style);
+            let row_group_part_style = TablePartUsedStyle::from_table_used(row_group_style);
+            if let Some(participant) = row_group_part_style.collapsed_border_participant() {
+                collapsed_grid.add_row_group(start_row, end_row, column_count, participant.style());
+            }
         }
         for (start_column, end_column, column_group) in
             table_column_group_spans(columns, column_count)
@@ -1209,11 +1261,12 @@ mod tests {
     use crate::css::{TextBoxEdge, TextBoxTrim, TextEdgeMetric, TextEdgePair};
     use std::collections::HashMap;
 
-    fn test_layout_builder<'a>(
+    fn test_layout_builder<'a, Collection: crate::css::StylesheetCollection + ?Sized>(
         options: &'a RenderOptions,
-        stylesheets: &'a [Stylesheet],
+        stylesheets: &'a Collection,
         resource_cache: &'a ResourceCache,
     ) -> LayoutBuilder<'a> {
+        let stylesheets = crate::css::StylesheetCollection::stylesheet_view(stylesheets);
         LayoutBuilder::new(LayoutBuilderConfig {
             options,
             stylesheets,
@@ -1226,6 +1279,7 @@ mod tests {
             iframe_viewport: None,
             page_progression_direction: Direction::Ltr,
             page_counter_initial_values: HashMap::new(),
+            target_references: crate::layout::TargetReferenceSnapshot::default(),
             font_system: FontSystem::new(),
         })
     }

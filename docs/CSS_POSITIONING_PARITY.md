@@ -1,6 +1,6 @@
 # CSS Positioning Parity
 
-Last updated: 2026-07-19
+Last updated: 2026-07-31
 
 This document tracks current CSS positioning and stacking behavior in Quire.
 Known unresolved divergences belong in `SPEC_DIVERGENCES.md`; this file is a
@@ -65,6 +65,10 @@ working parity snapshot for implemented behavior and nearby follow-up areas.
   the rectangle the box would have occupied in normal flow. Atomic inline
   sources such as inline-blocks also use the placeholder margin-box top for
   auto vertical placement, preserving explicit top margins and used heights.
+- Temporary inline-block fragments use a matching scratch page and page
+  context. Positioned descendants that escape a non-stacking inline-block
+  therefore carry their page-area clips in the same coordinate space as their
+  static-position geometry before replay into the parent stacking context.
 - Inline-level absolutely positioned descendants before a terminal generated
   line break, such as HTML `br`, do not collapse the following line onto their
   static-position line; the generated break still creates the normal in-flow
@@ -92,11 +96,17 @@ working parity snapshot for implemented behavior and nearby follow-up areas.
   their own content height.
 - Nested absolutely positioned boxes that overflow page areas extend the final
   page sequence from their resolved absolute offsets without leaking temporary
-  positioned-subtree pagination into normal flow; fixed descendants discovered
-  inside those subtrees still replay on every generated page. Nested absolute
-  layers retain their independently resolved destination-page ownership rather
-  than being remapped again by an ancestor, and the final page-span requirement
-  is merged across the nested subtree.
+  positioned-subtree pagination into normal flow. Viewport-fixed layers replay
+  on every generated page regardless of whether they occur before, inside, or
+  after the overflowing absolute subtree. Nested absolute layers retain their
+  independently resolved destination-page ownership rather than being remapped
+  again by an ancestor, and the final page-span requirement is merged across
+  the nested subtree.
+- A decoration-free nested absolute box with no paint and no viewport-fixed
+  replay requirement does not materialize otherwise blank document pages.
+  Visible ordinary text retains its resolved destination page; a forced page
+  break below that subtree likewise preserves the corresponding page context
+  and page-margin counter sequence.
 - Fixed descendants replay after the final page sequence is known. Their
   initial containing-block geometry is retained while each output page supplies
   its own media clip, including later named pages with a different used page
@@ -121,25 +131,29 @@ working parity snapshot for implemented behavior and nearby follow-up areas.
   outer block or page, including edge-only inline fragments and nested
   positioned inline ancestors with identical styles.
 - Inline-block pseudo stacking contexts paint their own background/border
-  before atom-owned block content, and non-stacking inline-blocks let
-  absolutely positioned descendants escape to the parent stacking context at
-  their atom-local auto static position, including block-level absolute
-  descendants whose containing block is outside the inline-block. Explicit
-  insets remain page-resolved when the inline-block is not a containing block,
-  and remain atom-local when the inline-block itself is positioned or
-  transformed and establishes the containing block.
+  before atom-owned block content. A non-stacking inline-block keeps an
+  absolutely positioned descendant's actual containing block separate from
+  its atom-local static-position rectangle, so it escapes to the parent
+  stacking context while outer insets, percentage sizes, and page ownership
+  remain outer-coordinate concerns. Explicit insets therefore remain
+  page-resolved unless the inline-block itself is positioned or transformed
+  and establishes the containing block.
 - Positioned descendants produced while an atomic inline is measured, including
   relatively positioned table captions, likewise escape the atom's inline
   paint unit and retain their parent stacking level and source order.
-- An absolutely positioned flex child whose hypothetical sole-item rectangle
-  is centered on the physical horizontal axis retains that typed rectangle
-  through automatic sizing and final static-position resolution.
+- Absolutely positioned children retain one typed static-alignment rectangle
+  through automatic sizing and final placement. Flex supplies its sole-item
+  main-axis and container cross-axis geometry, Grid supplies its grid area,
+  and ordinary positioned descendants use their containing-block rectangle;
+  all three resolve self-alignment through the same physical-axis path.
 - Intrinsic inline-block measurement suppresses positioned-descendant
   materialization, so committed atom layout—not an off-page intrinsic probe—
   creates escaped positioned layers.
 - Positioned `html` roots, including flex roots, resolve absolute and fixed
   insets against the initial containing block and retain their own border
   decoration while the root background continues to propagate to the canvas.
+- Static-position offsets remain signed through the absolute-position solver,
+  so a hypothetical source may legitimately fall outside its containing block.
 - Same-page non-positioned overflow clips apply to descendant paint without
   creating an atomic stacking context, so later normal-flow block backgrounds
   do not cover earlier clipped inline foregrounds.

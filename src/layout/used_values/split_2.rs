@@ -435,6 +435,19 @@ mod tests {
     }
 
     #[test]
+    fn cyclic_min_height_keeps_the_fixed_calc_component() {
+        let mut style = ComputedStyle::initial();
+        style.box_values.min_height = css::ComputedLengthPercentageOrAuto::LengthPercentage(
+            css::ComputedLengthPercentage::from_affine(layout_pt(18.75), 0.5, true),
+        );
+
+        let used = used_min_height(&style, PercentageBasis::<ContentBoxLength>::indefinite())
+            .expect("a fixed calc component remains a used min-height");
+
+        assert_eq!(used.points(), 18.75);
+    }
+
+    #[test]
     fn used_length_or_auto_keeps_fixed_lengths_under_an_indefinite_basis() {
         let fixed: LayoutLength = used_length_percentage_or_auto(
             length_auto(12.0),
@@ -696,7 +709,7 @@ mod tests {
 
         assert_eq!(used_multicol_column_count(&style, 150.0, 10.0), Some(3));
 
-        style.column_count = Some(2);
+        style.column_count = css::ColumnCount::Count(std::num::NonZeroUsize::new(2).unwrap());
         assert_eq!(used_multicol_column_count(&style, 150.0, 10.0), Some(2));
         assert_eq!(used_multicol_column_count(&style, 40.0, 10.0), Some(1));
 
@@ -708,7 +721,7 @@ mod tests {
     fn size_containment_preserves_authored_multicol_intrinsic_width() {
         let mut style = ComputedStyle::initial();
         style.contain.size = true;
-        style.column_count = Some(3);
+        style.column_count = css::ColumnCount::Count(std::num::NonZeroUsize::new(3).unwrap());
         style.column_width =
             css::ComputedColumnWidth::Length(css::ComputedLengthPercentage::from_points(20.0));
         style.column_gap =
@@ -724,7 +737,7 @@ mod tests {
     fn size_contained_auto_width_multicol_preserves_authored_gaps() {
         let mut style = ComputedStyle::initial();
         style.contain.size = true;
-        style.column_count = Some(3);
+        style.column_count = css::ColumnCount::Count(std::num::NonZeroUsize::new(3).unwrap());
         style.column_width = css::ComputedColumnWidth::Auto;
         style.font_size = 12.0;
         style.column_gap = css::ComputedGap::Normal;

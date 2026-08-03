@@ -1,5 +1,55 @@
 use super::*;
 use crate::layout::block::child_available_space_for_formatting_context;
+use crate::layout::builder::page_for_context;
+use crate::units::content_box_to_margin_box_length;
+
+/// Fully resolved physical margin-box geometry for an atomic inline.
+///
+/// The inline layout graph replays an atom only through [`InlineSize`], but
+/// layout must first resolve its CSS margin box: font-relative margins and
+/// padding belong to the atomic participant's advance, not to a later paint
+/// adjustment. Keeping that conversion here makes the legacy scalar-size
+/// boundary explicit.
+/// <https://www.w3.org/TR/CSS22/visuren.html#inline-boxes>
+#[derive(Debug, Clone, Copy)]
+struct ResolvedAtomicInlineMarginBox {
+    physical_size: MarginBoxSize,
+}
+
+impl ResolvedAtomicInlineMarginBox {
+    fn from_resolved_boxes(
+        content: ContentBoxSize,
+        horizontal_non_content: NonContentLength,
+        vertical_non_content: NonContentLength,
+        horizontal_margins: LayoutLength,
+        vertical_margins: LayoutLength,
+    ) -> Self {
+        let width = content_box_to_margin_box_length(
+            content_box_pt(content.width),
+            horizontal_non_content,
+            horizontal_margins,
+        );
+        let height = content_box_to_margin_box_length(
+            content_box_pt(content.height),
+            vertical_non_content,
+            vertical_margins,
+        );
+        Self {
+            physical_size: margin_box_size_pt(width.points(), height.points()),
+        }
+    }
+
+    /// Convert to the legacy graph-size representation at the inline-layout
+    /// boundary. No caller may reconstruct this from independent margin and
+    /// border scalars after this point.
+    fn into_inline_layout_size(self) -> InlineSize {
+        InlineSize::new(self.physical_size.width, self.physical_size.height)
+    }
+
+    fn horizontal_span(self) -> MarginBoxLength {
+        margin_box_pt(self.physical_size.width)
+    }
+}
 
 impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn inline_fragment_atom_for_children(
@@ -7,19 +57,20 @@ impl<'a> LayoutBuilder<'a> {
         element: Option<&Element>,
         style: &ComputedStyle,
         children: &[box_tree::FormattingBox<'_>],
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         baseline_shift: f32,
         link_target: Option<String>,
     ) -> InlineAtom {
+        let mut used_style = self.style_with_current_used_lengths(style);
+        let box_metrics = apply_used_box_metrics_for_logical_inline_basis(
+            &mut used_style,
+            self.current_content_logical_inline_percentage_basis(),
+        );
+        let style = &used_style;
         let available_width =
             (self.content_right - self.content_left - style.margin.left - style.margin.right)
                 .max(0.0);
-        let mut used_style = self.style_with_current_viewport_lengths(style);
-        let box_metrics = apply_used_box_metrics(
-            &mut used_style,
-            PercentageBasis::definite(layout_pt(available_width)),
-        );
-        let style = &used_style;
+        let containment = element.map(|element| used_property_containment(element, style));
         let borders = box_metrics.border.to_css_edges();
         let horizontal_extras = box_metrics.horizontal_non_content_length().points();
         let vertical_extras = box_metrics.vertical_non_content_length().points();
@@ -80,7 +131,7 @@ impl<'a> LayoutBuilder<'a> {
         // zero, but descendants are still laid out (and may visibly overflow)
         // inside the resulting zero-sized content box.
         // <https://www.w3.org/TR/css-contain-1/#containment-size>
-        let (preferred_min, preferred) = if style.contain.size {
+        let (preferred_min, preferred) = if containment.is_some_and(|effects| effects.size) {
             (0.0, 0.0)
         } else {
             let preferred_min = contribution
@@ -132,11 +183,38 @@ impl<'a> LayoutBuilder<'a> {
         .points();
 
         let snapshot = self.snapshot();
+        // Retain the real absolute-positioning fallback before replacing the
+        // current page with this atomic inline's temporary formatting page.
+        // The static-position rectangle itself is constructed below in that
+        // temporary coordinate space.
+        let escaped_atom_actual_containing_block = self.current_containing_block();
+        // Intrinsic inline-block layout runs in a temporary page coordinate
+        // space. Its internal lines export the atom baseline, but are not
+        // principal list-item lines and therefore cannot consume an outside
+        // marker anchor.
+        let pending_outside_marker_anchors =
+            std::mem::take(&mut self.pending_outside_marker_anchors);
         let positioned_layer_start = self.positioned_layers.len();
         let top = 10_000.0;
         let content_left = borders.left + style.padding.left;
         let content_top = top - borders.top - style.padding.top;
-        self.current_page = Page::new(content_width + horizontal_extras, top);
+        // The temporary page and its page context form one coordinate space.
+        // Keeping the outer page context here would let page-area clips
+        // created while laying out an escaped positioned descendant retain
+        // outer coordinates while its primitives retain this scratch origin.
+        // That detaches the clip when the atom is replayed at its final line
+        // position.
+        // <https://www.w3.org/TR/CSS22/visuren.html#inline-blocks> and
+        // <https://www.w3.org/TR/CSS22/zindex.html>.
+        let atom_page_context = PageContext {
+            size: PageSize::from_points(content_width + horizontal_extras, top),
+            margins: PageMargins::all_points(0.0),
+            edges: PageBoxEdges::ZERO,
+            rotation: snapshot.current_page_context.rotation,
+        };
+        self.current_page = page_for_context(atom_page_context);
+        self.overflow_clips.clear();
+        self.fragment_top_offsets.clear();
         self.content_left = content_left;
         self.content_right = content_left + content_width;
         self.cursor_y = content_top;
@@ -148,7 +226,15 @@ impl<'a> LayoutBuilder<'a> {
         let static_scroll_snap_scope = self.begin_static_scroll_snap_scope(style, false);
         self.last_in_flow_line_baseline_y = None;
         self.truncate_page_start_margins = false;
-        let positioning_containing_block_mode = PositionedContainingBlockMode::for_style(style);
+        let positioning_containing_block_mode = element
+            .and_then(|element| PositionedContainingBlockMode::for_element(element, style))
+            .or_else(|| {
+                element
+                    .is_none()
+                    .then(|| PositionedContainingBlockMode::for_style(style))
+                    .flatten()
+            });
+        let previous_escaped_atom_containing_block = self.escaped_atom_containing_block;
         let positioned_containing_block_scope =
             if let Some(mode) = positioning_containing_block_mode {
                 // CSS Positioned Layout uses the padding box of a positioned
@@ -193,7 +279,6 @@ impl<'a> LayoutBuilder<'a> {
             ));
         let previous_block_static_position_y_offset = self.block_static_position_y_offset;
         let previous_absolute_static_position = self.absolute_static_position;
-        let previous_escaped_atom_containing_block = self.escaped_atom_containing_block;
         // The inline-block fragment is laid out on a temporary page, while an
         // absolutely positioned descendant's containing block can still be an
         // ancestor outside that temporary coordinate space. For auto vertical
@@ -207,28 +292,157 @@ impl<'a> LayoutBuilder<'a> {
         // Their auto static position must therefore use the temporary
         // formatting context's content-box origin, including cases where the
         // containing block remains an ancestor outside this inline-block.
-        self.absolute_static_position = Some(AbsoluteStaticPosition::from_page_rect(
+        let escaped_atom_static_position = AbsoluteStaticPosition::from_page_rect(
             content_left,
             content_left + content_width,
             content_top,
-        ));
+        );
+        self.absolute_static_position = Some(escaped_atom_static_position);
+        self.escaped_atom_positioning_context = Some(EscapedAtomPositioningContext {
+            actual_containing_block: escaped_atom_actual_containing_block,
+            static_position: escaped_atom_static_position,
+        });
         self.escaped_atom_positioning_depth += 1;
         let text_box_line_trim = self.effective_text_box_line_trim_for_style(style);
+        let mut multicol_outcome = None;
+        let mut multicol_outcome_includes_control_label_flow = false;
         self.with_text_box_line_trim_scope(text_box_line_trim, |layout| {
             let laid_out_multicol = element.is_some_and(|element| {
-                (style.column_count.is_some()
+                // An atomic inline keeps its inline outer display for the
+                // parent line, but its contents establish their own block
+                // formatting context.  The multicol planner consumes that
+                // *inner* flow; passing the inline-level principal style made
+                // direct spanners take a different sizing and positioning
+                // path from an equivalent block wrapper.
+                // <https://drafts.csswg.org/css-display-3/#blockify>
+                let mut multicol_flow_style = style.clone();
+                multicol_flow_style.display = multicol_flow_style.display.blockified();
+                let eligible_multicol = (matches!(style.column_count, css::ColumnCount::Count(_))
                     || matches!(style.column_width, css::ComputedColumnWidth::Length(_))
                     || matches!(style.column_height, css::ComputedColumnHeight::Length(_)))
                     && (definite_content_height.is_none()
                         || style.column_fill != css::ColumnFill::Auto
-                        || formatting_boxes_contain_column_spanner(children))
-                    && layout.layout_simple_block_child_columns(
+                        || formatting_boxes_contain_column_spanner(children));
+                let outcome = eligible_multicol.then(|| {
+                    // HTML buttons have an anonymous control-label flow. When
+                    // block descendants force that flow to become mixed, the
+                    // leading and trailing preserved inline runs remain label
+                    // siblings of the internal block flow, rather than being
+                    // inserted into its multicolumn content. This is the
+                    // same structure as the WPT's explicit inner wrapper.
+                    // <https://html.spec.whatwg.org/multipage/rendering.html#the-button-element>
+                    let is_button = element.tag.eq_ignore_ascii_case("button");
+                    let normalized_children = is_button.then(|| {
+                        layout.build_frozen_child_boxes_with_current_ancestors(
+                            element,
+                            stylesheets,
+                            &multicol_flow_style,
+                        )
+                    });
+                    let Some(normalized_children) = normalized_children else {
+                        return layout.layout_simple_block_child_columns(
+                            element,
+                            &multicol_flow_style,
+                            stylesheets,
+                            // The atomic outer display kept this tree from the
+                            // block-container normalization pass. Rebuild the
+                            // frozen children with the blockified inner style.
+                            None,
+                            definite_content_height,
+                        );
+                    };
+                    let leading_inline_run =
+                        normalized_children.first().and_then(|child| match child {
+                            box_tree::FormattingBox::AnonymousBlock(anonymous)
+                                if formatting_box_has_inline_content(&anonymous.children) =>
+                            {
+                                Some((
+                                    std::rc::Rc::clone(&anonymous.style),
+                                    anonymous.children.clone(),
+                                ))
+                            }
+                            _ => None,
+                        });
+                    let trailing_inline_run =
+                        normalized_children.last().and_then(|child| match child {
+                            box_tree::FormattingBox::AnonymousBlock(anonymous)
+                                if formatting_box_has_inline_content(&anonymous.children) =>
+                            {
+                                Some((
+                                    std::rc::Rc::clone(&anonymous.style),
+                                    anonymous.children.clone(),
+                                ))
+                            }
+                            _ => None,
+                        });
+                    let first_flow_child = usize::from(leading_inline_run.is_some());
+                    let last_flow_child = normalized_children
+                        .len()
+                        .saturating_sub(usize::from(trailing_inline_run.is_some()));
+                    if first_flow_child >= last_flow_child {
+                        return layout.layout_simple_block_child_columns(
+                            element,
+                            &multicol_flow_style,
+                            stylesheets,
+                            Some(&normalized_children),
+                            definite_content_height,
+                        );
+                    }
+                    if let Some((inline_style, inline_children)) = &leading_inline_run {
+                        layout.layout_anonymous_block(
+                            inline_style,
+                            inline_children,
+                            stylesheets,
+                            None,
+                        );
+                    }
+                    let mut control_flow_children = Vec::with_capacity(
+                        last_flow_child - first_flow_child
+                            + usize::from(leading_inline_run.is_some())
+                            + usize::from(trailing_inline_run.is_some()),
+                    );
+                    // The control's anonymous internal block owns a fresh
+                    // pair of inline-flow edges. Preserve the author-facing
+                    // label runs above while also retaining their equivalent
+                    // wrapper-edge line in the internal multicol flow.
+                    if let Some((inline_style, inline_children)) = &leading_inline_run {
+                        control_flow_children.push(box_tree::FormattingBox::AnonymousBlock(
+                            box_tree::AnonymousBlockBoxWith {
+                                style: std::rc::Rc::clone(inline_style),
+                                children: inline_children.clone(),
+                            },
+                        ));
+                    }
+                    control_flow_children
+                        .extend_from_slice(&normalized_children[first_flow_child..last_flow_child]);
+                    if let Some((inline_style, inline_children)) = &trailing_inline_run {
+                        control_flow_children.push(box_tree::FormattingBox::AnonymousBlock(
+                            box_tree::AnonymousBlockBoxWith {
+                                style: std::rc::Rc::clone(inline_style),
+                                children: inline_children.clone(),
+                            },
+                        ));
+                    }
+                    let outcome = layout.layout_simple_block_child_columns(
                         element,
-                        style,
+                        &multicol_flow_style,
                         stylesheets,
-                        Some(children),
+                        Some(&control_flow_children),
                         definite_content_height,
-                    )
+                    );
+                    if let Some((inline_style, inline_children)) = &trailing_inline_run {
+                        layout.layout_anonymous_block(
+                            inline_style,
+                            inline_children,
+                            stylesheets,
+                            None,
+                        );
+                    }
+                    multicol_outcome_includes_control_label_flow = true;
+                    outcome
+                });
+                multicol_outcome = outcome.filter(|outcome| outcome.is_multicol_layout());
+                multicol_outcome.is_some()
             });
             if laid_out_multicol {
                 // The shared planner has consumed the atomic flow root's
@@ -259,10 +473,6 @@ impl<'a> LayoutBuilder<'a> {
         self.content_logical_inline_size_stack.pop();
         self.pop_float_context();
         self.pop_page_name_scope_suppression();
-        if let Some(scope) = positioned_containing_block_scope {
-            self.escaped_atom_containing_block = previous_escaped_atom_containing_block;
-            self.pop_positioned_containing_block(scope);
-        }
         // Empty inline-blocks and zero-height block children do not synthesize
         // a line box. Any real inline line or block child has already advanced
         // the temporary formatting-context cursor by its used block size.
@@ -278,9 +488,19 @@ impl<'a> LayoutBuilder<'a> {
             let baseline_offset = self.inline_box_text_line_layout_baseline_offset(style);
             baseline_from_content_top + (style.line_height - baseline_offset).max(0.0)
         });
-        let measured_content_height = (content_top - self.cursor_y)
-            .max(0.0)
-            .max(compatible_line_height.unwrap_or(0.0));
+        let measured_content_height = multicol_outcome
+            .map(|outcome| {
+                if multicol_outcome_includes_control_label_flow {
+                    (content_top - self.cursor_y).max(outcome.committed_block_extent().points())
+                } else {
+                    outcome.committed_block_extent().points()
+                }
+            })
+            .unwrap_or_else(|| {
+                (content_top - self.cursor_y)
+                    .max(0.0)
+                    .max(compatible_line_height.unwrap_or(0.0))
+            });
         // CSS Sizing applies explicit `height` to the content box of the
         // atomic inline-block fragment; internal line/block contents may
         // overflow but do not increase the used height:
@@ -288,7 +508,7 @@ impl<'a> LayoutBuilder<'a> {
         let content_height = definite_content_height.unwrap_or_else(|| {
             constrain_content_height(
                 style,
-                content_box_pt(if style.contain.size {
+                content_box_pt(if containment.is_some_and(|effects| effects.size) {
                     0.0
                 } else {
                     measured_content_height
@@ -297,6 +517,21 @@ impl<'a> LayoutBuilder<'a> {
             )
             .points()
         });
+        if let Some(scope) = positioned_containing_block_scope {
+            // The atomic root is now auto-sized from the committed multicol
+            // flow.  Finalize the padding-box containing block before its
+            // captured positioned descendants leave this formatting context.
+            let containing_block = ContainingBlock::from_page_top_rect(PageTopRect::new(
+                borders.left,
+                top - borders.top,
+                content_width + style.padding.left + style.padding.right,
+                content_height.max(0.0) + style.padding.top + style.padding.bottom,
+            ));
+            self.finalize_positioned_containing_block(scope, containing_block);
+            self.escaped_atom_containing_block = Some(containing_block);
+            self.pop_positioned_containing_block(scope);
+            self.escaped_atom_containing_block = previous_escaped_atom_containing_block;
+        }
         let border_box_height = content_height + vertical_extras;
         let border_box = PageTopRect::new(
             0.0,
@@ -380,7 +615,8 @@ impl<'a> LayoutBuilder<'a> {
                     .into_iter()
                     .map(|context| PositionedPaintLayer {
                         page_index: self.pages.len(),
-                        source_style: style.clone(),
+                        source_element: None,
+                        source_style: style.as_computed().clone(),
                         source_is_target: false,
                         stack_level: context.stack_level,
                         context,
@@ -395,29 +631,48 @@ impl<'a> LayoutBuilder<'a> {
             .collect::<Vec<_>>();
         let escaped_positioned_layers = (!escaped_positioned_layers.is_empty())
             .then(|| escaped_positioned_layers.into_boxed_slice());
-        let line_baseline_offset = self
-            .last_in_flow_line_baseline_y
-            .map(|baseline_y| (top - baseline_y).max(0.0));
-        let baseline_offset =
-            Self::inline_block_baseline_offset(style, border_box_height, line_baseline_offset);
+        let line_baseline_offset = multicol_outcome
+            .and_then(|outcome| outcome.final_in_flow_baseline())
+            .filter(|_| !containment.is_some_and(|effects| effects.layout))
+            .map(|baseline| borders.top + style.padding.top + baseline.points())
+            .or_else(|| {
+                self.last_in_flow_line_baseline_y
+                    .map(|baseline_y| (top - baseline_y).max(0.0))
+            });
+        let baseline_offset = Self::inline_block_baseline_offset_with_containment(
+            style,
+            containment.is_some_and(|effects| effects.layout),
+            border_box_height,
+            line_baseline_offset,
+        );
         self.restore(snapshot);
+        self.pending_outside_marker_anchors = pending_outside_marker_anchors;
 
-        InlineAtom::new(
+        let resolved_margin_box = ResolvedAtomicInlineMarginBox::from_resolved_boxes(
+            content_box_size_pt(content_width, content_height),
+            box_metrics.horizontal_non_content_length(),
+            box_metrics.vertical_non_content_length(),
+            layout_pt(style.margin.left + style.margin.right),
+            layout_pt(style.margin.top + style.margin.bottom),
+        );
+        let atom = InlineAtom::new(
             InlineAtomContent::InlineFragment {
                 fragment: Box::new(fragment),
                 table_cell_context: None,
             },
-            style.clone(),
+            style.as_computed().clone(),
             escaped_positioned_layers,
-            InlineSize::new(
-                content_width + horizontal_extras + style.margin.left + style.margin.right,
-                border_box_height + style.margin.top + style.margin.bottom,
-            ),
+            resolved_margin_box.into_inline_layout_size(),
             baseline_offset,
             baseline_shift,
             link_target,
             None,
-        )
+        );
+        debug_assert!(
+            (atom.size.width - resolved_margin_box.horizontal_span().points()).abs() <= 0.01,
+            "atomic inline replay advance must equal its resolved horizontal margin-box span"
+        );
+        atom
     }
 
     /// Return an inline-block baseline offset from its border-box top.
@@ -429,6 +684,7 @@ impl<'a> LayoutBuilder<'a> {
     /// <https://www.w3.org/TR/CSS22/visudet.html#propdef-vertical-align>.
     pub(in crate::layout) fn inline_block_baseline_offset(
         style: &ComputedStyle,
+        has_layout_containment: bool,
         border_box_height: f32,
         line_baseline_offset: Option<f32>,
     ) -> f32 {
@@ -436,12 +692,27 @@ impl<'a> LayoutBuilder<'a> {
         // alignment the atomic inline therefore uses its synthesized
         // bottom-margin-edge baseline even when descendants produced lines.
         // <https://www.w3.org/TR/css-contain-1/#containment-layout>
-        if style.contain.layout {
-            // CSS Containment suppresses the exported baseline entirely. Its
-            // inline/flex/grid parent then synthesizes one from the principal
-            // border box's block-end edge; margins participate in outer
-            // spacing, not in the contained box's exported baseline.
-            return border_box_height;
+        Self::inline_block_baseline_offset_with_containment(
+            style,
+            has_layout_containment,
+            border_box_height,
+            line_baseline_offset,
+        )
+    }
+
+    pub(in crate::layout) fn inline_block_baseline_offset_with_containment(
+        style: &ComputedStyle,
+        has_layout_containment: bool,
+        border_box_height: f32,
+        line_baseline_offset: Option<f32>,
+    ) -> f32 {
+        if has_layout_containment {
+            // CSS Containment suppresses a descendant-provided baseline. The
+            // containing line then uses the same no-baseline fallback as an
+            // empty inline-block: the bottom margin edge.
+            // <https://www.w3.org/TR/css-inline-3/#inline-block-baseline>
+            // <https://www.w3.org/TR/css-contain-1/#containment-layout>
+            return border_box_height + style.margin.bottom;
         }
         if effective_overflow_for_style(style) == css::Overflow::Visible
             && let Some(line_baseline_offset) = line_baseline_offset
@@ -463,7 +734,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         containing_style: &ComputedStyle,
         children: &[box_tree::FormattingBox<'_>],
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
     ) {
         let mut float_run = self.float_run_state();
         for child in children {
@@ -558,4 +829,24 @@ fn formatting_boxes_contain_column_spanner(boxes: &[box_tree::FormattingBox<'_>]
                 && style.float == Float::None
         }) || formatting_boxes_contain_column_spanner(box_.children())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layout_containment_uses_the_bottom_margin_edge_when_no_baseline_is_exported() {
+        let mut style = ComputedStyle::initial();
+        style.margin.bottom = 2.0;
+
+        assert_eq!(
+            LayoutBuilder::inline_block_baseline_offset(&style, true, 20.0, Some(8.0)),
+            22.0,
+        );
+        assert_eq!(
+            LayoutBuilder::inline_block_baseline_offset(&style, false, 20.0, None),
+            22.0,
+        );
+    }
 }

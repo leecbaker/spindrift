@@ -255,6 +255,7 @@ impl StyleFreezer {
                 core: self.freeze_element_box_core(box_.core),
                 marker: box_.marker.map(|marker| self.freeze_marker(marker)),
                 run_in_children: self.freeze_child_boxes(box_.run_in_children),
+                fieldset: box_.fieldset,
             }),
             MutableFormattingBox::Inline(box_) => FrozenFormattingBox::Inline(FrozenInlineBox {
                 core: self.freeze_element_box_core(box_.core),
@@ -384,6 +385,7 @@ fn thaw_box<'a>(box_: &FrozenFormattingBox<'a>) -> MutableFormattingBox<'a> {
             core: thaw_element_box_core(&box_.core),
             marker: box_.marker.as_ref().map(thaw_marker),
             run_in_children: thaw_child_boxes(&box_.run_in_children),
+            fieldset: box_.fieldset,
         }),
         FrozenFormattingBox::Inline(box_) => MutableFormattingBox::Inline(MutableInlineBox {
             core: thaw_element_box_core(&box_.core),
@@ -843,6 +845,55 @@ pub(crate) struct BlockBoxWith<'a, S = MutableStyle> {
     pub(crate) core: ElementBoxCoreWith<'a, S>,
     pub marker: Option<MarkerBoxWith<S>>,
     pub run_in_children: Vec<FormattingBoxWith<'a, S>>,
+    /// HTML fieldsets have a rendering-time structure that is distinct from
+    /// an ordinary block's source child list. The selected child remains in
+    /// `core.children` so CSS selectors and source-order side effects keep
+    /// their DOM identity; layout uses this record to promote it to the
+    /// rendered-legend slot and wrap the remaining children anonymously.
+    ///
+    /// <https://html.spec.whatwg.org/multipage/rendering.html#the-fieldset-and-legend-elements>
+    pub(crate) fieldset: Option<FieldsetFormattingBox>,
+}
+
+/// Rendering-time selection state for an HTML `fieldset` principal box.
+///
+/// The HTML rendering model promotes the first eligible direct `legend` child
+/// to a rendered-legend slot. Its index deliberately addresses the immutable
+/// formatting-tree child order rather than the DOM: tree-abiding generated
+/// boxes may precede it, but never qualify as a legend themselves.
+///
+/// <https://html.spec.whatwg.org/multipage/rendering.html#the-fieldset-and-legend-elements>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FieldsetFormattingBox {
+    pub(crate) rendered_legend_index: Option<usize>,
+}
+
+impl FieldsetFormattingBox {
+    /// Select the first direct in-flow principal `legend` box.
+    ///
+    /// This is shared by mutable construction and frozen layout traversal so
+    /// generated boxes cannot make the two paths disagree about which legend
+    /// owns the rendered-legend slot.
+    /// <https://html.spec.whatwg.org/multipage/rendering.html#the-fieldset-and-legend-elements>
+    pub(crate) fn from_children<S>(children: &[FormattingBoxWith<'_, S>]) -> Self
+    where
+        S: AsRef<ComputedStyle>,
+    {
+        Self {
+            rendered_legend_index: children.iter().position(|child| {
+                let Some(core) = child.element_core() else {
+                    return false;
+                };
+                core.element.tag.eq_ignore_ascii_case("legend")
+                    && matches!(core.source, BoxSource::Principal)
+                    && core.style.as_ref().float == Float::None
+                    && !matches!(
+                        core.style.as_ref().position,
+                        Position::Absolute | Position::Fixed
+                    )
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

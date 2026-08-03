@@ -219,10 +219,16 @@ impl GridLanesTrackGeometry {
 
 impl GridLanesAxis {
     fn from_style(style: &ComputedStyle) -> Self {
-        match style.grid_lanes_direction.axis {
-            css::GridLanesDirectionAxis::Column => Self::Columns,
-            css::GridLanesDirectionAxis::Row => Self::Rows,
-            css::GridLanesDirectionAxis::Normal => {
+        match style.grid_lanes_direction {
+            css::GridLanesDirection::Axis {
+                axis: css::GridLanesAxis::Column,
+                ..
+            } => Self::Columns,
+            css::GridLanesDirection::Axis {
+                axis: css::GridLanesAxis::Row,
+                ..
+            } => Self::Rows,
+            css::GridLanesDirection::Normal => {
                 match (&style.grid_template_columns, &style.grid_template_rows) {
                     (css::GridTrackList::None, css::GridTrackList::Tracks { .. }) => Self::Rows,
                     _ => Self::Columns,
@@ -256,7 +262,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         style: &ComputedStyle,
         children: &[GridChild<'_>],
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         width: PhysicalContentWidth,
         mut layout: GridLayout,
         subgrid_context: Option<&ResolvedSubgridContext>,
@@ -447,7 +453,13 @@ impl<'a> LayoutBuilder<'a> {
             };
             if auto_placed {
                 auto_placement_cursor = range.end;
-                if style.grid_lanes_direction.track_reverse {
+                if matches!(
+                    style.grid_lanes_direction,
+                    css::GridLanesDirection::Axis {
+                        track_reverse: true,
+                        ..
+                    }
+                ) {
                     range = grid_lanes_reverse_range(range, lane_count);
                 }
             }
@@ -614,7 +626,7 @@ impl<'a> LayoutBuilder<'a> {
             // height is replaced by the stacking range.
             // <https://drafts.csswg.org/css-grid-3/#sizing-grid-containers>
             if used_length_percentage_or_auto(
-                style.box_values.height.clone(),
+                style.box_values.height.value().clone(),
                 PercentageBasis::definite(layout_pt(layout.height.points())),
             )
             .is_none()
@@ -628,7 +640,7 @@ impl<'a> LayoutBuilder<'a> {
             // own auto-placement, so preserve the authored lane rows here.
             if has_auto_row_geometry
                 && used_length_percentage_or_auto(
-                    style.box_values.height.clone(),
+                    style.box_values.height.value().clone(),
                     PercentageBasis::definite(layout_pt(layout.height.points())),
                 )
                 .is_none()
@@ -657,7 +669,13 @@ impl<'a> LayoutBuilder<'a> {
             GridLanesAxis::Columns => {
                 for (item, child) in placed.iter_mut().zip(children) {
                     let margins = grid_lanes_margins(&child.style, inline_percentage_basis);
-                    if style.grid_lanes_direction.fill_reverse {
+                    if matches!(
+                        style.grid_lanes_direction,
+                        css::GridLanesDirection::Axis {
+                            fill_reverse: true,
+                            ..
+                        }
+                    ) {
                         item.set_axis_geometry(
                             GridAxis::Row,
                             stacking_extent - (item.y() + item.height() + margins.bottom.points())
@@ -675,7 +693,13 @@ impl<'a> LayoutBuilder<'a> {
             GridLanesAxis::Rows => {
                 for (item, child) in placed.iter_mut().zip(children) {
                     let margins = grid_lanes_margins(&child.style, inline_percentage_basis);
-                    if style.grid_lanes_direction.fill_reverse {
+                    if matches!(
+                        style.grid_lanes_direction,
+                        css::GridLanesDirection::Axis {
+                            fill_reverse: true,
+                            ..
+                        }
+                    ) {
                         item.set_axis_geometry(
                             GridAxis::Column,
                             stacking_extent - (item.x() + item.width() + margins.right.points())
@@ -714,7 +738,7 @@ impl<'a> LayoutBuilder<'a> {
     fn grid_lanes_item_border_block_size(
         &mut self,
         child: &GridChild<'_>,
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         grid_axis_border_size: f32,
         inline_percentage_basis: GridLanesPercentageBasis,
         axis: GridLanesAxis,
@@ -769,7 +793,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         tracks: &css::GridTrackList,
         children: &[GridChild<'_>],
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         inline_percentage_basis: GridLanesPercentageBasis,
         gap: css::ComputedGap,
         content_alignment: css::ContentAlignment,
@@ -855,7 +879,7 @@ impl<'a> LayoutBuilder<'a> {
         tracks: &css::GridTrackList,
         children: &[GridChild<'_>],
         items: &[GridItemLayout],
-        stylesheets: &[Stylesheet],
+        stylesheets: &Stylesheets<'_>,
         inline_percentage_basis: GridLanesPercentageBasis,
         available_size: GridLanesPercentageBasis,
         gap: f32,
@@ -892,7 +916,7 @@ impl<'a> LayoutBuilder<'a> {
                     margins.left.points() + margins.right.points(),
                 ),
                 GridLanesAxis::Rows => (
-                    child.style.box_values.height.clone(),
+                    child.style.box_values.height.value().clone(),
                     item.height(),
                     grid_lanes_vertical_non_content(&child.style, inline_percentage_basis),
                     margins.top.points() + margins.bottom.points(),
@@ -1122,7 +1146,7 @@ fn grid_lanes_grid_axis_specified_border_size(
             layout_pt(used_border_widths(child_style).right),
         ),
         GridLanesAxis::Rows => (
-            child_style.box_values.height.clone(),
+            child_style.box_values.height.value().clone(),
             used_length_percentage(
                 child_style.box_values.padding.top.clone(),
                 PercentageBasis::definite(area_size),
@@ -1183,7 +1207,7 @@ fn grid_lanes_alignment_uses_physical_start(
 fn grid_lanes_grid_axis_size_is_auto(axis: GridLanesAxis, style: &ComputedStyle) -> bool {
     let size = match axis {
         GridLanesAxis::Columns => style.box_values.width.clone(),
-        GridLanesAxis::Rows => style.box_values.height.clone(),
+        GridLanesAxis::Rows => style.box_values.height.value().clone(),
     };
     used_length_percentage_or_auto(size, PercentageBasis::<LayoutLength>::indefinite()).is_none()
 }
@@ -1479,8 +1503,8 @@ fn grid_lanes_has_out_of_range_explicit_placement(
     children.iter().any(|child| {
         let (start, end) = axis.placements(child);
         [start, end].into_iter().any(|placement| {
-            matches!(placement, css::GridPlacement::Line(line) if line.name.is_none()
-                && line.index.is_some_and(|index| index > last_explicit_line))
+            matches!(placement, css::GridPlacement::Line(line) if line.name().is_none()
+                && line.index().is_some_and(|index| index > last_explicit_line))
         })
     })
 }
@@ -1489,7 +1513,7 @@ fn grid_lanes_span(axis: GridLanesAxis, child: &GridChild<'_>, lane_count: usize
     let (start, end) = axis.placements(child);
     match (start, end) {
         (css::GridPlacement::Span(span), _) | (_, css::GridPlacement::Span(span)) => {
-            usize::from(span.span.unwrap_or(1))
+            usize::from(span.count().unwrap_or(1))
         }
         _ => 1,
     }
@@ -1560,7 +1584,7 @@ fn grid_lanes_line(
     let css::GridPlacement::Line(line) = placement else {
         return None;
     };
-    let index = line.index?;
+    let index = line.index()?;
     if index > 0 {
         usize::try_from(index - 1)
             .ok()

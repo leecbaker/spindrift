@@ -89,38 +89,6 @@ pub(crate) fn keep_all_suppresses_break_between(previous: char, next: char) -> b
     keep_all_unbreakable_unit(previous) && keep_all_unbreakable_unit(next)
 }
 
-/// Return whether an intra-text break contributes to min-content sizing.
-///
-/// CSS Sizing min-content uses ordinary CSS Text soft wrap opportunities,
-/// including normal UAX #14 ideographic boundaries. `keep-all` may suppress
-/// such a boundary; `overflow-wrap:break-word` emergency opportunities are
-/// intentionally handled by graph metadata and do not call this predicate:
-/// <https://www.w3.org/TR/css-sizing-3/#min-content> and
-/// <https://www.w3.org/TR/css-text-3/#overflow-wrap-property>.
-pub(crate) fn text_break_is_min_content_eligible(
-    text: &str,
-    style: &ComputedStyle,
-    byte_offset: usize,
-) -> bool {
-    if byte_offset == 0 || byte_offset >= text.len() || !text.is_char_boundary(byte_offset) {
-        return false;
-    }
-    let previous = text[..byte_offset].chars().next_back();
-    let next = text[byte_offset..].chars().next();
-    if let (Some(previous), Some(next)) = (previous, next) {
-        match style.word_break {
-            CssWordBreak::KeepAll if keep_all_suppresses_break_between(previous, next) => {
-                return false;
-            }
-            CssWordBreak::Manual if manual_suppresses_break_between(previous, next) => {
-                return false;
-            }
-            _ => {}
-        }
-    }
-    true
-}
-
 fn keep_all_unbreakable_unit(character: char) -> bool {
     character_is_unicode_alphanumeric(character)
         || matches!(line_break_class(character), LineBreak::Ideographic)
@@ -138,7 +106,7 @@ fn character_blocks_inter_character_gap(character: char) -> bool {
     character_has_joining_behavior(character) || character_is_inter_character_control(character)
 }
 
-fn character_is_inter_character_control(character: char) -> bool {
+pub(crate) fn character_is_inter_character_control(character: char) -> bool {
     character_is_join_control(character)
         || character_is_unicode_control(character)
         || character_is_default_ignorable_code_point(character)
@@ -225,32 +193,21 @@ mod tests {
     }
 
     #[test]
+    fn typographic_units_split_latin_around_halfwidth_katakana_middle_dot() {
+        let text = "a･a";
+        let units = typographic_unit_ranges(text)
+            .into_iter()
+            .map(|range| &text[range])
+            .collect::<Vec<_>>();
+
+        assert_eq!(units, vec!["a", "･", "a"]);
+    }
+
+    #[test]
     fn keep_all_policy_suppresses_word_units_but_not_space_or_punctuation() {
         assert!(keep_all_suppresses_break_between('A', '中'));
         assert!(keep_all_suppresses_break_between('中', '文'));
         assert!(!keep_all_suppresses_break_between('中', ' '));
         assert!(!keep_all_suppresses_break_between('。', '文'));
-    }
-
-    #[test]
-    fn min_content_uses_ordinary_ideographic_soft_wraps() {
-        let mut style = ComputedStyle::initial();
-        let text = "中文";
-        assert!(text_break_is_min_content_eligible(text, &style, "中".len()));
-
-        style.word_break = CssWordBreak::KeepAll;
-        assert!(!text_break_is_min_content_eligible(
-            text,
-            &style,
-            "中".len()
-        ));
-    }
-
-    #[test]
-    fn min_content_manual_excludes_complex_context_dictionary_breaks() {
-        let mut style = ComputedStyle::initial();
-        style.word_break = CssWordBreak::Manual;
-        let text = "กรุงเทพ";
-        assert!(!text_break_is_min_content_eligible(text, &style, "ก".len()));
     }
 }

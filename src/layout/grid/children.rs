@@ -9,11 +9,10 @@ use std::ops::{Deref, DerefMut};
 /// <https://drafts.csswg.org/css-viewport/#zoom-property>
 /// <https://www.w3.org/TR/css-grid-1/#algo-overview>
 #[derive(Debug, Clone)]
-pub(super) struct GridUsedStyle(ComputedStyle);
+pub(super) struct GridUsedStyle(css::ZoomedLayoutStyle);
 
 impl GridUsedStyle {
-    pub(super) fn from_normalized(style: ComputedStyle) -> Self {
-        debug_assert!(style.zoom_applied);
+    pub(super) fn from_normalized(style: css::ZoomedLayoutStyle) -> Self {
         Self(style)
     }
 
@@ -50,7 +49,10 @@ pub(super) struct GridUsedItem<'a> {
 }
 
 impl<'a> GridUsedItem<'a> {
-    pub(super) fn from_source(source: FormattingContextChild<'a>, style: ComputedStyle) -> Self {
+    pub(super) fn from_source(
+        source: FormattingContextChild<'a>,
+        style: css::ZoomedLayoutStyle,
+    ) -> Self {
         Self {
             source,
             style: GridUsedStyle::from_normalized(style),
@@ -77,7 +79,10 @@ pub(super) fn positioned_grid_static_probe_child<'a>(child: &GridChild<'a>) -> G
     }
     style.margin = css::Edges::ZERO;
     style.box_values.width = css::ComputedLengthPercentageOrAuto::ZERO;
-    style.box_values.height = css::ComputedLengthPercentageOrAuto::ZERO;
+    style
+        .box_values
+        .height
+        .replace_with_used(css::ComputedLengthPercentageOrAuto::ZERO);
     style.box_values.min_width = css::ComputedLengthPercentageOrAuto::ZERO;
     style.box_values.min_height = css::ComputedLengthPercentageOrAuto::ZERO;
     style.box_values.max_width = css::ComputedLengthPercentageOrAuto::ZERO;
@@ -109,17 +114,11 @@ pub(super) fn grid_child_lists_from_boxes<'a>(
 impl<'a> LayoutBuilder<'a> {
     /// Return the Grid used-style view for a formatting-context entrypoint.
     ///
-    /// Some intrinsic probes receive a style already prepared by their parent
-    /// formatting context, while standalone Grid roots start from frozen
-    /// computed style. Normalize only the latter so effective zoom remains a
-    /// one-time conversion.
+    /// Grid roots enter a dedicated zoomed used-value view before sizing or
+    /// replay. Legacy replay records may retain a raw zoomed style.
     /// <https://drafts.csswg.org/css-viewport/#zoom-property>
     pub(in crate::layout::grid) fn grid_used_style(&self, style: &ComputedStyle) -> GridUsedStyle {
-        if style.zoom_applied {
-            GridUsedStyle::from_normalized(style.clone())
-        } else {
-            GridUsedStyle::from_normalized(self.style_with_current_viewport_lengths(style))
-        }
+        GridUsedStyle::from_normalized(self.style_with_current_viewport_lengths(style))
     }
 
     /// Resolve a Grid item's deferred lengths and create its used-style view.
@@ -137,8 +136,7 @@ impl<'a> LayoutBuilder<'a> {
             .into_iter()
             .map(|mut source| {
                 self.resolve_style_current_viewport_lengths(&mut source.style);
-                let mut style = source.style.clone();
-                style.apply_effective_zoom();
+                let style = css::LayoutStyle::from_computed(&source.style).into_zoomed();
                 GridUsedItem::from_source(source, style)
             })
             .collect()

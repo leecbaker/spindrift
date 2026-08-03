@@ -38,9 +38,10 @@ behavior where the specs leave implementation details ambiguous.
 - Floats with no visible paint, including `visibility:hidden` placeholders,
   still record margin-box exclusions, so consecutive same-line floats reserve
   reference-grid cells before later floats are placed.
-- Line boxes, normal-flow block formatting context roots, table wrappers,
-  block-level replaced boxes, flex containers, and SVG/canvas blocks avoid
-  active floats through the shared float collision model.
+- Line boxes and normal-flow horizontal block formatting context roots avoid
+  active floats through the shared float collision model. Table wrappers,
+  flex/grid roots, replaced boxes, and orthogonal flows still need broader
+  parity coverage.
 - In-flow block fragments produced by block-in-inline splitting query active
   float exclusions in their relatively positioned inline ancestor's visual
   coordinate space. Their parent normal-flow cursor and interposed float's
@@ -71,9 +72,7 @@ behavior where the specs leave implementation details ambiguous.
   beyond its containing inline span through that margin instead of being
   incorrectly moved below the float.
 - Float-stacking placement and normal-flow BFC avoidance retain distinct
-  hypothetical block positions: a following table, grid, flex, or replaced
-  BFC root stays at its source position unless its own margin box cannot fit
-  the active exclusion band.
+  hypothetical block positions for horizontal block formatting-context roots.
 - Auto-layout table wrappers use the complete active float band for their
   shrink-to-fit input, and a cell's declared `width` contributes a preferred
   track size rather than incorrectly becoming its min-content floor.
@@ -101,6 +100,10 @@ behavior where the specs leave implementation details ambiguous.
   unrelated same-page floats.
 - `clear` accounts for active same-page fragments of a broken float, including
   float fragments continued from earlier fragmentainers.
+- An empty tree-abiding generated block with `clear` remains a normal-flow
+  clearance boundary rather than collapsing through its parent. This lets the
+  common `::after { content: ""; clear: both }` clearfix include preceding
+  float rows in the parent's automatic height and background.
 - Clearance candidates with adjoining collapsed top margins use the
   post-collapse hypothetical border edge, so a large collapsed top margin that
   already places the empty block below the matching float does not create
@@ -119,20 +122,29 @@ behavior where the specs leave implementation details ambiguous.
 - Inline floats are preserved as zero-width graph markers during line
   selection. A marker reached at the start of a selected line is placed before
   following text is selected. A marker reached after preceding inline text is
-  placed on that current line when its margin box fits in the remaining band;
-  suffix text is then reselected into the same line when there is post-float
-  space. If an oversized tentative placement cannot keep visible suffix content
-  on that completed line, the placement is rolled back so the marker defers
-  with the suffix to the next line. Prefix text keeps its original position.
+  placed on that current line when its signed CSS2 outer margin extent fits the
+  remaining band; suffix text is then reselected against the final,
+  non-negative float-exclusion band. A negative end margin can therefore paint
+  beyond the band while preserving its aligned outer margin edge and leaving
+  the suffix on the same line. If an oversized tentative placement cannot keep
+  visible suffix content on that completed line, the placement is rolled back
+  so the marker defers with the suffix to the next line. Prefix text keeps its
+  original position.
 - Equal-width line break candidates advance over zero-width inline float
   markers, so an inline-block prefix does not force a following fitting
   right float onto the next line.
 - Inline float markers inside unbreakable `white-space: nowrap` and `pre`
-  lines no longer create artificial line breaks; floats are placed at the
-  current line top while surrounding inline content remains on the overflowing
-  visual line. Collapsible whitespace now looks through those zero-width
-  out-of-flow markers, so spaces adjacent to the marker collapse as if the
-  float were not part of the inline text run.
+  lines use a source-order transaction rather than a synthetic CSS Text break.
+  The transaction preserves the selected source range and real break metadata,
+  line slab, physical placement floor, and committed exclusion. A right float
+  that cannot fit after its prefix uses the earliest legal later float row
+  without splitting or soft-wrapping the source line. This covers the current
+  `float-nowrap-1.html` and `float-nowrap-hyphen-rewind-1.html` cases; broader
+  fragmented and nested inline-float replay remains listed in
+  `SPEC_DIVERGENCES.md`.
+  Collapsible whitespace looks through those zero-width out-of-flow markers,
+  so adjacent spaces collapse as if the float were not part of the inline
+  text run.
 - `clear` progresses across continued float fragments, applying pending
   page-local exclusions until the final matching continuation is cleared.
 - HTML `br` line breaks generated by `br::before` preserve the originating
@@ -184,8 +196,6 @@ behavior where the specs leave implementation details ambiguous.
 - Complete split-flow inline continuation replay. A float normalized from an
   inline ancestor must still make its source line and its following inline
   continuation participate in the same float-excluded line-selection retry.
-- Distinguish a descendant `white-space: nowrap` island from ordinary
-  float-excluded soft-wrap recovery, including hyphenation rewind.
 
 ## CSS2 Float Benchmark
 
@@ -195,4 +205,7 @@ This improves on the 49/67 baseline and remains below its 9.15s render time.
 The former auto-height crashtest timeout completes without timing out. The
 remaining failures are `float-no-content-beside-001.html`, the two nowrap
 cases, `floats-line-wrap-shifted-001.html`, and
-`zero-width-floats-positioning.tentative.html`.
+`zero-width-floats-positioning.tentative.html`. A fresh targeted run on
+2026-08-02 confirms that its unbreakable lines select the first full-width
+slab below the float; the reftest still differs in the separate explicit-break
+and `clear: both` paragraph-flow replay.

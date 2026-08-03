@@ -1,4 +1,5 @@
 use super::*;
+use crate::css::component_values::split_css_component_values;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ParsedGapRuleShorthand {
@@ -242,32 +243,7 @@ fn strip_gap_repeat_function(value: &str) -> Option<&str> {
 }
 
 fn map_gap_rule_list<T, U>(list: &GapRuleList<T>, map: impl Fn(&T) -> U + Copy) -> GapRuleList<U> {
-    GapRuleList::from_parts(
-        list.leading
-            .iter()
-            .map(|component| map_gap_rule_component(component, map))
-            .collect(),
-        list.auto
-            .as_ref()
-            .map(|values| values.iter().map(map).collect()),
-        list.trailing
-            .iter()
-            .map(|component| map_gap_rule_component(component, map))
-            .collect(),
-    )
-}
-
-fn map_gap_rule_component<T, U>(
-    component: &GapRuleListComponent<T>,
-    map: impl Fn(&T) -> U + Copy,
-) -> GapRuleListComponent<U> {
-    match component {
-        GapRuleListComponent::Value(value) => GapRuleListComponent::Value(map(value)),
-        GapRuleListComponent::Repeat { count, values } => GapRuleListComponent::Repeat {
-            count: *count,
-            values: values.iter().map(map).collect(),
-        },
-    }
+    list.map(map)
 }
 
 fn split_top_level_commas(value: &str) -> Vec<&str> {

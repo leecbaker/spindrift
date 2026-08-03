@@ -2,6 +2,22 @@ use super::super::super::*;
 use super::model::*;
 
 impl<'a> LayoutBuilder<'a> {
+    /// Captures one float's complete page-local paint subtree for replay in
+    /// the parent float paint band.
+    ///
+    /// The captured [`PaintFragment`] retains every paint primitive emitted by
+    /// the floated box's decoration, including vector SVG [`PaintPrimitive::Path`]
+    /// and tiled [`PaintPrimitive::SvgPattern`] background layers from a
+    /// tree-abiding generated pseudo-element.  Re-parenting the existing
+    /// display-list nodes, rather than reconstructing a subset of decoration
+    /// paint, preserves CSS background clips, transforms, source order, and
+    /// the float's ownership across fragmentation.
+    ///
+    /// <https://www.w3.org/TR/css-backgrounds-3/#layering>
+    /// <https://drafts.csswg.org/css-pseudo-4/#generated-content>
+    /// <https://www.w3.org/TR/CSS22/visuren.html#floats>
+    /// <https://www.w3.org/TR/CSS22/zindex.html>
+    /// <https://www.w3.org/TR/css-break-3/>
     #[allow(clippy::too_many_arguments)]
     pub(in crate::layout) fn build_float_paint_fragment(
         &mut self,
@@ -11,11 +27,13 @@ impl<'a> LayoutBuilder<'a> {
         side: UsedFloatSide,
         source_order: usize,
         placement: LogicalFloatPlacement,
+        outer_inline_extent: MarginBoxLength,
         fallback_bounds: PaintClip,
         style: &ComputedStyle,
         replaced_content_is_clipped: bool,
         fragment: PaintFragment,
         child_contexts: Vec<PaintStackingContext>,
+        is_fragmented_float: bool,
     ) -> Option<FloatPaintFragment> {
         if fragment.is_empty() && child_contexts.is_empty() {
             return None;
@@ -49,18 +67,31 @@ impl<'a> LayoutBuilder<'a> {
             .with_source_order(source_order)
             .with_effects(policy.effects)
             .with_bounds(bounds);
-        let rect = PageTopRect::new(
-            placement.margin_box.x(),
-            bounds.y() + bounds.height(),
-            placement.margin_box.width(),
-            bounds.height(),
-        );
+        // An unsplit float's exclusion is defined by its used margin box, not by the
+        // union of the paint primitives that happened to be emitted while
+        // replaying the float. A child-only paint fragment can omit the
+        // float's border or padding, which would otherwise make a following
+        // float start one border-width earlier than its sibling. A fragmented
+        // float, conversely, needs the page-local paint bounds for each
+        // continuation rather than its full source margin box.
+        // <https://www.w3.org/TR/CSS22/visuren.html#float-position>
+        let rect = if is_fragmented_float {
+            PageTopRect::new(
+                placement.margin_box.x(),
+                bounds.y() + bounds.height(),
+                placement.margin_box.width(),
+                bounds.height(),
+            )
+        } else {
+            placement.margin_box
+        };
         Some(FloatPaintFragment {
             id,
             specified_side,
             page_index,
             side,
             rect,
+            outer_inline_extent,
             placement: placement
                 .with_margin_box(placement.containing, rect)
                 .on_page(page_index),

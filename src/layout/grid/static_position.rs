@@ -7,7 +7,7 @@ use super::*;
 /// <https://www.w3.org/TR/css-grid-1/#abspos-items>.
 pub(super) struct PositionedGridStaticContext<'a> {
     pub(super) container_style: &'a ComputedStyle,
-    pub(super) stylesheets: &'a [Stylesheet],
+    pub(super) stylesheets: &'a Stylesheets<'a>,
     pub(super) inner_x: f32,
     pub(super) inner_width: PhysicalContentWidth,
     pub(super) content_top: f32,
@@ -15,7 +15,23 @@ pub(super) struct PositionedGridStaticContext<'a> {
     pub(super) content_height: PhysicalContentHeight,
     pub(super) column_line_offsets: &'a [f32],
     pub(super) row_line_offsets: &'a [f32],
-    pub(super) establishes_positioning_containing_block: bool,
+    /// The Grid padding box when this Grid establishes the child's actual
+    /// absolute-positioning containing block.
+    pub(super) positioning_containing_block: Option<ContainingBlock>,
+}
+
+/// The formatting-context source of a Grid child's static-position rectangle.
+///
+/// A Grid child uses the Grid content edges when its actual containing block
+/// is elsewhere. Only a Grid that establishes that actual containing block
+/// substitutes the grid-placement area (whose automatic placement edges are
+/// the Grid padding edges):
+/// <https://www.w3.org/TR/css-position-3/#staticpos-rect> and
+/// <https://www.w3.org/TR/css-grid-1/#abspos>.
+#[derive(Debug, Clone, Copy)]
+enum GridAbsposStaticPositionSource {
+    ContentEdges,
+    PlacementArea { padding_box: ContainingBlock },
 }
 
 /// Final grid geometry made available while replaying grid contents.
@@ -49,6 +65,90 @@ pub(in crate::layout) struct GridPositionedDescendantContext {
     /// separate value below.
     pub(in crate::layout) grid_area_containing_block: Option<ContainingBlock>,
     pub(in crate::layout) static_position: AbsoluteStaticPosition,
+}
+
+/// Resolve the physical rectangle used by Grid to establish a child's static
+/// position. The caller has already resolved a placement area from final grid
+/// line geometry; this function applies CSS Grid's special automatic
+/// placement lines at the Grid padding edges when that placement area is the
+/// actual containing block.
+fn grid_abspos_static_position_area(
+    source: GridAbsposStaticPositionSource,
+    placement_area: PageTopRect,
+    child_style: &ComputedStyle,
+    container_style: &ComputedStyle,
+) -> PageTopRect {
+    let GridAbsposStaticPositionSource::PlacementArea { padding_box } = source else {
+        return placement_area;
+    };
+
+    let mut left = placement_area.x();
+    let mut right = left + placement_area.width();
+    let mut top = placement_area.top_y();
+    let mut bottom = placement_area.bottom_y();
+    let padding = padding_box.rect;
+    let axes = WritingModeAxes::new(
+        container_style.writing_mode,
+        container_style.used_direction(),
+    );
+    let mut use_padding_edge = |placement: &css::GridPlacement, side: LogicalSide| {
+        if !matches!(placement, css::GridPlacement::Auto) {
+            return;
+        }
+        match axes.physical_side(side) {
+            PhysicalSide::Left => left = padding.x(),
+            PhysicalSide::Right => right = padding.x() + padding.width(),
+            PhysicalSide::Top => top = padding.top_y(),
+            PhysicalSide::Bottom => bottom = padding.bottom_y(),
+        }
+    };
+    use_padding_edge(&child_style.grid_column_start, LogicalSide::InlineStart);
+    use_padding_edge(&child_style.grid_column_end, LogicalSide::InlineEnd);
+    use_padding_edge(&child_style.grid_row_start, LogicalSide::BlockStart);
+    use_padding_edge(&child_style.grid_row_end, LogicalSide::BlockEnd);
+
+    PageTopRect::new(
+        left.min(right),
+        top.max(bottom),
+        (right - left).abs(),
+        (top - bottom).abs(),
+    )
+}
+
+/// Convert Grid's selected static-position rectangle into the generic
+/// positioned-layout handoff without applying self-alignment early. The
+/// generic positioned algorithm owns alignment because it is the first point
+/// where the abspos margin-box size is known.
+fn grid_positioned_child_static_rect(
+    source: GridAbsposStaticPositionSource,
+    area: PageTopRect,
+    child_style: &ComputedStyle,
+    container_style: &ComputedStyle,
+) -> PositionedChildStaticRect {
+    let left = area.x();
+    let right = left + area.width();
+    let static_rect = match source {
+        GridAbsposStaticPositionSource::ContentEdges => {
+            PositionedChildStaticRect::new(left, right, area.top_y())
+        }
+        GridAbsposStaticPositionSource::PlacementArea { .. } => {
+            PositionedChildStaticRect::with_containing_block(
+                left,
+                right,
+                area.top_y(),
+                ContainingBlock::from_page_top_rect(area),
+            )
+        }
+    };
+    if grid_abspos_has_explicit_alignment(child_style, container_style) {
+        static_rect.with_static_alignment(grid_abspos_static_alignment(
+            area,
+            child_style,
+            container_style,
+        ))
+    } else {
+        static_rect
+    }
 }
 
 impl GridPositioningScope {
@@ -181,7 +281,17 @@ impl GridPositioningScope {
             let left = self.inner_x + x;
             let right = self.inner_x + right;
             let top = self.content_top - y;
-            let area = PageTopRect::new(left, top, right - left, (bottom - y).max(0.0));
+            let area = grid_abspos_static_position_area(
+                GridAbsposStaticPositionSource::PlacementArea {
+                    padding_box: self.containing_block,
+                },
+                PageTopRect::new(left, top, right - left, (bottom - y).max(0.0)),
+                style,
+                &self.container_style,
+            );
+            let left = area.x();
+            let right = left + area.width();
+            let top = area.top_y();
             let placement_selects_grid_area = !matches!(
                 (
                     &style.grid_column_start,
@@ -210,7 +320,10 @@ impl GridPositioningScope {
                 static_position: AbsoluteStaticPosition::from_page_rect_with_horizontal_outside(
                     left, right, top, true,
                 )
-                .with_grid_alignment(GridAbsposStaticAlignment::new(area, &self.container_style)),
+                .with_static_alignment_if(
+                    grid_abspos_static_alignment(area, style, &self.container_style),
+                    grid_abspos_has_explicit_alignment(style, &self.container_style),
+                ),
             }
         })
     }
@@ -282,6 +395,39 @@ impl<'a> LayoutBuilder<'a> {
         in_flow_children: &[GridChild<'grid>],
         context: PositionedGridStaticContext<'_>,
     ) {
+        let source = context.positioning_containing_block.map_or(
+            GridAbsposStaticPositionSource::ContentEdges,
+            |padding_box| GridAbsposStaticPositionSource::PlacementArea { padding_box },
+        );
+        let row_container_size = context
+            .definite_content_height
+            .unwrap_or(context.content_height)
+            .points();
+        let content_area = PageTopRect::new(
+            context.inner_x,
+            context.content_top,
+            context.inner_width.points(),
+            row_container_size,
+        );
+        if matches!(source, GridAbsposStaticPositionSource::ContentEdges) {
+            // Grid placement applies only when this Grid establishes the
+            // actual containing block. Otherwise the static-position
+            // rectangle is its content box, irrespective of grid-area.
+            // <https://www.w3.org/TR/css-position-3/#staticpos-rect>
+            let static_rect = grid_positioned_child_static_rect(
+                source,
+                content_area,
+                &child.style,
+                context.container_style,
+            );
+            self.layout_positioned_formatting_context_child(
+                child,
+                context.stylesheets,
+                static_rect,
+            );
+            return;
+        }
+
         let hypothetical_child = positioned_grid_static_probe_child(child);
         let mut hypothetical_children = Vec::with_capacity(in_flow_children.len() + 1);
         hypothetical_children.extend_from_slice(in_flow_children);
@@ -378,10 +524,6 @@ impl<'a> LayoutBuilder<'a> {
                 logical_end - logical_start,
             );
         }
-        let row_container_size = context
-            .definite_content_height
-            .unwrap_or(context.content_height)
-            .points();
         let row_start = grid_static_line_offset(
             &context.container_style.grid_template_rows,
             &context.container_style.grid_auto_rows,
@@ -429,17 +571,11 @@ impl<'a> LayoutBuilder<'a> {
             hypothetical.set_axis_geometry(GridAxis::Row, 0.0, row_container_size);
         }
 
-        if !context.establishes_positioning_containing_block {
-            hypothetical.set_axis_geometry(GridAxis::Column, 0.0, context.inner_width.points());
-            hypothetical.set_axis_geometry(GridAxis::Row, 0.0, row_container_size);
-        }
-
-        if context.establishes_positioning_containing_block
-            && WritingModeAxes::new(
-                context.container_style.writing_mode,
-                context.container_style.direction,
-            )
-            .swaps_physical_axes()
+        if WritingModeAxes::new(
+            context.container_style.writing_mode,
+            context.container_style.direction,
+        )
+        .swaps_physical_axes()
         {
             // `compute_grid_layout` adapts CSS Grid's logical axes to
             // Taffy's physical x/y tracks. For a positioned grid child whose
@@ -505,223 +641,118 @@ impl<'a> LayoutBuilder<'a> {
             hypothetical.set_axis_geometry(GridAxis::Row, y, y_end - y_start);
         }
 
-        apply_grid_abspos_self_alignment(
-            &mut hypothetical,
+        let placement_area = PageTopRect::new(
+            context.inner_x + hypothetical.x(),
+            context.content_top - hypothetical.y(),
+            hypothetical.width(),
+            hypothetical.height(),
+        );
+        let static_area = grid_abspos_static_position_area(
+            source,
+            placement_area,
             &child.style,
             context.container_style,
-            PercentageBasis::definite(layout_pt(context.inner_width.points())),
         );
-
-        let static_left = context.inner_x + hypothetical.x();
-        // The grid container's padding box remains the CSS containing block,
-        // while the grid area supplies static-position and alignment geometry.
-        // Keeping those values separate is essential when CSS Positioned
-        // Layout chooses the RTL static right side for automatic insets.
-        // <https://www.w3.org/TR/css-grid-1/#abspos-items> and
-        // <https://www.w3.org/TR/css-position-3/#static-position>
-        let static_width = grid_abspos_alignment_axis_metrics(
+        let static_rect = grid_positioned_child_static_rect(
+            source,
+            static_area,
             &child.style,
-            PercentageBasis::definite(layout_pt(context.inner_width.points())),
-            GridAbsposAlignmentAxis::Horizontal,
+            context.container_style,
         )
-        .border_size
-        .unwrap_or(hypothetical.width());
-        let static_top = context.content_top - hypothetical.y();
-        let grid_alignment = GridAbsposStaticAlignment::new(
-            PageTopRect::new(
-                static_left,
-                static_top,
-                hypothetical.width(),
-                hypothetical.height(),
-            ),
-            context.container_style,
+        .with_static_physical_edges(
+            grid_explicit_static_left_edge(&child.style, context.container_style, placement_area),
+            grid_explicit_static_right_edge(&child.style, context.container_style, placement_area),
+            grid_explicit_static_top_edge(&child.style, context.container_style, placement_area),
         );
-        let static_rect = if context.establishes_positioning_containing_block {
-            let containing_block = ContainingBlock::from_page_top_rect(PageTopRect::new(
-                static_left,
-                static_top,
-                hypothetical.width(),
-                hypothetical.height(),
-            ));
-            PositionedChildStaticRect::with_containing_block(
-                static_left,
-                static_left + static_width,
-                static_top,
-                containing_block,
-            )
-        } else {
-            PositionedChildStaticRect::new(static_left, static_left + static_width, static_top)
-        }
-        .with_grid_alignment(grid_alignment);
         self.layout_positioned_formatting_context_child(child, context.stylesheets, static_rect);
     }
 }
 
-/// Apply the definite-size portion of Grid abspos self-alignment while the
-/// static-position grid area is being constructed. Automatically sized axes
-/// are refined later by positioned layout once their used size is known.
+/// Preserve an explicit Grid area's physical edge as the CSS Positioned
+/// Layout static corner when its opposing automatic line maps to a padding
+/// edge on the other side of the normalized area.
 /// <https://www.w3.org/TR/css-grid-1/#abspos-items>
-fn apply_grid_abspos_self_alignment(
-    item: &mut GridItemLayout,
+fn grid_explicit_static_left_edge(
     child_style: &ComputedStyle,
     container_style: &ComputedStyle,
-    inline_percentage_basis: PercentageBasis<LayoutLength>,
-) {
-    let container_axes = WritingModeAxes::new(
+    placement_area: PageTopRect,
+) -> Option<f32> {
+    let axes = WritingModeAxes::new(
         container_style.writing_mode,
         container_style.used_direction(),
     );
-    let horizontal = grid_abspos_alignment_axis_metrics(
-        child_style,
-        inline_percentage_basis,
-        GridAbsposAlignmentAxis::Horizontal,
-    );
-    if let Some(border_size) = horizontal.border_size {
-        let (self_alignment, container_alignment) = if container_axes.swaps_physical_axes() {
-            (child_style.align_self, container_style.align_items)
-        } else {
-            (child_style.justify_self, container_style.justify_items)
-        };
-        let mut alignment = effective_grid_abspos_alignment(self_alignment, container_alignment);
-        if matches!(
-            (
-                container_axes.swaps_physical_axes(),
-                WritingModeAxes::new(child_style.writing_mode, child_style.direction,)
-                    .swaps_physical_axes()
-            ),
-            (true, false)
-        ) {
-            // `self-start` and `self-end` follow the item's own block axis.
-            // <https://drafts.csswg.org/css-align-3/#self-position>
-            alignment.keyword = match alignment.keyword {
-                SelfAlignmentKeyword::SelfStart => SelfAlignmentKeyword::End,
-                SelfAlignmentKeyword::SelfEnd => SelfAlignmentKeyword::Start,
-                other => other,
-            };
+    match axes.physical_side(LogicalSide::InlineStart) {
+        PhysicalSide::Left
+            if !matches!(child_style.grid_column_start, css::GridPlacement::Auto)
+                && matches!(child_style.grid_column_end, css::GridPlacement::Auto) =>
+        {
+            Some(placement_area.x())
         }
-        let x = item.x()
-            + grid_abspos_alignment_offset(
-                alignment,
-                item.width(),
-                border_size,
-                horizontal.margin_start,
-                horizontal.margin_end,
-                GridAbsposAlignmentDirection {
-                    reverse_start_end: container_axes.physical_start_side(
-                        container_axes.logical_axis_for_physical(PhysicalAxis::Horizontal),
-                    ) == PhysicalSide::Right,
-                    left_right_are_physical: !container_axes.swaps_physical_axes(),
-                    fallback_to_logical_start: container_axes.swaps_physical_axes()
-                        || container_axes.is_reversed(LogicalAxis::Inline),
-                },
-            );
-        item.set_axis_geometry(GridAxis::Column, x, item.width());
-    }
-    let vertical = grid_abspos_alignment_axis_metrics(
-        child_style,
-        inline_percentage_basis,
-        GridAbsposAlignmentAxis::Vertical,
-    );
-    if let Some(border_size) = vertical.border_size {
-        let (self_alignment, container_alignment) = if container_axes.swaps_physical_axes() {
-            (child_style.justify_self, container_style.justify_items)
-        } else {
-            (child_style.align_self, container_style.align_items)
-        };
-        let y = item.y()
-            + grid_abspos_alignment_offset(
-                effective_grid_abspos_alignment(self_alignment, container_alignment),
-                item.height(),
-                border_size,
-                vertical.margin_start,
-                vertical.margin_end,
-                GridAbsposAlignmentDirection {
-                    reverse_start_end: false,
-                    left_right_are_physical: false,
-                    fallback_to_logical_start: false,
-                },
-            );
-        item.set_axis_geometry(GridAxis::Row, y, item.height());
-    }
-}
-
-#[derive(Clone, Copy)]
-enum GridAbsposAlignmentAxis {
-    Horizontal,
-    Vertical,
-}
-
-struct GridAbsposAlignmentMetrics {
-    border_size: Option<f32>,
-    margin_start: f32,
-    margin_end: f32,
-}
-
-fn grid_abspos_alignment_axis_metrics(
-    style: &ComputedStyle,
-    percentage_basis: PercentageBasis<LayoutLength>,
-    axis: GridAbsposAlignmentAxis,
-) -> GridAbsposAlignmentMetrics {
-    let (
-        specified,
-        box_sizing,
-        padding_start,
-        padding_end,
-        border_start,
-        border_end,
-        margin_start,
-        margin_end,
-    ) = match axis {
-        GridAbsposAlignmentAxis::Horizontal => (
-            style.box_values.width.clone(),
-            style.box_sizing,
-            used_length_percentage(style.box_values.padding.left.clone(), percentage_basis)
-                .points(),
-            used_length_percentage(style.box_values.padding.right.clone(), percentage_basis)
-                .points(),
-            used_border_widths(style).left,
-            used_border_widths(style).right,
-            used_length_percentage_or_auto(style.box_values.margin.left.clone(), percentage_basis)
-                .map(|margin| margin.points())
-                .unwrap_or(0.0),
-            used_length_percentage_or_auto(style.box_values.margin.right.clone(), percentage_basis)
-                .map(|margin| margin.points())
-                .unwrap_or(0.0),
-        ),
-        GridAbsposAlignmentAxis::Vertical => (
-            style.box_values.height.clone(),
-            style.box_sizing,
-            used_length_percentage(style.box_values.padding.top.clone(), percentage_basis).points(),
-            used_length_percentage(style.box_values.padding.bottom.clone(), percentage_basis)
-                .points(),
-            used_border_widths(style).top,
-            used_border_widths(style).bottom,
-            used_length_percentage_or_auto(style.box_values.margin.top.clone(), percentage_basis)
-                .map(|margin| margin.points())
-                .unwrap_or(0.0),
-            used_length_percentage_or_auto(
-                style.box_values.margin.bottom.clone(),
-                percentage_basis,
-            )
-            .map(|margin| margin.points())
-            .unwrap_or(0.0),
-        ),
-    };
-    let border_size = (!specified.is_auto())
-        .then(|| used_length_percentage_or_auto(specified, percentage_basis))
-        .flatten()
-        .map(|size| {
-            let size = size.points();
-            if box_sizing == BoxSizing::ContentBox {
-                size + padding_start + padding_end + border_start + border_end
-            } else {
-                size
+        _ => match axes.physical_side(LogicalSide::InlineEnd) {
+            PhysicalSide::Left
+                if !matches!(child_style.grid_column_end, css::GridPlacement::Auto)
+                    && matches!(child_style.grid_column_start, css::GridPlacement::Auto) =>
+            {
+                Some(placement_area.x() + placement_area.width())
             }
-        });
-    GridAbsposAlignmentMetrics {
-        border_size,
-        margin_start,
-        margin_end,
+            _ => None,
+        },
+    }
+}
+
+fn grid_explicit_static_right_edge(
+    child_style: &ComputedStyle,
+    container_style: &ComputedStyle,
+    placement_area: PageTopRect,
+) -> Option<f32> {
+    let axes = WritingModeAxes::new(
+        container_style.writing_mode,
+        container_style.used_direction(),
+    );
+    match axes.physical_side(LogicalSide::InlineStart) {
+        PhysicalSide::Right
+            if !matches!(child_style.grid_column_start, css::GridPlacement::Auto)
+                && matches!(child_style.grid_column_end, css::GridPlacement::Auto) =>
+        {
+            Some(placement_area.x())
+        }
+        _ => match axes.physical_side(LogicalSide::InlineEnd) {
+            PhysicalSide::Right
+                if !matches!(child_style.grid_column_end, css::GridPlacement::Auto)
+                    && matches!(child_style.grid_column_start, css::GridPlacement::Auto) =>
+            {
+                Some(placement_area.x() + placement_area.width())
+            }
+            _ => None,
+        },
+    }
+}
+
+fn grid_explicit_static_top_edge(
+    child_style: &ComputedStyle,
+    container_style: &ComputedStyle,
+    placement_area: PageTopRect,
+) -> Option<f32> {
+    let axes = WritingModeAxes::new(
+        container_style.writing_mode,
+        container_style.used_direction(),
+    );
+    match axes.physical_side(LogicalSide::BlockStart) {
+        PhysicalSide::Top
+            if !matches!(child_style.grid_row_start, css::GridPlacement::Auto)
+                && matches!(child_style.grid_row_end, css::GridPlacement::Auto) =>
+        {
+            Some(placement_area.top_y())
+        }
+        _ => match axes.physical_side(LogicalSide::BlockEnd) {
+            PhysicalSide::Top
+                if !matches!(child_style.grid_row_end, css::GridPlacement::Auto)
+                    && matches!(child_style.grid_row_start, css::GridPlacement::Auto) =>
+            {
+                Some(placement_area.top_y() - placement_area.height())
+            }
+            _ => None,
+        },
     }
 }
 
@@ -736,174 +767,40 @@ fn effective_grid_abspos_alignment(
     }
 }
 
-#[derive(Clone, Copy)]
-struct GridAbsposAlignmentDirection {
-    reverse_start_end: bool,
-    left_right_are_physical: bool,
-    fallback_to_logical_start: bool,
-}
-
-fn grid_abspos_alignment_offset(
-    alignment: css::SelfAlignment,
-    area_size: f32,
-    border_size: f32,
-    margin_start: f32,
-    margin_end: f32,
-    direction: GridAbsposAlignmentDirection,
-) -> f32 {
-    let free_space = area_size - margin_start - border_size - margin_end;
-    // Grid's abspos alignment uses the grid area as its alignment container.
-    // `safe` falls back to the logical start *alignment* when the subject
-    // overflows that area. Clamping free space while retaining `center` or
-    // `end` would instead choose a physical side in reversed writing modes.
-    // Default and explicit `unsafe` alignment preserve the requested
-    // overflowing center/end position:
-    // <https://drafts.csswg.org/css-align-3/#overflow-values>.
-    let keyword = if alignment.safety == AlignmentSafety::Safe && free_space < 0.0 {
-        SelfAlignmentKeyword::Start
-    } else {
-        alignment.keyword
-    };
-    let start = margin_start;
-    let end = margin_start + free_space;
-    match keyword {
-        SelfAlignmentKeyword::Center => margin_start + free_space / 2.0,
-        SelfAlignmentKeyword::End
-        | SelfAlignmentKeyword::SelfEnd
-        | SelfAlignmentKeyword::FlexEnd => {
-            if direction.reverse_start_end {
-                start
-            } else {
-                end
-            }
-        }
-        SelfAlignmentKeyword::Start
-        | SelfAlignmentKeyword::SelfStart
-        | SelfAlignmentKeyword::FlexStart => {
-            if direction.reverse_start_end {
-                end
-            } else {
-                start
-            }
-        }
-        // `left` and `right` are physical only on a horizontal
-        // `justify-self` axis. On `align-self`, and on a vertical
-        // `justify-self` axis, they fall back to logical start.
-        // <https://drafts.csswg.org/css-align-3/#self-position>
-        SelfAlignmentKeyword::Left if direction.left_right_are_physical => start,
-        SelfAlignmentKeyword::Right if direction.left_right_are_physical => end,
-        SelfAlignmentKeyword::Left | SelfAlignmentKeyword::Right => {
-            if direction.fallback_to_logical_start && direction.reverse_start_end {
-                end
-            } else {
-                start
-            }
-        }
-        // CSS Grid's abspos static-position rules resolve the remaining
-        // self-alignment fallbacks to logical start. `normal`, `stretch`, and
-        // baseline alignment do not stretch an out-of-flow item, but their
-        // static position still follows the container's start side.
-        // <https://www.w3.org/TR/css-grid-1/#abspos-items> and
-        // <https://drafts.csswg.org/css-align-3/#align-abspos>
-        SelfAlignmentKeyword::Auto
-        | SelfAlignmentKeyword::Normal
-        | SelfAlignmentKeyword::Stretch
-        | SelfAlignmentKeyword::Baseline
-        | SelfAlignmentKeyword::LastBaseline => {
-            if direction.fallback_to_logical_start && direction.reverse_start_end {
-                end
-            } else {
-                start
-            }
-        }
-    }
-}
-
-/// Resolve the physical horizontal static position after positioned layout has
-/// determined an automatically sized grid item's used border-box width.
-///
-/// This keeps the grid area as the alignment container without substituting
-/// it for the actual CSS containing block used by the absolute inset equation:
-/// <https://www.w3.org/TR/css-grid-1/#abspos> and
-/// <https://drafts.csswg.org/css-align-3/#abspos-align>.
-pub(in crate::layout) fn grid_abspos_late_horizontal_static_position(
-    grid: GridAbsposStaticAlignment,
-    style: &ComputedStyle,
-    containing_block: ContainingBlock,
-    border_box_width: BorderBoxLength,
-) -> StaticHorizontalPosition {
-    let border_box_width = border_box_width.points();
-    let axes = WritingModeAxes::new(grid.writing_mode, grid.direction);
-    let (self_alignment, container_alignment) = if axes.swaps_physical_axes() {
-        (style.align_self, grid.align_items)
-    } else {
-        (style.justify_self, grid.justify_items)
-    };
-    let alignment = effective_grid_abspos_alignment(self_alignment, container_alignment);
-    let reverse_start_end = axes
-        .physical_start_side(axes.logical_axis_for_physical(PhysicalAxis::Horizontal))
-        == PhysicalSide::Right;
-    let margin_start = style.margin.left;
-    let margin_end = style.margin.right;
-    let start = grid.area.x()
-        + grid_abspos_alignment_offset(
-            alignment,
-            grid.area.width(),
-            border_box_width,
-            margin_start,
-            margin_end,
-            GridAbsposAlignmentDirection {
-                reverse_start_end,
-                left_right_are_physical: !axes.swaps_physical_axes(),
-                fallback_to_logical_start: axes.swaps_physical_axes(),
-            },
-        );
-    let start_in_containing_block = start - containing_block.x();
-    let end_in_containing_block =
-        start_in_containing_block + margin_start + border_box_width + margin_end;
-    StaticHorizontalPosition::new_unclamped(
-        start_in_containing_block,
-        containing_block.width() - end_in_containing_block,
+/// Record Grid's fully resolved static-position defaults in the generic
+/// positioned-layout alignment context. The grid area remains distinct from
+/// the absolute containing block: it is only the static alignment container.
+/// <https://www.w3.org/TR/css-grid-1/#abspos-items>
+/// <https://drafts.csswg.org/css-align-3/#align-abspos>
+fn grid_abspos_static_alignment(
+    area: PageTopRect,
+    child_style: &ComputedStyle,
+    container_style: &ComputedStyle,
+) -> AbsposStaticAlignment {
+    AbsposStaticAlignment::new(
+        area,
+        container_style.writing_mode,
+        container_style.direction,
+        effective_grid_abspos_alignment(child_style.justify_self, container_style.justify_items),
+        effective_grid_abspos_alignment(child_style.align_self, container_style.align_items),
     )
 }
 
-/// Resolve the physical vertical static position after positioned layout has
-/// measured an automatically sized grid item's used border-box height.
-///
-/// The return value is the physical block-start distance expected by the CSS
-/// absolute-position vertical equation.
-pub(in crate::layout) fn grid_abspos_late_vertical_static_start(
-    grid: GridAbsposStaticAlignment,
-    style: &ComputedStyle,
-    containing_block: ContainingBlock,
-    border_box_height: f32,
-) -> f32 {
-    let axes = WritingModeAxes::new(grid.writing_mode, grid.direction);
-    let (self_alignment, container_alignment) = if axes.swaps_physical_axes() {
-        (style.justify_self, grid.justify_items)
-    } else {
-        (style.align_self, grid.align_items)
-    };
-    let alignment = effective_grid_abspos_alignment(self_alignment, container_alignment);
-    // This is the physical vertical axis.  In horizontal writing modes it is
-    // always top-to-bottom; in vertical writing modes it is the inline axis,
-    // where direction determines its start edge.
-    let reverse_start_end = axes
-        .physical_start_side(axes.logical_axis_for_physical(PhysicalAxis::Vertical))
-        == PhysicalSide::Bottom;
-    let offset = grid_abspos_alignment_offset(
-        alignment,
-        grid.area.height(),
-        border_box_height,
-        style.margin.top,
-        style.margin.bottom,
-        GridAbsposAlignmentDirection {
-            reverse_start_end,
-            left_right_are_physical: false,
-            fallback_to_logical_start: false,
-        },
-    );
-    containing_block.top_y() - grid.area.top_y() + offset
+/// `normal` does not add a Grid self-alignment offset to an absolutely
+/// positioned item's static rectangle. The generic abspos equations consume
+/// that rectangle directly, including their direction-dependent choice of an
+/// automatic inset. Record alignment only when an authored or inherited Grid
+/// alignment actually changes that static rectangle.
+/// <https://www.w3.org/TR/css-grid-1/#abspos-items>
+fn grid_abspos_has_explicit_alignment(
+    child_style: &ComputedStyle,
+    container_style: &ComputedStyle,
+) -> bool {
+    effective_grid_abspos_alignment(child_style.justify_self, container_style.justify_items).keyword
+        != SelfAlignmentKeyword::Normal
+        || effective_grid_abspos_alignment(child_style.align_self, container_style.align_items)
+            .keyword
+            != SelfAlignmentKeyword::Normal
 }
 
 /// Resolve a grid static-position line from final layout offsets, then from
@@ -1072,7 +969,7 @@ fn grid_layout_line_static_offset_with_inferred_gaps(
             )?;
             let gap =
                 definite_grid_gap_size(gap.clone(), layout_pt(options.container_size)).points();
-            auto_fill_line_offsets = line_offsets_from_track_sizes(&track_sizes, gap);
+            auto_fill_line_offsets = grid_line_offsets_from_track_sizes(&track_sizes, gap);
             &auto_fill_line_offsets
         };
         let line_index = grid_line_static_offset_index(
@@ -1110,8 +1007,8 @@ fn grid_layout_line_static_offset_with_inferred_gaps(
         // use that geometry even when `grid-auto-*` is intrinsically sized and
         // cannot be reconstructed from its computed track definition alone.
         // Negative numeric lines remain relative to the explicit grid.
-        css::GridPlacement::Line(line) if line.name.is_none() => {
-            let index = line.index?;
+        css::GridPlacement::Line(line) if line.name().is_none() => {
+            let index = line.index()?;
             if index > 0 {
                 index
             } else {
@@ -1261,20 +1158,6 @@ fn collect_auto_repeat_track_sizes(
     Some(())
 }
 
-fn line_offsets_from_track_sizes(track_sizes: &[f32], gap: f32) -> Vec<f32> {
-    let mut offsets = Vec::with_capacity(track_sizes.len() + 1);
-    let mut offset = 0.0;
-    offsets.push(offset);
-    for (index, size) in track_sizes.iter().enumerate() {
-        offset += *size;
-        if index + 1 < track_sizes.len() {
-            offset += gap;
-        }
-        offsets.push(offset);
-    }
-    offsets
-}
-
 struct AutoRepeatStaticLineOffsets {
     first_line_index: i32,
     offsets: Vec<f32>,
@@ -1398,6 +1281,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn content_edge_static_source_preserves_the_grid_content_rectangle() {
+        let style = ComputedStyle::initial();
+        let content = PageTopRect::new(12.0, 80.0, 40.0, 30.0);
+        let padding = ContainingBlock::from_page_top_rect(PageTopRect::new(4.0, 92.0, 64.0, 54.0));
+
+        assert_eq!(
+            grid_abspos_static_position_area(
+                GridAbsposStaticPositionSource::ContentEdges,
+                content,
+                &style,
+                &style,
+            ),
+            content,
+            "a Grid parent that is not the actual containing block ignores grid placement",
+        );
+        assert_ne!(content, padding.rect);
+    }
+
+    #[test]
+    fn placement_area_auto_edges_follow_padding_box_in_vertical_rtl_grid() {
+        let mut style = ComputedStyle::initial();
+        style.writing_mode = WritingMode::VerticalRl;
+        style.direction = Direction::Rtl;
+        style.grid_column_end = css::GridPlacement::Line(css::GridLinePlacement::Number(
+            std::num::NonZeroI32::new(2).unwrap(),
+        ));
+        style.grid_row_end = css::GridPlacement::Line(css::GridLinePlacement::Number(
+            std::num::NonZeroI32::new(2).unwrap(),
+        ));
+        let placement = PageTopRect::new(20.0, 90.0, 30.0, 40.0);
+        let padding_box =
+            ContainingBlock::from_page_top_rect(PageTopRect::new(10.0, 100.0, 60.0, 80.0));
+
+        // In vertical-rl/rtl, inline-start is physical bottom and block-start
+        // is physical right. The automatic start lines therefore replace only
+        // those two placement-area edges with Grid's padding edges.
+        assert_eq!(
+            grid_abspos_static_position_area(
+                GridAbsposStaticPositionSource::PlacementArea { padding_box },
+                placement,
+                &style,
+                &style,
+            ),
+            PageTopRect::new(20.0, 90.0, 50.0, 70.0),
+        );
+    }
+
+    #[test]
     fn numeric_line_static_offset_includes_track_gaps() {
         let tracks = css::GridTrackList::Tracks {
             components: vec![
@@ -1426,10 +1357,9 @@ mod tests {
             ],
             trailing_names: Vec::new(),
         };
-        let placement = css::GridPlacement::Line(css::GridLinePlacement {
-            name: None,
-            index: Some(2),
-        });
+        let placement = css::GridPlacement::Line(css::GridLinePlacement::Number(
+            std::num::NonZeroI32::new(2).unwrap(),
+        ));
         assert_eq!(
             grid_line_static_offset(
                 &tracks,
@@ -1460,9 +1390,9 @@ mod tests {
             ],
             trailing_names: vec!["main".to_string()],
         };
-        let placement = css::GridPlacement::Line(css::GridLinePlacement {
-            name: Some("main".to_string()),
-            index: Some(2),
+        let placement = css::GridPlacement::Line(css::GridLinePlacement::Named {
+            name: "main".to_string(),
+            occurrence: std::num::NonZeroI32::new(2),
         });
         assert_eq!(
             grid_line_static_offset(
@@ -1494,10 +1424,9 @@ mod tests {
             ],
             trailing_names: Vec::new(),
         };
-        let placement = css::GridPlacement::Line(css::GridLinePlacement {
-            name: None,
-            index: Some(-1),
-        });
+        let placement = css::GridPlacement::Line(css::GridLinePlacement::Number(
+            std::num::NonZeroI32::new(-1).unwrap(),
+        ));
         assert_eq!(
             grid_line_static_offset(
                 &tracks,
@@ -1528,9 +1457,9 @@ mod tests {
             ],
             trailing_names: vec!["main".to_string()],
         };
-        let placement = css::GridPlacement::Line(css::GridLinePlacement {
-            name: Some("main".to_string()),
-            index: Some(-1),
+        let placement = css::GridPlacement::Line(css::GridLinePlacement::Named {
+            name: "main".to_string(),
+            occurrence: std::num::NonZeroI32::new(-1),
         });
         assert_eq!(
             grid_line_static_offset(
@@ -1547,10 +1476,9 @@ mod tests {
 
     #[test]
     fn numeric_static_offset_uses_final_collapsed_track_lines() {
-        let placement = css::GridPlacement::Line(css::GridLinePlacement {
-            name: None,
-            index: Some(3),
-        });
+        let placement = css::GridPlacement::Line(css::GridLinePlacement::Number(
+            std::num::NonZeroI32::new(3).unwrap(),
+        ));
         let tracks = css::GridTrackList::Tracks {
             components: vec![css::GridTrackListComponent::Repeat(
                 Vec::new(),
@@ -1661,9 +1589,9 @@ mod tests {
             )],
             trailing_names: Vec::new(),
         };
-        let placement = css::GridPlacement::Line(css::GridLinePlacement {
-            name: Some("slot".to_string()),
-            index: Some(3),
+        let placement = css::GridPlacement::Line(css::GridLinePlacement::Named {
+            name: "slot".to_string(),
+            occurrence: std::num::NonZeroI32::new(3),
         });
 
         assert_eq!(
@@ -1717,9 +1645,9 @@ mod tests {
             )],
             trailing_names: Vec::new(),
         };
-        let placement = css::GridPlacement::Line(css::GridLinePlacement {
-            name: Some("middle".to_string()),
-            index: Some(2),
+        let placement = css::GridPlacement::Line(css::GridLinePlacement::Named {
+            name: "middle".to_string(),
+            occurrence: std::num::NonZeroI32::new(2),
         });
 
         assert_eq!(
@@ -1759,19 +1687,18 @@ mod tests {
             )],
             trailing_names: Vec::new(),
         };
-        let auto_tracks = css::GridAutoTrackList {
-            tracks: vec![css::GridTrackSize {
-                min: css::GridMinTrackBreadth::LengthPercentage(
-                    css::ComputedLengthPercentage::from_points(30.0),
-                ),
-                max: css::GridMaxTrackBreadth::LengthPercentage(
-                    css::ComputedLengthPercentage::from_points(30.0),
-                ),
-            }],
-        };
-        let placement = css::GridPlacement::Line(css::GridLinePlacement {
-            name: Some("slot".to_string()),
-            index: Some(4),
+        let auto_tracks = css::GridAutoTrackList::from_tracks(vec![css::GridTrackSize {
+            min: css::GridMinTrackBreadth::LengthPercentage(
+                css::ComputedLengthPercentage::from_points(30.0),
+            ),
+            max: css::GridMaxTrackBreadth::LengthPercentage(
+                css::ComputedLengthPercentage::from_points(30.0),
+            ),
+        }])
+        .expect("test grid auto-track list is non-empty");
+        let placement = css::GridPlacement::Line(css::GridLinePlacement::Named {
+            name: "slot".to_string(),
+            occurrence: std::num::NonZeroI32::new(4),
         });
 
         assert_eq!(
@@ -1811,29 +1738,28 @@ mod tests {
             )],
             trailing_names: Vec::new(),
         };
-        let auto_tracks = css::GridAutoTrackList {
-            tracks: vec![
-                css::GridTrackSize {
-                    min: css::GridMinTrackBreadth::LengthPercentage(
-                        css::ComputedLengthPercentage::from_points(30.0),
-                    ),
-                    max: css::GridMaxTrackBreadth::LengthPercentage(
-                        css::ComputedLengthPercentage::from_points(30.0),
-                    ),
-                },
-                css::GridTrackSize {
-                    min: css::GridMinTrackBreadth::LengthPercentage(
-                        css::ComputedLengthPercentage::from_points(40.0),
-                    ),
-                    max: css::GridMaxTrackBreadth::LengthPercentage(
-                        css::ComputedLengthPercentage::from_points(40.0),
-                    ),
-                },
-            ],
-        };
-        let placement = css::GridPlacement::Line(css::GridLinePlacement {
-            name: Some("slot".to_string()),
-            index: Some(-4),
+        let auto_tracks = css::GridAutoTrackList::from_tracks(vec![
+            css::GridTrackSize {
+                min: css::GridMinTrackBreadth::LengthPercentage(
+                    css::ComputedLengthPercentage::from_points(30.0),
+                ),
+                max: css::GridMaxTrackBreadth::LengthPercentage(
+                    css::ComputedLengthPercentage::from_points(30.0),
+                ),
+            },
+            css::GridTrackSize {
+                min: css::GridMinTrackBreadth::LengthPercentage(
+                    css::ComputedLengthPercentage::from_points(40.0),
+                ),
+                max: css::GridMaxTrackBreadth::LengthPercentage(
+                    css::ComputedLengthPercentage::from_points(40.0),
+                ),
+            },
+        ])
+        .expect("test grid auto-track list is non-empty");
+        let placement = css::GridPlacement::Line(css::GridLinePlacement::Named {
+            name: "slot".to_string(),
+            occurrence: std::num::NonZeroI32::new(-4),
         });
 
         assert_eq!(
@@ -1873,19 +1799,18 @@ mod tests {
             )],
             trailing_names: Vec::new(),
         };
-        let auto_tracks = css::GridAutoTrackList {
-            tracks: vec![css::GridTrackSize {
-                min: css::GridMinTrackBreadth::LengthPercentage(
-                    css::ComputedLengthPercentage::from_points(30.0),
-                ),
-                max: css::GridMaxTrackBreadth::LengthPercentage(
-                    css::ComputedLengthPercentage::from_points(30.0),
-                ),
-            }],
-        };
-        let placement = css::GridPlacement::Line(css::GridLinePlacement {
-            name: Some("slot".to_string()),
-            index: Some(4),
+        let auto_tracks = css::GridAutoTrackList::from_tracks(vec![css::GridTrackSize {
+            min: css::GridMinTrackBreadth::LengthPercentage(
+                css::ComputedLengthPercentage::from_points(30.0),
+            ),
+            max: css::GridMaxTrackBreadth::LengthPercentage(
+                css::ComputedLengthPercentage::from_points(30.0),
+            ),
+        }])
+        .expect("test grid auto-track list is non-empty");
+        let placement = css::GridPlacement::Line(css::GridLinePlacement::Named {
+            name: "slot".to_string(),
+            occurrence: std::num::NonZeroI32::new(4),
         });
 
         assert_eq!(
@@ -1925,29 +1850,28 @@ mod tests {
             )],
             trailing_names: Vec::new(),
         };
-        let auto_tracks = css::GridAutoTrackList {
-            tracks: vec![
-                css::GridTrackSize {
-                    min: css::GridMinTrackBreadth::LengthPercentage(
-                        css::ComputedLengthPercentage::from_points(30.0),
-                    ),
-                    max: css::GridMaxTrackBreadth::LengthPercentage(
-                        css::ComputedLengthPercentage::from_points(30.0),
-                    ),
-                },
-                css::GridTrackSize {
-                    min: css::GridMinTrackBreadth::LengthPercentage(
-                        css::ComputedLengthPercentage::from_points(40.0),
-                    ),
-                    max: css::GridMaxTrackBreadth::LengthPercentage(
-                        css::ComputedLengthPercentage::from_points(40.0),
-                    ),
-                },
-            ],
-        };
-        let placement = css::GridPlacement::Line(css::GridLinePlacement {
-            name: Some("slot".to_string()),
-            index: Some(-4),
+        let auto_tracks = css::GridAutoTrackList::from_tracks(vec![
+            css::GridTrackSize {
+                min: css::GridMinTrackBreadth::LengthPercentage(
+                    css::ComputedLengthPercentage::from_points(30.0),
+                ),
+                max: css::GridMaxTrackBreadth::LengthPercentage(
+                    css::ComputedLengthPercentage::from_points(30.0),
+                ),
+            },
+            css::GridTrackSize {
+                min: css::GridMinTrackBreadth::LengthPercentage(
+                    css::ComputedLengthPercentage::from_points(40.0),
+                ),
+                max: css::GridMaxTrackBreadth::LengthPercentage(
+                    css::ComputedLengthPercentage::from_points(40.0),
+                ),
+            },
+        ])
+        .expect("test grid auto-track list is non-empty");
+        let placement = css::GridPlacement::Line(css::GridLinePlacement::Named {
+            name: "slot".to_string(),
+            occurrence: std::num::NonZeroI32::new(-4),
         });
 
         assert_eq!(

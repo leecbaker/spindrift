@@ -169,15 +169,33 @@ pub(super) fn used_letter_spacing_for_text(text: &str, letter_spacing: f32) -> f
 pub(super) fn visual_ranges_for_line<B: parley::style::Brush>(
     line: parley::Line<'_, B>,
 ) -> Vec<BidiVisualRange> {
-    let mut ranges = Vec::<BidiVisualRange>::new();
+    // `Line::runs()` is source ordered even when individual runs have been
+    // resolved to different bidi levels. A visual cluster iterator reverses
+    // an RTL run, but cannot by itself move an adjacent LTR run across it.
+    // Keep Parley's resolved visual offset with each cluster and sort the
+    // complete line before exposing the ranges to inline layout.
+    //
+    // UAX #9 applies L2 across level runs, not independently inside each
+    // shaping run: <https://www.unicode.org/reports/tr9/#L2>.
+    let mut clusters = Vec::new();
     for run in line.runs() {
         for cluster in run.visual_clusters() {
-            push_visual_range(
-                &mut ranges,
+            clusters.push((
+                cluster.visual_offset().unwrap_or(f32::INFINITY),
                 cluster.text_range(),
                 ResolvedBidiDirection::from_parley_cluster_is_rtl(cluster.is_rtl()),
-            );
+            ));
         }
+    }
+    clusters.sort_by(|left, right| {
+        left.0
+            .total_cmp(&right.0)
+            .then_with(|| left.1.start.cmp(&right.1.start))
+    });
+
+    let mut ranges = Vec::<BidiVisualRange>::new();
+    for (_, range, direction) in clusters {
+        push_visual_range(&mut ranges, range, direction);
     }
     if ranges.is_empty() {
         ranges.push(BidiVisualRange {

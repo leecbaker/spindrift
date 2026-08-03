@@ -19,6 +19,136 @@ fn page_has_line(page: &quire::Page, text: &str) -> bool {
     page.lines().iter().any(|line| line.text == text)
 }
 
+async fn assert_positioned_child_preserves_adjoining_sibling_margins(html: &str) {
+    let document = Html::from_string(html)
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        document.pages.len(),
+        1,
+        "the collapsed sibling margin set must fit the page: {document:?}"
+    );
+    assert!(page_has_line(&document.pages[0], "Target"));
+}
+
+/// Out-of-flow positioned source children do not participate in the normal
+/// block flow, and therefore cannot split an adjoining margin set between
+/// neighboring in-flow block siblings.
+/// <https://www.w3.org/TR/CSS22/visuren.html#absolute-positioning>
+/// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
+#[tokio::test]
+async fn positioned_children_preserve_adjoining_block_sibling_margin_collapsing() {
+    let stylesheet = "<style>\
+        @page { size: 160pt 80pt; margin: 10pt }\
+        body, p, section { margin: 0; font: 10pt/10pt sans-serif }\
+        .lead { height: 10pt; margin-bottom: 10pt }\
+        .target { height: 10pt; margin-top: 40pt }\
+        .positioned { position: absolute }\
+        </style>";
+    assert_positioned_child_preserves_adjoining_sibling_margins(&format!(
+        "{stylesheet}<span class=\"positioned\">Logo</span><p class=\"lead\">Lead</p><section class=\"target\">Target</section>"
+    ))
+    .await;
+    assert_positioned_child_preserves_adjoining_sibling_margins(&format!(
+        "{stylesheet}<p class=\"lead\">Lead</p><span class=\"positioned\">Logo</span><section class=\"target\">Target</section>"
+    ))
+    .await;
+}
+
+/// An out-of-flow static-position marker does not own a row in the root/body
+/// flow. Its presence must therefore not send an otherwise block-only body
+/// through a traversal that turns a flex box's provisional extent into a page
+/// break before the final line.
+/// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+#[tokio::test]
+async fn root_auto_height_flow_uses_in_flow_endpoint_after_near_page_end_flex() {
+    for (spacer_height, expected_pages) in [(58, 1), (62, 2)] {
+        let document = Html::from_string(format!(
+            "<style>\
+             @page {{ size: 160pt 100pt; margin: 10pt }}\
+             html, body, p, div {{ margin: 0; font: 10pt/10pt sans-serif }}\
+             .logo {{ position: absolute }}\
+             .spacer {{ height: {spacer_height}pt }}\
+             .sponsors {{ display: flex; height: 10pt }}\
+             .sponsors > span {{ display: inline-block; height: 10pt }}\
+             </style>\
+             <span class=\"logo\">Logo</span>\
+             <div class=\"spacer\"></div>\
+             <div class=\"sponsors\"><span>Sponsor</span></div>\
+             <p>Address</p>"
+        ))
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+
+        assert_eq!(
+            document.pages.len(),
+            expected_pages,
+            "spacer height {spacer_height}pt produced unexpected pages"
+        );
+        let address_page = document
+            .pages
+            .iter()
+            .position(|page| page_has_line(page, "Address"));
+        assert_eq!(address_page, Some(expected_pages - 1));
+    }
+}
+
+#[tokio::test]
+async fn poster_sample_fragments_address_when_the_page_area_is_exhausted() {
+    let stylesheet = Css::from_file("weasyprint-samples/poster/poster.css")
+        .await
+        .unwrap();
+    let document = Html::from_file("weasyprint-samples/poster/poster.html")
+        .await
+        .unwrap()
+        .with_stylesheet(stylesheet)
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+
+    // The in-flow sponsor row leaves less than one address line in the page
+    // area. CSS Fragmentation therefore takes the unforced class-A break
+    // before the address rather than letting it paint into the page margin.
+    // The checked-in WeasyPrint PDF keeps the line on page one, but that is a
+    // diagnostic compatibility difference rather than the pagination oracle.
+    // <https://www.w3.org/TR/css-break-3/#unforced-breaks>
+    assert_eq!(document.pages.len(), 2);
+    let page = &document.pages[0];
+    assert!(
+        (page.width() - 278.0 * 72.0 / 25.4).abs() < 0.01,
+        "{page:?}"
+    );
+    assert!(
+        (page.height() - 388.0 * 72.0 / 25.4).abs() < 0.01,
+        "{page:?}"
+    );
+    let first_page_text = page
+        .lines()
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<String>();
+    assert!(
+        first_page_text.contains("ÉPINAL"),
+        "poster date content is missing from page 1: {first_page_text:?}"
+    );
+    let address_page_text = document.pages[1]
+        .lines()
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<String>();
+    let address_page_text_without_whitespace = address_page_text
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    assert!(
+        address_page_text_without_whitespace.contains("LaSourisVerte"),
+        "poster address is missing from page 2: {address_page_text:?}"
+    );
+}
+
 #[tokio::test]
 async fn layout_containment_captures_nested_fixed_descendant() {
     let document = Html::from_string(
@@ -157,7 +287,7 @@ async fn percentage_hr_width_uses_destination_page_size_after_prebreak() {
 }
 
 #[tokio::test]
-async fn viewport_width_units_use_destination_page_size_after_prebreak() {
+async fn viewport_width_units_use_immutable_initial_page_context_after_prebreak() {
     let document = Html::from_string(
         "<style>\
          @page { size: 320px 200px; margin: 0 }\
@@ -176,8 +306,8 @@ async fn viewport_width_units_use_destination_page_size_after_prebreak() {
     assert_eq!(document.pages.len(), 2);
     assert_eq!(document.pages[1].width(), 240.0);
     assert!(
-        (cyan.width() - 120.0).abs() < 0.01,
-        "viewport width should resolve against destination page: {cyan:?}"
+        (cyan.width() - 187.5).abs() < 0.01,
+        "viewport width should resolve against immutable initial page context: {cyan:?}"
     );
 }
 
@@ -426,7 +556,8 @@ async fn absolute_block_level_abspos_static_position_after_inline_content() {
     let abs_before_rtl = line("abs before rtl");
     let inline_after_rtl = line("inline after rtl");
     let abs_after_rtl = line("abs after rtl");
-    let line_right = |line: &quire::RenderedLine| line.x() + rendered_line_advance(line);
+    let line_right =
+        |line: &crate::document::paint::text::RenderedLine| line.x() + rendered_line_advance(line);
     assert!((abs_before_ltr.y() - inline_before_ltr.y()).abs() < 0.01);
     assert!(
         (abs_before_ltr.x() - inline_before_ltr.x()).abs() < 0.01,
@@ -900,7 +1031,10 @@ async fn anonymous_block_after_flow_matches_inline_abspos_reference_with_default
     .await
     .unwrap();
 
-    fn line<'a>(document: &'a quire::Document, text: &str) -> &'a quire::RenderedLine {
+    fn line<'a>(
+        document: &'a quire::Document,
+        text: &str,
+    ) -> &'a crate::document::paint::text::RenderedLine {
         document.pages[0]
             .lines()
             .iter()
@@ -1000,20 +1134,27 @@ async fn fixed_static_position_inside_static_position_absolute() {
     let pdf_rects = pdf_emitted_rects_with_fills(&pdf, &[green, red]);
     assert_eq!(
         pdf_rects.len(),
-        3,
-        "expected three colored PDF rectangles: {pdf_rects:?}",
+        1,
+        "PDF realization should coalesce fully covered same-color paint: {pdf_rects:?}",
     );
     assert_eq!(
         pdf_rects.iter().map(|rect| rect.fill).collect::<Vec<_>>(),
-        vec![green, red, green],
-        "PDF rectangles should be emitted in tree paint order: {pdf_rects:?}",
+        vec![green],
+        "the PDF should retain only the final visible green composition: {pdf_rects:?}",
     );
 
-    let pdf_red_rect = pdf_rects[1].rect;
-    let pdf_small_green_rect = pdf_rects[2].rect;
+    let pdf_green_rect = pdf_rects[0].rect;
     assert!(
-        same_pdf_rect(pdf_red_rect, pdf_small_green_rect),
-        "fixed green PDF rectangle should cover red PDF rectangle: red={pdf_red_rect:?} green={pdf_small_green_rect:?}",
+        same_pdf_rect(
+            pdf_green_rect,
+            (
+                outer_green_rect.x(),
+                outer_green_rect.y(),
+                outer_green_rect.width(),
+                outer_green_rect.height()
+            ),
+        ),
+        "the retained PDF rectangle should be the outer green composition: outer={outer_green_rect:?} pdf={pdf_green_rect:?}",
     );
 }
 
@@ -1376,6 +1517,56 @@ async fn absolute_collapsed_table_bottom_uses_fragment_border_insets() {
 }
 
 #[tokio::test]
+async fn absolute_collapsed_table_auto_height_uses_asymmetric_outer_half_insets() {
+    let document = Html::from_string(
+        "<style>@page { size: 220pt 180pt; margin: 20pt } body { margin:0 } table { position:absolute; bottom:0; margin:0; width:100pt; border-collapse:collapse; border-style:solid; border-width:20pt 0 40pt; border-color:#eeeeee; background:#00aa00 } td { padding:0; font-size:10pt; line-height:10pt }</style>\
+         <table><tr><td>Bottom</td></tr></table>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let table_background = document.pages[0]
+        .rects()
+        .iter()
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 170, 0)))
+        .max_by(|left, right| left.width().total_cmp(&right.width()))
+        .unwrap();
+
+    assert!(
+        (table_background.y() - 20.0).abs() < 0.01
+            && (table_background.height() - 70.0).abs() < 0.01,
+        "auto-height collapsed table should add its 40pt grid row and only the 10pt/20pt resolved outer half-insets: {table_background:?}"
+    );
+}
+
+#[tokio::test]
+async fn absolute_collapsed_table_uses_asymmetric_outer_half_insets_for_width_and_position() {
+    let document = Html::from_string(
+        "<style>@page{size:300pt 100pt;margin:0}body{margin:0;font-size:10pt;line-height:10pt}table{position:absolute;left:50pt;top:20pt;margin:0;width:180pt;box-sizing:border-box;border-collapse:collapse;table-layout:fixed;border-left:20pt solid red;border-right:40pt solid blue}td{padding:0;width:75pt;height:10pt;text-align:left}</style>\
+         <table><tr><td>First</td><td>Second</td></tr></table>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let first = document.pages[0]
+        .lines()
+        .iter()
+        .find(|line| line.text == "First")
+        .unwrap();
+    let second = document.pages[0]
+        .lines()
+        .iter()
+        .find(|line| line.text == "Second")
+        .unwrap();
+    assert!(
+        (first.x() - 70.0).abs() < 0.01 && (second.x() - 145.0).abs() < 0.01,
+        "absolute collapsed table should place its 150pt grid inside 10pt/20pt outer half-insets: first={first:?} second={second:?}"
+    );
+}
+
+#[tokio::test]
 async fn relative_position_offsets_flex_and_table_boxes() {
     let document = Html::from_string(
         "<style>@page { size: 180pt 140pt; margin: 10pt } body, table, p { margin: 0; font-size: 10pt; line-height: 10pt } .flex { display: flex; position: relative; left: 10pt; top: 5pt } table { position: relative; left: 20pt; top: 5pt; border-spacing: 0 } td { padding: 0 }</style><div class=\"flex\"><p>Flex</p></div><table><tr><td>Table</td></tr></table><p>After</p>",
@@ -1697,6 +1888,125 @@ async fn collapses_first_child_top_margin_through_parent_block() {
         .unwrap();
 
     assert_line_baseline_at_top(&document, line, 150.0);
+}
+
+/// CSS 2.2 §8.3.1: adjoining positive parent/first-child margins collapse to
+/// their maximum, even when a preceding zero-margin block routes the wrapper
+/// through the sibling-margin path.
+/// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
+#[tokio::test]
+async fn nested_first_child_margin_after_header_uses_the_full_collapsed_set() {
+    let document = Html::from_string(
+        "<style>@page { size: 200pt 200pt; margin: 20pt } html, body, header { margin: 0 } .wrapper { margin-top: 20pt } p { margin: 10pt 0 0; font-size: 10pt; line-height: 10pt }</style><header></header><div class=\"wrapper\"><p>Nested</p></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let line = document.pages[0]
+        .lines()
+        .iter()
+        .find(|line| line.text == "Nested")
+        .unwrap();
+
+    assert_line_baseline_at_top(&document, line, 160.0);
+}
+
+/// The frozen formatting-tree path must preserve the same CSS 2.2 adjoining
+/// margin set when an empty generated block precedes the paragraph.
+/// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
+#[tokio::test]
+async fn generated_empty_block_keeps_nested_first_child_collapsed_margin() {
+    let document = Html::from_string(
+        "<style>@page { size: 200pt 200pt; margin: 20pt } html, body, header { margin: 0 } .wrapper { margin-top: 20pt } .wrapper::before { content: \"\"; display: block } p { margin: 10pt 0 0; font-size: 10pt; line-height: 10pt }</style><header></header><div class=\"wrapper\"><p>Nested</p></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let line = document.pages[0]
+        .lines()
+        .iter()
+        .find(|line| line.text == "Nested")
+        .unwrap();
+
+    assert_line_baseline_at_top(&document, line, 160.0);
+}
+
+/// HTML's rendered-legend model promotes the eligible direct legend before
+/// anonymous fieldset content, including tree-abiding generated content.
+/// <https://html.spec.whatwg.org/multipage/rendering.html#the-fieldset-and-legend-elements>
+#[tokio::test]
+async fn fieldset_rendered_legend_precedes_generated_anonymous_content() {
+    let document = Html::from_string(
+        "<style>@page { size: 240pt 180pt; margin: 20pt } body { margin: 0 } \
+         fieldset { margin: 0; padding: 10pt; border: 2pt solid black } \
+         fieldset::before { content: 'Before'; display: block; font: 10pt/10pt serif } \
+         legend { margin: 0; font: 10pt/10pt serif } \
+         .content { font: 10pt/10pt serif }</style>\
+         <fieldset><legend>Legend</legend><div class=content>After</div></fieldset>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+    let lines = document.pages[0].lines();
+    let legend = lines.iter().find(|line| line.text == "Legend").unwrap();
+    let before = lines.iter().find(|line| line.text == "Before").unwrap();
+    let after = lines.iter().find(|line| line.text == "After").unwrap();
+
+    assert!(
+        legend.y() > before.y(),
+        "page coordinates descend: {lines:?}"
+    );
+    assert!(before.y() > after.y(), "{lines:?}");
+}
+
+/// CSS 2.2 paint order keeps a fieldset's decoration below its in-flow
+/// descendants, while HTML centers the rendered legend on the block-start
+/// border and reserves its block span before anonymous fieldset content.
+/// <https://html.spec.whatwg.org/multipage/rendering.html#the-fieldset-and-legend-elements>
+/// <https://www.w3.org/TR/CSS22/zindex.html>
+#[tokio::test]
+async fn fieldset_rendered_legend_reserves_block_start_before_content() {
+    let document = Html::from_string(
+        "<style>@page { size: 200pt 160pt; margin: 20pt } body { margin: 0 } \
+         fieldset { margin: 0; padding: 10pt; border: 2pt solid red } \
+         legend, .content { margin: 0; font: 10pt/10pt serif }</style>\
+         <fieldset><legend>Legend</legend><div class=content>Content</div></fieldset>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+    let lines = document.pages[0].lines();
+    let legend = lines.iter().find(|line| line.text == "Legend").unwrap();
+    let content = lines.iter().find(|line| line.text == "Content").unwrap();
+
+    assert!(
+        legend.y() > content.y(),
+        "page coordinates descend: {lines:?}"
+    );
+    assert!(
+        (legend.y() - content.y() - 24.0).abs() < 0.1,
+        "legend/content baseline spacing should retain the rendered legend's block-start reservation: {lines:?}"
+    );
+}
+
+#[tokio::test]
+async fn sibling_after_transparent_wrapper_keeps_full_collapsed_start_margin() {
+    let document = Html::from_string(
+        "<style>@page { size: 200pt 200pt; margin: 20pt } html, body { margin: 0 } .wrapper { margin-top: 20pt } p { margin: 10pt 0 0; font-size: 10pt; line-height: 10pt }</style><div class=\"preceding\"></div><div class=\"wrapper\"><p>Nested</p></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let line = document.pages[0]
+        .lines()
+        .iter()
+        .find(|line| line.text == "Nested")
+        .unwrap();
+
+    assert_line_baseline_at_top(&document, line, 160.0);
 }
 
 #[tokio::test]
@@ -2251,6 +2561,57 @@ async fn margin_trim_block_start_trims_collapsed_block_inside_inline_margin() {
 }
 
 #[tokio::test]
+async fn margin_trim_block_end_discards_only_the_final_block_child_margin() {
+    let document = Html::from_string(
+        "<style>@page { size: 75pt 75pt; margin: 0 } html, body { margin: 0 }</style>\
+         <div style=\"width:75pt; height:75pt; background:red\">\
+           <div style=\"margin-trim:block-end; background:green\">\
+             <div style=\"height:37.5pt; margin-bottom:37.5pt\"></div>\
+           </div>\
+           <div style=\"height:37.5pt; background:green\"></div>\
+         </div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    for y in [3.75, 37.5, 71.25] {
+        assert_eq!(
+            final_rect_fill_at(page, 37.5, y),
+            Some(CssColor::new(0, 128, 0)),
+            "trimmed final-child margin must not expose the red parent at y={y}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn margin_trim_block_end_discards_joined_self_collapsing_end_margin_set() {
+    let document = Html::from_string(
+        "<style>@page { size: 75pt 75pt; margin: 0 } html, body { margin: 0 }</style>\
+         <div style=\"width:75pt; height:75pt; background:red\">\
+           <div style=\"margin-trim:block-end; background:green\">\
+             <div style=\"height:37.5pt; margin-bottom:37.5pt\"></div>\
+             <div style=\"height:0; margin-top:37.5pt\"></div>\
+           </div>\
+           <div style=\"height:37.5pt; background:green\"></div>\
+         </div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    for y in [3.75, 37.5, 71.25] {
+        assert_eq!(
+            final_rect_fill_at(page, 37.5, y),
+            Some(CssColor::new(0, 128, 0)),
+            "the self-collapsing end set must not expose the red parent at y={y}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn paints_body_background_on_page() {
     let document = Html::from_string("<body style=\"background: yellow\"><p>Hello</p></body>")
         .render(&RenderOptions::default())
@@ -2340,6 +2701,99 @@ async fn positioned_descendant_paint_materializes_its_destination_page() {
             .iter()
             .any(|rect| rect.fill == Some(CssColor::new(0, 255, 0)))
     );
+}
+
+#[tokio::test]
+async fn transparent_absolute_text_keeps_its_destination_page() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 100px; margin: 0 }\
+         html, body, div { margin: 0; font: 10px/10px sans-serif }\
+         </style>\
+         <div style=\"position:absolute; bottom:0\">first page</div>\
+         <div style=\"position:absolute; bottom:-100vh\">second page</div>\
+         <div style=\"position:absolute; bottom:-200vh\">third page</div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(document.pages.len(), 3);
+    for (page, text) in document
+        .pages
+        .iter()
+        .zip(["first page", "second page", "third page"])
+    {
+        assert!(page_has_line(page, text), "expected {text:?}: {page:?}");
+    }
+}
+
+#[tokio::test]
+async fn viewport_fixed_replays_over_absolute_spans_regardless_of_source_order() {
+    for (case, body) in [
+        (
+            "fixed before absolute",
+            "<div class=\"fixed\">fixed</div><div class=\"span\">span</div>",
+        ),
+        (
+            "fixed after absolute",
+            "<div class=\"span\">span</div><div class=\"fixed\">fixed</div>",
+        ),
+    ] {
+        let document = Html::from_string(format!(
+            "<style>\
+             @page {{ size: 100px; margin: 0 }}\
+             html, body, div {{ margin: 0; font: 10px/10px sans-serif }}\
+             .fixed {{ position: fixed; bottom: 0 }}\
+             .span {{ position: absolute; height: 300vh }}\
+             </style>{body}"
+        ))
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+
+        assert_eq!(document.pages.len(), 3, "{case}");
+        for page in &document.pages {
+            assert_eq!(
+                page.lines()
+                    .iter()
+                    .filter(|line| line.text == "fixed")
+                    .count(),
+                1,
+                "{case}: {page:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn nested_viewport_fixed_layers_replay_across_an_absolute_span() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 100px; margin: 0 }\
+         html, body, div { margin: 0; font: 10px/10px sans-serif }\
+         .outer-fixed { position: fixed; bottom: 2em }\
+         .span { position: absolute }\
+         .tall { top: 0; height: 300vh }\
+         .inner-fixed { position: fixed; bottom: 0 }\
+         </style>\
+         <div class=\"outer-fixed\">outer fixed</div>\
+         <div class=\"span\"><div class=\"tall\"><div class=\"inner-fixed\">inner fixed</div></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(document.pages.len(), 3);
+    for page in &document.pages {
+        for text in ["outer fixed", "inner fixed"] {
+            assert_eq!(
+                page.lines().iter().filter(|line| line.text == text).count(),
+                1,
+                "expected one {text:?}: {page:?}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -2435,25 +2889,14 @@ async fn following_flow_after_nested_absolute_overflow_stays_in_source_flow() {
         })
         .collect::<Vec<_>>();
     // Transparent absolute margin boxes do not create otherwise blank
-    // fragmentainers. Only their paint and positioned descendants materialize
-    // document pages, so the two positioned text fragments occupy two pages.
-    assert_eq!(document.pages.len(), 2, "{page_lines:?}");
+    // fragmentainers, but each visible positioned text fragment retains its
+    // resolved destination page. The nested absolute offset skips page three;
+    // the source flow remains on page one.
+    assert_eq!(document.pages.len(), 4, "{page_lines:?}");
     assert!(page_has_line(&document.pages[0], "Before"));
     assert!(page_has_line(&document.pages[0], "After"));
-    assert!(
-        document
-            .pages
-            .iter()
-            .any(|page| page_has_line(page, "Absolute second page")),
-        "{page_lines:?}"
-    );
-    assert!(
-        document
-            .pages
-            .iter()
-            .any(|page| page_has_line(page, "Absolute third page")),
-        "{page_lines:?}"
-    );
+    assert!(page_has_line(&document.pages[1], "Absolute second page"));
+    assert!(page_has_line(&document.pages[3], "Absolute third page"));
 }
 
 #[tokio::test]
@@ -3085,7 +3528,7 @@ async fn adjacent_inline_block_page_names_do_not_create_inline_boundary_breaks()
 }
 
 #[tokio::test]
-async fn non_leading_inline_page_name_splits_inline_formatting_context() {
+async fn inline_page_name_does_not_split_inline_formatting_context() {
     let document = Html::from_string(
         "<style>\
          @page { size: 140pt 100pt; margin: 10pt }\
@@ -3099,18 +3542,27 @@ async fn non_leading_inline_page_name_splits_inline_formatting_context() {
     .await
     .unwrap();
 
-    // CSS Paged Media applies `page` to inline boxes as well as block boxes.
-    // A non-leading inline page-name change ends the current inline fragment,
-    // lays the span out on its named page, and then restores the surrounding
-    // page group for following inline content:
+    // Inline boxes do not create class-A break opportunities, so the span's
+    // `page` declaration does not leave the surrounding `page:a` context.
     // https://www.w3.org/TR/css-page-3/#using-named-pages
-    assert_eq!(document.pages.len(), 3);
-    assert_eq!(document.pages[0].lines()[0].text, "Before");
-    assert_eq!(document.pages[0].lines()[0].x(), 30.0);
-    assert_eq!(document.pages[1].lines()[0].text, "Named");
-    assert_eq!(document.pages[1].lines()[0].x(), 50.0);
-    assert_eq!(document.pages[2].lines()[0].text, "After");
-    assert_eq!(document.pages[2].lines()[0].x(), 30.0);
+    assert_eq!(document.pages.len(), 1);
+    let lines = document.pages[0].lines();
+    assert!(
+        lines.iter().any(|line| line.text.contains("Before")),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| line.text.contains("Named")),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| line.text.contains("After")),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().all(|line| (line.x() - 30.0).abs() < 0.01),
+        "{lines:?}"
+    );
 }
 
 fn red_png_data_uri() -> &'static str {
@@ -3580,6 +4032,47 @@ async fn table_row_page_names_select_page_context_per_fragment() {
     assert_eq!(document.pages[1].lines()[0].text, "Second");
     assert_eq!(document.pages[0].lines()[0].x(), 30.0);
     assert_eq!(document.pages[1].lines()[0].x(), 50.0);
+}
+
+#[tokio::test]
+async fn first_named_table_row_follows_preceding_content_without_an_empty_page() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 120pt 100pt; margin: 10pt }\
+         @page firstrow { margin-left: 30pt }\
+         @page secondrow { margin-left: 50pt }\
+         body, p, table, tr, td, div { margin: 0; padding: 0; border: 0; font-size: 10pt; line-height: 10pt }\
+         table { border-collapse: collapse; width: 80pt }\
+         tr { height: 80pt }\
+         </style>\
+         <p>Before</p>\
+         <table>\
+           <tr style=\"page:firstrow\"><td><div>First</div></td></tr>\
+           <tr style=\"page:secondrow\"><td><div>Second</div></td></tr>\
+         </table>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page_lines = document
+        .pages
+        .iter()
+        .map(|page| {
+            page.lines()
+                .iter()
+                .map(|line| (line.text.as_str(), line.x(), line.y()))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(document.pages.len(), 3, "{page_lines:?}");
+    assert_eq!(document.pages[0].lines()[0].text, "Before");
+    assert_eq!(document.pages[1].lines()[0].text, "First");
+    assert_eq!(document.pages[2].lines()[0].text, "Second");
+    assert_eq!(document.pages[0].lines()[0].x(), 10.0);
+    assert_eq!(document.pages[1].lines()[0].x(), 30.0);
+    assert_eq!(document.pages[2].lines()[0].x(), 50.0);
 }
 
 #[tokio::test]
@@ -4191,6 +4684,59 @@ async fn nested_break_inside_avoid_block_moves_to_next_page_when_it_fits() {
             .collect::<Vec<_>>(),
         vec!["2", "3"]
     );
+    let first_page_x = document.pages[0].lines()[0].x();
+    assert!(
+        document.pages[1]
+            .lines()
+            .iter()
+            .all(|line| (line.x() - first_page_x).abs() < 0.01),
+        "avoid retry must retain the default body canvas inset: {page_lines:?}"
+    );
+    let blue = CssColor::new(0, 0, 255);
+    let blue_origins = |page: &quire::Page| {
+        page.rects()
+            .iter()
+            .filter(|rect| {
+                rect.fill == Some(blue)
+                    && (rect.width() - 72.0).abs() < 0.01
+                    && (rect.height() - 72.0).abs() < 0.01
+            })
+            .map(|rect| rect.x())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(blue_origins(&document.pages[0]), vec![first_page_x]);
+    assert_eq!(blue_origins(&document.pages[1]), vec![first_page_x; 2]);
+}
+
+#[tokio::test]
+async fn overflow_hidden_break_inside_avoid_retry_retains_body_canvas_inset() {
+    let document = Html::from_string(
+        "<style>@page { size: 360pt 216pt; margin: 36pt } p { height: 72pt; width: 72pt; margin: 0; background-color: blue; font-size: 10pt; line-height: 10pt } .test { overflow: hidden; page-break-inside: avoid }</style>\
+         <div class=\"test\"><p>1</p><div class=\"test\"><p>2</p><p>3</p></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page_text = document
+        .pages
+        .iter()
+        .map(|page| {
+            page.lines()
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(page_text, vec![vec!["1"], vec!["2", "3"]]);
+    let first_page_x = document.pages[0].lines()[0].x();
+    assert!(
+        document.pages[1]
+            .lines()
+            .iter()
+            .all(|line| (line.x() - first_page_x).abs() < 0.01),
+        "overflow-hidden avoid retry must retain body canvas inset: {page_text:?}"
+    );
 }
 
 #[tokio::test]
@@ -4228,6 +4774,13 @@ async fn floated_break_inside_avoid_block_moves_to_next_page_when_it_fits() {
     assert_eq!(page_text[1], vec!["2", "3"]);
 
     let page_two_lines = document.pages[1].lines();
+    let first_page_x = document.pages[0].lines()[0].x();
+    assert!(
+        page_two_lines
+            .iter()
+            .all(|line| (line.x() - first_page_x).abs() < 0.01),
+        "deferred root-flow float must retain the body canvas inset: {page_text:?}",
+    );
     assert!(
         page_two_lines[0].y() > page_two_lines[1].y(),
         "floated avoid lines should be vertically ordered: {page_two_lines:?}",
@@ -4640,7 +5193,7 @@ async fn fixed_position_replays_full_paint_fragment_on_each_page() {
         assert_eq!(painted_blue_rect_count(page), 1);
         assert!(page.operations().iter().any(|operation| matches!(
             operation,
-            quire::PaintOperation::Line(index)
+            crate::document::paint::page::PaintOperation::Line(index)
                 if page.lines().get(*index).is_some_and(|line| line.text == "Pin")
         )));
     }
@@ -4781,7 +5334,7 @@ async fn positioned_context_preserves_internal_inline_above_negative_child() {
         .position(|operation| {
             matches!(
                 operation,
-                quire::PaintOperation::Line(index)
+                crate::document::paint::page::PaintOperation::Line(index)
                     if document.pages[0].lines().get(*index).is_some_and(|line| line.text == "Text")
             )
         })
@@ -5008,7 +5561,9 @@ async fn positioned_collapsed_table_paints_cell_text_above_late_border_rects() {
     let line_operation = document.pages[0]
         .operations()
         .iter()
-        .position(|operation| *operation == quire::PaintOperation::Line(line_index))
+        .position(|operation| {
+            *operation == crate::document::paint::page::PaintOperation::Line(line_index)
+        })
         .unwrap();
     let line = &document.pages[0].lines()[line_index];
     let covering_rect_after_text = document.pages[0]
@@ -5016,7 +5571,9 @@ async fn positioned_collapsed_table_paints_cell_text_above_late_border_rects() {
         .iter()
         .skip(line_operation + 1)
         .filter_map(|operation| match operation {
-            quire::PaintOperation::Rect(index) => document.pages[0].rects().get(*index),
+            crate::document::paint::page::PaintOperation::Rect(index) => {
+                document.pages[0].rects().get(*index)
+            }
             _ => None,
         })
         .any(|rect| {
@@ -5053,7 +5610,10 @@ async fn stacking_trigger_paint_order(parent_declaration: &str) -> Vec<CssColor>
     )
 }
 
-fn filled_rect(page: &quire::Page, color: CssColor) -> &quire::RenderedRect {
+fn filled_rect(
+    page: &quire::Page,
+    color: CssColor,
+) -> &crate::document::paint::shapes::RenderedRect {
     page.rects()
         .iter()
         .find(|rect| rect.fill == Some(color))
@@ -5063,12 +5623,12 @@ fn filled_rect(page: &quire::Page, color: CssColor) -> &quire::RenderedRect {
 fn emitted_rects_with_fills<'a>(
     page: &'a quire::Page,
     colors: &[CssColor],
-) -> Vec<(usize, &'a quire::RenderedRect)> {
+) -> Vec<(usize, &'a crate::document::paint::shapes::RenderedRect)> {
     page.paint_operations()
         .iter()
         .enumerate()
         .filter_map(|(operation_index, operation)| {
-            let quire::PaintOperation::Rect(index) = operation else {
+            let crate::document::paint::page::PaintOperation::Rect(index) = operation else {
                 return None;
             };
             let rect = page.rects().get(*index)?;
@@ -5079,7 +5639,10 @@ fn emitted_rects_with_fills<'a>(
         .collect()
 }
 
-fn same_rect(left: &quire::RenderedRect, right: &quire::RenderedRect) -> bool {
+fn same_rect(
+    left: &crate::document::paint::shapes::RenderedRect,
+    right: &crate::document::paint::shapes::RenderedRect,
+) -> bool {
     (left.x() - right.x()).abs() < 0.01
         && (left.y() - right.y()).abs() < 0.01
         && (left.width() - right.width()).abs() < 0.01
@@ -5148,7 +5711,11 @@ fn same_pdf_rect(left: (f32, f32, f32, f32), right: (f32, f32, f32, f32)) -> boo
         && (left.3 - right.3).abs() < 0.01
 }
 
-fn assert_final_rect_fill(page: &quire::Page, rect: &quire::RenderedRect, expected: CssColor) {
+fn assert_final_rect_fill(
+    page: &quire::Page,
+    rect: &crate::document::paint::shapes::RenderedRect,
+    expected: CssColor,
+) {
     for x_fraction in [0.125, 0.5, 0.875] {
         for y_fraction in [0.125, 0.5, 0.875] {
             let x = rect.x() + rect.width() * x_fraction;
@@ -5166,7 +5733,7 @@ fn painted_rect_fills(page: &quire::Page, colors: &[CssColor]) -> Vec<CssColor> 
     page.operations()
         .iter()
         .filter_map(|operation| match operation {
-            quire::PaintOperation::Rect(index) => page
+            crate::document::paint::page::PaintOperation::Rect(index) => page
                 .rects()
                 .get(*index)
                 .and_then(|rect| rect.fill.filter(|fill| colors.contains(fill))),
@@ -5180,7 +5747,7 @@ fn painted_blue_rect_count(page: &quire::Page) -> usize {
     page.operations()
         .iter()
         .filter(|operation| match operation {
-            quire::PaintOperation::Rect(index) => page
+            crate::document::paint::page::PaintOperation::Rect(index) => page
                 .rects()
                 .get(*index)
                 .is_some_and(|rect| rect.fill == Some(blue)),

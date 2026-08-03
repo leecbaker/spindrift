@@ -16,6 +16,8 @@ pub(crate) struct TextBreakPolicy {
     white_space: crate::css::WhiteSpace,
     overflow_wrap: CssOverflowWrap,
     writing_system: ContentWritingSystem,
+    thai_named_entity_tailoring: bool,
+    auto_phrase_language: Option<AutoPhraseLanguage>,
 }
 
 impl From<&ComputedStyle> for TextBreakPolicy {
@@ -26,6 +28,13 @@ impl From<&ComputedStyle> for TextBreakPolicy {
             white_space: style.white_space,
             overflow_wrap: style.overflow_wrap,
             writing_system: content_writing_system(style.language.as_deref()),
+            thai_named_entity_tailoring: matches!(
+                AutoPhraseLanguage::from_language(style.language.as_deref()),
+                Some(AutoPhraseLanguage::Thai)
+            ),
+            auto_phrase_language: matches!(style.word_break, CssWordBreak::AutoPhrase)
+                .then(|| AutoPhraseLanguage::from_language(style.language.as_deref()))
+                .flatten(),
         }
     }
 }
@@ -37,17 +46,40 @@ impl TextBreakPolicy {
         self.overflow_wrap = CssOverflowWrap::Normal;
         self
     }
+
+    /// Return the ordinary UAX #14 policy before Quire applies virtual phrase
+    /// boundaries. `auto-phrase` begins as `normal`; the phrase filter then
+    /// suppresses only candidates inside an ICU-detected phrase.
+    const fn effective_word_break(self) -> CssWordBreak {
+        self.word_break
+    }
+
+    /// Return the UAX #14 collection policy used before CSS `keep-all`
+    /// suppresses word-unit candidates.
+    ///
+    /// ICU's `KeepAll` mode also drops ordinary punctuation opportunities.
+    /// CSS Text instead defines `keep-all` as normal wrapping with only the
+    /// affected word-unit boundaries removed, so collect the normal set and
+    /// apply that removal explicitly below.
+    /// <https://www.w3.org/TR/css-text-3/#word-break-property>
+    const fn ordinary_collection_policy(mut self) -> Self {
+        if matches!(self.word_break, CssWordBreak::KeepAll) {
+            self.word_break = CssWordBreak::Normal;
+        }
+        self
+    }
 }
 
 pub(crate) fn text_with_hyphenation_controls<'a>(
     text: &'a str,
     style: &ComputedStyle,
 ) -> Cow<'a, str> {
-    let mut output = if style.hyphens == Hyphens::None && text.contains(SOFT_HYPHEN) {
-        Cow::Owned(text.replace(SOFT_HYPHEN, ""))
-    } else {
-        Cow::Borrowed(text)
-    };
+    let mut output =
+        if style.hyphenation_is_unconditionally_suppressed() && text.contains(SOFT_HYPHEN) {
+            Cow::Owned(text.replace(SOFT_HYPHEN, ""))
+        } else {
+            Cow::Borrowed(text)
+        };
     if style.allows_soft_wrap()
         && line_break_strictness(style.line_break).is_some()
         && !matches!(style.line_break, CssLineBreak::Anywhere)
@@ -406,7 +438,7 @@ pub(crate) fn text_with_css_line_breaks(text: &str, style: &ComputedStyle) -> St
     let content_locale = line_break_content_locale(policy.writing_system);
     let mut options = LineBreakOptions::default();
     options.strictness = Some(strictness);
-    options.word_option = Some(line_break_word_option(policy.word_break));
+    options.word_option = Some(line_break_word_option(policy.effective_word_break()));
     options.content_locale = content_locale.as_ref();
     let segmenter = LineSegmenter::new_auto(options);
     let breaks = segmenter
@@ -445,6 +477,7 @@ pub(super) fn line_break_word_option(word_break: CssWordBreak) -> LineBreakWordO
         CssWordBreak::Normal => LineBreakWordOption::Normal,
         CssWordBreak::BreakAll => LineBreakWordOption::BreakAll,
         CssWordBreak::KeepAll => LineBreakWordOption::KeepAll,
+        CssWordBreak::AutoPhrase => LineBreakWordOption::Normal,
         CssWordBreak::Manual => LineBreakWordOption::Normal,
         CssWordBreak::BreakWord => LineBreakWordOption::Normal,
     }
@@ -492,10 +525,13 @@ pub(crate) fn collect_measured_break_opportunities(
     breaks: &mut Vec<usize>,
 ) {
     breaks.clear();
-    let content_locale = line_break_content_locale(policy.writing_system);
+    let ordinary_policy = policy.ordinary_collection_policy();
+    let content_locale = line_break_content_locale(ordinary_policy.writing_system);
     let mut options = LineBreakOptions::default();
-    options.strictness = line_break_strictness(policy.line_break);
-    options.word_option = Some(line_break_word_option(policy.word_break));
+    options.strictness = line_break_strictness(ordinary_policy.line_break);
+    options.word_option = Some(line_break_word_option(
+        ordinary_policy.effective_word_break(),
+    ));
     options.content_locale = content_locale.as_ref();
     let segmenter = LineSegmenter::new_auto(options);
     breaks.extend(
@@ -506,7 +542,9 @@ pub(crate) fn collect_measured_break_opportunities(
     if matches!(policy.word_break, CssWordBreak::BreakAll) {
         breaks.extend(word_break_all_inner_boundaries(text));
     }
-    apply_css_line_break_class_tailoring(text, policy, breaks);
+    apply_css_line_break_class_tailoring(text, ordinary_policy, breaks);
+    suppress_thai_named_entity_unit_breaks(text, policy, breaks);
+    suppress_auto_phrase_unit_breaks(text, policy, breaks);
     suppress_keep_all_unit_breaks(text, policy, breaks);
     suppress_manual_complex_context_breaks(text, policy, breaks);
     // U+00AD is an explicit conditional break supplied by the author or the
@@ -541,9 +579,35 @@ pub(crate) fn collect_measured_break_opportunities(
         }));
     }
 
-    if matches!(policy.line_break, CssLineBreak::Anywhere)
-        || matches!(policy.overflow_wrap, CssOverflowWrap::Anywhere)
-    {
+    if matches!(policy.line_break, CssLineBreak::Anywhere) {
+        // CSS Text defines `line-break:anywhere` in terms of typographic
+        // character units, not raw extended grapheme clusters. A run of
+        // default-ignorable or joining controls attaches to its following
+        // visible unit (or to the preceding one at text end), so treating a
+        // grapheme boundary beside every control as an opportunity cannot put
+        // a zero-width control on its own line.
+        // <https://drafts.csswg.org/css-text-3/#typographic-character-unit>
+        // <https://drafts.csswg.org/css-text-3/#valdef-line-break-anywhere>
+        let mut unit_ends = typographic_unit_ranges(text)
+            .into_iter()
+            .map(|range| range.end)
+            .collect::<Vec<_>>();
+        attach_line_break_anywhere_controls_to_following_unit(text, &mut unit_ends);
+        // ICU can report a boundary around a format control even though the
+        // control belongs to one neighboring typographic unit. Replace those
+        // ordinary UAX candidates instead of merely adding more `anywhere`
+        // candidates beside them.
+        breaks.retain(|position| unit_ends.binary_search(position).is_ok());
+        breaks.extend(unit_ends.into_iter().filter(|position| {
+            *position > 0
+                && *position < text.len()
+                && pre_wrap_anywhere_break_allowed(text, policy, *position)
+        }));
+    }
+    if matches!(policy.overflow_wrap, CssOverflowWrap::Anywhere) {
+        // Unlike `line-break:anywhere`, overflow wrapping is an emergency
+        // fallback and remains defined at grapheme-cluster boundaries.
+        // <https://drafts.csswg.org/css-text-3/#overflow-wrap-property>
         breaks.extend(
             GraphemeClusterSegmenter::new()
                 .segment_str(text)
@@ -554,9 +618,130 @@ pub(crate) fn collect_measured_break_opportunities(
                 }),
         );
     }
+    move_breaks_after_bidi_format_controls(text, breaks);
     breaks.push(text.len());
     breaks.sort_unstable();
     breaks.dedup();
+}
+
+/// Collect ordinary UAX #14 candidates which `word-break:auto-phrase` holds
+/// back until phrase wrapping cannot avoid overflow.
+///
+/// The returned offsets retain the original source coordinate system.  The
+/// inline graph gives them [`BreakAvailability::RelaxedWordBreak`] rather
+/// than deleting and later reconstructing them, so authored text, shaping,
+/// and dictionary hyphenation remain source faithful.
+/// <https://drafts.csswg.org/css-text-4/#word-break-auto-phrase>
+pub(crate) fn collect_auto_phrase_relaxed_wrap_opportunities(
+    text: &str,
+    policy: TextBreakPolicy,
+    breaks: &mut Vec<usize>,
+) {
+    breaks.clear();
+    let Some(language) = policy.auto_phrase_language else {
+        return;
+    };
+    let Some(phrases) = phrase_boundaries(text, language) else {
+        return;
+    };
+
+    let mut ordinary_policy = policy;
+    ordinary_policy.auto_phrase_language = None;
+    collect_measured_break_opportunities(text, ordinary_policy, breaks);
+    breaks.retain(|position| {
+        let previous = text[..*position].chars().next_back();
+        let next = text[*position..].chars().next();
+        matches!(
+            (previous, next),
+            (Some(previous), Some(next))
+                if auto_phrase_suppresses_break_between(previous, next)
+                    && !phrases.contains_boundary(*position)
+        )
+    });
+}
+
+/// Collect normal UAX #14 candidates that `word-break:keep-all` suppresses.
+///
+/// CSS Text permits relaxing *those suppressed boundaries* when no ordinary
+/// break can fit. It does not turn every grapheme boundary in an otherwise
+/// unbreakable Latin word into a `keep-all` fallback. Retaining the original
+/// candidate set also keeps punctuation such as a literal hyphen ordinary.
+/// <https://www.w3.org/TR/css-text-3/#word-break-property>
+pub(crate) fn collect_keep_all_relaxed_wrap_opportunities(
+    text: &str,
+    policy: TextBreakPolicy,
+    breaks: &mut Vec<usize>,
+) {
+    breaks.clear();
+    if !matches!(policy.word_break, CssWordBreak::KeepAll) {
+        return;
+    }
+    let mut normal_policy = policy;
+    normal_policy.word_break = CssWordBreak::Normal;
+    collect_measured_break_opportunities(text, normal_policy, breaks);
+    breaks.retain(|position| {
+        let previous = text[..*position].chars().next_back();
+        let next = text[*position..].chars().next();
+        matches!(
+            (previous, next),
+            (Some(previous), Some(next)) if keep_all_suppresses_break_between(previous, next)
+        )
+    });
+}
+
+/// Keep a UAX #14 break boundary outside a following bidi-format-control run.
+///
+/// Bidirectional formatting characters contribute to UAX #9 resolution but do
+/// not own an inline advance or a CSS Text line box. If a segmenter reports a
+/// boundary immediately before one, select the equivalent source boundary
+/// after the complete control run. This retains the ordinary break between the
+/// adjacent visible typographic units without putting a control on its own
+/// physical line:
+/// <https://www.unicode.org/reports/tr14/#LB9> and
+/// <https://www.w3.org/TR/css-text-3/#line-break-details>.
+fn move_breaks_after_bidi_format_controls(text: &str, breaks: &mut [usize]) {
+    for position in breaks {
+        let Some(mut suffix) = text.get(*position..) else {
+            continue;
+        };
+        while let Some(character) = suffix.chars().next() {
+            if !character_is_bidi_format_control(character) {
+                break;
+            }
+            *position += character.len_utf8();
+            suffix = &suffix[character.len_utf8()..];
+        }
+    }
+}
+
+/// Make default-ignorable and join-control runs part of their following
+/// `line-break:anywhere` typographic unit.
+///
+/// A terminal control has no following visible unit and consequently remains
+/// with its preceding unit. This preserves a useful soft edge without ever
+/// offering a control-only line. The direction is intentionally local to
+/// `line-break:anywhere`: general typographic-unit consumers retain their
+/// existing preceding-control ownership for shaping and tracking.
+///
+/// <https://drafts.csswg.org/css-text-3/#typographic-character-unit>
+/// <https://drafts.csswg.org/css-text-3/#valdef-line-break-anywhere>
+fn attach_line_break_anywhere_controls_to_following_unit(text: &str, unit_ends: &mut Vec<usize>) {
+    let mut control_run_start = None;
+    for (offset, character) in text.char_indices() {
+        if character_is_default_ignorable_code_point(character)
+            || character_is_join_control(character)
+        {
+            control_run_start.get_or_insert(offset);
+            continue;
+        }
+        let Some(start) = control_run_start.take() else {
+            continue;
+        };
+        unit_ends.retain(|position| *position <= start || *position > offset);
+        unit_ends.push(start);
+    }
+    unit_ends.sort_unstable();
+    unit_ends.dedup();
 }
 
 /// Return whether an emergency-style grapheme opportunity preserves a
@@ -805,6 +990,76 @@ fn suppress_keep_all_unit_breaks(text: &str, policy: TextBreakPolicy, breaks: &m
     });
 }
 
+/// Return whether a normal opportunity is inside textual phrase content. CSS
+/// Text typographic units include combining marks; treating only letter and
+/// number scalars as word content would leak Thai breaks between a base and
+/// its marks before phrase filtering can see the ICU boundary.
+fn auto_phrase_suppresses_break_between(previous: char, next: char) -> bool {
+    let word_content = |character| {
+        character_is_unicode_alphanumeric(character) || character_is_unicode_mark(character)
+    };
+    word_content(previous) && word_content(next)
+}
+
+/// Apply Thai dictionary and named-entity units to automatic complex-context
+/// wrapping. ICU still owns punctuation, whitespace, and explicit U+200B
+/// opportunities; Kham only removes a candidate that falls within one Thai
+/// lexical unit.
+///
+/// This tailoring is intentionally independent of `word-break:auto-phrase`.
+/// A normal Thai run must not split a named entity merely because an explicit
+/// `<wbr>` separates it from the following word.
+/// <https://www.unicode.org/reports/tr14/#SA>
+fn suppress_thai_named_entity_unit_breaks(
+    text: &str,
+    policy: TextBreakPolicy,
+    breaks: &mut Vec<usize>,
+) {
+    if !policy.thai_named_entity_tailoring {
+        return;
+    }
+    let Some(units) = phrase_boundaries(text, AutoPhraseLanguage::Thai) else {
+        return;
+    };
+    breaks.retain(|position| {
+        let previous = text[..*position].chars().next_back();
+        let next = text[*position..].chars().next();
+        !matches!(
+            (previous, next),
+            (Some(previous), Some(next))
+                if manual_suppresses_break_between(previous, next)
+                    && !units.contains_boundary(*position)
+        )
+    });
+}
+
+/// Suppress normal word-unit opportunities that lie within one ICU-detected
+/// phrase. The ICU boundary is virtual: source text and shaped ranges remain
+/// unchanged, while the graph receives only the surviving CSS opportunity.
+///
+/// This intentionally preserves ordinary whitespace and punctuation breaks.
+/// CSS Text's phrase behavior only suppresses the otherwise-normal word-unit
+/// boundaries within a detected phrase.
+/// <https://drafts.csswg.org/css-text-4/#valdef-word-break-auto-phrase>
+fn suppress_auto_phrase_unit_breaks(text: &str, policy: TextBreakPolicy, breaks: &mut Vec<usize>) {
+    let Some(language) = policy.auto_phrase_language else {
+        return;
+    };
+    let Some(phrases) = phrase_boundaries(text, language) else {
+        return;
+    };
+    breaks.retain(|position| {
+        let previous = text[..*position].chars().next_back();
+        let next = text[*position..].chars().next();
+        !matches!(
+            (previous, next),
+            (Some(previous), Some(next))
+                if auto_phrase_suppresses_break_between(previous, next)
+                    && !phrases.contains_boundary(*position)
+        )
+    });
+}
+
 /// Return whether `word-break: manual` suppresses an automatic break between
 /// two adjacent characters.
 ///
@@ -901,6 +1156,93 @@ mod tests {
         assert_eq!(
             measured_break_opportunities("　XX　　XX", &style),
             [3, 8, 11, 13]
+        );
+    }
+
+    #[test]
+    fn keep_all_preserves_normal_literal_hyphen_candidates() {
+        let normal = ComputedStyle::initial();
+        let mut keep_all = normal.clone();
+        keep_all.word_break = CssWordBreak::KeepAll;
+        for text in ["AB-CD-EF", "12-34-56"] {
+            assert_eq!(
+                measured_break_opportunities(text, &keep_all),
+                measured_break_opportunities(text, &normal),
+                "literal-hyphen punctuation candidates must not be lost for {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn keep_all_relaxes_only_its_suppressed_normal_candidates() {
+        let mut keep_all = ComputedStyle::initial();
+        keep_all.word_break = CssWordBreak::KeepAll;
+        let policy = TextBreakPolicy::from(&keep_all);
+        let mut relaxed = Vec::new();
+
+        collect_keep_all_relaxed_wrap_opportunities("AB-CD-EF", policy, &mut relaxed);
+        assert!(
+            relaxed.is_empty(),
+            "Latin graphemes are not keep-all fallbacks"
+        );
+
+        collect_keep_all_relaxed_wrap_opportunities("中文", policy, &mut relaxed);
+        assert_eq!(relaxed, ["中".len()]);
+    }
+
+    #[test]
+    fn line_break_anywhere_uses_typographic_units_for_controls() {
+        let mut style = ComputedStyle::initial();
+        style.line_break = CssLineBreak::Anywhere;
+
+        for control in ['\u{2060}', '\u{feff}', '\u{034f}', '\u{200d}'] {
+            let text = format!("A{control}B");
+            let before_control = "A".len();
+            let after_control = before_control + control.len_utf8();
+            let breaks = measured_break_opportunities(&text, &style);
+            assert!(
+                breaks.contains(&before_control),
+                "{control:?} must attach to its following typographic unit: {breaks:?}"
+            );
+            assert!(
+                !breaks.contains(&after_control),
+                "{control:?} must not become its own typographic unit: {breaks:?}"
+            );
+        }
+
+        let nbsp = "A\u{00a0}B";
+        let breaks = measured_break_opportunities(nbsp, &style);
+        assert!(breaks.contains(&"A".len()), "{breaks:?}");
+        assert!(breaks.contains(&"A\u{00a0}".len()), "{breaks:?}");
+    }
+
+    #[test]
+    fn ordinary_line_breaks_keep_bidi_controls_with_the_preceding_source() {
+        let style = ComputedStyle::initial();
+        let text = "東\u{2066}京";
+        let before_control = "東".len();
+        let after_control = before_control + '\u{2066}'.len_utf8();
+        let breaks = measured_break_opportunities(text, &style);
+
+        assert!(
+            !breaks.contains(&before_control),
+            "a bidi control must not begin a physical line: {breaks:?}"
+        );
+        assert!(
+            breaks.contains(&after_control),
+            "the visible CJK boundary remains available after its control: {breaks:?}"
+        );
+    }
+
+    #[test]
+    fn overflow_wrap_anywhere_retains_grapheme_boundaries_for_controls() {
+        let mut style = ComputedStyle::initial();
+        style.overflow_wrap = CssOverflowWrap::Anywhere;
+        let text = "A\u{2060}B";
+
+        assert!(
+            measured_break_opportunities(text, &style).contains(&"A".len()),
+            "overflow-wrap:anywhere must retain grapheme fallback boundaries"
         );
     }
 

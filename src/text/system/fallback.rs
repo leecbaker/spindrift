@@ -210,7 +210,7 @@ impl FontSystem {
         None
     }
 
-    fn resolve_system_fallback_for_style_character(
+    pub(super) fn resolve_system_fallback_for_style_character(
         &mut self,
         style: &ComputedStyle,
         character: char,

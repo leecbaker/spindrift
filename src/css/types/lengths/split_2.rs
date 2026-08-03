@@ -1,4 +1,5 @@
 use super::*;
+use std::ops::{Deref, DerefMut};
 
 /// Computed `flex-basis` value.
 ///
@@ -127,7 +128,7 @@ pub(crate) struct ComputedBoxValues {
     pub margin: CssEdges<ComputedLengthPercentageOrAuto>,
     pub padding: CssEdges<ComputedLengthPercentage>,
     pub width: ComputedLengthPercentageOrAuto,
-    pub height: ComputedLengthPercentageOrAuto,
+    pub height: PhysicalHeight,
     pub min_width: ComputedLengthPercentageOrAuto,
     pub max_width: ComputedLengthPercentageOrAuto,
     pub min_height: ComputedLengthPercentageOrAuto,
@@ -136,6 +137,72 @@ pub(crate) struct ComputedBoxValues {
     pub inset_top: ComputedLengthPercentageOrAuto,
     pub inset_right: ComputedLengthPercentageOrAuto,
     pub inset_bottom: ComputedLengthPercentageOrAuto,
+}
+
+/// A physical `height` together with the used-value lifecycle of its selected
+/// font metric.
+///
+/// An orthogonal table row must resolve `ch` against its own track context.
+/// The enum keeps that fact attached to the exact computed value until layout
+/// intentionally substitutes a definite used height or `auto`.
+/// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>
+/// <https://www.w3.org/TR/css-tables-3/#row-layout>
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum PhysicalHeight {
+    Resolved(ComputedLengthPercentageOrAuto),
+    DeferredFontMetric(ComputedLengthPercentageOrAuto),
+}
+
+impl PhysicalHeight {
+    pub(crate) const AUTO: Self = Self::Resolved(ComputedLengthPercentageOrAuto::AUTO);
+
+    pub(crate) fn from_computed(value: ComputedLengthPercentageOrAuto) -> Self {
+        if value.requires_ch_advance() {
+            Self::DeferredFontMetric(value)
+        } else {
+            Self::Resolved(value)
+        }
+    }
+
+    pub(crate) const fn is_deferred_font_metric(&self) -> bool {
+        matches!(self, Self::DeferredFontMetric(_))
+    }
+
+    pub(crate) fn value(&self) -> &ComputedLengthPercentageOrAuto {
+        match self {
+            Self::Resolved(value) | Self::DeferredFontMetric(value) => value,
+        }
+    }
+
+    pub(crate) fn value_mut(&mut self) -> &mut ComputedLengthPercentageOrAuto {
+        match self {
+            Self::Resolved(value) | Self::DeferredFontMetric(value) => value,
+        }
+    }
+
+    pub(crate) fn replace_with_used(&mut self, value: ComputedLengthPercentageOrAuto) {
+        *self = Self::Resolved(value);
+    }
+}
+
+impl Deref for PhysicalHeight {
+    type Target = ComputedLengthPercentageOrAuto;
+
+    fn deref(&self) -> &Self::Target {
+        self.value()
+    }
+}
+
+impl DerefMut for PhysicalHeight {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.value_mut()
+    }
+}
+
+impl PartialEq<ComputedLengthPercentageOrAuto> for PhysicalHeight {
+    fn eq(&self, other: &ComputedLengthPercentageOrAuto) -> bool {
+        self.value() == other
+    }
 }
 
 impl ComputedBoxValues {
@@ -228,7 +295,7 @@ impl ComputedBoxValues {
             margin: CssEdges::all(ComputedLengthPercentageOrAuto::ZERO),
             padding: CssEdges::all(ComputedLengthPercentage::ZERO),
             width: ComputedLengthPercentageOrAuto::AUTO,
-            height: ComputedLengthPercentageOrAuto::AUTO,
+            height: PhysicalHeight::AUTO,
             min_width: ComputedLengthPercentageOrAuto::AUTO,
             max_width: ComputedLengthPercentageOrAuto::AUTO,
             min_height: ComputedLengthPercentageOrAuto::AUTO,

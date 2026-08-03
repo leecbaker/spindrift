@@ -64,6 +64,7 @@ pub(super) struct PdfIccColorSpace {
 /// A source-image RGB profile retained by an ordinary PDF.
 #[derive(Debug, Clone)]
 struct EmbeddedRgbIccProfile {
+    name: Box<[u8]>,
     bytes: Rc<[u8]>,
     object_id: usize,
 }
@@ -84,7 +85,8 @@ impl PdfColorPlan {
     pub(super) fn new(
         profile: PdfProfile,
         first_object_id: usize,
-        used_css_spaces: impl IntoIterator<Item = CssColorSpace>,
+        vector_paint_colors: impl IntoIterator<Item = CssColor>,
+        image_color_spaces: impl IntoIterator<Item = CssColorSpace>,
         embedded_rgb_profiles: Vec<Rc<[u8]>>,
     ) -> Result<Self> {
         let mode = if profile.is_pdfa() {
@@ -92,13 +94,17 @@ impl PdfColorPlan {
         } else {
             PdfColorMode::PreserveCssSpace
         };
-        // PDF/A converts every CSS paint to its tagged sRGB output condition.
-        // Ordinary PDF instead plans only the authored spaces actually used by
-        // vector paint or raster images, preserving CSS CssColor 4 semantics
-        // without attaching unused profiles to every page.
-        let used_css_spaces = used_css_spaces
+        // A vector paint's retained CSS coordinates are not necessarily its
+        // PDF coordinates: ordinary-PDF paint uses sRGB where possible and
+        // Display-P3 otherwise. Plan those final spaces with the exact helper
+        // used by content serialization, while leaving image samples in their
+        // own retained component spaces.
+        let vector_output_spaces = vector_paint_colors
             .into_iter()
-            .map(ordinary_pdf_output_space)
+            .map(|color| pdf_paint_color(color, mode).space())
+            .collect::<std::collections::HashSet<_>>();
+        let image_color_spaces = image_color_spaces
+            .into_iter()
             .collect::<std::collections::HashSet<_>>();
         let retained_spaces = match mode {
             PdfColorMode::SrgbOutputIntent => vec![CssColorSpace::Srgb],
@@ -108,15 +114,17 @@ impl PdfColorPlan {
                 CssColorSpace::A98Rgb,
                 CssColorSpace::ProphotoRgb,
                 CssColorSpace::Rec2020,
+                CssColorSpace::XyzD50,
             ]
             .into_iter()
             // Raster glyph fallbacks and late image materialization can add
             // sRGB samples after document-level resource planning. Keep the
-            // universal CSS default available while continuing to plan wider
-            // authored spaces lazily.
+            // universal CSS default available while planning vector output and
+            // image source spaces lazily.
             .filter(|space| {
-                matches!(space, CssColorSpace::Srgb | CssColorSpace::DisplayP3)
-                    || used_css_spaces.contains(space)
+                *space == CssColorSpace::Srgb
+                    || vector_output_spaces.contains(space)
+                    || image_color_spaces.contains(space)
             })
             .collect(),
         };
@@ -138,6 +146,7 @@ impl PdfColorPlan {
                 .into_iter()
                 .enumerate()
                 .map(|(index, bytes)| EmbeddedRgbIccProfile {
+                    name: format!("CSEmbeddedRgb{}", index + 1).into_bytes().into(),
                     bytes,
                     object_id: first_object_id + spaces.len() + index,
                 })
@@ -167,21 +176,48 @@ impl PdfColorPlan {
             .unwrap_or_else(|| panic!("CSS color space {space:?} was not planned for this PDF"))
     }
 
-    /// Resolve an authored gradient or generated-image space for this PDF
-    /// policy. PDF/A has exactly one tagged output condition.
-    pub(super) const fn output_space(&self, authored: CssColorSpace) -> CssColorSpace {
+    /// Select the common final RGB condition for one native PDF shading.
+    ///
+    /// A PDF function shading has exactly one color space, so its stops must
+    /// not independently choose sRGB or Display-P3. Preserve sRGB when every
+    /// stop fits; otherwise encode the full shading in Display-P3.
+    pub(super) fn gradient_output_space(
+        &self,
+        gradient: &crate::document::paint::paths::RenderedGradient,
+    ) -> CssColorSpace {
         match self.mode {
-            PdfColorMode::PreserveCssSpace => ordinary_pdf_output_space(authored),
             PdfColorMode::SrgbOutputIntent => CssColorSpace::Srgb,
+            PdfColorMode::PreserveCssSpace => {
+                if gradient
+                    .stops
+                    .iter()
+                    .chain(
+                        gradient
+                            .periodic
+                            .iter()
+                            .flat_map(|periodic| periodic.stops.iter()),
+                    )
+                    .all(|stop| color_fits_output_space(stop.color, CssColorSpace::Srgb))
+                {
+                    CssColorSpace::Srgb
+                } else {
+                    CssColorSpace::DisplayP3
+                }
+            }
         }
     }
 
-    pub(super) fn output_color(&self, color: CssColor) -> PdfPaintColor {
-        pdf_paint_color(color, self.mode)
+    /// Convert a gradient stop into the shading's already-selected RGB space.
+    pub(super) fn gradient_color(&self, color: CssColor, space: CssColorSpace) -> PdfPaintColor {
+        debug_assert!(matches!(
+            space,
+            CssColorSpace::Srgb | CssColorSpace::DisplayP3
+        ));
+        pdf_paint_color_in_space(color, space)
     }
 
     pub(super) fn profile_object_id(&self, space: CssColorSpace) -> usize {
-        self.space(self.output_space(space)).object_id
+        self.space(space).object_id
     }
 
     /// Resolve an image's retained raster profile under this PDF policy.
@@ -192,7 +228,7 @@ impl PdfColorPlan {
         match (self.mode, color_space) {
             (PdfColorMode::SrgbOutputIntent, _) => self.space(CssColorSpace::Srgb).object_id,
             (PdfColorMode::PreserveCssSpace, crate::color::RasterColorSpace::BuiltIn(space)) => {
-                self.space(ordinary_pdf_output_space(*space)).object_id
+                self.space(*space).object_id
             }
             (
                 PdfColorMode::PreserveCssSpace,
@@ -205,6 +241,45 @@ impl PdfColorPlan {
                     .object_id
             }
         }
+    }
+
+    /// Paint opaque raster samples directly in the calibrated component space
+    /// that the corresponding image XObject would use.
+    ///
+    /// This is intentionally separate from [`set_fill_color`]: embedded image
+    /// profiles have source-defined component coordinates rather than CSS
+    /// color coordinates.
+    pub(super) fn set_raster_fill_color(
+        &self,
+        content: &mut Content,
+        color_space: &crate::color::RasterColorSpace,
+        samples: [u8; 3],
+    ) {
+        let name = match (self.mode, color_space) {
+            (PdfColorMode::SrgbOutputIntent, crate::color::RasterColorSpace::BuiltIn(space)) => {
+                debug_assert_eq!(*space, CssColorSpace::Srgb);
+                color_space_name(*space)
+            }
+            (PdfColorMode::SrgbOutputIntent, crate::color::RasterColorSpace::EmbeddedRgb(_)) => {
+                unreachable!("PDF/A raster fills must be converted to sRGB before emission")
+            }
+            (PdfColorMode::PreserveCssSpace, crate::color::RasterColorSpace::BuiltIn(space)) => {
+                color_space_name(*space)
+            }
+            (
+                PdfColorMode::PreserveCssSpace,
+                crate::color::RasterColorSpace::EmbeddedRgb(bytes),
+            ) => self
+                .embedded_rgb_profiles
+                .iter()
+                .find(|profile| profile.bytes.as_ref() == bytes.as_ref())
+                .expect("every retained image profile is planned before PDF object allocation")
+                .name
+                .as_ref(),
+        };
+        content
+            .set_fill_color_space(Name(name))
+            .set_fill_color(samples.map(|sample| sample as f32 / 255.0));
     }
 
     pub(super) fn write_profiles(&self, pdf: &mut Pdf, compression: PdfCompression) {
@@ -236,6 +311,11 @@ impl PdfColorPlan {
         }
     }
 
+    /// Declare every named calibrated color space that PDF content can select.
+    ///
+    /// PDF resource names used by `cs`/`CS` are scoped by the enclosing
+    /// resource dictionary; ICCBased color spaces are defined by §8.6.5.5.
+    /// <https://developer.adobe.com/document-services/docs/assets/5b15559b96303194340b99820d3a70fa/PDF_ISO_32000-2.pdf>
     pub(super) fn write_page_resources(&self, resources: &mut pdf_writer::writers::Resources<'_>) {
         let mut color_spaces = resources.color_spaces();
         for space in &self.spaces {
@@ -243,6 +323,12 @@ impl PdfColorPlan {
                 .insert(Name(space.name))
                 .start::<pdf_writer::writers::ColorSpace>()
                 .icc_based(Ref::new(space.object_id as i32));
+        }
+        for profile in &self.embedded_rgb_profiles {
+            color_spaces
+                .insert(Name(&profile.name))
+                .start::<pdf_writer::writers::ColorSpace>()
+                .icc_based(Ref::new(profile.object_id as i32));
         }
     }
 
@@ -275,6 +361,12 @@ pub(super) fn set_stroke_color(content: &mut Content, color: CssColor, mode: Pdf
         ]);
 }
 
+/// Convert direct CSS paint to the PDF output condition selected for it.
+///
+/// CSS Color 4 conversion preserves extended-range components until the
+/// physical output boundary; this helper chooses the tagged PDF condition and
+/// is shared by resource planning and content emission.
+/// <https://www.w3.org/TR/css-color-4/#color-conversion>
 pub(super) fn output_color(color: CssColor, mode: PdfColorMode) -> CssColor {
     match mode {
         // sRGB is the interoperable ordinary-PDF encoding when a CSS color is
@@ -316,6 +408,16 @@ fn pdf_paint_color(color: CssColor, mode: PdfColorMode) -> PdfPaintColor {
     PdfPaintColor::new(color.space(), color.components(), color.alpha())
 }
 
+fn pdf_paint_color_in_space(color: CssColor, space: CssColorSpace) -> PdfPaintColor {
+    let color = crate::css::color_to_predefined_rgb(color, space)
+        .expect("a PDF gradient output space is a predefined CSS RGB space");
+    PdfPaintColor::new(space, color.components(), color.alpha())
+}
+
+fn color_fits_output_space(color: CssColor, space: CssColorSpace) -> bool {
+    crate::css::color_to_predefined_rgb(color, space).is_some_and(rgb_coordinates_are_in_unit_gamut)
+}
+
 /// Whether an encoded RGB paint can be represented without output clipping.
 ///
 /// CSS predefined-RGB conversion retains extended-range components. This
@@ -349,19 +451,6 @@ fn quantized_rgb_pdf_color(color: CssColor) -> CssColor {
         sample(color.components()[2]),
         color.alpha(),
     )
-}
-
-/// PDF's ordinary output condition for an authored CSS component space.
-///
-/// D50 XYZ is an internal profile-connection space. CSS CssColor 4 values
-/// produced from Lab, LCH, OKLab, OKLCH, `xyz*`, and PCS interpolation reserve
-/// Display-P3 as their wide-gamut ordinary-PDF fallback rather than emitting
-/// the PCS directly.
-const fn ordinary_pdf_output_space(authored: CssColorSpace) -> CssColorSpace {
-    match authored {
-        CssColorSpace::XyzD50 => CssColorSpace::DisplayP3,
-        rgb => rgb,
-    }
 }
 
 pub(super) const fn color_space_name(space: CssColorSpace) -> &'static [u8] {
@@ -463,17 +552,26 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_pdf_retargets_pcs_resources_to_display_p3() {
-        let plan = PdfColorPlan::new(PdfProfile::Pdf, 1, [CssColorSpace::XyzD50], Vec::new())
-            .expect("built-in Display-P3 ICC profile is available");
-        assert_eq!(
-            plan.output_space(CssColorSpace::XyzD50),
-            CssColorSpace::DisplayP3
-        );
+    fn ordinary_pdf_plans_the_final_p3_space_for_wide_pcs_paint() {
+        let p3_green = CssColor::rgb(crate::css::RgbColorSpace::DisplayP3, 0.0, 1.0, 0.0, 1.0);
+        let plan = PdfColorPlan::new(
+            PdfProfile::Pdf,
+            1,
+            [crate::css::color_to_xyz_d50(p3_green)],
+            [],
+            Vec::new(),
+        )
+        .expect("built-in Display-P3 ICC profile is available");
         assert!(
             plan.spaces
                 .iter()
-                .all(|space| space.space != CssColorSpace::XyzD50)
+                .any(|space| space.space == CssColorSpace::DisplayP3)
+        );
+        assert!(
+            !plan
+                .spaces
+                .iter()
+                .any(|space| space.space == CssColorSpace::XyzD50)
         );
     }
 }

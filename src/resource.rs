@@ -77,6 +77,11 @@ pub(crate) struct ResourceFetcher {
 pub(crate) struct FetchedResource {
     pub(crate) bytes: Vec<u8>,
     pub(crate) final_url: Url,
+    /// MIME type supplied by the resource response, when that response has
+    /// explicit type metadata.  This is required for destinations such as
+    /// HTML linked stylesheets, whose processing depends on response MIME
+    /// metadata rather than only the destination that initiated the fetch.
+    pub(crate) content_type: Option<String>,
     pub(crate) access_control_allow_origin: Option<String>,
     pub(crate) access_control_allow_credentials: bool,
 }
@@ -118,12 +123,20 @@ impl ResourceFetcher {
     }
 
     pub(crate) async fn fetch(&self, location: &Url) -> crate::Result<FetchedResource> {
+        let location = fetch_url(location).ok_or_else(|| {
+            crate::Error::InvalidInput(format!(
+                "unsupported resource URL scheme {:?}: {location}",
+                location.scheme()
+            ))
+        })?;
+
         #[cfg(target_arch = "wasm32")]
         {
-            // Data URLs are decoded directly by their callers and therefore
-            // do not reach this platform resource backend.
+            if location.scheme() == "data" {
+                return fetch_data_url(&location);
+            }
             return Err(crate::Error::InvalidInput(format!(
-                "resource URL scheme {:?} is unavailable when targeting wasm32; use in-memory or data URL resources",
+                "resource URL scheme {:?} is unavailable when targeting wasm32",
                 location.scheme()
             )));
         }
@@ -152,6 +165,11 @@ impl ResourceFetcher {
                     .get(reqwest::header::ACCESS_CONTROL_ALLOW_ORIGIN)
                     .and_then(|value| value.to_str().ok())
                     .map(str::to_owned);
+                let content_type = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
                 let access_control_allow_credentials = response
                     .headers()
                     .get(reqwest::header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
@@ -173,6 +191,7 @@ impl ResourceFetcher {
                 Ok(FetchedResource {
                     bytes,
                     final_url,
+                    content_type,
                     access_control_allow_origin,
                     access_control_allow_credentials,
                 })
@@ -193,10 +212,12 @@ impl ResourceFetcher {
                 Ok(FetchedResource {
                     bytes,
                     final_url: location.clone(),
+                    content_type: None,
                     access_control_allow_origin: None,
                     access_control_allow_credentials: false,
                 })
             }
+            "data" => fetch_data_url(&location),
             scheme => Err(crate::Error::InvalidInput(format!(
                 "unsupported resource URL scheme {scheme:?}: {location}"
             ))),
@@ -213,6 +234,34 @@ impl ResourceFetcher {
         })?;
         Ok((source, fetched.final_url))
     }
+}
+
+/// Fetch a `data:` URL without a network request.
+///
+/// Fetch defines `data:` URLs as resources with a decoded byte body and MIME
+/// type metadata. The URL fragment is removed by [`fetch_url`] before this
+/// function receives the URL, so it cannot become part of the resource body.
+/// <https://fetch.spec.whatwg.org/#data-url-processor>
+fn fetch_data_url(location: &Url) -> crate::Result<FetchedResource> {
+    debug_assert_eq!(location.scheme(), "data");
+    let data_url = data_url::DataUrl::process(location.as_str()).map_err(|error| {
+        crate::Error::InvalidInput(format!("failed to parse data URL {location}: {error}"))
+    })?;
+    let content_type = data_url.mime_type().to_string();
+    let (bytes, _) = data_url.decode_to_vec().map_err(|error| {
+        crate::Error::InvalidInput(format!("failed to decode data URL {location}: {error}"))
+    })?;
+    log::trace!(
+        "decoded data URL {location} as {content_type} ({} byte(s))",
+        bytes.len()
+    );
+    Ok(FetchedResource {
+        bytes,
+        final_url: location.clone(),
+        content_type: Some(content_type),
+        access_control_allow_origin: None,
+        access_control_allow_credentials: false,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -642,7 +691,7 @@ pub(crate) fn css_resource_urls(
 }
 
 pub(crate) fn fetch_url(url: &Url) -> Option<Url> {
-    matches!(url.scheme(), "file" | "http" | "https").then(|| {
+    matches!(url.scheme(), "data" | "file" | "http" | "https").then(|| {
         let mut url = url.clone();
         url.set_fragment(None);
         url
@@ -696,86 +745,7 @@ fn absolute_path(path: &Path) -> crate::Result<PathBuf> {
 }
 
 fn css_urls(source: &str) -> Vec<String> {
-    let bytes = source.as_bytes();
-    let mut urls = Vec::new();
-    let mut index = 0;
-    while index + 4 <= bytes.len() {
-        if !bytes[index..]
-            .get(..4)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"url("))
-        {
-            index += 1;
-            continue;
-        }
-        index += 4;
-        while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
-            index += 1;
-        }
-        let Some(url) = (if matches!(bytes.get(index), Some(b'"' | b'\'')) {
-            let quote = bytes[index];
-            index += 1;
-            let start = index;
-            while index < bytes.len() && bytes[index] != quote {
-                index += 1;
-            }
-            let value = source.get(start..index).map(str::to_string);
-            if bytes.get(index) == Some(&quote) {
-                index += 1;
-            }
-            value
-        } else {
-            let start = index;
-            while index < bytes.len() && bytes[index] != b')' {
-                index += 1;
-            }
-            source
-                .get(start..index)
-                .map(|value| value.trim().to_string())
-        }) else {
-            break;
-        };
-        while bytes.get(index).is_some_and(|byte| *byte != b')') {
-            index += 1;
-        }
-        if bytes.get(index) == Some(&b')') {
-            index += 1;
-        }
-        if !url.is_empty() {
-            urls.push(url);
-        }
-    }
-    // CSS Images permits a bare string as an `image-set()` image source. It
-    // resolves exactly like a `url()` source, but is not discoverable by the
-    // ordinary URL-token scan above. Preload quoted candidates so layout's
-    // immutable resource cache can resolve the selected image later.
-    // <https://drafts.csswg.org/css-images-4/#image-set-notation>
-    let lower = source.to_ascii_lowercase();
-    let mut search = 0;
-    while let Some(found) = lower[search..].find("image-set(") {
-        let mut cursor = search + found + "image-set(".len();
-        let end = source[cursor..]
-            .find(')')
-            .map(|offset| cursor + offset)
-            .unwrap_or(source.len());
-        while cursor < end {
-            if matches!(bytes.get(cursor), Some(b'\'' | b'\"')) {
-                let quote = bytes[cursor];
-                cursor += 1;
-                let start = cursor;
-                while cursor < end && bytes[cursor] != quote {
-                    cursor += 1;
-                }
-                if let Some(value) = source.get(start..cursor)
-                    && !value.is_empty()
-                {
-                    urls.push(value.to_string());
-                }
-            }
-            cursor += 1;
-        }
-        search = end.saturating_add(1);
-    }
-    urls
+    crate::css::component_values::css_image_candidate_urls(source)
 }
 
 #[cfg(test)]
@@ -816,6 +786,29 @@ mod tests {
         assert!(cache.bytes.is_empty());
     }
 
+    #[tokio::test]
+    async fn fetches_data_url_bytes_and_mime_type_without_its_fragment() {
+        let fetcher = ResourceFetcher::new(ResourcePolicy::default()).unwrap();
+        let url = Url::parse("data:text/plain;base64,SGVsbG8=#section").unwrap();
+
+        let fetched = fetcher.fetch(&url).await.unwrap();
+
+        assert_eq!(fetched.bytes, b"Hello");
+        assert_eq!(fetched.content_type.as_deref(), Some("text/plain"));
+        assert_eq!(
+            fetched.final_url.as_str(),
+            "data:text/plain;base64,SGVsbG8="
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_data_url_is_a_fetch_failure() {
+        let fetcher = ResourceFetcher::new(ResourcePolicy::default()).unwrap();
+        let url = Url::parse("data:text/css").unwrap();
+
+        assert!(fetcher.fetch(&url).await.is_err());
+    }
+
     #[test]
     fn discovers_url_with_request_modifiers_for_preloading() {
         let source = r#".test { background-image: url("http://www.example.test/image.png?pipe=header(Access-Control-Allow-Origin,*)" cross-origin(anonymous)); }"#;
@@ -823,6 +816,43 @@ mod tests {
         assert_eq!(
             css_urls(source),
             vec!["http://www.example.test/image.png?pipe=header(Access-Control-Allow-Origin,*)"]
+        );
+    }
+
+    #[test]
+    fn discovers_bare_image_set_sources_without_preloading_type_descriptors() {
+        let source = r#".test { background-image: image-set(
+            linear-gradient(red, blue) 1x,
+            "first.png" 2x type("image/png"),
+            "escaped\ name.png" 3x,
+            url("fourth.png") 4x
+        ); }"#;
+
+        assert_eq!(
+            css_urls(source),
+            vec![
+                "first.png".to_string(),
+                "escaped name.png".to_string(),
+                "fourth.png".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn discovers_escaped_and_nested_image_set_candidates_without_type_strings() {
+        let source = r#".test { background-image: image-set(
+            "escaped\2epng" 1x type("image/not-a-url"),
+            image(url("nested.png")) 2x,
+            url("quoted\20url.png") 3x
+        ); }"#;
+
+        assert_eq!(
+            css_urls(source),
+            vec![
+                "escaped.png".to_string(),
+                "nested.png".to_string(),
+                "quoted url.png".to_string(),
+            ]
         );
     }
 

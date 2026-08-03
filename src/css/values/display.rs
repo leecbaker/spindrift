@@ -82,6 +82,11 @@ pub(crate) fn parse_display(value: &str, current: Display) -> Display {
                     return current;
                 }
             }
+            "ruby" => {
+                if inner.replace(DisplayInner::Ruby).is_some() {
+                    return current;
+                }
+            }
             "list-item" => {
                 if list_item {
                     return current;
@@ -93,7 +98,7 @@ pub(crate) fn parse_display(value: &str, current: Display) -> Display {
     }
 
     let outer = outer.unwrap_or({
-        if math_inner {
+        if math_inner || inner == Some(DisplayInner::Ruby) {
             current.outer
         } else {
             DisplayOuter::Block
@@ -132,6 +137,7 @@ fn parse_display_legacy(lower: &str) -> Option<Display> {
         "inline-grid" => Some(Display::INLINE_GRID),
         "grid-lanes" => Some(Display::GRID_LANES),
         "inline-grid-lanes" => Some(Display::INLINE_GRID_LANES),
+        "ruby" => Some(Display::RUBY),
         "table" => Some(Display::TABLE),
         "inline-table" => Some(Display::INLINE_TABLE),
         "table-caption" => Some(Display::TABLE_CAPTION),
@@ -142,6 +148,10 @@ fn parse_display_legacy(lower: &str) -> Option<Display> {
         "table-row-group" => Some(Display::TABLE_ROW_GROUP),
         "table-row" => Some(Display::TABLE_ROW),
         "table-cell" => Some(Display::TABLE_CELL),
+        "ruby-base" => Some(Display::RUBY_BASE),
+        "ruby-text" => Some(Display::RUBY_TEXT),
+        "ruby-base-container" => Some(Display::RUBY_BASE_CONTAINER),
+        "ruby-text-container" => Some(Display::RUBY_TEXT_CONTAINER),
         _ => None,
     }
 }

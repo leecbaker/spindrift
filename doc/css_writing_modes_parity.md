@@ -39,7 +39,8 @@ The following local reftests pass with the debug renderer after these changes:
 - Principal-flow body tests still double-advance a later block sibling after a
   vertical-flow child; the correction needs to distinguish normal child flow
   from the root/canvas paint projection.
-- Native form controls use the browser-compatible `border-box` UA sizing
-  model. The remaining zero-inline-size range mismatch is in the flex replay
-  path, which still reintroduces an intrinsic main-axis extent after flex
-  sizing has resolved that border-box dimension to zero.
+- Buttons, inputs, and selects use the browser-compatible `border-box` UA
+  sizing model; textarea retains CSS's default `content-box` model. The
+  remaining zero-inline-size range mismatch is in the flex replay path, which
+  still reintroduces an intrinsic main-axis extent after flex sizing has
+  resolved that border-box dimension to zero.

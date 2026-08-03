@@ -34,6 +34,29 @@ pub(crate) struct Element {
     pub namespace_attrs: Vec<NamespacedAttribute>,
     pub children: Vec<Node>,
     pub is_target: bool,
+    /// Static rendering outcome selected for an HTML `<object>` element.
+    ///
+    /// The HTML resource-selection algorithm decides whether an object
+    /// represents its external resource or its fallback subtree. This is
+    /// resolved after optional visual resources have been preloaded and before
+    /// CSS box construction, so all layout paths observe the same result.
+    /// <https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-object-element>
+    pub object_rendering: ObjectRendering,
+}
+
+/// The static renderer's selected representation for an HTML `<object>`.
+///
+/// A live browser can change this as a resource loads. Quire resolves the
+/// available state once before paged layout, selecting fallback whenever it
+/// cannot represent the resource as a supported static image.
+/// <https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-object-element>
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ObjectRendering {
+    /// Render the object's child subtree through the ordinary CSS box model.
+    #[default]
+    Fallback,
+    /// Render a successfully decoded raster or SVG resource as a replaced image.
+    Image,
 }
 
 /// Stable identity for a source DOM element, preserved by layout clones.
@@ -66,6 +89,7 @@ impl Node {
                 namespace_attrs: Vec::new(),
                 children: Vec::new(),
                 is_target: false,
+                object_rendering: ObjectRendering::Fallback,
             }),
         }
     }

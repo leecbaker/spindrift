@@ -80,9 +80,24 @@ computed CSS lengths, percentages, and sizing keywords.
   separate when they are not definite CSS percentage bases.
 - Used-value helpers now take typed percentage bases directly; the former
   optional-basis compatibility wrappers have been removed.
-- Grid item sizing, intrinsic item height constraints, and the grid Taffy gap
-  adapter use typed inline/block percentage bases, preserving indefinite row
-  sizing behavior until the final Taffy conversion.
+- Grid item sizing, intrinsic item height constraints, and the Grid Taffy
+  bridge use typed physical percentage bases. `GridPhysicalAvailableSpace`
+  projects these once into `LogicalInlinePercentageBasis`; the shared edge and
+  Taffy-bridge APIs require that type for item margin/padding percentages.
+  This preserves indefinite row sizing while preventing vertical-writing
+  physical edge percentages from resolving against the wrong physical axis.
+- Flex item edges, block-flow child edges, table-cell padding, inline atom
+  edges, and in-flow replaced-element edges use the same logical-inline edge
+  API. The generic layout-length helper remains only for older callers whose
+  containing-block writing-mode projection has not yet been carried through
+  their layout input.
+- The remaining generic edge-basis callers are deliberately retained physical
+  boundaries: Grid container setup (including its used-style/zoom boundary),
+  Grid and replaced-element absolute positioning, table and multicol track
+  geometry, page-margin layout, and legacy block-estimation APIs. Migrating
+  any of these requires a typed physical available-space record at its public
+  boundary; a local `f32` to logical-inline conversion would hide rather than
+  solve the missing projection.
 - Table wrapper target heights, row/row-group percentage height distribution,
   table-cell content scopes, and table-cell final relayout paths use typed
   block-size percentage bases.

@@ -1,3 +1,7 @@
+use super::component_values::{
+    parse_css_string_token, split_css_component_values, split_function_argument,
+    strip_ascii_function, trim_css_value,
+};
 use super::parse::parse_declarations;
 use super::selector::{selector_chain, selector_matches_with_scope_proximity_in_chain};
 use super::types::*;
@@ -33,7 +37,8 @@ pub(in crate::css) use declarations::{
 pub(in crate::css) use properties::is_modeled_property_name;
 use properties::*;
 pub(crate) use style::{
-    anonymous_block_style, apply_pseudo_rules_with_parent_ch_advance, default_style_for_tag,
+    anonymous_block_style, anonymous_text_style, apply_pseudo_rules_with_parent_ch_advance,
+    default_display_is_block_level_for_tag, default_style_for_tag,
     style_for_element_with_signature, style_for_element_with_signature_and_parent_ch_advance,
 };
 use variables::*;
