@@ -1,12 +1,11 @@
 use crate::{css, document::Page};
 
 use super::annotations::RenderedLink;
+use super::contours::{OverflowClipEffect, ResolvedBoxContentClip};
 use super::display_list::{PaintBand, PaintBandList, PaintDisplayItem, PaintDisplayList};
-use super::effects::{PaintClipPathEffect, PaintEffectScope, PaintEffects};
+use super::effects::{PaintEffectScope, PaintEffects};
 use super::geometry::{AxisSelectivePaintClip, PaintBounds, PaintClip, PaintTranslation};
 use super::page::PaintPrimitive;
-use super::paths::RenderedPathClip;
-use super::shapes::RenderedRoundedRect;
 use super::stacking::PaintStackingContext;
 
 pub(crate) struct RecordedPaintFragment {
@@ -62,6 +61,14 @@ impl PaintFragment {
 
     pub(crate) fn flattened_primitives(&self) -> Vec<PaintPrimitive> {
         self.display_list.flattened_primitives()
+    }
+
+    /// Whether this retained subtree includes a 3D transform which a plain
+    /// `flat` ancestor must rasterize into its own plane instead of allowing
+    /// it to participate in an enclosing `preserve-3d` context.
+    /// <https://drafts.csswg.org/css-transforms-2/#3d-rendering-contexts>
+    pub(crate) fn contains_affine_3d_transform(&self) -> bool {
+        self.display_list.bands.contains_affine_3d_transform()
     }
 
     pub(in crate::document) fn for_each_flattened_primitive<'a>(
@@ -167,6 +174,7 @@ impl PaintFragment {
     /// the first parent-level phase after floats while still preceding
     /// positioned descendants:
     /// <https://www.w3.org/TR/CSS22/zindex.html>.
+    #[allow(dead_code)]
     pub(crate) fn promote_background_border_after_floats(&mut self) {
         let background_items =
             std::mem::take(&mut self.display_list.bands.bands[PaintBand::BackgroundBorder.index()]);
@@ -275,6 +283,14 @@ impl PaintFragment {
         page: &Page,
         clip: PaintClip,
     ) -> Self {
+        if self.display_list.bands.contains_unresolved_3d_transform() {
+            // CSS overflow acts on visual overflow after the 3D rendering
+            // context has projected its descendants. Recorded bounds are in
+            // the source plane, so they cannot establish that this clip is a
+            // no-op.
+            // <https://drafts.csswg.org/css-transforms-2/#perspective-property>
+            return self.with_contents_effect_scoped_to_rect(clip);
+        }
         let mut bounds: Option<PaintBounds> = None;
         for band in PaintBand::ORDER {
             for item in &self.display_list.bands.bands[band.index()] {
@@ -326,7 +342,7 @@ impl PaintFragment {
     /// <https://www.w3.org/TR/css-overflow-3/#overflow-clip-edge> and
     /// <https://www.w3.org/TR/CSS22/zindex.html>.
     pub(crate) fn with_contents_effect_scoped_to_rect(self, clip: PaintClip) -> Self {
-        self.with_contents_effect_scoped_to_clip(clip, None, PaintClipPathEffect::None, false, None)
+        self.with_contents_effect_scoped_to_clip(clip, false, None, None)
     }
 
     /// Scope non-decoration contents with an axis-selective CSS overflow
@@ -335,13 +351,7 @@ impl PaintFragment {
         self,
         clip: AxisSelectivePaintClip,
     ) -> Self {
-        self.with_contents_effect_scoped_to_clip(
-            clip.bounds(),
-            None,
-            PaintClipPathEffect::None,
-            false,
-            Some(clip),
-        )
+        self.with_contents_effect_scoped_to_clip(clip.bounds(), false, Some(clip), None)
     }
 
     /// Clip only recorded ink that can reach the overflow edge.
@@ -360,12 +370,7 @@ impl PaintFragment {
         page: &Page,
         clip: PaintClip,
     ) -> Self {
-        self.with_contents_effect_scoped_to_clip_with_recorded_ink(
-            page,
-            clip,
-            None,
-            PaintClipPathEffect::None,
-        )
+        self.with_contents_effect_scoped_to_clip_with_recorded_ink(page, clip)
     }
 
     /// Scope paint-contained contents while preserving the edge coverage of a
@@ -374,7 +379,7 @@ impl PaintFragment {
         self,
         clip: PaintClip,
     ) -> Self {
-        self.with_contents_effect_scoped_to_clip(clip, None, PaintClipPathEffect::None, true, None)
+        self.with_contents_effect_scoped_to_clip(clip, true, None, None)
     }
 
     /// Inserts captured positioned descendants into their normal paint bands,
@@ -415,57 +420,47 @@ impl PaintFragment {
         self.with_contents_effect_scoped_to_rect_if_needed(page, clip)
     }
 
-    /// Clip non-decoration contents to a rounded padding edge.
-    ///
-    /// CSS paint containment uses the padding edge including its curved
-    /// corners, while the rectangular clip remains useful for bounds and link
-    /// intersection bookkeeping:
-    /// <https://www.w3.org/TR/css-contain-1/#containment-paint>.
-    pub(crate) fn with_contents_effect_scoped_to_rounded_rect(
+    /// Clip non-decoration contents to one retained CSS box contour.  Unlike
+    /// CSS `clip-path`, this effect owns both the conservative bounds and the
+    /// border/padding/content edge that produced it.
+    pub(crate) fn with_contents_effect_scoped_to_box_content_contour(
         self,
-        clip: PaintClip,
-        rounded_clip: RenderedRoundedRect,
+        contour: ResolvedBoxContentClip,
     ) -> Self {
-        self.with_contents_effect_scoped_to_clip(
-            clip,
-            Some(rounded_clip),
-            PaintClipPathEffect::None,
-            false,
-            None,
-        )
+        self.with_contents_effect_scoped_to_clip(contour.bounds, false, None, Some(contour))
     }
 
-    /// Clip non-decoration contents to an exact resolved shape contour.
-    pub(crate) fn with_contents_effect_scoped_to_path(
-        self,
-        clip: PaintClip,
-        path: RenderedPathClip,
+    /// Include captured positioned descendants in the same retained box
+    /// contour as normal-flow contents. This preserves the overflow owner
+    /// through table and positioned replay without turning it into CSS
+    /// `clip-path`.
+    pub(crate) fn with_contents_effect_scoped_to_box_content_contour_and_child_contexts(
+        mut self,
+        contour: ResolvedBoxContentClip,
+        child_contexts: Vec<PaintStackingContext>,
     ) -> Self {
-        self.with_contents_effect_scoped_to_clip(
-            clip,
-            None,
-            PaintClipPathEffect::Path(path),
-            false,
-            None,
-        )
+        for context in child_contexts {
+            self.display_list.bands.push_context(context);
+        }
+        self.display_list.bands.sort_stacking_contexts();
+        self.with_contents_effect_scoped_to_box_content_contour(contour)
     }
 
     fn with_contents_effect_scoped_to_clip(
         self,
         clip: PaintClip,
-        rounded_clip: Option<RenderedRoundedRect>,
-        shape_clip: PaintClipPathEffect,
         elide_covered_rectangular_clip: bool,
         axis_selective_clip: Option<AxisSelectivePaintClip>,
+        contoured_overflow_clip: Option<ResolvedBoxContentClip>,
     ) -> Self {
         let mut bands = self.display_list.bands;
-        let effects = PaintEffects {
-            overflow_clip: axis_selective_clip.is_none().then_some(clip),
-            axis_selective_overflow_clip: axis_selective_clip,
-            rounded_overflow_clip: rounded_clip,
-            clip_path: shape_clip,
-            ..PaintEffects::default()
-        };
+        let overflow_clip_effect = contoured_overflow_clip
+            .map(OverflowClipEffect::Contoured)
+            .or_else(|| axis_selective_clip.map(OverflowClipEffect::AxisSelective))
+            .or(Some(OverflowClipEffect::Rect(clip)));
+        let effects = PaintEffects::transparent_overflow_scope(
+            overflow_clip_effect.expect("overflow scoping always has a clip effect"),
+        );
         let mut emitted_scope = false;
 
         for band in PaintBand::ORDER {
@@ -554,16 +549,9 @@ impl PaintFragment {
         self,
         _page: &Page,
         clip: PaintClip,
-        rounded_clip: Option<RenderedRoundedRect>,
-        shape_clip: PaintClipPathEffect,
     ) -> Self {
         let mut bands = self.display_list.bands;
-        let effects = PaintEffects {
-            overflow_clip: Some(clip),
-            rounded_overflow_clip: rounded_clip,
-            clip_path: shape_clip,
-            ..PaintEffects::default()
-        };
+        let effects = PaintEffects::transparent_overflow_scope(OverflowClipEffect::Rect(clip));
         let mut emitted_scope = false;
 
         for band in PaintBand::ORDER {
@@ -624,10 +612,7 @@ impl PaintFragment {
     /// band here represents the outer box's own decoration.
     /// <https://www.w3.org/TR/css-contain-1/#containment-paint>
     pub(crate) fn with_effect_scoped_to_rect_all_bands(mut self, clip: PaintClip) -> Self {
-        let effects = PaintEffects {
-            overflow_clip: Some(clip),
-            ..PaintEffects::default()
-        };
+        let effects = PaintEffects::transparent_overflow_scope(OverflowClipEffect::Rect(clip));
         for band in PaintBand::ORDER {
             let items = std::mem::take(&mut self.display_list.bands.bands[band.index()]);
             if items.is_empty() {
@@ -675,7 +660,7 @@ impl PaintFragment {
             })
             .flat_map(|band| &self.display_list.bands.bands[band.index()])
             .find_map(|item| match item {
-                PaintDisplayItem::EffectScope(scope) => scope.effects.overflow_clip,
+                PaintDisplayItem::EffectScope(scope) => scope.effects.overflow_clip_bounds(),
                 _ => None,
             })
     }
@@ -684,11 +669,20 @@ impl PaintFragment {
         self.display_list.bands.contains_overflow_clip()
     }
 
-    pub(crate) fn with_primitives_clipped_to_rect_preserving_structure(
+    /// Slice geometry at a fragmentainer boundary without flattening the
+    /// retained paint tree. CSS visual-overflow clips must remain owner-space
+    /// effects: rewriting descendant bounds before a transform would clip in
+    /// the descendant's source coordinate system.
+    /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+    /// <https://www.w3.org/TR/css-transforms-1/#transform-rendering>
+    pub(crate) fn with_primitives_sliced_to_fragmentainer_rect_preserving_structure(
         mut self,
         clip: PaintClip,
     ) -> Self {
-        self.display_list.bands = self.display_list.bands.clipped_primitives_to_rect(clip);
+        self.display_list.bands = self
+            .display_list
+            .bands
+            .sliced_primitives_to_fragmentainer_rect(clip);
         self.links = self
             .links
             .into_iter()
@@ -764,10 +758,7 @@ impl PaintFragment {
                 .bands
                 .contains_monolithic_fragmentation()
         {
-            let effects = PaintEffects {
-                overflow_clip: Some(clip),
-                ..PaintEffects::default()
-            };
+            let effects = PaintEffects::transparent_overflow_scope(OverflowClipEffect::Rect(clip));
             for band in PaintBand::ORDER {
                 let items = std::mem::take(&mut fragment.display_list.bands.bands[band.index()]);
                 if items.is_empty() {
@@ -867,10 +858,9 @@ impl PaintFragment {
         if !content_fragment.is_empty() || !child_contexts.is_empty() {
             let content_context =
                 PaintStackingContext::from_banded_fragment(content_fragment, child_contexts)
-                    .with_effects(PaintEffects {
-                        overflow_clip: Some(clip),
-                        ..PaintEffects::default()
-                    })
+                    .with_effects(PaintEffects::transparent_overflow_scope(
+                        OverflowClipEffect::Rect(clip),
+                    ))
                     .with_bounds(clip);
             decoration_bands.push_context_in_band(PaintBand::InFlowBlock, content_context);
         }
@@ -912,11 +902,16 @@ impl PaintFragment {
 mod tests {
     use std::rc::Rc;
 
-    use super::PaintFragment;
+    use super::{PaintFragment, PaintStackingContext};
     use crate::CssColor;
     use crate::document::paint::annotations::RenderedLink;
+    use crate::document::paint::display_list::{
+        PaintBand, PaintBandList, PaintDisplayItem, PaintDisplayList,
+    };
+    use crate::document::paint::effects::PaintEffects;
     use crate::document::paint::geometry::{
-        PaintClip, PaintPoint, PaintRect, PaintSize, PaintStrokeWidth, PaintTranslation,
+        Affine3dPaintTransform, PaintClip, PaintPoint, PaintRect, PaintSize, PaintStrokeWidth,
+        PaintTranslation,
     };
     use crate::document::paint::page::PaintPrimitive;
     use crate::document::paint::paths::{
@@ -924,6 +919,7 @@ mod tests {
     };
     use crate::document::paint::patterns::{PaintPatternTiling, RenderedImagePattern};
     use crate::document::paint::shapes::RenderedRect;
+    use crate::document::paint::stacking::StackLevel;
     use crate::document::paint::text::{
         RenderedGlyph, RenderedGlyphKind, RenderedGlyphs, RenderedLine, RenderedTextMatrix,
         RenderedTextRun,
@@ -1083,5 +1079,32 @@ mod tests {
             );
 
         assert!(sliced.flattened_primitives().is_empty());
+    }
+
+    #[test]
+    fn overflow_scope_is_not_elided_for_unresolved_3d_paint() {
+        let clip = PaintClip::new(0.0, 0.0, 100.0, 100.0);
+        let child = PaintStackingContext::with_bands(StackLevel::Auto, PaintBandList::default())
+            .with_effects(PaintEffects {
+                affine_3d_transform: Some(Affine3dPaintTransform::identity()),
+                ..PaintEffects::default()
+            })
+            .with_bounds(PaintClip::new(10.0, 10.0, 10.0, 10.0));
+        let mut bands = PaintBandList::default();
+        bands.extend_band(
+            PaintBand::InFlowBlock,
+            [PaintDisplayItem::StackingContext(child)],
+        );
+        let fragment = PaintFragment {
+            display_list: PaintDisplayList { bands },
+            links: Vec::new(),
+        };
+
+        let clipped = fragment.with_contents_effect_scoped_to_rect_if_needed(
+            &crate::document::Page::new(100.0, 100.0),
+            clip,
+        );
+
+        assert!(clipped.display_list.bands.contains_overflow_clip());
     }
 }

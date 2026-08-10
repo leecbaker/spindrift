@@ -1,5 +1,9 @@
 use super::*;
-use crate::css::component_values::split_css_component_values;
+use crate::css::component_values::{
+    css_leading_function_matching, css_leading_ident, css_single_ident, split_css_component_values,
+    try_split_css_component_values,
+};
+use cssparser::{Parser, ParserInput, Token};
 
 /// Parse a CSS `<counter-style>` value.
 ///
@@ -33,8 +37,11 @@ pub(crate) fn parse_list_style_type(value: &str) -> Option<ListStyleType> {
 }
 
 pub(crate) fn parse_list_style_position(value: &str) -> Option<ListStylePosition> {
-    value
-        .split_whitespace()
+    try_split_css_component_values(value)?
+        .into_iter()
+        .map(css_single_ident)
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
         .find_map(|part| match part.to_ascii_lowercase().as_str() {
             "outside" => Some(ListStylePosition::Outside),
             "inside" => Some(ListStylePosition::Inside),
@@ -51,15 +58,14 @@ pub(crate) fn parse_marker_side(value: &str) -> Option<MarkerSide> {
 }
 
 pub(crate) fn parse_symbols_function(value: &str) -> Option<CounterStyleRule> {
-    let body = strip_ascii_function(value, "symbols")?;
-    let (argument, tail) = split_function_argument(body)?;
+    let (argument, tail) = css_leading_function_matching(value, "symbols")?;
     if !tail.trim().is_empty() {
         return None;
     }
     let mut system = CounterStyleSystem::Symbolic;
     let mut rest = argument.trim();
-    if let Some((token, tail)) = split_symbols_token(rest)
-        && let Some(parsed_system) = parse_symbols_system_keyword(token)
+    if let Some((token, tail)) = css_leading_ident(rest)
+        && let Some(parsed_system) = parse_symbols_system_keyword(&token)
     {
         system = parsed_system;
         rest = tail.trim_start();
@@ -116,15 +122,6 @@ pub(crate) fn parse_symbols_function_symbols(mut value: &str) -> Vec<String> {
     symbols
 }
 
-pub(crate) fn split_symbols_token(value: &str) -> Option<(&str, &str)> {
-    let value = value.trim_start();
-    let end = value
-        .char_indices()
-        .find_map(|(index, character)| character.is_whitespace().then_some(index))
-        .unwrap_or(value.len());
-    (end > 0).then_some((&value[..end], &value[end..]))
-}
-
 pub(crate) fn is_counter_style_ident(value: &str) -> bool {
     let mut chars = value.chars();
     let Some(first) = chars.next() else {
@@ -158,7 +155,7 @@ pub(crate) fn parse_font_family(value: &str) -> Option<FontFamily> {
             (!quoted)
                 .then(|| generic_font_family(&name))
                 .flatten()
-                .unwrap_or_else(|| FontFamily::Names(vec![name]))
+                .unwrap_or_else(|| FontFamily::named(name))
         })
         .collect::<Vec<_>>();
     if families.len() == 1 {
@@ -173,54 +170,62 @@ pub(crate) fn parse_font_family(value: &str) -> Option<FontFamily> {
 /// unquoted; quoted `"serif"` or `"ui-serif"` are ordinary family names.
 /// <https://www.w3.org/TR/css-fonts-4/#generic-font-families>
 fn parse_font_family_components(value: &str) -> Vec<(String, bool)> {
+    let mut input = ParserInput::new(value);
+    let mut parser = Parser::new(&mut input);
     let mut components = Vec::new();
-    let mut start = 0;
-    let mut quote = None;
-    let mut escaped = false;
-    for (index, character) in value.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if character == '\\' {
-            escaped = true;
-            continue;
-        }
-        if let Some(open_quote) = quote {
-            if character == open_quote {
-                quote = None;
+    let mut current = Vec::new();
+
+    while let Ok(token) = parser.next_including_whitespace_and_comments() {
+        match token.clone() {
+            Token::WhiteSpace(_) | Token::Comment(_) => {}
+            Token::Comma => {
+                if !push_font_family_component(&mut current, &mut components) {
+                    return Vec::new();
+                }
             }
-        } else if matches!(character, '\'' | '"') {
-            quote = Some(character);
-        } else if character == ',' {
-            parse_font_family_component(&value[start..index], &mut components);
-            start = index + character.len_utf8();
+            Token::Ident(name) => current.push((name.to_string(), false)),
+            Token::QuotedString(name) => current.push((name.to_string(), true)),
+            _ => return Vec::new(),
         }
     }
-    parse_font_family_component(&value[start..], &mut components);
-    components
+
+    if push_font_family_component(&mut current, &mut components) {
+        components
+    } else {
+        Vec::new()
+    }
 }
 
-fn parse_font_family_component(value: &str, components: &mut Vec<(String, bool)>) {
-    let value = value.trim();
-    let quoted = value
-        .chars()
-        .next()
-        .zip(value.chars().next_back())
-        .is_some_and(|(first, last)| matches!(first, '\'' | '"') && first == last)
-        && value.len() >= 2;
-    let name = if quoted {
-        &value[1..value.len() - 1]
-    } else {
-        value
-    };
-    let name = decode_css_escapes(name);
-    // `""` is a valid quoted CSS font-family name. It is distinct from an
-    // omitted component and can be targeted by `@font-face` and
-    // `@font-palette-values` rules.
-    if quoted || !name.is_empty() {
-        components.push((name, quoted));
+fn push_font_family_component(
+    current: &mut Vec<(String, bool)>,
+    components: &mut Vec<(String, bool)>,
+) -> bool {
+    if current.is_empty() {
+        return true;
     }
+
+    let component = std::mem::take(current);
+    if component.len() == 1 {
+        components.push(
+            component
+                .into_iter()
+                .next()
+                .expect("component is non-empty"),
+        );
+        return true;
+    }
+
+    if component.iter().any(|(_, quoted)| *quoted) {
+        return false;
+    }
+
+    let name = component
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    components.push((name, false));
+    true
 }
 
 /// Parsed CSS `font` shorthand components currently modeled by `ComputedStyle`.
@@ -1002,8 +1007,7 @@ fn parse_font_feature_value_function(value: &str, name: &str) -> Option<String> 
 }
 
 fn parse_font_feature_value_function_list(value: &str, name: &str) -> Option<Vec<String>> {
-    let body = strip_ascii_function(value, name)?;
-    let (argument, tail) = split_function_argument(body)?;
+    let (argument, tail) = css_leading_function_matching(value, name)?;
     if !tail.trim().is_empty() {
         return None;
     }
@@ -1014,7 +1018,9 @@ fn parse_font_feature_value_function_list(value: &str, name: &str) -> Option<Vec
     let names = split_top_level_commas(argument)
         .into_iter()
         .flat_map(split_css_component_values)
-        .map(decode_css_escapes)
+        .map(css_single_ident)
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
         .filter(|name| font_feature_value_name_is_valid(name))
         .collect::<Vec<_>>();
     (!names.is_empty()).then_some(names)

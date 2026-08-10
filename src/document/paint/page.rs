@@ -121,6 +121,57 @@ impl Page {
         fragment
     }
 
+    /// Translate the concrete primitives recorded after a checkpoint while
+    /// preserving their existing paint-tree operation nodes.
+    ///
+    /// A recorded display-list operation indexes this page's primitive arrays,
+    /// so translating an extracted fragment alone cannot move it: operation
+    /// nodes intentionally carry no geometry. This adapter changes the
+    /// appended primitive suffix in place, retaining its paint order and
+    /// operation identity.
+    pub(crate) fn translate_recorded_primitives_since(
+        &mut self,
+        checkpoint: &PaintCheckpoint,
+        offset: PaintTranslation,
+    ) {
+        for rect in &mut self.rects[checkpoint.rects.len()..] {
+            *rect = rect.clone().translated(offset);
+        }
+        for rect in &mut self.rounded_rects[checkpoint.rounded_rects.len()..] {
+            *rect = (*rect).translated(offset);
+        }
+        for path in &mut self.paths[checkpoint.paths.len()..] {
+            *path = path.clone().translated(offset);
+        }
+        for stroke in &mut self.strokes[checkpoint.strokes.len()..] {
+            *stroke = (*stroke).translated(offset);
+        }
+        for image in &mut self.images[checkpoint.images.len()..] {
+            *image = image.clone().translated(offset);
+        }
+        for pattern in &mut self.image_patterns[checkpoint.image_patterns.len()..] {
+            *pattern = pattern
+                .clone()
+                .translated_geometry_preserving_tile_origin(offset);
+        }
+        for pattern in &mut self.gradient_patterns[checkpoint.gradient_patterns.len()..] {
+            *pattern = pattern
+                .clone()
+                .translated_geometry_preserving_tile_origin(offset);
+        }
+        for pattern in &mut self.svg_patterns[checkpoint.svg_patterns.len()..] {
+            *pattern = pattern
+                .clone()
+                .translated_geometry_preserving_tile_origin(offset);
+        }
+        for line in &mut self.lines[checkpoint.lines.len()..] {
+            *line = line.clone().translated(offset);
+        }
+        for link in &mut self.links[checkpoint.links.len()..] {
+            *link = link.clone().translated(offset);
+        }
+    }
+
     pub(crate) fn paint_tree_fragment_since(&self, checkpoint: &PaintCheckpoint) -> PaintFragment {
         PaintFragment {
             display_list: PaintDisplayList {
@@ -148,7 +199,7 @@ impl Page {
         // per-band stacking-context order at the commit boundary rather than
         // relying on capture completion order.
         self.paint_tree.sort_stacking_contexts();
-        self.links = self.paint_tree.transformed_links();
+        self.links = self.paint_tree.transformed_links(self);
     }
 
     pub(crate) fn replace_paint_tree_since_with_fragment(
@@ -161,7 +212,7 @@ impl Page {
             .root
             .bands
             .append_bands(fragment.display_list.bands);
-        self.links = self.paint_tree.transformed_links();
+        self.links = self.paint_tree.transformed_links(self);
     }
 
     pub(crate) fn prepend_recorded_primitives_to_fragment(
@@ -175,6 +226,40 @@ impl Page {
             .map(|primitive| PaintDisplayItem::Operation(self.record_paint_primitive(primitive)))
             .collect::<Vec<_>>();
         fragment.display_list.bands.bands[band.index()].splice(0..0, items);
+    }
+
+    /// Insert paint primitives that may still be translated by an enclosing
+    /// fragmentation replay before they become page-owned resources.
+    ///
+    /// Fragmentation moves CSS background positioning areas together with
+    /// their painting clips. Retaining primitives here lets the final replay
+    /// update tiled-image phase before PDF resource materialization.
+    /// <https://www.w3.org/TR/css-break-3/#break-decoration>
+    pub(crate) fn prepend_primitives_to_fragment(
+        &mut self,
+        fragment: &mut PaintFragment,
+        band: PaintBand,
+        primitives: impl IntoIterator<Item = PaintPrimitive>,
+    ) {
+        let items = primitives
+            .into_iter()
+            .map(PaintDisplayItem::Primitive)
+            .collect::<Vec<_>>();
+        fragment.display_list.bands.bands[band.index()].splice(0..0, items);
+    }
+
+    /// Append paint primitives that remain transformable until the enclosing
+    /// fragment is committed to its final page destination.
+    pub(crate) fn append_primitives_to_fragment(
+        &mut self,
+        fragment: &mut PaintFragment,
+        band: PaintBand,
+        primitives: impl IntoIterator<Item = PaintPrimitive>,
+    ) {
+        fragment.display_list.bands.extend_band(
+            band,
+            primitives.into_iter().map(PaintDisplayItem::Primitive),
+        );
     }
 
     pub(crate) fn append_recorded_primitives_to_fragment(
@@ -323,10 +408,9 @@ impl Page {
             self.paint_tree.root.bands.push_effect_scope_in_band(
                 band,
                 PaintEffectScope::new(
-                    PaintEffects {
-                        overflow_clip: Some(clip),
-                        ..PaintEffects::default()
-                    },
+                    PaintEffects::transparent_overflow_scope(
+                        super::contours::OverflowClipEffect::Rect(clip),
+                    ),
                     Some(clip),
                     vec![PaintDisplayItem::Operation(operation)],
                 ),
@@ -586,7 +670,7 @@ impl Page {
     }
 
     pub(crate) fn finalize_paint_tree_for_public_view(&mut self) {
-        self.links = self.paint_tree.transformed_links();
+        self.links = self.paint_tree.transformed_links(self);
     }
 
     pub(crate) fn record_rect(&mut self, rect: RenderedRect) -> (usize, PaintOperation) {
@@ -715,7 +799,7 @@ impl Page {
         let mut links = Vec::new();
         display_list
             .bands
-            .push_transformed_links(PaintTransform::identity(), &mut links);
+            .push_transformed_links(PaintTransform::identity(), None, &mut links);
         self.links.extend(links);
         RecordedPaintFragment { display_list }
     }
@@ -1024,6 +1108,7 @@ mod tests {
     use crate::document::paint::display_list::PaintBand;
     use crate::document::paint::geometry::{
         PaintClip, PaintPoint, PaintRect, PaintSize, PaintStrokeWidth, PaintTransform,
+        PaintTranslation,
     };
     use crate::document::paint::paths::{
         RenderedGradient, RenderedGradientKind, RenderedGradientStop, RenderedPath,
@@ -1120,6 +1205,12 @@ mod tests {
         )
         .transformed(PaintTransform::new(1.0, 0.0, 0.0, 1.0, 100.0, 0.0));
 
+        assert_eq!(pattern.tiling.origin, PaintPoint::new(0.0, 0.0));
+        let projected = pattern
+            .clone()
+            .translated_geometry_preserving_tile_origin(PaintTranslation::new(0.0, 75.0));
+        assert_eq!(projected.tiling.origin, PaintPoint::new(0.0, 0.0));
+        assert_eq!(projected.paint_rect().origin, PaintPoint::new(0.0, 75.0));
         assert!(
             PaintPrimitive::GradientPattern(pattern)
                 .clipped_to_rect(PaintClip::new(105.0, 0.0, 5.0, 10.0))

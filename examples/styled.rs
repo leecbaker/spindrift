@@ -1,6 +1,7 @@
 //! HTML-to-PDF rendering example with an explicit author stylesheet.
 
 use quire::{Css, Html, PdfOptions, RenderOptions};
+use std::fs::File;
 
 #[tokio::main]
 async fn main() -> quire::Result<()> {
@@ -12,6 +13,7 @@ async fn main() -> quire::Result<()> {
         "#,
     );
 
+    let mut output = File::create("output/quire-styled-example.pdf")?;
     Html::from_string(
         r#"
         <title>Styled</title>
@@ -22,7 +24,7 @@ async fn main() -> quire::Result<()> {
     )
     .with_stylesheet(css)
     .write_pdf(
-        "output/quire-styled-example.pdf",
+        &mut output,
         &RenderOptions::default(),
         &PdfOptions::default(),
     )

@@ -87,7 +87,7 @@ serialization representation.
 - Replayed flex and grid items apply their principal compositing and stacking
   effects once at the item context. Nested descendants retain independent
   effect scopes, and formatting-context overflow clipping remains content-only.
-- `Page` exposes page geometry and read-only primitive slices for inspection.
+- Page geometry and paint primitives remain renderer-private.
   External construction through mutable primitive vectors is not a supported
   API goal.
 

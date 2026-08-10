@@ -750,16 +750,16 @@ pub(super) fn flex_item_main_axis_overflow(
 /// container's inner main size, and if that size is indefinite the used value
 /// is content:
 /// <https://www.w3.org/TR/css-flexbox-1/#flex-basis-property>.
-pub(super) fn taffy_flex_basis(
+pub(super) fn resolve_taffy_flex_basis(
     style: &ComputedStyle,
     estimate: &FlexItemEstimate,
     context: FlexBasisContext,
-) -> taffy_layout::Dimension {
+) -> ResolvedFlexBasis {
     match &style.flex_basis {
         css::ComputedFlexBasis::LengthPercentage(length) => {
             let main_size_basis = context.main_size_basis.points();
             if length.contains_percentage() && main_size_basis.is_none() {
-                return taffy_layout::Dimension::length(
+                return ResolvedFlexBasis::normal_flow_content(taffy_layout::Dimension::length(
                     flex_auto_content_basis(
                         style,
                         if context.direction.is_row_axis() {
@@ -770,20 +770,40 @@ pub(super) fn taffy_flex_basis(
                         context.direction,
                     )
                     .points(),
-                );
+                ));
             }
-            return taffy_optional_dimension_with_basis(
+            return ResolvedFlexBasis::definite_flex_basis(taffy_optional_dimension_with_basis(
                 css::ComputedLengthPercentageOrAuto::LengthPercentage(length.value.clone()),
                 context.main_size_basis,
-            );
+            ));
         }
         css::ComputedFlexBasis::Content | css::ComputedFlexBasis::MaxContent => {
-            return taffy_layout::Dimension::length(
-                flex_content_basis_with_aspect_ratio(style, estimate, context).points(),
-            );
+            let fallback = if context.direction.is_row_axis() {
+                estimate.content_width
+            } else {
+                estimate.content_height
+            };
+            return aspect_ratio_transferred_flex_basis(
+                style,
+                estimate,
+                context.direction,
+                context.available_cross_size,
+                context.stretched_cross_size,
+                context.preferred_aspect_ratio,
+            )
+            .map(|basis| {
+                ResolvedFlexBasis::aspect_ratio_transfer(taffy_layout::Dimension::length(
+                    basis.points(),
+                ))
+            })
+            .unwrap_or_else(|| {
+                ResolvedFlexBasis::normal_flow_content(taffy_layout::Dimension::length(
+                    flex_auto_content_basis(style, fallback, context.direction).points(),
+                ))
+            });
         }
         css::ComputedFlexBasis::MinContent => {
-            return taffy_layout::Dimension::length(
+            return ResolvedFlexBasis::normal_flow_content(taffy_layout::Dimension::length(
                 flex_auto_content_basis(
                     style,
                     if context.direction.is_row_axis() {
@@ -794,7 +814,7 @@ pub(super) fn taffy_flex_basis(
                     context.direction,
                 )
                 .points(),
-            );
+            ));
         }
         css::ComputedFlexBasis::FitContent(limit) => {
             let min_content = if context.direction.is_row_axis() {
@@ -823,14 +843,14 @@ pub(super) fn taffy_flex_basis(
                     }
                 })
                 .unwrap_or_else(|| flex_main_content_box_length(context.available_main_size));
-            return taffy_layout::Dimension::length(
+            return ResolvedFlexBasis::normal_flow_content(taffy_layout::Dimension::length(
                 flex_auto_content_basis(
                     style,
                     fit_content_basis(min_content, max_content, limit),
                     context.direction,
                 )
                 .points(),
-            );
+            ));
         }
         css::ComputedFlexBasis::Auto => {}
     }
@@ -841,13 +861,21 @@ pub(super) fn taffy_flex_basis(
     // before falling back to content sizing.
     if context.direction.is_row_axis() {
         if !style.box_values.width.is_auto() {
-            taffy_flex_basis_from_main_size(
+            let dimension = taffy_flex_basis_from_main_size(
                 style,
                 style.box_values.width.clone(),
                 estimate,
                 context.main_size_basis,
                 FlexDirection::Row,
-            )
+            );
+            if main_size_property_needs_content_fallback(
+                &style.box_values.width,
+                context.main_size_basis,
+            ) {
+                ResolvedFlexBasis::normal_flow_content(dimension)
+            } else {
+                ResolvedFlexBasis::main_size_property(dimension)
+            }
         } else if let Some(transferred) = aspect_ratio_transferred_flex_basis(
             style,
             estimate,
@@ -856,20 +884,30 @@ pub(super) fn taffy_flex_basis(
             context.stretched_cross_size,
             context.preferred_aspect_ratio,
         ) {
-            taffy_layout::Dimension::length(transferred.points())
+            ResolvedFlexBasis::aspect_ratio_transfer(taffy_layout::Dimension::length(
+                transferred.points(),
+            ))
         } else {
-            taffy_layout::Dimension::length(
+            ResolvedFlexBasis::normal_flow_content(taffy_layout::Dimension::length(
                 flex_auto_content_basis(style, estimate.content_width, FlexDirection::Row).points(),
-            )
+            ))
         }
     } else if !style.box_values.height.is_auto() {
-        taffy_flex_basis_from_main_size(
+        let dimension = taffy_flex_basis_from_main_size(
             style,
             style.box_values.height.value().clone(),
             estimate,
             context.main_size_basis,
             FlexDirection::Column,
-        )
+        );
+        if main_size_property_needs_content_fallback(
+            style.box_values.height.value(),
+            context.main_size_basis,
+        ) {
+            ResolvedFlexBasis::normal_flow_content(dimension)
+        } else {
+            ResolvedFlexBasis::main_size_property(dimension)
+        }
     } else if let Some(transferred) = aspect_ratio_transferred_flex_basis(
         style,
         estimate,
@@ -878,42 +916,22 @@ pub(super) fn taffy_flex_basis(
         context.stretched_cross_size,
         context.preferred_aspect_ratio,
     ) {
-        taffy_layout::Dimension::length(transferred.points())
+        ResolvedFlexBasis::aspect_ratio_transfer(taffy_layout::Dimension::length(
+            transferred.points(),
+        ))
     } else {
-        taffy_layout::Dimension::length(
+        ResolvedFlexBasis::normal_flow_content(taffy_layout::Dimension::length(
             flex_auto_content_basis(style, estimate.content_height, FlexDirection::Column).points(),
-        )
+        ))
     }
 }
 
-/// Resolve `flex-basis: content` without consulting the preferred main-size.
-///
-/// The `content` keyword ignores an authored main-size property, but a
-/// definite cross size still transfers through a preferred aspect ratio while
-/// calculating the content-based flex base size. Keeping this at the
-/// flex-basis boundary prevents an authored `width`/`height` from suppressing
-/// that transfer in generic item estimation.
-/// <https://www.w3.org/TR/css-flexbox-1/#flex-basis-property> and
-/// <https://www.w3.org/TR/css-flexbox-1/#algo-main-item>
-fn flex_content_basis_with_aspect_ratio(
-    style: &ComputedStyle,
-    estimate: &FlexItemEstimate,
-    context: FlexBasisContext,
-) -> LayoutLength {
-    let fallback = if context.direction.is_row_axis() {
-        estimate.content_width
-    } else {
-        estimate.content_height
-    };
-    aspect_ratio_transferred_flex_basis(
-        style,
-        estimate,
-        context.direction,
-        context.available_cross_size,
-        context.stretched_cross_size,
-        context.preferred_aspect_ratio,
-    )
-    .unwrap_or_else(|| flex_auto_content_basis(style, fallback, context.direction))
+fn main_size_property_needs_content_fallback(
+    main_size: &css::ComputedLengthPercentageOrAuto,
+    main_size_basis: FlexAvailablePercentageBasis,
+) -> bool {
+    matches!(main_size, css::ComputedLengthPercentageOrAuto::LengthPercentage(value)
+        if value.needs_percentage_basis() && !main_size_basis.is_definite())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -924,6 +942,65 @@ pub(super) struct FlexBasisContext {
     pub(super) stretched_cross_size: Option<FlexCrossSize>,
     pub(super) main_size_basis: FlexAvailablePercentageBasis,
     pub(super) preferred_aspect_ratio: Option<f32>,
+}
+
+/// The CSS rule that supplied a resolved flex basis.
+///
+/// This remains separate from Taffy's scalar basis through final flex
+/// geometry. A later normal-flow measurement may replace only a genuinely
+/// content-derived provisional main span; neither an aspect-ratio transfer nor
+/// a retrieved main-size property may be mistaken for that case.
+/// <https://www.w3.org/TR/css-flexbox-1/#flex-basis-property>
+/// <https://www.w3.org/TR/css-flexbox-1/#algo-main-item>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FlexMainSizeProvenance {
+    NormalFlowContent,
+    AspectRatioTransfer,
+    MainSizeProperty,
+    DefiniteFlexBasis,
+}
+
+impl FlexMainSizeProvenance {
+    pub(super) fn permits_final_normal_flow_block_span(self) -> bool {
+        matches!(self, Self::NormalFlowContent)
+    }
+}
+
+/// A Taffy basis and the CSS sizing rule that produced it.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ResolvedFlexBasis {
+    pub(super) dimension: taffy_layout::Dimension,
+    pub(super) provenance: FlexMainSizeProvenance,
+}
+
+impl ResolvedFlexBasis {
+    fn normal_flow_content(dimension: taffy_layout::Dimension) -> Self {
+        Self {
+            dimension,
+            provenance: FlexMainSizeProvenance::NormalFlowContent,
+        }
+    }
+
+    fn aspect_ratio_transfer(dimension: taffy_layout::Dimension) -> Self {
+        Self {
+            dimension,
+            provenance: FlexMainSizeProvenance::AspectRatioTransfer,
+        }
+    }
+
+    fn main_size_property(dimension: taffy_layout::Dimension) -> Self {
+        Self {
+            dimension,
+            provenance: FlexMainSizeProvenance::MainSizeProperty,
+        }
+    }
+
+    fn definite_flex_basis(dimension: taffy_layout::Dimension) -> Self {
+        Self {
+            dimension,
+            provenance: FlexMainSizeProvenance::DefiniteFlexBasis,
+        }
+    }
 }
 
 /// Computes the flex base-size transfer from a definite cross size.
@@ -1586,19 +1663,19 @@ mod tests {
 
         style.flex_basis = css::ComputedFlexBasis::Content;
         assert_eq!(
-            taffy_flex_basis(&style, &estimate, test_flex_basis_context()),
+            resolve_taffy_flex_basis(&style, &estimate, test_flex_basis_context()).dimension,
             taffy_layout::Dimension::length(80.0)
         );
 
         style.flex_basis = css::ComputedFlexBasis::MinContent;
         assert_eq!(
-            taffy_flex_basis(&style, &estimate, test_flex_basis_context()),
+            resolve_taffy_flex_basis(&style, &estimate, test_flex_basis_context()).dimension,
             taffy_layout::Dimension::length(20.0)
         );
 
         style.flex_basis = css::ComputedFlexBasis::MaxContent;
         assert_eq!(
-            taffy_flex_basis(&style, &estimate, test_flex_basis_context()),
+            resolve_taffy_flex_basis(&style, &estimate, test_flex_basis_context()).dimension,
             taffy_layout::Dimension::length(80.0)
         );
     }
@@ -1615,9 +1692,59 @@ mod tests {
             ..test_flex_basis_context()
         };
 
+        let resolved = resolve_taffy_flex_basis(&style, &estimate, context);
+        assert_eq!(resolved.dimension, taffy_layout::Dimension::length(80.0));
         assert_eq!(
-            taffy_flex_basis(&style, &estimate, context),
-            taffy_layout::Dimension::length(80.0)
+            resolved.provenance,
+            FlexMainSizeProvenance::NormalFlowContent,
+            "an indefinite percentage flex basis, including flex: 1's 0%, uses content sizing",
+        );
+    }
+
+    #[test]
+    fn resolved_flex_basis_retains_the_main_size_provenance() {
+        let estimate = test_flex_estimate();
+        let mut content = ComputedStyle::initial();
+        content.flex_basis = css::ComputedFlexBasis::Content;
+        assert_eq!(
+            resolve_taffy_flex_basis(&content, &estimate, test_flex_basis_context()).provenance,
+            FlexMainSizeProvenance::NormalFlowContent,
+        );
+
+        let mut main_size_property = ComputedStyle::initial();
+        main_size_property.box_values.width = css::ComputedLengthPercentageOrAuto::LengthPercentage(
+            css::ComputedLengthPercentage::from_points(60.0),
+        );
+        assert_eq!(
+            resolve_taffy_flex_basis(&main_size_property, &estimate, test_flex_basis_context(),)
+                .provenance,
+            FlexMainSizeProvenance::MainSizeProperty,
+        );
+
+        let mut definite_basis = ComputedStyle::initial();
+        definite_basis.flex_basis = css::ComputedFlexBasis::LengthPercentage(
+            css::ComputedFlexBasisLength::new(css::ComputedLengthPercentage::from_points(60.0)),
+        );
+        assert_eq!(
+            resolve_taffy_flex_basis(&definite_basis, &estimate, test_flex_basis_context())
+                .provenance,
+            FlexMainSizeProvenance::DefiniteFlexBasis,
+        );
+
+        let mut transferred = ComputedStyle::initial();
+        transferred.flex_basis = css::ComputedFlexBasis::Content;
+        transferred.box_values.width = css::ComputedLengthPercentageOrAuto::LengthPercentage(
+            css::ComputedLengthPercentage::from_points(80.0),
+        );
+        let context = FlexBasisContext {
+            direction: FlexDirection::Column,
+            available_cross_size: Some(FlexCrossSize::new(80.0)),
+            preferred_aspect_ratio: Some(1.0),
+            ..test_flex_basis_context()
+        };
+        assert_eq!(
+            resolve_taffy_flex_basis(&transferred, &estimate, context).provenance,
+            FlexMainSizeProvenance::AspectRatioTransfer,
         );
     }
 

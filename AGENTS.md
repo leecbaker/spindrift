@@ -35,6 +35,7 @@ Note that we aim to be much more spec compliant and performant than weasyprint. 
 - Don't be shy to create new enums that best represent the state of something.
 - Dont' be shy about using `debug_assert!()` to document preconditions and postconditions of functions.
 - Once a file is over about 500-1000 lines of code, then consider breaking it out into a module for better organization. Make sure files are named appropriately for their function.
+- Don't write bespoke parsers without explicit permission. When you request permission, describe why existing parsers or crates are insufficient.
 
 ## Development guidelines
 
@@ -57,6 +58,14 @@ Tests can be found at `~/projects/quire-wpt/third_party/wpt`.
 The latest results for each web platform test are in `~/projects/quire-wpt/results/engine-cache/`. Use those to figure out pass rate for a group or to find tests to work on.
 
 Use `quire-wpt evaluate-test <path>` to render and evaluate one WPT test by its exact path across every configured engine, producing the normal PDFs, raster artifacts, diffs, and report. It is exact selection rather than a prefix filter; add `--include-scripts` only when evaluating a script-driven test. `quire-wpt` can be run with cargo inside `~/projects/quire-wpt/`.
+
+### Fixing Web Platform Tests
+
+When fixing a single or group of web platform tests, focus on finding the root cause and fix it at the source in the most correct way possible. Read the relevant specs, and ensure that the fix complies with the specs.
+
+Use the type system to try to make invalid state unrepresentable. For quantities, consider if `euclid`-based type aliases are appropriate to avoid inappropriate conversions.
+
+Generally prefer a fix for a whole category, rather than a specific fix aimed at a single test.
 
 ## Tests
 

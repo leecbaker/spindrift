@@ -1,5 +1,5 @@
 use super::*;
-use crate::css::cascade::declarations::affected_longhands;
+use crate::css::cascade::declarations::affected_longhand_names;
 
 /// Whether the cascade owns the named property or shorthand.
 ///
@@ -7,412 +7,760 @@ use crate::css::cascade::declarations::affected_longhands;
 /// and CSS Conditional feature queries.  It deliberately uses the cascade's
 /// longhand and shorthand model instead of a second hand-maintained list.
 pub(in crate::css) fn is_modeled_property_name(name: &str) -> bool {
-    name.eq_ignore_ascii_case("all")
-        || ALL_MODELED_LONGHANDS.contains(&name)
-        || affected_longhands(name, Direction::Ltr, WritingMode::HorizontalTb).is_some()
+    ModeledProperty::parse(name).is_some()
 }
 
-/// Returns whether a modeled property inherits by default.
+/// A canonical modeled property that owns one independently cascaded computed
+/// value. Shorthands, legacy aliases, and logical spellings must be resolved
+/// to these entries before CSS-wide defaulting or computed-value copying.
 ///
-/// The inherited-property decision is property-specific in each CSS module.
-/// This list covers the properties currently represented in `ComputedStyle`:
-/// <https://www.w3.org/TR/css-cascade-5/#inheritance>.
-pub(super) fn property_is_inherited(name: &str) -> bool {
-    matches!(
-        name,
-        "border-collapse"
-            | "border-spacing"
-            | "caption-side"
-            | "color"
-            | "color-scheme"
-            | "forced-color-adjust"
-            | "fill"
-            | "stroke"
-            | "stroke-width"
-            | "-webkit-text-fill-color"
-            | "direction"
-            | "dominant-baseline"
-            | "empty-cells"
-            | "font-family"
-            | "font-language-override"
-            | "font-feature-settings"
-            | "font-variation-settings"
-            | "font-palette"
-            | "font-synthesis"
-            | "font-synthesis-weight"
-            | "font-synthesis-style"
-            | "font-synthesis-small-caps"
-            | "font-synthesis-position"
-            | "font-kerning"
-            | "font-size"
-            | "font-size-adjust"
-            | "font-style"
-            | "font-stretch"
-            | "font-variant-alternates"
-            | "font-variant-caps"
-            | "font-variant-east-asian"
-            | "font-variant-emoji"
-            | "font-variant-ligatures"
-            | "font-variant-numeric"
-            | "font-variant-position"
-            | "font-width"
-            | "font-weight"
-            | "hyphenate-character"
-            | "hyphenate-limit-chars"
-            | "hyphens"
-            | "image-rendering"
-            | "image-orientation"
-            | "letter-spacing"
-            | "line-break"
-            | "line-height"
-            | "list-style-image"
-            | "list-style-position"
-            | "list-style-type"
-            | "marker-side"
-            | "orphans"
-            | "overflow-wrap"
-            | "quotes"
-            | "text-align"
-            | "text-combine-upright"
-            | "text-align-all"
-            | "text-align-last"
-            | "text-justify"
-            | "text-autospace"
-            | "text-spacing-trim"
-            | "word-space-transform"
-            | "initial-letter-align"
-            | "initial-letter-wrap"
-            | "line-fit-edge"
-            | "text-box-edge"
-            | "text-orientation"
-            | "text-decoration-skip-ink"
-            | "text-decoration-skip-self"
-            | "text-decoration-skip-box"
-            | "text-decoration-skip-spaces"
-            | "text-underline-offset"
-            | "text-underline-position"
-            | "text-emphasis-color"
-            | "text-emphasis-position"
-            | "text-emphasis-skip"
-            | "text-emphasis-style"
-            | "ruby-position"
-            | "text-shadow"
-            | "text-indent"
-            | "hanging-punctuation"
-            | "text-transform"
-            | "text-wrap"
-            | "text-wrap-mode"
-            | "text-wrap-style"
-            | "tab-size"
-            | "visibility"
-            | "white-space"
-            | "widows"
-            | "word-break"
-            | "word-spacing"
-            | "word-wrap"
-            | "writing-mode"
-    )
+/// Keeping the static name private makes this the property-identity boundary
+/// for the style copier. External cascade code continues to use CSS spelling
+/// at its parsing boundary, but cannot accidentally copy an arbitrary string.
+/// <https://www.w3.org/TR/css-cascade-5/#value-stages>
+macro_rules! define_modeled_longhands {
+    ($( $variant:ident => $name:literal, )*) => {
+        /// A canonical modeled property that owns one independently cascaded
+        /// computed value. Shorthands, legacy aliases, and logical spellings
+        /// must be resolved to these entries before CSS-wide defaulting or
+        /// computed-value copying.
+        ///
+        /// This closed enum is the cascade property-identity boundary. Adding a
+        /// modeled longhand requires adding its identity to this registry, and
+        /// the copy operation below is regression-tested against every variant.
+        /// <https://www.w3.org/TR/css-cascade-5/#value-stages>
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub(in crate::css) enum ModeledLonghand {
+            $($variant,)*
+        }
+
+        impl ModeledLonghand {
+            pub(in crate::css) fn parse(name: &str) -> Option<Self> {
+                match name {
+                    $($name => Some(Self::$variant),)*
+                    _ => None,
+                }
+            }
+
+            pub(in crate::css) const fn css_name(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $name,)*
+                }
+            }
+
+            fn copy_from(self, style: &mut ComputedStyle, source: &ComputedStyle) {
+                match self {
+                    $(Self::$variant => copy_modeled_longhand_by_css_name(style, source, $name),)*
+                }
+            }
+        }
+
+        pub(in crate::css) const ALL_MODELED_LONGHANDS: &[ModeledLonghand] = &[
+            $(ModeledLonghand::$variant,)*
+        ];
+    };
 }
 
-pub(in crate::css) const ALL_MODELED_LONGHANDS: &[&str] = &[
-    "color-scheme",
-    "zoom",
-    "display",
-    "flex-direction",
-    "justify-content",
-    "justify-items",
-    "justify-self",
-    "align-content",
-    "align-items",
-    "align-self",
-    "place-content",
-    "place-items",
-    "place-self",
-    "flex-wrap",
-    "flex-grow",
-    "flex-shrink",
-    "flex-basis",
-    "order",
-    "row-gap",
-    "column-gap",
-    "row-rule-width",
-    "row-rule-style",
-    "row-rule-color",
-    "row-rule-break",
-    "row-rule-visibility-items",
-    "row-rule-inset-cap-start",
-    "row-rule-inset-cap-end",
-    "row-rule-inset-junction-start",
-    "row-rule-inset-junction-end",
-    "column-rule-width",
-    "column-rule-style",
-    "column-rule-color",
-    "column-rule-break",
-    "column-rule-visibility-items",
-    "column-rule-inset-cap-start",
-    "column-rule-inset-cap-end",
-    "column-rule-inset-junction-start",
-    "column-rule-inset-junction-end",
-    "rule-overlap",
-    "grid-template-rows",
-    "grid-template-columns",
-    "grid-template-areas",
-    "grid-auto-rows",
-    "grid-auto-columns",
-    "grid-auto-flow",
-    "grid-lanes-direction",
-    "flow-tolerance",
-    "grid-row-start",
-    "grid-row-end",
-    "grid-column-start",
-    "grid-column-end",
-    "column-count",
-    "column-width",
-    "column-fill",
-    "column-span",
-    "margin-trim",
-    "margin-top",
-    "margin-right",
-    "margin-bottom",
-    "margin-left",
-    "padding-top",
-    "padding-right",
-    "padding-bottom",
-    "padding-left",
-    "border-top-width",
-    "border-right-width",
-    "border-bottom-width",
-    "border-left-width",
-    "border-top-style",
-    "border-right-style",
-    "border-bottom-style",
-    "border-left-style",
-    "border-top-color",
-    "border-right-color",
-    "border-bottom-color",
-    "border-left-color",
-    "border-top-left-radius",
-    "border-top-right-radius",
-    "border-bottom-right-radius",
-    "border-bottom-left-radius",
-    "corner-top-left-shape",
-    "corner-top-right-shape",
-    "corner-bottom-right-shape",
-    "corner-bottom-left-shape",
-    "shape-outside",
-    "shape-margin",
-    "shape-image-threshold",
-    "border-shape",
-    "border-image-source",
-    "border-image-slice",
-    "border-image-width",
-    "border-image-outset",
-    "border-image-repeat",
-    "border-collapse",
-    "caption-side",
-    "table-layout",
-    "empty-cells",
-    "border-spacing",
-    "background-color",
-    "background-image",
-    "background-size",
-    "background-position",
-    "background-position-x",
-    "background-position-y",
-    "background-repeat",
-    "background-origin",
-    "background-clip",
-    "object-fit",
-    "object-view-box",
-    "object-position",
-    "image-rendering",
-    "image-orientation",
-    "box-decoration-break",
-    "outline-offset",
-    "box-shadow",
-    "color",
-    "forced-color-adjust",
-    "fill",
-    "stroke",
-    "stroke-width",
-    "-webkit-text-fill-color",
-    "direction",
-    "unicode-bidi",
-    "writing-mode",
-    "text-orientation",
-    "text-combine-upright",
-    "line-fit-edge",
-    "text-box-trim",
-    "text-box-edge",
-    "initial-letter",
-    "initial-letter-align",
-    "initial-letter-wrap",
-    "font-size",
-    "font-size-adjust",
-    "font-language-override",
-    "font-synthesis",
-    "font-synthesis-weight",
-    "font-synthesis-style",
-    "font-synthesis-small-caps",
-    "font-synthesis-position",
-    "line-height",
-    "letter-spacing",
-    "word-spacing",
-    "width",
-    "height",
-    "aspect-ratio",
-    "contain-intrinsic-size",
-    "contain-intrinsic-inline-size",
-    "contain-intrinsic-block-size",
-    "inline-size",
-    "block-size",
-    "min-width",
-    "max-width",
-    "min-height",
-    "max-height",
-    "min-inline-size",
-    "max-inline-size",
-    "min-block-size",
-    "max-block-size",
-    "box-sizing",
-    "left",
-    "top",
-    "right",
-    "bottom",
-    "position",
-    "float",
-    "footnote-display",
-    "footnote-policy",
-    "clear",
-    "z-index",
-    "opacity",
-    "transform",
-    "translate",
-    "rotate",
-    "scale",
-    "transform-origin",
-    "transform-box",
-    "isolation",
-    "mix-blend-mode",
-    "filter",
-    "clip-path",
-    "mask",
-    "mask-image",
-    "contain",
-    "container-type",
-    "container-name",
-    "container",
-    "content-visibility",
-    "will-change",
-    "text-align-all",
-    "text-align-last",
-    "text-justify",
-    "text-autospace",
-    "text-spacing-trim",
-    "word-space-transform",
-    "text-indent",
-    "hanging-punctuation",
-    "vertical-align",
-    "dominant-baseline",
-    "alignment-baseline",
-    "baseline-source",
-    "baseline-shift",
-    "font-weight",
-    "font-style",
-    "font-width",
-    "font-stretch",
-    "font-family",
-    "font-language-override",
-    "font-feature-settings",
-    "font-variation-settings",
-    "font-palette",
-    "font-synthesis",
-    "font-synthesis-weight",
-    "font-synthesis-style",
-    "font-synthesis-small-caps",
-    "font-synthesis-position",
-    "font-kerning",
-    "font-variant-ligatures",
-    "font-variant-position",
-    "font-variant-caps",
-    "font-variant-numeric",
-    "font-variant-alternates",
-    "font-variant-east-asian",
-    "font-variant-emoji",
-    "bookmark-level",
-    "bookmark-label",
-    "bookmark-state",
-    "text-transform",
-    "tab-size",
-    "visibility",
-    "list-style-type",
-    "list-style-position",
-    "list-style-image",
-    "marker-side",
-    "counter-reset",
-    "counter-increment",
-    "counter-set",
-    "string-set",
-    "page",
-    "break-before",
-    "break-after",
-    "break-inside",
-    "orphans",
-    "widows",
-    "text-decoration-line",
-    "text-decoration-style",
-    "text-decoration-color",
-    "text-decoration-thickness",
-    "text-decoration-inset",
-    "text-decoration-skip-ink",
-    "text-decoration-skip-self",
-    "text-decoration-skip-box",
-    "text-decoration-skip-spaces",
-    "text-underline-offset",
-    "text-underline-position",
-    "text-emphasis",
-    "text-emphasis-style",
-    "text-emphasis-color",
-    "text-emphasis-position",
-    "text-emphasis-skip",
-    "ruby-position",
-    "text-shadow",
-    "white-space",
-    "text-wrap",
-    "text-wrap-mode",
-    "text-wrap-style",
-    "wrap-inside",
-    "line-clamp",
-    "-webkit-line-clamp",
-    "-webkit-box-orient",
-    "word-break",
-    "overflow",
-    "overflow-x",
-    "overflow-y",
-    "scrollbar-gutter",
-    "scrollbar-width",
-    "scroll-snap-type",
-    "scroll-snap-align",
-    "scroll-snap-stop",
-    "scroll-padding",
-    "scroll-padding-top",
-    "scroll-padding-right",
-    "scroll-padding-bottom",
-    "scroll-padding-left",
-    "scroll-margin",
-    "scroll-margin-top",
-    "scroll-margin-right",
-    "scroll-margin-bottom",
-    "scroll-margin-left",
-    "overflow-clip-margin",
-    "overflow-wrap",
-    "line-break",
-    "hyphens",
-    "hyphenate-character",
-    "hyphenate-limit-chars",
-    "content",
-    "quotes",
-];
+define_modeled_longhands! {
+    ColorScheme => "color-scheme",
+    AnimationName => "animation-name",
+    AnimationDuration => "animation-duration",
+    AnimationDelay => "animation-delay",
+    Zoom => "zoom",
+    Display => "display",
+    FlexDirection => "flex-direction",
+    JustifyContent => "justify-content",
+    JustifyItems => "justify-items",
+    JustifySelf => "justify-self",
+    AlignContent => "align-content",
+    AlignItems => "align-items",
+    AlignSelf => "align-self",
+    FlexWrap => "flex-wrap",
+    FlexLineCount => "flex-line-count",
+    FlexGrow => "flex-grow",
+    FlexShrink => "flex-shrink",
+    FlexBasis => "flex-basis",
+    Order => "order",
+    RowGap => "row-gap",
+    ColumnGap => "column-gap",
+    RowRuleWidth => "row-rule-width",
+    RowRuleStyle => "row-rule-style",
+    RowRuleColor => "row-rule-color",
+    RowRuleBreak => "row-rule-break",
+    RowRuleVisibilityItems => "row-rule-visibility-items",
+    RowRuleInsetCapStart => "row-rule-inset-cap-start",
+    RowRuleInsetCapEnd => "row-rule-inset-cap-end",
+    RowRuleInsetJunctionStart => "row-rule-inset-junction-start",
+    RowRuleInsetJunctionEnd => "row-rule-inset-junction-end",
+    ColumnRuleWidth => "column-rule-width",
+    ColumnRuleStyle => "column-rule-style",
+    ColumnRuleColor => "column-rule-color",
+    ColumnRuleBreak => "column-rule-break",
+    ColumnRuleVisibilityItems => "column-rule-visibility-items",
+    ColumnRuleInsetCapStart => "column-rule-inset-cap-start",
+    ColumnRuleInsetCapEnd => "column-rule-inset-cap-end",
+    ColumnRuleInsetJunctionStart => "column-rule-inset-junction-start",
+    ColumnRuleInsetJunctionEnd => "column-rule-inset-junction-end",
+    RuleOverlap => "rule-overlap",
+    GridTemplateRows => "grid-template-rows",
+    GridTemplateColumns => "grid-template-columns",
+    GridTemplateAreas => "grid-template-areas",
+    GridAutoRows => "grid-auto-rows",
+    GridAutoColumns => "grid-auto-columns",
+    GridAutoFlow => "grid-auto-flow",
+    GridLanesDirection => "grid-lanes-direction",
+    FlowTolerance => "flow-tolerance",
+    GridRowStart => "grid-row-start",
+    GridRowEnd => "grid-row-end",
+    GridColumnStart => "grid-column-start",
+    GridColumnEnd => "grid-column-end",
+    ColumnCount => "column-count",
+    ColumnWidth => "column-width",
+    ColumnHeight => "column-height",
+    ColumnWrap => "column-wrap",
+    ColumnFill => "column-fill",
+    ColumnSpan => "column-span",
+    MarginTrim => "margin-trim",
+    MarginTop => "margin-top",
+    MarginRight => "margin-right",
+    MarginBottom => "margin-bottom",
+    MarginLeft => "margin-left",
+    PaddingTop => "padding-top",
+    PaddingRight => "padding-right",
+    PaddingBottom => "padding-bottom",
+    PaddingLeft => "padding-left",
+    BorderTopWidth => "border-top-width",
+    BorderRightWidth => "border-right-width",
+    BorderBottomWidth => "border-bottom-width",
+    BorderLeftWidth => "border-left-width",
+    BorderTopStyle => "border-top-style",
+    BorderRightStyle => "border-right-style",
+    BorderBottomStyle => "border-bottom-style",
+    BorderLeftStyle => "border-left-style",
+    BorderTopColor => "border-top-color",
+    BorderRightColor => "border-right-color",
+    BorderBottomColor => "border-bottom-color",
+    BorderLeftColor => "border-left-color",
+    BorderTopLeftRadius => "border-top-left-radius",
+    BorderTopRightRadius => "border-top-right-radius",
+    BorderBottomRightRadius => "border-bottom-right-radius",
+    BorderBottomLeftRadius => "border-bottom-left-radius",
+    CornerTopLeftShape => "corner-top-left-shape",
+    CornerTopRightShape => "corner-top-right-shape",
+    CornerBottomRightShape => "corner-bottom-right-shape",
+    CornerBottomLeftShape => "corner-bottom-left-shape",
+    ShapeOutside => "shape-outside",
+    ShapeMargin => "shape-margin",
+    ShapeImageThreshold => "shape-image-threshold",
+    BorderShape => "border-shape",
+    BorderImageSource => "border-image-source",
+    BorderImageSlice => "border-image-slice",
+    BorderImageWidth => "border-image-width",
+    BorderImageOutset => "border-image-outset",
+    BorderImageRepeat => "border-image-repeat",
+    BorderCollapse => "border-collapse",
+    CaptionSide => "caption-side",
+    TableLayout => "table-layout",
+    EmptyCells => "empty-cells",
+    BorderSpacing => "border-spacing",
+    BackgroundColor => "background-color",
+    BackgroundImage => "background-image",
+    BackgroundSize => "background-size",
+    BackgroundPosition => "background-position",
+    BackgroundPositionX => "background-position-x",
+    BackgroundPositionY => "background-position-y",
+    BackgroundRepeat => "background-repeat",
+    BackgroundOrigin => "background-origin",
+    BackgroundClip => "background-clip",
+    ObjectFit => "object-fit",
+    ObjectViewBox => "object-view-box",
+    ObjectPosition => "object-position",
+    ImageRendering => "image-rendering",
+    ImageOrientation => "image-orientation",
+    BoxDecorationBreak => "box-decoration-break",
+    OutlineOffset => "outline-offset",
+    OutlineWidth => "outline-width",
+    OutlineStyle => "outline-style",
+    OutlineColor => "outline-color",
+    BoxShadow => "box-shadow",
+    Color => "color",
+    ForcedColorAdjust => "forced-color-adjust",
+    Fill => "fill",
+    Stroke => "stroke",
+    StrokeWidth => "stroke-width",
+    WebkitTextFillColor => "-webkit-text-fill-color",
+    Direction => "direction",
+    UnicodeBidi => "unicode-bidi",
+    WritingMode => "writing-mode",
+    TextOrientation => "text-orientation",
+    TextCombineUpright => "text-combine-upright",
+    LineFitEdge => "line-fit-edge",
+    TextBoxTrim => "text-box-trim",
+    TextBoxEdge => "text-box-edge",
+    InitialLetter => "initial-letter",
+    InitialLetterAlign => "initial-letter-align",
+    InitialLetterWrap => "initial-letter-wrap",
+    FontSize => "font-size",
+    FontSizeAdjust => "font-size-adjust",
+    LineHeight => "line-height",
+    LetterSpacing => "letter-spacing",
+    WordSpacing => "word-spacing",
+    Width => "width",
+    Height => "height",
+    AspectRatio => "aspect-ratio",
+    ContainIntrinsicSize => "contain-intrinsic-size",
+    ContainIntrinsicWidth => "contain-intrinsic-width",
+    ContainIntrinsicHeight => "contain-intrinsic-height",
+    MinWidth => "min-width",
+    MaxWidth => "max-width",
+    MinHeight => "min-height",
+    MaxHeight => "max-height",
+    BoxSizing => "box-sizing",
+    Left => "left",
+    Top => "top",
+    Right => "right",
+    Bottom => "bottom",
+    Position => "position",
+    Float => "float",
+    FootnoteDisplay => "footnote-display",
+    FootnotePolicy => "footnote-policy",
+    Clear => "clear",
+    ZIndex => "z-index",
+    Opacity => "opacity",
+    Transform => "transform",
+    Translate => "translate",
+    Rotate => "rotate",
+    Scale => "scale",
+    TransformOrigin => "transform-origin",
+    Perspective => "perspective",
+    PerspectiveOrigin => "perspective-origin",
+    TransformBox => "transform-box",
+    TransformStyle => "transform-style",
+    BackfaceVisibility => "backface-visibility",
+    Isolation => "isolation",
+    MixBlendMode => "mix-blend-mode",
+    Filter => "filter",
+    Clip => "clip",
+    ClipPath => "clip-path",
+    MaskImage => "mask-image",
+    MaskBorderSource => "mask-border-source",
+    Contain => "contain",
+    ContainerType => "container-type",
+    ContainerName => "container-name",
+    ContentVisibility => "content-visibility",
+    WillChange => "will-change",
+    TextAlignAll => "text-align-all",
+    TextAlignLast => "text-align-last",
+    TextJustify => "text-justify",
+    TextAutospace => "text-autospace",
+    TextSpacingTrim => "text-spacing-trim",
+    WordSpaceTransform => "word-space-transform",
+    TextIndent => "text-indent",
+    HangingPunctuation => "hanging-punctuation",
+    VerticalAlign => "vertical-align",
+    DominantBaseline => "dominant-baseline",
+    AlignmentBaseline => "alignment-baseline",
+    BaselineSource => "baseline-source",
+    BaselineShift => "baseline-shift",
+    FontWeight => "font-weight",
+    FontStyle => "font-style",
+    FontWidth => "font-width",
+    FontFamily => "font-family",
+    FontLanguageOverride => "font-language-override",
+    FontFeatureSettings => "font-feature-settings",
+    FontVariationSettings => "font-variation-settings",
+    FontPalette => "font-palette",
+    FontSynthesis => "font-synthesis",
+    FontSynthesisWeight => "font-synthesis-weight",
+    FontSynthesisStyle => "font-synthesis-style",
+    FontSynthesisSmallCaps => "font-synthesis-small-caps",
+    FontSynthesisPosition => "font-synthesis-position",
+    FontKerning => "font-kerning",
+    FontVariantLigatures => "font-variant-ligatures",
+    FontVariantPosition => "font-variant-position",
+    FontVariantCaps => "font-variant-caps",
+    FontVariantNumeric => "font-variant-numeric",
+    FontVariantAlternates => "font-variant-alternates",
+    FontVariantEastAsian => "font-variant-east-asian",
+    FontVariantEmoji => "font-variant-emoji",
+    BookmarkLevel => "bookmark-level",
+    BookmarkLabel => "bookmark-label",
+    BookmarkState => "bookmark-state",
+    TextTransform => "text-transform",
+    TabSize => "tab-size",
+    Visibility => "visibility",
+    ListStyleType => "list-style-type",
+    ListStylePosition => "list-style-position",
+    ListStyleImage => "list-style-image",
+    MarkerSide => "marker-side",
+    CounterReset => "counter-reset",
+    CounterIncrement => "counter-increment",
+    CounterSet => "counter-set",
+    StringSet => "string-set",
+    Page => "page",
+    BreakBefore => "break-before",
+    BreakAfter => "break-after",
+    BreakInside => "break-inside",
+    Orphans => "orphans",
+    Widows => "widows",
+    TextDecorationLine => "text-decoration-line",
+    TextDecorationStyle => "text-decoration-style",
+    TextDecorationColor => "text-decoration-color",
+    TextDecorationThickness => "text-decoration-thickness",
+    TextDecorationInset => "text-decoration-inset",
+    TextDecorationSkipInk => "text-decoration-skip-ink",
+    TextDecorationSkipSelf => "text-decoration-skip-self",
+    TextDecorationSkipBox => "text-decoration-skip-box",
+    TextDecorationSkipSpaces => "text-decoration-skip-spaces",
+    TextUnderlineOffset => "text-underline-offset",
+    TextUnderlinePosition => "text-underline-position",
+    TextEmphasisStyle => "text-emphasis-style",
+    TextEmphasisColor => "text-emphasis-color",
+    TextEmphasisPosition => "text-emphasis-position",
+    TextEmphasisSkip => "text-emphasis-skip",
+    RubyPosition => "ruby-position",
+    RubyAlign => "ruby-align",
+    RubyOverhang => "ruby-overhang",
+    TextShadow => "text-shadow",
+    WhiteSpace => "white-space",
+    TextWrap => "text-wrap",
+    TextWrapMode => "text-wrap-mode",
+    TextWrapStyle => "text-wrap-style",
+    WrapInside => "wrap-inside",
+    MaxLines => "max-lines",
+    BlockEllipsis => "block-ellipsis",
+    Continue => "continue",
+    WebkitBoxOrient => "-webkit-box-orient",
+    WordBreak => "word-break",
+    OverflowX => "overflow-x",
+    OverflowY => "overflow-y",
+    ScrollbarGutter => "scrollbar-gutter",
+    ScrollbarWidth => "scrollbar-width",
+    ScrollSnapType => "scroll-snap-type",
+    ScrollSnapAlign => "scroll-snap-align",
+    ScrollSnapStop => "scroll-snap-stop",
+    ScrollPaddingTop => "scroll-padding-top",
+    ScrollPaddingRight => "scroll-padding-right",
+    ScrollPaddingBottom => "scroll-padding-bottom",
+    ScrollPaddingLeft => "scroll-padding-left",
+    ScrollMarginTop => "scroll-margin-top",
+    ScrollMarginRight => "scroll-margin-right",
+    ScrollMarginBottom => "scroll-margin-bottom",
+    ScrollMarginLeft => "scroll-margin-left",
+    OverflowClipMargin => "overflow-clip-margin",
+    OverflowWrap => "overflow-wrap",
+    LineBreak => "line-break",
+    Hyphens => "hyphens",
+    HyphenateCharacter => "hyphenate-character",
+    HyphenateLimitChars => "hyphenate-limit-chars",
+    Content => "content",
+    Quotes => "quotes",
+}
+
+/// A supported CSS property spelling before it has been resolved to the
+/// canonical physical longhands that own computed values.
+///
+/// CSS Cascade applies the cascade to a shorthand's component longhands, and
+/// CSS Logical Properties resolves flow-relative spellings in the element's
+/// writing context. Keeping that syntax distinct from [`ModeledLonghand`]
+/// makes it impossible for defaulting or computed-style copying to mistake a
+/// shorthand for an independently owned computed value.
+/// <https://www.w3.org/TR/css-cascade-5/#shorthand>
+/// <https://www.w3.org/TR/css-logical-1/>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::css) enum ModeledProperty {
+    Longhand(ModeledLonghand),
+    /// A canonical longhand emitted from a `font` shorthand. Its property
+    /// identity is the longhand; the component marker retains just enough
+    /// provenance to parse the shorthand value at computed-value time.
+    FontComponent(ModeledLonghand),
+    Shorthand(ModeledShorthand),
+    Logical(LogicalProperty),
+    Alias(LegacyPropertyAlias),
+    All,
+}
+
+macro_rules! define_modeled_syntax {
+    ($type:ident, $all:ident { $($variant:ident => $name:literal,)* }) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub(in crate::css) enum $type { $($variant,)* }
+
+        impl $type {
+            fn parse(name: &str) -> Option<Self> {
+                match name { $($name => Some(Self::$variant),)* _ => None }
+            }
+
+            const fn css_name(self) -> &'static str {
+                match self { $(Self::$variant => $name,)* }
+            }
+        }
+
+        #[cfg(test)]
+        const $all: &[$type] = &[$($type::$variant,)*];
+    };
+}
+
+// Physical shorthands and aggregate spelling supported by Quire. Each spelling
+// is a closed variant so cascade identity cannot retain an authored string.
+define_modeled_syntax! {
+    ModeledShorthand, ALL_MODELED_SHORTHANDS {
+        Background => "background", Border => "border", BorderBottom => "border-bottom",
+        BorderBottomRadius => "border-bottom-radius", BorderColor => "border-color",
+        BorderImage => "border-image", BorderLeft => "border-left", BorderLeftRadius => "border-left-radius",
+        BorderRadius => "border-radius", BorderRight => "border-right", BorderRightRadius => "border-right-radius",
+        BorderStyle => "border-style", BorderTop => "border-top", BorderTopRadius => "border-top-radius",
+        BorderWidth => "border-width", ColumnRule => "column-rule", ColumnRuleInset => "column-rule-inset",
+        ColumnRuleInsetCap => "column-rule-inset-cap", ColumnRuleInsetEnd => "column-rule-inset-end",
+        ColumnRuleInsetJunction => "column-rule-inset-junction", ColumnRuleInsetStart => "column-rule-inset-start",
+        Columns => "columns", Container => "container", Corner => "corner", CornerShape => "corner-shape",
+        Animation => "animation", Flex => "flex", FlexFlow => "flex-flow", Font => "font", FontVariant => "font-variant",
+        Gap => "gap", GridColumnGap => "grid-column-gap", GridGap => "grid-gap", GridRowGap => "grid-row-gap",
+        ListStyle => "list-style", Margin => "margin", Mask => "mask", MaskBorder => "mask-border", Outline => "outline",
+        Overflow => "overflow", Padding => "padding", PlaceContent => "place-content", PlaceItems => "place-items",
+        PlaceSelf => "place-self", RowRule => "row-rule", RowRuleInset => "row-rule-inset",
+        RowRuleInsetCap => "row-rule-inset-cap", RowRuleInsetEnd => "row-rule-inset-end",
+        RowRuleInsetJunction => "row-rule-inset-junction", RowRuleInsetStart => "row-rule-inset-start",
+        Rule => "rule", RuleBreak => "rule-break", RuleColor => "rule-color", RuleInset => "rule-inset",
+        RuleInsetCap => "rule-inset-cap", RuleInsetEnd => "rule-inset-end", RuleInsetJunction => "rule-inset-junction",
+        RuleInsetStart => "rule-inset-start", RuleStyle => "rule-style", RuleVisibilityItems => "rule-visibility-items",
+        RuleWidth => "rule-width", TextAlign => "text-align", TextBox => "text-box",
+        TextDecoration => "text-decoration", TextDecorationSkip => "text-decoration-skip",
+        TextEmphasis => "text-emphasis", TextSpacing => "text-spacing", LineClamp => "line-clamp",
+        WebkitLineClamp => "-webkit-line-clamp", ScrollMargin => "scroll-margin", ScrollPadding => "scroll-padding",
+        Inset => "inset", GridRow => "grid-row", GridColumn => "grid-column", Grid => "grid",
+        GridTemplate => "grid-template", GridArea => "grid-area",
+    }
+}
+
+// Flow-relative spellings resolve through writing mode and, for sides,
+// direction.
+define_modeled_syntax! {
+    LogicalProperty, ALL_LOGICAL_PROPERTIES {
+        InlineSize => "inline-size", BlockSize => "block-size", MinInlineSize => "min-inline-size",
+        MaxInlineSize => "max-inline-size", MinBlockSize => "min-block-size", MaxBlockSize => "max-block-size",
+        ContainIntrinsicInlineSize => "contain-intrinsic-inline-size", ContainIntrinsicBlockSize => "contain-intrinsic-block-size",
+        MarginBlock => "margin-block", MarginInline => "margin-inline", PaddingBlock => "padding-block", PaddingInline => "padding-inline",
+        ScrollPaddingBlock => "scroll-padding-block", ScrollPaddingInline => "scroll-padding-inline",
+        ScrollMarginBlock => "scroll-margin-block", ScrollMarginInline => "scroll-margin-inline",
+        InsetBlock => "inset-block", InsetInline => "inset-inline",
+        MarginBlockStart => "margin-block-start", MarginBlockEnd => "margin-block-end", MarginInlineStart => "margin-inline-start", MarginInlineEnd => "margin-inline-end",
+        PaddingBlockStart => "padding-block-start", PaddingBlockEnd => "padding-block-end", PaddingInlineStart => "padding-inline-start", PaddingInlineEnd => "padding-inline-end",
+        ScrollPaddingBlockStart => "scroll-padding-block-start", ScrollPaddingBlockEnd => "scroll-padding-block-end", ScrollPaddingInlineStart => "scroll-padding-inline-start", ScrollPaddingInlineEnd => "scroll-padding-inline-end",
+        ScrollMarginBlockStart => "scroll-margin-block-start", ScrollMarginBlockEnd => "scroll-margin-block-end", ScrollMarginInlineStart => "scroll-margin-inline-start", ScrollMarginInlineEnd => "scroll-margin-inline-end",
+        InsetBlockStart => "inset-block-start", InsetBlockEnd => "inset-block-end", InsetInlineStart => "inset-inline-start", InsetInlineEnd => "inset-inline-end",
+        BorderBlock => "border-block", BorderInline => "border-inline", BorderBlockStart => "border-block-start", BorderBlockEnd => "border-block-end", BorderInlineStart => "border-inline-start", BorderInlineEnd => "border-inline-end",
+        BorderBlockWidth => "border-block-width", BorderInlineWidth => "border-inline-width", BorderBlockStyle => "border-block-style", BorderInlineStyle => "border-inline-style", BorderBlockColor => "border-block-color", BorderInlineColor => "border-inline-color",
+        BorderBlockStartWidth => "border-block-start-width", BorderBlockEndWidth => "border-block-end-width", BorderInlineStartWidth => "border-inline-start-width", BorderInlineEndWidth => "border-inline-end-width",
+        BorderBlockStartStyle => "border-block-start-style", BorderBlockEndStyle => "border-block-end-style", BorderInlineStartStyle => "border-inline-start-style", BorderInlineEndStyle => "border-inline-end-style",
+        BorderBlockStartColor => "border-block-start-color", BorderBlockEndColor => "border-block-end-color", BorderInlineStartColor => "border-inline-start-color", BorderInlineEndColor => "border-inline-end-color",
+        BorderBlockStartRadius => "border-block-start-radius", BorderBlockEndRadius => "border-block-end-radius", BorderInlineStartRadius => "border-inline-start-radius", BorderInlineEndRadius => "border-inline-end-radius",
+        BorderStartStartRadius => "border-start-start-radius", BorderStartEndRadius => "border-start-end-radius", BorderEndStartRadius => "border-end-start-radius", BorderEndEndRadius => "border-end-end-radius",
+    }
+}
+
+// Legacy spellings are syntax only; their cascade target is canonical.
+define_modeled_syntax! {
+    LegacyPropertyAlias, ALL_LEGACY_PROPERTY_ALIASES {
+        WebkitFlexBasis => "-webkit-flex-basis", PageBreakBefore => "page-break-before",
+        PageBreakAfter => "page-break-after", PageBreakInside => "page-break-inside",
+        FontStretch => "font-stretch", WordWrap => "word-wrap",
+    }
+}
+
+/// Canonical longhands addressed by one property spelling without a heap
+/// allocation. Dynamic logical resolution has at most six targets; fixed
+/// shorthand target sets remain borrowed from the declaration registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::css) enum ResolvedLonghandTargets {
+    Inline {
+        targets: [Option<ModeledLonghand>; 6],
+        len: u8,
+    },
+    StaticNames(&'static [&'static str]),
+    All,
+}
+
+impl ResolvedLonghandTargets {
+    pub(in crate::css) fn from_names<const N: usize>(names: [&'static str; N]) -> Self {
+        assert!(
+            N <= 6,
+            "context-resolved target set exceeds inline capacity"
+        );
+        let mut targets = [None; 6];
+        for (slot, name) in targets.iter_mut().zip(names) {
+            *slot = Some(
+                ModeledLonghand::parse(name)
+                    .unwrap_or_else(|| panic!("unregistered modeled longhand target `{name}`")),
+            );
+        }
+        Self::Inline {
+            targets,
+            len: N as u8,
+        }
+    }
+
+    pub(in crate::css) const fn static_names(names: &'static [&'static str]) -> Self {
+        Self::StaticNames(names)
+    }
+}
+
+pub(in crate::css) enum ResolvedLonghandTargetIter {
+    Inline {
+        targets: [Option<ModeledLonghand>; 6],
+        index: usize,
+        len: usize,
+    },
+    StaticNames {
+        names: &'static [&'static str],
+        index: usize,
+    },
+    All {
+        index: usize,
+    },
+}
+
+impl Iterator for ResolvedLonghandTargetIter {
+    type Item = ModeledLonghand;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Inline {
+                targets,
+                index,
+                len,
+            } => {
+                if *index == *len {
+                    None
+                } else {
+                    let target = targets[*index].expect("inline target length must be initialized");
+                    *index += 1;
+                    Some(target)
+                }
+            }
+            Self::StaticNames { names, index } => {
+                let name = *names.get(*index)?;
+                *index += 1;
+                Some(
+                    ModeledLonghand::parse(name)
+                        .unwrap_or_else(|| panic!("unregistered modeled longhand target `{name}`")),
+                )
+            }
+            Self::All { index } => loop {
+                let target = *ALL_MODELED_LONGHANDS.get(*index)?;
+                *index += 1;
+                if !matches!(
+                    target,
+                    ModeledLonghand::Direction | ModeledLonghand::UnicodeBidi
+                ) {
+                    return Some(target);
+                }
+            },
+        }
+    }
+}
+
+impl IntoIterator for ResolvedLonghandTargets {
+    type Item = ModeledLonghand;
+    type IntoIter = ResolvedLonghandTargetIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        match self {
+            Self::Inline { targets, len } => ResolvedLonghandTargetIter::Inline {
+                targets,
+                index: 0,
+                len: usize::from(len),
+            },
+            Self::StaticNames(names) => ResolvedLonghandTargetIter::StaticNames { names, index: 0 },
+            Self::All => ResolvedLonghandTargetIter::All { index: 0 },
+        }
+    }
+}
+
+impl ModeledProperty {
+    pub(in crate::css) fn parse(name: &str) -> Option<Self> {
+        if let Some(longhand) = ModeledLonghand::parse(name) {
+            return Some(Self::Longhand(longhand));
+        }
+        match name {
+            "all" => Some(Self::All),
+            _ => LegacyPropertyAlias::parse(name)
+                .map(Self::Alias)
+                .or_else(|| LogicalProperty::parse(name).map(Self::Logical))
+                .or_else(|| ModeledShorthand::parse(name).map(Self::Shorthand)),
+        }
+    }
+
+    pub(in crate::css) const fn css_name(&self) -> &'static str {
+        match self {
+            Self::Longhand(longhand) | Self::FontComponent(longhand) => longhand.css_name(),
+            Self::Shorthand(name) => name.css_name(),
+            Self::Logical(name) => name.css_name(),
+            Self::Alias(name) => name.css_name(),
+            Self::All => "all",
+        }
+    }
+
+    /// Resolves this spelling to the physical longhands affected in `context`.
+    pub(in crate::css) fn resolve_targets(
+        &self,
+        direction: Direction,
+        writing_mode: WritingMode,
+    ) -> ResolvedLonghandTargets {
+        match self {
+            Self::Longhand(longhand) | Self::FontComponent(longhand) => {
+                ResolvedLonghandTargets::from_names([longhand.css_name()])
+            }
+            Self::All => ResolvedLonghandTargets::All,
+            Self::Shorthand(name) => {
+                modeled_targets_for_name(name.css_name(), direction, writing_mode)
+            }
+            Self::Logical(name) => {
+                modeled_targets_for_name(name.css_name(), direction, writing_mode)
+            }
+            Self::Alias(alias) => modeled_targets_for_name(
+                match alias {
+                    LegacyPropertyAlias::WebkitFlexBasis => "flex-basis",
+                    LegacyPropertyAlias::PageBreakBefore => "break-before",
+                    LegacyPropertyAlias::PageBreakAfter => "break-after",
+                    LegacyPropertyAlias::PageBreakInside => "break-inside",
+                    LegacyPropertyAlias::FontStretch => "font-width",
+                    LegacyPropertyAlias::WordWrap => "overflow-wrap",
+                },
+                direction,
+                writing_mode,
+            ),
+        }
+    }
+
+    pub(in crate::css) const fn font_component(self) -> Option<ModeledLonghand> {
+        match self {
+            Self::FontComponent(longhand) => Some(longhand),
+            _ => None,
+        }
+    }
+}
+
+fn modeled_targets_for_name(
+    name: &str,
+    direction: Direction,
+    writing_mode: WritingMode,
+) -> ResolvedLonghandTargets {
+    if let Some(longhand) = ModeledLonghand::parse(name) {
+        return ResolvedLonghandTargets::from_names([longhand.css_name()]);
+    }
+    affected_longhand_names(name, direction, writing_mode)
+        .unwrap_or_else(|| panic!("modeled property `{name}` has no modeled longhand targets"))
+}
+
+pub(in crate::css) fn all_modeled_longhands() -> impl Iterator<Item = ModeledLonghand> {
+    ALL_MODELED_LONGHANDS.iter().copied().filter(|longhand| {
+        !matches!(
+            longhand,
+            ModeledLonghand::Direction | ModeledLonghand::UnicodeBidi
+        )
+    })
+}
+
+impl ModeledLonghand {
+    pub(in crate::css) fn is_inherited(self) -> bool {
+        matches!(
+            self.css_name(),
+            "border-collapse"
+                | "border-spacing"
+                | "caption-side"
+                | "color"
+                | "color-scheme"
+                | "forced-color-adjust"
+                | "fill"
+                | "stroke"
+                | "stroke-width"
+                | "-webkit-text-fill-color"
+                | "direction"
+                | "dominant-baseline"
+                | "empty-cells"
+                | "font-family"
+                | "font-language-override"
+                | "font-feature-settings"
+                | "font-variation-settings"
+                | "font-palette"
+                | "font-synthesis"
+                | "font-synthesis-weight"
+                | "font-synthesis-style"
+                | "font-synthesis-small-caps"
+                | "font-synthesis-position"
+                | "font-kerning"
+                | "font-size"
+                | "font-size-adjust"
+                | "font-style"
+                | "font-variant-alternates"
+                | "font-variant-caps"
+                | "font-variant-east-asian"
+                | "font-variant-emoji"
+                | "font-variant-ligatures"
+                | "font-variant-numeric"
+                | "font-variant-position"
+                | "font-width"
+                | "font-weight"
+                | "hyphenate-character"
+                | "hyphenate-limit-chars"
+                | "hyphens"
+                | "image-rendering"
+                | "image-orientation"
+                | "letter-spacing"
+                | "line-break"
+                | "line-height"
+                | "block-ellipsis"
+                | "list-style-image"
+                | "list-style-position"
+                | "list-style-type"
+                | "marker-side"
+                | "orphans"
+                | "overflow-wrap"
+                | "quotes"
+                | "text-align"
+                | "text-combine-upright"
+                | "text-align-all"
+                | "text-align-last"
+                | "text-justify"
+                | "text-autospace"
+                | "text-spacing-trim"
+                | "word-space-transform"
+                | "initial-letter-align"
+                | "initial-letter-wrap"
+                | "line-fit-edge"
+                | "text-box-edge"
+                | "text-orientation"
+                | "text-decoration-skip-ink"
+                | "text-decoration-skip-self"
+                | "text-decoration-skip-box"
+                | "text-decoration-skip-spaces"
+                | "text-underline-offset"
+                | "text-underline-position"
+                | "text-emphasis-color"
+                | "text-emphasis-position"
+                | "text-emphasis-skip"
+                | "text-emphasis-style"
+                | "ruby-position"
+                | "ruby-align"
+                | "ruby-overhang"
+                | "text-shadow"
+                | "text-indent"
+                | "hanging-punctuation"
+                | "text-transform"
+                | "text-wrap"
+                | "text-wrap-mode"
+                | "text-wrap-style"
+                | "tab-size"
+                | "visibility"
+                | "white-space"
+                | "widows"
+                | "word-break"
+                | "word-spacing"
+                | "word-wrap"
+                | "writing-mode"
+        )
+    }
+}
 
 /// Builds a child style's pre-cascade inherited base from its parent.
 ///
@@ -427,9 +775,9 @@ pub(super) fn inherited_base_style(parent: &ComputedStyle) -> ComputedStyle {
     style.used_color_scheme = parent.used_color_scheme;
     style.page_color_scheme = parent.page_color_scheme;
     style.language = parent.language.clone();
-    for longhand in ALL_MODELED_LONGHANDS {
-        if property_is_inherited(longhand) {
-            copy_modeled_property(&mut style, parent, longhand);
+    for &longhand in ALL_MODELED_LONGHANDS {
+        if longhand.is_inherited() {
+            copy_modeled_longhand(&mut style, parent, longhand);
         }
     }
     style
@@ -449,12 +797,37 @@ pub(super) fn pseudo_inherited_base_style(originating_style: &ComputedStyle) -> 
     style
 }
 
-pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &ComputedStyle, name: &str) {
+pub(in crate::css) fn copy_modeled_longhand(
+    style: &mut ComputedStyle,
+    source: &ComputedStyle,
+    longhand: ModeledLonghand,
+) {
+    longhand.copy_from(style, source);
+}
+
+/// Implements the computed-state contract for each canonical longhand.
+///
+/// `ModeledLonghand::copy_from` is the typed, exhaustive dispatch boundary;
+/// this legacy name-oriented body is kept temporarily to avoid duplicating the
+/// large field-level copy table while individual value parsers remain keyed by
+/// CSS spelling.
+fn copy_modeled_longhand_by_css_name(
+    style: &mut ComputedStyle,
+    source: &ComputedStyle,
+    name: &'static str,
+) {
     match name {
         "color-scheme" => {
             style.color_scheme = source.color_scheme.clone();
             style.used_color_scheme = source.used_color_scheme;
             style.page_color_scheme = source.page_color_scheme;
+        }
+        "animation-name" => style.animation_snapshot.name = source.animation_snapshot.name.clone(),
+        "animation-duration" => {
+            style.animation_snapshot.duration_seconds = source.animation_snapshot.duration_seconds;
+        }
+        "animation-delay" => {
+            style.animation_snapshot.delay_seconds = source.animation_snapshot.delay_seconds;
         }
         "zoom" => style.zoom = source.zoom,
         "display" => {
@@ -477,44 +850,44 @@ pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &Computed
         "order" => style.order = source.order,
         "row-gap" => style.row_gap = source.row_gap.clone(),
         "column-gap" => style.column_gap = source.column_gap.clone(),
-        "row-rule-width" => style.row_rule.widths = source.row_rule.clone().widths,
-        "row-rule-style" => style.row_rule.styles = source.row_rule.clone().styles,
-        "row-rule-color" => style.row_rule.colors = source.row_rule.clone().colors,
-        "row-rule-break" => style.row_rule.rule_break = source.row_rule.clone().rule_break,
+        "row-rule-width" => style.row_rule.widths = source.row_rule.widths.clone(),
+        "row-rule-style" => style.row_rule.styles = source.row_rule.styles.clone(),
+        "row-rule-color" => style.row_rule.colors = source.row_rule.colors.clone(),
+        "row-rule-break" => style.row_rule.rule_break = source.row_rule.rule_break,
         "row-rule-visibility-items" => {
-            style.row_rule.visibility_items = source.row_rule.clone().visibility_items;
+            style.row_rule.visibility_items = source.row_rule.visibility_items;
         }
         "row-rule-inset-cap-start" => {
-            style.row_rule.inset_cap_start = source.row_rule.clone().inset_cap_start;
+            style.row_rule.inset_cap_start = source.row_rule.inset_cap_start.clone();
         }
         "row-rule-inset-cap-end" => {
-            style.row_rule.inset_cap_end = source.row_rule.clone().inset_cap_end;
+            style.row_rule.inset_cap_end = source.row_rule.inset_cap_end.clone();
         }
         "row-rule-inset-junction-start" => {
-            style.row_rule.inset_junction_start = source.row_rule.clone().inset_junction_start;
+            style.row_rule.inset_junction_start = source.row_rule.inset_junction_start.clone();
         }
         "row-rule-inset-junction-end" => {
-            style.row_rule.inset_junction_end = source.row_rule.clone().inset_junction_end;
+            style.row_rule.inset_junction_end = source.row_rule.inset_junction_end.clone();
         }
-        "column-rule-width" => style.column_rule.widths = source.column_rule.clone().widths,
-        "column-rule-style" => style.column_rule.styles = source.column_rule.clone().styles,
-        "column-rule-color" => style.column_rule.colors = source.column_rule.clone().colors,
-        "column-rule-break" => style.column_rule.rule_break = source.column_rule.clone().rule_break,
+        "column-rule-width" => style.column_rule.widths = source.column_rule.widths.clone(),
+        "column-rule-style" => style.column_rule.styles = source.column_rule.styles.clone(),
+        "column-rule-color" => style.column_rule.colors = source.column_rule.colors.clone(),
+        "column-rule-break" => style.column_rule.rule_break = source.column_rule.rule_break,
         "column-rule-visibility-items" => {
-            style.column_rule.visibility_items = source.column_rule.clone().visibility_items;
+            style.column_rule.visibility_items = source.column_rule.visibility_items;
         }
         "column-rule-inset-cap-start" => {
-            style.column_rule.inset_cap_start = source.column_rule.clone().inset_cap_start;
+            style.column_rule.inset_cap_start = source.column_rule.inset_cap_start.clone();
         }
         "column-rule-inset-cap-end" => {
-            style.column_rule.inset_cap_end = source.column_rule.clone().inset_cap_end;
+            style.column_rule.inset_cap_end = source.column_rule.inset_cap_end.clone();
         }
         "column-rule-inset-junction-start" => {
             style.column_rule.inset_junction_start =
-                source.column_rule.clone().inset_junction_start;
+                source.column_rule.inset_junction_start.clone();
         }
         "column-rule-inset-junction-end" => {
-            style.column_rule.inset_junction_end = source.column_rule.clone().inset_junction_end;
+            style.column_rule.inset_junction_end = source.column_rule.inset_junction_end.clone();
         }
         "rule-overlap" => style.rule_overlap = source.rule_overlap,
         "grid-template-rows" => style.grid_template_rows = source.grid_template_rows.clone(),
@@ -539,154 +912,72 @@ pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &Computed
         "column-wrap" => style.column_wrap = source.column_wrap,
         "column-fill" => style.column_fill = source.column_fill,
         "column-span" => style.column_span = source.column_span,
+        "aspect-ratio" => style.aspect_ratio = source.aspect_ratio,
+        "contain-intrinsic-size" => {
+            style.contain_intrinsic_size = source.contain_intrinsic_size.clone();
+        }
+        "contain-intrinsic-width" => {
+            style.contain_intrinsic_size.width = source.contain_intrinsic_size.width.clone();
+        }
+        "contain-intrinsic-height" => {
+            style.contain_intrinsic_size.height = source.contain_intrinsic_size.height.clone();
+        }
         "margin-trim" => style.margin_trim = source.margin_trim,
         "margin-top" => {
-            style.box_values.margin.top = source.box_values.clone().margin.top;
+            style.box_values.margin.top = source.box_values.margin.top.clone();
             style.margin.top = source.margin.top;
             style.ua_margin_em.top = source.ua_margin_em.top;
         }
         "margin-right" => {
-            style.box_values.margin.right = source.box_values.clone().margin.right;
+            style.box_values.margin.right = source.box_values.margin.right.clone();
             style.margin.right = source.margin.right;
             style.ua_margin_em.right = source.ua_margin_em.right;
         }
         "margin-bottom" => {
-            style.box_values.margin.bottom = source.box_values.clone().margin.bottom;
+            style.box_values.margin.bottom = source.box_values.margin.bottom.clone();
             style.margin.bottom = source.margin.bottom;
             style.ua_margin_em.bottom = source.ua_margin_em.bottom;
         }
         "margin-left" => {
-            style.box_values.margin.left = source.box_values.clone().margin.left;
+            style.box_values.margin.left = source.box_values.margin.left.clone();
             style.margin.left = source.margin.left;
             style.ua_margin_em.left = source.ua_margin_em.left;
         }
         "padding-top" => {
-            style.box_values.padding.top = source.box_values.clone().padding.top;
+            style.box_values.padding.top = source.box_values.padding.top.clone();
             style.padding.top = source.padding.top;
         }
         "padding-right" => {
-            style.box_values.padding.right = source.box_values.clone().padding.right;
+            style.box_values.padding.right = source.box_values.padding.right.clone();
             style.padding.right = source.padding.right;
         }
         "padding-bottom" => {
-            style.box_values.padding.bottom = source.box_values.clone().padding.bottom;
+            style.box_values.padding.bottom = source.box_values.padding.bottom.clone();
             style.padding.bottom = source.padding.bottom;
         }
         "padding-left" => {
-            style.box_values.padding.left = source.box_values.clone().padding.left;
+            style.box_values.padding.left = source.box_values.padding.left.clone();
             style.padding.left = source.padding.left;
         }
-        "border-block" => {
-            for property in [
-                "border-top-width",
-                "border-bottom-width",
-                "border-top-style",
-                "border-bottom-style",
-                "border-top-color",
-                "border-bottom-color",
-            ] {
-                copy_modeled_property(style, source, property);
-            }
-        }
-        "border-inline" => {
-            for property in [
-                "border-left-width",
-                "border-right-width",
-                "border-left-style",
-                "border-right-style",
-                "border-left-color",
-                "border-right-color",
-            ] {
-                copy_modeled_property(style, source, property);
-            }
-        }
-        "border-block-start" => {
-            for property in ["border-top-width", "border-top-style", "border-top-color"] {
-                copy_modeled_property(style, source, property);
-            }
-        }
-        "border-block-end" => {
-            for property in [
-                "border-bottom-width",
-                "border-bottom-style",
-                "border-bottom-color",
-            ] {
-                copy_modeled_property(style, source, property);
-            }
-        }
-        "border-inline-start" => {
-            for property in [
-                "border-left-width",
-                "border-left-style",
-                "border-left-color",
-            ] {
-                copy_modeled_property(style, source, property);
-            }
-        }
-        "border-inline-end" => {
-            for property in [
-                "border-right-width",
-                "border-right-style",
-                "border-right-color",
-            ] {
-                copy_modeled_property(style, source, property);
-            }
-        }
-        "border-block-width" => {
-            copy_modeled_property(style, source, "border-top-width");
-            copy_modeled_property(style, source, "border-bottom-width");
-        }
-        "border-inline-width" => {
-            copy_modeled_property(style, source, "border-left-width");
-            copy_modeled_property(style, source, "border-right-width");
-        }
-        "border-block-style" => {
-            copy_modeled_property(style, source, "border-top-style");
-            copy_modeled_property(style, source, "border-bottom-style");
-        }
-        "border-inline-style" => {
-            copy_modeled_property(style, source, "border-left-style");
-            copy_modeled_property(style, source, "border-right-style");
-        }
-        "border-block-color" => {
-            copy_modeled_property(style, source, "border-top-color");
-            copy_modeled_property(style, source, "border-bottom-color");
-        }
-        "border-inline-color" => {
-            copy_modeled_property(style, source, "border-left-color");
-            copy_modeled_property(style, source, "border-right-color");
-        }
-        "border-block-start-width" => copy_modeled_property(style, source, "border-top-width"),
-        "border-block-end-width" => copy_modeled_property(style, source, "border-bottom-width"),
-        "border-inline-start-width" => copy_modeled_property(style, source, "border-left-width"),
-        "border-inline-end-width" => copy_modeled_property(style, source, "border-right-width"),
-        "border-block-start-style" => copy_modeled_property(style, source, "border-top-style"),
-        "border-block-end-style" => copy_modeled_property(style, source, "border-bottom-style"),
-        "border-inline-start-style" => copy_modeled_property(style, source, "border-left-style"),
-        "border-inline-end-style" => copy_modeled_property(style, source, "border-right-style"),
-        "border-block-start-color" => copy_modeled_property(style, source, "border-top-color"),
-        "border-block-end-color" => copy_modeled_property(style, source, "border-bottom-color"),
-        "border-inline-start-color" => copy_modeled_property(style, source, "border-left-color"),
-        "border-inline-end-color" => copy_modeled_property(style, source, "border-right-color"),
         "border-top-width" => set_border_side_width(
             style,
             BorderSide::Top,
-            source.border_width_values.clone().top,
+            source.border_width_values.top.clone(),
         ),
         "border-right-width" => set_border_side_width(
             style,
             BorderSide::Right,
-            source.border_width_values.clone().right,
+            source.border_width_values.right.clone(),
         ),
         "border-bottom-width" => set_border_side_width(
             style,
             BorderSide::Bottom,
-            source.border_width_values.clone().bottom,
+            source.border_width_values.bottom.clone(),
         ),
         "border-left-width" => set_border_side_width(
             style,
             BorderSide::Left,
-            source.border_width_values.clone().left,
+            source.border_width_values.left.clone(),
         ),
         "border-top-style" => style.border_styles.top = source.border_styles.top,
         "border-right-style" => style.border_styles.right = source.border_styles.right,
@@ -700,16 +991,16 @@ pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &Computed
         "border-bottom-color" => style.border_colors.bottom = source.border_colors.bottom,
         "border-left-color" => style.border_colors.left = source.border_colors.left,
         "border-top-left-radius" => {
-            style.border_radius.top_left = source.border_radius.clone().top_left
+            style.border_radius.top_left = source.border_radius.top_left.clone()
         }
         "border-top-right-radius" => {
-            style.border_radius.top_right = source.border_radius.clone().top_right;
+            style.border_radius.top_right = source.border_radius.top_right.clone();
         }
         "border-bottom-right-radius" => {
-            style.border_radius.bottom_right = source.border_radius.clone().bottom_right;
+            style.border_radius.bottom_right = source.border_radius.bottom_right.clone();
         }
         "border-bottom-left-radius" => {
-            style.border_radius.bottom_left = source.border_radius.clone().bottom_left;
+            style.border_radius.bottom_left = source.border_radius.bottom_left.clone();
         }
         "corner-top-left-shape" => style.corner_shapes.top_left = source.corner_shapes.top_left,
         "corner-top-right-shape" => style.corner_shapes.top_right = source.corner_shapes.top_right,
@@ -724,14 +1015,14 @@ pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &Computed
         "shape-margin" => style.shape_margin = source.shape_margin.clone(),
         "shape-image-threshold" => style.shape_image_threshold = source.shape_image_threshold,
         "border-image-source" => {
-            style.border_image.source = source.border_image.clone().source;
-            style.border_image.source_base_url = source.border_image.clone().source_base_url;
-            style.border_image.source_root_url = source.border_image.clone().source_root_url;
+            style.border_image.source = source.border_image.source.clone();
+            style.border_image.source_base_url = source.border_image.source_base_url.clone();
+            style.border_image.source_root_url = source.border_image.source_root_url.clone();
         }
-        "border-image-slice" => style.border_image.slice = source.border_image.clone().slice,
-        "border-image-width" => style.border_image.width = source.border_image.clone().width,
-        "border-image-outset" => style.border_image.outset = source.border_image.clone().outset,
-        "border-image-repeat" => style.border_image.repeat = source.border_image.clone().repeat,
+        "border-image-slice" => style.border_image.slice = source.border_image.slice,
+        "border-image-width" => style.border_image.width = source.border_image.width.clone(),
+        "border-image-outset" => style.border_image.outset = source.border_image.outset.clone(),
+        "border-image-repeat" => style.border_image.repeat = source.border_image.repeat,
         "border-collapse" => style.border_collapse = source.border_collapse,
         "caption-side" => style.caption_side = source.caption_side,
         "table-layout" => style.table_layout = source.table_layout,
@@ -740,21 +1031,24 @@ pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &Computed
             style.border_spacing = source.border_spacing.clone();
         }
         "background-color" => {
-            style.background_color = source.background_color.clone();
+            style.background.background_color = source.background.background_color.clone();
         }
         "background-image" => {
-            style.background_image = source.background_image.clone();
-            style.background_layers = source.background_layers.clone();
-            style.background_image_layer_count = source.background_image_layer_count;
+            style.background.background_image = source.background.background_image.clone();
+            style.background.background_layers = source.background.background_layers.clone();
+            style.background.background_image_layer_count =
+                source.background.background_image_layer_count;
         }
         "background-size" => {
-            style.background_size = source.background_size.clone();
-            for (index, layer) in style.background_layers.iter_mut().enumerate() {
+            style.background.background_size = source.background.background_size.clone();
+            let source_layer_count = source.background.background_layers.len().max(1);
+            for (index, layer) in style.background.background_layers.iter_mut().enumerate() {
                 layer.size = source
+                    .background
                     .background_layers
-                    .get(index % source.background_layers.clone().len().max(1))
+                    .get(index % source_layer_count)
                     .map(|layer| layer.size.clone())
-                    .unwrap_or(source.background_size.clone());
+                    .unwrap_or(source.background.background_size.clone());
             }
         }
         "object-fit" => style.object_fit = source.object_fit,
@@ -763,63 +1057,77 @@ pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &Computed
         "image-orientation" => style.image_orientation = source.image_orientation,
         "object-position" => style.object_position = source.object_position.clone(),
         "background-position" => {
-            style.background_position = source.background_position.clone();
-            for (index, layer) in style.background_layers.iter_mut().enumerate() {
+            style.background.background_position = source.background.background_position.clone();
+            let source_layer_count = source.background.background_layers.len().max(1);
+            for (index, layer) in style.background.background_layers.iter_mut().enumerate() {
                 layer.position = source
+                    .background
                     .background_layers
-                    .get(index % source.background_layers.clone().len().max(1))
+                    .get(index % source_layer_count)
                     .map(|layer| layer.position.clone())
-                    .unwrap_or(source.background_position.clone());
+                    .unwrap_or(source.background.background_position.clone());
             }
         }
         "background-position-x" => {
-            style.background_position.x = source.background_position.clone().x;
-            for (index, layer) in style.background_layers.iter_mut().enumerate() {
+            style.background.background_position.x =
+                source.background.background_position.x.clone();
+            let source_layer_count = source.background.background_layers.len().max(1);
+            for (index, layer) in style.background.background_layers.iter_mut().enumerate() {
                 layer.position.x = source
+                    .background
                     .background_layers
-                    .get(index % source.background_layers.clone().len().max(1))
+                    .get(index % source_layer_count)
                     .map(|layer| layer.position.x.clone())
-                    .unwrap_or(source.background_position.clone().x);
+                    .unwrap_or(source.background.background_position.x.clone());
             }
         }
         "background-position-y" => {
-            style.background_position.y = source.background_position.clone().y;
-            for (index, layer) in style.background_layers.iter_mut().enumerate() {
+            style.background.background_position.y =
+                source.background.background_position.y.clone();
+            let source_layer_count = source.background.background_layers.len().max(1);
+            for (index, layer) in style.background.background_layers.iter_mut().enumerate() {
                 layer.position.y = source
+                    .background
                     .background_layers
-                    .get(index % source.background_layers.clone().len().max(1))
+                    .get(index % source_layer_count)
                     .map(|layer| layer.position.y.clone())
-                    .unwrap_or(source.background_position.clone().y);
+                    .unwrap_or(source.background.background_position.y.clone());
             }
         }
         "background-repeat" => {
-            style.background_repeat = source.background_repeat;
-            for (index, layer) in style.background_layers.iter_mut().enumerate() {
+            style.background.background_repeat = source.background.background_repeat;
+            let source_layer_count = source.background.background_layers.len().max(1);
+            for (index, layer) in style.background.background_layers.iter_mut().enumerate() {
                 layer.repeat = source
+                    .background
                     .background_layers
-                    .get(index % source.background_layers.clone().len().max(1))
+                    .get(index % source_layer_count)
                     .map(|layer| layer.repeat)
-                    .unwrap_or(source.background_repeat);
+                    .unwrap_or(source.background.background_repeat);
             }
         }
         "background-origin" => {
-            style.background_origin = source.background_origin;
-            for (index, layer) in style.background_layers.iter_mut().enumerate() {
+            style.background.background_origin = source.background.background_origin;
+            let source_layer_count = source.background.background_layers.len().max(1);
+            for (index, layer) in style.background.background_layers.iter_mut().enumerate() {
                 layer.origin = source
+                    .background
                     .background_layers
-                    .get(index % source.background_layers.clone().len().max(1))
+                    .get(index % source_layer_count)
                     .map(|layer| layer.origin)
-                    .unwrap_or(source.background_origin);
+                    .unwrap_or(source.background.background_origin);
             }
         }
         "background-clip" => {
-            style.background_clip = source.background_clip;
-            for (index, layer) in style.background_layers.iter_mut().enumerate() {
+            style.background.background_clip = source.background.background_clip;
+            let source_layer_count = source.background.background_layers.len().max(1);
+            for (index, layer) in style.background.background_layers.iter_mut().enumerate() {
                 layer.clip = source
+                    .background
                     .background_layers
-                    .get(index % source.background_layers.clone().len().max(1))
+                    .get(index % source_layer_count)
                     .map(|layer| layer.clip)
-                    .unwrap_or(source.background_clip);
+                    .unwrap_or(source.background.background_clip);
             }
         }
         "color" => style.color = source.color,
@@ -858,19 +1166,19 @@ pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &Computed
         }
         "letter-spacing" => style.letter_spacing = source.letter_spacing.clone(),
         "word-spacing" => style.word_spacing = source.word_spacing.clone(),
-        "width" => style.box_values.width = source.box_values.clone().width,
+        "width" => style.box_values.width = source.box_values.width.clone(),
         "height" => {
             style.box_values.height = source.box_values.height.clone();
         }
-        "min-width" => style.box_values.min_width = source.box_values.clone().min_width,
-        "max-width" => style.box_values.max_width = source.box_values.clone().max_width,
-        "min-height" => style.box_values.min_height = source.box_values.clone().min_height,
-        "max-height" => style.box_values.max_height = source.box_values.clone().max_height,
+        "min-width" => style.box_values.min_width = source.box_values.min_width.clone(),
+        "max-width" => style.box_values.max_width = source.box_values.max_width.clone(),
+        "min-height" => style.box_values.min_height = source.box_values.min_height.clone(),
+        "max-height" => style.box_values.max_height = source.box_values.max_height.clone(),
         "box-sizing" => style.box_sizing = source.box_sizing,
-        "left" => style.box_values.inset_left = source.box_values.clone().inset_left,
-        "top" => style.box_values.inset_top = source.box_values.clone().inset_top,
-        "right" => style.box_values.inset_right = source.box_values.clone().inset_right,
-        "bottom" => style.box_values.inset_bottom = source.box_values.clone().inset_bottom,
+        "left" => style.box_values.inset_left = source.box_values.inset_left.clone(),
+        "top" => style.box_values.inset_top = source.box_values.inset_top.clone(),
+        "right" => style.box_values.inset_right = source.box_values.inset_right.clone(),
+        "bottom" => style.box_values.inset_bottom = source.box_values.inset_bottom.clone(),
         "position" => style.position = source.position.clone(),
         "float" => style.float = source.float,
         "footnote-display" => style.footnote_display = source.footnote_display,
@@ -880,27 +1188,26 @@ pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &Computed
         "opacity" => style.opacity = source.opacity,
         "transform" => style.transform = source.transform.clone(),
         "translate" => {
-            style.individual_transforms.translate = source.individual_transforms.clone().translate
+            style.individual_transforms.translate = source.individual_transforms.translate.clone()
         }
-        "rotate" => {
-            style.individual_transforms.rotate = source.individual_transforms.clone().rotate
-        }
-        "scale" => style.individual_transforms.scale = source.individual_transforms.clone().scale,
+        "rotate" => style.individual_transforms.rotate = source.individual_transforms.rotate,
+        "scale" => style.individual_transforms.scale = source.individual_transforms.scale,
         "transform-origin" => style.transform_origin = source.transform_origin.clone(),
+        "perspective" => style.perspective = source.perspective.clone(),
+        "perspective-origin" => style.perspective_origin = source.perspective_origin.clone(),
         "transform-box" => style.transform_box = source.transform_box,
+        "transform-style" => style.transform_style = source.transform_style,
         "backface-visibility" => style.backface_visibility = source.backface_visibility,
         "isolation" => style.isolation = source.isolation,
         "mix-blend-mode" => style.mix_blend_mode = source.mix_blend_mode,
         "filter" => style.filter = source.filter.clone(),
+        "clip" => style.legacy_clip = source.legacy_clip.clone(),
         "clip-path" => style.clip_path = source.clip_path.clone(),
-        "mask" | "mask-image" => style.mask = source.mask.clone(),
+        "mask-image" => style.mask = source.mask.clone(),
+        "mask-border-source" => style.mask_border_source = source.mask_border_source.clone(),
         "contain" => style.contain = source.contain,
         "container-type" => style.container_type = source.container_type,
         "container-name" => style.container_names = source.container_names.clone(),
-        "container" => {
-            style.container_type = source.container_type;
-            style.container_names = source.container_names.clone();
-        }
         "content-visibility" => style.content_visibility = source.content_visibility,
         "will-change" => style.will_change = source.will_change,
         "text-align" | "text-align-all" => style.text_align = source.text_align,
@@ -916,22 +1223,27 @@ pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &Computed
         "text-box-trim" => style.text_box_trim = source.text_box_trim,
         "text-box-edge" => style.text_box_edge = source.text_box_edge,
         "box-decoration-break" => style.box_decoration_break = source.box_decoration_break,
+        "outline-offset" => style.outline_offset = source.outline_offset.clone(),
+        "outline-width" => {
+            style.outline_width = source.outline_width;
+            style.outline_width_value = source.outline_width_value.clone();
+        }
+        "outline-style" => style.outline_style = source.outline_style,
+        "outline-color" => style.outline_color = source.outline_color,
         "text-indent" => style.text_indent = source.text_indent.clone(),
         "hanging-punctuation" => style.hanging_punctuation = source.hanging_punctuation,
         "vertical-align" => style.vertical_align = source.vertical_align.clone(),
         "dominant-baseline" => {
-            style.vertical_align.dominant_baseline =
-                source.vertical_align.clone().dominant_baseline;
+            style.vertical_align.dominant_baseline = source.vertical_align.dominant_baseline;
         }
         "alignment-baseline" => {
-            style.vertical_align.alignment_baseline =
-                source.vertical_align.clone().alignment_baseline;
+            style.vertical_align.alignment_baseline = source.vertical_align.alignment_baseline;
         }
         "baseline-source" => {
-            style.vertical_align.baseline_source = source.vertical_align.clone().baseline_source;
+            style.vertical_align.baseline_source = source.vertical_align.baseline_source;
         }
         "baseline-shift" => {
-            style.vertical_align.baseline_shift = source.vertical_align.clone().baseline_shift;
+            style.vertical_align.baseline_shift = source.vertical_align.baseline_shift.clone();
         }
         "font-weight" => style.font_weight = source.font_weight,
         "font-style" => style.font_style = source.font_style,
@@ -994,57 +1306,47 @@ pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &Computed
         "break-before" | "page-break-before" => style.break_before = source.break_before,
         "break-after" | "page-break-after" => style.break_after = source.break_after,
         "break-inside" | "page-break-inside" => {
-            style.break_inside_avoid = source.break_inside_avoid;
-            style.break_inside_avoid_column = source.break_inside_avoid_column;
+            style.break_inside = source.break_inside;
         }
         "orphans" => style.orphans = source.orphans,
         "widows" => style.widows = source.widows,
         "text-decoration-line" | "text-decoration" => {
-            style.text_decoration.underline = source.text_decoration.clone().underline;
-            style.text_decoration.overline = source.text_decoration.clone().overline;
-            style.text_decoration.line_through = source.text_decoration.clone().line_through;
-            style.text_decoration.blink = source.text_decoration.clone().blink;
-            style.text_decoration.spelling_error = source.text_decoration.clone().spelling_error;
-            style.text_decoration.grammar_error = source.text_decoration.clone().grammar_error;
+            style.text_decoration.underline = source.text_decoration.underline;
+            style.text_decoration.overline = source.text_decoration.overline;
+            style.text_decoration.line_through = source.text_decoration.line_through;
+            style.text_decoration.blink = source.text_decoration.blink;
+            style.text_decoration.spelling_error = source.text_decoration.spelling_error;
+            style.text_decoration.grammar_error = source.text_decoration.grammar_error;
         }
-        "text-decoration-style" => {
-            style.text_decoration.style = source.text_decoration.clone().style
-        }
-        "text-decoration-color" => {
-            style.text_decoration.color = source.text_decoration.clone().color
-        }
+        "text-decoration-style" => style.text_decoration.style = source.text_decoration.style,
+        "text-decoration-color" => style.text_decoration.color = source.text_decoration.color,
         "text-decoration-thickness" => {
-            style.text_decoration.thickness = source.text_decoration.clone().thickness;
+            style.text_decoration.thickness = source.text_decoration.thickness.clone();
         }
         "text-decoration-inset" => {
-            style.text_decoration.inset = source.text_decoration.clone().inset;
+            style.text_decoration.inset = source.text_decoration.inset.clone();
         }
         "text-decoration-skip-ink" => {
-            style.text_decoration.skip_ink = source.text_decoration.clone().skip_ink;
+            style.text_decoration.skip_ink = source.text_decoration.skip_ink;
         }
         "text-decoration-skip-self" => {
-            style.text_decoration.skip_self = source.text_decoration.clone().skip_self;
+            style.text_decoration.skip_self = source.text_decoration.skip_self;
         }
         "text-decoration-skip-box" => {
-            style.text_decoration.skip_box = source.text_decoration.clone().skip_box;
+            style.text_decoration.skip_box = source.text_decoration.skip_box;
         }
         "text-decoration-skip-spaces" => {
-            style.text_decoration.skip_spaces = source.text_decoration.clone().skip_spaces;
+            style.text_decoration.skip_spaces = source.text_decoration.skip_spaces;
         }
         "text-underline-offset" => {
             style.text_decoration.underline_offset =
-                source.text_decoration.clone().underline_offset;
+                source.text_decoration.underline_offset.clone();
         }
         "text-underline-position" => {
-            style.text_decoration.underline_position =
-                source.text_decoration.clone().underline_position;
+            style.text_decoration.underline_position = source.text_decoration.underline_position;
         }
         "text-emphasis-style" => {
             style.text_emphasis_style = source.text_emphasis_style.clone();
-        }
-        "text-emphasis" => {
-            style.text_emphasis_style = source.text_emphasis_style.clone();
-            style.text_emphasis_color = source.text_emphasis_color;
         }
         "text-emphasis-color" => style.text_emphasis_color = source.text_emphasis_color,
         "text-emphasis-position" => {
@@ -1052,6 +1354,8 @@ pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &Computed
         }
         "text-emphasis-skip" => style.text_emphasis_skip = source.text_emphasis_skip,
         "ruby-position" => style.ruby_position = source.ruby_position,
+        "ruby-align" => style.ruby_align = source.ruby_align,
+        "ruby-overhang" => style.ruby_overhang = source.ruby_overhang,
         "text-shadow" => style.text_shadow = source.text_shadow.clone(),
         "box-shadow" => style.box_shadow = source.box_shadow.clone(),
         "white-space" => {
@@ -1065,16 +1369,19 @@ pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &Computed
         "text-wrap-mode" => style.text_wrap_mode = source.text_wrap_mode,
         "text-wrap-style" => style.text_wrap_style = source.text_wrap_style,
         "wrap-inside" => style.wrap_inside = source.wrap_inside,
-        "line-clamp" | "-webkit-line-clamp" => {
-            style.line_clamp = source.line_clamp.clone();
-            style.used_line_clamp = None;
+        "max-lines" => {
+            style.max_lines = source.max_lines;
+            style.line_limit_traversal = None;
+        }
+        "block-ellipsis" => {
+            style.block_ellipsis = source.block_ellipsis.clone();
+            style.line_limit_traversal = None;
+        }
+        "continue" => {
+            style.continue_ = source.continue_;
+            style.line_limit_traversal = None;
         }
         "word-break" => style.word_break = source.word_break,
-        "overflow" => {
-            style.overflow = source.overflow;
-            style.overflow_x = source.overflow_x;
-            style.overflow_y = source.overflow_y;
-        }
         "overflow-x" => style.overflow_x = source.overflow_x,
         "overflow-y" => style.overflow_y = source.overflow_y,
         "scrollbar-gutter" => style.scrollbar_gutter = source.scrollbar_gutter,
@@ -1082,14 +1389,12 @@ pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &Computed
         "scroll-snap-type" => style.scroll_snap_type = source.scroll_snap_type,
         "scroll-snap-align" => style.scroll_snap_align = source.scroll_snap_align,
         "scroll-snap-stop" => style.scroll_snap_stop = source.scroll_snap_stop,
-        "scroll-padding" => style.scroll_padding = source.scroll_padding.clone(),
         "scroll-padding-top" => style.scroll_padding.top = source.scroll_padding.top.clone(),
         "scroll-padding-right" => style.scroll_padding.right = source.scroll_padding.right.clone(),
         "scroll-padding-bottom" => {
             style.scroll_padding.bottom = source.scroll_padding.bottom.clone()
         }
         "scroll-padding-left" => style.scroll_padding.left = source.scroll_padding.left.clone(),
-        "scroll-margin" => style.scroll_margin = source.scroll_margin.clone(),
         "scroll-margin-top" => style.scroll_margin.top = source.scroll_margin.top.clone(),
         "scroll-margin-right" => style.scroll_margin.right = source.scroll_margin.right.clone(),
         "scroll-margin-bottom" => style.scroll_margin.bottom = source.scroll_margin.bottom.clone(),
@@ -1107,6 +1412,179 @@ pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &Computed
             style.marker_content = source.marker_content.clone();
         }
         "quotes" => style.quotes = source.quotes.clone().inherited(),
-        _ => {}
+        name => unreachable!("modeled longhand `{name}` has no computed-style copy operation"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn modeled_longhand_registry_is_unique_and_copy_complete() {
+        let mut names = HashSet::new();
+        let source = ComputedStyle::initial();
+        let mut destination = ComputedStyle::initial();
+
+        for &longhand in ALL_MODELED_LONGHANDS {
+            let name = longhand.css_name();
+            assert!(names.insert(name), "duplicate modeled longhand `{name}`");
+            let parsed = ModeledLonghand::parse(name)
+                .expect("the modeled-longhand registry must parse its own entry");
+            assert_eq!(parsed, longhand);
+            copy_modeled_longhand(&mut destination, &source, longhand);
+        }
+    }
+
+    #[test]
+    fn closed_property_syntax_round_trips_and_always_resolves_to_longhands() {
+        let mut names = HashSet::new();
+        for shorthand in ALL_MODELED_SHORTHANDS {
+            let property = ModeledProperty::Shorthand(*shorthand);
+            let name = property.css_name();
+            assert!(names.insert(name), "duplicate modeled syntax `{name}`");
+            assert_eq!(ModeledProperty::parse(name), Some(property));
+            for writing_mode in [WritingMode::HorizontalTb, WritingMode::VerticalRl] {
+                assert!(
+                    property
+                        .resolve_targets(Direction::Ltr, writing_mode)
+                        .into_iter()
+                        .next()
+                        .is_some()
+                );
+            }
+        }
+        for logical in ALL_LOGICAL_PROPERTIES {
+            let property = ModeledProperty::Logical(*logical);
+            let name = property.css_name();
+            assert!(names.insert(name), "duplicate modeled syntax `{name}`");
+            assert_eq!(ModeledProperty::parse(name), Some(property));
+            for writing_mode in [WritingMode::HorizontalTb, WritingMode::VerticalRl] {
+                assert!(
+                    property
+                        .resolve_targets(Direction::Ltr, writing_mode)
+                        .into_iter()
+                        .next()
+                        .is_some()
+                );
+            }
+        }
+        for alias in ALL_LEGACY_PROPERTY_ALIASES {
+            let property = ModeledProperty::Alias(*alias);
+            let name = property.css_name();
+            assert!(names.insert(name), "duplicate modeled syntax `{name}`");
+            assert_eq!(ModeledProperty::parse(name), Some(property));
+            assert!(
+                property
+                    .resolve_targets(Direction::Ltr, WritingMode::HorizontalTb)
+                    .into_iter()
+                    .next()
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn typed_property_syntax_resolves_to_canonical_longhand_targets() {
+        let width = ModeledProperty::parse("width").expect("modeled longhand");
+        assert!(matches!(
+            width,
+            ModeledProperty::Longhand(ModeledLonghand::Width)
+        ));
+        assert_eq!(
+            width
+                .resolve_targets(Direction::Ltr, WritingMode::HorizontalTb)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![ModeledLonghand::Width]
+        );
+
+        let margin = ModeledProperty::parse("margin").expect("modeled shorthand");
+        assert!(matches!(margin, ModeledProperty::Shorthand(_)));
+        assert_eq!(
+            margin
+                .resolve_targets(Direction::Ltr, WritingMode::HorizontalTb)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![
+                ModeledLonghand::MarginTop,
+                ModeledLonghand::MarginRight,
+                ModeledLonghand::MarginBottom,
+                ModeledLonghand::MarginLeft,
+            ]
+        );
+
+        let alias = ModeledProperty::parse("word-wrap").expect("legacy alias");
+        assert!(matches!(alias, ModeledProperty::Alias(_)));
+        assert_eq!(
+            alias
+                .resolve_targets(Direction::Ltr, WritingMode::HorizontalTb)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![ModeledLonghand::OverflowWrap]
+        );
+
+        let font_stretch = ModeledProperty::parse("font-stretch").expect("font-width alias");
+        assert!(matches!(font_stretch, ModeledProperty::Alias(_)));
+        assert_eq!(
+            font_stretch
+                .resolve_targets(Direction::Ltr, WritingMode::HorizontalTb)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![ModeledLonghand::FontWidth]
+        );
+
+        let font = ModeledProperty::parse("font").expect("font shorthand");
+        assert!(matches!(
+            font,
+            ModeledProperty::Shorthand(ModeledShorthand::Font)
+        ));
+        let font_targets = font
+            .resolve_targets(Direction::Ltr, WritingMode::HorizontalTb)
+            .into_iter()
+            .collect::<Vec<_>>();
+        assert!(font_targets.contains(&ModeledLonghand::FontSize));
+        assert!(font_targets.contains(&ModeledLonghand::FontFeatureSettings));
+        assert!(font_targets.contains(&ModeledLonghand::FontVariationSettings));
+
+        let logical = ModeledProperty::parse("block-size").expect("logical property");
+        assert!(matches!(logical, ModeledProperty::Logical(_)));
+        assert_eq!(
+            logical
+                .resolve_targets(Direction::Ltr, WritingMode::HorizontalTb)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![ModeledLonghand::Height]
+        );
+        assert_eq!(
+            logical
+                .resolve_targets(Direction::Ltr, WritingMode::VerticalRl)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![ModeledLonghand::Width]
+        );
+
+        let containment = ModeledProperty::parse("contain-intrinsic-inline-size")
+            .expect("logical containment property");
+        assert_eq!(
+            containment
+                .resolve_targets(Direction::Ltr, WritingMode::VerticalRl)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![ModeledLonghand::ContainIntrinsicHeight]
+        );
+    }
+
+    #[test]
+    fn all_targets_every_modeled_longhand_except_direction_and_unicode_bidi() {
+        let all = ModeledProperty::parse("all").expect("all shorthand");
+        let targets = all
+            .resolve_targets(Direction::Ltr, WritingMode::HorizontalTb)
+            .into_iter()
+            .collect::<Vec<_>>();
+        assert!(targets.contains(&ModeledLonghand::AspectRatio));
+        assert!(!targets.contains(&ModeledLonghand::Direction));
+        assert!(!targets.contains(&ModeledLonghand::UnicodeBidi));
     }
 }

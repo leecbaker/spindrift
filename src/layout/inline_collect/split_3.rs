@@ -198,7 +198,7 @@ pub(in crate::layout) fn mark_inline_box_ancestor_decorations(
     style: &ComputedStyle,
     positioning_containing_block_id: Option<InlinePositioningContainingBlockId>,
 ) {
-    let has_paint_effect_scope = style.opacity < 1.0;
+    let has_paint_effect_scope = style.opacity.value() < 1.0;
     // Allocate once per lexical inline box, then copy that opaque identity to
     // every descendant word.  The copied metadata survives source slicing and
     // bidi reordering without making equal-opacity siblings coalesce.
@@ -239,8 +239,8 @@ pub(in crate::layout) fn mark_inline_box_ancestor_decorations(
         // context's text style.  In the former case the word already paints
         // this background itself; in the latter, retain it as an ancestor
         // decoration even at the first lexical scope.
-        let word_owns_scope_background = style.background_color.is_potentially_visible()
-            && word.style.background_color == style.background_color;
+        let word_owns_scope_background = style.background.background_color.is_potentially_visible()
+            && word.style.background.background_color == style.background.background_color;
         let paints_background_or_border =
             scope_depth > 1 || (scope_depth > 0 && !word_owns_scope_background);
         if !paints_background_or_border
@@ -262,8 +262,8 @@ pub(in crate::layout) fn mark_inline_box_ancestor_decorations(
 }
 
 pub(in crate::layout) fn inline_box_has_paintable_decoration(style: &ComputedStyle) -> bool {
-    style.background_color.is_potentially_visible()
-        || style.background_image.is_image()
+    style.background.background_color.is_potentially_visible()
+        || style.background.background_image.is_image()
         || used_border_width(style).points() > 0.0
 }
 
@@ -350,7 +350,7 @@ pub(in crate::layout) fn insert_text_autospace_items(
 /// <https://drafts.csswg.org/css-text-4/#text-autospace-property>
 pub(in crate::layout) fn inline_edge_is_transparent_to_text_autospace(atom: &InlineAtom) -> bool {
     match atom.content() {
-        InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace) => true,
+        InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace(_)) => true,
         InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge)) => {
             let edge = match edge.logical_edge {
                 InlineLogicalEdge::Start => InlineBoxEdge::Start,
@@ -404,6 +404,7 @@ pub(in crate::layout) fn push_autospaced_word(
                 &word.style,
                 word.baseline_shift,
                 word.visual_offset,
+                character_is_autospace_ideograph(previous),
             );
             *previous_text = None;
             run_start_index = index;
@@ -483,6 +484,7 @@ pub(in crate::layout) fn push_autospace_boundary(
             &previous.style,
             previous.baseline_shift,
             previous.visual_offset,
+            character_is_autospace_ideograph(previous.character),
         );
     }
 }
@@ -493,13 +495,18 @@ pub(in crate::layout) fn push_text_autospace_atom(
     style: &ComputedStyle,
     baseline_shift: f32,
     visual_offset: InlineVisualOffset,
+    predecessor_is_ideograph: bool,
 ) {
+    let spacing = InlineTextBoundarySpacing::new(
+        font_system.ic_advance_for_style(style) / 8.0,
+        predecessor_is_ideograph,
+    );
     output.push(InlineItem::Atom(Box::new(
         InlineAtom::new(
-            InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace),
+            InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace(spacing)),
             style.clone(),
             None,
-            InlineSize::new(font_system.ic_advance_for_style(style).points() / 8.0, 0.0),
+            InlineSize::new(spacing.advance().points(), 0.0),
             0.0,
             baseline_shift,
             None,
@@ -517,8 +524,8 @@ pub(in crate::layout) fn quote_pair(style: &ComputedStyle, depth: usize) -> (Str
             .or_else(|| pairs.last())
             .cloned()
             .unwrap_or_else(default_quote_pair),
-        Quotes::Auto { .. } => {
-            let (open, close) = quotes::language_quote_pair(style.quotes.auto_language(), depth);
+        Quotes::Auto(_) => {
+            let (open, close) = style.quotes.auto_quote_pair(depth);
             (open.to_string(), close.to_string())
         }
     }
@@ -737,7 +744,7 @@ mod tests {
             output.as_slice(),
             [InlineItem::Word(first), InlineItem::Atom(atom), InlineItem::Word(last)]
                 if first.text == "国\u{301}"
-                    && matches!(atom.content(), InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace))
+                    && matches!(atom.content(), InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace(_)))
                     && last.text == "X"
         ));
     }
@@ -765,14 +772,19 @@ mod tests {
 
         push_autospaced_word(&mut font_system, &mut output, word, &mut previous);
 
-        let width = output.iter().find_map(|item| match item {
+        let spacing = output.iter().find_map(|item| match item {
             InlineItem::Atom(atom)
                 if matches!(
                     atom.content(),
-                    InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace)
+                    InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace(_))
                 ) =>
             {
-                Some(atom.size.width)
+                let InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace(spacing)) =
+                    atom.content()
+                else {
+                    unreachable!("match guard selects text autospace")
+                };
+                Some((spacing.advance().points(), atom.size.width))
             }
             InlineItem::Word(_)
             | InlineItem::Atom(_)
@@ -781,7 +793,7 @@ mod tests {
             | InlineItem::PageScopeStart(_)
             | InlineItem::PageScopeEnd => None,
         });
-        assert_eq!(width, Some(expected_width));
+        assert_eq!(spacing, Some((expected_width, expected_width)));
     }
 
     #[test]
@@ -809,7 +821,7 @@ mod tests {
                         InlineItem::Atom(atom)
                             if matches!(
                                 atom.content(),
-                                InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace)
+                                InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace(_))
                             )
                     )
                 })
@@ -891,7 +903,7 @@ mod tests {
                         InlineItem::Atom(atom)
                             if matches!(
                                 atom.content(),
-                                InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace)
+                                InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace(_))
                             )
                     )
                 })

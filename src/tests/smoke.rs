@@ -1,6 +1,39 @@
 use crate as quire;
-use crate::{BookmarkState, Css, CssColor, Html, RenderOptions};
+use crate::{BookmarkState, Css, CssColor, Document, Html, PdfOptions, RenderOptions};
 use base64::Engine as _;
+
+trait PdfBytesForTest {
+    fn write_pdf_bytes(&self, options: &PdfOptions) -> crate::Result<Vec<u8>>;
+}
+
+impl PdfBytesForTest for Document {
+    fn write_pdf_bytes(&self, options: &PdfOptions) -> crate::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        self.write_pdf(&mut bytes, options)?;
+        Ok(bytes)
+    }
+}
+
+trait HtmlPdfBytesForTest {
+    async fn write_pdf_bytes(
+        &self,
+        render_options: &RenderOptions,
+        pdf_options: &PdfOptions,
+    ) -> crate::Result<Vec<u8>>;
+}
+
+impl HtmlPdfBytesForTest for Html {
+    async fn write_pdf_bytes(
+        &self,
+        render_options: &RenderOptions,
+        pdf_options: &PdfOptions,
+    ) -> crate::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        self.write_pdf(&mut bytes, render_options, pdf_options)
+            .await?;
+        Ok(bytes)
+    }
+}
 
 const ROW_SUBGRID_AUTO_FILL_WPT: &str = include_str!(
     "../../tests/fixtures/wpt/css/css-grid/grid-lanes/subgrid/grid-subgridded-to-grid-lanes/track-sizing/row-subgrid-auto-fill-002.html"

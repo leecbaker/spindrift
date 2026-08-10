@@ -43,6 +43,10 @@ impl UsedOverflowAxis {
     pub(in crate::layout) const fn is_scroll_container(self) -> bool {
         matches!(self, Self::ScrollContainer(_))
     }
+
+    pub(in crate::layout) const fn is_non_scrollable_clip(self) -> bool {
+        matches!(self, Self::Clip)
+    }
 }
 
 /// Used overflow for the physical horizontal and vertical axes.
@@ -86,6 +90,14 @@ impl UsedOverflowAxes {
         self.vertical.clips()
     }
 
+    pub(in crate::layout) const fn non_scrollable_clip_x(self) -> bool {
+        self.horizontal.is_non_scrollable_clip()
+    }
+
+    pub(in crate::layout) const fn non_scrollable_clip_y(self) -> bool {
+        self.vertical.is_non_scrollable_clip()
+    }
+
     fn representative(self, fallback: css::Overflow) -> css::Overflow {
         if self.horizontal == UsedOverflowAxis::Visible
             && self.vertical == UsedOverflowAxis::Visible
@@ -114,24 +126,55 @@ pub(in crate::layout) struct PhysicalScrollbarGutters {
     pub(in crate::layout) bottom: LayoutLength,
 }
 
-/// Resolved scrollport geometry for a single physical padding box.
-///
-/// The static PDF UA reserves deterministic classic-gutter space but does
-/// not paint native interactive chrome. Keeping this value explicit lets
-/// layout, background positioning, and clipping agree on that choice.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(in crate::layout) struct ScrollportGeometry {
-    pub(in crate::layout) padding_box: PaintClip,
-    pub(in crate::layout) scrollport: PaintClip,
-    pub(in crate::layout) gutters: PhysicalScrollbarGutters,
+impl PhysicalScrollbarGutters {
+    /// The reserved space along the physical horizontal and vertical axes.
+    ///
+    /// A vertical scrollbar consumes horizontal layout space and vice versa.
+    /// Keep this conversion on the physical scrollport primitive so formatting
+    /// contexts do not independently re-derive it from overflow longhands.
+    pub(in crate::layout) fn horizontal_extent(self) -> LayoutLength {
+        LayoutLength::new(self.left.points() + self.right.points())
+    }
+
+    pub(in crate::layout) fn vertical_extent(self) -> LayoutLength {
+        LayoutLength::new(self.top.points() + self.bottom.points())
+    }
 }
 
-impl ScrollportGeometry {
-    /// Resolve static-media scrollbar reservation against known overflow.
-    /// `auto` receives the actual overflow flags, while `stable` and `scroll`
-    /// can reserve space before descendant layout has finished.
-    pub(in crate::layout) fn for_padding_box(
-        padding_box: PaintClip,
+/// A pre-layout scrollbar-gutter reservation for one physical padding box.
+///
+/// CSS Overflow adds a reserved scrollbar gutter to intrinsic sizes, but
+/// deducts it from otherwise-allotted content space.  This record makes the
+/// reservation available before a formatting context knows its final padding
+/// rectangle, and is later consumed by [`ScrollportGeometry`] for clipping.
+/// <https://drafts.csswg.org/css-overflow-3/#scrollbars-layout>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct ScrollbarGutterReservation {
+    gutters: PhysicalScrollbarGutters,
+}
+
+impl ScrollbarGutterReservation {
+    /// Quire's static PDF backend has no native interactive scrollbar chrome,
+    /// and therefore selects the CSS Overflow overlay-scrollbar UA policy.
+    /// Overlay scrollbars reserve no layout space.
+    /// <https://drafts.csswg.org/css-overflow-3/#scrollbar-gutter-property>
+    pub(in crate::layout) fn static_pdf_overlay() -> Self {
+        Self {
+            gutters: PhysicalScrollbarGutters {
+                left: LayoutLength::new(0.0),
+                right: LayoutLength::new(0.0),
+                top: LayoutLength::new(0.0),
+                bottom: LayoutLength::new(0.0),
+            },
+        }
+    }
+
+    /// Resolve a static-media classic-scrollbar reservation.
+    ///
+    /// Callers that have not yet established automatic overflow pass `false`
+    /// for both overflow flags, as required by CSS Overflow's initial
+    /// no-scrollbar sizing assumption.
+    pub(in crate::layout) fn for_style(
         style: &ComputedStyle,
         overflow: UsedOverflowAxes,
         has_overflow_x: bool,
@@ -158,28 +201,80 @@ impl ScrollportGeometry {
             style.scrollbar_gutter,
             css::ScrollbarGutter::Stable { both_edges: true }
         );
-        let gutters = PhysicalScrollbarGutters {
-            left: if reserves_y && both_edges {
-                thickness
-            } else {
-                LayoutLength::new(0.0)
+        Self {
+            gutters: PhysicalScrollbarGutters {
+                left: if reserves_y && both_edges {
+                    thickness
+                } else {
+                    LayoutLength::new(0.0)
+                },
+                right: if reserves_y {
+                    thickness
+                } else {
+                    LayoutLength::new(0.0)
+                },
+                top: if reserves_x && both_edges {
+                    thickness
+                } else {
+                    LayoutLength::new(0.0)
+                },
+                bottom: if reserves_x {
+                    thickness
+                } else {
+                    LayoutLength::new(0.0)
+                },
             },
-            right: if reserves_y {
-                thickness
-            } else {
-                LayoutLength::new(0.0)
-            },
-            top: if reserves_x && both_edges {
-                thickness
-            } else {
-                LayoutLength::new(0.0)
-            },
-            bottom: if reserves_x {
-                thickness
-            } else {
-                LayoutLength::new(0.0)
-            },
-        };
+        }
+    }
+
+    pub(in crate::layout) fn gutters(self) -> PhysicalScrollbarGutters {
+        self.gutters
+    }
+
+    pub(in crate::layout) fn horizontal_extent(self) -> LayoutLength {
+        self.gutters.horizontal_extent()
+    }
+
+    pub(in crate::layout) fn vertical_extent(self) -> LayoutLength {
+        self.gutters.vertical_extent()
+    }
+}
+
+/// Resolved scrollport geometry for a single physical padding box.
+///
+/// The static PDF UA reserves deterministic classic-gutter space but does
+/// not paint native interactive chrome. Keeping this value explicit lets
+/// layout, background positioning, and clipping agree on that choice.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct ScrollportGeometry {
+    pub(in crate::layout) padding_box: PaintClip,
+    pub(in crate::layout) scrollport: PaintClip,
+    pub(in crate::layout) gutters: PhysicalScrollbarGutters,
+}
+
+impl ScrollportGeometry {
+    /// Resolve static-media scrollbar reservation against known overflow.
+    /// `auto` receives the actual overflow flags, while `stable` and `scroll`
+    /// can reserve space before descendant layout has finished.
+    pub(in crate::layout) fn for_padding_box(
+        padding_box: PaintClip,
+        style: &ComputedStyle,
+        overflow: UsedOverflowAxes,
+        has_overflow_x: bool,
+        has_overflow_y: bool,
+    ) -> Self {
+        Self::for_padding_box_with_reservation(
+            padding_box,
+            ScrollbarGutterReservation::for_style(style, overflow, has_overflow_x, has_overflow_y),
+        )
+    }
+
+    /// Construct a scrollport from an already-resolved layout reservation.
+    pub(in crate::layout) fn for_padding_box_with_reservation(
+        padding_box: PaintClip,
+        reservation: ScrollbarGutterReservation,
+    ) -> Self {
+        let gutters = reservation.gutters();
         let left = gutters.left.points();
         let right = gutters.right.points();
         let top = gutters.top.points();
@@ -1100,6 +1195,38 @@ mod tests {
     }
 
     #[test]
+    fn positioned_body_still_supplies_viewport_overflow() {
+        let root = crate::dom::parse("<html><body>content</body></html>");
+        let author = css::parse_stylesheet(&crate::css::Css::from_string(
+            "html { overflow: visible } body { overflow: hidden; position: absolute }",
+        ));
+        let stylesheets = Stylesheets::for_document(
+            css::html5_user_agent_stylesheet(),
+            None,
+            std::slice::from_ref(&author),
+        );
+        let page_box = box_tree::build_page_box(&root, &stylesheets, &ComputedStyle::initial());
+        let resolution = DocumentCanvasResolution::from_page_box(&page_box);
+        let document = root
+            .as_element()
+            .expect("parsed document has an element root");
+        let html = document
+            .children
+            .iter()
+            .filter_map(Node::as_element)
+            .find(|element| element.tag == "html")
+            .expect("document has an HTML root");
+        let body = html
+            .children
+            .iter()
+            .filter_map(Node::as_element)
+            .find(|element| element.tag == "body")
+            .expect("HTML root has a body");
+
+        assert!(resolution.is_viewport_overflow_source(body));
+    }
+
+    #[test]
     fn root_overflow_is_used_by_the_viewport() {
         let html = html_element("html");
         let mut style = ComputedStyle::initial();
@@ -1310,6 +1437,29 @@ mod tests {
         assert_eq!(geometry.gutters.right.points(), 0.0);
         assert_eq!(geometry.gutters.top.points(), 0.0);
         assert_eq!(geometry.gutters.bottom.points(), 0.0);
+    }
+
+    #[test]
+    fn scrollbar_reservation_preserves_forced_thin_and_both_edge_geometry() {
+        let mut style = ComputedStyle::initial();
+        style.overflow_x = css::Overflow::Scroll;
+        style.overflow_y = css::Overflow::Scroll;
+        style.scrollbar_width = css::ScrollbarWidth::Thin;
+        style.scrollbar_gutter = css::ScrollbarGutter::Stable { both_edges: true };
+
+        let reservation = ScrollbarGutterReservation::for_style(
+            &style,
+            UsedOverflowAxes::from_style(&style),
+            false,
+            false,
+        );
+        let thickness = 8.0 * css::CSS_PX_TO_PT;
+        assert_eq!(reservation.gutters().left.points(), thickness);
+        assert_eq!(reservation.gutters().right.points(), thickness);
+        assert_eq!(reservation.gutters().top.points(), thickness);
+        assert_eq!(reservation.gutters().bottom.points(), thickness);
+        assert_eq!(reservation.horizontal_extent().points(), thickness * 2.0);
+        assert_eq!(reservation.vertical_extent().points(), thickness * 2.0);
     }
 
     #[test]

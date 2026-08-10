@@ -1,5 +1,5 @@
 use super::super::*;
-use super::{BlockFlowChildTraversalState, BlockFlowChildrenPhaseInput};
+use super::{BlockFlowChildTraversalState, BlockFlowChildrenPhaseInput, DiscardRegionLimit};
 use crate::css::Edges;
 use crate::layout::block::flow::children::{
     BlockFlowMarginCollapseContext,
@@ -8,6 +8,7 @@ use crate::layout::block::flow::children::{
 use crate::layout::builder::page_for_context;
 use crate::layout::inline_layout::InlineLayoutOutcome;
 use std::cmp::Reverse;
+use std::num::NonZeroUsize;
 use std::ops::Deref;
 
 /// A multicol formatting-context style after the CSS `zoom` used-value
@@ -54,6 +55,74 @@ impl Deref for MulticolUsedStyle {
 /// A quarter-CSS-pixel interval changes glyph and one-device-pixel rule
 /// antialiasing in otherwise exact percentage-sized column sets.
 const MULTICOL_BALANCE_EPSILON: f32 = css::CSS_PX_TO_PT / 128.0;
+
+/// Maximum synthetic paint slices retained for one temporary column fragment.
+///
+/// A source fragment can have an arbitrarily large visual overflow extent
+/// (for example, a terminal border), even when its normal-flow content is
+/// small. Retaining a finite prefix prevents that paint extent from creating
+/// work proportional to an authored CSS length. Ordinary content-driven
+/// column fragmentation uses its separate continuation policy.
+/// <https://www.w3.org/TR/css-break-3/#breaking-rules>
+/// <https://www.w3.org/TR/css-break-3/#break-decoration>
+const MAX_MATERIALIZED_SYNTHETIC_COLUMN_SLICES: usize = 4;
+
+/// Bounded replay of one temporary column fragment's visual overflow.
+///
+/// Synthetic slices exist only to project the overflowing paint of a single
+/// committed source fragment through later anonymous columns. The final
+/// conceptual slice remains explicit so the caller can retain the source
+/// flow's block-end without materializing every intermediate column.
+/// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+/// <https://www.w3.org/TR/css-break-3/#break-decoration>
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SyntheticColumnReplayPlan {
+    materialized_slice_count: usize,
+    conceptual_slice_count: usize,
+    final_slice_used_block_size: LayoutLength,
+}
+
+impl SyntheticColumnReplayPlan {
+    fn for_visual_overflow(visual_block_extent: f32, fragmentainer_block_size: f32) -> Self {
+        let fragmentainer_block_size = fragmentainer_block_size.max(css::CSS_PX_TO_PT);
+        let visual_block_extent = visual_block_extent.max(fragmentainer_block_size);
+        let conceptual_slice_count = (visual_block_extent / fragmentainer_block_size)
+            .ceil()
+            .max(1.0) as usize;
+        // Derive the final slice from a remainder rather than subtracting two
+        // very large `f32` values. At large conceptual column counts that
+        // subtraction loses the final non-zero slice entirely.
+        let remainder = (visual_block_extent as f64).rem_euclid(fragmentainer_block_size as f64);
+        let final_slice_used_block_size = layout_pt(
+            (if remainder <= f64::EPSILON {
+                fragmentainer_block_size as f64
+            } else {
+                remainder
+            }) as f32,
+        );
+
+        Self {
+            materialized_slice_count: conceptual_slice_count
+                .min(MAX_MATERIALIZED_SYNTHETIC_COLUMN_SLICES),
+            conceptual_slice_count,
+            final_slice_used_block_size,
+        }
+    }
+
+    fn has_unmaterialized_tail(self) -> bool {
+        self.final_conceptual_slice_offset() >= self.materialized_slice_count
+    }
+
+    fn final_conceptual_slice_offset(self) -> usize {
+        self.conceptual_slice_count.saturating_sub(1)
+    }
+}
+
+/// The final source geometry retained after truncating synthetic paint replay.
+#[derive(Debug, Clone, Copy)]
+struct SyntheticColumnReplayTail {
+    final_slice_used_block_size: LayoutLength,
+}
 
 #[derive(Debug, Clone, Copy)]
 struct EstimatedMulticolFlowUnit {
@@ -108,24 +177,6 @@ impl Default for MulticolDescendantPercentageBasis {
     }
 }
 
-/// Whether a later temporary column page needs its complete destination
-/// rectangle retained during replay.
-///
-/// The first source page still owns normal-flow inline overflow. A later page
-/// is already a committed continuation, however, so in an orthogonal writing
-/// mode its cross-axis ink must not escape beyond the destination column after
-/// the local-to-page translation. Horizontal multicolumn replay keeps the
-/// established cross-axis overflow behavior.
-/// <https://www.w3.org/TR/css-multicol-1/#overflow-inside-multicol>
-/// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
-fn continuation_column_fragment_requires_full_clip(
-    fragment_index: usize,
-    writing_mode: WritingMode,
-    direction: Direction,
-) -> bool {
-    fragment_index > 0 && WritingModeAxes::new(writing_mode, direction).swaps_physical_axes()
-}
-
 /// Independent block-axis constraints for one anonymous column set.
 ///
 /// A final set can have a definite used height, an earlier balancing set can
@@ -158,6 +209,7 @@ pub(in crate::layout) struct MulticolFlowLayoutOutcome {
     is_multicol_layout: bool,
     committed_block_extent: LayoutLength,
     final_in_flow_baseline: Option<LayoutLength>,
+    local_discard_break: bool,
 }
 
 impl MulticolFlowLayoutOutcome {
@@ -166,6 +218,7 @@ impl MulticolFlowLayoutOutcome {
             is_multicol_layout: false,
             committed_block_extent: layout_pt(0.0),
             final_in_flow_baseline: None,
+            local_discard_break: false,
         }
     }
 
@@ -177,6 +230,7 @@ impl MulticolFlowLayoutOutcome {
             is_multicol_layout: true,
             committed_block_extent,
             final_in_flow_baseline,
+            local_discard_break: false,
         }
     }
 
@@ -196,6 +250,7 @@ impl MulticolFlowLayoutOutcome {
             final_in_flow_baseline: segment_baseline
                 .map(|baseline| layout_pt(segment_start.points() + baseline.points()))
                 .or(self.final_in_flow_baseline),
+            local_discard_break: self.local_discard_break,
         }
     }
 
@@ -206,6 +261,15 @@ impl MulticolFlowLayoutOutcome {
     /// The content-box block extent, measured from the flow-root block start.
     pub(in crate::layout) fn committed_block_extent(self) -> LayoutLength {
         self.committed_block_extent
+    }
+
+    fn with_local_discard_break(mut self) -> Self {
+        self.local_discard_break = true;
+        self
+    }
+
+    fn has_local_discard_break(self) -> bool {
+        self.local_discard_break
     }
 
     /// Offset from that same content-box start to the final baseline, when a
@@ -557,6 +621,9 @@ impl<'a> LayoutBuilder<'a> {
                             layout_pt((content_top - self.cursor_y).max(0.0)),
                             None,
                         );
+                        if column_set_outcome.has_local_discard_break() {
+                            break;
+                        }
                     }
                     index += 1;
                 }
@@ -598,6 +665,9 @@ impl<'a> LayoutBuilder<'a> {
                         run_in_inline_items_laid_out: false,
                         use_ordered_mixed_flow: false,
                         has_preceding_inline_flow_content: false,
+                        preceding_inline_local_cutoff: false,
+                        discard_region_limit: None,
+                        direct_automatic_block_size_constraint: None,
                         definite_content_height: content_height,
                         descendant_percentage_height_basis: content_height.map(|height| {
                             block_size_percentage_basis_from_points(
@@ -830,6 +900,11 @@ impl<'a> LayoutBuilder<'a> {
         if child_boxes.is_empty() {
             return MulticolFlowLayoutOutcome::not_multicol();
         }
+        // A discard capture may require replaying a strict source prefix.
+        // Hold the caller-visible state here; the ordinary temporary-column
+        // snapshot below is intentionally narrower and cannot undo committed
+        // projection into the outer fragmentainer.
+        let column_set_snapshot = self.snapshot();
         // A nested column set is laid out while its parent column remains the
         // containing block. Temporary fragmentainer page margins can expose
         // a wider physical page slice here, so use the typed logical inline
@@ -859,7 +934,22 @@ impl<'a> LayoutBuilder<'a> {
             return MulticolFlowLayoutOutcome::not_multicol();
         };
         let total_gap = gap * column_count.saturating_sub(1) as f32;
-        let column_width = ((available_width - total_gap) / column_count as f32).max(1.0);
+        let vertical = style.writing_mode.has_vertical_lines();
+        // The multicol inline size is the child content measure. In vertical
+        // writing, columns are divided over the physical block span instead.
+        // <https://www.w3.org/TR/css-multicol-1/#column-width>
+        // <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+        let total_block_extent = if vertical {
+            (self.content_right - self.content_left).max(0.0)
+        } else {
+            available_width
+        };
+        let column_width = ((total_block_extent - total_gap) / column_count as f32).max(1.0);
+        let column_inline_size = if vertical {
+            available_width
+        } else {
+            column_width
+        };
         let previous_left = self.content_left;
         let previous_right = self.content_right;
         let previous_cursor_y = self.cursor_y;
@@ -929,7 +1019,7 @@ impl<'a> LayoutBuilder<'a> {
                     .estimated_multicol_flow_units(
                         std::slice::from_ref(child),
                         stylesheets,
-                        column_width,
+                        column_inline_size,
                         descendant_percentage_height_basis,
                         false,
                     )
@@ -953,7 +1043,7 @@ impl<'a> LayoutBuilder<'a> {
             let definite_height = descendant_percentage_height_basis.and_then(|basis| {
                 let metrics = used_box_metrics(
                     child_style,
-                    PercentageBasis::definite(layout_pt(column_width)),
+                    PercentageBasis::definite(layout_pt(column_inline_size)),
                 );
                 used_content_box_height_or_auto_with_basis(
                     child_style,
@@ -964,7 +1054,7 @@ impl<'a> LayoutBuilder<'a> {
                     constrain_content_height(
                         child_style,
                         height,
-                        PercentageBasis::definite(layout_pt(column_width)),
+                        PercentageBasis::definite(layout_pt(column_inline_size)),
                     )
                     .points()
                         + metrics.vertical_non_content_length().points()
@@ -978,7 +1068,7 @@ impl<'a> LayoutBuilder<'a> {
                         element,
                         child_style,
                         stylesheets,
-                        column_width,
+                        column_inline_size,
                         Some(children),
                     )
                 })
@@ -988,7 +1078,7 @@ impl<'a> LayoutBuilder<'a> {
                 .estimated_multicol_flow_units(
                     std::slice::from_ref(child),
                     stylesheets,
-                    column_width,
+                    column_inline_size,
                     descendant_percentage_height_basis,
                     false,
                 )
@@ -996,7 +1086,7 @@ impl<'a> LayoutBuilder<'a> {
                 .map(|unit| unit.block_size.points())
                 .sum::<f32>();
             let derives_height_from_flow = definite_height.is_none()
-                && definite_logical_block_size(child_style, column_width).is_none();
+                && definite_logical_block_size(child_style, column_inline_size).is_none();
             let contribution = if derives_height_from_flow {
                 own_height.max(descendant_flow_height)
             } else {
@@ -1021,12 +1111,12 @@ impl<'a> LayoutBuilder<'a> {
         // <https://www.w3.org/TR/css-multicol-1/#filling-columns>
         // <https://www.w3.org/TR/css-break-3/#breaking-boxes>
         let estimated_float_flow_extent =
-            self.estimated_multicol_float_flow_extent(child_boxes, stylesheets, column_width);
+            self.estimated_multicol_float_flow_extent(child_boxes, stylesheets, column_inline_size);
         let text_box_line_trim = self.effective_text_box_line_trim_for_style(style);
         let flow_units = self.estimated_multicol_flow_units(
             child_boxes,
             stylesheets,
-            column_width,
+            column_inline_size,
             descendant_percentage_height_basis,
             false,
         );
@@ -1074,7 +1164,7 @@ impl<'a> LayoutBuilder<'a> {
             0.0
         };
         let minimum_monolithic_column_height = self
-            .estimated_multicol_monolithic_block_size(child_boxes, stylesheets, column_width)
+            .estimated_multicol_monolithic_block_size(child_boxes, stylesheets, column_inline_size)
             .max(minimum_simple_avoid_run_height);
         let minimum_forced_run_height = content_height
             .is_none()
@@ -1121,7 +1211,7 @@ impl<'a> LayoutBuilder<'a> {
                 style,
                 stylesheets,
                 child_boxes,
-                column_width,
+                column_width: column_inline_size,
                 column_count,
                 descendant_percentage_height_basis,
                 estimated_content_height,
@@ -1171,7 +1261,7 @@ impl<'a> LayoutBuilder<'a> {
                 style,
                 child_boxes,
                 stylesheets,
-                column_width,
+                column_inline_size,
                 nominal_column_height,
                 descendant_percentage_height_basis,
             );
@@ -1237,7 +1327,7 @@ impl<'a> LayoutBuilder<'a> {
                 child_element,
                 child_style,
                 children,
-                column_width,
+                column_inline_size,
             )
         } else {
             false
@@ -1305,10 +1395,11 @@ impl<'a> LayoutBuilder<'a> {
         self.fixed_layers.clear();
         self.current_page_named_strings.clear();
         self.current_page_running_elements.clear();
-        self.content_logical_inline_size_stack.push(column_width);
+        self.content_logical_inline_size_stack
+            .push(column_inline_size);
         self.multicol_column_containing_blocks
             .push(MulticolColumnContainingBlock {
-                inline_size: LogicalInlineContentSize::new(content_box_pt(column_width)),
+                inline_size: LogicalInlineContentSize::new(content_box_pt(column_inline_size)),
                 content_left: previous_left,
             });
         self.definite_block_size_stack
@@ -1321,32 +1412,47 @@ impl<'a> LayoutBuilder<'a> {
         // a separate entry point would lose the rollback candidate needed by
         // `break-before/after: avoid`.
         // <https://www.w3.org/TR/css-break-3/#break-between>
-        self.push_float_context();
-        self.layout_block_flow_children_phase(Box::new(BlockFlowChildrenPhaseInput {
-            fragmentainer_kind: FragmentainerKind::Column,
-            element,
-            style,
-            stylesheets,
-            child_boxes: Some(child_boxes),
-            can_collapse_start_margin: false,
-            can_collapse_end_margin: false,
-            applied_start_margin: layout_pt(0.0),
-            clearance_consumed_adjoining_start_margin: false,
-            starts_at_page_top: false,
-            laid_out_column_children: false,
-            use_box_inline_items: false,
-            run_in_inline_items_laid_out: false,
-            use_ordered_mixed_flow: false,
-            has_preceding_inline_flow_content: false,
-            definite_content_height: Some(column_height),
-            descendant_percentage_height_basis: descendant_percentage_height_basis.map(|height| {
-                block_size_percentage_basis_from_points(
-                    Some(height),
-                    BlockSizeBasisSource::ContainingBlock,
-                )
-            }),
-        }));
-        self.pop_float_context();
+        let child_flow_outcome =
+            self.with_replay_float_scope(ReplayFloatScope::IsolatedFormattingContext, |layout| {
+                layout.layout_block_flow_children_phase(Box::new(BlockFlowChildrenPhaseInput {
+                    fragmentainer_kind: FragmentainerKind::Column,
+                    element,
+                    style,
+                    stylesheets,
+                    child_boxes: Some(child_boxes),
+                    can_collapse_start_margin: false,
+                    can_collapse_end_margin: false,
+                    applied_start_margin: layout_pt(0.0),
+                    clearance_consumed_adjoining_start_margin: false,
+                    starts_at_page_top: false,
+                    laid_out_column_children: false,
+                    use_box_inline_items: false,
+                    run_in_inline_items_laid_out: false,
+                    use_ordered_mixed_flow: false,
+                    has_preceding_inline_flow_content: false,
+                    preceding_inline_local_cutoff: false,
+                    discard_region_limit: matches!(
+                        style.used_continuation(),
+                        css::UsedContinuation::Discard(_)
+                    )
+                    .then(|| {
+                        DiscardRegionLimit::new(
+                            NonZeroUsize::new(column_count)
+                                .expect("column count was validated non-zero"),
+                        )
+                    }),
+                    direct_automatic_block_size_constraint: None,
+                    definite_content_height: Some(column_height),
+                    descendant_percentage_height_basis: descendant_percentage_height_basis.map(
+                        |height| {
+                            block_size_percentage_basis_from_points(
+                                Some(height),
+                                BlockSizeBasisSource::ContainingBlock,
+                            )
+                        },
+                    ),
+                }))
+            });
         // Out-of-flow descendants affect column balancing and the multicol
         // container's block size. Their positioned layout records the last
         // anonymous column page required even when normal flow ends earlier;
@@ -1382,7 +1488,7 @@ impl<'a> LayoutBuilder<'a> {
         // Capture the distinction before restoring the outer page.
         // <https://www.w3.org/TR/css-position-3/#static-position>
         // <https://www.w3.org/TR/css-multicol-1/#the-multi-column-model>
-        let mut source_positioned_children = {
+        let source_positioned_children = {
             let sibling_tags = element_sibling_signature_list(element);
             let mut element_index = 0usize;
             let mut positioned = Vec::new();
@@ -1431,15 +1537,7 @@ impl<'a> LayoutBuilder<'a> {
                     source_static_rect,
                     positioning_containing_block,
                 )
-                .committed_to_fragmentainer(
-                    if static_position_depends_on_final_column {
-                        self.pages.len()
-                    } else {
-                        0
-                    },
-                    PaintTranslation::identity(),
-                    None,
-                );
+                .across_committed_multicolumn_fragments();
                 positioned.push((child_element.clone(), signature, child_style, fragment));
             }
             positioned
@@ -1486,6 +1584,14 @@ impl<'a> LayoutBuilder<'a> {
         let committed_final_in_flow_baseline = self
             .last_in_flow_line_baseline_y
             .map(|baseline| layout_pt((previous_cursor_y - baseline).max(0.0)));
+        // The temporary column sequence is rolled back below, but a discard
+        // controller's captured local region break is source state, not
+        // temporary page state. Retain that fact before the rollback so the
+        // segment dispatcher can omit following spanners and column sets.
+        // <https://drafts.csswg.org/css-overflow-4/#continue>
+        let local_discard_break = child_flow_outcome.has_local_continuation_cutoff
+            && matches!(style.used_continuation(), css::UsedContinuation::Discard(_));
+        let discard_source_prefix = child_flow_outcome.discard_source_prefix;
         self.restore(outer_snapshot);
         self.multicol_positioned_replay_capture_depth -= 1;
         self.counter_set = committed_counter_set;
@@ -1534,18 +1640,34 @@ impl<'a> LayoutBuilder<'a> {
             .current_page
             .paint_band_insertion_point(PaintBand::InFlowBlock);
         let multicol_axes = FlowAxes::for_style(style);
+        let vertical = style.writing_mode.has_vertical_lines();
+        let source_inline_extent = if vertical {
+            column_height
+        } else {
+            column_width
+        };
+        let source_fragment_block_extent = if vertical {
+            column_width
+        } else {
+            column_height
+        };
         let multicol_block_axis = WritingModeAxes::new(style.writing_mode, style.direction)
             .physical_axis(LogicalAxis::Block);
+        let mut synthetic_replay_tail = None;
         for (fragment_index, fragment) in column_fragments.into_iter().enumerate() {
             // Out-of-flow descendants are positioned against the multicol
             // container, not the shortened flow extent selected for an early
             // first-column break, so every replay slice uses the nominal
             // column height.
-            let source_fragment_height = column_height;
-            let fragment_block_extent = fragment
-                .bounds()
-                .map(|bounds| (previous_cursor_y - bounds.y()).max(source_fragment_height))
-                .unwrap_or(source_fragment_height);
+            let source_fragment_height = source_fragment_block_extent;
+            let fragment_block_extent = if vertical {
+                source_fragment_height
+            } else {
+                fragment
+                    .bounds()
+                    .map(|bounds| (previous_cursor_y - bounds.y()).max(source_fragment_height))
+                    .unwrap_or(source_fragment_height)
+            };
             // The numerical one-CSS-pixel progress capacity of a zero-height
             // column keeps fragmentation finite, but is not an authored
             // clipping edge. An atomic overflow subject, including a flex
@@ -1553,8 +1675,9 @@ impl<'a> LayoutBuilder<'a> {
             // becoming a one-pixel stripe during multicol projection.
             // <https://www.w3.org/TR/css-break-3/#breaking-rules>
             // <https://www.w3.org/TR/css-flexbox-1/#pagination>
-            let zero_capacity_column_fragment_overflows = column_height <= css::CSS_PX_TO_PT + 0.01
-                && fragment_block_extent > column_height + 0.01;
+            let zero_capacity_column_fragment_overflows = source_fragment_height
+                <= css::CSS_PX_TO_PT + 0.01
+                && fragment_block_extent > source_fragment_height + 0.01;
             // A block that is substantially taller than its temporary column
             // can remain in one paint fragment even though its background and
             // descendants must be replayed through later columns. Small glyph
@@ -1564,7 +1687,7 @@ impl<'a> LayoutBuilder<'a> {
             // backgrounds, decorations, or other visual overflow on those
             // fragments as more content slices and manufacture extra columns.
             // <https://www.w3.org/TR/css-break-3/#break-decoration>
-            let slice_count = if replay_oversized_flow_slices
+            let synthetic_replay_plan = if replay_oversized_flow_slices
                 // A zero-height column's atomic overflow is committed as one
                 // source fragment per flex item. Those records may already
                 // occupy multiple temporary pages, but each still needs its
@@ -1575,20 +1698,23 @@ impl<'a> LayoutBuilder<'a> {
                     || zero_capacity_column_fragment_overflows)
                 && fragment_block_extent > source_fragment_height * 1.5
             {
-                (fragment_block_extent / column_height).ceil().max(1.0) as usize
+                SyntheticColumnReplayPlan::for_visual_overflow(
+                    fragment_block_extent,
+                    source_fragment_height,
+                )
             } else {
-                1
+                SyntheticColumnReplayPlan::for_visual_overflow(
+                    source_fragment_height,
+                    source_fragment_height,
+                )
             };
+            let slice_count = synthetic_replay_plan.materialized_slice_count;
             for slice_index in 0..slice_count {
-                let slice_height = if slice_index == 0 {
-                    source_fragment_height
-                } else {
-                    column_height
-                };
+                let slice_height = source_fragment_height;
                 let lifted_block_offset = if slice_index == 0 {
                     0.0
                 } else {
-                    source_fragment_height + (slice_index - 1) as f32 * column_height
+                    source_fragment_height + (slice_index - 1) as f32 * source_fragment_height
                 };
                 let source_slice = LogicalRect {
                     origin: LogicalPoint {
@@ -1596,7 +1722,7 @@ impl<'a> LayoutBuilder<'a> {
                         block: lifted_block_offset,
                     },
                     size: LogicalSize {
-                        inline: column_width,
+                        inline: source_inline_extent,
                         block: slice_height,
                     },
                 };
@@ -1676,25 +1802,36 @@ impl<'a> LayoutBuilder<'a> {
                 } else {
                     row_fragment as isize
                 };
-                let destination_inline_extent = available_width
-                    .max((row_fragment + 1) as f32 * column_width + row_fragment as f32 * gap);
+                let destination_inline_extent = available_width;
                 let projection = FragmentainerProjection::new(FragmentainerProjectionInput {
                     axes: multicol_axes,
                     source_origin: PageTopPoint::new(previous_left, previous_cursor_y),
                     source_extent: LogicalSize {
-                        inline: column_width,
+                        inline: source_inline_extent,
                         block: lifted_block_offset + slice_height,
                     },
                     source_slice,
                     destination_origin: PageTopPoint::new(row_left, row_top),
                     destination_extent: LogicalSize {
                         inline: destination_inline_extent,
-                        block: slice_height,
+                        block: if vertical {
+                            total_block_extent
+                        } else {
+                            slice_height
+                        },
                     },
                     destination_slice: LogicalRect {
                         origin: LogicalPoint {
-                            inline: row_fragment as f32 * (column_width + gap),
-                            block: 0.0,
+                            inline: if vertical {
+                                0.0
+                            } else {
+                                row_fragment as f32 * (column_width + gap)
+                            },
+                            block: if vertical {
+                                row_fragment as f32 * (column_width + gap)
+                            } else {
+                                0.0
+                            },
                         },
                         size: source_slice.size,
                     },
@@ -1705,33 +1842,23 @@ impl<'a> LayoutBuilder<'a> {
                         self.page_area_height(),
                     ),
                 });
-                // A direct positioned descendant captured on this temporary
-                // page owns the same source-to-destination projection as the
-                // normal-flow paint collected from it. This matters for an
-                // auto inset: all temporary pages share a local X/Y origin,
-                // while their committed columns do not.
+                // Every source-to-destination slice available to normal-flow
+                // paint is also a candidate for a positioned principal
+                // captured on this temporary page. This includes synthetic
+                // overflow slices: a positioned box can cross their column
+                // boundary even though it contributes no normal-flow height.
+                // Temporary pages share a local X/Y origin while their
+                // committed columns do not.
                 // <https://www.w3.org/TR/css-position-3/#static-position>
                 // <https://www.w3.org/TR/css-multicol-1/#the-multi-column-model>
-                if slice_index == 0 {
-                    for (_, _, _, positioned_fragment) in &mut source_positioned_children {
-                        if positioned_fragment.owns_source_fragmentainer(fragment_index) {
-                            *positioned_fragment = positioned_fragment
-                                .clone()
-                                .projected_to_destination(projection.destination_translation());
-                        }
-                    }
-                    self.project_deferred_multicol_positioned_fragments(
-                        deferred_positioned_children_start,
-                        fragment_index,
-                        projection.destination_translation(),
-                    );
-                }
                 self.retain_deferred_multicol_positioned_candidate(
                     deferred_positioned_children_start,
-                    projection.source_clip(),
-                    layout_pt(fragment_index as f32 * column_height),
-                    layout_pt((fragment_index + 1) as f32 * column_height),
-                    projection.destination_translation(),
+                    projection,
+                    layout_pt(target_fragment as f32 * source_fragment_height),
+                    layout_pt((target_fragment + 1) as f32 * source_fragment_height),
+                    multicol_axes.continuous_block_to_local_paint_translation(layout_pt(
+                        target_fragment as f32 * source_fragment_height,
+                    )),
                 );
                 let fragment = if single_unsplittable_column_subject
                     // Only the source fragment's first replay owns the
@@ -1747,28 +1874,8 @@ impl<'a> LayoutBuilder<'a> {
                         .with_primitives_clipped_to_physical_axis_range_preserving_cross_axis_overflow(
                             multicol_block_axis,
                             projection.source_clip(),
-                            slice_count > 1,
+                            synthetic_replay_plan.conceptual_slice_count > 1,
                         )
-                };
-                // The first column's normal-flow inline overflow remains
-                // visible, but a continuation captured on a later temporary
-                // column page belongs to its committed column rectangle. In
-                // a vertical writing mode, preserving that continuation's
-                // physical cross-axis overflow would paint it beyond the
-                // multicol container's inline end after destination
-                // translation. Keep the entire committed source rectangle
-                // for later column pages before projecting it.
-                // <https://www.w3.org/TR/css-multicol-1/#overflow-inside-multicol>
-                let fragment = if continuation_column_fragment_requires_full_clip(
-                    fragment_index,
-                    style.writing_mode,
-                    style.direction,
-                ) {
-                    fragment.with_primitives_clipped_to_rect_preserving_structure(
-                        projection.source_clip(),
-                    )
-                } else {
-                    fragment
                 };
                 if fragment.is_empty() {
                     continue;
@@ -1784,7 +1891,7 @@ impl<'a> LayoutBuilder<'a> {
                     // fragment is still contained by the outer page area—the
                     // initial containing block for that page fragment.
                     // <https://www.w3.org/TR/css-page-3/#page-model>
-                    .with_primitives_clipped_to_rect_preserving_structure(
+                    .with_primitives_sliced_to_fragmentainer_rect_preserving_structure(
                         projection.destination_page_clip_in_source_space(),
                     );
                 if fragment.is_empty() {
@@ -1798,6 +1905,11 @@ impl<'a> LayoutBuilder<'a> {
                     painted_columns_in_row =
                         painted_columns_in_row.max(visual_column_offset as usize + 1);
                 }
+            }
+            if synthetic_replay_plan.has_unmaterialized_tail() {
+                synthetic_replay_tail = Some(SyntheticColumnReplayTail {
+                    final_slice_used_block_size: synthetic_replay_plan.final_slice_used_block_size,
+                });
             }
         }
         if paginate_column_rows
@@ -1859,20 +1971,23 @@ impl<'a> LayoutBuilder<'a> {
             self.mark_current_page_flow_content();
         }
         for (child_element, signature, child_style, fragment) in source_positioned_children {
-            let owning_fragment_clip =
-                PageTopRect::new(previous_left, row_top, available_width, column_height)
-                    .paint_clip();
             self.defer_multicol_positioned_fragment_element(
                 &child_element,
                 &signature,
                 child_style,
-                fragment.with_destination_clip(owning_fragment_clip),
+                fragment,
             );
         }
         self.replay_deferred_multicol_positioned_children(deferred_positioned_children_start);
         self.content_left = previous_left;
         self.content_right = previous_right;
-        let used_column_set_height = if content_height.is_none()
+        let used_column_set_height = if let Some(tail) = synthetic_replay_tail {
+            // The retained current page represents the last conceptual
+            // anonymous column. Keep following normal flow at the full
+            // source block-end without allocating the skipped columns.
+            // <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+            tail.final_slice_used_block_size.points()
+        } else if content_height.is_none()
             && style.column_fill == css::ColumnFill::Auto
             && paginate_column_rows
             && !column_set_has_paint
@@ -1937,13 +2052,39 @@ impl<'a> LayoutBuilder<'a> {
         let rule_primitives = gap_decoration_primitives_for_topology(style, &topology);
         self.current_page
             .insert_primitives_at_paint_band_point(row_rule_paint_point, rule_primitives);
-        MulticolFlowLayoutOutcome::column_set(
+        if let Some(prefix) = discard_source_prefix
+            && prefix.child_count() < child_boxes.len()
+        {
+            // Re-run the column set from the captured source endpoint. The
+            // first pass identified the Category-3 local region break; this
+            // pass computes balancing, box height, and decorations solely
+            // from source that can actually render. Restoring the complete
+            // entry snapshot keeps this local operation separate from page
+            // and column fragmentation.
+            // <https://drafts.csswg.org/css-overflow-4/#continue>
+            self.restore(column_set_snapshot);
+            return self
+                .layout_multicol_column_set(
+                    element,
+                    style,
+                    stylesheets,
+                    &child_boxes[..prefix.child_count()],
+                    height_constraints,
+                )
+                .with_local_discard_break();
+        }
+        let outcome = MulticolFlowLayoutOutcome::column_set(
             // `row_top` incorporates prior wrapped rows; preserve that
             // committed advance as well as the final row's used height rather
             // than relying on a transient cursor after replay.
             layout_pt((previous_cursor_y - row_top).max(0.0) + used_column_set_height),
             committed_final_in_flow_baseline,
-        )
+        );
+        if local_discard_break {
+            outcome.with_local_discard_break()
+        } else {
+            outcome
+        }
     }
 
     /// Find the smallest balanced column block size that fits the source into
@@ -2118,36 +2259,53 @@ impl<'a> LayoutBuilder<'a> {
         self.truncate_page_start_margins = false;
         self.multicol_text_box_trim_end_child_indices = None;
 
-        self.push_float_context();
-        self.multicol_balance_probe_depth += 1;
-        self.layout_block_flow_children_phase(Box::new(BlockFlowChildrenPhaseInput {
-            fragmentainer_kind: FragmentainerKind::Column,
-            element: input.element,
-            style: input.style,
-            stylesheets: input.stylesheets,
-            child_boxes: Some(input.child_boxes),
-            can_collapse_start_margin: false,
-            can_collapse_end_margin: false,
-            applied_start_margin: layout_pt(0.0),
-            clearance_consumed_adjoining_start_margin: false,
-            starts_at_page_top: false,
-            laid_out_column_children: false,
-            use_box_inline_items: false,
-            run_in_inline_items_laid_out: false,
-            use_ordered_mixed_flow: false,
-            has_preceding_inline_flow_content: false,
-            definite_content_height: Some(candidate_height),
-            descendant_percentage_height_basis: input.descendant_percentage_height_basis.map(
-                |height| {
-                    block_size_percentage_basis_from_points(
-                        Some(height),
-                        BlockSizeBasisSource::ContainingBlock,
+        self.with_replay_float_scope(ReplayFloatScope::IsolatedFormattingContext, |layout| {
+            layout.multicol_balance_probe_depth += 1;
+            layout.layout_block_flow_children_phase(Box::new(BlockFlowChildrenPhaseInput {
+                fragmentainer_kind: FragmentainerKind::Column,
+                element: input.element,
+                style: input.style,
+                stylesheets: input.stylesheets,
+                child_boxes: Some(input.child_boxes),
+                can_collapse_start_margin: false,
+                can_collapse_end_margin: false,
+                applied_start_margin: layout_pt(0.0),
+                clearance_consumed_adjoining_start_margin: false,
+                starts_at_page_top: false,
+                laid_out_column_children: false,
+                use_box_inline_items: false,
+                run_in_inline_items_laid_out: false,
+                use_ordered_mixed_flow: false,
+                has_preceding_inline_flow_content: false,
+                preceding_inline_local_cutoff: false,
+                // A balance probe is a source-order layout of the same multicol
+                // container. It must honor the local discard controller too:
+                // otherwise omitted source can inflate the selected balanced
+                // column height even though it cannot occupy a rendered region.
+                // <https://drafts.csswg.org/css-overflow-4/#continue>
+                discard_region_limit: matches!(
+                    input.style.used_continuation(),
+                    css::UsedContinuation::Discard(_)
+                )
+                .then(|| {
+                    DiscardRegionLimit::new(
+                        NonZeroUsize::new(input.column_count)
+                            .expect("balance probe column count was validated non-zero"),
                     )
-                },
-            ),
-        }));
-        self.multicol_balance_probe_depth -= 1;
-        self.pop_float_context();
+                }),
+                direct_automatic_block_size_constraint: None,
+                definite_content_height: Some(candidate_height),
+                descendant_percentage_height_basis: input.descendant_percentage_height_basis.map(
+                    |height| {
+                        block_size_percentage_basis_from_points(
+                            Some(height),
+                            BlockSizeBasisSource::ContainingBlock,
+                        )
+                    },
+                ),
+            }));
+            layout.multicol_balance_probe_depth -= 1;
+        });
         let normal_flow_columns = self.pages.len() + usize::from(self.current_page_has_content());
         // Definite principals and positioned descendants can leave their
         // normal-flow cursor in the originating column while assigning paint
@@ -2887,6 +3045,7 @@ impl<'a> LayoutBuilder<'a> {
                 Some(style),
             );
             if traversal_state.is_exhausted()
+                && !traversal_state.admits_zero_height_automatic_child(&child_style)
                 && (style_is_in_normal_flow(&child_style) || child_style.float != Float::None)
             {
                 // Floats after the clamp boundary are part of discarded
@@ -2952,12 +3111,12 @@ impl<'a> LayoutBuilder<'a> {
                         first_formatted_line.applies_to_next_inline_run(),
                         &mut previous_child_page_end,
                     );
-                    if inline_outcome.clamp_line_slots >= remaining_slots {
+                    if inline_outcome.clamp_line_slots >= remaining_slots.visible_line_limit() {
                         if inline_outcome.has_flow_effects {
                             first_formatted_line.consume_next_formatted_line();
                             self.flush_float_run(&mut float_run);
                         }
-                        traversal_state.debit(inline_outcome.clamp_line_slots);
+                        traversal_state.debit_inline_outcome(inline_outcome);
                         inline_nodes.clear();
                         seen_flow_child = true;
                         previous_flow_bottom_margin = None;
@@ -3001,7 +3160,7 @@ impl<'a> LayoutBuilder<'a> {
                         first_formatted_line.consume_next_formatted_line();
                         self.flush_float_run(&mut float_run);
                     }
-                    traversal_state.debit(inline_outcome.clamp_line_slots);
+                    traversal_state.debit_inline_outcome(inline_outcome);
                     inline_nodes.clear();
                     seen_flow_child = true;
                     previous_flow_bottom_margin = None;
@@ -3032,7 +3191,7 @@ impl<'a> LayoutBuilder<'a> {
                     previous_flow_bottom_margin = None;
                     self.flush_float_run(&mut float_run);
                 }
-                traversal_state.debit(inline_outcome.clamp_line_slots);
+                traversal_state.debit_inline_outcome(inline_outcome);
                 inline_nodes.clear();
                 if traversal_state.is_exhausted() {
                     // The pending inline run may have spent the final slot
@@ -3114,7 +3273,7 @@ impl<'a> LayoutBuilder<'a> {
                     previous_flow_bottom_margin = None;
                     self.flush_float_run(&mut float_run);
                 }
-                traversal_state.debit(inline_outcome.clamp_line_slots);
+                traversal_state.debit_inline_outcome(inline_outcome);
                 inline_nodes.clear();
                 // A block-level abspos at this source boundary gets the
                 // static rectangle of its hypothetical in-flow block. The
@@ -3194,9 +3353,11 @@ impl<'a> LayoutBuilder<'a> {
                 previous_flow_bottom_margin = None;
                 self.flush_float_run(&mut float_run);
             }
-            traversal_state.debit(inline_outcome.clamp_line_slots);
+            traversal_state.debit_inline_outcome(inline_outcome);
             inline_nodes.clear();
-            if traversal_state.is_exhausted() {
+            let zero_height_automatic_child =
+                traversal_state.admits_zero_height_automatic_child(&child_style);
+            if traversal_state.is_exhausted() && !zero_height_automatic_child {
                 // This child was classified before the preceding inline run
                 // was laid out. Once that run exhausts the shared clamp
                 // budget, the child and every descendant it would own are
@@ -3225,12 +3386,43 @@ impl<'a> LayoutBuilder<'a> {
                     &self.ancestors,
                     &mut self.font_system,
                 );
-                traversal_state.apply_to_with_continuation(
-                    &mut child_style,
-                    BlockFlowChildTraversalState::continuation_for_later_in_flow_source(
-                        has_later_in_flow_child,
-                    ),
-                );
+                if zero_height_automatic_child {
+                    let has_later_inline_source = element.children[child_node_index + 1..]
+                        .iter()
+                        .any(|node| {
+                            matches!(&node.kind, NodeKind::Text(text) if !text.trim().is_empty())
+                        });
+                    traversal_state.apply_zero_height_automatic_boundary(
+                        &mut child_style,
+                        has_later_in_flow_child || has_later_inline_source,
+                    );
+                } else {
+                    traversal_state.apply_to_with_continuation(
+                        &mut child_style,
+                        BlockFlowChildTraversalState::continuation_for_later_in_flow_source(
+                            has_later_in_flow_child,
+                        ),
+                    );
+                    let border = used_border_widths(&child_style);
+                    let automatic_child_non_content = crate::units::content_box_pt(
+                        (child_style.margin.top
+                            + child_style.margin.bottom
+                            + child_style.padding.top
+                            + child_style.padding.bottom
+                            + border.top
+                            + border.bottom)
+                            .max(0.0),
+                    );
+                    BlockFlowChildTraversalState::reserve_automatic_child_non_content(
+                        &mut child_style,
+                        automatic_child_non_content,
+                    );
+                    if has_later_in_flow_child {
+                        BlockFlowChildTraversalState::require_automatic_terminal_marker_when_full(
+                            &mut child_style,
+                        );
+                    }
+                }
             }
 
             let collapsible_block_child = is_collapsible_block_child(child_element, &child_style);
@@ -3291,7 +3483,11 @@ impl<'a> LayoutBuilder<'a> {
                 traversal_state.record_descendant_clamp_line_slots(
                     self.last_block_layout_outcome.clamp_line_slots,
                 );
-                traversal_state.debit(self.last_block_layout_outcome.clamp_line_slots);
+                traversal_state
+                    .debit_rendered_slots(self.last_block_layout_outcome.clamp_line_slots);
+                if self.last_block_layout_outcome.has_local_continuation_cutoff {
+                    traversal_state.mark_local_continuation_cutoff();
+                }
             }
             let child_consumed_bottom_margin = if child_uses_block_layout {
                 self.last_block_layout_outcome
@@ -3333,7 +3529,7 @@ impl<'a> LayoutBuilder<'a> {
             previous_flow_bottom_margin = None;
             self.flush_float_run(&mut float_run);
         }
-        traversal_state.debit(inline_outcome.clamp_line_slots);
+        traversal_state.debit_inline_outcome(inline_outcome);
         self.flush_float_run(&mut float_run);
 
         let _ = previous_flow_bottom_margin;
@@ -3384,7 +3580,7 @@ impl<'a> LayoutBuilder<'a> {
         } else {
             TextBoxLineTrim::default()
         };
-        let laid_out = self.with_text_box_line_trim_scope(run_text_box_line_trim, |layout| {
+        let captured = self.with_text_box_line_trim_scope(run_text_box_line_trim, |layout| {
             layout.begin_clamp_line_slot_capture();
             layout.layout_inline_fragment_block_with_first_line_policy(
                 inline_nodes,
@@ -3398,12 +3594,14 @@ impl<'a> LayoutBuilder<'a> {
         if is_text_box_trim_candidate {
             *inline_run_index += 1;
         }
-        self.record_clamp_line_slots(laid_out);
+        self.record_clamp_line_slots(captured.line_slots);
         let outcome = InlineLayoutOutcome {
-            next_line_index: laid_out,
-            clamp_line_slots: laid_out,
-            has_non_phantom_line: laid_out > 0,
-            has_flow_effects: laid_out > 0,
+            next_line_index: captured.line_slots,
+            clamp_line_slots: captured.line_slots,
+            clamp_block_advance: captured.block_advance,
+            has_non_phantom_line: captured.line_slots > 0,
+            has_flow_effects: captured.line_slots > 0,
+            has_local_continuation_cutoff: captured.has_local_continuation_cutoff,
         };
         if outcome.has_flow_effects {
             *previous_child_page_end = Some(inline_page_value);
@@ -4401,30 +4599,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_later_orthogonal_column_pages_receive_a_full_destination_clip() {
-        assert!(!continuation_column_fragment_requires_full_clip(
-            0,
-            WritingMode::VerticalLr,
-            Direction::Ltr,
-        ));
-        assert!(!continuation_column_fragment_requires_full_clip(
-            1,
-            WritingMode::HorizontalTb,
-            Direction::Ltr,
-        ));
-        assert!(continuation_column_fragment_requires_full_clip(
-            1,
-            WritingMode::VerticalLr,
-            Direction::Ltr,
-        ));
-        assert!(continuation_column_fragment_requires_full_clip(
-            1,
-            WritingMode::VerticalRl,
-            Direction::Rtl,
-        ));
-    }
-
-    #[test]
     fn multicol_flow_outcome_composes_column_sets_around_a_spanner() {
         let before = MulticolFlowLayoutOutcome::column_set(layout_pt(24.0), Some(layout_pt(18.0)));
         let after = MulticolFlowLayoutOutcome::column_set(layout_pt(30.0), Some(layout_pt(22.0)));
@@ -4456,5 +4630,22 @@ mod tests {
         assert!(outcome.is_multicol_layout());
         assert_eq!(outcome.committed_block_extent(), layout_pt(40.0));
         assert_eq!(outcome.final_in_flow_baseline(), None);
+    }
+
+    #[test]
+    fn synthetic_column_replay_bounds_large_visual_overflow() {
+        let plan = SyntheticColumnReplayPlan::for_visual_overflow(4_294_967_295.0, 12.0);
+
+        assert_eq!(
+            plan.materialized_slice_count,
+            MAX_MATERIALIZED_SYNTHETIC_COLUMN_SLICES
+        );
+        assert!(plan.has_unmaterialized_tail());
+        assert_eq!(
+            plan.final_conceptual_slice_offset(),
+            plan.conceptual_slice_count - 1
+        );
+        assert!(plan.final_slice_used_block_size.points() > 0.0);
+        assert!(plan.final_slice_used_block_size.points() <= 12.0);
     }
 }

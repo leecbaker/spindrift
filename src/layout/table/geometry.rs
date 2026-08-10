@@ -713,61 +713,6 @@ impl TableGridPlacement {
         self.axes.flow.writing_mode()
     }
 
-    /// Return a horizontal logical paint view of this grid.
-    ///
-    /// CSS background images resolve their positioning and gradient geometry
-    /// in the table's logical coordinate system.  Structural table painting
-    /// uses this view to produce those primitives before
-    /// [`Self::logical_paint_to_page_transform`] projects them as one unit.
-    pub(super) fn logical_paint_view_with_inline_edge(self, inline_edge: TableGridLength) -> Self {
-        let page_rect = self.full_page_top_rect();
-        let edge = inline_edge.get().max(0.0);
-        Self::with_axes(
-            PageTopPoint::new(page_rect.x() - edge, page_rect.top_y() - edge),
-            TableAxes {
-                flow: FlowAxes::new(WritingMode::HorizontalTb, Direction::Ltr),
-                direction: Direction::Ltr,
-            },
-            self.logical_size,
-        )
-    }
-
-    /// Transform a primitive painted in [`Self::logical_paint_view`] to the
-    /// root table's physical page orientation.
-    ///
-    /// The matrix is derived from CSS Writing Modes' logical inline/block
-    /// axes, rather than from a background-image-specific angle adjustment.
-    /// It therefore keeps a gradient's positioning rectangle and its hard
-    /// stop geometry in the same coordinate system:
-    /// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>.
-    pub(super) fn logical_paint_to_page_transform(
-        self,
-        inline_edge: TableGridLength,
-    ) -> PaintTransform {
-        let page_rect = self.full_page_top_rect();
-        let edge = inline_edge.get().max(0.0);
-        let logical_top = page_rect.top_y() - edge;
-        match self.axes.flow.writing_mode() {
-            WritingMode::HorizontalTb => PaintTransform::identity(),
-            WritingMode::VerticalRl | WritingMode::SidewaysRl => PaintTransform::new(
-                0.0,
-                1.0,
-                -1.0,
-                0.0,
-                page_rect.x() + logical_top,
-                logical_top - page_rect.width() - page_rect.x(),
-            ),
-            WritingMode::VerticalLr | WritingMode::SidewaysLr => PaintTransform::new(
-                0.0,
-                -1.0,
-                1.0,
-                0.0,
-                page_rect.x() - logical_top + page_rect.width(),
-                logical_top + page_rect.x(),
-            ),
-        }
-    }
-
     /// Return the table content box including separated-border block-edge
     /// spacing around the row grid.
     ///
@@ -798,6 +743,37 @@ impl TableGridPlacement {
                 rect.height() + edge * 2.0,
             )
         }
+    }
+
+    /// Return the logical row grid after removing the wrapper-owned outer
+    /// block-axis border-spacing edges.
+    ///
+    /// `table_content_height` includes the two outer separated-border edges
+    /// because they contribute to the table wrapper's block size. Structural
+    /// row, column, and cell backgrounds, however, are positioned against the
+    /// grid of originating cells. Keep that grid as the retained source
+    /// placement and let table-root painting add the wrapper edges explicitly:
+    /// <https://www.w3.org/TR/CSS22/tables.html#separated-borders> and
+    /// <https://drafts.csswg.org/css-tables-3/#drawing-cell-backgrounds>.
+    pub(super) fn without_block_edge_spacing(self, edge_spacing: TableGridLength) -> Self {
+        let edge = edge_spacing.get().max(0.0);
+        if edge == 0.0 {
+            return self;
+        }
+        let origin = if self.writing_mode().has_vertical_lines() {
+            PageTopPoint::new(self.origin.x() + edge, self.origin.top_y())
+        } else {
+            PageTopPoint::new(self.origin.x(), self.origin.top_y() - edge)
+        };
+        let block = (self.logical_block_grid_extent().get() - edge * 2.0).max(0.0);
+        Self::with_axes(
+            origin,
+            self.axes,
+            TableGridLogicalSize::new(
+                self.logical_size.inline(),
+                LogicalBlockContentSize::new(content_box_pt(block)),
+            ),
+        )
     }
 
     pub(super) fn containing_block_for(
@@ -1055,26 +1031,27 @@ mod tests {
     }
 
     #[test]
-    fn vertical_rl_column_image_transform_rotates_the_logical_paint_view() {
+    fn vertical_block_edge_spacing_expands_physical_x_only() {
         let placement = TableGridPlacement::with_axes(
-            PageTopPoint::new(15.0, 830.0),
+            PageTopPoint::new(20.0, 200.0),
             TableAxes {
                 flow: FlowAxes::new(WritingMode::VerticalRl, Direction::Rtl),
                 direction: Direction::Rtl,
             },
             TableGridLogicalSize::new(
                 LogicalInlineContentSize::new(content_box_pt(100.0)),
-                LogicalBlockContentSize::new(content_box_pt(80.0)),
+                LogicalBlockContentSize::new(content_box_pt(300.0)),
             ),
         );
-        let transform = placement.logical_paint_to_page_transform(TableGridLength::new(5.0));
+
         assert_eq!(
-            transform.apply_point(PaintPoint::new(15.0, 825.0)),
-            PaintPoint::new(15.0, 745.0)
+            placement.page_top_rect_with_block_edge_spacing(grid_length(10.0)),
+            PageTopRect::new(10.0, 200.0, 320.0, 100.0)
         );
+        let grid = placement.without_block_edge_spacing(grid_length(10.0));
         assert_eq!(
-            transform.apply_point(PaintPoint::new(115.0, 745.0)),
-            PaintPoint::new(95.0, 845.0)
+            grid.full_page_top_rect(),
+            PageTopRect::new(30.0, 200.0, 280.0, 100.0)
         );
     }
 }

@@ -52,6 +52,16 @@ impl<'a> LayoutBuilder<'a> {
         link_target: Option<&str>,
         content_height: Option<f32>,
     ) -> bool {
+        // The column planner needs a used block constraint before it balances
+        // the local regions. `lh` is resolved against this block's own used
+        // line height, not deferred until after a provisional column row has
+        // selected too many source lines.
+        // <https://www.w3.org/TR/css-values-4/#lh>
+        let mut multicol_style = style.clone();
+        multicol_style.resolve_line_height_relative_lengths();
+        let style = &multicol_style;
+        let content_height =
+            content_height.or_else(|| style.box_values.height.length_if_no_percent());
         let available_width = self.current_content_logical_inline_size().max(1.0);
         let gap = used_multicol_column_gap(
             style.column_gap.clone(),

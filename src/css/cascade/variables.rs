@@ -1,5 +1,6 @@
 use super::declarations::{CascadedDeclaration, affected_longhands, expand_modeled_shorthands};
 use super::*;
+use crate::css::component_values::CssComponentValueList;
 use crate::css::{custom_property_value_is_valid, is_custom_property_name};
 use cssparser::{Parser, ParserInput};
 use std::borrow::Cow;
@@ -23,8 +24,7 @@ pub(super) fn apply_cascaded_custom_property_declarations(
             .or_insert_with(|| ComputedCustomPropertyValue::Color(registration.initial_color));
     }
     for declaration in declarations {
-        let name = declaration.name.as_ref();
-        if is_custom_property_name(name) {
+        if let Some(name) = declaration.property.custom_name() {
             let value = trim_css_value(&declaration.value);
             let registration = style.registered_custom_properties.by_name.get(name);
             match value.to_ascii_lowercase().as_str() {
@@ -68,10 +68,11 @@ pub(super) fn apply_cascaded_custom_property_declarations(
                 }
                 "unset" => {}
                 _ => {
-                    style.custom_properties.insert(
-                        name.to_string(),
-                        ComputedCustomPropertyValue::Tokens(value.to_string()),
-                    );
+                    let value = CssComponentValueList::parse(value)
+                        .expect("custom-property declaration was validated before cascade");
+                    style
+                        .custom_properties
+                        .insert(name.to_string(), ComputedCustomPropertyValue::Tokens(value));
                 }
             }
         }
@@ -114,7 +115,7 @@ pub(super) fn apply_cascaded_color_scheme_declarations(
     for declaration in declarations
         .iter()
         .rev()
-        .filter(|declaration| declaration.name.as_ref() == "color-scheme")
+        .filter(|declaration| declaration.property.css_name() == "color-scheme")
     {
         let raw = trim_css_value(&declaration.value);
         let resolved;
@@ -172,9 +173,19 @@ fn resolve_custom_properties_at_computed_value_time(style: &mut ComputedStyle) {
 
     let resolved = custom_properties
         .iter()
-        .filter_map(|(name, value)| {
-            resolve_css_variables(&value.substitution_tokens(), &custom_properties)
-                .map(|value| (name.clone(), ComputedCustomPropertyValue::Tokens(value)))
+        .filter_map(|(name, value)| match value {
+            // Registered properties have already reached their typed computed
+            // value.  They contain no unresolved `var()` references, and
+            // serializing them here would add an unnecessary parse/serialize
+            // round trip before the actual substitution boundary.
+            ComputedCustomPropertyValue::Color(color) => {
+                Some((name.clone(), ComputedCustomPropertyValue::Color(*color)))
+            }
+            ComputedCustomPropertyValue::Tokens(value) => {
+                resolve_css_variables(value.as_css(), &custom_properties)
+                    .and_then(|value| CssComponentValueList::parse(&value))
+                    .map(|value| (name.clone(), ComputedCustomPropertyValue::Tokens(value)))
+            }
         })
         .collect();
     style.custom_properties = resolved;
@@ -252,11 +263,16 @@ pub(super) fn apply_cascaded_font_size_declarations_with_parent_ch_advance(
     inherited_ch_advance: LayoutLength,
 ) {
     let inherited_font_size = style.font_size;
-    for declaration in declarations
-        .iter()
-        .rev()
-        .filter(|declaration| matches!(declaration.name.as_ref(), "font-size" | "font"))
-    {
+    for declaration in declarations.iter().rev().filter(|declaration| {
+        matches!(
+            declaration.property.modeled(),
+            Some(
+                ModeledProperty::Longhand(ModeledLonghand::FontSize)
+                    | ModeledProperty::FontComponent(ModeledLonghand::FontSize)
+                    | ModeledProperty::Shorthand(ModeledShorthand::Font)
+            )
+        )
+    }) {
         let resolved_value;
         let value = trim_css_value(&declaration.value);
         let contains_var = contains_css_variable_reference(value);
@@ -282,20 +298,26 @@ pub(super) fn apply_cascaded_font_size_declarations_with_parent_ch_advance(
             }
             _ => {}
         }
-        if declaration.name.as_ref() == "font-size"
-            && let Some(font_size) = parse_deferred_font_size(value)
+        if matches!(
+            declaration.property.modeled(),
+            Some(ModeledProperty::Longhand(ModeledLonghand::FontSize))
+        ) && let Some(font_size) = parse_deferred_font_size(value)
         {
             set_deferred_font_size(style, font_size, inherited_font_size, inherited_ch_advance);
             return;
         }
-        if declaration.name.as_ref() == "font"
-            && let Some(font) = parse_font_shorthand_with_parent_ch_advance(
-                value,
-                inherited_font_size,
-                inherited_ch_advance,
-                style.font_weight,
+        if matches!(
+            declaration.property.modeled(),
+            Some(
+                ModeledProperty::FontComponent(ModeledLonghand::FontSize)
+                    | ModeledProperty::Shorthand(ModeledShorthand::Font)
             )
-        {
+        ) && let Some(font) = parse_font_shorthand_with_parent_ch_advance(
+            value,
+            inherited_font_size,
+            inherited_ch_advance,
+            style.font_weight,
+        ) {
             set_deferred_font_size(
                 style,
                 font.deferred_size,
@@ -324,7 +346,7 @@ pub(super) fn apply_cascaded_color_declarations(
     for declaration in declarations
         .iter()
         .rev()
-        .filter(|declaration| declaration.name.as_ref() == "color")
+        .filter(|declaration| declaration.property.css_name() == "color")
     {
         let resolved_value;
         let value = trim_css_value(&declaration.value);
@@ -390,9 +412,23 @@ pub(super) fn declarations_after_variable_substitution_and_shorthand_expansion<'
 ) -> Vec<CascadedDeclaration<'a>> {
     let mut output = Vec::with_capacity(declarations.len());
     for declaration in declarations {
-        if is_custom_property_name(&declaration.name)
+        if declaration.property.custom_name().is_some()
             || !contains_css_variable_reference(&declaration.value)
         {
+            output.push(declaration.clone());
+            continue;
+        }
+        let Some(property) = declaration.property.modeled() else {
+            output.push(declaration.clone());
+            continue;
+        };
+        let affected = affected_longhands(property, direction, writing_mode);
+        let requires_longhand_expansion = !matches!(property, ModeledProperty::Longhand(_));
+        if !requires_longhand_expansion {
+            // Longhands retain their authored var() token stream. Their
+            // property-specific cascade path performs substitution and can
+            // therefore distinguish a post-substitution grammar failure
+            // (invalid at computed-value time) from an earlier winner.
             output.push(declaration.clone());
             continue;
         }
@@ -401,22 +437,11 @@ pub(super) fn declarations_after_variable_substitution_and_shorthand_expansion<'
             // it addresses. Keep one unresolved declaration per affected
             // longhand so the normal invalid-at-computed-value-time handling
             // suppresses earlier winners instead of reviving them.
-            let targets =
-                affected_longhands(&declaration.name, direction, writing_mode).filter(|targets| {
-                    targets.len() != 1
-                        || targets
-                            .first()
-                            .is_none_or(|target| *target != declaration.name)
-                });
-            if let Some(targets) = targets {
-                output.extend(targets.into_iter().map(|target| {
-                    let mut pending = declaration.clone();
-                    pending.name = Cow::Owned(target.to_string());
-                    pending
-                }));
-            } else {
-                output.push(declaration.clone());
-            }
+            output.extend(affected.into_iter().map(|target| {
+                let mut pending = declaration.clone();
+                pending.property = CascadedProperty::Modeled(ModeledProperty::Longhand(target));
+                pending
+            }));
             continue;
         };
         let mut resolved = declaration.clone();
@@ -428,13 +453,18 @@ pub(super) fn declarations_after_variable_substitution_and_shorthand_expansion<'
             // for the normal cascade path. This post-substitution path owns
             // its value so the expanded declarations can outlive `resolved`.
             output.push(CascadedDeclaration {
-                name: Cow::Owned(expanded.name.into_owned()),
+                property: match expanded.property {
+                    CascadedProperty::Modeled(property) => CascadedProperty::Modeled(property),
+                    CascadedProperty::Custom(_) => {
+                        unreachable!("custom properties do not enter shorthand expansion")
+                    }
+                },
                 value: Cow::Owned(expanded.value.into_owned()),
                 origin: declaration.origin,
                 base_url: declaration.base_url,
                 root_url: declaration.root_url,
                 important: declaration.important,
-                layer_order: declaration.layer_order,
+                layer_order: declaration.layer_order.clone(),
                 specificity: declaration.specificity,
                 scope_proximity: declaration.scope_proximity,
                 stylesheet_index: declaration.stylesheet_index,
@@ -458,7 +488,9 @@ pub(super) fn resolve_css_variables(
     if !custom_property_value_is_valid(value) {
         return None;
     }
-    resolve_css_variables_inner(value, custom_properties, &mut Vec::new())
+    resolve_css_variables_inner(value, custom_properties, &mut Vec::new()).map(|value| {
+        crate::css::component_values::trim_css_component_value_edges(&value).to_string()
+    })
 }
 
 /// Returns whether a token stream contains a `var()` function. CSS function
@@ -534,11 +566,13 @@ fn resolve_component_values(
         };
         if is_var {
             // A substituted value is a token stream, not text pasted into the
-            // surrounding source. Whitespace keeps the later property parser
-            // from merging adjacent identifier, number, or dimension tokens.
-            output.push(' ');
+            // surrounding source. A CSS comment is the canonical token
+            // boundary: it prevents re-tokenization from merging adjacent
+            // identifiers, numbers, or dimensions without adding whitespace
+            // semantics to the substituted value.
+            output.push_str("/**/");
             output.push_str(&replacement);
-            output.push(' ');
+            output.push_str("/**/");
         }
         let after_block = parser.position();
         if !is_var {
@@ -559,34 +593,67 @@ fn resolve_var_function(
     if !is_custom_property_name(&name) {
         return None;
     }
-    let has_fallback = if parser.is_exhausted() {
-        false
+    let fallback = if parser.is_exhausted() {
+        None
     } else {
-        matches!(parser.next().ok()?, cssparser::Token::Comma)
+        if !matches!(parser.next().ok()?, cssparser::Token::Comma) {
+            return None;
+        }
+        let start = parser.position();
+        consume_component_values(parser).ok()?;
+        let fallback = parser.slice(start..parser.position()).to_string();
+        Some(fallback)
     };
-    let fallback = has_fallback
-        .then(|| resolve_component_values(parser, custom_properties, stack))
-        .transpose()
-        .ok()
-        .flatten();
-    if has_fallback && fallback.is_none() {
-        return None;
-    }
-    if !parser.is_exhausted() {
-        return None;
-    }
-    if stack.iter().any(|item| item == &name) {
-        return fallback;
-    }
-    if let Some(replacement) = custom_properties.get(&name) {
+
+    // CSS Variables substitutes the fallback only when the referenced
+    // property is guaranteed-invalid. Resolving it eagerly would make an
+    // unselected `var(--missing)` invalidate `var(--defined, var(--missing))`.
+    // The complete value has already passed specified-value-time validation in
+    // `resolve_css_variables`, so consuming the fallback above only preserves
+    // this function's component-value boundary for the enclosing parser.
+    let replacement = if stack.iter().any(|item| item == &name) {
+        None
+    } else if let Some(replacement) = custom_properties.get(&name) {
         stack.push(name);
         let replacement = replacement.substitution_tokens();
         let replacement = resolve_css_variables_inner(&replacement, custom_properties, stack);
         stack.pop();
-        replacement.or(fallback)
+        replacement
     } else {
+        None
+    };
+    replacement.or_else(|| {
         fallback
+            .and_then(|fallback| resolve_css_variables_inner(&fallback, custom_properties, stack))
+    })
+}
+
+/// Consumes a component-value stream without performing variable substitution.
+///
+/// `var()` fallbacks must be parsed immediately so the enclosing function has
+/// a well-defined boundary, but their substitutions are conditional on the
+/// primary custom property's validity.
+fn consume_component_values(parser: &mut Parser<'_, '_>) -> Result<(), ()> {
+    while !parser.is_exhausted() {
+        let token = parser
+            .next_including_whitespace_and_comments()
+            .map_err(|_| ())?;
+        if matches!(
+            token,
+            cssparser::Token::Function(_)
+                | cssparser::Token::ParenthesisBlock
+                | cssparser::Token::SquareBracketBlock
+                | cssparser::Token::CurlyBracketBlock
+        ) {
+            parser
+                .parse_nested_block(|nested| {
+                    consume_component_values(nested)
+                        .map_err(|_| nested.new_custom_error::<(), ()>(()))
+                })
+                .map_err(|_| ())?;
+        }
     }
+    Ok(())
 }
 
 /// Returns decoded custom-property references found in a valid CSS component
@@ -604,6 +671,9 @@ fn collect_css_variable_references(
     references: &mut Vec<String>,
 ) -> Option<()> {
     while let Ok(token) = parser.next_including_whitespace_and_comments() {
+        if token.is_parse_error() {
+            return None;
+        }
         let is_var =
             matches!(token, cssparser::Token::Function(name) if name.eq_ignore_ascii_case("var"));
         let is_block = is_var

@@ -2,6 +2,7 @@ use super::shared::*;
 use super::state::{BlockFlowChildTraversalState, ChildFlowTraversalOutcome};
 use super::*;
 use crate::layout::inline_collect::TextDecorationPropagationContext;
+use std::num::NonZeroUsize;
 
 impl<'a> LayoutBuilder<'a> {
     #[allow(clippy::too_many_arguments)]
@@ -16,6 +17,7 @@ impl<'a> LayoutBuilder<'a> {
         applied_start_margin: LayoutLength,
         clearance_consumed_adjoining_start_margin: bool,
         starts_at_page_top: bool,
+        has_preceding_inline_flow_content: bool,
         traversal_state: &mut BlockFlowChildTraversalState,
     ) -> ChildFlowTraversalOutcome {
         let mut collapsed_end_margin = false;
@@ -24,6 +26,14 @@ impl<'a> LayoutBuilder<'a> {
         let mut previous_flow_bottom_margin = None;
         let mut seen_flow_child = false;
         let mut trim_block_start_adjoining_margins = style.margin_trim.block_start;
+        // Direct inline content is laid out before this DOM fallback traversal.
+        // A following block child can receive the ancestor pseudo only when
+        // that earlier source did not provide its first formatted line.
+        // <https://drafts.csswg.org/css-pseudo-4/#first-line-pseudo>
+        let mut first_formatted_line = FirstFormattedLineState::for_style(style);
+        if has_preceding_inline_flow_content {
+            first_formatted_line.consume_next_formatted_line();
+        }
         let sibling_tags = element_sibling_signature_list(element);
         let text_box_line_trim = self.effective_text_box_line_trim_for_style(style);
         let text_box_trim_start_child = text_box_line_trim
@@ -61,6 +71,16 @@ impl<'a> LayoutBuilder<'a> {
         let mut replaying_adjoining_until: Option<usize> = None;
         let mut child_node_index = 0usize;
         while child_node_index < element.children.len() {
+            if traversal_state.has_reached_discard_region_limit(self.pages.len()) {
+                let child_count = NonZeroUsize::new(child_node_index);
+                debug_assert!(child_count.is_some(), "a local region break retains source");
+                if let Some(child_count) = child_count {
+                    traversal_state.capture_discard_source_prefix(child_count);
+                } else {
+                    traversal_state.mark_local_continuation_cutoff();
+                }
+                break;
+            }
             let replaying_adjoining_target = if replaying_adjoining_until == Some(child_node_index)
             {
                 replaying_adjoining_until = None;
@@ -115,6 +135,19 @@ impl<'a> LayoutBuilder<'a> {
             // <https://drafts.csswg.org/css-text-decor-4/#line-decoration>
             let decoration_context = TextDecorationPropagationContext::from_style(style);
             *child_style = decoration_context.used_child_style(&child_style);
+            // A block container's first formatted line is supplied by the
+            // first line of its first in-flow block child when it has no
+            // preceding inline line of its own. Preserve the originating
+            // pseudo while the child starts its own block formatting context.
+            // <https://drafts.csswg.org/css-pseudo-4/#first-line-pseudo>
+            if first_formatted_line.applies_to_next_inline_run()
+                && style_is_in_normal_flow(&child_style)
+                && child_style.display.is_block_level()
+                && let Some(style_with_originating_pseudos) =
+                    style_with_originating_typographic_pseudos(&child_style, style)
+            {
+                *child_style = style_with_originating_pseudos;
+            }
             // A descendant that consumes the final remaining line must know
             // about later in-flow source before it selects that line. Compute
             // this from the same cascade inputs as the primary traversal so
@@ -147,6 +180,7 @@ impl<'a> LayoutBuilder<'a> {
             if traversal_state.is_exhausted()
                 && (style_is_in_normal_flow(&child_style) || child_style.float != Float::None)
             {
+                traversal_state.capture_forced_discard_before_later_child(child_node_index);
                 // A clamp discards later in-flow source and floats generated
                 // after that source boundary. Positioned descendants remain
                 // eligible because their containing-block placement is
@@ -163,6 +197,25 @@ impl<'a> LayoutBuilder<'a> {
                         has_later_in_flow_child,
                     ),
                 );
+                let border = used_border_widths(&child_style);
+                let source_box_envelope = crate::units::content_box_pt(
+                    (child_style.margin.top
+                        + child_style.margin.bottom
+                        + child_style.padding.top
+                        + child_style.padding.bottom
+                        + border.top
+                        + border.bottom)
+                        .max(0.0),
+                );
+                BlockFlowChildTraversalState::reserve_automatic_child_non_content(
+                    &mut child_style,
+                    source_box_envelope,
+                );
+                if has_later_in_flow_child && source_box_envelope.points() > 0.01 {
+                    BlockFlowChildTraversalState::require_automatic_terminal_marker_when_full(
+                        &mut child_style,
+                    );
+                }
             }
             // A following block sibling establishes a clamp point *after*
             // this child; it is not inline overflow inside the child. Passing
@@ -341,7 +394,7 @@ impl<'a> LayoutBuilder<'a> {
                     child_element,
                     &child_style,
                     UsedEdges::from_css_edges(used_border_widths(&child_style)),
-                    has_direct_inline_content_dom_with_font_metrics(
+                    has_direct_inline_content_before_first_flow_child_dom_with_font_metrics(
                         child_element,
                         &child_style,
                         stylesheets,
@@ -437,6 +490,7 @@ impl<'a> LayoutBuilder<'a> {
 
             let mut collapses_with_parent_end = false;
             let mut adjoining_start_margin_paint_offset = None;
+            let mut inherited_adjoining_start_margin = None;
             if is_flow_child {
                 let collapses_with_parent = is_collapsible_block_child(child_element, &child_style);
                 let collapses_with_sibling =
@@ -446,6 +500,7 @@ impl<'a> LayoutBuilder<'a> {
                     && can_collapse_start_margin
                     && collapses_with_parent;
                 if adjoins_parent_start {
+                    inherited_adjoining_start_margin = Some(adjoining_start_margin.value());
                     if let Some(previous_margin) = previous_flow_bottom_margin {
                         // Keep the parent's applied start margin in the
                         // collapsed set when a self-collapsing sibling has
@@ -504,38 +559,52 @@ impl<'a> LayoutBuilder<'a> {
             if is_flow_child {
                 preserve_adjusted_block_margins(&mut child_style);
             }
+            if child_shares_clamp_context
+                && let Some(Node {
+                    kind: NodeKind::Element(next),
+                    ..
+                }) = element.children.get(child_node_index + 1)
+            {
+                let next_signature = ElementSignature::with_sibling_list(
+                    next.tag.clone(),
+                    next.attrs.clone(),
+                    element_index,
+                    sibling_tags.clone(),
+                );
+                let next_style = self.style_for_layout_element_with_parent_font_metrics(
+                    next,
+                    next_signature,
+                    stylesheets,
+                    Some(style),
+                );
+                if style_is_in_normal_flow(&next_style) {
+                    let next_border = used_border_widths(&next_style);
+                    let next_non_content = crate::units::content_box_pt(
+                        (next_style.margin.top
+                            + next_style.margin.bottom
+                            + next_style.padding.top
+                            + next_style.padding.bottom
+                            + next_border.top
+                            + next_border.bottom)
+                            .max(0.0),
+                    );
+                    if next_non_content.points() > 0.01 {
+                        BlockFlowChildTraversalState::reserve_automatic_child_non_content(
+                            &mut child_style,
+                            next_non_content,
+                        );
+                        BlockFlowChildTraversalState::require_automatic_terminal_marker_when_full(
+                            &mut child_style,
+                        );
+                    }
+                }
+            }
 
             let available_outer_width = (self.content_right
                 - self.content_left
                 - child_style.margin.left
                 - child_style.margin.right)
                 .max(child_style.font_size);
-            let avoid_run_starts_on_empty_page = fragmentainer_kind == FragmentainerKind::Page
-                && avoid_run_candidate
-                    .as_ref()
-                    .is_some_and(AvoidBreakRunCandidate::starts_on_empty_page);
-            // The estimate is only consumed to move or extend a contiguous
-            // `break-inside: avoid` run.  Measuring every ordinary child
-            // here duplicates expensive table row layout before the real
-            // fragmenting pass has selected a page. A table cell's replay
-            // suppresses descendant fragmentation entirely, so its result
-            // cannot consume this estimate at all.
-            // <https://www.w3.org/TR/css-break-3/#break-between>
-            let child_estimated_height = ((avoid_run_start_decision.is_avoid_boundary
-                || avoid_run_start_decision.seeds_later_avoid_boundary)
-                && !self.cursor_is_at_page_top()
-                && self.fragmentation_suppression_depth == 0
-                && !avoid_run_starts_on_empty_page)
-                .then(|| {
-                    self.estimate_element_height(
-                        child_element,
-                        &child_style,
-                        stylesheets,
-                        available_outer_width,
-                        None,
-                    )
-                })
-                .flatten();
             let mut run_start_candidate = if is_flow_child {
                 if avoid_run_start_decision.is_avoid_boundary {
                     Some(avoid_run_candidate.take().unwrap_or_else(|| {
@@ -553,19 +622,53 @@ impl<'a> LayoutBuilder<'a> {
             } else {
                 None
             };
+            let avoid_run_retry_context =
+                run_start_candidate
+                    .as_ref()
+                    .map(|candidate| AvoidRunRetryContext {
+                        current_fragmentainer: self.fragmentainer_from_page_cursor(
+                            PageTopBlockPosition::new(self.cursor_y),
+                        ),
+                        empty_destination_fragmentainer: self
+                            .next_empty_fragmentainer(fragmentainer_kind),
+                        source_occupancy: candidate.source_fragmentainer_occupancy(),
+                    });
+            // The estimate is only consumed to move or extend a contiguous
+            // `break-inside: avoid` run. Measuring every ordinary child here
+            // duplicates expensive table row layout before the real
+            // fragmenting pass has selected a destination. An empty source
+            // probes only when that destination is strictly larger, so equal
+            // temporary columns relax the avoid preference instead of
+            // replaying forever.
+            // <https://www.w3.org/TR/css-break-3/#break-between>
+            let child_estimated_height = ((avoid_run_start_decision.is_avoid_boundary
+                || avoid_run_start_decision.seeds_later_avoid_boundary)
+                && !self.cursor_is_at_page_top()
+                && self.fragmentation_suppression_depth == 0
+                && avoid_run_retry_context.is_some_and(AvoidRunRetryContext::can_advance))
+            .then(|| {
+                self.estimate_element_height(
+                    child_element,
+                    &child_style,
+                    stylesheets,
+                    available_outer_width,
+                    None,
+                )
+            })
+            .flatten();
             if is_flow_child
                 && avoid_run_start_decision.is_avoid_boundary
                 && let Some(child_height) = child_estimated_height
+                && let Some(retry_context) = avoid_run_retry_context
                 && let Some(candidate) = run_start_candidate.as_ref()
-                && should_move_avoid_break_run_to_next_fragmentainer(
-                    candidate.height(),
-                    child_height.min(
+                && should_move_avoid_break_run_to_next_fragmentainer(AvoidRunPrebreakInput {
+                    run_height: candidate.height(),
+                    next_height: child_height.min(
                         child_style.margin.top
-                            + child_style.line_height * child_style.orphans.max(1) as f32,
+                            + child_style.line_height * child_style.orphans.get() as f32,
                     ),
-                    self.fragmentainer_from_page_cursor(PageTopBlockPosition::new(self.cursor_y)),
-                    avoid_run_starts_on_empty_page,
-                )
+                    retry_context,
+                })
             {
                 let run_start_candidate = run_start_candidate
                     .take()
@@ -592,7 +695,18 @@ impl<'a> LayoutBuilder<'a> {
                 child_node_index = index;
                 avoid_run_candidate = None;
                 previous_break_after = PageBreak::Auto;
-                self.push_page_if_nonempty();
+                // A retry from an empty source is permitted only when the
+                // destination fragmentainer is larger. Restoring that source
+                // also restores its empty temporary fragmentainer, so the ordinary
+                // conditional transition would be a no-op and re-run the
+                // exact same avoid boundary forever. Materialize the larger
+                // destination fragmentainer before replaying the run.
+                // <https://www.w3.org/TR/css-break-3/#breaking-rules>
+                if retry_context.source_occupancy == AvoidRunSourceFragmentainerOccupancy::Empty {
+                    self.push_page();
+                } else {
+                    self.push_page_if_nonempty();
+                }
                 continue;
             }
 
@@ -672,6 +786,10 @@ impl<'a> LayoutBuilder<'a> {
             if is_flow_child {
                 if !self_collapsing_child {
                     seen_flow_child = true;
+                    // The child has been entered as the first in-flow block
+                    // source. Its own line selection owns the propagated
+                    // pseudo, so later siblings must not restart it.
+                    first_formatted_line.consume_next_formatted_line();
                 }
                 if trim_block_start_adjoining_margins && !self_collapsing_child {
                     trim_block_start_adjoining_margins = false;
@@ -691,6 +809,13 @@ impl<'a> LayoutBuilder<'a> {
                 element_layout_kind(child_element, &child_style),
                 ElementLayoutKind::BlockFlow
             );
+            // This snapshot is taken after the parent has resolved sibling
+            // margins and clearance, immediately before the child enters its
+            // own formatting context. The automatic controller consumes the
+            // child's actual normal-flow block advance, not paint bounds or
+            // an out-of-flow descendant's extent.
+            let automatic_child_flow_start =
+                (is_flow_child && child_shares_clamp_context).then_some(self.cursor_y);
             let clearance_count_before_child = self.applied_clearance_count;
             self.last_block_layout_outcome = BlockLayoutOutcome::default();
             if child_style.display.is_block_level() {
@@ -702,11 +827,17 @@ impl<'a> LayoutBuilder<'a> {
                     } else {
                         None
                     };
+                if let Some(margin) = inherited_adjoining_start_margin {
+                    self.inherited_adjoining_start_margins.push(margin);
+                }
                 self.push_ancestor_signature(child_signature);
                 self.with_text_box_line_trim_scope(child_text_box_line_trim, |layout| {
                     layout.layout_element(child_element, &child_style, stylesheets);
                 });
                 self.ancestors.pop();
+                if inherited_adjoining_start_margin.is_some() {
+                    self.inherited_adjoining_start_margins.pop();
+                }
                 if let Some(previous) = previous_block_static_position_y_offset {
                     self.block_static_position_y_offset = previous;
                 }
@@ -774,10 +905,23 @@ impl<'a> LayoutBuilder<'a> {
                     previous_child_page_end = Some(values.end);
                 }
                 if child_uses_block_layout && child_shares_clamp_context {
+                    if let Some(child_flow_start) = automatic_child_flow_start {
+                        traversal_state.debit_automatic_block_contribution(
+                            crate::units::content_box_pt(
+                                (child_flow_start - self.cursor_y).max(0.0),
+                            ),
+                        );
+                    }
                     traversal_state.record_descendant_clamp_line_slots(
                         self.last_block_layout_outcome.clamp_line_slots,
                     );
-                    traversal_state.debit(self.last_block_layout_outcome.clamp_line_slots);
+                    traversal_state
+                        .debit_rendered_slots(self.last_block_layout_outcome.clamp_line_slots);
+                    if traversal_state.has_active_clamp()
+                        && self.last_block_layout_outcome.has_local_continuation_cutoff
+                    {
+                        traversal_state.mark_local_continuation_cutoff();
+                    }
                 }
             }
             avoid_run_candidate = if avoid_run_start_decision.seeds_later_avoid_boundary {

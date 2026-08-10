@@ -7,6 +7,18 @@ pub(super) struct GridItemEstimate {
     /// at the Grid adapter boundary.
     pub(super) metrics: IntrinsicItemMetrics,
     pub(super) swaps_physical_axes: bool,
+    /// Replaced items retain their physical automatic used size separately
+    /// from their Grid intrinsic contribution. A `minmax(auto, 0)` track can
+    /// suppress the latter without changing the former.
+    pub(super) replaced_used_size: Option<ReplacedGridItemUsedSize>,
+}
+
+/// Physical content-box geometry retained for Grid's final replaced-item
+/// sizing phase.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ReplacedGridItemUsedSize {
+    pub(super) width: PhysicalContentWidth,
+    pub(super) height: PhysicalContentHeight,
 }
 
 /// Intrinsic grid-container geometry needed when Grid itself participates as
@@ -31,6 +43,7 @@ impl GridItemEstimate {
         Self {
             metrics: IntrinsicItemMetrics::fixed(width, height),
             swaps_physical_axes: false,
+            replaced_used_size: None,
         }
     }
 
@@ -45,6 +58,7 @@ impl GridItemEstimate {
         Self {
             metrics: self.metrics.swapped_axes(),
             swaps_physical_axes: false,
+            replaced_used_size: self.replaced_used_size,
         }
     }
 }
@@ -232,6 +246,7 @@ impl<'a> LayoutBuilder<'a> {
     ) -> (f32, f32) {
         let used_style = self.grid_used_style(style);
         let style = used_style.as_computed();
+        let scrollbar_reservation = ScrollbarGutterReservation::static_pdf_overlay();
         let built_child_boxes;
         let child_boxes = if let Some(child_boxes) = child_boxes {
             child_boxes
@@ -292,6 +307,14 @@ impl<'a> LayoutBuilder<'a> {
             estimates: &estimates,
             gap: style.column_gap.clone(),
         });
+        let scrollbar_extent = intrinsic_grid_scrollbar_axis_extent(
+            used_style.as_computed(),
+            axis,
+            scrollbar_reservation,
+        )
+        .points();
+        let min_width = min_width + scrollbar_extent;
+        let max_width = max_width + scrollbar_extent;
         (min_width.max(0.0), max_width.max(min_width).max(0.0))
     }
 }
@@ -307,6 +330,27 @@ enum GridIntrinsicAxis {
     Block,
 }
 
+/// The reserved scrollbar space contributes to the Grid container's
+/// intrinsic size in the corresponding logical axis.  The reservation itself
+/// remains physical because CSS overflow longhands are physical.
+/// <https://drafts.csswg.org/css-overflow-3/#scrollbars-layout>
+fn intrinsic_grid_scrollbar_axis_extent(
+    style: &ComputedStyle,
+    axis: GridIntrinsicAxis,
+    reservation: ScrollbarGutterReservation,
+) -> LayoutLength {
+    let inline_is_physical_horizontal =
+        !WritingModeAxes::new(style.writing_mode, style.used_direction()).swaps_physical_axes();
+    match (axis, inline_is_physical_horizontal) {
+        (GridIntrinsicAxis::Inline, true) | (GridIntrinsicAxis::Block, false) => {
+            reservation.horizontal_extent()
+        }
+        (GridIntrinsicAxis::Inline, false) | (GridIntrinsicAxis::Block, true) => {
+            reservation.vertical_extent()
+        }
+    }
+}
+
 impl GridItemEstimate {
     /// Present this item's logical block measurements as the intrinsic
     /// track algorithm's logical inline measurements, including the item's
@@ -320,6 +364,7 @@ impl GridItemEstimate {
         Self {
             metrics,
             swaps_physical_axes: false,
+            replaced_used_size: self.replaced_used_size,
         }
     }
 }
@@ -518,7 +563,7 @@ impl<'a> LayoutBuilder<'a> {
                     content_size.width.max(1.0),
                     content_size.height.max(1.0),
                 );
-                return grid_item_estimate_from_intrinsic(
+                let mut estimate = grid_item_estimate_from_intrinsic(
                     style,
                     available_width,
                     inline_basis,
@@ -527,6 +572,11 @@ impl<'a> LayoutBuilder<'a> {
                     inline_size,
                     block_size,
                 );
+                estimate.replaced_used_size = Some(ReplacedGridItemUsedSize {
+                    width: PhysicalContentWidth::new(content_box_pt(content_size.width)),
+                    height: PhysicalContentHeight::new(content_box_pt(content_size.height)),
+                });
+                return estimate;
             }
 
             if replaced_element_kind(element) == Some(ReplacedElementKind::Canvas) {
@@ -545,7 +595,7 @@ impl<'a> LayoutBuilder<'a> {
                     content_size.width.max(1.0),
                     content_size.height.max(1.0),
                 );
-                return grid_item_estimate_from_intrinsic(
+                let mut estimate = grid_item_estimate_from_intrinsic(
                     style,
                     available_width,
                     inline_basis,
@@ -554,6 +604,11 @@ impl<'a> LayoutBuilder<'a> {
                     inline_size,
                     block_size,
                 );
+                estimate.replaced_used_size = Some(ReplacedGridItemUsedSize {
+                    width: PhysicalContentWidth::new(content_box_pt(content_size.width)),
+                    height: PhysicalContentHeight::new(content_box_pt(content_size.height)),
+                });
+                return estimate;
             }
 
             if replaced_element_kind(element) == Some(ReplacedElementKind::Svg)
@@ -571,7 +626,7 @@ impl<'a> LayoutBuilder<'a> {
                 let height = svg.content_size.height;
                 let (inline_size, block_size) =
                     grid_item_logical_sizes_from_physical(style, width.max(1.0), height.max(1.0));
-                return grid_item_estimate_from_intrinsic(
+                let mut estimate = grid_item_estimate_from_intrinsic(
                     style,
                     available_width,
                     inline_basis,
@@ -580,6 +635,11 @@ impl<'a> LayoutBuilder<'a> {
                     inline_size,
                     block_size,
                 );
+                estimate.replaced_used_size = Some(ReplacedGridItemUsedSize {
+                    width: PhysicalContentWidth::new(content_box_pt(width)),
+                    height: PhysicalContentHeight::new(content_box_pt(height)),
+                });
+                return estimate;
             }
 
             if style.display.inner == DisplayInner::Grid
@@ -651,7 +711,29 @@ impl<'a> LayoutBuilder<'a> {
                     } else {
                         grid_children.as_slice()
                     };
-                if let Some(grid_layout) = layout.compute_grid_layout(
+                // A subgrid has no independent contribution in its inherited
+                // axis, but its standalone axis is still an ordinary grid
+                // axis.  In particular, it cannot borrow an unresolved
+                // `subgrid` layout pass to discover that standalone axis:
+                // the parent-track context exists only after placement.
+                // Measure that axis directly from the grid's own tracks.
+                // <https://drafts.csswg.org/css-grid-2/#subgrids>
+                let standalone_block_size = matches!(
+                    style.grid_template_columns,
+                    css::GridTrackList::Subgrid { .. }
+                )
+                .then(|| {
+                    layout
+                        .estimate_grid_intrinsic_block_sizes(
+                            element,
+                            style,
+                            stylesheets,
+                            available_width,
+                            Some(child_boxes),
+                        )
+                        .1
+                });
+                let grid_layout = layout.compute_grid_layout(
                     style,
                     intrinsic_grid_children,
                     stylesheets,
@@ -659,21 +741,24 @@ impl<'a> LayoutBuilder<'a> {
                     definite_content_height
                         .map(|height| PhysicalContentHeight::new(content_box_pt(height))),
                     GridLayoutPurpose::IntrinsicProbe,
-                ) {
-                    let content_height = constrain_grid_intrinsic_height(
-                        style,
-                        grid_layout.height.points(),
-                        block_basis,
-                    );
-                    let mut estimate = grid_item_estimate_from_intrinsic(
-                        style,
-                        available_width,
-                        inline_basis,
-                        block_basis,
-                        grid_min,
-                        grid_max,
-                        content_height,
-                    );
+                );
+                let content_height = standalone_block_size.unwrap_or_else(|| {
+                    grid_layout
+                        .as_ref()
+                        .map_or(0.0, |layout| layout.height.points())
+                });
+                let content_height =
+                    constrain_grid_intrinsic_height(style, content_height, block_basis);
+                let mut estimate = grid_item_estimate_from_intrinsic(
+                    style,
+                    available_width,
+                    inline_basis,
+                    block_basis,
+                    grid_min,
+                    grid_max,
+                    content_height,
+                );
+                if let Some(grid_layout) = grid_layout {
                     let baseline_offset =
                         (intrinsic_metrics.border.top + intrinsic_metrics.padding.top).points();
                     estimate.first_baseline = grid_layout
@@ -682,8 +767,22 @@ impl<'a> LayoutBuilder<'a> {
                     estimate.last_baseline = grid_layout
                         .last_baseline
                         .map(|baseline| baseline_offset + baseline);
-                    return estimate;
+                    // An unresolved inherited row axis has no independent
+                    // zero-distance first baseline. Its final shared row
+                    // supplies the stretch, while the empty standalone
+                    // formatting context still synthesizes its first inline
+                    // baseline from the used line height.
+                    // <https://drafts.csswg.org/css-grid-2/#subgrids>
+                    // <https://drafts.csswg.org/css-align-3/#synthesize-baseline>
+                    if matches!(style.grid_template_rows, css::GridTrackList::Subgrid { .. })
+                        && estimate
+                            .first_baseline
+                            .is_some_and(|baseline| (baseline - baseline_offset).abs() < 0.01)
+                    {
+                        estimate.first_baseline = Some(baseline_offset + style.line_height);
+                    }
                 }
+                return estimate;
             }
 
             let inline_measurement = layout.intrinsic_inline_measurement_for_element(
@@ -2383,9 +2482,20 @@ fn grid_item_estimate_from_intrinsic(
     let max_content = max_content.max(min_content).max(0.0);
     let min_content = min_content.max(0.0);
     let content_height = content_height.max(0.0);
-    let specified_width =
+    let intrinsic_metrics = intrinsic_box_metrics(style);
+    let horizontal_non_content = intrinsic_metrics.horizontal_non_content_length();
+    let specified_width = crate::layout::intrinsic::intrinsic_content_box_width_keyword(
+        style.box_values.width.clone(),
+        content_box_pt(min_content),
+        content_box_pt(max_content),
+        layout_pt(available_width),
+        horizontal_non_content,
+    )
+    .map(SemanticLengthExt::points)
+    .or_else(|| {
         used_length_percentage_or_auto_with_basis(style.box_values.width.clone(), inline_basis)
-            .map(|width| width.points());
+            .map(SemanticLengthExt::points)
+    });
     let content_width = specified_width.unwrap_or(max_content);
     // A definite or intrinsic preferred inline size constrains the item's
     // min-content contribution. For example, `width: max-content` makes the
@@ -2433,7 +2543,11 @@ fn grid_item_estimate_from_intrinsic(
                 content_height,
                 block_basis,
             )),
-            content_width: content_box_pt(max_content),
+            // A preferred size constrains both intrinsic contributions.  The
+            // raw max-content width remains relevant only while `width` is
+            // automatic (or percentage-cyclic) in this intrinsic pass.
+            // <https://drafts.csswg.org/css-sizing-3/#intrinsic-contribution>
+            content_width: content_box_pt(content_width),
             content_height: content_box_pt(content_height),
             preferred_aspect_ratio: style.aspect_ratio.preferred_ratio_for_non_replaced(false),
             first_baseline: None,
@@ -2441,6 +2555,7 @@ fn grid_item_estimate_from_intrinsic(
         },
         swaps_physical_axes: WritingModeAxes::new(style.writing_mode, style.direction)
             .swaps_physical_axes(),
+        replaced_used_size: None,
     }
 }
 
@@ -2515,6 +2630,7 @@ pub(super) fn measure_grid_item(
     let estimate = estimate.cloned().unwrap_or(GridItemEstimate {
         metrics: IntrinsicItemMetrics::zero(),
         swaps_physical_axes: false,
+        replaced_used_size: None,
     });
     let estimate = estimate.physical_measurements();
     measure_intrinsic_item_leaf(
@@ -2632,10 +2748,24 @@ mod tests {
     }
 
     #[test]
+    fn replaced_grid_estimate_retains_intrinsic_used_size_across_axis_projection() {
+        let mut estimate = GridItemEstimate::fixed(200.0, 100.0);
+        estimate.replaced_used_size = Some(ReplacedGridItemUsedSize {
+            width: PhysicalContentWidth::new(content_box_pt(200.0)),
+            height: PhysicalContentHeight::new(content_box_pt(100.0)),
+        });
+
+        let projected = estimate.logical_block_contribution(0.0);
+        assert_eq!(projected.replaced_used_size.unwrap().width.points(), 200.0);
+        assert_eq!(projected.replaced_used_size.unwrap().height.points(), 100.0);
+    }
+
+    #[test]
     fn block_track_contribution_swaps_grid_item_intrinsic_axes() {
         let estimate = GridItemEstimate {
             metrics: IntrinsicItemMetrics::fixed(40.0, 60.0),
             swaps_physical_axes: true,
+            replaced_used_size: None,
         };
 
         let contribution = estimate.logical_block_contribution(3.0);
@@ -2656,6 +2786,27 @@ mod tests {
             GridPercentageBasis::indefinite(),
             20.0,
             100.0,
+            20.0,
+        );
+
+        assert_eq!(estimate.min_width.points(), 100.0);
+        assert_eq!(estimate.content_width.points(), 100.0);
+    }
+
+    #[test]
+    fn definite_preferred_width_caps_grid_item_max_content_measurement() {
+        let mut style = ComputedStyle::initial();
+        style.box_values.width = css::ComputedLengthPercentageOrAuto::LengthPercentage(
+            css::ComputedLengthPercentage::from_points(100.0),
+        );
+
+        let estimate = grid_item_estimate_from_intrinsic(
+            &style,
+            300.0,
+            GridPercentageBasis::indefinite(),
+            GridPercentageBasis::indefinite(),
+            20.0,
+            200.0,
             20.0,
         );
 
@@ -2953,6 +3104,7 @@ mod tests {
                 last_baseline: None,
             },
             swaps_physical_axes: false,
+            replaced_used_size: None,
         };
 
         let min_content = measure_grid_item(
@@ -3013,6 +3165,7 @@ mod tests {
                 last_baseline: None,
             },
             swaps_physical_axes: true,
+            replaced_used_size: None,
         };
 
         let max_content = measure_grid_item(
@@ -3055,6 +3208,30 @@ mod tests {
         assert_eq!(
             expanded.line_names,
             vec![Vec::<String>::new(), vec!["end".to_string()]]
+        );
+    }
+
+    #[test]
+    fn intrinsic_scrollbar_contribution_follows_logical_axis_in_vertical_grid() {
+        let mut style = ComputedStyle::initial();
+        style.writing_mode = WritingMode::VerticalLr;
+        style.overflow_x = css::Overflow::Scroll;
+        let reservation = ScrollbarGutterReservation::for_style(
+            &style,
+            UsedOverflowAxes::from_style(&style),
+            false,
+            false,
+        );
+
+        assert_eq!(
+            intrinsic_grid_scrollbar_axis_extent(&style, GridIntrinsicAxis::Inline, reservation)
+                .points(),
+            15.0 * css::CSS_PX_TO_PT,
+        );
+        assert_eq!(
+            intrinsic_grid_scrollbar_axis_extent(&style, GridIntrinsicAxis::Block, reservation)
+                .points(),
+            0.0,
         );
     }
 }

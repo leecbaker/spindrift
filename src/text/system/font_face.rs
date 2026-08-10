@@ -13,7 +13,7 @@ impl FontSystem {
                 .iter()
                 .find_map(|family| self.resolve_font_family(family, weight, style, width));
         }
-        let FontFamily::Names(names) = family else {
+        let FontFamily::Named(name) = family else {
             return self.resolve_generic_family(family, weight, style, width);
         };
         let cache_key = FontRequest::from_family(family, weight, style, width);
@@ -21,48 +21,47 @@ impl FontSystem {
             return Some(*id);
         }
 
-        for name in names {
-            log::trace!(
-                "resolving CSS font-family name {} weight={} style={:?} width={}",
-                name,
-                weight.0,
-                style,
-                width.0
-            );
-            if let Some(family) = standard_ui_family_alias(name)
-                && let Some(id) = self.resolve_generic_family(&family, weight, style, width)
-            {
-                self.family_cache.insert(cache_key, id);
-                return Some(id);
-            }
-            if is_private_standard_ui_family_name(name) {
-                continue;
-            }
-            if let Some(id) = self.load_document_font_for_families(
-                &[FontiqueQueryFamily::Named(fontique_family_name(name))],
-                weight,
-                style,
-                width,
-                None,
-                &FontRequest::single_name(name, weight, style, width),
-            ) {
-                let font = self.document_fonts.get(id)?;
-                log::debug!(
-                    "resolved CSS font-family {} to font {} ({})",
-                    name,
-                    font.family,
-                    font.post_script_name
-                );
-                self.family_cache.insert(cache_key, id);
-                self.family_cache
-                    .insert(FontRequest::single_name(name, weight, style, width), id);
-                return Some(id);
-            }
-            log::trace!(
-                "CSS font-family name {} did not resolve to a document/system font candidate",
-                name
-            );
+        let name = name.as_str();
+        log::trace!(
+            "resolving CSS font-family name {} weight={} style={:?} width={}",
+            name,
+            weight.0,
+            style,
+            width.0
+        );
+        if let Some(family) = standard_ui_family_alias(name)
+            && let Some(id) = self.resolve_generic_family(&family, weight, style, width)
+        {
+            self.family_cache.insert(cache_key, id);
+            return Some(id);
         }
+        if is_private_standard_ui_family_name(name) {
+            return None;
+        }
+        if let Some(id) = self.load_document_font_for_families(
+            &[FontiqueQueryFamily::Named(fontique_family_name(name))],
+            weight,
+            style,
+            width,
+            None,
+            &FontRequest::single_name(name, weight, style, width),
+        ) {
+            let font = self.document_fonts.get(id)?;
+            log::debug!(
+                "resolved CSS font-family {} to font {} ({})",
+                name,
+                font.family,
+                font.post_script_name
+            );
+            self.family_cache.insert(cache_key, id);
+            self.family_cache
+                .insert(FontRequest::single_name(name, weight, style, width), id);
+            return Some(id);
+        }
+        log::trace!(
+            "CSS font-family name {} did not resolve to a document/system font candidate",
+            name
+        );
 
         log::trace!("CSS font-family {:?} did not resolve", family);
         None

@@ -64,9 +64,25 @@ async fn positioned_children_preserve_adjoining_block_sibling_margin_collapsing(
 /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
 #[tokio::test]
 async fn root_auto_height_flow_uses_in_flow_endpoint_after_near_page_end_flex() {
-    for (spacer_height, expected_pages) in [(58, 1), (62, 2)] {
-        let document = Html::from_string(format!(
-            "<style>\
+    for (positioned_source_order, in_flow_source) in [
+        (
+            "before the in-flow sequence",
+            "<span class=\"logo\">Logo</span>\
+             <div class=\"spacer\"></div>\
+             <div class=\"sponsors\"><span>Sponsor</span></div>\
+             <p>Address</p>",
+        ),
+        (
+            "between the in-flow block siblings",
+            "<div class=\"spacer\"></div>\
+             <span class=\"logo\">Logo</span>\
+             <div class=\"sponsors\"><span>Sponsor</span></div>\
+             <p>Address</p>",
+        ),
+    ] {
+        for (spacer_height, expected_pages) in [(58, 1), (62, 2)] {
+            let document = Html::from_string(format!(
+                "<style>\
              @page {{ size: 160pt 100pt; margin: 10pt }}\
              html, body, p, div {{ margin: 0; font: 10pt/10pt sans-serif }}\
              .logo {{ position: absolute }}\
@@ -74,25 +90,27 @@ async fn root_auto_height_flow_uses_in_flow_endpoint_after_near_page_end_flex() 
              .sponsors {{ display: flex; height: 10pt }}\
              .sponsors > span {{ display: inline-block; height: 10pt }}\
              </style>\
-             <span class=\"logo\">Logo</span>\
-             <div class=\"spacer\"></div>\
-             <div class=\"sponsors\"><span>Sponsor</span></div>\
-             <p>Address</p>"
-        ))
-        .render(&RenderOptions::default())
-        .await
-        .unwrap();
+             {in_flow_source}"
+            ))
+            .render(&RenderOptions::default())
+            .await
+            .unwrap();
 
-        assert_eq!(
-            document.pages.len(),
-            expected_pages,
-            "spacer height {spacer_height}pt produced unexpected pages"
-        );
-        let address_page = document
-            .pages
-            .iter()
-            .position(|page| page_has_line(page, "Address"));
-        assert_eq!(address_page, Some(expected_pages - 1));
+            assert_eq!(
+                document.pages.len(),
+                expected_pages,
+                "{positioned_source_order}, spacer height {spacer_height}pt produced unexpected pages"
+            );
+            let address_page = document
+                .pages
+                .iter()
+                .position(|page| page_has_line(page, "Address"));
+            assert_eq!(
+                address_page,
+                Some(expected_pages - 1),
+                "{positioned_source_order}, spacer height {spacer_height}pt"
+            );
+        }
     }
 }
 
@@ -167,6 +185,36 @@ async fn layout_containment_captures_nested_fixed_descendant() {
     assert!((green.width() - 60.0).abs() < 0.01, "{green:?}");
 }
 
+/// A non-scrollable ancestor clip bounds static PDF paint before positioned
+/// scratch fragmentation allocates anonymous multicolumn pages. The complete
+/// authored extent still participates in logical fragmentation, but it must
+/// not turn a clipped million-pixel tail into a million-page payload.
+/// <https://drafts.csswg.org/css-position/#abspos-breaking>
+/// <https://drafts.csswg.org/css-overflow-3/#valdef-overflow-clip>
+#[tokio::test]
+async fn clipped_positioned_multicolumn_tail_does_not_materialize_pages() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200px 200px; margin: 0 }\
+         html, body { margin: 0 }\
+         .columns { columns: 3; column-gap: 20px; column-fill: auto; height: 100px; width: 100px }\
+         .clip { overflow: clip }\
+         .relative { position: relative; height: 300px }\
+         .absolute { position: absolute; width: 100%; height: 1000000px; background: green }\
+         </style>\
+         <div class=\"columns\"><div class=\"clip\"><div class=\"relative\"><div class=\"absolute\"></div></div></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(
+        document.pages.len(),
+        1,
+        "a clipped positioned tail must not materialize destination pages"
+    );
+}
+
 #[tokio::test]
 async fn supports_absolute_positioned_blocks() {
     let options = RenderOptions::default();
@@ -194,7 +242,7 @@ async fn supports_absolute_positioned_blocks() {
 
     assert_eq!(flow.text, "Flow");
     assert_eq!(abs.text, "Abs");
-    assert_eq!(abs.x(), options.page_margins.left() + 20.0);
+    assert_eq!(abs.x(), crate::layout::PageMargins::DEFAULT.left() + 20.0);
     assert_line_baseline_at_top(
         &document,
         abs,
@@ -202,7 +250,7 @@ async fn supports_absolute_positioned_blocks() {
         // `top`; its first line box starts at the content edge. The line
         // height's leading expands that line box rather than moving the
         // positioned box above its used inset.
-        options.page_size.height() - options.page_margins.top() - 30.0,
+        options.page_size.height() - crate::layout::PageMargins::DEFAULT.top() - 30.0,
     );
     assert_eq!(after.text, "After");
     assert!(after.y() < flow.y());
@@ -1631,6 +1679,65 @@ async fn positions_absolute_children_against_relative_containing_blocks() {
     assert!((blue.width() - 50.0).abs() < 0.01);
 }
 
+/// A marker-only positioned inline still owns a CSS Inline phantom line.  The
+/// line has no in-flow height, but its edge markers must replay explicitly
+/// inset absolute descendants exactly once.
+/// <https://drafts.csswg.org/css-inline-3/#phantom-line-boxes>
+/// <https://drafts.csswg.org/css-position-3/#def-cb>
+#[tokio::test]
+async fn positioned_descendant_of_phantom_inline_line_replays_without_flow_effects() {
+    let render = |line_height: &str| {
+        Html::from_string(format!(
+            "<style>\
+             @page {{ size: 240px 160px; margin: 0 }}\
+             html, body, div {{ margin: 0; padding: 0 }}\
+             body {{ font: 16px/16px sans-serif }}\
+             .parent {{ position: relative; line-height: {line_height} }}\
+             .abs {{ position: absolute; inset: 0 auto auto 0; width: 20px; height: 20px; background: rgb(0, 128, 0) }}\
+             </style>\
+             <div>Before</div><div><span class=\"parent\"><span class=\"abs\"></span></span></div><div>After</div>"
+        ))
+    };
+    let ordinary = render("16px")
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+    let inflated = render("100px")
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+    let green = CssColor::new(0, 128, 0);
+    let positioned_rect = |document: &quire::Document| {
+        let rects = document.pages[0]
+            .rects()
+            .iter()
+            .filter(|rect| rect.fill == Some(green))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rects.len(),
+            1,
+            "phantom edge must replay one abspos layer: {rects:?}"
+        );
+        rects[0].clone()
+    };
+    let after_y = |document: &quire::Document| {
+        document.pages[0]
+            .lines()
+            .iter()
+            .find(|line| line.text == "After")
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing following in-flow line: {:?}",
+                    document.pages[0].lines()
+                )
+            })
+            .y()
+    };
+
+    assert_eq!(positioned_rect(&ordinary), positioned_rect(&inflated));
+    assert_eq!(after_y(&ordinary), after_y(&inflated));
+}
+
 #[tokio::test]
 async fn transformed_block_establishes_containing_block_for_absolute_child() {
     let document = Html::from_string(
@@ -2026,6 +2133,25 @@ async fn collapses_first_descendant_top_margin_through_transparent_wrappers() {
     assert_eq!(
         wrapped.pages[0].lines()[0].y(),
         direct.pages[0].lines()[0].y()
+    );
+}
+
+#[tokio::test]
+async fn document_canvas_margin_collapses_through_transparent_wrapper() {
+    let style = "<style>p { margin: 1em 0; font-size: 10pt; line-height: 10pt }</style>";
+    let direct = Html::from_string(format!("{style}<p>Text</p>"))
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+    let wrapped = Html::from_string(format!("{style}<div><p>Text</p></div>"))
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        wrapped.pages[0].lines()[0].y(),
+        direct.pages[0].lines()[0].y(),
+        "a transparent wrapper must not apply the document canvas's body inset a second time"
     );
 }
 
@@ -2753,7 +2879,7 @@ async fn viewport_fixed_replays_over_absolute_spans_regardless_of_source_order()
         .unwrap();
 
         assert_eq!(document.pages.len(), 3, "{case}");
-        for page in &document.pages {
+        for (page_index, page) in document.pages.iter().enumerate() {
             assert_eq!(
                 page.lines()
                     .iter()
@@ -2761,6 +2887,69 @@ async fn viewport_fixed_replays_over_absolute_spans_regardless_of_source_order()
                     .count(),
                 1,
                 "{case}: {page:?}"
+            );
+            assert_eq!(
+                page.lines()
+                    .iter()
+                    .filter(|line| line.text == "span")
+                    .count(),
+                usize::from(page_index == 0),
+                "{case}: the absolute principal must be committed once on its source page: {page:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn static_absolute_page_span_paint_is_not_committed_twice_with_fixed_layers() {
+    for (case, positioned_rules, body) in [
+        (
+            "fixed sibling (fixedpos-001)",
+            ".span { position: absolute; height: 300vh }",
+            "<div class=\"fixed\">fixed</div><div class=\"span\">principal</div>",
+        ),
+        (
+            "fixed descendant (fixedpos-002)",
+            ".span { position: absolute; height: 300vh }",
+            "<div class=\"span\">principal<div class=\"fixed\">fixed</div></div>",
+        ),
+        (
+            "nested absolute and fixed descendants (fixedpos-004)",
+            ".span { position: absolute } .nested { position: absolute; top: 0; height: 300vh }",
+            "<div class=\"fixed outer\">outer</div><div class=\"span\">principal<div class=\"nested\"><div class=\"fixed\">fixed</div></div></div>",
+        ),
+    ] {
+        let document = Html::from_string(format!(
+            "<style>\
+             @page {{ size: 100px; margin: 0 }}\
+             html, body, div {{ margin: 0; font: 10px/10px sans-serif }}\
+             .fixed {{ position: fixed; bottom: 0 }}\
+             .outer {{ bottom: 2em }}\
+             {positioned_rules}\
+             </style>{body}"
+        ))
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+
+        assert_eq!(document.pages.len(), 3, "{case}");
+        assert_eq!(
+            document.pages[0]
+                .lines()
+                .iter()
+                .filter(|line| line.text == "principal")
+                .count(),
+            1,
+            "{case}: the static-positioned absolute principal must paint once"
+        );
+        for page in &document.pages {
+            assert_eq!(
+                page.lines()
+                    .iter()
+                    .filter(|line| line.text == "fixed")
+                    .count(),
+                1,
+                "{case}: fixed descendant must replay once: {page:?}"
             );
         }
     }
@@ -5084,6 +5273,43 @@ async fn positioned_negative_z_index_paints_before_normal_flow() {
 }
 
 #[tokio::test]
+async fn root_stacking_context_orders_background_negative_flow_auto_and_positive_bands() {
+    let document = Html::from_string(
+        "<style>@page { size: 120pt 120pt; margin: 0 } \
+         html { border: 10pt solid red } body { margin: 0 } \
+         .box { width: 30pt; height: 30pt; margin-top: -30pt } \
+         .negative { position: relative; z-index: -1; background: green } \
+         .flow { margin-top: 0; background: blue } \
+         .auto { position: relative; z-index: auto; background: yellow } \
+         .zero { position: relative; z-index: 0; background: cyan } \
+         .positive { position: relative; z-index: 1; background: magenta } \
+         </style><div class=\"box negative\"></div><div class=\"box flow\"></div>\
+         <div class=\"box auto\"></div><div class=\"box zero\"></div>\
+         <div class=\"box positive\"></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = first_rect_paint_operation_index(page, CssColor::new(255, 0, 0));
+    let green = first_rect_paint_operation_index(page, CssColor::new(0, 128, 0));
+    let blue = first_rect_paint_operation_index(page, CssColor::new(0, 0, 255));
+    let yellow = first_rect_paint_operation_index(page, CssColor::new(255, 255, 0));
+    let cyan = first_rect_paint_operation_index(page, CssColor::new(0, 255, 255));
+    let magenta = first_rect_paint_operation_index(page, CssColor::new(255, 0, 255));
+
+    assert!(red < green, "root border must precede negative-z paint");
+    assert!(green < blue, "negative-z paint must precede in-flow paint");
+    assert!(
+        blue < yellow,
+        "in-flow paint must precede auto positioned paint"
+    );
+    assert!(yellow < cyan, "auto paint must precede z-index:0 paint");
+    assert!(cyan < magenta, "zero paint must precede positive-z paint");
+}
+
+#[tokio::test]
 async fn absolute_z_index_auto_does_not_trap_positive_positioned_descendant() {
     let document = Html::from_string(
         "<style>@page { size: 120pt 120pt; margin: 10pt } body, div { margin: 0 } .parent { position: absolute; left: 0; top: 0; width: 30pt; height: 30pt } .child { position: absolute; z-index: 1; left: 0; top: 0; width: 30pt; height: 30pt; background: #00ff00 } .sibling { position: absolute; z-index: 0; left: 0; top: 0; width: 30pt; height: 30pt; background: #ff0000 }</style><div class=\"parent\"><div class=\"child\"></div></div><div class=\"sibling\"></div>",
@@ -5502,18 +5728,18 @@ async fn effect_triggers_trap_positive_positioned_descendants() {
 }
 
 #[tokio::test]
-async fn layout_containment_does_not_trap_positive_positioned_descendants() {
-    // Layout containment establishes an independent formatting context and a
-    // containing block, but unlike paint containment it does not establish a
-    // stacking context. The positive-z-index child therefore remains above
-    // the later z-index:1 sibling.
+async fn layout_containment_traps_positive_positioned_descendants() {
+    // Layout containment establishes an independent formatting context, a
+    // containing block, and a stacking context. The positive-z-index child is
+    // therefore painted atomically with its contained parent before the later
+    // z-index:1 sibling.
     // <https://www.w3.org/TR/css-contain-1/#containment-layout>
     assert_eq!(
         stacking_trigger_paint_order("contain: layout").await,
         vec![
             CssColor::new(0, 0, 255),
-            CssColor::new(255, 0, 0),
             CssColor::new(0, 255, 0),
+            CssColor::new(255, 0, 0),
         ],
     );
 }
@@ -5543,6 +5769,70 @@ async fn opacity_transform_and_overflow_context_writes_pdf_group() {
     assert!(pdf.contains("/Group"));
     assert!(pdf.contains("cm"));
     assert!(pdf.contains("W\nn"));
+}
+
+/// CSS Overflow clips the transformed visual result in the scroll container's
+/// coordinate system; it does not trim the child's pre-transform geometry.
+/// <https://www.w3.org/TR/css-transforms-1/#transform-rendering>
+/// <https://www.w3.org/TR/css-overflow-3/#overflow-clipping>
+#[tokio::test]
+async fn transformed_descendant_retains_owner_overflow_clip() {
+    for overflow in ["auto", "scroll", "hidden", "clip"] {
+        let document = Html::from_string(format!(
+            "<style>@page {{ size: 200pt 100pt; margin: 0 }} html, body {{ margin: 0 }} .owner {{ width: 100pt; height: 50pt; overflow: {overflow} }} .child {{ width: 50pt; height: 50pt; background: blue; transform: translateX(75pt); transform-origin: 0 0 }}</style><div class=\"owner\"><div class=\"child\"></div></div>"
+        ))
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+        let blue = document.pages[0]
+            .rects()
+            .iter()
+            .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
+            .expect("the transformed child must retain its source primitive");
+        assert!(
+            (blue.width() - 50.0).abs() < 0.01 && (blue.height() - 50.0).abs() < 0.01,
+            "{overflow} must not trim the child before its transform: {blue:?}"
+        );
+
+        let pdf = Html::from_string(format!(
+            "<style>@page {{ size: 200pt 100pt; margin: 0 }} html, body {{ margin: 0 }} .owner {{ width: 100pt; height: 50pt; overflow: {overflow} }} .child {{ width: 50pt; height: 50pt; background: blue; transform: translateX(75pt); transform-origin: 0 0 }}</style><div class=\"owner\"><div class=\"child\"></div></div>"
+        ))
+        .write_pdf_bytes(&RenderOptions::default(), &crate::PdfOptions::default())
+        .await
+        .unwrap();
+        let rendered = pdf_searchable_text(&pdf);
+        let clip = "0 50 100 50 re\nW\nn";
+        let transform = "1 0 0 1 75 0 cm";
+        let child = "0 50 50 50 re\nf";
+        let clip_at = rendered
+            .find(clip)
+            .unwrap_or_else(|| panic!("{overflow} must retain the owner clip: {rendered}"));
+        let transform_at = rendered
+            .find(transform)
+            .unwrap_or_else(|| panic!("{overflow} must retain the child transform: {rendered}"));
+        let child_at = rendered
+            .find(child)
+            .unwrap_or_else(|| panic!("{overflow} must retain the full child paint: {rendered}"));
+        assert!(
+            clip_at < transform_at && transform_at < child_at,
+            "{overflow} must emit owner clip, child transform, then child paint: {rendered}"
+        );
+        assert!(
+            !rendered.contains("0 50 50 50 re\nW\nn"),
+            "{overflow} must not install a child-source clip: {rendered}"
+        );
+    }
+
+    let visible = Html::from_string(
+        "<style>@page { size: 200pt 100pt; margin: 0 } html, body { margin: 0 } .owner { width: 100pt; height: 50pt; overflow: visible } .child { width: 50pt; height: 50pt; background: blue; transform: translateX(75pt); transform-origin: 0 0 }</style><div class=\"owner\"><div class=\"child\"></div></div>",
+    )
+    .write_pdf_bytes(&RenderOptions::default(), &crate::PdfOptions::default())
+    .await
+    .unwrap();
+    assert!(
+        !pdf_searchable_text(&visible).contains("0 50 100 50 re\nW\nn"),
+        "overflow: visible must not install the owner's overflow clip"
+    );
 }
 
 #[tokio::test]

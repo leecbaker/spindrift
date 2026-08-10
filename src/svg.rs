@@ -19,6 +19,10 @@ use crate::document::paint::paths::{
 };
 use crate::dom::{Element, ElementId, NodeKind};
 use crate::units::{LayoutLength, LayoutSize, SemanticLengthExt, layout_pt};
+use cssparser::{
+    AtRuleParser, CowRcStr, Parser, ParserInput, ParserState, QualifiedRuleParser,
+    StyleSheetParser, Token,
+};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -26,6 +30,39 @@ const SVG_NAMESPACE: &str = "http://www.w3.org/2000/svg";
 const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
 const XLINK_NAMESPACE: &str = "http://www.w3.org/1999/xlink";
 const XMLNS_NAMESPACE: &str = "http://www.w3.org/2000/xmlns/";
+const SVG_IMAGE_ROOT_MARKER_ATTRIBUTE: &str = "data-quire-svg-root";
+
+/// CSS environment inherited by an SVG document embedded as an image.
+///
+/// Media Queries requires a secure animated SVG image to expose the used
+/// color scheme of its embedding element, rather than the outer document's
+/// raw user preference. Keeping this as an image-only context prevents a
+/// parsed SVG variant for a light embedding from being reused in a dark one.
+/// <https://www.w3.org/TR/mediaqueries-5/#prefers-color-scheme>
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct SvgImageContext {
+    used_color_scheme: css::UsedColorScheme,
+}
+
+impl SvgImageContext {
+    pub(crate) const fn from_used_color_scheme(used_color_scheme: css::UsedColorScheme) -> Self {
+        Self { used_color_scheme }
+    }
+
+    fn media_environment(self) -> css::MediaEnvironment {
+        let preference = match self.used_color_scheme {
+            css::UsedColorScheme::Light => css::ColorSchemePreference::Light,
+            css::UsedColorScheme::Dark => css::ColorSchemePreference::Dark,
+        };
+        css::MediaEnvironment::default().with_color_scheme_preference(preference)
+    }
+}
+
+impl Default for SvgImageContext {
+    fn default() -> Self {
+        Self::from_used_color_scheme(css::UsedColorScheme::Light)
+    }
+}
 
 /// SVG-root viewport coordinates in top-left-origin SVG user units.
 ///
@@ -39,6 +76,83 @@ pub(crate) enum SvgSourceSpace {}
 pub(crate) type SvgSourcePoint = euclid::Point2D<f32, SvgSourceSpace>;
 pub(crate) type SvgSourceSize = euclid::Size2D<f32, SvgSourceSpace>;
 pub(crate) type SvgSourceRect = euclid::Rect<f32, SvgSourceSpace>;
+
+/// One SVG element's local user coordinate system.
+///
+/// This is deliberately distinct from the root SVG source viewport and PDF
+/// paint space. A CSS transform reference box and its matrix are evaluated in
+/// this local coordinate system before the SVG scene maps them into the root
+/// viewport:
+/// <https://drafts.csswg.org/css-transforms/#transform-rendering>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SvgElementUserSpace {}
+
+pub(crate) type SvgElementPoint = euclid::Point2D<f32, SvgElementUserSpace>;
+pub(crate) type SvgElementSize = euclid::Size2D<f32, SvgElementUserSpace>;
+pub(crate) type SvgElementRect = euclid::Rect<f32, SvgElementUserSpace>;
+pub(crate) type SvgElementTransform =
+    euclid::Transform2D<f32, SvgElementUserSpace, SvgElementUserSpace>;
+
+/// The reference rectangles from which CSS `transform-box` selects one local
+/// SVG coordinate system. All conversion into a selected reference rectangle
+/// goes through [`Self::select`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SvgTransformReferenceBoxes {
+    fill: SvgElementRect,
+    stroke: SvgElementRect,
+    view: Option<SvgElementRect>,
+}
+
+/// The selected local rectangle for one CSS transform operation.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SvgTransformReferenceBox(SvgElementRect);
+
+/// A CSS transform origin after percentage resolution in local SVG units.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SvgTransformOrigin(SvgElementPoint);
+
+impl SvgTransformReferenceBoxes {
+    pub(crate) fn new(
+        fill: SvgElementRect,
+        stroke: SvgElementRect,
+        view: Option<SvgElementRect>,
+    ) -> Self {
+        Self { fill, stroke, view }
+    }
+
+    /// CSS Transforms selects SVG fill-, stroke-, or view-box geometry here.
+    /// `content-box` and `border-box` use the SVG fill box for graphical SVG
+    /// elements:
+    /// <https://drafts.csswg.org/css-transforms/#transform-box>.
+    pub(crate) fn select(
+        self,
+        transform_box: css::TransformBox,
+    ) -> Option<SvgTransformReferenceBox> {
+        match transform_box {
+            css::TransformBox::ContentBox
+            | css::TransformBox::BorderBox
+            | css::TransformBox::FillBox => Some(SvgTransformReferenceBox(self.fill)),
+            css::TransformBox::StrokeBox => Some(SvgTransformReferenceBox(self.stroke)),
+            css::TransformBox::ViewBox => self.view.map(SvgTransformReferenceBox),
+        }
+    }
+}
+
+impl SvgTransformReferenceBox {
+    pub(crate) fn rect(self) -> SvgElementRect {
+        self.0
+    }
+
+    pub(crate) fn origin(self, x: f32, y: f32) -> SvgTransformOrigin {
+        SvgTransformOrigin(SvgElementPoint::new(self.0.min_x() + x, self.0.min_y() + y))
+    }
+}
+
+impl SvgTransformOrigin {
+    pub(crate) fn point(self) -> SvgElementPoint {
+        self.0
+    }
+}
 type SvgSourceToPaintTransform =
     euclid::ScaleOffset2D<f32, SvgSourceSpace, crate::document::paint::geometry::PaintSpace>;
 
@@ -74,6 +188,7 @@ struct SvgPaintOperation {
     paint: SvgPaintServer,
     fill_rule: RenderedPathFillRule,
     clip: Option<RenderedPathClip>,
+    primary_clip_is_viewport: bool,
 }
 
 struct SvgPathGeometry {
@@ -93,7 +208,7 @@ impl SvgPaintOperation {
     /// by its stroke paint. At this point both ordinary fills and those stroke
     /// outlines therefore share the same page-space path representation:
     /// <https://www.w3.org/TR/SVG2/painting.html#StrokeShape>.
-    fn materialize(mut self) -> RenderedPath {
+    fn materialize(mut self) -> Option<RenderedPath> {
         let commands = self
             .geometry
             .commands
@@ -102,7 +217,7 @@ impl SvgPaintOperation {
             .collect::<Vec<_>>();
         self.paint.materialize_to_paint_space();
         let clip = remove_redundant_svg_clips(self.clip, &commands);
-        RenderedPath::new(
+        let path = RenderedPath::new(
             commands,
             None,
             self.fill_rule,
@@ -110,7 +225,12 @@ impl SvgPaintOperation {
             PaintStrokeWidth::ZERO,
             clip,
         )
-        .with_paints(Some(self.paint.paint), None)
+        .with_paints(Some(self.paint.paint), None);
+        if self.primary_clip_is_viewport {
+            hard_crop_opaque_svg_rectangle(path)
+        } else {
+            Some(path)
+        }
     }
 }
 
@@ -138,13 +258,43 @@ impl SvgPaintServer {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SvgPresentationOverride {
     pub(crate) display: Option<SvgDisplayOverride>,
-    pub(crate) transform: Option<String>,
+    pub(crate) transform: Option<SvgTransformOverride>,
     pub(crate) fill: Option<String>,
     pub(crate) stroke: Option<String>,
     pub(crate) stroke_width: Option<String>,
     /// A forced solid color replaces this element's unsupported filter result.
     pub(crate) remove_filter: bool,
 }
+
+/// A transform selected by Quire's host-document cascade for an inline SVG
+/// node. Scene-local values serialize into SVG user units; root SVG values
+/// are applied only to the enclosing CSS layout box.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SvgTransformOverride {
+    Scene(SvgUsedTransform),
+    #[expect(
+        dead_code,
+        reason = "Root SVG transforms are consumed by the enclosing HTML box transform path."
+    )]
+    RootBox(SvgRootBoxTransform),
+}
+
+/// The complete static 2D transform result for one SVG scene node.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SvgUsedTransform {
+    None,
+    Affine(SvgElementTransform),
+}
+
+/// A root `<svg>` transform projected into Quire's page-paint coordinate
+/// system. Keeping this distinct from [`SvgElementTransform`] prevents a CSS
+/// box transform from being serialized into the SVG scene a second time.
+#[derive(Debug, Clone, Copy)]
+#[expect(
+    dead_code,
+    reason = "The root-box transform wrapper documents the scene/layout transform boundary."
+)]
+pub(crate) struct SvgRootBoxTransform(pub(crate) PaintTransform);
 
 /// The SVG-scene equivalent of CSS box suppression.
 ///
@@ -297,15 +447,17 @@ impl SvgAsset {
         asset
     }
 
-    /// Reparse this SVG for a concrete CSS background-image viewport.
+    /// Reparse this SVG for a concrete CSS image viewport.
     ///
     /// SVG percentage geometry and `preserveAspectRatio` are relative to the
-    /// root SVG viewport. CSS Backgrounds supplies that viewport from the
-    /// concrete background image size, independently of the SVG's intrinsic
-    /// dimensions used earlier by `background-size`.
+    /// root SVG viewport. CSS image consumers supply that viewport from their
+    /// concrete image size, independently of the SVG's intrinsic dimensions
+    /// used earlier by the CSS sizing algorithm. In particular, border-image
+    /// establishes this viewport before resolving its source slice offsets.
     /// <https://www.w3.org/TR/SVG2/coords.html#ViewportSpace>
     /// <https://www.w3.org/TR/css-images-3/#default-sizing>
-    pub(crate) fn with_background_viewport(&self, viewport: PaintSize) -> Self {
+    /// <https://www.w3.org/TR/css-backgrounds-3/#border-image-slice>
+    pub(crate) fn with_css_image_viewport(&self, viewport: PaintSize) -> Self {
         let width = viewport.width;
         let height = viewport.height;
         if width <= 0.0 || height <= 0.0 || !width.is_finite() || !height.is_finite() {
@@ -372,7 +524,7 @@ impl SvgAsset {
         if source.size.width <= 0.0 || source.size.height <= 0.0 {
             return Vec::new();
         }
-        let transform = ViewportTransform::new(destination, source, true);
+        let transform = ViewportTransform::new(destination, source, true, true);
         let mut group = collect_svg_group(self.tree.root(), transform, &[]);
         canonicalize_svg_paint_servers(&mut group);
         elide_redundant_svg_paints(&mut group);
@@ -419,7 +571,7 @@ impl SvgAsset {
         self.paint_group_for_source_rect_with_viewport_clip(destination, source, true)
     }
 
-    fn paint_group_for_source_rect_with_viewport_clip(
+    pub(crate) fn paint_group_for_source_rect_with_viewport_clip(
         &self,
         destination: PaintRect,
         source: SvgSourceRect,
@@ -432,7 +584,7 @@ impl SvgAsset {
         {
             return SvgPaintGroup::empty();
         }
-        let viewport = ViewportTransform::new(destination, source, clip_viewport);
+        let viewport = ViewportTransform::new(destination, source, clip_viewport, false);
         let mut group = collect_svg_group(self.tree.root(), viewport, &[]);
         canonicalize_svg_paint_servers(&mut group);
         elide_redundant_svg_paints(&mut group);
@@ -855,6 +1007,66 @@ fn remove_redundant_svg_clips(
     ))
 }
 
+/// Materialize a root-viewport crop directly into a hard-edged rectangle when
+/// doing so is exactly equivalent to the SVG paint.
+///
+/// A solid axis-aligned rectangle has no interior geometry that clipping can
+/// reveal or hide. Intersecting it with the sole rectangular viewport clip is
+/// therefore equivalent to PDF clipping, while avoiding the device-pixel
+/// antialias seam that a separately clipped SVG tile can create next to an
+/// adjacent tile. Paths with an SVG clip path, stroke, transparency, pattern,
+/// gradient, curve, or non-rectangular geometry retain the general PDF clip
+/// path unchanged.
+/// <https://www.w3.org/TR/SVG2/coords.html#ViewportSpace>
+/// <https://www.w3.org/TR/css-backgrounds-3/#border-image-process>
+fn hard_crop_opaque_svg_rectangle(path: RenderedPath) -> Option<RenderedPath> {
+    let Some(clip) = path.clip.as_ref() else {
+        return Some(path);
+    };
+    if clip.fill_rule != RenderedPathFillRule::NonZero || !clip.additional_clips.is_empty() {
+        return Some(path);
+    }
+    let Some(clip_bounds) = axis_aligned_rectangle_bounds(&clip.commands) else {
+        return Some(path);
+    };
+    let Some((color, bounds)) = opaque_axis_aligned_rectangle(&path) else {
+        return Some(path);
+    };
+    let left = bounds.0.max(clip_bounds.0);
+    let bottom = bounds.1.max(clip_bounds.1);
+    let right = bounds.2.min(clip_bounds.2);
+    let top = bounds.3.min(clip_bounds.3);
+    if right <= left || top <= bottom {
+        return None;
+    }
+    Some(
+        RenderedPath::new(
+            rectangular_path_commands(left, bottom, right, top),
+            None,
+            RenderedPathFillRule::NonZero,
+            None,
+            PaintStrokeWidth::ZERO,
+            None,
+        )
+        .with_paints(Some(RenderedPathPaint::Solid(color)), None),
+    )
+}
+
+fn rectangular_path_commands(
+    left: f32,
+    bottom: f32,
+    right: f32,
+    top: f32,
+) -> Vec<RenderedPathCommand> {
+    vec![
+        RenderedPathCommand::move_to(PaintPoint::new(left, bottom)),
+        RenderedPathCommand::line_to(PaintPoint::new(right, bottom)),
+        RenderedPathCommand::line_to(PaintPoint::new(right, top)),
+        RenderedPathCommand::line_to(PaintPoint::new(left, top)),
+        RenderedPathCommand::Close,
+    ]
+}
+
 fn svg_rectangular_clip_contains_path(
     clip: &RenderedPathClipPath,
     commands: &[RenderedPathCommand],
@@ -999,6 +1211,7 @@ struct ViewportTransform {
     destination: PaintRect,
     source_to_paint: SvgSourceToPaintTransform,
     clip_viewport: bool,
+    hard_crop_viewport: bool,
 }
 
 impl ViewportTransform {
@@ -1006,7 +1219,12 @@ impl ViewportTransform {
     ///
     /// The negative y scale is the sole coordinate-system conversion between
     /// SVG's top-left source space and PDF paint space.
-    fn new(destination: PaintRect, source: SvgSourceRect, clip_viewport: bool) -> Self {
+    fn new(
+        destination: PaintRect,
+        source: SvgSourceRect,
+        clip_viewport: bool,
+        hard_crop_viewport: bool,
+    ) -> Self {
         let scale_x = destination.size.width / source.size.width;
         let scale_y = destination.size.height / source.size.height;
         Self {
@@ -1018,6 +1236,7 @@ impl ViewportTransform {
                 destination.max_y() + scale_y * source.origin.y,
             ),
             clip_viewport,
+            hard_crop_viewport,
         }
     }
 }
@@ -1213,6 +1432,9 @@ fn render_path_with_clips(
         paint,
         fill_rule,
         clip: clip.clone(),
+        primary_clip_is_viewport: viewport.hard_crop_viewport
+            && viewport.clip_viewport
+            && additional_clips.is_empty(),
     });
     let stroke = path.stroke().and_then(|stroke_style| {
         let paint = stroke?;
@@ -1228,6 +1450,9 @@ fn render_path_with_clips(
             paint,
             fill_rule: RenderedPathFillRule::NonZero,
             clip: clip.clone(),
+            primary_clip_is_viewport: viewport.hard_crop_viewport
+                && viewport.clip_viewport
+                && additional_clips.is_empty(),
         })
     });
 
@@ -1235,12 +1460,12 @@ fn render_path_with_clips(
         Vec::with_capacity(usize::from(fill.is_some()) + usize::from(stroke.is_some()));
     match path.paint_order() {
         usvg::PaintOrder::FillAndStroke => {
-            rendered.extend(fill.map(SvgPaintOperation::materialize));
-            rendered.extend(stroke.map(SvgPaintOperation::materialize));
+            rendered.extend(fill.and_then(SvgPaintOperation::materialize));
+            rendered.extend(stroke.and_then(SvgPaintOperation::materialize));
         }
         usvg::PaintOrder::StrokeAndFill => {
-            rendered.extend(stroke.map(SvgPaintOperation::materialize));
-            rendered.extend(fill.map(SvgPaintOperation::materialize));
+            rendered.extend(stroke.and_then(SvgPaintOperation::materialize));
+            rendered.extend(fill.and_then(SvgPaintOperation::materialize));
         }
     }
     rendered
@@ -1653,8 +1878,27 @@ pub(crate) fn parse_inline_svg_with_presentation_overrides(
 }
 
 pub(crate) fn parse_svg_bytes(bytes: &[u8]) -> Result<SvgAsset, String> {
+    parse_svg_bytes_with_optional_image_context(bytes, None)
+}
+
+/// Parse an external SVG image in the color-scheme environment of its
+/// embedding element.
+pub(crate) fn parse_svg_bytes_with_image_context(
+    bytes: &[u8],
+    image_context: SvgImageContext,
+) -> Result<SvgAsset, String> {
+    parse_svg_bytes_with_optional_image_context(bytes, Some(image_context))
+}
+
+fn parse_svg_bytes_with_optional_image_context(
+    bytes: &[u8],
+    image_context: Option<SvgImageContext>,
+) -> Result<SvgAsset, String> {
+    let normalized_source = image_context
+        .and_then(|context| normalize_svg_image_stylesheet(bytes, context))
+        .unwrap_or_else(|| bytes.to_vec());
     let tree = parse_svg_tree(
-        bytes,
+        &normalized_source,
         usvg::Size::from_wh(300.0, 150.0).expect("default SVG viewport is valid"),
     )?;
     if svg_tree_has_unsupported_content(tree.root()) {
@@ -1663,9 +1907,9 @@ pub(crate) fn parse_svg_bytes(bytes: &[u8]) -> Result<SvgAsset, String> {
         );
     }
     let size = tree.size();
-    let intrinsic_dimensions = svg_intrinsic_dimensions(bytes, size);
-    let has_degenerate_view_box = svg_has_degenerate_view_box(bytes);
-    let view_fragments = svg_view_fragments(bytes);
+    let intrinsic_dimensions = svg_intrinsic_dimensions(&normalized_source, size);
+    let has_degenerate_view_box = svg_has_degenerate_view_box(&normalized_source);
+    let view_fragments = svg_view_fragments(&normalized_source);
     Ok(SvgAsset {
         tree,
         intrinsic_size: LayoutSize::new(
@@ -1675,8 +1919,223 @@ pub(crate) fn parse_svg_bytes(bytes: &[u8]) -> Result<SvgAsset, String> {
         intrinsic_dimensions,
         has_degenerate_view_box,
         view_fragments,
-        source: Rc::from(bytes),
+        source: Rc::from(normalized_source),
     })
+}
+
+/// Normalize the small CSS boundary between an image SVG and `usvg`.
+///
+/// `usvg` deliberately uses SimpleCSS, which skips conditional rules and does
+/// not implement `:root`. Quire evaluates the image document's media queries
+/// before that handoff, then gives SimpleCSS an equivalent static stylesheet.
+/// The upstream limitation, including both `:root` and `@media`, is tracked
+/// at <https://github.com/linebender/resvg/issues/960>.
+/// `cssparser` tokenizes the stylesheet boundary, so strings, comments, escaped
+/// identifiers, and nested component-value blocks cannot be mistaken for CSS
+/// syntax by this normalization step.
+fn normalize_svg_image_stylesheet(bytes: &[u8], context: SvgImageContext) -> Option<Vec<u8>> {
+    let source = std::str::from_utf8(bytes).ok()?;
+    let document = usvg::roxmltree::Document::parse(source).ok()?;
+    let root = document.root_element();
+    if root.tag_name().name() != "svg" {
+        return None;
+    }
+
+    let environment = context.media_environment();
+    let mut replacements = Vec::new();
+    let mut needs_root_marker = false;
+    for style in root.descendants().filter(|node| node.has_tag_name("style")) {
+        if !matches!(style.attribute("type"), None | Some("text/css")) {
+            continue;
+        }
+        for text in style.children().filter(|node| node.is_text()) {
+            let range = text.range();
+            let stylesheet = source.get(range.clone())?;
+            let (normalized, rewrote_root) = flatten_svg_image_css(stylesheet, &environment);
+            needs_root_marker |= rewrote_root;
+            if normalized != stylesheet {
+                replacements.push((range, normalized));
+            }
+        }
+    }
+
+    if replacements.is_empty() && !needs_root_marker {
+        return Some(bytes.to_vec());
+    }
+    let mut normalized = source.to_owned();
+    for (range, replacement) in replacements.into_iter().rev() {
+        normalized.replace_range(range, &replacement);
+    }
+    if needs_root_marker {
+        let root_start = root.range().start;
+        let close = svg_start_tag_close(normalized.get(root_start..)?)? + root_start;
+        let insert_at = normalized[..close]
+            .trim_end_matches(char::is_whitespace)
+            .strip_suffix('/')
+            .map_or(close, str::len);
+        normalized.insert_str(
+            insert_at,
+            &format!(r#" {SVG_IMAGE_ROOT_MARKER_ATTRIBUTE}="""#),
+        );
+    }
+    Some(normalized.into_bytes())
+}
+
+/// Evaluate `@media` rules in an SVG stylesheet while retaining all
+/// non-conditional rule text for `usvg`'s existing SVG CSS cascade.
+fn flatten_svg_image_css(source: &str, environment: &css::MediaEnvironment) -> (String, bool) {
+    let mut input = ParserInput::new(source);
+    let mut input = Parser::new(&mut input);
+    let mut parser = SvgImageCssParser {
+        environment,
+        rewrote_root: false,
+    };
+    let mut output = String::with_capacity(source.len());
+    for rule in StyleSheetParser::new(&mut input, &mut parser) {
+        match rule {
+            Ok(rule) => output.push_str(&rule),
+            // Keep malformed and unsupported rules in the source handed to
+            // SimpleCSS. This preserves its existing recovery behavior.
+            Err((_, source)) => output.push_str(source),
+        }
+    }
+    (output, parser.rewrote_root)
+}
+
+struct SvgImageCssParser<'a> {
+    environment: &'a css::MediaEnvironment,
+    rewrote_root: bool,
+}
+
+enum SvgImageCssAtRulePrelude {
+    Media { applies: bool },
+    Other { name: String, prelude: String },
+}
+
+impl<'i> QualifiedRuleParser<'i> for SvgImageCssParser<'_> {
+    type Prelude = String;
+    type QualifiedRule = String;
+    type Error = ();
+
+    fn parse_prelude<'t>(
+        &mut self,
+        input: &mut Parser<'i, 't>,
+    ) -> Result<Self::Prelude, cssparser::ParseError<'i, Self::Error>> {
+        let selector = consume_svg_css_input(input);
+        let (selector, rewrote_root) = rewrite_svg_root_selector(&selector);
+        self.rewrote_root |= rewrote_root;
+        Ok(selector)
+    }
+
+    fn parse_block<'t>(
+        &mut self,
+        selector: Self::Prelude,
+        _start: &ParserState,
+        input: &mut Parser<'i, 't>,
+    ) -> Result<Self::QualifiedRule, cssparser::ParseError<'i, Self::Error>> {
+        Ok(format!("{selector}{{{}}}", consume_svg_css_input(input)))
+    }
+}
+
+impl<'i> AtRuleParser<'i> for SvgImageCssParser<'_> {
+    type Prelude = SvgImageCssAtRulePrelude;
+    type AtRule = String;
+    type Error = ();
+
+    fn parse_prelude<'t>(
+        &mut self,
+        name: CowRcStr<'i>,
+        input: &mut Parser<'i, 't>,
+    ) -> Result<Self::Prelude, cssparser::ParseError<'i, Self::Error>> {
+        let prelude = consume_svg_css_input(input);
+        if name.eq_ignore_ascii_case("media") {
+            Ok(SvgImageCssAtRulePrelude::Media {
+                applies: css::media_rule_applies_in_environment(prelude.trim(), self.environment),
+            })
+        } else {
+            Ok(SvgImageCssAtRulePrelude::Other {
+                name: name.to_string(),
+                prelude,
+            })
+        }
+    }
+
+    fn rule_without_block(
+        &mut self,
+        prelude: Self::Prelude,
+        _start: &ParserState,
+    ) -> Result<Self::AtRule, ()> {
+        Ok(match prelude {
+            SvgImageCssAtRulePrelude::Media { .. } => String::new(),
+            SvgImageCssAtRulePrelude::Other { name, prelude } => format!("@{name}{prelude};"),
+        })
+    }
+
+    fn parse_block<'t>(
+        &mut self,
+        prelude: Self::Prelude,
+        _start: &ParserState,
+        input: &mut Parser<'i, 't>,
+    ) -> Result<Self::AtRule, cssparser::ParseError<'i, Self::Error>> {
+        match prelude {
+            SvgImageCssAtRulePrelude::Media { applies: true } => {
+                let (flattened, rewrote_root) =
+                    flatten_svg_image_css(&consume_svg_css_input(input), self.environment);
+                self.rewrote_root |= rewrote_root;
+                Ok(flattened)
+            }
+            SvgImageCssAtRulePrelude::Media { applies: false } => {
+                consume_svg_css_input(input);
+                Ok(String::new())
+            }
+            SvgImageCssAtRulePrelude::Other { name, prelude } => Ok(format!(
+                "@{name}{prelude}{{{}}}",
+                consume_svg_css_input(input)
+            )),
+        }
+    }
+}
+
+/// Consume a delimited CSS parser while preserving its source text. Component
+/// values are tokenized by `cssparser`, so nested strings and blocks are safe.
+fn consume_svg_css_input(input: &mut Parser<'_, '_>) -> String {
+    let start = input.position();
+    while input.next_including_whitespace_and_comments().is_ok() {}
+    input.slice_from(start).to_string()
+}
+
+/// Replace the exact `:root` pseudo-class in a selector prelude. The private
+/// attribute carries the same class specificity and cannot match descendants.
+/// This compensates for the upstream SimpleCSS `:root` gap:
+/// <https://github.com/linebender/resvg/issues/960>.
+fn rewrite_svg_root_selector(source: &str) -> (String, bool) {
+    let mut input = ParserInput::new(source);
+    let mut input = Parser::new(&mut input);
+    let mut output = String::with_capacity(source.len());
+    let mut cursor = input.position();
+    let mut changed = false;
+    while !input.is_exhausted() {
+        let token_start = input.position();
+        let Ok(token) = input.next_including_whitespace_and_comments() else {
+            break;
+        };
+        if matches!(token, Token::Colon)
+            && matches!(input.next_including_whitespace_and_comments(), Ok(Token::Ident(name)) if name.eq_ignore_ascii_case("root"))
+        {
+            output.push_str(input.slice(cursor..token_start));
+            output.push('[');
+            output.push_str(SVG_IMAGE_ROOT_MARKER_ATTRIBUTE);
+            output.push(']');
+            cursor = input.position();
+            changed = true;
+        }
+    }
+    if changed {
+        output.push_str(input.slice_from(cursor));
+        (output, true)
+    } else {
+        (source.to_owned(), false)
+    }
 }
 
 /// Substitute the used CSS image viewport for an SVG root's own viewport
@@ -2213,18 +2672,27 @@ fn serialize_element(
     }
     let mut attrs: Vec<_> = element.attrs.iter().collect();
     attrs.sort_unstable_by_key(|(name, _)| *name);
-    let source_transform = override_values
-        .and_then(|values| values.transform.clone())
-        .or_else(|| element.attrs.get("transform").cloned());
-    let resolved_transform = source_transform
-        .as_deref()
-        .map(|transform| svg_presentation_transform_with_origin(element, transform));
+    let selected_scene_transform = override_values.and_then(|values| match values.transform {
+        Some(SvgTransformOverride::Scene(transform)) => Some(transform),
+        Some(SvgTransformOverride::RootBox(_)) | None => None,
+    });
+    let transform_is_owned = selected_scene_transform.is_some();
+    let source_transform = element.attrs.get("transform").cloned();
+    let resolved_transform = match selected_scene_transform {
+        Some(SvgUsedTransform::None) => None,
+        Some(SvgUsedTransform::Affine(transform)) => {
+            Some(svg_element_transform_attribute(transform))
+        }
+        None => source_transform
+            .as_deref()
+            .map(|transform| svg_presentation_transform_with_origin(element, transform)),
+    };
     let mut emitted_transform = false;
     for (name, value) in attrs {
         if name == "xmlns" || name.starts_with("xmlns:") {
             continue;
         }
-        if name == "transform-origin" && resolved_transform.is_some() {
+        if name == "transform-origin" && (transform_is_owned || resolved_transform.is_some()) {
             // `usvg` would resolve this presentation attribute against its
             // viewport after the normalized transform has already been
             // wrapped around the selected CSS reference box.
@@ -2241,6 +2709,12 @@ fn serialize_element(
             // A stripped `<use>` retains its referenced shadow content but
             // not its own non-inherited layout/visual style. The host cascade
             // separately serializes computed inherited presentation values.
+            continue;
+        }
+        if name == "style" && transform_is_owned {
+            if let Some(style) = sanitize_inline_svg_transform_style(value) {
+                push_attribute(output, name, &style);
+            }
             continue;
         }
         if matches!(name.as_str(), "fill" | "stroke" | "stroke-width")
@@ -2266,6 +2740,13 @@ fn serialize_element(
             // later declaration resets it. These forced-solid cases have no
             // other presentation declaration, so omit the source style.
             continue;
+        } else if name == "transform" && transform_is_owned {
+            // Quire owns the selected cascade result. The source presentation
+            // attribute must not enter `usvg`'s second cascade.
+            emitted_transform = true;
+            if let Some(transform) = resolved_transform.as_deref() {
+                push_attribute(output, name, transform);
+            }
         } else if name == "transform" {
             emitted_transform = true;
             push_attribute(output, name, resolved_transform.as_deref().unwrap_or(value));
@@ -2339,6 +2820,38 @@ fn serialize_element(
     output.push('>');
 }
 
+/// Serialize a typed SVG-element matrix at the only string boundary of the
+/// host-CSS-to-SVG bridge.
+fn svg_element_transform_attribute(transform: SvgElementTransform) -> String {
+    format!(
+        "matrix({} {} {} {} {} {})",
+        transform.m11, transform.m12, transform.m21, transform.m22, transform.m31, transform.m32
+    )
+}
+
+/// Remove declarations whose used values Quire has already applied to the
+/// serialized SVG transform attribute. Rebuilding only the declaration list
+/// is safe here: this is a private payload for `usvg`, not the source DOM.
+fn sanitize_inline_svg_transform_style(value: &str) -> Option<String> {
+    let declarations = css::parse_declarations(value);
+    let style = declarations
+        .iter()
+        .filter(|(name, _)| {
+            !matches!(
+                name.as_str(),
+                "transform"
+                    | "transform-origin"
+                    | "transform-box"
+                    | "translate"
+                    | "rotate"
+                    | "scale"
+            )
+        })
+        .map(|(name, value)| format!("{name}: {value};"))
+        .collect::<String>();
+    (!style.is_empty()).then_some(style)
+}
+
 fn push_attribute(output: &mut String, name: &str, value: &str) {
     output.push(' ');
     output.push_str(name);
@@ -2391,6 +2904,36 @@ mod tests {
     use crate::units::content_box_size_pt;
 
     #[test]
+    fn svg_transform_reference_boxes_select_only_the_requested_coordinate_space() {
+        let fill = SvgElementRect::new(
+            SvgElementPoint::new(1.0, 2.0),
+            SvgElementSize::new(30.0, 40.0),
+        );
+        let stroke = SvgElementRect::new(
+            SvgElementPoint::new(0.0, 1.0),
+            SvgElementSize::new(32.0, 42.0),
+        );
+        let view = SvgElementRect::new(
+            SvgElementPoint::new(-10.0, -20.0),
+            SvgElementSize::new(100.0, 200.0),
+        );
+        let boxes = SvgTransformReferenceBoxes::new(fill, stroke, Some(view));
+
+        assert_eq!(
+            boxes.select(css::TransformBox::FillBox).unwrap().rect(),
+            fill
+        );
+        assert_eq!(
+            boxes.select(css::TransformBox::StrokeBox).unwrap().rect(),
+            stroke
+        );
+        assert_eq!(
+            boxes.select(css::TransformBox::ViewBox).unwrap().rect(),
+            view
+        );
+    }
+
+    #[test]
     fn presentation_origin_rotates_svg_rect_about_its_fill_box_center() {
         let asset = parse_svg_bytes(
             br#"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200"><rect width="150" height="150" transform="translate(75 75) rotate(90) translate(-75 -75)"/></svg>"#,
@@ -2429,15 +2972,17 @@ mod tests {
         overrides.insert(
             rect.id,
             SvgPresentationOverride {
-                transform: Some("matrix(0 1 -1 0 0 0)".to_owned()),
+                transform: Some(SvgTransformOverride::Scene(SvgUsedTransform::Affine(
+                    // The bridge has already folded the fill-box origin into
+                    // this scene-local matrix.
+                    SvgElementTransform::new(0.0, 1.0, -1.0, 0.0, 150.0, 0.0),
+                ))),
                 ..SvgPresentationOverride::default()
             },
         );
         let xml = serialize_inline_svg_with_presentation_overrides(&rect, &overrides);
 
-        assert!(
-            xml.contains("transform=\"translate(75 75) matrix(0 1 -1 0 0 0) translate(-75 -75)\"")
-        );
+        assert!(xml.contains("transform=\"matrix(0 1 -1 0 150 0)\""));
         assert!(!xml.contains("transform-origin="));
     }
 
@@ -2711,7 +3256,7 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_omitted_svg_viewports_to_the_background_image_size() {
+    fn normalizes_omitted_svg_viewports_to_the_css_image_size() {
         let asset = parse_svg_bytes(
             br#"<svg xmlns="http://www.w3.org/2000/svg"><rect width="100%" height="100%" fill="orange"/></svg>"#,
         )
@@ -2719,7 +3264,7 @@ mod tests {
 
         assert_eq!(
             asset
-                .with_background_viewport(PaintSize::new(150.0, 300.0))
+                .with_css_image_viewport(PaintSize::new(150.0, 300.0))
                 .source_viewport_size(),
             SvgSourceSize::new(200.0, 400.0)
         );
@@ -2735,6 +3280,25 @@ mod tests {
                 .unwrap()
                 .contains("width=\"200px\" height=\"400px\"/")
         );
+    }
+
+    #[test]
+    fn css_image_viewport_uses_border_image_area_for_view_box_only_svg() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100" fill="orange"/></svg>"#,
+        )
+        .unwrap();
+
+        // A 150pt border-image area is 200 CSS pixels.  Number-valued
+        // border-image slices therefore resolve against this viewport rather
+        // than the SVG parser's viewBox-sized fallback.
+        // <https://www.w3.org/TR/css-backgrounds-3/#border-image-slice>
+        let viewport = asset.with_css_image_viewport(PaintSize::new(150.0, 150.0));
+        assert_eq!(
+            viewport.source_viewport_size(),
+            SvgSourceSize::new(200.0, 200.0)
+        );
+        assert_opaque_rect_bounds(&viewport, (0.0, 0.0, 12.0, 12.0));
     }
 
     fn assert_opaque_rect_bounds(asset: &SvgAsset, expected: (f32, f32, f32, f32)) {
@@ -2756,13 +3320,13 @@ mod tests {
     }
 
     #[test]
-    fn background_viewport_honors_default_preserve_aspect_ratio_for_view_box_only_svg() {
+    fn css_image_viewport_honors_default_preserve_aspect_ratio_for_view_box_only_svg() {
         let asset = parse_svg_bytes(
             br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 8"><rect width="16" height="8" fill="orange"/></svg>"#,
         )
         .unwrap();
         let intrinsic_dimensions = asset.intrinsic_dimensions();
-        let viewport = asset.with_background_viewport(PaintSize::new(12.0, 12.0));
+        let viewport = asset.with_css_image_viewport(PaintSize::new(12.0, 12.0));
 
         assert_eq!(
             viewport.source_viewport_size(),
@@ -2773,13 +3337,13 @@ mod tests {
     }
 
     #[test]
-    fn background_viewport_honors_default_preserve_aspect_ratio_for_sized_svg() {
+    fn css_image_viewport_honors_default_preserve_aspect_ratio_for_sized_svg() {
         let asset = parse_svg_bytes(
             br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="8" viewBox="0 0 16 8"><rect width="16" height="8" fill="orange"/></svg>"#,
         )
         .unwrap();
         let intrinsic_dimensions = asset.intrinsic_dimensions();
-        let viewport = asset.with_background_viewport(PaintSize::new(12.0, 12.0));
+        let viewport = asset.with_css_image_viewport(PaintSize::new(12.0, 12.0));
 
         assert_eq!(
             viewport.source_viewport_size(),
@@ -2790,12 +3354,12 @@ mod tests {
     }
 
     #[test]
-    fn background_viewport_preserves_none_aspect_ratio_stretching() {
+    fn css_image_viewport_preserves_none_aspect_ratio_stretching() {
         let asset = parse_svg_bytes(
             br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="8" viewBox="0 0 16 8" preserveAspectRatio="none"><rect width="16" height="8" fill="orange"/></svg>"#,
         )
         .unwrap();
-        let viewport = asset.with_background_viewport(PaintSize::new(12.0, 12.0));
+        let viewport = asset.with_css_image_viewport(PaintSize::new(12.0, 12.0));
 
         assert_eq!(
             viewport.source_viewport_size(),
@@ -2841,6 +3405,81 @@ mod tests {
         )
         .unwrap();
         assert_eq!(translucent.opaque_viewport_fill(), None);
+    }
+
+    #[test]
+    fn svg_image_stylesheet_uses_embedding_color_scheme_for_root_media_rules() {
+        let source = br#"
+            <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32">
+                <style>
+                    :root { color: blue }
+                    @media (prefers-color-scheme: dark) {
+                        :root { color: purple }
+                    }
+                </style>
+                <rect width="32" height="32" fill="currentColor"/>
+            </svg>
+        "#;
+        let light = parse_svg_bytes_with_image_context(
+            source,
+            SvgImageContext::from_used_color_scheme(css::UsedColorScheme::Light),
+        )
+        .unwrap();
+        let dark = parse_svg_bytes_with_image_context(
+            source,
+            SvgImageContext::from_used_color_scheme(css::UsedColorScheme::Dark),
+        )
+        .unwrap();
+
+        assert_eq!(light.opaque_viewport_fill(), Some(CssColor::new(0, 0, 255)));
+        assert_eq!(
+            dark.opaque_viewport_fill(),
+            Some(CssColor::new(128, 0, 128))
+        );
+    }
+
+    #[test]
+    fn svg_image_stylesheet_media_normalization_preserves_nonmatching_branches() {
+        let source = br#"
+            <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32">
+                <style>
+                    :root { color: blue }
+                    @media (prefers-color-scheme: dark) { :root { color: purple } }
+                    @media (prefers-color-scheme: light) { :root { color: lime } }
+                </style>
+                <rect width="32" height="32" fill="currentColor"/>
+            </svg>
+        "#;
+        let light = parse_svg_bytes_with_image_context(
+            source,
+            SvgImageContext::from_used_color_scheme(css::UsedColorScheme::Light),
+        )
+        .unwrap();
+
+        assert_eq!(light.opaque_viewport_fill(), Some(CssColor::new(0, 255, 0)));
+    }
+
+    #[test]
+    fn svg_image_stylesheet_normalization_uses_css_tokens_for_root_and_media() {
+        let environment =
+            SvgImageContext::from_used_color_scheme(css::UsedColorScheme::Dark).media_environment();
+        let (normalized, rewrote_root) = flatten_svg_image_css(
+            r#"
+                /* :root is only a comment. */
+                :r\6f ot { --label: ":root"; color: blue }
+                @media (prefers-color-scheme: dark) {
+                    @media (prefers-color-scheme: dark) { :root { color: purple } }
+                }
+                @media (prefers-color-scheme: light) { :root { color: lime } }
+            "#,
+            &environment,
+        );
+
+        assert!(rewrote_root);
+        assert!(normalized.contains(&format!("[{SVG_IMAGE_ROOT_MARKER_ATTRIBUTE}]")));
+        assert!(normalized.contains(r#"--label: ":root""#));
+        assert!(normalized.contains("color: purple"));
+        assert!(!normalized.contains("color: lime"));
     }
 
     #[test]
@@ -2993,19 +3632,65 @@ mod tests {
         );
 
         assert_eq!(paths.len(), 1);
-        assert_eq!(
-            paths[0].commands.first(),
-            Some(&RenderedPathCommand::move_to(PaintPoint::new(90.0, 212.0)))
+        assert_eq!(paths[0].clip, None);
+        assert_eq!(paths[0].bounds(), Some(paint_rect(100.0, 200.0, 20.0, 8.0)));
+    }
+
+    #[test]
+    fn border_image_viewport_crop_hardens_a_view_box_only_solid_rectangle() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100" fill="aqua"/></svg>"#,
+        )
+        .unwrap()
+        // The 150pt border-image area establishes a 200 CSS-pixel viewport.
+        .with_css_image_viewport(PaintSize::new(150.0, 150.0));
+        let paths = asset.paint_paths_for_source_rect(
+            paint_rect(10.0, 20.0, 30.0, 40.0),
+            SvgSourceRect::new(
+                SvgSourcePoint::new(10.0, 20.0),
+                SvgSourceSize::new(40.0, 20.0),
+            ),
         );
+
+        let [path] = paths.as_slice() else {
+            panic!("the cropped rectangle should remain one vector path");
+        };
+        assert_eq!(path.fill, Some(CssColor::new(0, 255, 255)));
+        assert_eq!(path.clip, None);
+        assert_eq!(path.bounds(), Some(paint_rect(10.0, 20.0, 30.0, 40.0)));
+    }
+
+    #[test]
+    fn border_image_viewport_crop_hardens_each_solid_cell_in_an_edge_slice() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+                <rect x="0" y="0" width="10" height="40" fill="yellow"/>
+                <rect x="10" y="0" width="60" height="40" fill="blue"/>
+                <rect x="70" y="0" width="30" height="40" fill="aqua"/>
+            </svg>"#,
+        )
+        .unwrap()
+        // The 150pt border-image area establishes a 200 CSS-pixel viewport.
+        .with_css_image_viewport(PaintSize::new(150.0, 150.0));
+        let paths = asset.paint_paths_for_source_rect(
+            paint_rect(10.0, 20.0, 120.0, 30.0),
+            // A numeric `border-image-slice: 40 30 20 10` top edge: crop the
+            // 200px root viewport after the concrete SVG sizing pass.
+            SvgSourceRect::new(
+                SvgSourcePoint::new(10.0, 0.0),
+                SvgSourceSize::new(160.0, 40.0),
+            ),
+        );
+
+        assert_eq!(paths.len(), 3);
+        assert!(paths.iter().all(|path| path.clip.is_none()));
         assert_eq!(
-            paths[0].clip.as_ref().map(|clip| &clip.commands),
-            Some(&vec![
-                RenderedPathCommand::move_to(PaintPoint::new(100.0, 200.0)),
-                RenderedPathCommand::line_to(PaintPoint::new(120.0, 200.0)),
-                RenderedPathCommand::line_to(PaintPoint::new(120.0, 208.0)),
-                RenderedPathCommand::line_to(PaintPoint::new(100.0, 208.0)),
-                RenderedPathCommand::Close,
-            ])
+            paths.iter().map(|path| path.fill).collect::<Vec<_>>(),
+            vec![
+                Some(CssColor::new(255, 255, 0)),
+                Some(CssColor::new(0, 0, 255)),
+                Some(CssColor::new(0, 255, 255)),
+            ]
         );
     }
 

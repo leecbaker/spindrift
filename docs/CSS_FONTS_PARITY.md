@@ -14,6 +14,10 @@ the normal, light, dark, indexed, and named base-palette selections from CPAL.
 Repeated `@font-face` sources now share decoded font-program storage while
 retaining face-specific selection metadata such as `size-adjust` and
 `unicode-range`; PDF output embeds a single subset for shared programs.
+Glyph-relative CSS Values metrics select the face that covers their metric
+character (U+0030 for upright `ch` and U+6C34 for `ic`), so those values honor
+font-stack fallback and `unicode-range` rather than borrowing the U+0020
+line-metric face.
 `ascent-override`, `descent-override`, and `line-gap-override` now change CSS
 inline layout metrics without moving the native OpenType glyph coordinate
 system used for PDF painting. PDF text emission converts between those systems
@@ -76,6 +80,12 @@ text. Mixed `text-orientation` applies vertical glyph-form features to `U`,
 Control-only fallback runs and simple selected-face fragments containing
 ZWJ/ZWNJ preserve the shaping control while omitting its fallback PDF payload;
 the two CSS Fonts feature-resolution reftests pass pixel-identically.
+
+The cascade represents `font` as typed canonical longhand components before
+rollback. Its explicit and reset-only modeled subproperties now participate in
+`revert`, `revert-layer`, CSS-wide keywords, and custom-property substitution
+independently; the legacy `font-stretch` spelling is the same cascade slot as
+`font-width`.
 
 `font-variant-emoji` uses Unicode 15.1's registered emoji variation-sequence
 bases rather than an approximate emoji range. This preserves authored VS15 and

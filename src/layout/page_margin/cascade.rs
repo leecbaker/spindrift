@@ -1,4 +1,5 @@
 use super::*;
+use crate::css::LayerOrder;
 use crate::units::LayoutSize;
 use std::rc::Rc;
 
@@ -24,7 +25,7 @@ pub(in crate::layout) fn page_declarations_for_rules(
                     (
                         rule.origin,
                         specificity,
-                        rule.layer_order,
+                        rule.layer_order.clone(),
                         rule.order,
                         &rule.declarations,
                     )
@@ -56,7 +57,7 @@ pub(in crate::layout) fn page_footnote_area_declarations_for_rules(
                     (
                         rule.origin,
                         specificity,
-                        rule.layer_order,
+                        rule.layer_order.clone(),
                         rule.order,
                         declarations,
                     )
@@ -100,7 +101,7 @@ pub(in crate::layout) fn page_margin_boxes_for_rules(
                     (
                         rule.origin,
                         specificity,
-                        rule.layer_order,
+                        rule.layer_order.clone(),
                         rule.order,
                         declarations,
                     )
@@ -363,7 +364,7 @@ pub(in crate::layout) fn cascade_page_rule_declarations<'a>(
         Item = (
             StylesheetOrigin,
             PageSpecificity,
-            Option<usize>,
+            Option<LayerOrder>,
             usize,
             &'a Declarations,
         ),
@@ -378,8 +379,7 @@ pub(in crate::layout) fn cascade_page_rule_declarations<'a>(
                 important,
                 origin,
                 origin_rank: css::origin_importance_rank(origin, important),
-                layer_order,
-                layer_rank: page_layer_precedence_rank(layer_order, important),
+                layer_order: layer_order.clone(),
                 specificity,
                 rule_order,
                 declaration_order,
@@ -392,7 +392,7 @@ pub(in crate::layout) fn cascade_page_rule_declarations<'a>(
             });
         }
     }
-    candidates.sort_by_key(|candidate| candidate.key);
+    candidates.sort_by(|left, right| compare_page_cascade_keys(&left.key, &right.key));
 
     let mut active: Vec<PageCascadedDeclaration> = Vec::with_capacity(candidates.len());
     for candidate in candidates {
@@ -441,16 +441,15 @@ pub(in crate::layout) struct PageCascadedDeclaration {
 /// Level 5 sorts importance and layers before selector specificity:
 /// <https://www.w3.org/TR/css-page-3/#cascading-and-page-context> and
 /// <https://www.w3.org/TR/css-cascade-5/#cascade-sort>.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::layout) struct PageCascadeKey {
     pub(in crate::layout) important: bool,
     pub(in crate::layout) origin_rank: u8,
-    pub(in crate::layout) layer_rank: usize,
     pub(in crate::layout) specificity: PageSpecificity,
     pub(in crate::layout) rule_order: usize,
     pub(in crate::layout) declaration_order: usize,
     pub(in crate::layout) origin: StylesheetOrigin,
-    pub(in crate::layout) layer_order: Option<usize>,
+    pub(in crate::layout) layer_order: Option<LayerOrder>,
 }
 
 pub(in crate::layout) fn page_declaration_is_important(value: &str) -> bool {
@@ -499,15 +498,35 @@ pub(in crate::layout) fn same_page_cascade_layer(
         && left.key.layer_order == right.key.layer_order
 }
 
-pub(in crate::layout) fn page_layer_precedence_rank(
-    layer_order: Option<usize>,
+fn compare_page_cascade_keys(left: &PageCascadeKey, right: &PageCascadeKey) -> std::cmp::Ordering {
+    left.origin_rank
+        .cmp(&right.origin_rank)
+        .then_with(|| {
+            compare_layer_order(
+                left.layer_order.as_ref(),
+                right.layer_order.as_ref(),
+                left.important,
+            )
+        })
+        .then_with(|| left.specificity.cmp(&right.specificity))
+        .then_with(|| left.rule_order.cmp(&right.rule_order))
+        .then_with(|| left.declaration_order.cmp(&right.declaration_order))
+}
+
+fn compare_layer_order(
+    left: Option<&LayerOrder>,
+    right: Option<&LayerOrder>,
     important: bool,
-) -> usize {
-    match (important, layer_order) {
-        (false, Some(order)) => order,
-        (false, None) => usize::MAX,
-        (true, None) => 0,
-        (true, Some(order)) => usize::MAX.saturating_sub(1).saturating_sub(order),
+) -> std::cmp::Ordering {
+    match (important, left, right) {
+        (false, Some(left), Some(right)) => left.cmp(right),
+        (false, Some(_), None) => std::cmp::Ordering::Less,
+        (false, None, Some(_)) => std::cmp::Ordering::Greater,
+        (false, None, None) => std::cmp::Ordering::Equal,
+        (true, Some(left), Some(right)) => right.cmp(left),
+        (true, Some(_), None) => std::cmp::Ordering::Greater,
+        (true, None, Some(_)) => std::cmp::Ordering::Less,
+        (true, None, None) => std::cmp::Ordering::Equal,
     }
 }
 

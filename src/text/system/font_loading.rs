@@ -897,25 +897,21 @@ fn font_families_for_style(
     weight: FontWeight,
 ) -> Cow<'_, [FontiqueQueryFamily<'_>]> {
     match family {
-        FontFamily::Names(names) => {
+        FontFamily::Named(name) => {
             // A quoted generic-looking name is still a named family in CSS.
             // Do not turn `"serif"` or `"fantasy"` back into a generic while
             // matching the concrete font selected by Parley.
-            Cow::Owned(
-                names
-                    .iter()
-                    .map(|name| FontiqueQueryFamily::Named(fontique_family_name(name)))
-                    .collect(),
-            )
+            Cow::Owned(vec![FontiqueQueryFamily::Named(fontique_family_name(
+                name.as_str(),
+            ))])
         }
         FontFamily::List(families) => Cow::Owned(
             families
                 .iter()
                 .flat_map(|family| match family {
-                    FontFamily::Names(names) => names
-                        .iter()
-                        .map(|name| FontiqueQueryFamily::Named(fontique_family_name(name)))
-                        .collect::<Vec<_>>(),
+                    FontFamily::Named(name) => vec![FontiqueQueryFamily::Named(
+                        fontique_family_name(name.as_str()),
+                    )],
                     generic => generic_query_families(generic, weight)
                         .unwrap_or(&[])
                         .to_vec(),

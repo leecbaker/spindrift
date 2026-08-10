@@ -1,15 +1,17 @@
 use crate::dom::{Element, ElementId};
 use crate::image_store::{DocumentImageStore, ImageId, ImageMetadata};
 use crate::svg::{
-    SharedSvgAsset, SvgPresentationOverrides, parse_inline_svg_with_presentation_overrides,
-    parse_svg_bytes,
+    SharedSvgAsset, SvgImageContext, SvgPresentationOverrides,
+    parse_inline_svg_with_presentation_overrides, parse_svg_bytes_with_image_context,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -23,9 +25,23 @@ use url::Url;
 /// optional stylesheet and font failures; it never makes a primary HTML or
 /// explicitly supplied stylesheet source optional.
 ///
-/// ```
-/// let policy = quire::FetchErrorPolicy::Allow;
-/// assert_eq!(policy, quire::FetchErrorPolicy::Allow);
+/// ```no_run
+/// use quire::{FetchErrorPolicy, Html, PdfOptions, RenderOptions, ResourcePolicy};
+/// use std::fs::File;
+///
+/// # async fn render() -> quire::Result<()> {
+/// let resource_policy = ResourcePolicy {
+///     error_policy: FetchErrorPolicy::Allow,
+///     ..ResourcePolicy::default()
+/// };
+/// let html = Html::from_file("document.html")
+///     .await?
+///     .with_resource_policy(resource_policy);
+/// let mut output = File::create("document.pdf")?;
+/// html.write_pdf(&mut output, &RenderOptions::default(), &PdfOptions::default())
+///     .await?;
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FetchErrorPolicy {
@@ -36,23 +52,130 @@ pub enum FetchErrorPolicy {
     Allow,
 }
 
+/// A non-zero time limit for a single HTTP(S) resource request.
+///
+/// The limit covers sending the request and receiving its response body. It
+/// does not apply to `data:` or `file:` resources.
+///
+/// ```no_run
+/// use quire::{Html, HttpRequestTimeout, PdfOptions, RenderOptions, ResourcePolicy};
+/// use std::{fs::File, time::Duration};
+///
+/// # async fn render() -> quire::Result<()> {
+/// let resource_policy = ResourcePolicy {
+///     http_timeout: HttpRequestTimeout::try_from(Duration::from_secs(5))
+///         .expect("five seconds is non-zero"),
+///     ..ResourcePolicy::default()
+/// };
+/// let html = Html::from_file("document.html")
+///     .await?
+///     .with_resource_policy(resource_policy);
+/// let mut output = File::create("document.pdf")?;
+/// html.write_pdf(&mut output, &RenderOptions::default(), &PdfOptions::default())
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HttpRequestTimeout(Duration);
+
+impl HttpRequestTimeout {
+    /// The ten-second HTTP request limit used by [`ResourcePolicy::default`].
+    pub const DEFAULT: Self = Self(Duration::from_secs(10));
+
+    /// Returns the duration enforced for an HTTP(S) request.
+    pub const fn duration(self) -> Duration {
+        self.0
+    }
+}
+
+impl Default for HttpRequestTimeout {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl TryFrom<Duration> for HttpRequestTimeout {
+    type Error = InvalidHttpRequestTimeout;
+
+    /// Rejects a zero duration, which would make every HTTP request time out
+    /// immediately.
+    fn try_from(duration: Duration) -> Result<Self, Self::Error> {
+        if duration.is_zero() {
+            Err(InvalidHttpRequestTimeout)
+        } else {
+            Ok(Self(duration))
+        }
+    }
+}
+
+/// Error returned when constructing an [`HttpRequestTimeout`] from zero.
+///
+/// ```no_run
+/// use quire::{
+///     Error, Html, HttpRequestTimeout, InvalidHttpRequestTimeout, PdfOptions, RenderOptions,
+///     ResourcePolicy,
+/// };
+/// use std::{fs::File, time::Duration};
+///
+/// # async fn render() -> quire::Result<()> {
+/// let timeout = HttpRequestTimeout::try_from(Duration::from_secs(5))
+///     .map_err(|error: InvalidHttpRequestTimeout| Error::InvalidInput(error.to_string()))?;
+/// let html = Html::from_file("document.html")
+///     .await?
+///     .with_resource_policy(ResourcePolicy {
+///         http_timeout: timeout,
+///         ..ResourcePolicy::default()
+///     });
+/// let mut output = File::create("document.pdf")?;
+/// html.write_pdf(&mut output, &RenderOptions::default(), &PdfOptions::default())
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidHttpRequestTimeout;
+
+impl fmt::Display for InvalidHttpRequestTimeout {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HTTP request timeout must be greater than zero")
+    }
+}
+
+impl std::error::Error for InvalidHttpRequestTimeout {}
+
 /// Policy used for filesystem and HTTP(S) document resources.
 ///
 /// HTTP redirects are followed by default. Primary resources are fatal by
 /// default, unlike WeasyPrint's permissive URL fetcher; HTML image/background
 /// preloads always recover as unavailable visual assets.
 ///
-/// ```
-/// let policy = quire::ResourcePolicy {
+/// ```no_run
+/// use quire::{Html, HttpRequestTimeout, PdfOptions, RenderOptions, ResourcePolicy};
+/// use std::{fs::File, time::Duration};
+///
+/// # async fn render() -> quire::Result<()> {
+/// let resource_policy = ResourcePolicy {
 ///     follow_http_redirects: false,
-///     error_policy: quire::FetchErrorPolicy::Fail,
+///     http_timeout: HttpRequestTimeout::try_from(Duration::from_secs(5))
+///         .expect("five seconds is non-zero"),
+///     ..ResourcePolicy::default()
 /// };
-/// assert!(!policy.follow_http_redirects);
+/// let html = Html::from_file("document.html")
+///     .await?
+///     .with_resource_policy(resource_policy);
+/// let mut output = File::create("document.pdf")?;
+/// html.write_pdf(&mut output, &RenderOptions::default(), &PdfOptions::default())
+///     .await?;
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResourcePolicy {
     /// Whether HTTP(S) fetches follow redirects.
     pub follow_http_redirects: bool,
+    /// The non-zero time limit for each HTTP(S) resource request.
+    pub http_timeout: HttpRequestTimeout,
     /// How fetch failures affect rendering.
     pub error_policy: FetchErrorPolicy,
 }
@@ -61,6 +184,7 @@ impl Default for ResourcePolicy {
     fn default() -> Self {
         Self {
             follow_http_redirects: true,
+            http_timeout: HttpRequestTimeout::DEFAULT,
             error_policy: FetchErrorPolicy::Fail,
         }
     }
@@ -97,6 +221,7 @@ impl ResourceFetcher {
             };
             let http_client = reqwest::Client::builder()
                 .redirect(redirect)
+                .timeout(policy.http_timeout.duration())
                 .build()
                 .map_err(|error| {
                     crate::Error::InvalidInput(format!(
@@ -281,10 +406,11 @@ pub(crate) struct ResourceCache {
     /// measurement layout. They let nested browsing contexts lay out against
     /// their actual embedding viewport on the final pass.
     iframe_viewports: RefCell<HashMap<ElementId, (f32, f32)>>,
-    image_assets: RefCell<HashMap<Url, Option<ResourceImageAsset>>>,
-    oriented_image_assets: RefCell<HashMap<Url, Option<ResourceImageAsset>>>,
-    data_image_assets: RefCell<HashMap<String, Option<ResourceImageAsset>>>,
-    oriented_data_image_assets: RefCell<HashMap<String, Option<ResourceImageAsset>>>,
+    image_assets: RefCell<HashMap<(Url, SvgImageContext), Option<ResourceImageAsset>>>,
+    oriented_image_assets: RefCell<HashMap<(Url, SvgImageContext), Option<ResourceImageAsset>>>,
+    data_image_assets: RefCell<HashMap<(String, SvgImageContext), Option<ResourceImageAsset>>>,
+    oriented_data_image_assets:
+        RefCell<HashMap<(String, SvgImageContext), Option<ResourceImageAsset>>>,
     placeholder_rgb: Rc<[u8]>,
 }
 
@@ -472,6 +598,7 @@ impl ResourceCache {
         &self,
         url: &Url,
         apply_orientation: bool,
+        image_context: SvgImageContext,
     ) -> Option<ResourceImageAsset> {
         let url = fetch_url(url)?;
         let assets = if apply_orientation {
@@ -479,11 +606,12 @@ impl ResourceCache {
         } else {
             &self.image_assets
         };
-        if let Some(asset) = assets.borrow().get(&url) {
+        let cache_key = (url.clone(), image_context);
+        if let Some(asset) = assets.borrow().get(&cache_key) {
             return asset.clone();
         }
         let asset = self.bytes.get(&url).cloned().and_then(|bytes| {
-            parse_svg_bytes(&bytes)
+            parse_svg_bytes_with_image_context(&bytes, image_context)
                 .map(|asset| ResourceImageAsset::Svg(Rc::new(asset)))
                 .ok()
                 .or_else(|| {
@@ -500,7 +628,7 @@ impl ResourceCache {
                         })
                 })
         });
-        assets.borrow_mut().insert(url, asset.clone());
+        assets.borrow_mut().insert(cache_key, asset.clone());
         asset
     }
 
@@ -508,13 +636,15 @@ impl ResourceCache {
         &self,
         source: &str,
         apply_orientation: bool,
+        image_context: SvgImageContext,
     ) -> Option<ResourceImageAsset> {
         let assets = if apply_orientation {
             &self.oriented_data_image_assets
         } else {
             &self.data_image_assets
         };
-        if let Some(asset) = assets.borrow().get(source) {
+        let cache_key = (source.to_owned(), image_context);
+        if let Some(asset) = assets.borrow().get(&cache_key) {
             return asset.clone();
         }
         let asset = data_url::DataUrl::process(source)
@@ -527,7 +657,7 @@ impl ResourceCache {
             .and_then(|(is_svg, bytes)| {
                 let bytes: Rc<[u8]> = Rc::from(bytes);
                 if is_svg {
-                    parse_svg_bytes(&bytes)
+                    parse_svg_bytes_with_image_context(&bytes, image_context)
                         .ok()
                         .map(|asset| ResourceImageAsset::Svg(Rc::new(asset)))
                 } else {
@@ -540,7 +670,7 @@ impl ResourceCache {
                         })
                 }
             });
-        assets.borrow_mut().insert(source.to_owned(), asset.clone());
+        assets.borrow_mut().insert(cache_key, asset.clone());
         asset
     }
 
@@ -756,8 +886,36 @@ mod tests {
         let policy = ResourcePolicy::default();
 
         assert!(policy.follow_http_redirects);
+        assert_eq!(policy.http_timeout, HttpRequestTimeout::DEFAULT);
+        assert_eq!(
+            policy.http_timeout.duration(),
+            std::time::Duration::from_secs(10)
+        );
         assert_eq!(policy.error_policy, FetchErrorPolicy::Fail);
         assert_eq!(FetchErrorPolicy::default(), FetchErrorPolicy::Fail);
+    }
+
+    #[test]
+    fn http_request_timeout_rejects_zero_duration() {
+        assert_eq!(
+            HttpRequestTimeout::try_from(std::time::Duration::ZERO),
+            Err(InvalidHttpRequestTimeout)
+        );
+    }
+
+    #[test]
+    fn resource_fetcher_preserves_http_request_timeout() {
+        let fetcher = ResourceFetcher::new(ResourcePolicy {
+            http_timeout: HttpRequestTimeout::try_from(std::time::Duration::from_millis(20))
+                .unwrap(),
+            ..ResourcePolicy::default()
+        })
+        .unwrap();
+
+        assert_eq!(
+            fetcher.policy().http_timeout.duration(),
+            std::time::Duration::from_millis(20)
+        );
     }
 
     #[tokio::test]
@@ -870,5 +1028,48 @@ mod tests {
                 .all(|url| url.origin() == parent.origin())
         );
         assert!(dependencies.iter().all(|url| url.fragment().is_none()));
+    }
+
+    #[test]
+    fn svg_image_cache_keeps_color_scheme_variants_separate() {
+        let mut cache = ResourceCache::default();
+        let url = Url::parse("https://example.test/image.svg").unwrap();
+        cache.bytes.insert(
+            url.clone(),
+            Arc::new(
+                br#"<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><style>:root { color: blue } @media (prefers-color-scheme: dark) { :root { color: purple } }</style><rect width="32" height="32" fill="currentColor"/></svg>"#
+                    .to_vec(),
+            ),
+        );
+        let light = cache
+            .image_asset_url_with_orientation(
+                &url,
+                false,
+                SvgImageContext::from_used_color_scheme(crate::css::UsedColorScheme::Light),
+            )
+            .unwrap();
+        let dark = cache
+            .image_asset_url_with_orientation(
+                &url,
+                false,
+                SvgImageContext::from_used_color_scheme(crate::css::UsedColorScheme::Dark),
+            )
+            .unwrap();
+        let ResourceImageAsset::Svg(light) = light else {
+            panic!("expected SVG image");
+        };
+        let ResourceImageAsset::Svg(dark) = dark else {
+            panic!("expected SVG image");
+        };
+
+        assert_eq!(
+            light.opaque_viewport_fill(),
+            Some(crate::CssColor::new(0, 0, 255))
+        );
+        assert_eq!(
+            dark.opaque_viewport_fill(),
+            Some(crate::CssColor::new(128, 0, 128))
+        );
+        assert!(!Rc::ptr_eq(&light, &dark));
     }
 }

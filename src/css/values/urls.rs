@@ -1,4 +1,5 @@
 use super::*;
+use crate::css::component_values::css_leading_function_matching;
 
 /// Cross-origin mode requested by CSS Values Level 5's `cross-origin()` URL
 /// modifier.
@@ -37,13 +38,27 @@ pub(crate) struct ParsedCssUrl {
 /// <https://drafts.csswg.org/css-backgrounds-3/#the-background> and
 /// <https://drafts.csswg.org/css-values-5/#request-url-modifiers>.
 pub(crate) fn parse_first_css_url_with_modifiers(value: &str) -> Option<ParsedCssUrl> {
-    let mut remaining = trim_css_value(value);
-    while let Some(offset) = find_ascii_url_function(remaining) {
-        remaining = &remaining[offset..];
-        if let Some((url, _)) = parse_css_url_token_with_modifiers(remaining) {
-            return Some(url);
+    let value = trim_css_value(value);
+    let mut input = ParserInput::new(value);
+    let mut parser = Parser::new(&mut input);
+    while !parser.is_exhausted() {
+        let start = parser.position().byte_index();
+        let token = parser
+            .next_including_whitespace_and_comments()
+            .ok()?
+            .clone();
+        match token {
+            cssparser::Token::UnquotedUrl(src) => {
+                return Some(ParsedCssUrl {
+                    src: src.to_string(),
+                    modifiers: RequestUrlModifiers::default(),
+                });
+            }
+            cssparser::Token::Function(name) if name.eq_ignore_ascii_case("url") => {
+                return parse_css_url_token_with_modifiers(&value[start..]).map(|(url, _)| url);
+            }
+            _ => {}
         }
-        remaining = &remaining["url".len()..];
     }
     None
 }
@@ -65,8 +80,7 @@ pub(crate) fn parse_css_url_token_with_modifiers(value: &str) -> Option<(ParsedC
             &value[parser.position().byte_index()..],
         ));
     }
-    let body = strip_ascii_function(value, "url")?;
-    let (arguments, tail) = split_function_argument(body)?;
+    let (arguments, tail) = css_leading_function_matching(value, "url")?;
     let (url, modifiers) = parse_url_source_and_modifiers(arguments)?;
     Some((
         ParsedCssUrl {
@@ -77,46 +91,25 @@ pub(crate) fn parse_css_url_token_with_modifiers(value: &str) -> Option<(ParsedC
     ))
 }
 
-fn find_ascii_url_function(value: &str) -> Option<usize> {
-    for (index, _) in value.char_indices() {
-        let Some(name) = value.get(index..index + 3) else {
-            continue;
-        };
-        if !name.eq_ignore_ascii_case("url")
-            || index > 0 && is_css_ident_continue(value[..index].chars().next_back()?)
-        {
-            continue;
-        }
-        let after_name = value[index + 3..].trim_start();
-        if after_name.starts_with('(') {
-            return Some(index);
-        }
-    }
-    None
-}
-
 fn parse_url_source_and_modifiers(value: &str) -> Option<(String, &str)> {
     let value = value.trim();
     if let Some((url, tail)) = parse_css_string_token(value) {
         return Some((url, tail.trim()));
     }
-    let end = value.find(char::is_whitespace).unwrap_or(value.len());
-    let url = value[..end].trim();
-    (!url.is_empty()).then_some((url.to_string(), value[end..].trim()))
+    let mut input = ParserInput::new(value);
+    let mut parser = Parser::new(&mut input);
+    let url = parser.expect_url().ok()?.to_string();
+    Some((url, value[parser.position().byte_index()..].trim()))
 }
 
-fn parse_request_url_modifiers(mut value: &str) -> Option<RequestUrlModifiers> {
+fn parse_request_url_modifiers(value: &str) -> Option<RequestUrlModifiers> {
     let mut modifiers = RequestUrlModifiers::default();
-    while !value.is_empty() {
-        let name_end = value.find('(')?;
-        let name = value[..name_end].trim();
-        if name.is_empty() || !name.chars().all(is_css_ident_continue) {
-            return None;
-        }
-        let (arguments, tail) = split_function_argument(&value[name_end + 1..])?;
-        let arguments = arguments.trim();
+    for (name, arguments) in crate::css::component_values::css_function_list(value)? {
         if name.eq_ignore_ascii_case("cross-origin") {
-            let mode = match arguments.to_ascii_lowercase().as_str() {
+            let mode = match crate::css::component_values::css_single_ident(arguments)?
+                .to_ascii_lowercase()
+                .as_str()
+            {
                 "anonymous" => CrossOriginRequestMode::Anonymous,
                 "use-credentials" => CrossOriginRequestMode::UseCredentials,
                 _ => return None,
@@ -125,7 +118,7 @@ fn parse_request_url_modifiers(mut value: &str) -> Option<RequestUrlModifiers> {
                 return None;
             }
         } else if name.eq_ignore_ascii_case("integrity") {
-            let (integrity, tail) = parse_css_string_token(arguments)?;
+            let (integrity, tail) = parse_css_string_token(arguments.trim())?;
             if !tail.trim().is_empty() {
                 return None;
             }
@@ -133,7 +126,8 @@ fn parse_request_url_modifiers(mut value: &str) -> Option<RequestUrlModifiers> {
                 return None;
             }
         } else if name.eq_ignore_ascii_case("referrer-policy") {
-            let policy = arguments.to_ascii_lowercase();
+            let policy =
+                crate::css::component_values::css_single_ident(arguments)?.to_ascii_lowercase();
             if !matches!(
                 policy.as_str(),
                 "no-referrer"
@@ -153,7 +147,6 @@ fn parse_request_url_modifiers(mut value: &str) -> Option<RequestUrlModifiers> {
         } else {
             return None;
         }
-        value = tail.trim();
     }
     Some(modifiers)
 }
@@ -187,6 +180,25 @@ mod tests {
         assert!(
             parse_css_url_token(
                 r#"url("image.png" cross-origin(anonymous) cross-origin(use-credentials))"#
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn url_function_and_modifier_names_are_token_decoded() {
+        assert_eq!(
+            parse_css_url_token(r#"\75 rl("image.png" cross-origin(\61 nonymous))"#),
+            Some(("image.png".to_string(), ""))
+        );
+    }
+
+    #[test]
+    fn complete_url_values_do_not_accept_a_valid_prefix() {
+        assert!(
+            parse_css_url_token(
+                r#"url("image.png" integrity("bad
+value"))"#
             )
             .is_none()
         );

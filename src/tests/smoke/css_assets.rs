@@ -522,6 +522,10 @@ async fn corner_shape_bevels_background_fill_clip() {
         "background clipping should follow the CSS Borders 4 bevel contour: {:?}",
         path.commands
     );
+    assert!(
+        path.clip.is_some(),
+        "corner-shaped backgrounds must paint their complete source surface through the contour clip"
+    );
 }
 
 #[tokio::test]
@@ -1164,6 +1168,91 @@ async fn external_svg_url_images_paint_as_vectors_for_img_background_and_border_
 }
 
 #[tokio::test]
+async fn optimized_svg_background_paints_below_the_normal_border() {
+    let document = Html::from_string(format!(
+        "<style>@page {{ size: 120pt 120pt; margin: 0 }} body {{ margin: 0 }} \
+         div {{ width: 80pt; height: 60pt; border: 4pt solid black; \
+         background: url('{GREEN_50X50_SVG}') no-repeat center / cover }}</style><div></div>",
+    ))
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let pdf = document
+        .write_pdf_bytes(&crate::PdfOptions::default())
+        .unwrap();
+    let rendered = pdf_searchable_text(&pdf);
+    let background = rendered
+        .find("0 0.5019608 0 scn")
+        .unwrap_or_else(|| panic!("expected optimized SVG background fill in {rendered}"));
+    let border = rendered
+        .find("0 0 0 scn")
+        .unwrap_or_else(|| panic!("expected normal border fill in {rendered}"));
+
+    assert!(
+        background < border,
+        "the CSS background image must paint below the border: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn uniform_svg_source_underlays_an_opaque_border_clip() {
+    let document = Html::from_string(format!(
+        "<style>@page {{ size: 300pt 650pt; margin: 0 }} body {{ margin: 0 }} \
+         div {{ width: 256px; height: 768px; border: 1px solid black; \
+         background: url('{GREEN_50X50_SVG}') no-repeat center / cover }}</style><div></div>",
+    ))
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let green = filled_rects(page, CssColor::new(0, 128, 0));
+    let black = filled_rects(page, CssColor::BLACK);
+    assert_eq!(
+        black.len(),
+        4,
+        "expected four normal-border strips: {black:?}"
+    );
+    let left = black
+        .iter()
+        .map(|rect| rect.x())
+        .fold(f32::INFINITY, f32::min);
+    let bottom = black
+        .iter()
+        .map(|rect| rect.y())
+        .fold(f32::INFINITY, f32::min);
+    let right = black
+        .iter()
+        .map(|rect| rect.x() + rect.width())
+        .fold(f32::NEG_INFINITY, f32::max);
+    let top = black
+        .iter()
+        .map(|rect| rect.y() + rect.height())
+        .fold(f32::NEG_INFINITY, f32::max);
+
+    let green_left = green
+        .iter()
+        .map(|rect| rect.x())
+        .fold(f32::INFINITY, f32::min);
+    let green_bottom = green
+        .iter()
+        .map(|rect| rect.y())
+        .fold(f32::INFINITY, f32::min);
+    let green_right = green
+        .iter()
+        .map(|rect| rect.x() + rect.width())
+        .fold(f32::NEG_INFINITY, f32::max);
+    let green_top = green
+        .iter()
+        .map(|rect| rect.y() + rect.height())
+        .fold(f32::NEG_INFINITY, f32::max);
+
+    assert!(green_left <= left && green_bottom <= bottom);
+    assert!(green_right >= right && green_top >= top);
+}
+
+#[tokio::test]
 async fn generated_float_svg_background_retains_its_vector_paths() {
     let base_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     let document = Html::from_string(
@@ -1607,15 +1696,11 @@ async fn horizontal_rules_use_generic_per_side_border_painting() {
 
 #[tokio::test]
 async fn hr_size_and_width_presentational_hints_render_with_generic_block_layout() {
-    let options = RenderOptions {
-        presentational_hints: true,
-        ..RenderOptions::default()
-    };
     let document = Html::from_string(
         "<style>@page{size:160pt 100pt;margin:10pt}body{margin:0}</style>\
          <hr size=\"8\" width=\"100\" style=\"margin:0;border:0;background:cyan\">",
     )
-    .render(&options)
+    .render(&RenderOptions::default())
     .await
     .unwrap();
 
@@ -1626,15 +1711,11 @@ async fn hr_size_and_width_presentational_hints_render_with_generic_block_layout
 
 #[tokio::test]
 async fn hr_color_and_size_presentational_hints_render_solid_red_border() {
-    let options = RenderOptions {
-        presentational_hints: true,
-        ..RenderOptions::default()
-    };
     let document = Html::from_string(
         "<style>@page{size:160pt 100pt;margin:10pt}body{margin:0}</style>\
          <hr color=\"red\" size=\"10\" style=\"margin:0;width:20pt\">",
     )
-    .render(&options)
+    .render(&RenderOptions::default())
     .await
     .unwrap();
 

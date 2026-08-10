@@ -816,6 +816,112 @@ fn formatting_whitespace_between_block_children_is_ignored() {
 }
 
 #[test]
+fn inline_table_is_grouped_with_inline_content_between_block_siblings() {
+    let root = dom::parse(
+        "<html><body><div><p>Before</p><table style=\"display:inline-table\"><tr><td>Table</td></tr></table><p>After</p></div></body></html>",
+    );
+    let page = build_test_page(&root, &[]);
+    let div = &page.children[0].children()[0].children()[0];
+
+    assert_eq!(
+        div.children()
+            .iter()
+            .map(FormattingBox::kind)
+            .collect::<Vec<_>>(),
+        vec![
+            FormattingBoxKind::Block,
+            FormattingBoxKind::AnonymousBlock,
+            FormattingBoxKind::Block,
+        ]
+    );
+    let [FormattingBox::AtomicInline(table)] = div.children()[1].children() else {
+        panic!("inline-table must stay in the anonymous inline run");
+    };
+    assert_eq!(table.core.style.display, Display::INLINE_TABLE);
+}
+
+#[test]
+fn root_inline_table_follows_a_block_sibling_in_source_order() {
+    let root = dom::parse(
+        "<html><body><p>Before</p><table style=\"border-collapse:collapse;display:inline-table\"><td>Table</td></table></body></html>",
+    );
+    let page = build_test_page(&root, &[]);
+    let body = &page.children[0].children()[0];
+
+    assert_eq!(
+        body.children()
+            .iter()
+            .map(FormattingBox::kind)
+            .collect::<Vec<_>>(),
+        vec![FormattingBoxKind::Block, FormattingBoxKind::AnonymousBlock]
+    );
+    let [FormattingBox::AtomicInline(table)] = body.children()[1].children() else {
+        panic!("root inline-table must follow the preceding block in an anonymous inline run");
+    };
+    assert_eq!(table.core.style.display, Display::INLINE_TABLE);
+}
+
+#[test]
+fn inline_table_followed_by_block_sibling_keeps_source_order() {
+    let root = dom::parse(
+        "<html><body><div><table style=\"display:inline-table\"><tr><td>Table</td></tr></table><section>After</section></div></body></html>",
+    );
+    let page = build_test_page(&root, &[]);
+    let div = &page.children[0].children()[0].children()[0];
+
+    assert_eq!(
+        div.children()
+            .iter()
+            .map(FormattingBox::kind)
+            .collect::<Vec<_>>(),
+        vec![FormattingBoxKind::AnonymousBlock, FormattingBoxKind::Block]
+    );
+    let [FormattingBox::AtomicInline(table)] = div.children()[0].children() else {
+        panic!("inline-table must precede the following block sibling");
+    };
+    assert_eq!(table.core.style.display, Display::INLINE_TABLE);
+}
+
+#[test]
+fn nested_inline_tables_remain_in_the_atomic_inline_subtree() {
+    let root = dom::parse(
+        "<html><body><div><p>Before</p><table style=\"display:inline-table\"><tr><td><table style=\"display:inline-table\"><tr><td>Inner</td></tr></table></td></tr></table></div></body></html>",
+    );
+    let page = build_test_page(&root, &[]);
+    let div = &page.children[0].children()[0].children()[0];
+
+    assert_eq!(div.children()[0].kind(), FormattingBoxKind::Block);
+    assert_eq!(div.children()[1].kind(), FormattingBoxKind::AnonymousBlock);
+    assert_eq!(
+        count_inline_table_atoms(&div.children()[1]),
+        2,
+        "the nested table must remain inside the outer inline-table paint subtree"
+    );
+}
+
+#[test]
+fn relatively_positioned_inline_table_remains_an_inline_level_box() {
+    let root = dom::parse(
+        "<html><body><div><p>Before</p><table style=\"display:inline-table;position:relative\"><tr><td>Table</td></tr></table></div></body></html>",
+    );
+    let page = build_test_page(&root, &[]);
+    let div = &page.children[0].children()[0].children()[0];
+
+    assert_eq!(
+        div.children()
+            .iter()
+            .map(FormattingBox::kind)
+            .collect::<Vec<_>>(),
+        vec![FormattingBoxKind::Block, FormattingBoxKind::AnonymousBlock]
+    );
+    let [FormattingBox::AtomicInline(table)] = div.children()[1].children() else {
+        panic!("relatively positioned inline-table must remain inline-level");
+    };
+    assert_eq!(table.core.style.display, Display::INLINE_TABLE);
+    assert_eq!(table.core.style.position, Position::Relative);
+}
+
+#[test]
 fn pure_inline_content_keeps_inline_and_text_boxes() {
     let root = dom::parse("<html><body><p>Hello <em>world</em></p></body></html>");
     let page = build_test_page(&root, &[]);
@@ -829,6 +935,19 @@ fn pure_inline_content_keeps_inline_and_text_boxes() {
             .collect::<Vec<_>>(),
         vec![FormattingBoxKind::Text, FormattingBoxKind::Inline]
     );
+}
+
+fn count_inline_table_atoms(box_: &FormattingBox<'_>) -> usize {
+    let own = matches!(
+        box_,
+        FormattingBox::AtomicInline(table)
+            if table.core.style.display == Display::INLINE_TABLE
+    ) as usize;
+    own + box_
+        .children()
+        .iter()
+        .map(count_inline_table_atoms)
+        .sum::<usize>()
 }
 
 #[test]
@@ -1160,7 +1279,10 @@ fn anonymous_blocks_reset_non_inherited_parent_properties() {
         assert_eq!(style.margin, Edges::ZERO);
         assert_eq!(style.padding, Edges::ZERO);
         assert_eq!(style.border_widths, Edges::ZERO);
-        assert_eq!(style.background_color.color(), Some(CssColor::TRANSPARENT));
+        assert_eq!(
+            style.background.background_color.color(),
+            Some(CssColor::TRANSPARENT)
+        );
         assert!(style.box_values.width.is_auto());
         assert_eq!(style.position, Position::Static);
         assert_eq!(style.float, Float::None);
@@ -1182,7 +1304,7 @@ fn text_nodes_inherit_only_inherited_properties() {
     assert_eq!(text.style.color, CssColor::new(255, 0, 0));
     assert_eq!(text.style.writing_mode, WritingMode::VerticalRl);
     assert_eq!(
-        text.style.background_color.color(),
+        text.style.background.background_color.color(),
         Some(CssColor::TRANSPARENT)
     );
     assert!(text.style.box_values.width.is_auto());
@@ -1720,6 +1842,73 @@ fn table_box_contains_durable_fragment_rows_columns_and_captions() {
 }
 
 #[test]
+fn table_fragment_appends_missing_cells_for_declared_columns() {
+    let root = dom::parse(
+        "<html><body><table><colgroup><col style=\"width: 20px\"><col style=\"width: 20px\"><col style=\"width: 20px\"><col style=\"width: 20px\"></colgroup><tbody><tr><td>A</td><td>B</td></tr></tbody></table></body></html>",
+    );
+    let page = build_test_page(&root, &[]);
+    let table = &page.children[0].children()[0].children()[0];
+
+    let FormattingBox::Table(table) = table else {
+        panic!("expected table formatting box");
+    };
+    let [row] = table.fragment.rows.as_slice() else {
+        panic!("expected one table row");
+    };
+    assert_eq!(table.fragment.grid.column_count, 4);
+    assert_eq!(row.cells.len(), 4);
+    assert!(!row.cells[0].anonymous && !row.cells[1].anonymous);
+    assert!(row.cells[2].anonymous && row.cells[3].anonymous);
+    assert_eq!(table.fragment.grid.rows[0][2].column, 2);
+    assert_eq!(table.fragment.grid.rows[0][3].column, 3);
+}
+
+#[test]
+fn html_table_cells_retain_nth_of_type_style_through_fragment_construction() {
+    // This uses the compact HTML from the CSS Text full-size-kana WPT: HTML
+    // parsing must infer the tbody and close each omitted td end tag without
+    // changing the td source-sibling context used by :nth-of-type().
+    let root = dom::parse("<html><body><table><tr><td>ｧ<td>ｧ<td>ｱ</table></body></html>");
+    let stylesheet = css::parse_stylesheet(&Css::from_string(
+        "td:nth-of-type(2) { text-transform: full-size-kana }",
+    ));
+    let page = build_test_page(&root, &[stylesheet]);
+    let table = &page.children[0].children()[0].children()[0];
+
+    let FormattingBox::Table(table) = table else {
+        panic!("expected table formatting box");
+    };
+    let [row] = table.fragment.rows.as_slice() else {
+        panic!("expected one table row");
+    };
+    assert_eq!(row.cells.len(), 3);
+    assert!(
+        !row.cells[0]
+            .style
+            .as_ref()
+            .expect("first cell style should be preserved")
+            .text_transform
+            .applies_full_size_kana()
+    );
+    assert!(
+        row.cells[1]
+            .style
+            .as_ref()
+            .expect("second cell style should be preserved")
+            .text_transform
+            .applies_full_size_kana()
+    );
+    assert!(
+        !row.cells[2]
+            .style
+            .as_ref()
+            .expect("third cell style should be preserved")
+            .text_transform
+            .applies_full_size_kana()
+    );
+}
+
+#[test]
 fn table_fragment_clamps_html_span_attributes() {
     let root = dom::parse(
         "<html><body><table><colgroup span=\"1001px\"></colgroup><tr><td colspan=\"1001px\">A</td></tr><tr><td rowspan=\"999999999999999999999999px\">B</td><td>C</td></tr></table></body></html>",
@@ -1959,12 +2148,24 @@ fn display_contents_inside_table_flattens_children_with_inherited_style() {
     assert!(!table.core.style.border_spacing.is_author_declared());
     assert_eq!(table.fragment.rows.len(), 3);
     assert_eq!(table.fragment.rows[0].cells.len(), 3);
-    assert_eq!(table.fragment.rows[1].cells.len(), 1);
-    assert_eq!(table.fragment.rows[2].cells.len(), 1);
+    // Missing-cells fixup completes every row to the table grid's three
+    // columns. The final two slots in each one-cell row are anonymous,
+    // empty cells rather than absent geometry.
+    assert_eq!(table.fragment.rows[1].cells.len(), 3);
+    assert_eq!(table.fragment.rows[2].cells.len(), 3);
+    for row in &table.fragment.rows[1..] {
+        assert!(
+            row.cells[1..]
+                .iter()
+                .all(|cell| cell.anonymous && cell.children.is_empty())
+        );
+    }
 
     for row in &table.fragment.rows {
         for cell in &row.cells {
-            assert_eq!(cell.children[0].style().color, CssColor::new(0, 128, 0));
+            if let Some(child) = cell.children.first() {
+                assert_eq!(child.style().color, CssColor::new(0, 128, 0));
+            }
         }
     }
 }
@@ -2076,9 +2277,10 @@ fn table_fragment_preserves_authored_empty_rows() {
         panic!("expected table formatting box");
     };
     assert_eq!(table.fragment.rows.len(), 3);
-    assert_eq!(table.fragment.rows[1].cells.len(), 0);
+    assert_eq!(table.fragment.rows[1].cells.len(), 1);
+    assert!(table.fragment.rows[1].cells[0].anonymous);
     assert_eq!(table.fragment.grid.rows.len(), 3);
-    assert_eq!(table.fragment.grid.rows[1].len(), 0);
+    assert_eq!(table.fragment.grid.rows[1].len(), 1);
 }
 
 #[test]

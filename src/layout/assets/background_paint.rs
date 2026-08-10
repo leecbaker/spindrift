@@ -2,6 +2,57 @@ use super::*;
 use crate::document::paint::patterns::PaintPatternTiling;
 use std::rc::Rc;
 
+/// Resolved CSS background-image primitives plus their decoration-phase
+/// eligibility.
+///
+/// CSS Backgrounds paints images below borders. An opaque square normal
+/// border completely hides its border-area background, so normal box painting
+/// may first resolve that hidden area away. A finite no-repeat image then has
+/// only a zero-area boundary in common with the border, and PDF antialiasing
+/// can deterministically assign that edge to the image phase.
+/// <https://www.w3.org/TR/css-backgrounds-3/#the-background-clip>
+#[derive(Debug)]
+pub(in crate::layout) struct ResolvedBackgroundImagePaint {
+    pub(in crate::layout) primitives: Vec<PaintPrimitive>,
+    pub(in crate::layout) border_disjoint_tile_geometry: bool,
+}
+
+#[derive(Debug)]
+struct BackgroundImagePhaseEligibility {
+    has_image_layer: bool,
+    every_image_layer_is_border_disjoint: bool,
+}
+
+impl Default for BackgroundImagePhaseEligibility {
+    fn default() -> Self {
+        Self {
+            has_image_layer: false,
+            every_image_layer_is_border_disjoint: true,
+        }
+    }
+}
+
+impl BackgroundImagePhaseEligibility {
+    fn note_tile(
+        &mut self,
+        padding_clip: Option<PaintBackgroundArea>,
+        tile: &ResolvedBackgroundTile,
+    ) {
+        self.has_image_layer = true;
+        self.every_image_layer_is_border_disjoint &=
+            padding_clip.is_some_and(|padding| finite_no_repeat_tile_is_inside(tile, padding));
+    }
+
+    fn disqualify(&mut self) {
+        self.has_image_layer = true;
+        self.every_image_layer_is_border_disjoint = false;
+    }
+
+    fn finish(self) -> bool {
+        self.has_image_layer && self.every_image_layer_is_border_disjoint
+    }
+}
+
 /// Resolves and tiles a CSS background image layer for any box-like area.
 ///
 /// CSS Backgrounds and Borders defines background image sizing, positioning,
@@ -17,7 +68,7 @@ pub(in crate::layout) fn background_image_primitives_for_style(
     fallback_root_url: Option<&url::Url>,
     resource_cache: &ResourceCache,
 ) -> Vec<PaintPrimitive> {
-    background_image_primitives_for_style_with_paint_areas_and_fixed_positioning_area(
+    background_image_paint_for_style_with_paint_areas_and_fixed_positioning_area(
         area,
         area,
         None,
@@ -27,6 +78,7 @@ pub(in crate::layout) fn background_image_primitives_for_style(
         fallback_root_url,
         resource_cache,
     )
+    .primitives
 }
 
 pub(in crate::layout) fn background_image_primitives_for_style_with_paint_areas(
@@ -37,7 +89,7 @@ pub(in crate::layout) fn background_image_primitives_for_style_with_paint_areas(
     fallback_root_url: Option<&url::Url>,
     resource_cache: &ResourceCache,
 ) -> Vec<PaintPrimitive> {
-    background_image_primitives_for_style_with_paint_areas_and_fixed_positioning_area(
+    background_image_paint_for_style_with_paint_areas_and_fixed_positioning_area(
         positioning_border_area,
         clip_border_area,
         None,
@@ -47,6 +99,7 @@ pub(in crate::layout) fn background_image_primitives_for_style_with_paint_areas(
         fallback_root_url,
         resource_cache,
     )
+    .primitives
 }
 
 /// Paint a structural table background image without assuming a separate
@@ -76,8 +129,9 @@ pub(in crate::layout) fn structural_table_background_image_primitives(
         resource_cache,
         true,
         false,
-        true,
+        false,
     )
+    .primitives
 }
 
 /// Resolve a table-root background across an internal sliced fragment edge.
@@ -105,6 +159,7 @@ pub(in crate::layout) fn fragmented_table_root_background_image_primitives(
         true,
         false,
     )
+    .primitives
 }
 
 /// Resolves background layers with a viewport-equivalent positioning area for
@@ -126,6 +181,32 @@ pub(in crate::layout) fn background_image_primitives_for_style_with_paint_areas_
     fallback_root_url: Option<&url::Url>,
     resource_cache: &ResourceCache,
 ) -> Vec<PaintPrimitive> {
+    background_image_paint_for_style_with_paint_areas_and_fixed_positioning_area(
+        positioning_border_area,
+        clip_border_area,
+        fixed_positioning_area,
+        fixed_attachment_is_scrolled_by_transform,
+        style,
+        fallback_base_url,
+        fallback_root_url,
+        resource_cache,
+    )
+    .primitives
+}
+
+/// Resolve CSS image primitives and retain the physical tile relationship
+/// needed by normal-box decoration phases.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::layout) fn background_image_paint_for_style_with_paint_areas_and_fixed_positioning_area(
+    positioning_border_area: PaintBackgroundArea,
+    clip_border_area: PaintBackgroundArea,
+    fixed_positioning_area: Option<PaintBackgroundArea>,
+    fixed_attachment_is_scrolled_by_transform: bool,
+    style: &ComputedStyle,
+    fallback_base_url: Option<&url::Url>,
+    fallback_root_url: Option<&url::Url>,
+    resource_cache: &ResourceCache,
+) -> ResolvedBackgroundImagePaint {
     background_image_primitives_for_style_impl(
         BackgroundPaintAreas {
             positioning_border_area,
@@ -143,6 +224,7 @@ pub(in crate::layout) fn background_image_primitives_for_style_with_paint_areas_
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn background_image_primitives_for_style_impl(
     paint_areas: BackgroundPaintAreas<PaintSpace>,
     style: &ComputedStyle,
@@ -151,8 +233,8 @@ fn background_image_primitives_for_style_impl(
     resource_cache: &ResourceCache,
     use_pdf_patterns_for_repeated_images: bool,
     box_decoration_paints_vector_gradients: bool,
-    allow_border_box_occlusion_optimization: bool,
-) -> Vec<PaintPrimitive> {
+    collect_border_disjoint_phase_eligibility: bool,
+) -> ResolvedBackgroundImagePaint {
     let BackgroundPaintAreas {
         positioning_border_area,
         clip_border_area,
@@ -160,6 +242,7 @@ fn background_image_primitives_for_style_impl(
         fixed_attachment_is_scrolled_by_transform,
     } = paint_areas;
     let mut primitives = Vec::new();
+    let mut phase_eligibility = BackgroundImagePhaseEligibility::default();
     for layer in background_layers_for_paint(style).iter().rev() {
         let positioning_area = background_positioning_area_for_layer(
             positioning_border_area,
@@ -168,14 +251,11 @@ fn background_image_primitives_for_style_impl(
             style,
             layer,
         );
-        let clip_box = if allow_border_box_occlusion_optimization
-            && background_border_box_paint_is_occluded(style, layer.clip)
-        {
-            css::BackgroundBox::Padding
-        } else {
-            layer.clip
-        };
-        let clip_area = background_paint_area_for_box(clip_border_area, style, clip_box);
+        // This remains the CSS painting area.  The padding-box rectangle is
+        // consulted separately below as a PDF phase-eligibility probe; it
+        // must never substitute for `background-clip: border-box`.
+        let resolved_clip = layer.clip;
+        let clip_area = background_paint_area_for_box(clip_border_area, style, resolved_clip);
         let rounded_clip = rounded_background_clip_for_box(
             paint_space_rect(
                 clip_border_area.x(),
@@ -185,8 +265,12 @@ fn background_image_primitives_for_style_impl(
             ),
             style,
             used_border_widths(style),
-            clip_box,
+            resolved_clip,
         );
+        let padding_clip_for_phase = (collect_border_disjoint_phase_eligibility
+            && layer.clip == css::BackgroundBox::Border
+            && has_opaque_square_normal_border(style))
+        .then(|| background_paint_area_for_box(clip_border_area, style, css::BackgroundBox::Padding));
         let color_image = match layer.image.as_image().map(BackgroundImage::selected_image) {
             Some(BackgroundImage::CssColor(color)) => Some(color.resolve(style.color)),
             _ => None,
@@ -203,14 +287,16 @@ fn background_image_primitives_for_style_impl(
                 root_url.as_ref().or(fallback_root_url),
                 resource_cache,
                 raster_image_interpolation(style),
+                crate::svg::SvgImageContext::from_used_color_scheme(style.used_color_scheme),
                 request_modifiers,
             )
         {
             let image_size = used_svg_background_layer_size(&asset, layer, positioning_area.size());
             if image_size.width <= 0.0 || image_size.height <= 0.0 {
+                phase_eligibility.disqualify();
                 continue;
             }
-            let asset = Rc::new(asset.with_background_viewport(image_size));
+            let asset = Rc::new(asset.with_css_image_viewport(image_size));
             let tile = ResolvedBackgroundTile::new(
                 positioning_area,
                 clip_area,
@@ -218,23 +304,67 @@ fn background_image_primitives_for_style_impl(
                 layer,
                 image_size,
             );
+            // A finite tile wholly inside the padding box has no CSS-visible
+            // overlap with the border.  It uses the established post-border
+            // replay path; backing is exclusively for cover tiles that still
+            // need a continuation beneath the border clip.
+            let border_disjoint_tile = padding_clip_for_phase
+                .is_some_and(|padding| finite_no_repeat_tile_is_inside(&tile, padding));
+            phase_eligibility.note_tile(padding_clip_for_phase, &tile);
+            if let Some(slice) = non_repeating_svg_visible_area(&asset, &tile) {
+                let viewport_fill = asset.opaque_viewport_fill();
+                if !border_disjoint_tile
+                    && let Some(backing) = PdfOpaqueBorderBacking::new(style, layer, &tile, slice)
+                {
+                    // Backing belongs below the normal border, so this layer
+                    // cannot take the border-disjoint post-border replay.
+                    phase_eligibility.disqualify();
+                    append_svg_border_backing_primitives(
+                        &mut primitives,
+                        &asset,
+                        viewport_fill,
+                        backing,
+                        tile.rounded_clip.as_ref(),
+                    );
+                }
+                if let Some(color) =
+                    viewport_fill.or_else(|| asset.opaque_source_rect_fill(slice.source))
+                {
+                    // A spatially uniform visible image has the same PDF
+                    // edge coverage as the normal CSS background-color
+                    // reference path. Keep it in the ordinary under-border
+                    // phase; only non-uniform finite images need the
+                    // deterministic padding-edge replay.
+                    phase_eligibility.disqualify();
+                    primitives.push(uniform_background_rect_primitive(
+                        slice.destination_area,
+                        color,
+                        tile.rounded_clip.clone(),
+                    ));
+                } else {
+                    // A non-repeating SVG tile has one finite visible area.
+                    // Crop its root source viewport before producing PDF paths
+                    // instead of clipping the full tile with a second PDF
+                    // rectangle. That preserves CSS background-clip while
+                    // avoiding an antialiased seam at the crop edge.
+                    for mut path in asset.paint_paths_for_source_rect(
+                        slice.destination_area.paint_rect(),
+                        slice.source,
+                    ) {
+                        append_rounded_background_clip(&mut path, tile.rounded_clip.as_ref());
+                        primitives.push(PaintPrimitive::Path(path));
+                    }
+                }
+                continue;
+            }
             if let Some(color) = asset.opaque_viewport_fill() {
                 // A uniformly opaque SVG is geometrically equivalent to a
                 // `image(<color>)` layer. Reuse the color-image painter so
                 // repeat coalescing and CSS clipping remain identical while
                 // avoiding unbounded vector coordinates from extreme SVG
                 // viewBoxes.
+                phase_eligibility.disqualify();
                 append_color_image_primitives(&mut primitives, color, &tile);
-                continue;
-            }
-            if let Some((visible_area, source)) = non_repeating_svg_visible_area(&asset, &tile)
-                && let Some(color) = asset.opaque_source_rect_fill(source)
-            {
-                primitives.push(uniform_background_rect_primitive(
-                    visible_area,
-                    color,
-                    tile.rounded_clip.clone(),
-                ));
                 continue;
             }
             // A repeated SVG is one reusable vector cell.  Expanding it into
@@ -309,20 +439,7 @@ fn background_image_primitives_for_style_impl(
                             ));
                         }
                     }
-                    if let Some(rounded_clip) = &tile.rounded_clip {
-                        let clip = path.clip.get_or_insert_with(|| rounded_clip.clone());
-                        // A rounded background clip intersects (rather than
-                        // replaces) an SVG root or CSS rectangular clip.
-                        // The direct clone above is already the only clip.
-                        if !clip.commands.eq(&rounded_clip.commands)
-                            || clip.fill_rule != rounded_clip.fill_rule
-                        {
-                            clip.additional_clips.push(RenderedPathClipPath::new(
-                                rounded_clip.commands.clone(),
-                                rounded_clip.fill_rule,
-                            ));
-                        }
-                    }
+                    append_rounded_background_clip(&mut path, tile.rounded_clip.as_ref());
                     primitives.push(PaintPrimitive::Path(path));
                 }
             }
@@ -360,11 +477,13 @@ fn background_image_primitives_for_style_impl(
             used_generated_background_layer_size(layer, positioning_area.size())
         } else {
             let Some(decoded) = decoded_for_size.as_ref() else {
+                phase_eligibility.disqualify();
                 continue;
             };
             used_background_layer_size(decoded, layer, positioning_area.size())
         };
         if image_size.width <= 0.0 || image_size.height <= 0.0 {
+            phase_eligibility.disqualify();
             continue;
         }
         let tile = ResolvedBackgroundTile::new(
@@ -374,6 +493,7 @@ fn background_image_primitives_for_style_impl(
             layer,
             image_size,
         );
+        phase_eligibility.note_tile(padding_clip_for_phase, &tile);
         // The box-decoration painter already emits this subset as exact
         // vector bands. Keeping it out of the generic image path prevents a
         // second paint of the same CSS layer.
@@ -383,13 +503,16 @@ fn background_image_primitives_for_style_impl(
                 gradient, layer, tile.size,
             ))
         {
+            phase_eligibility.disqualify();
             continue;
         }
         if let Some(color) = color_image {
+            phase_eligibility.disqualify();
             append_color_image_primitives(&mut primitives, color, &tile);
             continue;
         }
         if let Some(color) = uniform_gradient_color(selected_image, style.color) {
+            phase_eligibility.disqualify();
             append_color_image_primitives(&mut primitives, color, &tile);
             continue;
         }
@@ -452,6 +575,7 @@ fn background_image_primitives_for_style_impl(
             // vector path as `image(<color>)`: this preserves repetition and
             // `background-clip` while avoiding PDF pattern-edge coverage
             // differences from its equivalent CSS color.
+            phase_eligibility.disqualify();
             append_color_image_primitives(&mut primitives, color, &tile);
             continue;
         }
@@ -552,7 +676,30 @@ fn background_image_primitives_for_style_impl(
             }
         }
     }
-    primitives
+    ResolvedBackgroundImagePaint {
+        primitives,
+        border_disjoint_tile_geometry: phase_eligibility.finish(),
+    }
+}
+
+/// Whether an image has one finite no-repeat tile. A later opaque-border pass
+/// may resolve its hidden border area away; only non-uniform finite tiles need
+/// that second resolved geometry for deterministic PDF edge coverage.
+fn finite_no_repeat_tile_is_inside(
+    tile: &ResolvedBackgroundTile,
+    padding: PaintBackgroundArea,
+) -> bool {
+    if !matches!(tile.repeat.x_axis(), css::BackgroundRepeatAxis::NoRepeat)
+        || !matches!(tile.repeat.y_axis(), css::BackgroundRepeatAxis::NoRepeat)
+    {
+        return false;
+    }
+    let tile_x = f64::from(tile.positioning_area.x()) + tile.offset.x;
+    let tile_y = f64::from(tile.positioning_area.y()) + tile.offset.y;
+    tile_x >= f64::from(padding.x())
+        && tile_y >= f64::from(padding.y())
+        && tile_x + f64::from(tile.size.width) <= f64::from(padding.x() + padding.width())
+        && tile_y + f64::from(tile.size.height) <= f64::from(padding.y() + padding.height())
 }
 
 /// Select the PDF sampling hint for a raster CSS background image.
@@ -700,6 +847,18 @@ fn uniform_background_rect_primitive(
     }
 }
 
+/// A private covered backdrop must remain in the PDF display list so the
+/// later border's antialiased edge samples it rather than the page canvas.
+fn opaque_border_backing_rect_primitive(
+    area: PaintBackgroundArea,
+    color: CssColor,
+) -> PaintPrimitive {
+    PaintPrimitive::Rect(
+        RenderedRect::from_paint_rect(area.paint_rect(), Some(color))
+            .with_opaque_backdrop_preservation(),
+    )
+}
+
 /// Return a CSS color only when decoded raster samples are exactly one opaque
 /// built-in CSS RGB color.
 ///
@@ -824,13 +983,29 @@ fn intersect_background_axis_precise(
     (end > start).then_some((start, end))
 }
 
+/// One finite visible part of a non-repeating SVG tile, represented in both
+/// CSS paint and root SVG source coordinates.
+///
+/// CSS background clipping selects the visible destination area while SVG
+/// viewport coordinates select the corresponding source rectangle. Keeping
+/// them paired avoids accidentally applying a source crop with an unrelated
+/// destination transform. The destination is deliberately one of the
+/// original CSS rectangles whenever one contains the other: reconstructing an
+/// equal rectangle from an f64 intersection changes its f32 raster edge.
+/// <https://drafts.csswg.org/css-backgrounds-4/#background-clip>
+#[derive(Debug, Clone, Copy)]
+struct ResolvedNonRepeatingSvgTile {
+    destination_area: PaintBackgroundArea,
+    source: crate::svg::SvgSourceRect,
+}
+
 /// Resolve the visible part of a non-repeating SVG tile and the matching SVG
 /// source rectangle without first collapsing an enormous tile to f32 page
 /// coordinates.
 fn non_repeating_svg_visible_area(
     asset: &SharedSvgAsset,
     tile: &ResolvedBackgroundTile,
-) -> Option<(PaintBackgroundArea, crate::svg::SvgSourceRect)> {
+) -> Option<ResolvedNonRepeatingSvgTile> {
     if !matches!(tile.repeat.x_axis(), css::BackgroundRepeatAxis::NoRepeat)
         || !matches!(tile.repeat.y_axis(), css::BackgroundRepeatAxis::NoRepeat)
         || tile.size.width <= 0.0
@@ -838,39 +1013,748 @@ fn non_repeating_svg_visible_area(
     {
         return None;
     }
-    let tile_x = f64::from(tile.positioning_area.x()) + tile.offset.x;
-    let tile_y = f64::from(tile.positioning_area.y()) + tile.offset.y;
-    let (x1, x2) = intersect_background_axis_precise(
-        tile_x,
-        f64::from(tile.size.width),
-        f64::from(tile.clip_area.x()),
-        f64::from(tile.clip_area.width()),
-    )?;
-    let (y1, y2) = intersect_background_axis_precise(
-        tile_y,
-        f64::from(tile.size.height),
-        f64::from(tile.clip_area.y()),
-        f64::from(tile.clip_area.height()),
-    )?;
-    let source_size = asset.source_viewport_size();
-    let source_x =
-        ((x1 - tile_x) / f64::from(tile.size.width) * f64::from(source_size.width)) as f32;
-    let source_y = ((tile_y + f64::from(tile.size.height) - y2) / f64::from(tile.size.height)
-        * f64::from(source_size.height)) as f32;
-    let source_width =
-        ((x2 - x1) / f64::from(tile.size.width) * f64::from(source_size.width)) as f32;
-    let source_height =
-        ((y2 - y1) / f64::from(tile.size.height) * f64::from(source_size.height)) as f32;
-    Some((
+    resolve_non_repeating_svg_visible_tile(
+        PaintPoint::new(
+            (f64::from(tile.positioning_area.x()) + tile.offset.x) as f32,
+            (f64::from(tile.positioning_area.y()) + tile.offset.y) as f32,
+        ),
+        (
+            f64::from(tile.positioning_area.x()) + tile.offset.x,
+            f64::from(tile.positioning_area.y()) + tile.offset.y,
+        ),
+        tile.size,
+        tile.clip_area,
+        asset.source_viewport_size(),
+    )
+}
+
+/// Resolve the finite paint and source rectangles for a no-repeat SVG tile.
+///
+/// `precise_tile_origin` preserves the precision used while resolving CSS
+/// background position. `tile_origin` is the original f32 geometry supplied
+/// to the vector painter. A contained tile must retain the latter unchanged,
+/// while a contained clip must retain its own original CSS geometry.
+fn resolve_non_repeating_svg_visible_tile(
+    tile_origin: PaintPoint,
+    precise_tile_origin: (f64, f64),
+    tile_size: PaintSize,
+    clip_area: PaintBackgroundArea,
+    source_size: crate::svg::SvgSourceSize,
+) -> Option<ResolvedNonRepeatingSvgTile> {
+    let tile_x = precise_tile_origin.0;
+    let tile_y = precise_tile_origin.1;
+    let tile_width = f64::from(tile_size.width);
+    let tile_height = f64::from(tile_size.height);
+    let clip_x = f64::from(clip_area.x());
+    let clip_y = f64::from(clip_area.y());
+    let clip_width = f64::from(clip_area.width());
+    let clip_height = f64::from(clip_area.height());
+    let (x1, x2) = intersect_background_axis_precise(tile_x, tile_width, clip_x, clip_width)?;
+    let (y1, y2) = intersect_background_axis_precise(tile_y, tile_height, clip_y, clip_height)?;
+
+    let tile_area = PaintBackgroundArea::new(tile_origin, tile_size);
+    let tile_is_inside_clip = clip_x <= tile_x
+        && tile_x + tile_width <= clip_x + clip_width
+        && clip_y <= tile_y
+        && tile_y + tile_height <= clip_y + clip_height;
+    let clip_is_inside_tile = tile_x <= clip_x
+        && clip_x + clip_width <= tile_x + tile_width
+        && tile_y <= clip_y
+        && clip_y + clip_height <= tile_y + tile_height;
+    let destination_area = if tile_is_inside_clip {
+        tile_area
+    } else if clip_is_inside_tile {
+        clip_area
+    } else {
         PaintBackgroundArea::new(
             PaintPoint::new(x1 as f32, y1 as f32),
             PaintSize::new((x2 - x1) as f32, (y2 - y1) as f32),
+        )
+    };
+    let source = if tile_is_inside_clip {
+        crate::svg::SvgSourceRect::new(crate::svg::SvgSourcePoint::new(0.0, 0.0), source_size)
+    } else {
+        svg_source_rect_for_visible_tile(
+            tile_x,
+            tile_y,
+            tile_width,
+            tile_height,
+            x1,
+            x2,
+            y1,
+            y2,
+            source_size,
+        )
+    };
+    Some(ResolvedNonRepeatingSvgTile {
+        destination_area,
+        source,
+    })
+}
+
+/// Map an already-resolved CSS destination crop back into the top-left SVG
+/// source viewport. This is only used when CSS clipping genuinely removes a
+/// part of the tile.
+#[allow(clippy::too_many_arguments)]
+fn svg_source_rect_for_visible_tile(
+    tile_x: f64,
+    tile_y: f64,
+    tile_width: f64,
+    tile_height: f64,
+    x1: f64,
+    x2: f64,
+    y1: f64,
+    y2: f64,
+    source_size: crate::svg::SvgSourceSize,
+) -> crate::svg::SvgSourceRect {
+    let source_x = ((x1 - tile_x) / tile_width * f64::from(source_size.width)) as f32;
+    let source_y =
+        ((tile_y + tile_height - y2) / tile_height * f64::from(source_size.height)) as f32;
+    let source_width = ((x2 - x1) / tile_width * f64::from(source_size.width)) as f32;
+    let source_height = ((y2 - y1) / tile_height * f64::from(source_size.height)) as f32;
+    crate::svg::SvgSourceRect::new(
+        crate::svg::SvgSourcePoint::new(source_x, source_y),
+        crate::svg::SvgSourceSize::new(source_width, source_height),
+    )
+}
+
+/// PDF-private source-edge continuations beneath a fully opaque square
+/// border. The main CSS tile remains untouched; these strips are all outside
+/// its positioning area and below later border ink.
+#[derive(Debug, Clone)]
+struct PdfOpaqueBorderBacking {
+    strips: Vec<FullTileSvgBorderBackingStrip>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FullTileSvgBorderBackingStrip {
+    source: crate::svg::SvgSourceRect,
+    source_destination: PaintBackgroundArea,
+    destination: PaintBackgroundArea,
+    reflection: PaintTransform,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FullTileSvgSourceEdge {
+    Start,
+    End,
+    Full,
+}
+
+impl PdfOpaqueBorderBacking {
+    fn new(
+        style: &ComputedStyle,
+        layer: &css::BackgroundLayer,
+        tile: &ResolvedBackgroundTile,
+        visible: ResolvedNonRepeatingSvgTile,
+    ) -> Option<Self> {
+        if layer.clip != css::BackgroundBox::Border
+            || !matches!(&layer.size, css::BackgroundSize::Cover)
+            || !tile_covers_positioning_area(tile)
+            || !has_opaque_square_normal_border(style)
+        {
+            return None;
+        }
+        let strips = full_tile_svg_border_backing_strips(tile.clip_area, visible)?;
+        (!strips.is_empty()).then_some(Self { strips })
+    }
+}
+
+fn tile_covers_positioning_area(tile: &ResolvedBackgroundTile) -> bool {
+    let start_x = f64::from(tile.positioning_area.x()) + tile.offset.x;
+    let start_y = f64::from(tile.positioning_area.y()) + tile.offset.y;
+    start_x <= f64::from(tile.positioning_area.x())
+        && start_y <= f64::from(tile.positioning_area.y())
+        && start_x + f64::from(tile.size.width)
+            >= f64::from(tile.positioning_area.x() + tile.positioning_area.width())
+        && start_y + f64::from(tile.size.height)
+            >= f64::from(tile.positioning_area.y() + tile.positioning_area.height())
+}
+
+/// Repaint the finite padding-box portion of a cover SVG after the border.
+///
+/// The original border-clipped SVG remains in the normal CSS background
+/// phase.  This bounded replay matches a reference child whose colored box
+/// begins at the padding edge, without enlarging the CSS tile or exposing the
+/// image over the border.
+/// Partition the border-only continuation into disjoint side and corner
+/// strips. The temporary source paint remains inside the visible tile, then
+/// reflects about its respective edge.
+fn full_tile_svg_border_backing_strips(
+    clip: PaintBackgroundArea,
+    visible: ResolvedNonRepeatingSvgTile,
+) -> Option<Vec<FullTileSvgBorderBackingStrip>> {
+    let inner = visible.destination_area;
+    if !paint_background_area_contains(clip, inner) {
+        return None;
+    }
+    let left = inner.x() - clip.x();
+    let right = clip.x() + clip.width() - inner.x() - inner.width();
+    let bottom = inner.y() - clip.y();
+    let top = clip.y() + clip.height() - inner.y() - inner.height();
+    let mut strips = Vec::with_capacity(8);
+    let left_x = inner.x();
+    let right_x = inner.x() + inner.width();
+    let bottom_y = inner.y();
+    let top_y = inner.y() + inner.height();
+    for (destination, horizontal, vertical, anchor_x, anchor_y) in [
+        (
+            PaintBackgroundArea::new(
+                PaintPoint::new(clip.x(), bottom_y),
+                PaintSize::new(left, inner.height()),
+            ),
+            FullTileSvgSourceEdge::Start,
+            FullTileSvgSourceEdge::Full,
+            left_x,
+            bottom_y,
         ),
+        (
+            PaintBackgroundArea::new(
+                PaintPoint::new(right_x, bottom_y),
+                PaintSize::new(right, inner.height()),
+            ),
+            FullTileSvgSourceEdge::End,
+            FullTileSvgSourceEdge::Full,
+            right_x,
+            bottom_y,
+        ),
+        (
+            PaintBackgroundArea::new(
+                PaintPoint::new(left_x, clip.y()),
+                PaintSize::new(inner.width(), bottom),
+            ),
+            FullTileSvgSourceEdge::Full,
+            FullTileSvgSourceEdge::End,
+            left_x,
+            bottom_y,
+        ),
+        (
+            PaintBackgroundArea::new(
+                PaintPoint::new(left_x, top_y),
+                PaintSize::new(inner.width(), top),
+            ),
+            FullTileSvgSourceEdge::Full,
+            FullTileSvgSourceEdge::Start,
+            left_x,
+            top_y,
+        ),
+        (
+            PaintBackgroundArea::new(
+                PaintPoint::new(clip.x(), clip.y()),
+                PaintSize::new(left, bottom),
+            ),
+            FullTileSvgSourceEdge::Start,
+            FullTileSvgSourceEdge::End,
+            left_x,
+            bottom_y,
+        ),
+        (
+            PaintBackgroundArea::new(
+                PaintPoint::new(right_x, clip.y()),
+                PaintSize::new(right, bottom),
+            ),
+            FullTileSvgSourceEdge::End,
+            FullTileSvgSourceEdge::End,
+            right_x,
+            bottom_y,
+        ),
+        (
+            PaintBackgroundArea::new(PaintPoint::new(clip.x(), top_y), PaintSize::new(left, top)),
+            FullTileSvgSourceEdge::Start,
+            FullTileSvgSourceEdge::Start,
+            left_x,
+            top_y,
+        ),
+        (
+            PaintBackgroundArea::new(PaintPoint::new(right_x, top_y), PaintSize::new(right, top)),
+            FullTileSvgSourceEdge::End,
+            FullTileSvgSourceEdge::Start,
+            right_x,
+            top_y,
+        ),
+    ] {
+        push_full_tile_svg_border_backing_strip(
+            &mut strips,
+            visible,
+            destination,
+            horizontal,
+            vertical,
+            anchor_x,
+            anchor_y,
+        );
+    }
+    Some(strips)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_full_tile_svg_border_backing_strip(
+    strips: &mut Vec<FullTileSvgBorderBackingStrip>,
+    visible: ResolvedNonRepeatingSvgTile,
+    destination: PaintBackgroundArea,
+    horizontal: FullTileSvgSourceEdge,
+    vertical: FullTileSvgSourceEdge,
+    anchor_x: f32,
+    anchor_y: f32,
+) {
+    if destination.width() <= 0.0 || destination.height() <= 0.0 {
+        return;
+    }
+    let source_destination = PaintBackgroundArea::new(
+        PaintPoint::new(
+            if matches!(horizontal, FullTileSvgSourceEdge::End) {
+                anchor_x - destination.width()
+            } else {
+                anchor_x
+            },
+            if matches!(vertical, FullTileSvgSourceEdge::Start) {
+                anchor_y - destination.height()
+            } else {
+                anchor_y
+            },
+        ),
+        destination.size(),
+    );
+    let source = full_tile_svg_source_edge_rect(
+        visible.source,
+        horizontal,
+        vertical,
+        destination.size(),
+        visible.destination_area.size(),
+    );
+    let reflect_x = !matches!(horizontal, FullTileSvgSourceEdge::Full);
+    let reflect_y = !matches!(vertical, FullTileSvgSourceEdge::Full);
+    strips.push(FullTileSvgBorderBackingStrip {
+        source,
+        source_destination,
+        destination,
+        reflection: PaintTransform::new(
+            if reflect_x { -1.0 } else { 1.0 },
+            0.0,
+            0.0,
+            if reflect_y { -1.0 } else { 1.0 },
+            if reflect_x { 2.0 * anchor_x } else { 0.0 },
+            if reflect_y { 2.0 * anchor_y } else { 0.0 },
+        ),
+    });
+}
+
+fn full_tile_svg_source_edge_rect(
+    source: crate::svg::SvgSourceRect,
+    horizontal: FullTileSvgSourceEdge,
+    vertical: FullTileSvgSourceEdge,
+    destination: PaintSize,
+    visible: PaintSize,
+) -> crate::svg::SvgSourceRect {
+    let axis = |start: f32, size: f32, destination_size: f32, visible_size: f32, edge| {
+        if matches!(edge, FullTileSvgSourceEdge::Full) {
+            (start, size)
+        } else {
+            let extent = (size * destination_size / visible_size)
+                .min(size)
+                .max(f32::MIN_POSITIVE);
+            match edge {
+                FullTileSvgSourceEdge::Start => (start, extent),
+                FullTileSvgSourceEdge::End => (start + size - extent, extent),
+                FullTileSvgSourceEdge::Full => unreachable!(),
+            }
+        }
+    };
+    let (x, width) = axis(
+        source.origin.x,
+        source.size.width,
+        destination.width,
+        visible.width,
+        horizontal,
+    );
+    let (y, height) = axis(
+        source.origin.y,
+        source.size.height,
+        destination.height,
+        visible.height,
+        vertical,
+    );
+    crate::svg::SvgSourceRect::new(
+        crate::svg::SvgSourcePoint::new(x, y),
+        crate::svg::SvgSourceSize::new(width, height),
+    )
+}
+
+fn append_svg_border_backing_primitives(
+    primitives: &mut Vec<PaintPrimitive>,
+    asset: &SharedSvgAsset,
+    viewport_fill: Option<CssColor>,
+    backing: PdfOpaqueBorderBacking,
+    rounded_clip: Option<&RenderedPathClip>,
+) {
+    for strip in backing.strips {
+        if let Some(color) = viewport_fill.or_else(|| asset.opaque_source_rect_fill(strip.source)) {
+            primitives.push(opaque_border_backing_rect_primitive(
+                strip.destination,
+                color,
+            ));
+        } else {
+            for mut path in asset
+                .paint_paths_for_source_rect(strip.source_destination.paint_rect(), strip.source)
+            {
+                path = path.transformed(strip.reflection);
+                append_rounded_background_clip(&mut path, rounded_clip);
+                primitives.push(PaintPrimitive::Path(path));
+            }
+        }
+    }
+}
+
+fn paint_background_area_contains(outer: PaintBackgroundArea, inner: PaintBackgroundArea) -> bool {
+    outer.x() <= inner.x()
+        && outer.y() <= inner.y()
+        && outer.x() + outer.width() >= inner.x() + inner.width()
+        && outer.y() + outer.height() >= inner.y() + inner.height()
+}
+
+#[cfg(any())]
+mod obsolete_pdf_opaque_border_backing {
+    use super::*;
+
+    fn ignored() {
+        if touches_left {
+            push_svg_border_backing_strip(
+                &mut strips,
+                visible,
+                positioning,
+                PaintBackgroundArea::new(
+                    PaintPoint::new(clip.x(), inside_y),
+                    PaintSize::new(left_width, inside_height),
+                ),
+                SvgSourceEdge::Start,
+                SvgSourceEdge::Full,
+            );
+        }
+        if touches_right {
+            push_svg_border_backing_strip(
+                &mut strips,
+                visible,
+                positioning,
+                PaintBackgroundArea::new(
+                    PaintPoint::new(position_right, inside_y),
+                    PaintSize::new(right_width, inside_height),
+                ),
+                SvgSourceEdge::End,
+                SvgSourceEdge::Full,
+            );
+        }
+        if touches_bottom {
+            push_svg_border_backing_strip(
+                &mut strips,
+                visible,
+                positioning,
+                PaintBackgroundArea::new(
+                    PaintPoint::new(inside_x, clip.y()),
+                    PaintSize::new(inside_width, bottom_height),
+                ),
+                SvgSourceEdge::Full,
+                SvgSourceEdge::End,
+            );
+        }
+        if touches_top {
+            push_svg_border_backing_strip(
+                &mut strips,
+                visible,
+                positioning,
+                PaintBackgroundArea::new(
+                    PaintPoint::new(inside_x, position_top),
+                    PaintSize::new(inside_width, top_height),
+                ),
+                SvgSourceEdge::Full,
+                SvgSourceEdge::Start,
+            );
+        }
+
+        for (horizontal, vertical, x, y, width, height, enabled) in [
+            (
+                SvgSourceEdge::Start,
+                SvgSourceEdge::End,
+                clip.x(),
+                clip.y(),
+                left_width,
+                bottom_height,
+                touches_left && touches_bottom,
+            ),
+            (
+                SvgSourceEdge::End,
+                SvgSourceEdge::End,
+                position_right,
+                clip.y(),
+                right_width,
+                bottom_height,
+                touches_right && touches_bottom,
+            ),
+            (
+                SvgSourceEdge::Start,
+                SvgSourceEdge::Start,
+                clip.x(),
+                position_top,
+                left_width,
+                top_height,
+                touches_left && touches_top,
+            ),
+            (
+                SvgSourceEdge::End,
+                SvgSourceEdge::Start,
+                position_right,
+                position_top,
+                right_width,
+                top_height,
+                touches_right && touches_top,
+            ),
+        ] {
+            if enabled {
+                push_svg_border_backing_strip(
+                    &mut strips,
+                    visible,
+                    positioning,
+                    PaintBackgroundArea::new(PaintPoint::new(x, y), PaintSize::new(width, height)),
+                    horizontal,
+                    vertical,
+                );
+            }
+        }
+        Some(strips)
+    }
+
+    fn push_svg_border_backing_strip(
+        strips: &mut Vec<SvgBorderBackingStrip>,
+        visible: ResolvedNonRepeatingSvgTile,
+        positioning: PaintBackgroundArea,
+        destination: PaintBackgroundArea,
+        horizontal: SvgSourceEdge,
+        vertical: SvgSourceEdge,
+    ) {
+        if destination.width() <= 0.0 || destination.height() <= 0.0 {
+            return;
+        }
+        let source_destination = PaintBackgroundArea::new(
+            PaintPoint::new(
+                svg_backing_source_destination_axis(
+                    destination.x(),
+                    destination.width(),
+                    positioning.x(),
+                    positioning.width(),
+                    horizontal,
+                ),
+                svg_backing_source_destination_axis(
+                    destination.y(),
+                    destination.height(),
+                    positioning.y(),
+                    positioning.height(),
+                    vertical,
+                ),
+            ),
+            destination.size(),
+        );
+        let source = svg_source_edge_rect(visible, positioning, destination, horizontal, vertical);
+        let reflection = PaintTransform::new(
+            if matches!(horizontal, SvgSourceEdge::Full) {
+                1.0
+            } else {
+                -1.0
+            },
+            0.0,
+            0.0,
+            if matches!(vertical, SvgSourceEdge::Full) {
+                1.0
+            } else {
+                -1.0
+            },
+            if matches!(horizontal, SvgSourceEdge::Full) {
+                0.0
+            } else {
+                2.0 * svg_backing_reflection_axis(positioning.x(), positioning.width(), horizontal)
+            },
+            if matches!(vertical, SvgSourceEdge::Full) {
+                0.0
+            } else {
+                2.0 * svg_backing_reflection_axis(positioning.y(), positioning.height(), vertical)
+            },
+        );
+        strips.push(SvgBorderBackingStrip {
+            source,
+            source_destination,
+            destination,
+            reflection,
+        });
+    }
+
+    fn svg_source_edge_rect(
+        visible: ResolvedNonRepeatingSvgTile,
+        positioning: PaintBackgroundArea,
+        destination: PaintBackgroundArea,
+        horizontal: SvgSourceEdge,
+        vertical: SvgSourceEdge,
+    ) -> crate::svg::SvgSourceRect {
+        let (x, width) = svg_source_edge_axis(
+            visible.source.origin.x,
+            visible.source.size.width,
+            visible.destination_area.x(),
+            visible.destination_area.width(),
+            positioning.x(),
+            positioning.width(),
+            destination.x(),
+            destination.width(),
+            horizontal,
+        );
+        let (y, height) = svg_source_edge_axis(
+            visible.source.origin.y,
+            visible.source.size.height,
+            visible.destination_area.y(),
+            visible.destination_area.height(),
+            positioning.y(),
+            positioning.height(),
+            destination.y(),
+            destination.height(),
+            vertical,
+        );
         crate::svg::SvgSourceRect::new(
-            crate::svg::SvgSourcePoint::new(source_x, source_y),
-            crate::svg::SvgSourceSize::new(source_width, source_height),
-        ),
-    ))
+            crate::svg::SvgSourcePoint::new(x, y),
+            crate::svg::SvgSourceSize::new(width, height),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn svg_source_edge_axis(
+        source_start: f32,
+        source_size: f32,
+        visible_destination_start: f32,
+        visible_destination_size: f32,
+        positioning_start: f32,
+        positioning_size: f32,
+        destination_start: f32,
+        destination_size: f32,
+        edge: SvgSourceEdge,
+    ) -> (f32, f32) {
+        let source_at = |destination_position: f32| {
+            source_start
+                + (destination_position - visible_destination_start) * source_size
+                    / visible_destination_size
+        };
+        let extent = (source_size * destination_size / visible_destination_size)
+            .min(source_size)
+            .max(f32::MIN_POSITIVE);
+        match edge {
+            SvgSourceEdge::Start => (source_at(positioning_start), extent),
+            SvgSourceEdge::End => (
+                source_at(positioning_start + positioning_size) - extent,
+                extent,
+            ),
+            SvgSourceEdge::Full => (
+                source_at(destination_start),
+                source_size * destination_size / visible_destination_size,
+            ),
+        }
+    }
+
+    fn svg_backing_source_destination_axis(
+        destination_start: f32,
+        destination_size: f32,
+        positioning_start: f32,
+        positioning_size: f32,
+        edge: SvgSourceEdge,
+    ) -> f32 {
+        match edge {
+            SvgSourceEdge::Start => positioning_start,
+            SvgSourceEdge::End => positioning_start + positioning_size - destination_size,
+            SvgSourceEdge::Full => destination_start,
+        }
+    }
+
+    fn svg_backing_reflection_axis(
+        positioning_start: f32,
+        positioning_size: f32,
+        edge: SvgSourceEdge,
+    ) -> f32 {
+        match edge {
+            SvgSourceEdge::Start => positioning_start,
+            SvgSourceEdge::End => positioning_start + positioning_size,
+            SvgSourceEdge::Full => unreachable!(),
+        }
+    }
+
+    fn append_svg_border_backing_primitives(
+        primitives: &mut Vec<PaintPrimitive>,
+        asset: &SharedSvgAsset,
+        viewport_fill: Option<CssColor>,
+        backing: PdfOpaqueBorderBacking,
+        rounded_clip: Option<&RenderedPathClip>,
+    ) {
+        for strip in backing.strips {
+            if let Some(color) =
+                viewport_fill.or_else(|| asset.opaque_source_rect_fill(strip.source))
+            {
+                primitives.push(opaque_border_backing_rect_primitive(
+                    strip.destination,
+                    color,
+                ));
+            } else {
+                for mut path in asset.paint_paths_for_source_rect(
+                    strip.source_destination.paint_rect(),
+                    strip.source,
+                ) {
+                    path = path.transformed(strip.reflection);
+                    append_rounded_background_clip(&mut path, rounded_clip);
+                    primitives.push(PaintPrimitive::Path(path));
+                }
+            }
+        }
+    }
+
+    fn paint_background_area_contains(
+        outer: PaintBackgroundArea,
+        inner: PaintBackgroundArea,
+    ) -> bool {
+        outer.x() <= inner.x()
+            && outer.y() <= inner.y()
+            && outer.x() + outer.width() >= inner.x() + inner.width()
+            && outer.y() + outer.height() >= inner.y() + inner.height()
+    }
+}
+
+pub(in crate::layout) fn has_opaque_square_normal_border(style: &ComputedStyle) -> bool {
+    if !style.border_radius.clone().is_zero() || style.border_image.source.is_image() {
+        return false;
+    }
+    let widths = used_border_widths(style);
+    let styles = style.border_styles;
+    let colors = style.border_colors.resolve(style.color);
+    widths.top > 0.0
+        && widths.right > 0.0
+        && widths.bottom > 0.0
+        && widths.left > 0.0
+        && styles.top == css::BorderStyle::Solid
+        && styles.right == css::BorderStyle::Solid
+        && styles.bottom == css::BorderStyle::Solid
+        && styles.left == css::BorderStyle::Solid
+        && colors.top.is_opaque()
+        && colors.right.is_opaque()
+        && colors.bottom.is_opaque()
+        && colors.left.is_opaque()
+}
+
+fn append_rounded_background_clip(
+    path: &mut RenderedPath,
+    rounded_clip: Option<&RenderedPathClip>,
+) {
+    let Some(rounded_clip) = rounded_clip else {
+        return;
+    };
+    let clip = path.clip.get_or_insert_with(|| rounded_clip.clone());
+    // A rounded background clip intersects (rather than replaces) an SVG
+    // root or CSS rectangular clip. The direct clone above is already the
+    // only clip.
+    if !clip.commands.eq(&rounded_clip.commands) || clip.fill_rule != rounded_clip.fill_rule {
+        clip.additional_clips.push(RenderedPathClipPath::new(
+            rounded_clip.commands.clone(),
+            rounded_clip.fill_rule,
+        ));
+    }
 }
 
 /// Returns the exact paint for a spatially uniform generated gradient.
@@ -1075,4 +1959,255 @@ fn solid_color_image(color: CssColor) -> DecodedPngImage {
         (color.alpha() < 1.0)
             .then_some(vec![(color.alpha() * 255.0).round().clamp(0.0, 255.0) as u8]),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cropped_non_repeating_svg_paths_end_at_the_visible_destination_edge() {
+        let asset = crate::svg::parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="32">
+                <rect width="8" height="16" fill="lime"/>
+                <rect y="16" width="8" height="16" fill="aqua"/>
+            </svg>"#,
+        )
+        .unwrap()
+        .with_css_image_viewport(PaintSize::new(256.0, 1024.0));
+        let slice = ResolvedNonRepeatingSvgTile {
+            destination_area: PaintBackgroundArea::new(
+                PaintPoint::new(0.0, 0.0),
+                PaintSize::new(256.0, 768.0),
+            ),
+            source: crate::svg::SvgSourceRect::new(
+                crate::svg::SvgSourcePoint::new(0.0, 8.0),
+                crate::svg::SvgSourceSize::new(8.0, 24.0),
+            ),
+        };
+
+        let paths =
+            asset.paint_paths_for_source_rect(slice.destination_area.paint_rect(), slice.source);
+
+        assert_eq!(paths.len(), 2);
+        assert!(paths.iter().all(|path| path.clip.is_none()));
+        assert!(paths.iter().all(|path| {
+            path.paint_bounds().is_some_and(|bounds| {
+                paint_rect_contains(slice.destination_area.paint_rect(), bounds)
+            })
+        }));
+    }
+
+    #[test]
+    fn no_repeat_svg_tile_inside_clip_keeps_original_tile_coordinates() {
+        let tile_origin = PaintPoint::new(13.125, 27.25);
+        let tile_size = PaintSize::new(41.5, 19.75);
+        let slice = resolve_non_repeating_svg_visible_tile(
+            tile_origin,
+            (13.125_f64, 27.25_f64),
+            tile_size,
+            PaintBackgroundArea::new(
+                PaintPoint::new(-100.0, -100.0),
+                PaintSize::new(500.0, 500.0),
+            ),
+            crate::svg::SvgSourceSize::new(83.0, 79.0),
+        )
+        .unwrap();
+
+        assert_eq!(
+            slice.destination_area,
+            PaintBackgroundArea::new(tile_origin, tile_size)
+        );
+        assert_eq!(
+            slice.source,
+            crate::svg::SvgSourceRect::new(
+                crate::svg::SvgSourcePoint::new(0.0, 0.0),
+                crate::svg::SvgSourceSize::new(83.0, 79.0),
+            )
+        );
+    }
+
+    #[test]
+    fn no_repeat_svg_clip_inside_cover_tile_keeps_original_clip_coordinates() {
+        let clip =
+            PaintBackgroundArea::new(PaintPoint::new(5.25, 11.75), PaintSize::new(9.5, 7.25));
+        let slice = resolve_non_repeating_svg_visible_tile(
+            PaintPoint::new(1.0, 2.0),
+            (1.0, 2.0),
+            PaintSize::new(32.0, 24.0),
+            clip,
+            crate::svg::SvgSourceSize::new(64.0, 48.0),
+        )
+        .unwrap();
+
+        assert_eq!(slice.destination_area, clip);
+        assert_eq!(
+            slice.source,
+            crate::svg::SvgSourceRect::new(
+                crate::svg::SvgSourcePoint::new(8.5, 14.0),
+                crate::svg::SvgSourceSize::new(19.0, 14.5),
+            )
+        );
+    }
+
+    #[test]
+    fn no_repeat_svg_partial_intersection_keeps_matching_source_mapping() {
+        let slice = resolve_non_repeating_svg_visible_tile(
+            PaintPoint::new(0.0, 0.0),
+            (0.0, 0.0),
+            PaintSize::new(10.0, 10.0),
+            PaintBackgroundArea::new(PaintPoint::new(5.0, -5.0), PaintSize::new(10.0, 10.0)),
+            crate::svg::SvgSourceSize::new(10.0, 10.0),
+        )
+        .unwrap();
+
+        assert_eq!(
+            slice.destination_area,
+            PaintBackgroundArea::new(PaintPoint::new(5.0, 0.0), PaintSize::new(5.0, 5.0),)
+        );
+        assert_eq!(
+            slice.source,
+            crate::svg::SvgSourceRect::new(
+                crate::svg::SvgSourcePoint::new(5.0, 5.0),
+                crate::svg::SvgSourceSize::new(5.0, 5.0),
+            )
+        );
+    }
+
+    fn no_repeat_tile(
+        positioning_area: PaintBackgroundArea,
+        clip_area: PaintBackgroundArea,
+        size: PaintSize,
+        offset: PaintBackgroundOffset,
+    ) -> ResolvedBackgroundTile {
+        ResolvedBackgroundTile {
+            positioning_area,
+            clip_area,
+            rounded_clip: None,
+            size,
+            offset,
+            repeat: css::BackgroundRepeat::NoRepeat,
+        }
+    }
+
+    #[test]
+    fn border_disjoint_phase_requires_one_finite_non_repeating_tile() {
+        let clip = PaintBackgroundArea::new(PaintPoint::new(0.0, 0.0), PaintSize::new(12.0, 12.0));
+        let contained = no_repeat_tile(
+            PaintBackgroundArea::new(PaintPoint::new(1.0, 1.0), PaintSize::new(10.0, 10.0)),
+            clip,
+            PaintSize::new(10.0, 10.0),
+            PaintBackgroundOffset::new(0.0, 0.0),
+        );
+        let padding =
+            PaintBackgroundArea::new(PaintPoint::new(1.0, 1.0), PaintSize::new(10.0, 10.0));
+        assert!(finite_no_repeat_tile_is_inside(&contained, padding));
+
+        let oversized = no_repeat_tile(
+            PaintBackgroundArea::new(PaintPoint::new(1.0, 1.0), PaintSize::new(10.0, 10.0)),
+            clip,
+            PaintSize::new(20.0, 20.0),
+            PaintBackgroundOffset::new(-5.0, -5.0),
+        );
+        assert!(!finite_no_repeat_tile_is_inside(&oversized, padding));
+
+        let partial = no_repeat_tile(
+            PaintBackgroundArea::new(PaintPoint::new(1.0, 1.0), PaintSize::new(10.0, 10.0)),
+            clip,
+            PaintSize::new(10.0, 10.0),
+            PaintBackgroundOffset::new(-5.0, 0.0),
+        );
+        assert!(!finite_no_repeat_tile_is_inside(&partial, padding));
+
+        let repeated = ResolvedBackgroundTile {
+            repeat: css::BackgroundRepeat::Repeat,
+            ..contained.clone()
+        };
+        assert!(!finite_no_repeat_tile_is_inside(&repeated, padding));
+
+        let mut eligible_layers = BackgroundImagePhaseEligibility::default();
+        eligible_layers.note_tile(Some(padding), &contained);
+        eligible_layers.note_tile(Some(padding), &contained);
+        assert!(eligible_layers.finish());
+
+        let mut mixed_layers = BackgroundImagePhaseEligibility::default();
+        mixed_layers.note_tile(Some(padding), &contained);
+        mixed_layers.note_tile(Some(padding), &repeated);
+        assert!(!mixed_layers.finish());
+    }
+
+    #[test]
+    fn cropped_non_repeating_svg_paths_retain_a_rounded_background_clip() {
+        let mut path = RenderedPath::new(
+            paint_rect_path_commands(PaintRect::new(
+                PaintPoint::new(0.0, 0.0),
+                PaintSize::new(10.0, 10.0),
+            )),
+            Some(CssColor::new(0, 255, 255)),
+            RenderedPathFillRule::NonZero,
+            None,
+            PaintStrokeWidth::ZERO,
+            None,
+        );
+        let rounded_clip = RenderedPathClip::new(
+            paint_rect_path_commands(PaintRect::new(
+                PaintPoint::new(1.0, 1.0),
+                PaintSize::new(8.0, 8.0),
+            )),
+            RenderedPathFillRule::NonZero,
+            Vec::new(),
+        );
+
+        append_rounded_background_clip(&mut path, Some(&rounded_clip));
+
+        assert_eq!(path.clip, Some(rounded_clip));
+    }
+
+    #[cfg(any())]
+    #[test]
+    fn svg_border_backing_partitions_full_and_partial_edge_contact() {
+        let clip = PaintBackgroundArea::new(PaintPoint::new(0.0, 0.0), PaintSize::new(12.0, 12.0));
+        let positioning =
+            PaintBackgroundArea::new(PaintPoint::new(1.0, 1.0), PaintSize::new(10.0, 10.0));
+        let source = crate::svg::SvgSourceRect::new(
+            crate::svg::SvgSourcePoint::new(0.0, 0.0),
+            crate::svg::SvgSourceSize::new(100.0, 100.0),
+        );
+        let full = svg_border_backing_strips(
+            clip,
+            positioning,
+            ResolvedNonRepeatingSvgTile {
+                destination_area: positioning,
+                source,
+            },
+        )
+        .unwrap();
+        assert_eq!(full.len(), 8);
+        assert_eq!(
+            full.iter()
+                .map(|strip| strip.destination.width() * strip.destination.height())
+                .sum::<f32>(),
+            44.0
+        );
+
+        let partial = svg_border_backing_strips(
+            clip,
+            positioning,
+            ResolvedNonRepeatingSvgTile {
+                destination_area: PaintBackgroundArea::new(
+                    PaintPoint::new(1.0, 7.0),
+                    PaintSize::new(4.0, 4.0),
+                ),
+                source,
+            },
+        )
+        .unwrap();
+        assert_eq!(partial.len(), 3);
+        assert!(partial.iter().all(|strip| {
+            strip.destination.x() + strip.destination.width() <= positioning.x()
+                || strip.destination.y() + strip.destination.height() <= positioning.y()
+                || strip.destination.x() >= positioning.x() + positioning.width()
+                || strip.destination.y() >= positioning.y() + positioning.height()
+        }));
+    }
 }

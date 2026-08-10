@@ -626,7 +626,7 @@ async fn block_align_content_center_overflow_defaults_to_safe_start() {
 }
 
 #[tokio::test]
-async fn block_align_content_scroll_container_initial_view_clips_unsafe_overflow() {
+async fn block_align_content_scroll_container_retains_unsafe_overflow_geometry() {
     let document = Html::from_string(
         "<style>@page { size: 120pt 120pt; margin: 10pt } body { margin: 0 }\
          .block { width: 50pt; height: 20pt; overflow-y: auto; align-content: center; background: red }\
@@ -650,8 +650,8 @@ async fn block_align_content_scroll_container_initial_view_clips_unsafe_overflow
         .expect("block child background should paint");
 
     assert!(
-        (green.y() - red.y()).abs() < 0.01 && (green.height() - red.height()).abs() < 0.01,
-        "the initial static view must clip the unsafe centered overflow to its scrollport: red={red:?}, green={green:?}"
+        (green.y() - (red.y() - 10.0)).abs() < 0.01 && (green.height() - 40.0).abs() < 0.01,
+        "the retained overflow clip must not destructively trim the unsafe centered child: red={red:?}, green={green:?}"
     );
 }
 
@@ -687,7 +687,7 @@ async fn block_align_content_unsafe_center_allows_symmetric_overflow() {
 }
 
 #[tokio::test]
-async fn auto_height_overflow_hidden_clips_negative_margin_child_to_used_padding_box() {
+async fn auto_height_overflow_hidden_retains_negative_margin_child_geometry() {
     let document = Html::from_string(
         "<style>@page { size: 140px 140px; margin: 0 } body { margin: 0 }\
          .before, .clip, .item { width: 100px }\
@@ -707,15 +707,15 @@ async fn auto_height_overflow_hidden_clips_negative_margin_child_to_used_padding
         .iter()
         .find(|rect| rect.fill == Some(green))
         .unwrap_or_else(|| panic!("expected previous green block: {:?}", page.rects()));
-    assert_eq!(
-        final_rect_fill_at(
-            page,
-            green_rect.x() + green_rect.width() / 2.0,
-            green_rect.y() + green_rect.height() / 2.0
-        ),
-        Some(green),
-        "auto-height overflow:hidden should keep negative-margin child paint from escaping over the previous block: {:?}",
-        page.rects()
+    let red_rect = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
+        .unwrap_or_else(|| panic!("expected negative-margin child: {:?}", page.rects()));
+    assert!(
+        red_rect.y() < green_rect.y() + green_rect.height()
+            && (red_rect.height() - 75.0).abs() < 0.01,
+        "the retained overflow clip must leave the negative-margin child's source geometry intact: green={green_rect:?}, red={red_rect:?}"
     );
 }
 
@@ -2770,14 +2770,13 @@ async fn page_sized_flex_item_preserves_definite_size_and_auto_margins() {
 async fn definite_viewport_height_block_fragments_its_background_and_following_flow() {
     let document = Html::from_string(
         "<style>\
+         @page { margin: 0 }\
          body { margin: 0 }\
          .outer { display: flex; flex-flow: column; background: yellow }\
          .tall { contain: size; width: 20pt; height: 350vh; background: hotpink }\
          </style><div class=\"outer\"><div class=\"tall\"></div>Yellow</div>White",
     );
-    let mut options = RenderOptions::default();
-    options.set_margin_points(0.0);
-    let document = document.render(&options).await.unwrap();
+    let document = document.render(&RenderOptions::default()).await.unwrap();
 
     assert_eq!(document.pages.len(), 4);
     let last_page_rects = document.pages[3].rects();
@@ -3134,6 +3133,18 @@ async fn book_sample_companion_stylesheet_preserves_right_page_breaks() {
     ] {
         assert!(contents.contains(entry), "missing {entry:?}: {contents:?}");
     }
+    let rendered_lines = document
+        .pages
+        .iter()
+        .flat_map(|page| page.lines())
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>();
+    for phrase in ["moi\u{202f}?", "Mince\u{202f}!"] {
+        assert!(
+            rendered_lines.iter().any(|line| line.contains(phrase)),
+            "U+202F must keep French punctuation with its preceding text: {phrase:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -3439,8 +3450,10 @@ async fn invalid_page_size_descriptor_does_not_partially_apply_lengths() {
         .await
         .unwrap();
 
-    assert!((document.pages[0].width() - quire::PageSize::A4_POINTS.width()).abs() < 0.001);
-    assert!((document.pages[0].height() - quire::PageSize::A4_POINTS.height()).abs() < 0.001);
+    assert!((document.pages[0].width() - crate::layout::PageSize::A4_POINTS.width()).abs() < 0.001);
+    assert!(
+        (document.pages[0].height() - crate::layout::PageSize::A4_POINTS.height()).abs() < 0.001
+    );
 }
 
 #[tokio::test]

@@ -44,10 +44,6 @@ pub(crate) fn typographic_unit_ranges(text: &str) -> Vec<Range<usize>> {
     ranges
 }
 
-pub(crate) fn typographic_unit_count(text: &str) -> usize {
-    typographic_unit_ranges(text).len()
-}
-
 /// Return whether source text consists entirely of formatting characters that
 /// cannot own an inter-character tracking boundary.
 pub(crate) fn text_is_inter_character_control_only(text: &str) -> bool {

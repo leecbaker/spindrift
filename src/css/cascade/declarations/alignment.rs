@@ -202,13 +202,19 @@ pub(in crate::css) fn parse_self_alignment_keyword(
     value: &str,
     allow_auto: bool,
     allow_left_right: bool,
+    allow_anchor_center: bool,
 ) -> Option<SelfAlignment> {
     let (safety, keyword) = parse_alignment_safety_and_keyword(value);
     let keyword = match keyword.as_str() {
         "auto" if allow_auto => SelfAlignmentKeyword::Auto,
         "normal" => SelfAlignmentKeyword::Normal,
         "stretch" => SelfAlignmentKeyword::Stretch,
+        // In the absence of anchor positioning, `anchor-center` has the same
+        // fallback as ordinary center alignment. It is a value of the
+        // self-alignment properties only, not the item-default properties.
+        // <https://drafts.csswg.org/css-anchor-position-1/#aligning-anchor-positioned-boxes>
         "center" => SelfAlignmentKeyword::Center,
+        "anchor-center" if allow_anchor_center => SelfAlignmentKeyword::Center,
         "flex-start" => SelfAlignmentKeyword::FlexStart,
         "flex-end" => SelfAlignmentKeyword::FlexEnd,
         "start" => SelfAlignmentKeyword::Start,
@@ -236,19 +242,19 @@ pub(in crate::css) fn parse_align_content_keyword(value: &str) -> Option<()> {
 }
 
 pub(in crate::css) fn parse_align_items_keyword(value: &str) -> Option<()> {
-    parse_self_alignment_keyword(value, false, false).map(|_| ())
+    parse_self_alignment_keyword(value, false, false, false).map(|_| ())
 }
 
 pub(in crate::css) fn parse_align_self_keyword(value: &str) -> Option<()> {
-    parse_self_alignment_keyword(value, true, false).map(|_| ())
+    parse_self_alignment_keyword(value, true, false, true).map(|_| ())
 }
 
 pub(in crate::css) fn parse_justify_items_keyword(value: &str) -> Option<()> {
-    parse_self_alignment_keyword(value, false, true).map(|_| ())
+    parse_self_alignment_keyword(value, false, true, false).map(|_| ())
 }
 
 pub(in crate::css) fn parse_justify_self_keyword(value: &str) -> Option<()> {
-    parse_self_alignment_keyword(value, true, true).map(|_| ())
+    parse_self_alignment_keyword(value, true, true, true).map(|_| ())
 }
 
 pub(in crate::css) fn parse_justify_content(
@@ -263,17 +269,17 @@ pub(in crate::css) fn parse_align_content(value: &str, current: AlignContent) ->
 }
 
 pub(in crate::css) fn parse_align_items(value: &str, current: AlignItems) -> AlignItems {
-    parse_self_alignment_keyword(value, false, false).unwrap_or(current)
+    parse_self_alignment_keyword(value, false, false, false).unwrap_or(current)
 }
 
 pub(in crate::css) fn parse_align_self(value: &str, current: AlignSelf) -> AlignSelf {
-    parse_self_alignment_keyword(value, true, false).unwrap_or(current)
+    parse_self_alignment_keyword(value, true, false, true).unwrap_or(current)
 }
 
 pub(in crate::css) fn parse_justify_items(value: &str, current: JustifyItems) -> JustifyItems {
-    parse_self_alignment_keyword(value, false, true).unwrap_or(current)
+    parse_self_alignment_keyword(value, false, true, false).unwrap_or(current)
 }
 
 pub(in crate::css) fn parse_justify_self(value: &str, current: JustifySelf) -> JustifySelf {
-    parse_self_alignment_keyword(value, true, true).unwrap_or(current)
+    parse_self_alignment_keyword(value, true, true, true).unwrap_or(current)
 }

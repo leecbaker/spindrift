@@ -38,6 +38,7 @@ pub(in crate::layout) fn element_signature(element: &Element) -> ElementSignatur
             .with_namespace(signature.namespace_url, signature.namespace_attrs)
             .with_child_list(signature.children, signature.has_text_child);
     element_signature.document_direction = signature.document_direction;
+    element_signature.source_element_id = signature.source_element_id;
     element_signature.is_target = signature.is_target;
     element_signature.has_target_descendant = signature.has_target_descendant;
     element_signature
@@ -63,6 +64,7 @@ pub(in crate::layout) fn element_selector_signature(element: &Element) -> Elemen
         })
         .collect();
     let mut signature = ElementSiblingSignature::new(element.tag.clone(), element.attrs.clone())
+        .with_source_element_id(element.id)
         .with_namespace(element.namespace_url.clone(), namespace_attrs)
         .with_document_is_html(element.document_syntax == dom::DocumentSyntax::Html)
         .with_child_list(children, has_text_child);
@@ -1036,9 +1038,9 @@ pub(in crate::layout) fn inline_style_affects_line(
         // backgrounds/borders or relative visual offsets.
         // <https://www.w3.org/TR/CSS22/visuren.html#inline-boxes>
         // <https://www.w3.org/TR/css-position-3/#relative-positioning>
-        || child.background_color.is_potentially_visible()
-        || child.background_image.is_image()
-        || child.background_layers.iter().any(|layer| layer.image.is_image())
+        || child.background.background_color.is_potentially_visible()
+        || child.background.background_image.is_image()
+        || child.background.background_layers.iter().any(|layer| layer.image.is_image())
         || used_border_width(child) > layout_pt(0.0)
         || child.margin != parent.margin
         || child.padding != parent.padding
@@ -1050,7 +1052,7 @@ pub(in crate::layout) fn inline_style_affects_line(
         // painted into that group instead of being flattened into the parent
         // text run.
         // <https://www.w3.org/TR/css-color-4/#transparency>
-        || child.opacity < 1.0
+        || child.opacity.value() < 1.0
 }
 
 pub(in crate::layout) fn has_direct_inline_replaced_child(element: &Element) -> bool {
@@ -1098,7 +1100,12 @@ pub(in crate::layout) fn has_direct_flow_child_with_resolver(
         if is_replaced_element(child_element) && style.display.is_inline_level() {
             return false;
         }
-        style.display.is_block_level() || is_html_table_element(child_element)
+        // HTML table semantics select table layout, but do not override the
+        // computed outer display role. In particular, `inline-table` remains
+        // an inline-level atomic child of its block container.
+        // <https://drafts.csswg.org/css-display-3/#outer-role>
+        // <https://drafts.csswg.org/css-tables-3/#table-root>
+        style.display.is_block_level()
     })
 }
 
@@ -1531,7 +1538,8 @@ pub(in crate::layout) fn has_ordered_mixed_flow_content_with_resolver(
                     // decides whether the table itself is dispatched as block
                     // flow or collected as an atomic inline.
                     // <https://drafts.csswg.org/css-display-3/#box-generation>
-                    || is_html_table_element(child_element)
+                    || (is_html_table_element(child_element)
+                        && child_style.display.is_block_level())
                     || (is_replaced_element(child_element)
                         && child_style.display.is_block_level());
                 if is_flow_child {
@@ -1734,7 +1742,7 @@ pub(in crate::layout) fn style_establishes_multicol_formatting_context(
 /// Resolve the clamp state consumed by inline layout for this block container.
 ///
 /// The computed declaration stays untouched; an ancestor traversal may supply
-/// a smaller layout budget through `used_line_clamp`. A multicol container is
+/// a smaller layout budget through `line_limit_traversal`. A multicol container is
 /// deliberately ineligible because `continue: collapse` behaves as `auto`
 /// there.
 /// <https://drafts.csswg.org/css-overflow-4/#continue>
@@ -1742,15 +1750,14 @@ pub(in crate::layout) fn used_line_clamp_for_style(
     style: &ComputedStyle,
 ) -> Option<css::InlineLineClamp<'_>> {
     style
-        .used_line_clamp
+        .line_limit_traversal
         .as_ref()
         .map(css::InlineLineClamp::Used)
         .or_else(|| {
             (!style_establishes_multicol_formatting_context(style))
                 .then(|| {
                     style
-                        .line_clamp
-                        .as_ref()
+                        .line_clamp_container()
                         .map(css::InlineLineClamp::Computed)
                 })
                 .flatten()

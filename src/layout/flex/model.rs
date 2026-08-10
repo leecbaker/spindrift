@@ -1,5 +1,10 @@
 use super::*;
 use crate::document::paint::geometry::AxisSelectivePaintClip;
+use crate::layout::baseline::{
+    BaselinePair, PhysicalBaselineSets, PhysicalLeftBaselineAxis, PhysicalLeftBaselineOffset,
+    PhysicalTopBaselineAxis, PhysicalTopBaselineOffset,
+};
+use std::num::NonZeroUsize;
 use std::ops::{Add, Deref, DerefMut, Sub};
 
 /// A computed style after the flex formatting-context used-value boundary.
@@ -367,14 +372,14 @@ impl FlexItemReplayDimensions {
 pub(in crate::layout::flex) fn flex_vertical_baseline_from_physical_height(
     height: FlexPhysicalVerticalSize,
 ) -> FlexVerticalBaselineOffset {
-    FlexVerticalBaselineOffset::new(height.points())
+    flex_vertical_baseline_from_points(height.points())
 }
 
 /// Adapt a physical border-box width to a horizontal item-baseline offset.
 pub(in crate::layout::flex) fn flex_horizontal_baseline_from_physical_width(
     width: FlexPhysicalHorizontalSize,
 ) -> FlexHorizontalBaselineOffset {
-    FlexHorizontalBaselineOffset::new(width.points())
+    flex_horizontal_baseline_from_points(width.points())
 }
 
 /// A non-negative CSS `flex-grow` factor after the flex used-value boundary.
@@ -549,13 +554,20 @@ pub(super) struct PhysicalFlexGaps {
 pub(super) struct FlexLayout {
     /// Final physical content-box height of the flex container.
     pub(super) height: PhysicalContentHeight,
+    /// Resolved gutter between adjacent items on a final flex line.
+    ///
+    /// The value has already resolved its percentage basis at the flex-layout
+    /// boundary.  Consumers of final flex geometry must retain it when they
+    /// derive an automatic main-axis span from line measurements:
+    /// <https://www.w3.org/TR/css-align-3/#gaps>.
+    pub(super) main_gap: FlexMainSize,
     /// First and last baselines exported by the flex container, relative to
     /// its physical content-box origin.
     ///
     /// A flex container can export either a vertical or horizontal baseline
     /// depending on its writing mode. Keep both physical axes until the
     /// parent formatting context selects the compatible one.
-    pub(super) baselines: FlexContainerBaselineEstimate,
+    pub(super) baselines: FlexContainerBaselineSets,
     pub(super) items: Vec<FlexItemLayout>,
     /// Flex line metadata recovered from the final Taffy layout.
     ///
@@ -657,6 +669,10 @@ pub(super) fn flex_available_percentage_basis_from_points(
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct FlexLineLayout {
     pub(super) item_indices: Vec<usize>,
+    /// Position in the order-modified sequence of flex lines, measured from
+    /// flex cross-start. This identity survives physical `wrap-reverse`
+    /// placement and later `align-content` translations.
+    pub(super) logical_cross_start_rank: usize,
     pub(super) source_start: usize,
     pub(super) source_end: usize,
     pub(super) main_start: FlexMainOffset,
@@ -848,12 +864,12 @@ impl FlexFragmentPlan {
     /// Prepare a fragment while the flex break units are consumed.
     ///
     /// The initial Taffy result is source geometry, not a fragment plan.
-    /// Continuation ordinals follow materialized fragmentainers, including a
-    /// partial first fragmentainer and forced transitions.
+    /// Item-fragment start kinds follow materialized fragmentainers, including
+    /// a partial first fragmentainer and forced transitions.
     /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
     pub(super) fn prepare_materialized_fragment(&self, fragment: &mut FlexFragmentLayout) {
         for item in &mut fragment.items {
-            let continuation_ordinal = self
+            let preceding_slice_count = self
                 .fragments
                 .iter()
                 .flat_map(|previous| &previous.items)
@@ -863,10 +879,16 @@ impl FlexFragmentPlan {
                             <= item.content_slice.block_start.points() + 0.01
                 })
                 .count();
+            item.continuation.fragment_start =
+                FlexItemFragmentStart::classify(preceding_slice_count, item.content_slice);
+            debug_assert!(
+                item.continuation
+                    .fragment_start
+                    .is_consistent_with(preceding_slice_count, item.content_slice,)
+            );
             item.continuation.source_content_slice = item.content_slice;
             item.continuation.decoration_slice = item.decoration_slice;
             item.continuation.fragmentainer_index = fragment.page_index;
-            item.continuation.continuation_ordinal = continuation_ordinal;
         }
     }
 
@@ -1171,6 +1193,12 @@ impl FlexItemFragmentLayout {
 /// changing descendant source flow.
 /// <https://www.w3.org/TR/css-break-3/#break-decoration>
 /// <https://www.w3.org/TR/css-break-3/#box-splitting>
+///
+/// `fragment_start` distinguishes a true fragment continuation from source
+/// coordinates that begin after zero only because paint overflow preceded the
+/// item's used border box. Keeping this classification with the committed
+/// continuation prevents replay from mistaking a negative cross-start margin
+/// for a prior fragment.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(super) struct FlexItemContinuation {
     pub(super) source_content_slice: FlexFragmentSlice,
@@ -1189,7 +1217,7 @@ pub(super) struct FlexItemContinuation {
     /// Capacity available to each later local fragmentainer.
     pub(super) continuation_fragmentainer_capacity: FlexFragmentBlockSize,
     pub(super) fragmentainer_index: usize,
-    pub(super) continuation_ordinal: usize,
+    pub(super) fragment_start: FlexItemFragmentStart,
     /// Ordinal of a fragment committed by the item's own formatting context,
     /// when that child forced a page transition without splitting a flex break
     /// unit. The outer flex record retains this instead of recovering a child
@@ -1198,6 +1226,20 @@ pub(super) struct FlexItemContinuation {
 }
 
 impl FlexItemContinuation {
+    /// Whether this item record has a committed source predecessor.
+    pub(super) fn continues_from_previous_fragment(self) -> bool {
+        self.fragment_start.is_continuation()
+    }
+
+    /// Select the child-local fragment cached for this item record.
+    ///
+    /// A source item starts with child fragment zero even when its source slice
+    /// is offset by leading paint overflow. Only a committed predecessor moves
+    /// child replay to a later fragment.
+    pub(super) fn child_fragment_replay_ordinal(self) -> usize {
+        self.fragment_start.child_fragment_replay_ordinal()
+    }
+
     /// Commit the source-canvas origin for a replayed flex-item slice.
     ///
     /// `source_content_slice` is measured from the frozen used border-box
@@ -1222,6 +1264,71 @@ impl FlexItemContinuation {
         );
         if self.replay_origin == FlexItemReplayOrigin::SourceSlice {
             self.source_canvas_block_start = self.source_content_slice.block_start;
+        }
+    }
+}
+
+/// Classification of an item's start within the committed flex-fragment
+/// sequence.
+///
+/// A positive local source-slice start alone does not establish a CSS
+/// fragmentation continuation: a negative cross-start margin may paint before
+/// the line's source interval without a preceding item fragment. The committed
+/// plan therefore records that case separately from a true predecessor.
+/// <https://www.w3.org/TR/css-flexbox-1/#pagination>
+/// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum FlexItemFragmentStart {
+    /// The first committed source slice begins at the item's source origin.
+    #[default]
+    ItemStart,
+    /// The first committed slice begins after zero because leading paint
+    /// overflow (such as a negative cross-start margin) lies before it.
+    LeadingPaintOverflow,
+    /// A prior committed slice of the same source item owns the earlier
+    /// source interval.
+    Continuation { ordinal: NonZeroUsize },
+}
+
+impl FlexItemFragmentStart {
+    const SOURCE_SLICE_EPSILON: f32 = 0.01;
+
+    fn classify(preceding_slice_count: usize, content_slice: FlexFragmentSlice) -> Self {
+        if let Some(ordinal) = NonZeroUsize::new(preceding_slice_count) {
+            Self::Continuation { ordinal }
+        } else if content_slice.block_start.points() > Self::SOURCE_SLICE_EPSILON {
+            Self::LeadingPaintOverflow
+        } else {
+            Self::ItemStart
+        }
+    }
+
+    pub(super) fn is_continuation(self) -> bool {
+        matches!(self, Self::Continuation { .. })
+    }
+
+    fn child_fragment_replay_ordinal(self) -> usize {
+        match self {
+            Self::ItemStart | Self::LeadingPaintOverflow => 0,
+            Self::Continuation { ordinal } => ordinal.get(),
+        }
+    }
+
+    fn is_consistent_with(
+        self,
+        preceding_slice_count: usize,
+        content_slice: FlexFragmentSlice,
+    ) -> bool {
+        match self {
+            Self::ItemStart => {
+                preceding_slice_count == 0
+                    && content_slice.block_start.points() <= Self::SOURCE_SLICE_EPSILON
+            }
+            Self::LeadingPaintOverflow => {
+                preceding_slice_count == 0
+                    && content_slice.block_start.points() > Self::SOURCE_SLICE_EPSILON
+            }
+            Self::Continuation { ordinal } => ordinal.get() == preceding_slice_count,
         }
     }
 }
@@ -1681,43 +1788,56 @@ impl FlexItemAvailableSpace {
     }
 }
 
-/// Marker for a baseline offset measured downward from a flex item's top edge.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(in crate::layout::flex) struct FlexVerticalBaselineAxis;
+/// Flex aliases for the shared physical baseline coordinates. Flex keeps the
+/// names local to make the physical-axis intent of its adapters obvious.
+pub(in crate::layout::flex) type FlexVerticalBaselineAxis = PhysicalTopBaselineAxis;
+pub(in crate::layout::flex) type FlexHorizontalBaselineAxis = PhysicalLeftBaselineAxis;
+pub(in crate::layout::flex) type FlexVerticalBaselineOffset = PhysicalTopBaselineOffset;
+pub(in crate::layout::flex) type FlexHorizontalBaselineOffset = PhysicalLeftBaselineOffset;
 
-/// Marker for a baseline offset measured rightward from a flex item's left edge.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(in crate::layout::flex) struct FlexHorizontalBaselineAxis;
-
-/// A baseline coordinate relative to a Flex item's physical border-box origin.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(in crate::layout::flex) struct FlexItemBaselineOffset<Axis>(
-    f32,
-    std::marker::PhantomData<Axis>,
-);
-
-impl<Axis> FlexItemBaselineOffset<Axis> {
-    pub(in crate::layout::flex) const fn new(points: f32) -> Self {
-        Self(points, std::marker::PhantomData)
-    }
-
-    pub(in crate::layout::flex) const fn points(self) -> f32 {
-        self.0
-    }
-
-    pub(in crate::layout::flex) fn offset_by(self, distance: LayoutLength) -> Self {
-        Self::new(self.0 + distance.points())
-    }
-
-    pub(in crate::layout::flex) fn half(self) -> Self {
-        Self::new(self.0 / 2.0)
-    }
+/// Form a physical vertical baseline coordinate from a final flex item's
+/// border-box origin.
+///
+/// [`FlexItemLayout::y`] is the final border-box origin after Flexbox has
+/// resolved margin-box placement. The measured baseline is likewise relative
+/// to that border box, so an item margin must not be added again here.
+/// <https://www.w3.org/TR/css-flexbox-1/#flex-baselines>
+pub(in crate::layout::flex) fn flex_item_vertical_border_box_baseline_coordinate(
+    item: &FlexItemLayout,
+    baseline: FlexVerticalBaselineOffset,
+) -> FlexVerticalBaselineOffset {
+    flex_vertical_baseline_from_points(item.y().points() + baseline.points())
 }
 
-pub(in crate::layout::flex) type FlexVerticalBaselineOffset =
-    FlexItemBaselineOffset<FlexVerticalBaselineAxis>;
-pub(in crate::layout::flex) type FlexHorizontalBaselineOffset =
-    FlexItemBaselineOffset<FlexHorizontalBaselineAxis>;
+/// Form a physical horizontal baseline coordinate from a final flex item's
+/// border-box origin.
+///
+/// [`FlexItemLayout::x`] is the final border-box origin after Flexbox has
+/// resolved margin-box placement. The measured baseline is likewise relative
+/// to that border box, so an item margin must not be added again here.
+/// <https://www.w3.org/TR/css-flexbox-1/#flex-baselines>
+pub(in crate::layout::flex) fn flex_item_horizontal_border_box_baseline_coordinate(
+    item: &FlexItemLayout,
+    baseline: FlexHorizontalBaselineOffset,
+) -> FlexHorizontalBaselineOffset {
+    flex_horizontal_baseline_from_points(item.x().points() + baseline.points())
+}
+
+/// Construct a typed baseline from a scalar only at an existing legacy text,
+/// Taffy, or test boundary.
+pub(in crate::layout::flex) fn flex_vertical_baseline_from_points(
+    points: f32,
+) -> FlexVerticalBaselineOffset {
+    FlexVerticalBaselineOffset::new(layout_pt(points))
+}
+
+/// Construct a typed baseline from a scalar only at an existing legacy text,
+/// Taffy, or test boundary.
+pub(in crate::layout::flex) fn flex_horizontal_baseline_from_points(
+    points: f32,
+) -> FlexHorizontalBaselineOffset {
+    FlexHorizontalBaselineOffset::new(layout_pt(points))
+}
 
 /// Project a vertical item-baseline offset into a row flex line's cross-axis
 /// displacement. Callers select this only when the physical cross axis is
@@ -1725,7 +1845,7 @@ pub(in crate::layout::flex) type FlexHorizontalBaselineOffset =
 pub(in crate::layout::flex) fn flex_cross_length_from_vertical_baseline(
     baseline: FlexVerticalBaselineOffset,
 ) -> FlexCrossLength {
-    FlexCrossLength::new(baseline.points())
+    FlexCrossLength::new(baseline.into_layout_length().points())
 }
 
 /// Project a horizontal item-baseline offset into a column flex line's
@@ -1734,7 +1854,7 @@ pub(in crate::layout::flex) fn flex_cross_length_from_vertical_baseline(
 pub(in crate::layout::flex) fn flex_cross_length_from_horizontal_baseline(
     baseline: FlexHorizontalBaselineOffset,
 ) -> FlexCrossLength {
-    FlexCrossLength::new(baseline.points())
+    FlexCrossLength::new(baseline.into_layout_length().points())
 }
 
 /// Project a row flex line's cross-axis coordinate into its physical vertical
@@ -1743,7 +1863,7 @@ pub(in crate::layout::flex) fn flex_cross_length_from_horizontal_baseline(
 pub(in crate::layout::flex) fn flex_vertical_baseline_from_cross_offset(
     offset: FlexCrossOffset,
 ) -> FlexVerticalBaselineOffset {
-    FlexVerticalBaselineOffset::new(offset.points())
+    flex_vertical_baseline_from_points(offset.points())
 }
 
 /// Project a column flex line's cross-axis coordinate into its physical
@@ -1752,7 +1872,7 @@ pub(in crate::layout::flex) fn flex_vertical_baseline_from_cross_offset(
 pub(in crate::layout::flex) fn flex_horizontal_baseline_from_cross_offset(
     offset: FlexCrossOffset,
 ) -> FlexHorizontalBaselineOffset {
-    FlexHorizontalBaselineOffset::new(offset.points())
+    flex_horizontal_baseline_from_points(offset.points())
 }
 
 /// A synthesized baseline whose physical offset axis is selected at runtime
@@ -1784,20 +1904,7 @@ impl FlexPhysicalBaselineOffset {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(in crate::layout::flex) struct FlexItemBaselinePair<Axis> {
-    pub(in crate::layout::flex) first: Option<FlexItemBaselineOffset<Axis>>,
-    pub(in crate::layout::flex) last: Option<FlexItemBaselineOffset<Axis>>,
-}
-
-impl<Axis> Default for FlexItemBaselinePair<Axis> {
-    fn default() -> Self {
-        Self {
-            first: None,
-            last: None,
-        }
-    }
-}
+pub(in crate::layout::flex) type FlexItemBaselinePair<Axis> = BaselinePair<Axis>;
 
 /// Estimated first/last baseline sets, separated by their physical axis.
 #[derive(Debug, Clone, Copy, Default)]
@@ -1814,13 +1921,49 @@ pub(in crate::layout::flex) struct FlexItemBaselineEstimate {
 /// physical-axis invariant required by CSS Flexbox baseline export:
 /// <https://www.w3.org/TR/css-flexbox-1/#flex-baselines>.
 #[derive(Debug, Clone, Copy, Default)]
-pub(in crate::layout::flex) struct FlexContainerBaselineEstimate {
-    pub(in crate::layout::flex) vertical: FlexItemBaselinePair<FlexVerticalBaselineAxis>,
-    // The current inline-atom consumer is horizontal-writing only, but
-    // vertical-writing parents must be able to consume this finalized record
-    // once their inline baseline transport is generalized.
-    #[allow(dead_code)]
-    pub(in crate::layout::flex) horizontal: FlexItemBaselinePair<FlexHorizontalBaselineAxis>,
+pub(in crate::layout) struct FlexContainerBaselineSets {
+    pub(in crate::layout) vertical: FlexItemBaselinePair<FlexVerticalBaselineAxis>,
+    // Parent inline layout projects this physical record only after its
+    // writing mode selects a compatible logical block axis.
+    pub(in crate::layout) horizontal: FlexItemBaselinePair<FlexHorizontalBaselineAxis>,
+}
+
+impl FlexContainerBaselineSets {
+    /// Convert final content-box-relative Flex baselines to the physical
+    /// border-box coordinates required by an atomic inline. This is the sole
+    /// Flex-to-Inline box-model conversion boundary.
+    pub(in crate::layout) fn into_inline_atom_baselines(
+        self,
+        border_top_and_padding: LayoutLength,
+        border_left_and_padding: LayoutLength,
+    ) -> PhysicalBaselineSets {
+        PhysicalBaselineSets {
+            vertical: BaselinePair {
+                first: self.vertical.first.map(|baseline| {
+                    PhysicalTopBaselineOffset::new(
+                        border_top_and_padding + baseline.into_layout_length(),
+                    )
+                }),
+                last: self.vertical.last.map(|baseline| {
+                    PhysicalTopBaselineOffset::new(
+                        border_top_and_padding + baseline.into_layout_length(),
+                    )
+                }),
+            },
+            horizontal: BaselinePair {
+                first: self.horizontal.first.map(|baseline| {
+                    PhysicalLeftBaselineOffset::new(
+                        border_left_and_padding + baseline.into_layout_length(),
+                    )
+                }),
+                last: self.horizontal.last.map(|baseline| {
+                    PhysicalLeftBaselineOffset::new(
+                        border_left_and_padding + baseline.into_layout_length(),
+                    )
+                }),
+            },
+        }
+    }
 }
 
 /// Physical content-box metrics that Flex keeps typed until it reaches the
@@ -1838,6 +1981,13 @@ pub(super) struct FlexPhysicalIntrinsicMetrics {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct FlexItemEstimate {
     pub(super) metrics: IntrinsicItemMetrics,
+    /// The CSS rule that produced the resolved flex basis used by Taffy.
+    ///
+    /// This travels with the estimate because a numeric flex rectangle cannot
+    /// distinguish a content-derived provisional main size from a transferred
+    /// aspect-ratio size. The final normal-flow span correction is valid only
+    /// for the former.
+    pub(super) main_size_provenance: FlexMainSizeProvenance,
     /// Descendant content extent measured from the flex item's border-box
     /// block start that must remain available to CSS Fragmentation replay.
     ///
@@ -1849,6 +1999,17 @@ pub(super) struct FlexItemEstimate {
     /// Flex keeps physical vertical and horizontal exported baselines apart
     /// until a legacy consumer explicitly requests scalar intrinsic metrics.
     pub(super) baselines: FlexItemBaselineEstimate,
+    /// The in-flow line-box span produced when the item is replayed at its
+    /// resolved flex main size.
+    ///
+    /// Taffy's leaf rectangle is a sizing input, not a record of the line
+    /// boxes selected by the item's independent formatting context.  Keep
+    /// that final normal-flow measurement separate from fragmentable overflow
+    /// so Flexbox line sizing can consume used geometry without deriving it
+    /// from paint bounds or pagination state.
+    /// <https://www.w3.org/TR/css-flexbox-1/#algo-cross-line>
+    /// <https://www.w3.org/TR/css-inline-3/#line-box>
+    pub(super) normal_flow_line_box_span: Option<PhysicalContentHeight>,
 }
 
 impl FlexItemEstimate {
@@ -1863,8 +2024,10 @@ impl FlexItemEstimate {
         let fragmentable_overflow_height = PhysicalContentHeight::new(metrics.content_height);
         Self {
             metrics,
+            main_size_provenance: FlexMainSizeProvenance::NormalFlowContent,
             fragmentable_overflow_height,
             baselines,
+            normal_flow_line_box_span: None,
         }
     }
 
@@ -1917,6 +2080,11 @@ impl FlexItemEstimate {
         metrics
     }
 
+    /// Record the flex-basis rule after the Taffy adapter has resolved it.
+    pub(super) fn set_main_size_provenance(&mut self, provenance: FlexMainSizeProvenance) {
+        self.main_size_provenance = provenance;
+    }
+
     /// Record the measured descendant source extent independently of the
     /// estimate's ordinary used/intrinsic block metric.
     pub(super) fn set_fragmentable_overflow_height(&mut self, height: PhysicalContentHeight) {
@@ -1931,6 +2099,18 @@ impl FlexItemEstimate {
                 .points()
                 .max(height.points()),
         ));
+    }
+
+    /// Record the physical block span selected by the item's actual in-flow
+    /// formatting context at its resolved flex main size.  This is not an
+    /// overflow measurement: callers may use it only as a used line-box
+    /// contribution while resolving flex-line geometry.
+    pub(super) fn set_normal_flow_line_box_span(&mut self, span: PhysicalContentHeight) {
+        self.normal_flow_line_box_span = Some(span);
+    }
+
+    pub(super) fn normal_flow_line_box_span(&self) -> Option<PhysicalContentHeight> {
+        self.normal_flow_line_box_span
     }
 
     /// Replace a horizontal row item's normal-flow cross contribution without
@@ -2399,6 +2579,30 @@ mod tests {
     }
 
     #[test]
+    fn explicit_balanced_line_count_reserves_cross_measurement_space() {
+        let mut style = ComputedStyle::initial();
+        style.flex_wrap = FlexWrap::Balance;
+        style.flex_line_count = css::FlexLineCount::Count(
+            std::num::NonZeroUsize::new(2).expect("line count is non-zero"),
+        );
+        let available = FlexAvailableSpace {
+            width: PhysicalContentWidth::new(content_box_pt(100.0)),
+            width_basis: PercentageBasis::definite_from(
+                content_box_pt(100.0),
+                FlexAvailableSizeSource::ContainingBlock,
+            ),
+            height: None,
+            height_basis: PercentageBasis::indefinite(),
+        };
+
+        let measurement =
+            balanced_flex_item_measure_available_space(&style, FlexDirection::Column, available);
+
+        assert_eq!(measurement.width.points(), 50.0);
+        assert_eq!(measurement.width_basis, available.width_basis);
+    }
+
+    #[test]
     fn flex_cross_percentage_basis_follows_the_resolved_physical_axis() {
         let available = FlexAvailableSpace {
             width: PhysicalContentWidth::new(content_box_pt(80.0)),
@@ -2514,12 +2718,12 @@ mod tests {
     }
 
     #[test]
-    fn materialized_fragment_plan_assigns_item_local_continuation_ordinals() {
+    fn materialized_fragment_plan_classifies_item_fragment_starts() {
         let item = FlexItemLayout::new(ContainerRect::new(
             ContainerPoint::new(0.0, 0.0),
             ContainerSize::new(20.0, 200.0),
         ));
-        let fragment = |page_index, start, end| FlexFragmentLayout {
+        let fragment = |page_index, item_index, start, end| FlexFragmentLayout {
             page_index,
             line_start: 0,
             line_end: 1,
@@ -2531,11 +2735,11 @@ mod tests {
                     FlexFragmentBlockOffset::new(start),
                     FlexFragmentBlockOffset::new(end),
                 ),
-                item_indices: vec![0],
+                item_indices: vec![item_index],
             }],
             items: vec![FlexItemFragmentLayout {
-                item_index: 0,
-                source_item_index: 0,
+                item_index,
+                source_item_index: item_index,
                 line_index: 0,
                 source_bounds: item.clone(),
                 used_bounds: item.clone(),
@@ -2554,9 +2758,16 @@ mod tests {
             metadata: FragmentPageMetadata::empty(page_index),
         };
         let mut plan = FlexFragmentPlan::default();
-        let mut first = fragment(3, 0.0, 75.0);
+        let mut first = fragment(3, 0, 0.0, 75.0);
         plan.prepare_materialized_fragment(&mut first);
-        assert_eq!(first.items[0].continuation.continuation_ordinal, 0);
+        assert_eq!(
+            first.items[0].continuation.fragment_start,
+            FlexItemFragmentStart::ItemStart
+        );
+        assert_eq!(
+            first.items[0].continuation.child_fragment_replay_ordinal(),
+            0
+        );
         let mut materialized_first = MaterializedFlexFragment::new(
             first,
             Some(PaintClip::new(0.0, 0.0, 20.0, 75.0)),
@@ -2627,9 +2838,38 @@ mod tests {
             "overflow clipping follows the committed destination fragment",
         );
 
-        let mut second = fragment(7, 75.0, 150.0);
+        let mut leading_paint_overflow = fragment(5, 1, 3.0, 75.0);
+        plan.prepare_materialized_fragment(&mut leading_paint_overflow);
+        assert_eq!(
+            leading_paint_overflow.items[0].continuation.fragment_start,
+            FlexItemFragmentStart::LeadingPaintOverflow,
+            "a positive source-slice offset without a committed predecessor is leading paint overflow",
+        );
+        assert_eq!(
+            leading_paint_overflow.items[0]
+                .continuation
+                .child_fragment_replay_ordinal(),
+            0,
+            "leading paint overflow must replay the child's initial fragment",
+        );
+
+        let mut second = fragment(7, 0, 75.0, 150.0);
         plan.prepare_materialized_fragment(&mut second);
-        assert_eq!(second.items[0].continuation.continuation_ordinal, 1);
+        assert_eq!(
+            second.items[0].continuation.fragment_start,
+            FlexItemFragmentStart::Continuation {
+                ordinal: NonZeroUsize::new(1).expect("continuation ordinal is non-zero"),
+            }
+        );
+        assert!(
+            second.items[0]
+                .continuation
+                .continues_from_previous_fragment()
+        );
+        assert_eq!(
+            second.items[0].continuation.child_fragment_replay_ordinal(),
+            1
+        );
         assert_eq!(second.items[0].continuation.fragmentainer_index, 7);
         assert_eq!(
             second.items[0]

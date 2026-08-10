@@ -1,5 +1,4 @@
 use super::*;
-use crate::css::is_custom_property_name;
 
 pub(crate) fn apply_cascaded_declarations_with_inheritance_source_and_parent_ch_advance(
     style: &mut ComputedStyle,
@@ -28,7 +27,17 @@ pub(crate) fn apply_cascaded_declarations_with_inheritance_source_and_parent_ch_
         inheritance_source,
         color_scheme_preference,
     );
+    // Registered `<color>` values resolve `light-dark()` in the color scheme
+    // selected by their owning element.  Keep their token form until the
+    // color-scheme prepass has established that scheme, then substitute the
+    // typed computed value into ordinary declarations.
     compute_registered_custom_property_values(style);
+    let declarations = declarations_after_variable_substitution_and_shorthand_expansion(
+        &declarations,
+        &style.custom_properties,
+        direction,
+        writing_mode,
+    );
     apply_cascaded_font_size_declarations_with_parent_ch_advance(
         style,
         &declarations,
@@ -36,31 +45,53 @@ pub(crate) fn apply_cascaded_declarations_with_inheritance_source_and_parent_ch_
         parent_ch_advance,
     );
     apply_cascaded_color_declarations(style, &declarations, inheritance_source);
-    let declarations = declarations_after_variable_substitution_and_shorthand_expansion(
-        &declarations,
-        &style.custom_properties,
-        direction,
-        writing_mode,
-    );
 
+    // Font shorthand expansion emits consecutive components with their source
+    // cascade metadata intact. Reuse one parsed shorthand for that group.
+    let mut parsed_font_component = None;
     for (index, declaration) in declarations.iter().enumerate() {
-        let name = declaration.name.as_ref();
-        if is_custom_property_name(name) {
+        let Some(property) = declaration.property.modeled() else {
+            continue;
+        };
+        let name = property.css_name();
+        // These properties are fully resolved by dependency-ordered prepasses
+        // above, including their CSS-wide keywords. Letting the generic
+        // handler process an earlier defaulting declaration again would
+        // overwrite the prepass's later winning longhand.
+        if matches!(
+            property,
+            ModeledProperty::Longhand(
+                ModeledLonghand::ColorScheme | ModeledLonghand::FontSize | ModeledLonghand::Color
+            ) | ModeledProperty::FontComponent(ModeledLonghand::FontSize)
+        ) {
             continue;
         }
-        // `color-scheme` is fully resolved in the prepass above, including
-        // its CSS-wide keywords. Letting the generic CSS-wide handler process
-        // it again would reset the page scheme selected for `normal`.
-        if name == "color-scheme" {
-            continue;
-        }
-        if is_shadowed_by_later_var_declaration(&declarations, index, name) {
+        if is_shadowed_by_later_var_declaration(&declarations, index, &declaration.property) {
             continue;
         }
         let resolved_value;
         let value = trim_css_value(&declaration.value);
         let value = if contains_css_variable_reference(value) {
             let Some(resolved) = resolve_css_variables(value, &style.custom_properties) else {
+                if matches!(
+                    property,
+                    ModeledProperty::Longhand(
+                        ModeledLonghand::AnimationName
+                            | ModeledLonghand::AnimationDuration
+                            | ModeledLonghand::AnimationDelay
+                    )
+                ) {
+                    // A winning unresolved variable makes this non-inherited
+                    // animation longhand invalid at computed-value time. It
+                    // therefore computes to its initial value; an earlier
+                    // declaration must not revive.
+                    apply_css_wide_default_keyword(
+                        style,
+                        property,
+                        CssWideDefaultKeyword::Initial,
+                        inheritance_source,
+                    );
+                }
                 continue;
             };
             resolved_value = resolved;
@@ -69,9 +100,34 @@ pub(crate) fn apply_cascaded_declarations_with_inheritance_source_and_parent_ch_
             value
         };
         if let Some(keyword) = CssWideDefaultKeyword::parse(value) {
-            apply_css_wide_default_keyword(style, name, keyword, inheritance_source);
+            apply_css_wide_default_keyword(style, property, keyword, inheritance_source);
             continue;
         }
+        if let Some(component) = property.font_component() {
+            let source = (
+                declaration.stylesheet_index,
+                declaration.rule_order,
+                declaration.declaration_order,
+            );
+            if parsed_font_component
+                .as_ref()
+                .is_none_or(|(cached_source, _)| *cached_source != source)
+            {
+                parsed_font_component = parse_font_shorthand_with_line_height_font_size(
+                    value,
+                    inheritance_source.font_size,
+                    parent_ch_advance,
+                    style.font_weight,
+                    Some(style.font_size),
+                )
+                .map(|font| (source, font));
+            }
+            if let Some((_, font)) = &parsed_font_component {
+                apply_font_shorthand_component(style, component, font);
+            }
+            continue;
+        }
+        parsed_font_component = None;
         // `match-parent` resolves the root's alignment as `start`: the root
         // has no element parent from which to inherit a physical start/end
         // direction, while its own used `direction` still maps logical start
@@ -140,6 +196,9 @@ fn apply_cascaded_property(
     inheritance_source: &ComputedStyle,
     parent_ch_advance: LayoutLength,
 ) -> bool {
+    if super::super::style::apply_animation_snapshot_longhand(style, name, value) {
+        return true;
+    }
     if name == "color-scheme" {
         return true;
     }
@@ -184,12 +243,23 @@ fn apply_cascaded_property(
 pub(in crate::css) fn canonical_cascaded_declaration<'a>(
     declaration: CascadedDeclaration<'a>,
 ) -> Option<CascadedDeclaration<'a>> {
+    // `font` is checked at specified-value time before it is split into
+    // component declarations. A component retains the original shorthand
+    // token stream, which is intentionally not valid as the component's own
+    // grammar until its font-relative values are resolved below.
+    if declaration
+        .property
+        .modeled()
+        .is_some_and(|property| property.font_component().is_some())
+    {
+        return Some(declaration);
+    }
     let (name, value) = crate::css::parse::declaration_operation(
-        declaration.name.as_ref(),
+        declaration.property.css_name(),
         declaration.value.as_ref(),
     )?;
     Some(CascadedDeclaration {
-        name: Cow::Owned(name),
+        property: CascadedProperty::from_name(Cow::Owned(name)),
         value: Cow::Owned(value),
         ..declaration
     })

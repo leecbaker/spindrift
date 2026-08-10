@@ -1,251 +1,95 @@
 use super::*;
-use crate::css::MediaEnvironment;
-use crate::css::component_values::find_matching_brace;
+use crate::css::{LayerName, LayerOrder};
+use cssparser::{
+    AtRuleParser, BasicParseErrorKind, CowRcStr, DeclarationParser, Parser, ParserState,
+    RuleBodyItemParser, Token,
+};
 
-/// Parses CSS Paged Media rules while preserving full raw `@page` bodies.
+/// A syntactically parsed `@page` rule before stylesheet-level cascade metadata
+/// has been assigned. Origin, layer order, and rule order belong to the
+/// stylesheet collector rather than the at-rule grammar.
+#[derive(Debug)]
+pub(in crate::css) struct ParsedPageRule {
+    pub(in crate::css) selectors: Vec<PageSelector>,
+    pub(in crate::css) declarations: Declarations,
+    pub(in crate::css) margin_boxes: HashMap<String, Declarations>,
+    pub(in crate::css) footnote_area: Option<Declarations>,
+    pub(in crate::css) layer: Option<LayerName>,
+}
+
+/// Parse CSS Paged Media's page-selector list from CSS tokens.
 ///
-/// CSS Paged Media allows nested margin at-rules inside `@page`, which the
-/// generic stylesheet parser does not expose as a single declaration block.
-/// This scanner walks top-level/group-rule blocks, honoring CSS Conditional
-/// `@media`/`@supports` and CSS Cascade layers before extracting page rules:
-/// <https://www.w3.org/TR/css-page-3/#at-page-rule>,
-/// <https://www.w3.org/TR/css-conditional-3/#condition-apis>, and
-/// <https://www.w3.org/TR/css-cascade-5/#layering>.
-pub(super) fn parse_page_rules(
-    source: &str,
-    base_url: Option<&url::Url>,
-    root_url: Option<&url::Url>,
-    origin: StylesheetOrigin,
-    layer_names: &[String],
-    initial_layer: Option<&str>,
-    media_environment: &MediaEnvironment,
-) -> Vec<PageRule> {
-    let layer_order = layer_names
-        .iter()
-        .enumerate()
-        .map(|(index, name)| (name.as_str(), index))
-        .collect::<HashMap<_, _>>();
-    let mut rules = Vec::new();
-    let mut state = PageRuleScanState {
-        anonymous_layer_count: 0,
-        order: 0,
-    };
-    parse_page_rules_in_block(
-        source,
-        PageRuleScanContext {
-            base_url,
-            root_url,
-            origin,
-            layer_order: &layer_order,
-            media_environment,
-        },
-        initial_layer,
-        &mut state,
-        &mut rules,
-    );
-    rules
+/// CSS Paged Media requires selector components to be adjacent. GCPM's
+/// existing `:nth()` extension uses CSS Syntax's shared `an+b` parser.
+/// <https://www.w3.org/TR/css-page-3/#page-selectors>
+/// <https://www.w3.org/TR/css-gcpm-3/#document-page-selectors>
+pub(super) fn parse_page_selector_list<'i, 't>(
+    input: &mut Parser<'i, 't>,
+) -> Result<Vec<PageSelector>, cssparser::ParseError<'i, ()>> {
+    input.skip_whitespace();
+    if input.is_exhausted() {
+        return Ok(Vec::new());
+    }
+    input.parse_comma_separated(parse_page_selector)
+}
+
+fn parse_page_selector<'i, 't>(
+    input: &mut Parser<'i, 't>,
+) -> Result<PageSelector, cssparser::ParseError<'i, ()>> {
+    let first = input.next_including_whitespace_and_comments()?.clone();
+    let mut page_type = None;
+    let mut pseudos = Vec::new();
+    match first {
+        Token::Ident(name) => page_type = Some(name.to_string()),
+        Token::Colon => pseudos.push(parse_page_pseudo(input)?),
+        _ => return Err(input.new_custom_error(())),
+    }
+    while !input.is_exhausted() {
+        if !matches!(
+            input.next_including_whitespace_and_comments()?,
+            Token::Colon
+        ) {
+            return Err(input.new_custom_error(()));
+        }
+        pseudos.push(parse_page_pseudo(input)?);
+    }
+    Ok(PageSelector { page_type, pseudos })
+}
+
+fn parse_page_pseudo<'i, 't>(
+    input: &mut Parser<'i, 't>,
+) -> Result<PagePseudo, cssparser::ParseError<'i, ()>> {
+    match input.next_including_whitespace_and_comments()?.clone() {
+        Token::Ident(name) if name.eq_ignore_ascii_case("first") => Ok(PagePseudo::First),
+        Token::Ident(name) if name.eq_ignore_ascii_case("left") => Ok(PagePseudo::Left),
+        Token::Ident(name) if name.eq_ignore_ascii_case("right") => Ok(PagePseudo::Right),
+        Token::Ident(name) if name.eq_ignore_ascii_case("blank") => Ok(PagePseudo::Blank),
+        Token::Function(name) if name.eq_ignore_ascii_case("nth") => {
+            input.parse_nested_block(|input| {
+                let (a, b) = cssparser::parse_nth(input)?;
+                input.expect_exhausted()?;
+                Ok(PagePseudo::Nth { a, b })
+            })
+        }
+        _ => Err(input.new_custom_error(())),
+    }
 }
 
 #[derive(Clone, Copy)]
-struct PageRuleScanContext<'a> {
-    base_url: Option<&'a url::Url>,
-    root_url: Option<&'a url::Url>,
-    origin: StylesheetOrigin,
-    layer_order: &'a HashMap<&'a str, usize>,
-    media_environment: &'a MediaEnvironment,
+pub(super) enum PageNestedAtRule {
+    MarginBox(&'static str),
+    Footnote,
 }
 
-struct PageRuleScanState {
-    anonymous_layer_count: usize,
-    order: usize,
-}
-
-fn parse_page_rules_in_block<'a>(
-    source: &'a str,
-    context: PageRuleScanContext<'a>,
-    current_layer: Option<&str>,
-    state: &mut PageRuleScanState,
-    rules: &mut Vec<PageRule>,
-) {
-    let mut position = 0usize;
-    while let Some(open) = find_next_top_level_open_brace(source, position) {
-        let Some(close) = find_matching_brace(source, open, true) else {
-            break;
-        };
-        let segment_start = source[position..open]
-            .rfind(['}', ';'])
-            .map(|index| position + index + 1)
-            .unwrap_or(position);
-        let prelude_start = source[segment_start..open]
-            .rfind('@')
-            .map(|index| segment_start + index)
-            .unwrap_or(segment_start);
-        let prelude = source[prelude_start..open].trim();
-        let body = &source[open + 1..close];
-        parse_page_at_rule(prelude, body, context, current_layer, state, rules);
-        position = close.saturating_add(1).min(source.len());
-    }
-}
-
-fn parse_page_at_rule<'a>(
-    prelude: &'a str,
-    body: &'a str,
-    context: PageRuleScanContext<'a>,
-    current_layer: Option<&str>,
-    state: &mut PageRuleScanState,
-    rules: &mut Vec<PageRule>,
-) {
-    let Some(rest) = prelude.trim().strip_prefix('@') else {
-        return;
-    };
-    let (name, at_prelude) = split_at_rule_name(rest);
-    if name.eq_ignore_ascii_case("page") {
-        rules.push(PageRule {
-            origin: context.origin,
-            selectors: parse_page_selectors(at_prelude),
-            declarations: parse_declarations_with_urls(
-                &strip_nested_page_rules(body),
-                context.base_url,
-                context.root_url,
-            ),
-            margin_boxes: parse_page_rule_margin_boxes(body, context.base_url, context.root_url),
-            footnote_area: parse_page_rule_footnote_area(body, context.base_url, context.root_url),
-            order: state.order,
-            layer_order: current_layer
-                .and_then(|name| context.layer_order.get(name))
-                .cloned(),
-        });
-        state.order = state.order.saturating_add(1);
-    } else if name.eq_ignore_ascii_case("media") {
-        if media_rule_applies_in_environment(at_prelude, context.media_environment) {
-            parse_page_rules_in_block(body, context, current_layer, state, rules);
-        }
-    } else if name.eq_ignore_ascii_case("supports") {
-        if supports_condition_applies(at_prelude) {
-            parse_page_rules_in_block(body, context, current_layer, state, rules);
-        }
-    } else if name.eq_ignore_ascii_case("layer") && !at_prelude.contains(',') {
-        let layer_name = if at_prelude.trim().is_empty() {
-            let anonymous_name = format!("__anonymous_layer_{}", state.anonymous_layer_count);
-            state.anonymous_layer_count = state.anonymous_layer_count.saturating_add(1);
-            Some(anonymous_name)
-        } else {
-            qualify_page_layer_name(current_layer, at_prelude)
-        };
-        parse_page_rules_in_block(body, context, layer_name.as_deref(), state, rules);
-    }
-}
-
-fn split_at_rule_name(rest: &str) -> (&str, &str) {
-    let trimmed = rest.trim_start();
-    let end = trimmed
-        .find(|character: char| character.is_whitespace())
-        .unwrap_or(trimmed.len());
-    (&trimmed[..end], trimmed[end..].trim())
-}
-
-fn qualify_page_layer_name(parent: Option<&str>, name: &str) -> Option<String> {
-    let name = name.trim();
-    if name.is_empty() {
-        return None;
-    }
-    if let Some(parent) = parent
-        && !parent.is_empty()
-    {
-        return Some(format!("{parent}.{name}"));
-    }
-    Some(name.to_string())
-}
-
-pub(super) fn parse_page_rule_margin_boxes(
-    page_body: &str,
-    base_url: Option<&url::Url>,
-    root_url: Option<&url::Url>,
-) -> HashMap<String, Declarations> {
-    let mut boxes = HashMap::new();
-    for name in PAGE_MARGIN_BOX_NAMES {
-        let at_name = format!("@{name}");
-        let mut body_rest = page_body;
-        while let Some(box_start) = find_margin_at_rule(body_rest, &at_name) {
-            let box_rest = &body_rest[box_start + at_name.len()..];
-            let Some(box_open_offset) =
-                crate::css::component_values::find_next_top_level_open_brace(box_rest, 0)
-            else {
-                break;
-            };
-            let box_open = box_start + at_name.len() + box_open_offset;
-            let Some(box_close) = find_matching_brace(body_rest, box_open, false) else {
-                break;
-            };
-            boxes
-                .entry(name.to_string())
-                .or_insert_with(Declarations::new)
-                .extend(parse_declarations_with_urls(
-                    &body_rest[box_open + 1..box_close],
-                    base_url,
-                    root_url,
-                ));
-            body_rest = &body_rest[box_close + 1..];
-        }
-    }
-    boxes
-}
-
-/// Parses GCPM's `@footnote` page-area rule without conflating it with one of
-/// CSS Paged Media's sixteen page-margin boxes:
-/// <https://www.w3.org/TR/css-gcpm-3/#footnote-area>.
-pub(super) fn parse_page_rule_footnote_area(
-    page_body: &str,
-    base_url: Option<&url::Url>,
-    root_url: Option<&url::Url>,
-) -> Option<Declarations> {
-    let at_name = "@footnote";
-    let mut body_rest = page_body;
-    let mut declarations = Declarations::new();
-    let mut found = false;
-    while let Some(area_start) = find_margin_at_rule(body_rest, at_name) {
-        let area_rest = &body_rest[area_start + at_name.len()..];
-        let Some(area_open_offset) =
-            crate::css::component_values::find_next_top_level_open_brace(area_rest, 0)
-        else {
-            break;
-        };
-        let area_open = area_start + at_name.len() + area_open_offset;
-        let Some(area_close) = find_matching_brace(body_rest, area_open, false) else {
-            break;
-        };
-        declarations.extend(parse_declarations_with_urls(
-            &body_rest[area_open + 1..area_close],
-            base_url,
-            root_url,
-        ));
-        found = true;
-        body_rest = &body_rest[area_close + 1..];
-    }
-    found.then_some(declarations)
-}
-
-/// Finds an exact page-margin at-rule name.
-///
-/// CSS Paged Media defines distinct at-rules such as `@bottom-right` and
-/// `@bottom-right-corner`; matching must therefore stop at the at-keyword
-/// boundary rather than using a simple substring prefix:
-/// <https://www.w3.org/TR/css-page-3/#syntax-page-margin-box>.
-fn find_margin_at_rule(source: &str, at_name: &str) -> Option<usize> {
-    let mut search_start = 0usize;
-    while let Some(relative) = source[search_start..].find(at_name) {
-        let start = search_start + relative;
-        let after = start + at_name.len();
-        let boundary = source[after..]
-            .chars()
-            .next()
-            .is_none_or(|character| character.is_whitespace() || character == '{');
-        if boundary {
-            return Some(start);
-        }
-        search_start = after;
-    }
-    None
+fn page_nested_at_rule(name: &str) -> Option<PageNestedAtRule> {
+    let margin_box = PAGE_MARGIN_BOX_NAMES
+        .iter()
+        .copied()
+        .find(|known| name.eq_ignore_ascii_case(known));
+    margin_box.map(PageNestedAtRule::MarginBox).or_else(|| {
+        name.eq_ignore_ascii_case("footnote")
+            .then_some(PageNestedAtRule::Footnote)
+    })
 }
 
 pub(super) const PAGE_MARGIN_BOX_NAMES: &[&str] = &[
@@ -267,96 +111,119 @@ pub(super) const PAGE_MARGIN_BOX_NAMES: &[&str] = &[
     "left-top",
 ];
 
-pub(super) fn parse_page_selectors(prelude: &str) -> Vec<PageSelector> {
-    split_selector_list(prelude)
-        .into_iter()
-        .filter_map(parse_page_selector)
-        .collect()
+pub(super) struct PageRuleBodyParser<'a> {
+    declarations: Declarations,
+    margin_boxes: HashMap<String, Declarations>,
+    footnote_area: Option<Declarations>,
+    base_url: Option<&'a url::Url>,
+    root_url: Option<&'a url::Url>,
 }
 
-pub(super) fn parse_page_selector(selector: &str) -> Option<PageSelector> {
-    let mut page_type = None;
-    let mut pseudos = Vec::new();
-    let mut rest = selector.trim();
-    if rest.is_empty() {
-        return Some(PageSelector { page_type, pseudos });
-    }
-    while !rest.is_empty() {
-        if let Some(stripped) = rest.strip_prefix(':') {
-            let (pseudo, next) = split_page_selector_token(stripped);
-            let pseudo = match pseudo.to_ascii_lowercase().as_str() {
-                "first" => PagePseudo::First,
-                "left" => PagePseudo::Left,
-                "right" => PagePseudo::Right,
-                "blank" => PagePseudo::Blank,
-                value => {
-                    let (a, b) = parse_page_nth_pseudo(value)?;
-                    PagePseudo::Nth { a, b }
-                }
-            };
-            pseudos.push(pseudo);
-            rest = next;
-            continue;
+impl<'a> PageRuleBodyParser<'a> {
+    pub(super) fn new(base_url: Option<&'a url::Url>, root_url: Option<&'a url::Url>) -> Self {
+        Self {
+            declarations: Declarations::new().with_urls(base_url, root_url),
+            margin_boxes: HashMap::new(),
+            footnote_area: None,
+            base_url,
+            root_url,
         }
-        if page_type.is_some() {
-            return None;
+    }
+
+    pub(super) fn finish(
+        self,
+        selectors: Vec<PageSelector>,
+        layer: Option<LayerName>,
+    ) -> ParsedPageRule {
+        ParsedPageRule {
+            selectors,
+            declarations: self.declarations,
+            margin_boxes: self.margin_boxes,
+            footnote_area: self.footnote_area,
+            layer,
         }
-        let (name, next) = split_page_selector_token(rest);
-        if name.is_empty() || !name.chars().all(is_css_identifier_character) {
-            return None;
+    }
+}
+
+impl<'i> DeclarationParser<'i> for PageRuleBodyParser<'_> {
+    type Declaration = ();
+    type Error = BasicParseErrorKind<'i>;
+
+    fn parse_value<'t>(
+        &mut self,
+        name: CowRcStr<'i>,
+        input: &mut Parser<'i, 't>,
+        declaration_start: &ParserState,
+    ) -> Result<Self::Declaration, cssparser::ParseError<'i, Self::Error>> {
+        let mut collector = DeclarationCollector;
+        self.declarations.extend(
+            std::iter::once(collector.parse_value(name, input, declaration_start)?).collect(),
+        );
+        Ok(())
+    }
+}
+
+impl<'i> AtRuleParser<'i> for PageRuleBodyParser<'_> {
+    type Prelude = PageNestedAtRule;
+    type AtRule = ();
+    type Error = BasicParseErrorKind<'i>;
+
+    fn parse_prelude<'t>(
+        &mut self,
+        name: CowRcStr<'i>,
+        input: &mut Parser<'i, 't>,
+    ) -> Result<Self::Prelude, cssparser::ParseError<'i, Self::Error>> {
+        let Some(kind) = page_nested_at_rule(&name) else {
+            return Err(input.new_custom_error(BasicParseErrorKind::AtRuleInvalid(name)));
+        };
+        input.expect_exhausted()?;
+        Ok(kind)
+    }
+
+    fn rule_without_block(
+        &mut self,
+        _prelude: Self::Prelude,
+        _start: &ParserState,
+    ) -> Result<Self::AtRule, ()> {
+        Err(())
+    }
+
+    fn parse_block<'t>(
+        &mut self,
+        prelude: Self::Prelude,
+        _start: &ParserState,
+        input: &mut Parser<'i, 't>,
+    ) -> Result<Self::AtRule, cssparser::ParseError<'i, Self::Error>> {
+        let declarations = parse_declarations_from_parser(input, self.base_url, self.root_url);
+        match prelude {
+            PageNestedAtRule::MarginBox(name) => self
+                .margin_boxes
+                .entry(name.to_string())
+                .or_insert_with(|| Declarations::new().with_urls(self.base_url, self.root_url))
+                .extend(declarations),
+            PageNestedAtRule::Footnote => self
+                .footnote_area
+                .get_or_insert_with(|| Declarations::new().with_urls(self.base_url, self.root_url))
+                .extend(declarations),
         }
-        page_type = Some(name.to_string());
-        rest = next;
+        Ok(())
     }
-    Some(PageSelector { page_type, pseudos })
 }
 
-/// Parses the GCPM `:nth()` page selector argument as an `an+b` sequence.
-///
-/// The grammar is the same sequence form used by structural pseudo-classes, but
-/// page matching is evaluated against one-based generated page numbers:
-/// <https://www.w3.org/TR/css-gcpm-3/#document-page-selectors>.
-fn parse_page_nth_pseudo(value: &str) -> Option<(i32, i32)> {
-    let argument = value.strip_prefix("nth(")?.strip_suffix(')')?;
-    parse_an_plus_b(argument)
+impl<'i> cssparser::QualifiedRuleParser<'i> for PageRuleBodyParser<'_> {
+    type Prelude = ();
+    type QualifiedRule = ();
+    type Error = BasicParseErrorKind<'i>;
 }
 
-fn parse_an_plus_b(value: &str) -> Option<(i32, i32)> {
-    let compact = value
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .collect::<String>()
-        .to_ascii_lowercase();
-    match compact.as_str() {
-        "even" => return Some((2, 0)),
-        "odd" => return Some((2, 1)),
-        _ => {}
+impl<'i> RuleBodyItemParser<'i, (), BasicParseErrorKind<'i>> for PageRuleBodyParser<'_> {
+    fn parse_declarations(&self) -> bool {
+        true
     }
-    let Some(n_index) = compact.find('n') else {
-        return compact.parse::<i32>().ok().map(|b| (0, b));
-    };
-    if compact[n_index + 1..].contains('n') {
-        return None;
+
+    fn parse_qualified(&self) -> bool {
+        false
     }
-    let a = match &compact[..n_index] {
-        "" | "+" => 1,
-        "-" => -1,
-        value => value.parse::<i32>().ok()?,
-    };
-    let b = match &compact[n_index + 1..] {
-        "" => 0,
-        value => value.parse::<i32>().ok()?,
-    };
-    Some((a, b))
-}
-
-pub(super) fn split_page_selector_token(value: &str) -> (&str, &str) {
-    let end = value.find(':').unwrap_or(value.len());
-    (&value[..end], &value[end..])
-}
-
-pub(super) fn is_css_identifier_character(character: char) -> bool {
-    character == '-' || character == '_' || character.is_ascii_alphanumeric()
 }
 
 pub(crate) fn cascade_page_declarations(
@@ -369,7 +236,7 @@ pub(crate) fn cascade_page_declarations(
                 (
                     rule.origin,
                     specificity,
-                    rule.layer_order,
+                    rule.layer_order.clone(),
                     rule.order,
                     &rule.declarations,
                 )
@@ -388,7 +255,7 @@ pub(super) fn cascade_page_rule_declarations<'a>(
         Item = (
             StylesheetOrigin,
             PageSpecificity,
-            Option<usize>,
+            Option<LayerOrder>,
             usize,
             &'a Declarations,
         ),
@@ -403,8 +270,7 @@ pub(super) fn cascade_page_rule_declarations<'a>(
                 important,
                 origin,
                 origin_rank: super::super::cascade::origin_importance_rank(origin, important),
-                layer_order,
-                layer_rank: page_layer_precedence_rank(layer_order, important),
+                layer_order: layer_order.clone(),
                 specificity,
                 rule_order,
                 declaration_order,
@@ -417,7 +283,7 @@ pub(super) fn cascade_page_rule_declarations<'a>(
             });
         }
     }
-    candidates.sort_by_key(|candidate| candidate.key);
+    candidates.sort_by(|left, right| compare_page_cascade_keys(&left.key, &right.key));
 
     let mut active: Vec<PageCascadedDeclaration> = Vec::with_capacity(candidates.len());
     for candidate in candidates {
@@ -464,16 +330,15 @@ struct PageCascadedDeclaration {
     key: PageCascadeKey,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PageCascadeKey {
     important: bool,
     origin_rank: u8,
-    layer_rank: usize,
     specificity: PageSpecificity,
     rule_order: usize,
     declaration_order: usize,
     origin: StylesheetOrigin,
-    layer_order: Option<usize>,
+    layer_order: Option<LayerOrder>,
 }
 
 fn page_declaration_is_important(value: &str) -> bool {
@@ -522,34 +387,34 @@ fn same_page_cascade_layer(
         && left.key.layer_order == right.key.layer_order
 }
 
-fn page_layer_precedence_rank(layer_order: Option<usize>, important: bool) -> usize {
-    match (important, layer_order) {
-        (false, Some(order)) => order,
-        (false, None) => usize::MAX,
-        (true, None) => 0,
-        (true, Some(order)) => usize::MAX.saturating_sub(1).saturating_sub(order),
-    }
+fn compare_page_cascade_keys(left: &PageCascadeKey, right: &PageCascadeKey) -> std::cmp::Ordering {
+    left.origin_rank
+        .cmp(&right.origin_rank)
+        .then_with(|| {
+            compare_page_layer_order(
+                left.layer_order.as_ref(),
+                right.layer_order.as_ref(),
+                left.important,
+            )
+        })
+        .then_with(|| left.specificity.cmp(&right.specificity))
+        .then_with(|| left.rule_order.cmp(&right.rule_order))
+        .then_with(|| left.declaration_order.cmp(&right.declaration_order))
 }
 
-pub(super) fn strip_nested_page_rules(body: &str) -> String {
-    let mut output = String::with_capacity(body.len());
-    let mut position = 0usize;
-    while let Some(at_start) = body[position..].find('@') {
-        let at_start = position + at_start;
-        output.push_str(&body[position..at_start]);
-        let Some(open_offset) =
-            crate::css::component_values::find_next_top_level_open_brace(&body[at_start..], 0)
-        else {
-            position = at_start + 1;
-            continue;
-        };
-        let open = at_start + open_offset;
-        let Some(close) = find_matching_brace(body, open, false) else {
-            position = at_start + 1;
-            continue;
-        };
-        position = close + 1;
+fn compare_page_layer_order(
+    left: Option<&LayerOrder>,
+    right: Option<&LayerOrder>,
+    important: bool,
+) -> std::cmp::Ordering {
+    match (important, left, right) {
+        (false, Some(left), Some(right)) => left.cmp(right),
+        (false, Some(_), None) => std::cmp::Ordering::Less,
+        (false, None, Some(_)) => std::cmp::Ordering::Greater,
+        (false, None, None) => std::cmp::Ordering::Equal,
+        (true, Some(left), Some(right)) => right.cmp(left),
+        (true, Some(_), None) => std::cmp::Ordering::Greater,
+        (true, None, Some(_)) => std::cmp::Ordering::Less,
+        (true, None, None) => std::cmp::Ordering::Equal,
     }
-    output.push_str(&body[position..]);
-    output
 }

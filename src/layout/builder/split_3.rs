@@ -108,17 +108,17 @@ pub(in crate::layout) fn page_background_positioning_area(
 pub(in crate::layout) fn page_background_layers_for_paint(
     style: &ComputedStyle,
 ) -> Vec<css::BackgroundLayer> {
-    if !style.background_layers.is_empty() {
-        return style.background_layers.clone();
+    if !style.background.background_layers.is_empty() {
+        return style.background.background_layers.clone();
     }
     vec![css::BackgroundLayer {
-        image: style.background_image.clone(),
-        position: style.background_position.clone(),
-        size: style.background_size.clone(),
-        repeat: style.background_repeat,
-        attachment: style.background_attachment,
-        origin: style.background_origin,
-        clip: style.background_clip,
+        image: style.background.background_image.clone(),
+        position: style.background.background_position.clone(),
+        size: style.background.background_size.clone(),
+        repeat: style.background.background_repeat,
+        attachment: style.background.background_attachment,
+        origin: style.background.background_origin,
+        clip: style.background.background_clip,
     }]
 }
 

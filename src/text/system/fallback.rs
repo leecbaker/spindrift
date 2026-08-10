@@ -19,18 +19,16 @@ impl FontSystem {
                 }
             }
         }
-        if let FontFamily::Names(names) = &style.font_family {
-            for name in names {
-                if let Some(font_id) = self.resolve_single_family(
-                    name,
-                    style.font_weight,
-                    style.font_style,
-                    style.font_width,
-                ) && self.document_fonts.font_has_character(font_id, character)
-                {
-                    return Some(font_id);
-                }
-            }
+        if let FontFamily::Named(name) = &style.font_family
+            && let Some(font_id) = self.resolve_single_family(
+                name.as_str(),
+                style.font_weight,
+                style.font_style,
+                style.font_width,
+            )
+            && self.document_fonts.font_has_character(font_id, character)
+        {
+            return Some(font_id);
         }
 
         if let Some(font_id) = self.resolve_generic_family(
@@ -107,26 +105,19 @@ impl FontSystem {
                 })
                 .collect::<Vec<_>>()
                 .join(", "),
-            FontFamily::Names(names) => {
-                let public_names = names
-                    .iter()
-                    .filter(|name| !is_private_standard_ui_family_name(name))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                if public_names.is_empty() {
+            FontFamily::Named(name) => {
+                if is_private_standard_ui_family_name(name.as_str()) {
                     // A missing named family falls through to the UA's sans-serif
                     // default, rather than exposing a private platform face.
                     parley_font_family_source(&FontFamily::SansSerif)
                 } else {
-                    parley_font_family_source(&FontFamily::Names(public_names))
+                    parley_font_family_source(family)
                 }
             }
             _ => self
                 .resolve_generic_family(family, weight, style, width)
                 .and_then(|font_id| self.document_fonts.get(font_id))
-                .map(|font| {
-                    parley_font_family_source(&FontFamily::Names(vec![font.family.clone()]))
-                })
+                .map(|font| parley_font_family_source(&FontFamily::named(font.family.clone())))
                 // Preserve the authored generic as a last resort. The PDF
                 // audit remains responsible for reporting the unsupported
                 // case when no eligible system candidate exists.

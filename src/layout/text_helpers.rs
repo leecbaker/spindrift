@@ -4,7 +4,14 @@ use icu_casemap::{CaseMapper, TitlecaseMapper, options::TitlecaseOptions};
 use icu_locale_core::LanguageIdentifier;
 use icu_segmenter::{WordSegmenter, options::WordBreakInvariantOptions};
 
-mod split_1;
-pub(in crate::layout) use self::split_1::*;
-mod split_2;
-pub(in crate::layout) use self::split_2::*;
+mod alignment;
+pub(in crate::layout) use self::alignment::*;
+mod generated_content;
+pub(in crate::layout) use self::generated_content::*;
+mod indent;
+pub(in crate::layout) use self::indent::*;
+mod text_transform;
+pub(in crate::layout) use self::text_transform::*;
+mod vertical_align;
+mod whitespace;
+pub(in crate::layout) use self::whitespace::*;

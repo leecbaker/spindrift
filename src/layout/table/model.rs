@@ -371,6 +371,51 @@ impl TableColumnPlan {
         self.inline_bounds_for_span(area.column, area.colspan)
     }
 
+    /// Return a logical table-grid rectangle for a column span.
+    ///
+    /// Unlike [`Self::inline_bounds_for_span`], this keeps the span in the
+    /// root's logical inline axis. Structural background positioning areas
+    /// are resolved in that source space before writing-mode projection:
+    /// <https://drafts.csswg.org/css-tables-3/#drawing-cell-backgrounds> and
+    /// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>.
+    pub(super) fn logical_span_rect(
+        &self,
+        start_column: usize,
+        end_column: usize,
+        block_start: TableGridLength,
+        block_size: TableGridLength,
+    ) -> TableGridRect {
+        let start_column = start_column.min(self.widths.len());
+        let end_column = end_column
+            .min(self.widths.len())
+            .max(start_column.saturating_add(1).min(self.widths.len()));
+        let inline_start = self.logical_boundary_offset(start_column);
+        let inline_size =
+            self.width_for_span(start_column, end_column.saturating_sub(start_column));
+        TableGridRect::new(
+            TableGridPoint::from_lengths(inline_start, block_start),
+            TableGridSize::from_lengths(inline_size, block_size),
+        )
+    }
+
+    /// Return the logical span occupied by all visible columns, excluding the
+    /// table's leading and trailing separated-border gaps.
+    pub(super) fn logical_occupied_inline_rect(&self) -> Option<TableGridRect> {
+        let start_column = self.collapsed.iter().position(|collapsed| !*collapsed)?;
+        let end_column = self
+            .collapsed
+            .iter()
+            .rposition(|collapsed| !*collapsed)
+            .map(|index| index + 1)
+            .unwrap_or(start_column + 1);
+        Some(self.logical_span_rect(
+            start_column,
+            end_column,
+            TableGridLength::new(0.0),
+            TableGridLength::new(0.0),
+        ))
+    }
+
     /// Return the physical x offset for a logical grid boundary.
     ///
     /// The returned value is table-grid local; use `TableGridPlacement` before

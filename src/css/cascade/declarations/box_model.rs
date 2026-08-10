@@ -315,7 +315,9 @@ pub(in crate::css) fn legacy_margin_edges(
 /// <https://www.w3.org/TR/css-values-4/#font-relative-lengths> and
 /// <https://www.w3.org/TR/css-cascade-5/#computed>.
 pub(in crate::css) fn parse_margin_em_edges(value: &str) -> OptionalEdges<f32> {
-    let parts = value.split_whitespace().collect::<Vec<_>>();
+    let Some(parts) = try_split_css_component_values(value) else {
+        return OptionalEdges::NONE;
+    };
     let [top, right, bottom, left] = match parts.as_slice() {
         [] => return OptionalEdges::NONE,
         [all] => [all, all, all, all],

@@ -13,6 +13,10 @@ where block sizing interacts with margin collapse.
 - First-child top margins and last-child bottom margins can collapse through
   auto-height block containers when no border, padding, clearance, line box, or
   formatting-context boundary separates the margins.
+- Document-canvas start-margin collapse carries the complete adjoining set
+  through transparent block wrappers. The body's canvas inset remains an
+  inline-axis offset and is not reapplied when a wrapped first descendant
+  continues that same block-start margin set.
 - A first child that follows an earlier zero-margin in-flow sibling still
   carries its wrapper and first-descendant margins as one adjoining start set;
   the descendant margin is not subtracted a second time. CSS 2.2:
@@ -79,6 +83,11 @@ where block sizing interacts with margin collapse.
   transitions now consume the same target-aware standalone box break context
   and shared `FragmentainerKind` page-cursor materialization gate used by flex,
   grid, and table wrappers.
+  Avoid-run retries distinguish an occupied fragmentainer from an empty source
+  fragmentainer. An empty temporary column retries only when its selected
+  continuation has strictly greater block capacity; equal column geometry
+  relaxes the unavoidable `avoid` preference and continues ordinary
+  fragmentation rather than materializing identical anonymous columns.
   Page fragmentation still treats
   column-specific values as non-page-forcing constraints at both block
   descendants and top-level page boundary handling, and legacy

@@ -63,10 +63,13 @@
   sRGB conversion.
 - CSS Color 5 single-argument `contrast-color()`, selecting black or white by
   WCAG relative-luminance contrast.
-- `currentcolor` background values retain their deferred resolution through
-  inheritance. The covered CSS Color 5 relative-color forms with a
-  `currentcolor` origin resolve against each element's own computed `color`;
-  relative RGB and HSL preserve extended-range target-space components.
+- `currentcolor` values remain deferred through computed border, outline,
+  background, gradient, and shadow values, then resolve at the fragment-local
+  used-color boundary. This includes `::first-line` inline text, edge atoms,
+  and ancestor-decoration snapshots. The covered CSS Color 5 relative-color
+  forms with a `currentcolor` origin resolve against each element's own
+  computed `color`; relative RGB and HSL preserve extended-range target-space
+  components.
 - `light-dark()` selects its light branch in Quire's fixed light print scheme.
 - Deterministic print-palette values for CSS system colors and their deprecated
   aliases, so aliases compare consistently within a generated PDF.

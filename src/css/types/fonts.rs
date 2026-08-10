@@ -85,6 +85,30 @@ impl FontWidth {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct FontFamilyName(String);
+
+impl FontFamilyName {
+    pub(crate) fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for FontFamilyName {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+/// A CSS font-family item or fallback list.
+///
+/// A named family is one CSS family name. Comma-separated fallback is modeled
+/// only by [`Self::List`], so a caller cannot accidentally treat whitespace or
+/// a backend candidate list as CSS fallback syntax.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum FontFamily {
     SansSerif,
     Serif,
@@ -97,7 +121,31 @@ pub(crate) enum FontFamily {
     /// An ordered `font-family` fallback list. Each entry retains whether it
     /// was an unquoted generic keyword or a quoted family name.
     List(Vec<FontFamily>),
-    Names(Vec<String>),
+    Named(FontFamilyName),
+}
+
+impl FontFamily {
+    pub(crate) fn named(value: impl Into<String>) -> Self {
+        Self::Named(FontFamilyName::new(value))
+    }
+
+    #[cfg(test)]
+    #[allow(non_snake_case)]
+    pub(crate) fn Names(names: Vec<String>) -> Self {
+        let mut names = names.into_iter().map(Self::named);
+        let first = names
+            .next()
+            .expect("test font family list must be non-empty");
+        match names.next() {
+            None => first,
+            Some(second) => Self::List(
+                std::iter::once(first)
+                    .chain(std::iter::once(second))
+                    .chain(names)
+                    .collect(),
+            ),
+        }
+    }
 }
 
 /// Controls which missing typographic forms the UA may synthesize.

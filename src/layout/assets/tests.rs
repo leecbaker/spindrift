@@ -110,6 +110,10 @@ fn containing_block(width: f32) -> ContainingBlock {
     ContainingBlock::from_page_top_rect(PageTopRect::new(0.0, 100.0, width, 100.0))
 }
 
+fn containing_block_size(width: f32, height: f32) -> ContainingBlock {
+    ContainingBlock::from_page_top_rect(PageTopRect::new(0.0, height, width, height))
+}
+
 fn length(value: f32) -> css::ComputedLengthPercentageOrAuto {
     css::ComputedLengthPercentageOrAuto::LengthPercentage(
         css::ComputedLengthPercentage::from_points(value),
@@ -170,6 +174,46 @@ fn absolute_positioned_height_basis_keeps_one_inset_auto_height_indefinite() {
 }
 
 #[test]
+fn positioned_table_sizing_uses_containing_block_inline_axis() {
+    let mut style = ComputedStyle::initial();
+    style.writing_mode = WritingMode::VerticalRl;
+    style.box_values.width = length(40.0);
+
+    let sizing = positioned_table_sizing_for_geometry(
+        &style,
+        &style,
+        containing_block_size(80.0, 60.0),
+        PhysicalContentWidth::new(content_box_pt(40.0)),
+        PhysicalContentHeight::new(content_box_pt(50.0)),
+    );
+
+    assert_eq!(sizing.writing_mode, WritingMode::VerticalRl);
+    assert_eq!(sizing.available_inline_size.points(), 60.0);
+    assert_eq!(
+        sizing
+            .definite_block_content_size
+            .expect("definite vertical table block size")
+            .points(),
+        40.0
+    );
+}
+
+#[test]
+fn positioned_table_sizing_keeps_auto_block_size_intrinsic() {
+    let style = ComputedStyle::initial();
+    let sizing = positioned_table_sizing_for_geometry(
+        &style,
+        &style,
+        containing_block_size(80.0, 60.0),
+        PhysicalContentWidth::new(content_box_pt(40.0)),
+        PhysicalContentHeight::new(content_box_pt(50.0)),
+    );
+
+    assert_eq!(sizing.available_inline_size.points(), 80.0);
+    assert_eq!(sizing.definite_block_content_size, None);
+}
+
+#[test]
 fn abspos_stretch_does_not_size_an_axis_with_an_auto_inset() {
     let mut style = ComputedStyle::initial();
     style.align_self = css::SelfAlignment::new(SelfAlignmentKeyword::Stretch);
@@ -201,7 +245,7 @@ fn rtl_auto_width_absolute_horizontal_uses_static_right() {
         &style,
         containing_block(100.0),
         30.0,
-        StaticHorizontalPosition::new(0.0, 0.0),
+        PhysicalStaticAxisFallback::new(0.0, 0.0),
         Direction::Rtl,
     );
 
@@ -219,7 +263,7 @@ fn rtl_definite_width_absolute_horizontal_uses_static_right() {
         &style,
         containing_block(100.0),
         30.0,
-        StaticHorizontalPosition::new(0.0, 0.0),
+        PhysicalStaticAxisFallback::new(0.0, 0.0),
         Direction::Rtl,
     );
 
@@ -460,7 +504,7 @@ fn ltr_absolute_horizontal_static_left_can_fall_after_containing_block() {
         &style,
         containing_block(100.0),
         30.0,
-        StaticHorizontalPosition::new_unclamped(130.0, -30.0),
+        PhysicalStaticAxisFallback::new_unclamped(130.0, -30.0),
         Direction::Ltr,
     );
 
@@ -475,7 +519,7 @@ fn rtl_absolute_horizontal_static_right_can_fall_after_containing_block() {
         &style,
         containing_block(100.0),
         30.0,
-        StaticHorizontalPosition::new_unclamped(-60.0, 130.0),
+        PhysicalStaticAxisFallback::new_unclamped(-60.0, 130.0),
         Direction::Rtl,
     );
 

@@ -1,7 +1,7 @@
 use crate::document::Page;
 
 use super::annotations::RenderedLink;
-use super::display_list::{PaintBand, PaintBandList};
+use super::display_list::{PaintBand, PaintBandList, recorded_context_paint_bounds};
 use super::effects::PaintEffects;
 use super::fragments::PaintFragment;
 use super::geometry::{PaintClip, PaintTransform, PaintTranslation};
@@ -51,6 +51,11 @@ impl StackLevel {
 pub(crate) struct PaintStackingContext {
     pub(crate) source_order: usize,
     pub(crate) stack_level: StackLevel,
+    /// Keep this context's materialized PDF paint separate from adjacent
+    /// contexts even when their CSS paint values happen to match. Fragment
+    /// replay uses the boundary so independently clipped continuations retain
+    /// their own device-pixel edge coverage.
+    pub(crate) pdf_paint_boundary: bool,
     pub(crate) bands: PaintBandList,
     pub(crate) effects: PaintEffects,
     pub(crate) bounds: Option<PaintClip>,
@@ -61,6 +66,7 @@ impl PaintStackingContext {
         Self {
             source_order: 0,
             stack_level: StackLevel::Auto,
+            pdf_paint_boundary: false,
             bands: PaintBandList::default(),
             effects: PaintEffects::default(),
             bounds: None,
@@ -155,6 +161,7 @@ impl PaintStackingContext {
         Self {
             source_order: 0,
             stack_level,
+            pdf_paint_boundary: false,
             bands,
             effects: PaintEffects::default(),
             bounds: None,
@@ -193,9 +200,12 @@ impl PaintStackingContext {
     /// ISO 32000-1:2008 §11.6.6.
     pub(crate) fn effect_bounds(&self, fallback: PaintClip) -> PaintClip {
         let mut bounds = self.bounds.unwrap_or(fallback);
-        for clip in [self.effects.absolute_clip, self.effects.overflow_clip]
-            .into_iter()
-            .flatten()
+        for clip in [
+            self.effects.absolute_clip,
+            self.effects.overflow_clip_bounds(),
+        ]
+        .into_iter()
+        .flatten()
         {
             bounds =
                 bounds
@@ -206,6 +216,27 @@ impl PaintStackingContext {
             bounds = transform.apply_clip_to_aabb(bounds);
         }
         bounds
+    }
+
+    /// Return the recorded ink bounds when every nested paint effect is a
+    /// rectangular, axis-aligned operation.
+    ///
+    /// Fragmentainer replay uses this only to reject source slices that cannot
+    /// contain any ink. Effects whose bounds cannot be established exactly are
+    /// intentionally reported as indeterminate so callers conservatively keep
+    /// every candidate.
+    /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+    pub(crate) fn recorded_paint_bounds(
+        &self,
+        page: &Page,
+    ) -> std::result::Result<Option<PaintClip>, ()> {
+        recorded_context_paint_bounds(
+            page,
+            &self.effects,
+            PaintBand::ORDER
+                .into_iter()
+                .flat_map(|band| self.bands.bands[band.index()].iter()),
+        )
     }
 
     pub(in crate::document) fn push_flattened_primitives(
@@ -226,6 +257,7 @@ impl PaintStackingContext {
         Self {
             source_order: self.source_order,
             stack_level: self.stack_level,
+            pdf_paint_boundary: self.pdf_paint_boundary,
             bands: self.bands.translated(offset),
             // Effects are expressed in the same page-top coordinate space as
             // the band's primitives.  Keeping them in place would detach an
@@ -235,20 +267,75 @@ impl PaintStackingContext {
         }
     }
 
+    /// Trim materialized primitive geometry to a fragmentation projection
+    /// without flattening the stacking-context tree.
+    ///
+    /// The accompanying rectangular effect remains necessary for paths,
+    /// images, glyphs, and deferred page operations whose exact ink cannot be
+    /// reduced to a rectangle here.  Rectangular primitives are nevertheless
+    /// trimmed before PDF serialization so a fragmentainer edge has the same
+    /// coverage as an independently painted fragment rather than a PDF clip
+    /// seam.
+    /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+    pub(crate) fn sliced_primitives_to_fragmentainer_rect(mut self, clip: PaintClip) -> Self {
+        self.bands = self.bands.sliced_primitives_to_fragmentainer_rect(clip);
+        self.bounds = self.bounds.and_then(|bounds| bounds.intersect(clip));
+        self
+    }
+
+    /// Whether all retained items have concrete rectangular bounds within a
+    /// clip. Callers may elide an additional PDF clip only in this narrow
+    /// case: deferred operations and nested effect scopes intentionally keep
+    /// the clip because their final ink is not known here.
+    pub(crate) fn has_only_items_wholly_contained_by_rect(&self, clip: PaintClip) -> bool {
+        let mut has_item = false;
+        for band in PaintBand::ORDER {
+            for item in &self.bands.bands[band.index()] {
+                has_item = true;
+                if !item.is_wholly_contained_by_rect(clip) {
+                    return false;
+                }
+            }
+        }
+        has_item
+    }
+
+    /// Whether a rectangular overflow clip can be omitted after all retained
+    /// primitive geometry has been cut to its effective bounds.
+    ///
+    /// This deliberately rejects every other effect. A transform, rounded
+    /// clip, mask, filter, or nested effect scope can change final ink after
+    /// local rectangle inspection, so its overflow clip remains authoritative.
+    pub(crate) fn can_elide_overflow_clip_after_materialization(
+        &self,
+        effective_clip: PaintClip,
+    ) -> bool {
+        let mut effects_without_overflow_clip = self.effects.clone();
+        effects_without_overflow_clip.overflow_clip_effect = None;
+        effects_without_overflow_clip
+            == PaintEffects {
+                opacity: self.effects.opacity,
+                ..PaintEffects::default()
+            }
+            && self.has_only_items_wholly_contained_by_rect(effective_clip)
+    }
+
     pub(in crate::document) fn into_recorded_nodes(self, page: &mut Page) -> Self {
         Self {
             source_order: self.source_order,
             stack_level: self.stack_level,
+            pdf_paint_boundary: self.pdf_paint_boundary,
             bands: self.bands.into_recorded_nodes(page),
             effects: self.effects.clone(),
             bounds: self.bounds,
         }
     }
 
-    pub(in crate::document) fn into_primitive_nodes(self, page: &Page) -> Self {
+    pub(crate) fn into_primitive_nodes(self, page: &Page) -> Self {
         Self {
             source_order: self.source_order,
             stack_level: self.stack_level,
+            pdf_paint_boundary: self.pdf_paint_boundary,
             bands: self.bands.primitive_node_copy(page),
             effects: self.effects,
             bounds: self.bounds,
@@ -259,6 +346,7 @@ impl PaintStackingContext {
         Self {
             source_order: self.source_order,
             stack_level: self.stack_level,
+            pdf_paint_boundary: self.pdf_paint_boundary,
             bands: self.bands.primitive_node_copy(page),
             effects: self.effects.clone(),
             bounds: self.bounds,
@@ -268,6 +356,7 @@ impl PaintStackingContext {
     pub(in crate::document) fn push_transformed_links(
         &self,
         parent_transform: PaintTransform,
+        clip: Option<PaintClip>,
         links: &mut Vec<RenderedLink>,
     ) {
         if self.effects.suppresses_paint() {
@@ -278,6 +367,16 @@ impl PaintStackingContext {
         } else {
             parent_transform
         };
-        self.bands.push_transformed_links(transform, links);
+        let clip = match (
+            clip,
+            self.effects
+                .scene_plane_clip
+                .map(|clip| transform.apply_clip_to_aabb(clip.bounds())),
+        ) {
+            (Some(left), Some(right)) => left.intersect(right),
+            (Some(clip), None) | (None, Some(clip)) => Some(clip),
+            (None, None) => None,
+        };
+        self.bands.push_transformed_links(transform, clip, links);
     }
 }

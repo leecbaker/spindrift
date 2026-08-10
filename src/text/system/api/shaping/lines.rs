@@ -5,6 +5,21 @@ use crate::units::{LayoutLength, SemanticLengthExt, layout_pt};
 use std::borrow::Cow;
 use std::rc::Rc;
 
+/// Return the OpenType shaping direction selected by UAX #9 for a visual run.
+///
+/// CSS `direction` establishes the paragraph level, while UAX #9 then
+/// resolves a level for each visual run. Joining scripts must be shaped in
+/// logical character order using that resolved run direction, or a strong RTL
+/// run in an LTR paragraph receives incorrect contextual forms:
+/// <https://drafts.csswg.org/css-writing-modes-4/#bidi-algo> and
+/// <https://www.unicode.org/reports/tr9/#Reordering_Resolved_Levels>.
+fn resolved_bidi_shaping_direction(direction: ResolvedBidiDirection) -> Direction {
+    match direction {
+        ResolvedBidiDirection::Ltr => Direction::Ltr,
+        ResolvedBidiDirection::Rtl => Direction::Rtl,
+    }
+}
+
 impl FontSystem {
     pub(crate) fn measure_text(&mut self, text: &str, style: &ComputedStyle) -> f32 {
         self.shape_unwrapped_line(text, style, style.line_height)
@@ -26,68 +41,20 @@ impl FontSystem {
             .unwrap_or(0.0)
     }
 
-    /// Return visual text ranges for one unwrapped bidi paragraph.
+    /// Return visual text ranges for one selected logical bidi line.
     ///
     /// CSS Writing Modes delegates inline bidirectional reordering to the
-    /// Unicode Bidirectional Algorithm. Parley exposes visual cluster order
-    /// after applying UAX #9, including formatting controls inserted for CSS
-    /// `unicode-bidi`:
+    /// Unicode Bidirectional Algorithm. The caller supplies the resolved CSS
+    /// paragraph direction; CSS `unicode-bidi` controls are already present
+    /// in the selected logical source:
     /// <https://www.w3.org/TR/css-writing-modes-4/#unicode-bidi> and
     /// <https://www.unicode.org/reports/tr9/>.
     pub(crate) fn visual_ranges_for_unwrapped_text(
         &mut self,
         text: &str,
-        style: &ComputedStyle,
+        base_direction: Direction,
     ) -> Vec<BidiVisualRange> {
-        if text.is_empty() {
-            return Vec::new();
-        }
-        let emoji_text = text_with_font_variant_emoji(text, style);
-        let bidi_text = text_with_css_bidi_controls(emoji_text.as_ref(), style);
-        let shaped_text = bidi_text.as_str();
-        self.with_reusable_parley_layout(|this, layout| {
-            let feature_context = this.font_feature_context_for_style(style);
-            let font_family_source = this
-                .emoji_presentation_family_source(emoji_text.as_ref(), style)
-                .unwrap_or_else(|| this.resolved_parley_font_family_source(style));
-            let mut builder: parley::RangedBuilder<'_, FontPalette> = this
-                .parley_layout_context
-                .ranged_builder(&mut this.parley_font_context, shaped_text, 1.0, false);
-            push_parley_default_style(&mut builder, style, &font_family_source);
-            push_parley_text_spacing_default_with_context(
-                &mut builder,
-                shaped_text,
-                style,
-                ShapingLetterSpacing::Computed.requested_for(style),
-                feature_context.as_ref(),
-            );
-            builder.build_into(layout, shaped_text);
-            layout.break_all_lines(None);
-            layout
-                .lines()
-                .next()
-                .map(|line| {
-                    visual_ranges_for_line(line)
-                        .into_iter()
-                        .filter_map(|visual_range| {
-                            bidi_text.original_range(visual_range.range).map(|range| {
-                                BidiVisualRange {
-                                    range,
-                                    direction: visual_range.direction,
-                                }
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .filter(|ranges| !ranges.is_empty())
-                .unwrap_or_else(|| {
-                    std::iter::once(BidiVisualRange {
-                        range: 0..text.len(),
-                        direction: ResolvedBidiDirection::Ltr,
-                    })
-                    .collect()
-                })
-        })
+        resolve_bidi_visual_ranges(text, base_direction)
     }
 
     pub(crate) fn shape_text_runs_with_parley(
@@ -283,15 +250,23 @@ impl FontSystem {
         // UAX #9 visual reordering and OpenType's cursive shaping direction
         // are separate inputs. An LTR override preserves the already-resolved
         // order of neutral punctuation, but would make HarfBuzz shape Arabic
-        // and other joining scripts left-to-right. Those scripts must retain
-        // their logical CSS direction while shaping:
+        // and other joining scripts left-to-right. Those scripts retain
+        // logical character order, but their OpenType shaping direction must
+        // be the UAX #9-resolved direction rather than the CSS paragraph
+        // direction:
         // <https://www.w3.org/TR/css-text-3/#boundary-shaping> and
         // <https://www.unicode.org/reports/tr9/#reordering-resolved-levels>.
         if text.chars().any(character_has_joining_behavior) {
-            let logical_paint_style = Self::visual_bidi_paint_style(style, style.used_direction());
+            let logical_paint_style = Self::visual_bidi_paint_style(
+                style,
+                resolved_bidi_shaping_direction(resolved_direction),
+            );
             return self.shape_unwrapped_line(text, &logical_paint_style, line_height);
         }
-        let visual_paint_style = Self::visual_bidi_paint_style(style, style.used_direction());
+        let visual_paint_style = Self::visual_bidi_paint_style(
+            style,
+            resolved_bidi_shaping_direction(resolved_direction),
+        );
         let mut guarded_text = String::with_capacity(text.len() + 2 * '\u{202d}'.len_utf8());
         guarded_text.push('\u{202d}');
         guarded_text.push_str(text);
@@ -380,6 +355,7 @@ impl FontSystem {
         resolved_direction: ResolvedBidiDirection,
     ) -> Option<ShapedInlineLine> {
         spans.first()?;
+        let visual_direction = resolved_bidi_shaping_direction(resolved_direction);
         if spans
             .iter()
             .flat_map(|span| span.text.chars())
@@ -387,7 +363,7 @@ impl FontSystem {
         {
             let logical_paint_styles = spans
                 .iter()
-                .map(|span| Self::visual_bidi_paint_style(span.style, span.style.used_direction()))
+                .map(|span| Self::visual_bidi_paint_style(span.style, visual_direction))
                 .collect::<Vec<_>>();
             let logical_paint_spans = spans
                 .iter()
@@ -398,7 +374,7 @@ impl FontSystem {
                 })
                 .collect::<Vec<_>>();
             let logical_tab_metric_style =
-                Self::visual_bidi_paint_style(tab_metric_style, tab_metric_style.used_direction());
+                Self::visual_bidi_paint_style(tab_metric_style, visual_direction);
             return self.shape_styled_inline_fragments(
                 &logical_paint_spans,
                 text_summary,
@@ -410,7 +386,7 @@ impl FontSystem {
         }
         let visual_paint_styles = spans
             .iter()
-            .map(|span| Self::visual_bidi_paint_style(span.style, span.style.used_direction()))
+            .map(|span| Self::visual_bidi_paint_style(span.style, visual_direction))
             .collect::<Vec<_>>();
         let visual_paint_spans = spans
             .iter()
@@ -421,7 +397,7 @@ impl FontSystem {
             })
             .collect::<Vec<_>>();
         let visual_tab_metric_style =
-            Self::visual_bidi_paint_style(tab_metric_style, tab_metric_style.used_direction());
+            Self::visual_bidi_paint_style(tab_metric_style, visual_direction);
         let first_style = visual_paint_spans.first()?.style;
         let mut guarded_spans = Vec::with_capacity(spans.len() + 2);
         guarded_spans.push(StyledTextSpan {
@@ -452,7 +428,8 @@ impl FontSystem {
     /// The selected visual fragment must retain font and OpenType inputs, but
     /// it must not inject `unicode-bidi` controls a second time. Non-joining
     /// visual slices are guarded with LRO by their caller; joining text keeps
-    /// its logical CSS shaping direction while remaining unscoped:
+    /// logical character order but uses its UAX #9-resolved shaping direction
+    /// while remaining unscoped:
     /// <https://drafts.csswg.org/css-writing-modes-4/#bidi-algo> and
     /// <https://www.unicode.org/reports/tr9/#L4>.
     fn visual_bidi_paint_style(style: &ComputedStyle, direction: Direction) -> ComputedStyle {
@@ -462,22 +439,21 @@ impl FontSystem {
         visual_style
     }
 
-    /// Apply UAX #9 L4 to an already visually ordered RTL line without
-    /// changing its Unicode source text or running UAX #9 a second time.
+    /// Normalize mirrored glyph presentation from an already-resolved UAX #9
+    /// level without changing its Unicode source text or running UAX #9 a
+    /// second time.
     ///
     /// Call this exactly once when logical shaping crosses into a selected
-    /// visual slice. Cached source slices are shaped before the UBA chooses
-    /// their final level, so they require the same presentation correction as
-    /// freshly shaped visual slices:
+    /// visual slice. Cached source slices can have been shaped under an
+    /// inline fragment's own paragraph direction before the UBA chooses the
+    /// final level. An LTR resolved level must therefore restore the source
+    /// glyph as well as an RTL level applying UAX #9 L4:
     /// <https://www.unicode.org/reports/tr9/#L4>.
     pub(crate) fn apply_resolved_bidi_glyph_mirroring(
         &self,
         shaped: &mut ShapedInlineLine,
         resolved_direction: ResolvedBidiDirection,
     ) {
-        if resolved_direction != ResolvedBidiDirection::Rtl {
-            return;
-        }
         for run in &mut shaped.runs {
             let Some(font_id) = run.font_id else {
                 continue;
@@ -500,21 +476,28 @@ impl FontSystem {
                 if characters.next().is_some() {
                     continue;
                 }
-                let Some(mirrored) = bidi_mirroring_glyph(character) else {
-                    continue;
+                let target_character = match resolved_direction {
+                    ResolvedBidiDirection::Ltr => character,
+                    ResolvedBidiDirection::Rtl => {
+                        bidi_mirroring_glyph(character).unwrap_or(character)
+                    }
                 };
-                let Some(mirrored_id) = face.glyph_index(mirrored) else {
+                if target_character == character && resolved_direction == ResolvedBidiDirection::Ltr
+                {
+                    continue;
+                }
+                let Some(target_id) = face.glyph_index(target_character) else {
                     continue;
                 };
                 let old_nominal = glyph.rendered.nominal_x_advance;
                 let extra_advance = glyph.rendered.x_advance - old_nominal;
-                let mirrored_nominal = face
-                    .glyph_hor_advance(mirrored_id)
+                let target_nominal = face
+                    .glyph_hor_advance(target_id)
                     .map(|advance| advance as f32 * scale)
                     .unwrap_or(old_nominal);
-                glyph.rendered.kind = RenderedGlyphKind::Paint(mirrored_id.0);
-                glyph.rendered.nominal_x_advance = mirrored_nominal;
-                glyph.rendered.x_advance = mirrored_nominal + extra_advance;
+                glyph.rendered.kind = RenderedGlyphKind::Paint(target_id.0);
+                glyph.rendered.nominal_x_advance = target_nominal;
+                glyph.rendered.x_advance = target_nominal + extra_advance;
             }
         }
     }
@@ -594,4 +577,21 @@ pub(in crate::text) fn shaped_suffix_advance(line: &ShapedInlineLine, prefix_len
         }
     }
     if remaining.is_empty() { width } else { 0.0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolved_rtl_run_shapes_rtl_even_in_an_ltr_paragraph() {
+        assert_eq!(
+            resolved_bidi_shaping_direction(ResolvedBidiDirection::Rtl),
+            Direction::Rtl
+        );
+        assert_eq!(
+            resolved_bidi_shaping_direction(ResolvedBidiDirection::Ltr),
+            Direction::Ltr
+        );
+    }
 }

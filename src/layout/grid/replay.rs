@@ -75,6 +75,7 @@ impl<'a> LayoutBuilder<'a> {
                         parent_layout,
                         &child.style,
                         area,
+                        item_fragment.original.grid_lanes_placement(),
                     )
                 {
                     self.with_resolved_subgrid_context(context, replay);
@@ -121,8 +122,13 @@ impl<'a> LayoutBuilder<'a> {
                 !layout_containment_applies_to_element(element, &child.style)
                     && !paint_containment_applies_to_element(element, &child.style)
             })
-            && let Some(context) =
-                ResolvedSubgridContext::from_parent(parent_style, parent_layout, &child.style, area)
+            && let Some(context) = ResolvedSubgridContext::from_parent(
+                parent_style,
+                parent_layout,
+                &child.style,
+                area,
+                item.grid_lanes_placement(),
+            )
         {
             self.with_resolved_subgrid_context(context, replay);
         } else {
@@ -163,11 +169,12 @@ impl<'a> LayoutBuilder<'a> {
         let item_paint_checkpoint = self.current_page.paint_checkpoint();
         let item_positioned_layer_start = self.positioned_layers.len();
         let item_page_index = self.pages.len();
-        self.with_formatting_context_item_placement(
-            FormattingContextItemPlacement {
+        self.with_placed_formatting_context(
+            PlacedFormattingContext {
                 content_left: inner_x + item.x(),
                 content_width: PhysicalContentWidth::new(content_box_pt(item_width)),
-                content_height: Some(PhysicalContentHeight::new(content_box_pt(item_height))),
+                content_height: (!item.preserves_cyclic_physical_height_on_replay())
+                    .then_some(PhysicalContentHeight::new(content_box_pt(item_height))),
                 table_wrapper_border_box_block_size: auto_table_wrapper_block_size_override(
                     &child.style,
                     border_box_pt(item_height),
@@ -182,6 +189,7 @@ impl<'a> LayoutBuilder<'a> {
                     .source_block_y(GridFragmentBlockOffset::new(item.y()))
                     .points(),
                 page_start_margin_policy: PageStartMarginPolicy::Suppress,
+                float_scope: ReplayFloatScope::IsolatedFormattingContext,
             },
             placed_style,
             |layout| {
@@ -322,8 +330,8 @@ impl<'a> LayoutBuilder<'a> {
         self.overflow_clips.clear();
         self.fragment_top_offsets.clear();
 
-        self.with_formatting_context_item_placement(
-            FormattingContextItemPlacement {
+        self.with_placed_formatting_context(
+            PlacedFormattingContext {
                 content_left: 0.0,
                 content_width: PhysicalContentWidth::new(content_box_pt(item_width)),
                 content_height: Some(PhysicalContentHeight::new(content_box_pt(item_height))),
@@ -335,6 +343,7 @@ impl<'a> LayoutBuilder<'a> {
                 scope_content_logical_inline_size: child.anonymous_content().is_some(),
                 cursor_y: offpage_top,
                 page_start_margin_policy: PageStartMarginPolicy::Suppress,
+                float_scope: ReplayFloatScope::IsolatedFormattingContext,
             },
             placed_style,
             |layout| {
@@ -359,7 +368,7 @@ impl<'a> LayoutBuilder<'a> {
 
         let policy = StackingContextPolicy::for_grid_item(placed_style, slice_border_box);
         let mut effects = policy.effects;
-        effects.overflow_clip = Some(slice_border_box);
+        effects.set_rectangular_overflow_clip(Some(slice_border_box));
         effects.absolute_clip = Some(slice_border_box);
         let source_bounds = PageTopRect::new(
             slice_border_box.x(),
@@ -394,13 +403,55 @@ fn grid_placed_item_style(
         placed_style.padding = metrics.padding.to_css_edges();
     }
     set_style_used_width(&mut placed_style, item_width);
-    set_style_used_height(&mut placed_style, item_height);
+    if item.preserves_cyclic_physical_height_on_replay() {
+        // Grid stretch has resolved the item's physical border-box placement,
+        // but an auto-sized container has not supplied a definite percentage
+        // basis for the item's logical inline axis. Preserve `100%` as a
+        // cyclic used value instead of freezing the final grid-area height.
+        // <https://drafts.csswg.org/css-grid-2/#grid-item-sizing>
+        placed_style.box_values.height.replace_with_used(
+            css::ComputedLengthPercentageOrAuto::LengthPercentage(
+                css::ComputedLengthPercentage::from_percent(1.0),
+            ),
+        );
+    } else {
+        set_style_used_height(&mut placed_style, item_height);
+    }
     // Both used axes are already definite. Replaying them through additional
     // content-box min/max constraints after switching to border-box sizing
     // would subtract borders and padding a second time.
     // <https://www.w3.org/TR/css-grid-1/#grid-item-sizing>
     placed_style.box_sizing = BoxSizing::BorderBox;
+    let final_percentage_axes = item.final_percentage_axes();
+    if final_percentage_axes.width {
+        set_style_used_border_box_width_bounds(&mut placed_style, item_width);
+    }
+    if final_percentage_axes.height {
+        set_style_used_border_box_height_bounds(&mut placed_style, item_height);
+    }
     placed_style
+}
+
+/// Freeze an axis resolved by Grid's final percentage-sizing phase.
+///
+/// The replay style uses `box-sizing: border-box`, so the stored bounds are
+/// border-box values. This prevents a cyclic percentage minimum/maximum from
+/// being evaluated again against the item's own temporary formatting context.
+/// <https://www.w3.org/TR/css-grid-1/#percentage-sizing>
+fn set_style_used_border_box_width_bounds(style: &mut ComputedStyle, width: f32) {
+    let width = css::ComputedLengthPercentageOrAuto::LengthPercentage(
+        css::ComputedLengthPercentage::from_points(width.max(0.0)),
+    );
+    style.box_values.min_width = width.clone();
+    style.box_values.max_width = width;
+}
+
+fn set_style_used_border_box_height_bounds(style: &mut ComputedStyle, height: f32) {
+    let height = css::ComputedLengthPercentageOrAuto::LengthPercentage(
+        css::ComputedLengthPercentage::from_points(height.max(0.0)),
+    );
+    style.box_values.min_height = height.clone();
+    style.box_values.max_height = height;
 }
 
 /// Materialize the Grid baseline fallback for a grid item's own content.

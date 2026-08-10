@@ -1,4 +1,5 @@
 use super::*;
+use crate::css::component_values::{css_leading_function_matching, css_leading_ident};
 
 pub(crate) fn parse_bookmark_level(value: &str) -> Option<Option<u32>> {
     let value = trim_css_value(value);
@@ -31,8 +32,7 @@ pub(crate) fn parse_bookmark_label(value: &str) -> Option<BookmarkLabel> {
         if let Some((string, tail)) = parse_css_string_token(rest) {
             parts.push(BookmarkLabelPart::String(string));
             rest = tail;
-        } else if let Some(tail) = strip_ascii_function(rest, "content") {
-            let (argument, tail) = split_function_argument(tail)?;
+        } else if let Some((argument, tail)) = css_leading_function_matching(rest, "content") {
             let argument = argument.trim().to_ascii_lowercase();
             if argument.is_empty() || argument == "text" {
                 parts.push(BookmarkLabelPart::ContentText);
@@ -40,26 +40,23 @@ pub(crate) fn parse_bookmark_label(value: &str) -> Option<BookmarkLabel> {
             } else {
                 return None;
             }
-        } else if let Some(tail) = strip_ascii_function(rest, "attr") {
-            let (argument, tail) = split_function_argument(tail)?;
+        } else if let Some((argument, tail)) = css_leading_function_matching(rest, "attr") {
             let name = argument
                 .trim()
                 .trim_matches('"')
                 .trim_matches('\'')
                 .to_string();
-            if name.is_empty() || name.split_whitespace().count() != 1 {
+            if name.is_empty()
+                || crate::css::component_values::try_split_css_component_values(&name)
+                    .is_none_or(|parts| parts.len() != 1)
+            {
                 return None;
             }
             parts.push(BookmarkLabelPart::Attr(name));
             rest = tail;
-        } else if rest
-            .get(..8)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("contents"))
+        } else if let Some((ident, tail)) = css_leading_ident(rest)
+            && ident.eq_ignore_ascii_case("contents")
         {
-            let tail = &rest[8..];
-            if tail.chars().next().is_some_and(is_css_ident_continue) {
-                return None;
-            }
             parts.push(BookmarkLabelPart::ContentText);
             rest = tail;
         } else {

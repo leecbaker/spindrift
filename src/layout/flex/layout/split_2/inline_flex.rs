@@ -31,6 +31,163 @@ fn flex_static_main_alignment(alignment: css::ContentAlignment) -> css::SelfAlig
     }
 }
 
+/// Final static-position geometry for an absolutely positioned flex child.
+///
+/// Flexbox first places a hypothetical sole item, but CSS Positioned Layout
+/// subsequently resolves the real abspos box against its actual containing
+/// block. Keep those coordinate systems separate: the hypothetical margin box
+/// supplies only the flex main-axis edges, while the flex content box supplies
+/// the cross-axis edges of the static-position rectangle.
+/// <https://www.w3.org/TR/css-flexbox-1/#abspos-items>
+/// <https://drafts.csswg.org/css-position-3/#static-position-rectangle>
+#[derive(Debug, Clone, Copy)]
+struct FlexAbsposStaticGeometry {
+    flex_content_box: PageTopRect,
+    hypothetical_margin_box: PageTopRect,
+    flex_axes: FlexAxes,
+    inline_alignment: css::SelfAlignment,
+    block_alignment: css::SelfAlignment,
+    container_writing_mode: WritingMode,
+    container_direction: Direction,
+    subject_writing_mode: WritingMode,
+    subject_direction: Direction,
+    source_block_interval: (LayoutLength, LayoutLength),
+}
+
+impl FlexAbsposStaticGeometry {
+    /// Compose the static-position alignment container from the two distinct
+    /// geometry sources required by Flexbox.
+    fn static_area(self) -> PageTopRect {
+        if self.flex_axes.is_main_row_axis() {
+            PageTopRect::new(
+                self.hypothetical_margin_box.x(),
+                self.flex_content_box.top_y(),
+                self.hypothetical_margin_box.width(),
+                self.flex_content_box.height(),
+            )
+        } else {
+            PageTopRect::new(
+                self.flex_content_box.x(),
+                self.hypothetical_margin_box.top_y(),
+                self.flex_content_box.width(),
+                self.hypothetical_margin_box.height(),
+            )
+        }
+    }
+
+    /// Project the flex-owned static area into the generic positioned-layout
+    /// handoff. `PositionedChildStaticRect` intentionally carries no actual
+    /// containing-block override here; positioned layout retains the real
+    /// ancestor containing block when resolving insets and safe overflow.
+    fn positioned_static_rect(self) -> PositionedChildStaticRect {
+        let area = self.static_area();
+        PositionedChildStaticRect::new(area.x(), area.x() + area.width(), area.top_y())
+            .with_static_alignment(AbsposStaticAlignment::new(
+                area,
+                self.container_writing_mode,
+                self.container_direction,
+                self.subject_writing_mode,
+                self.subject_direction,
+                self.inline_alignment,
+                self.block_alignment,
+            ))
+    }
+
+    fn source_block_interval(self) -> (LayoutLength, LayoutLength) {
+        self.source_block_interval
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod flex_abspos_static_geometry_tests {
+    use super::*;
+
+    fn geometry(direction: FlexDirection) -> FlexAbsposStaticGeometry {
+        FlexAbsposStaticGeometry {
+            flex_content_box: PageTopRect::new(100.0, 500.0, 200.0, 80.0),
+            hypothetical_margin_box: PageTopRect::new(130.0, 470.0, 40.0, 20.0),
+            flex_axes: FlexAxes::from_physical_direction(PhysicalFlexDirection::new(direction)),
+            inline_alignment: css::SelfAlignment::NORMAL,
+            block_alignment: css::SelfAlignment::NORMAL,
+            container_writing_mode: WritingMode::HorizontalTb,
+            container_direction: Direction::Ltr,
+            subject_writing_mode: WritingMode::HorizontalTb,
+            subject_direction: Direction::Ltr,
+            source_block_interval: (layout_pt(12.0), layout_pt(32.0)),
+        }
+    }
+
+    #[test]
+    fn row_static_area_uses_hypothetical_main_interval_and_content_cross_edges() {
+        let geometry = geometry(FlexDirection::Row);
+        let area = geometry.static_area();
+        assert_eq!(
+            (area.x(), area.top_y(), area.width(), area.height()),
+            (130.0, 500.0, 40.0, 80.0)
+        );
+
+        let _static_rect = geometry.positioned_static_rect();
+    }
+
+    #[test]
+    fn column_static_area_uses_content_cross_edges_and_hypothetical_main_interval() {
+        let geometry = geometry(FlexDirection::Column);
+        let area = geometry.static_area();
+        assert_eq!(
+            (area.x(), area.top_y(), area.width(), area.height()),
+            (100.0, 470.0, 200.0, 20.0)
+        );
+
+        let _static_rect = geometry.positioned_static_rect();
+        assert_eq!(
+            geometry.source_block_interval(),
+            (layout_pt(12.0), layout_pt(32.0))
+        );
+    }
+
+    #[test]
+    fn reverse_directions_preserve_their_physical_main_axis() {
+        let row_reverse = geometry(FlexDirection::RowReverse).static_area();
+        assert_eq!(
+            (
+                row_reverse.x(),
+                row_reverse.top_y(),
+                row_reverse.width(),
+                row_reverse.height()
+            ),
+            (130.0, 500.0, 40.0, 80.0)
+        );
+
+        let column_reverse = geometry(FlexDirection::ColumnReverse).static_area();
+        assert_eq!(
+            (
+                column_reverse.x(),
+                column_reverse.top_y(),
+                column_reverse.width(),
+                column_reverse.height()
+            ),
+            (100.0, 470.0, 200.0, 20.0)
+        );
+    }
+
+    #[test]
+    fn vertical_rtl_static_geometry_keeps_the_flex_area_in_physical_coordinates() {
+        let mut geometry = geometry(FlexDirection::Row);
+        geometry.container_writing_mode = WritingMode::VerticalRl;
+        geometry.container_direction = Direction::Rtl;
+        geometry.subject_writing_mode = WritingMode::VerticalRl;
+        geometry.subject_direction = Direction::Rtl;
+
+        let area = geometry.static_area();
+        assert_eq!(
+            (area.x(), area.top_y(), area.width(), area.height()),
+            (130.0, 500.0, 40.0, 80.0)
+        );
+        let _ = geometry.positioned_static_rect();
+    }
+}
+
 /// Record the visible block-end of one committed nested table fragment.
 ///
 /// Flex owns the outer source range, but a table's repeated chrome can make
@@ -69,7 +226,129 @@ pub(in crate::layout::flex) struct SplitFlexItemReplayState<'a> {
     pub(in crate::layout::flex) destination_block_end: &'a mut Option<f32>,
 }
 
+/// Combine the inline line formatter's item span with final flex-line
+/// geometry for an automatic physical-column `inline-flex`.
+///
+/// `main_gap` has already resolved its flex percentage basis, so a cyclic
+/// percentage gap arrives as zero.  The final line extent is retained as a
+/// lower bound for used margins, minimums, and overflow-safe geometry.
+/// <https://www.w3.org/TR/css-align-3/#gaps>
+fn final_physical_column_inline_flex_line_span(
+    normal_flow_item_span: PhysicalContentHeight,
+    finalized_line_span: PhysicalContentHeight,
+    main_gap: FlexMainSize,
+    non_collapsed_item_count: usize,
+) -> PhysicalContentHeight {
+    let separator_count = non_collapsed_item_count.saturating_sub(1) as f32;
+    let normal_flow_line_span = PhysicalContentHeight::new(content_box_pt(
+        normal_flow_item_span.points() + main_gap.scale(separator_count).points(),
+    ));
+    PhysicalContentHeight::new(content_box_pt(
+        normal_flow_line_span
+            .points()
+            .max(finalized_line_span.points()),
+    ))
+}
+
 impl<'a> LayoutBuilder<'a> {
+    /// Measure the automatic physical block span of a column `inline-flex`.
+    ///
+    /// The inline line formatter supplies leading that is not represented by
+    /// Taffy's final item rectangles.  It must nevertheless be measured per
+    /// *final* flex line and retain the resolved main-axis gutters between
+    /// that line's non-collapsed items.  The final flex-line extent remains a
+    /// lower bound so used margins and minimum sizes cannot disappear from an
+    /// automatic container size.
+    ///
+    /// This is deliberately limited to a one-to-one itemization of the box
+    /// tree.  Anonymous flex-item construction has no corresponding
+    /// `FormattingBox` slice for the inline probe; in that case the final
+    /// flex geometry is already the safe authoritative fallback.
+    /// <https://www.w3.org/TR/css-flexbox-1/#layout-algorithm>
+    /// <https://www.w3.org/TR/css-align-3/#gaps>
+    fn automatic_physical_column_inline_flex_height(
+        &mut self,
+        flex_layout: &FlexLayout,
+        style: &ComputedStyle,
+        child_boxes: &[box_tree::FormattingBox<'_>],
+        flex_item_count: usize,
+        stylesheets: &Stylesheets<'_>,
+        vertical_non_content: NonContentLength,
+    ) -> Option<PhysicalContentHeight> {
+        let mut order_modified_boxes = child_boxes
+            .iter()
+            .filter(|child| {
+                !child.style().display.is_none()
+                    && !matches!(child.style().position, Position::Absolute | Position::Fixed)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        order_modified_boxes.sort_by_key(|child| child.style().order);
+
+        // Flex itemization groups adjacent inline/text children into one
+        // anonymous item.  Do not guess a source-box mapping in that case:
+        // preserve the final flex result rather than measuring a different
+        // formatting context.
+        if order_modified_boxes.len() != flex_item_count {
+            return None;
+        }
+
+        let reverse_main_axis = matches!(
+            physical_flex_direction(style),
+            FlexDirection::ColumnReverse | FlexDirection::RowReverse
+        );
+        let mut largest_line_span = PhysicalContentHeight::new(content_box_pt(0.0));
+
+        for line in &flex_layout.lines {
+            let mut line_boxes = line
+                .item_indices
+                .iter()
+                .map(|&index| order_modified_boxes.get(index).cloned())
+                .collect::<Option<Vec<_>>>()?;
+            if line_boxes.is_empty() {
+                continue;
+            }
+            if reverse_main_axis {
+                line_boxes.reverse();
+            }
+
+            let atom = self.inline_fragment_atom_for_children(
+                None,
+                style,
+                &line_boxes,
+                stylesheets,
+                0.0,
+                None,
+            );
+            let normal_flow_item_span = PhysicalContentHeight::new(content_box_pt(
+                (atom.size.height
+                    - style.margin.top
+                    - style.margin.bottom
+                    - vertical_non_content.points())
+                .max(0.0),
+            ));
+            let finalized_line_span = PhysicalContentHeight::new(content_box_pt(
+                line.main_end
+                    .relative_to(line.main_start)
+                    .non_negative_size()
+                    .points(),
+            ));
+            largest_line_span = PhysicalContentHeight::new(content_box_pt(
+                largest_line_span.points().max(
+                    final_physical_column_inline_flex_line_span(
+                        normal_flow_item_span,
+                        finalized_line_span,
+                        flex_layout.main_gap,
+                        line.item_indices.len(),
+                    )
+                    .points(),
+                ),
+            ));
+        }
+
+        Some(largest_line_span)
+    }
+
     /// Build an atomic inline fragment for an `inline-flex` container.
     ///
     /// CSS Display makes `inline-flex` an inline-level atomic flex container,
@@ -300,6 +579,33 @@ impl<'a> LayoutBuilder<'a> {
             );
         };
 
+        // A column inline-flex's automatic physical block size is the span
+        // of its final in-flow lines, not Taffy's reduced item-rectangle
+        // proxy.  The normal-flow probe retains line-box leading selected by
+        // the inline formatter, and final flex geometry restores the main
+        // gaps that plain normal flow does not contain.  Keep paint capture
+        // and fragmentation independent from used layout geometry.
+        //
+        // This applies only to an automatic physical column: a row's final
+        // cross-size is resolved by its flex lines, and an explicit height
+        // remains the author's used content-box size.
+        // <https://www.w3.org/TR/css-flexbox-1/#algo-main-container>
+        // <https://www.w3.org/TR/css-inline-3/#line-box>
+        let final_physical_column_content_height = (!containment.size
+            && physical_flex_direction(style).is_column_axis()
+            && definite_content_height.is_none())
+        .then(|| {
+            self.automatic_physical_column_inline_flex_height(
+                &flex_layout,
+                style,
+                child_boxes,
+                children.len(),
+                stylesheets,
+                vertical_non_content,
+            )
+        })
+        .flatten();
+
         let total_content_height = if containment.size {
             definite_content_height.unwrap_or_else(|| {
                 constrain_content_height(
@@ -314,7 +620,11 @@ impl<'a> LayoutBuilder<'a> {
         } else {
             constrain_content_height(
                 style,
-                flex_layout.height.content_box_length(),
+                content_box_pt(
+                    final_physical_column_content_height
+                        .map(PhysicalContentHeight::points)
+                        .unwrap_or_else(|| flex_layout.height.points()),
+                ),
                 PercentageBasis::definite_from(
                     content_width.content_box_length(),
                     BlockSizeBasisSource::ContainingBlock,
@@ -335,14 +645,17 @@ impl<'a> LayoutBuilder<'a> {
         // Inline-fragment and paint APIs are legacy scalar boundaries. Keep
         // the border-box conversion above typed until this projection.
         let border_box_height_points = border_box_height.points();
-        let estimated_baseline_offset = (!containment.layout)
-            .then(|| inline_flex_exported_vertical_baseline(flex_layout.baselines))
-            .flatten()
-            .map(|baseline| border_widths.top + style.padding.top + baseline.points())
-            .unwrap_or_else(|| {
-                inline_flex_synthesized_baseline_offset(style, border_box_height).points()
-            });
+        let inline_atom_baselines = (!containment.layout).then(|| {
+            flex_layout.baselines.into_inline_atom_baselines(
+                layout_pt(border_widths.top + style.padding.top),
+                layout_pt(border_widths.left + style.padding.left),
+            )
+        });
         let snapshot = self.snapshot();
+        // The scratch page below is only a flex-paint construction space.
+        // Retain the real fallback containing block for descendants that are
+        // not contained by this inline-flex itself.
+        let escaped_atom_actual_containing_block = self.current_containing_block();
         let positioned_layer_start = self.positioned_layers.len();
         let top = 10_000.0;
         let content_top = top - border_widths.top - style.padding.top;
@@ -354,6 +667,25 @@ impl<'a> LayoutBuilder<'a> {
         self.cursor_y = content_top;
         self.truncate_page_start_margins = false;
 
+        let previous_escaped_atom_containing_block = self.escaped_atom_containing_block;
+        let previous_escaped_atom_positioning_context = self.escaped_atom_positioning_context;
+        let previous_block_static_position_y_offset = self.block_static_position_y_offset;
+        let previous_absolute_static_position = self.absolute_static_position;
+        // Descendant positioned layout needs a local static-position
+        // rectangle while retaining the outer containing block for explicit
+        // insets. This is the same escaped-atom contract used by
+        // inline-block capture.
+        // <https://www.w3.org/TR/css-position-3/#static-position-rectangle>
+        self.block_static_position_y_offset = Some(0.0);
+        let escaped_atom_static_position =
+            AbsoluteStaticPosition::from_page_rect(inner_x, inner_x + inner_width, content_top);
+        self.absolute_static_position = Some(escaped_atom_static_position);
+        self.escaped_atom_positioning_context = Some(EscapedAtomPositioningContext {
+            actual_containing_block: escaped_atom_actual_containing_block,
+            static_position: escaped_atom_static_position,
+        });
+        self.escaped_atom_positioning_depth += 1;
+
         let positioning_containing_block_mode = PositionedContainingBlockMode::for_style(style);
         let positioned_containing_block_scope =
             if let Some(mode) = positioning_containing_block_mode {
@@ -363,7 +695,9 @@ impl<'a> LayoutBuilder<'a> {
                     content_width_points + style.padding.left + style.padding.right,
                     total_content_height + style.padding.top + style.padding.bottom,
                 ));
-                Some(self.push_positioned_containing_block(mode, containing_block))
+                let scope = self.push_positioned_containing_block(mode, containing_block);
+                self.escaped_atom_containing_block = Some(containing_block);
+                Some(scope)
             } else {
                 None
             };
@@ -386,8 +720,8 @@ impl<'a> LayoutBuilder<'a> {
                 replay_dimensions.border_box_height(),
                 PhysicalFlexDirection::new(physical_flex_direction(style)),
             );
-            self.with_formatting_context_item_placement(
-                FormattingContextItemPlacement {
+            self.with_placed_formatting_context(
+                PlacedFormattingContext {
                     content_left: inner_x + item.x().points(),
                     content_width: replay_dimensions.available_width_for_replay(),
                     content_height: Some(replay_dimensions.available_height_for_replay()),
@@ -399,6 +733,7 @@ impl<'a> LayoutBuilder<'a> {
                     scope_content_logical_inline_size: child.anonymous_content().is_some(),
                     cursor_y: content_top - item.y().points(),
                     page_start_margin_policy: PageStartMarginPolicy::Suppress,
+                    float_scope: ReplayFloatScope::IsolatedFormattingContext,
                 },
                 &placed_style,
                 |layout| {
@@ -445,10 +780,34 @@ impl<'a> LayoutBuilder<'a> {
             );
         }
 
+        self.escaped_atom_positioning_depth -= 1;
+        self.block_static_position_y_offset = previous_block_static_position_y_offset;
+        self.absolute_static_position = previous_absolute_static_position;
+        self.escaped_atom_positioning_context = previous_escaped_atom_positioning_context;
         if let Some(scope) = positioned_containing_block_scope {
             self.pop_positioned_containing_block(scope);
         }
-        let border_bottom = top - border_box_height_points;
+        self.escaped_atom_containing_block = previous_escaped_atom_containing_block;
+        let atom_bounds = PaintClip::from_paint_rect(paint_space_rect(
+            0.0,
+            top - border_box_height_points,
+            content_width_points + horizontal_non_content.points(),
+            border_box_height_points,
+        ));
+        let policy = StackingContextPolicy::for_atomic(style, PaintBand::Inline, atom_bounds);
+        let escaped_positioned_layers =
+            if matches!(policy.child_layer_policy, ChildLayerPolicy::EscapeAll)
+                && positioned_layer_start < self.positioned_layers.len()
+            {
+                // An inline-flex is atomically painted for its in-flow
+                // contents, but an abspos descendant whose containing block
+                // is outside the flex container belongs to the parent
+                // stacking context instead of its captured scratch fragment.
+                // <https://www.w3.org/TR/CSS22/zindex.html>
+                self.positioned_layers.split_off(positioned_layer_start)
+            } else {
+                Vec::new()
+            };
         self.flush_positioned_layers_since(positioned_layer_start);
         let mut fragment = self.current_page.paint_fragment();
         if style.visibility == Visibility::Visible {
@@ -473,23 +832,39 @@ impl<'a> LayoutBuilder<'a> {
                 ),
             );
         }
-        let fragment = fragment.translated(PaintTranslation::new(0.0, -border_bottom));
-        // The captured paint fragment is not a baseline-selection input.
-        // Flexbox exports the resolved flex-line baseline, or synthesizes one
-        // from the container border box when none is parallel to the parent
-        // inline axis. A captured first line may belong to a later wrapped
-        // flex line and therefore cannot repair missing flex metadata.
-        // <https://drafts.csswg.org/css-flexbox/#flex-baselines>
-        let baseline_offset = estimated_baseline_offset;
+        // Normalize the capture before restoring the outer builder. Keeping
+        // a 10,000pt scratch origin until inline replay loses sub-pixel CSS
+        // geometry through cancellation in the final atom translation.
+        // Outer margins still participate only in the parent line's
+        // margin-box placement.
+        let scratch_border_box_origin = PaintPoint::new(0.0, top - border_box_height_points);
+        fragment = fragment.translated(PaintTranslation::new(
+            -scratch_border_box_origin.x,
+            -scratch_border_box_origin.y,
+        ));
+        let replay_coordinates = AtomicInlineFragmentReplayCoordinates::border_box_local();
+        let escaped_positioned_layers = escaped_positioned_layers
+            .into_iter()
+            .map(|layer| {
+                let offset = layer
+                    .escaped_atom_translation
+                    .escape_offset(-scratch_border_box_origin.y);
+                layer.translated(offset)
+            })
+            .collect::<Vec<_>>();
+        let escaped_positioned_layers = (!escaped_positioned_layers.is_empty())
+            .then(|| escaped_positioned_layers.into_boxed_slice());
         self.restore(snapshot);
 
-        InlineAtom::new(
+        let atom = InlineAtom::new(
             InlineAtomContent::InlineFragment {
                 fragment: Box::new(fragment),
+                replay_coordinates,
                 table_cell_context: None,
+                contents_overflow_clip_applied: false,
             },
             style.as_computed().clone(),
-            None,
+            escaped_positioned_layers,
             InlineSize::new(
                 content_width_points
                     + horizontal_non_content.points()
@@ -497,11 +872,15 @@ impl<'a> LayoutBuilder<'a> {
                     + style.margin.right,
                 border_box_height_points + style.margin.top + style.margin.bottom,
             ),
-            baseline_offset,
+            0.0,
             baseline_shift,
             link_target,
             None,
-        )
+        );
+        match inline_atom_baselines {
+            Some(baselines) => atom.with_flex_exported_baselines(baselines),
+            None => atom.with_synthesized_border_box_block_end_baseline(),
+        }
     }
 
     /// Lays out an absolutely positioned flex child from its flex static position.
@@ -598,10 +977,15 @@ impl<'a> LayoutBuilder<'a> {
     ) -> (PositionedChildStaticRect, (LayoutLength, LayoutLength)) {
         let mut hypothetical_child = child.clone();
         hypothetical_child.style.position = Position::Static;
-        hypothetical_child.style.flex_grow = 0.0;
-        hypothetical_child.style.flex_shrink = 0.0;
+        hypothetical_child.style.flex_grow = css::FlexGrowFactor::ZERO;
+        hypothetical_child.style.flex_shrink = css::FlexShrinkFactor::ZERO;
         hypothetical_child.style.flex_basis = css::ComputedFlexBasis::Auto;
         zero_auto_margins_for_static_flex_probe(&mut hypothetical_child.style);
+        // The hypothetical sole item resolves auto margins to zero. Retain
+        // these used probe edges so the outer rectangle and its fragment
+        // interval cannot accidentally mix probe geometry with the eventual
+        // positioned child's authored margins.
+        let probe_margins = hypothetical_child.style.margin;
         if hypothetical_child.style.display.is_inline_level() {
             hypothetical_child.style.display = hypothetical_child.style.display.blockified();
         }
@@ -628,14 +1012,14 @@ impl<'a> LayoutBuilder<'a> {
         // own margins a second time when normal positioned layout resolves
         // the final margin box.
         // <https://www.w3.org/TR/css-flexbox-1/#abspos-items>
-        let static_left = context.inner_inline_span.left_x() + hypothetical.x().points()
-            - child.style.margin.left;
+        let static_left =
+            context.inner_inline_span.left_x() + hypothetical.x().points() - probe_margins.left;
         let static_right = context.inner_inline_span.left_x()
             + hypothetical.x().points()
             + hypothetical.width().points()
-            + child.style.margin.right;
+            + probe_margins.right;
         let static_top =
-            context.content_top.points() - hypothetical.y().points() + child.style.margin.top;
+            context.content_top.points() - hypothetical.y().points() + probe_margins.top;
         let flex_axes = FlexAxes::for_style(context.container_style);
         let main_alignment =
             flex_static_main_alignment(hypothetical_container_style.justify_content);
@@ -655,47 +1039,45 @@ impl<'a> LayoutBuilder<'a> {
             (cross_alignment, main_alignment)
         };
         let hypothetical_outer_height =
-            (hypothetical.height().points() + child.style.margin.top + child.style.margin.bottom)
-                .max(0.0);
+            (hypothetical.height().points() + probe_margins.top + probe_margins.bottom).max(0.0);
         // Flexbox gives the static-position rectangle the container's content
         // edges in the cross axis, while the sole hypothetical item's margin
         // edges determine it in the main axis. This distinction is essential
         // when the eventual abspos size differs from the sizing probe.
         // <https://www.w3.org/TR/css-flexbox-1/#abspos-items>
-        let static_area = if flex_axes.is_main_row_axis() {
-            PageTopRect::new(
-                static_left,
-                context.content_top.points(),
-                (static_right - static_left).max(0.0),
-                context.content_height.points(),
-            )
-        } else {
-            PageTopRect::new(
-                context.inner_inline_span.left_x(),
-                static_top,
-                context.inner_inline_span.width(),
-                hypothetical_outer_height,
-            )
-        };
-        let static_alignment = AbsposStaticAlignment::new(
-            static_area,
-            context.container_style.writing_mode,
-            context.container_style.used_direction(),
-            inline_alignment,
-            block_alignment,
-        );
         let source_static_block_start = layout_pt(hypothetical.y().points().max(0.0));
         let source_static_block_end = layout_pt(
             (hypothetical.y().points()
                 + hypothetical.height().points()
-                + child.style.margin.top
-                + child.style.margin.bottom)
+                + probe_margins.top
+                + probe_margins.bottom)
                 .max(source_static_block_start.points()),
         );
+        let geometry = FlexAbsposStaticGeometry {
+            flex_content_box: PageTopRect::new(
+                context.inner_inline_span.left_x(),
+                context.content_top.points(),
+                context.inner_inline_span.width(),
+                context.content_height.points(),
+            ),
+            hypothetical_margin_box: PageTopRect::new(
+                static_left,
+                static_top,
+                (static_right - static_left).max(0.0),
+                hypothetical_outer_height,
+            ),
+            flex_axes,
+            inline_alignment,
+            block_alignment,
+            container_writing_mode: context.container_style.writing_mode,
+            container_direction: context.container_style.used_direction(),
+            subject_writing_mode: child.style.writing_mode,
+            subject_direction: child.style.used_direction(),
+            source_block_interval: (source_static_block_start, source_static_block_end),
+        };
         (
-            PositionedChildStaticRect::new(static_left, static_right, static_top)
-                .with_static_alignment(static_alignment),
-            (source_static_block_start, source_static_block_end),
+            geometry.positioned_static_rect(),
+            geometry.source_block_interval(),
         )
     }
 
@@ -781,7 +1163,7 @@ impl<'a> LayoutBuilder<'a> {
             return;
         }
 
-        let table_fragment_ordinal = context.continuation.continuation_ordinal;
+        let table_fragment_ordinal = context.continuation.child_fragment_replay_ordinal();
         // A child formatter owns its own pagination decisions. Once its first
         // flex slice has committed those child fragments, later flex slices
         // must replay the matching child fragment instead of laying out the
@@ -907,8 +1289,8 @@ impl<'a> LayoutBuilder<'a> {
                 )
             });
 
-        self.with_formatting_context_item_placement(
-            FormattingContextItemPlacement {
+        self.with_placed_formatting_context(
+            PlacedFormattingContext {
                 content_left: 0.0,
                 content_width: context.available_width_for_replay(),
                 content_height: Some(if child_fragment_replay {
@@ -925,6 +1307,7 @@ impl<'a> LayoutBuilder<'a> {
                 scope_content_logical_inline_size: child.anonymous_content().is_some(),
                 cursor_y: offpage_top,
                 page_start_margin_policy: PageStartMarginPolicy::Suppress,
+                float_scope: ReplayFloatScope::IsolatedFormattingContext,
             },
             replay_style,
             |layout| {
@@ -1053,8 +1436,8 @@ impl<'a> LayoutBuilder<'a> {
         // Preserve the nested paint-tree structure while clipping it at the
         // common fragment-span boundary.
         // <https://www.w3.org/TR/css-break-3/#box-splitting>
-        let fragment =
-            fragment.with_primitives_clipped_to_rect_preserving_structure(slice_border_box);
+        let fragment = fragment
+            .with_primitives_sliced_to_fragmentainer_rect_preserving_structure(slice_border_box);
         // The geometric fragmentainer slice above has already trimmed the
         // captured primitive tree. Do not wrap it in a second PDF overflow
         // clip: applying one around the complete stacking context
@@ -1142,42 +1525,72 @@ impl<'a> LayoutBuilder<'a> {
     }
 }
 
-/// Return the synthesized inline-level baseline for an `inline-flex` atom.
-///
-/// CSS Flexbox leaves an empty row flex container without a main-axis baseline
-/// set; CSS Inline then synthesizes the atomic inline's baseline from its
-/// margin box in the inline formatting context:
-/// <https://drafts.csswg.org/css-flexbox/#flex-baselines> and
-/// <https://www.w3.org/TR/css-inline-3/#atomic-inline>.
-pub(in crate::layout::flex) fn inline_flex_synthesized_baseline_offset(
-    style: &ComputedStyle,
-    border_box_height: BorderBoxLength,
-) -> FlexVerticalBaselineOffset {
-    match style.writing_mode {
-        // `InlineAtom` stores its exported baseline from the border-box
-        // block start. The shared atomic-inline adapter adds the block-start
-        // margin and compares it with the complete margin-box size, so adding
-        // the block-end margin here would count it twice.
-        WritingMode::HorizontalTb => FlexVerticalBaselineOffset::new(border_box_height.points()),
-        WritingMode::VerticalRl
-        | WritingMode::VerticalLr
-        | WritingMode::SidewaysRl
-        | WritingMode::SidewaysLr => FlexVerticalBaselineOffset::new(border_box_height.points()),
-    }
-}
+#[cfg(test)]
+mod inline_flex_baseline_tests {
+    use super::*;
 
-/// Select the finalized flex baseline that the current horizontal inline atom
-/// transport can carry.
-///
-/// Flex preserves first/last baseline sets for both physical axes.  This
-/// legacy atom boundary carries only a physical vertical offset, so it must
-/// consume the vertical export deliberately instead of treating a horizontal
-/// baseline as a y-coordinate.  A missing compatible export is left for CSS
-/// Inline baseline synthesis from the atom's margin box:
-/// <https://www.w3.org/TR/css-flexbox-1/#flex-baselines> and
-/// <https://www.w3.org/TR/css-inline-3/#atomic-inline>.
-pub(in crate::layout::flex) fn inline_flex_exported_vertical_baseline(
-    baselines: FlexContainerBaselineEstimate,
-) -> Option<FlexVerticalBaselineOffset> {
-    baselines.vertical.first
+    #[test]
+    fn final_column_line_span_adds_one_gap_between_each_noncollapsed_item() {
+        assert_eq!(
+            final_physical_column_inline_flex_line_span(
+                PhysicalContentHeight::new(content_box_pt(40.0)),
+                PhysicalContentHeight::new(content_box_pt(55.0)),
+                FlexMainSize::new(10.0),
+                4,
+            ),
+            PhysicalContentHeight::new(content_box_pt(70.0)),
+        );
+    }
+
+    #[test]
+    fn final_column_line_span_retains_final_geometry_and_zero_gap_behavior() {
+        // The caller resolves cyclic percentage gaps through flex layout;
+        // their used value is zero by the time it reaches this helper.
+        assert_eq!(
+            final_physical_column_inline_flex_line_span(
+                PhysicalContentHeight::new(content_box_pt(24.0)),
+                PhysicalContentHeight::new(content_box_pt(32.0)),
+                FlexMainSize::new(0.0),
+                3,
+            ),
+            PhysicalContentHeight::new(content_box_pt(32.0)),
+        );
+    }
+
+    #[test]
+    fn largest_wrapped_column_line_span_controls_automatic_height() {
+        let first_line = final_physical_column_inline_flex_line_span(
+            PhysicalContentHeight::new(content_box_pt(20.0)),
+            PhysicalContentHeight::new(content_box_pt(20.0)),
+            FlexMainSize::new(10.0),
+            2,
+        );
+        let second_line = final_physical_column_inline_flex_line_span(
+            PhysicalContentHeight::new(content_box_pt(36.0)),
+            PhysicalContentHeight::new(content_box_pt(30.0)),
+            FlexMainSize::new(10.0),
+            2,
+        );
+
+        assert_eq!(first_line.points().max(second_line.points()), 46.0);
+    }
+
+    #[test]
+    fn exported_content_baselines_convert_to_physical_border_box_coordinates() {
+        let baselines = FlexContainerBaselineSets {
+            vertical: FlexItemBaselinePair {
+                first: Some(flex_vertical_baseline_from_points(6.0)),
+                last: Some(flex_vertical_baseline_from_points(9.0)),
+            },
+            horizontal: FlexItemBaselinePair {
+                first: Some(flex_horizontal_baseline_from_points(8.0)),
+                last: Some(flex_horizontal_baseline_from_points(12.0)),
+            },
+        }
+        .into_inline_atom_baselines(layout_pt(4.0), layout_pt(5.0));
+        assert_eq!(baselines.vertical.first.unwrap().points(), 10.0);
+        assert_eq!(baselines.vertical.last.unwrap().points(), 13.0);
+        assert_eq!(baselines.horizontal.first.unwrap().points(), 13.0);
+        assert_eq!(baselines.horizontal.last.unwrap().points(), 17.0);
+    }
 }

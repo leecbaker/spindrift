@@ -1,9 +1,10 @@
 use crate::css::layout_pt;
 use crate::{
-    Css, Document, PdfOptions, RenderOptions, ResourcePolicy, Result, css, dom, layout, resource,
-    timing::DebugTimer,
+    Css, Document, DocumentDate, PdfOptions, RenderOptions, ResourcePolicy, Result, css, dom,
+    layout, resource, timing::DebugTimer,
 };
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::Path;
 use url::Url;
 
@@ -16,9 +17,23 @@ use url::Url;
 /// <https://html.spec.whatwg.org/multipage/parsing.html#the-input-byte-stream>
 /// and <https://www.w3.org/TR/xml/#NT-XMLDecl>.
 ///
-/// ```
-/// let syntax = quire::InputSyntax::Xml;
-/// assert_eq!(syntax, quire::InputSyntax::Xml);
+/// ```no_run
+/// use quire::{Html, InputSyntax, PdfOptions, RenderOptions};
+/// use std::fs::File;
+///
+/// # async fn render_xhtml() -> quire::Result<()> {
+/// let html = Html::from_file("document.xhtml")
+///     .await?
+///     .with_input_syntax(InputSyntax::Xml);
+/// let mut output = File::create("document.pdf")?;
+/// html.write_pdf(
+///     &mut output,
+///     &RenderOptions::default(),
+///     &PdfOptions::default(),
+/// )
+/// .await?;
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum InputSyntax {
@@ -34,8 +49,21 @@ pub enum InputSyntax {
 #[derive(Debug, Clone, PartialEq)]
 /// An HTML or XML source document and its rendering configuration.
 ///
-/// ```
-/// let document = quire::Html::from_string("<h1>Hello</h1>");
+/// ```no_run
+/// use quire::{Html, PdfOptions, RenderOptions};
+/// use std::fs::File;
+///
+/// # async fn render() -> quire::Result<()> {
+/// let html = Html::from_file("document.html").await?;
+/// let mut output = File::create("document.pdf")?;
+/// html.write_pdf(
+///     &mut output,
+///     &RenderOptions::default(),
+///     &PdfOptions::default(),
+/// )
+/// .await?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct Html {
     source: String,
@@ -309,6 +337,22 @@ impl Html {
             ));
             resolve_stylesheet_imports(stylesheets).await?
         };
+        // HTML's color-scheme meta value establishes the document page's
+        // supported schemes. Model that document input as the first
+        // document-level root declaration, so ordinary author
+        // `color-scheme` rules that follow it can still override it through
+        // the cascade.
+        // <https://html.spec.whatwg.org/multipage/semantics.html#meta-color-scheme>
+        let mut stylesheets = stylesheets;
+        if document_syntax == dom::DocumentSyntax::Html
+            && let Some(content) = dom::first_meta_content(&root, "color-scheme")
+            && css::ComputedColorScheme::parse(&content).is_some()
+        {
+            stylesheets.insert(
+                0,
+                Css::from_string(format!("html {{ color-scheme: {content} }}")),
+            );
+        }
         // Media features describe the renderer-provided output viewport. An
         // author `@page` rule may subsequently choose the page box used for
         // layout, but it must not feed back into evaluation of `@media` rules
@@ -326,7 +370,7 @@ impl Html {
         let html_important_stylesheet = (document_syntax == dom::DocumentSyntax::Html)
             .then(css::html_document_important_user_agent_stylesheet);
         let mut parsed_stylesheets = Vec::new();
-        if options.presentational_hints {
+        if document_syntax == dom::DocumentSyntax::Html {
             parsed_stylesheets.push(css::html5_presentational_hints_stylesheet_with_urls(
                 self.base_url.as_ref(),
                 self.root_url.as_ref(),
@@ -433,46 +477,26 @@ impl Html {
             document.metadata.title = dom::first_element_text(&root, "title");
             document.metadata.author = dom::first_meta_content(&root, "author");
             document.metadata.creator = dom::first_meta_content(&root, "generator");
+            document.metadata.language = dom::document_language(&root);
+            document.metadata.description = dom::first_meta_content(&root, "description");
+            document.metadata.keywords = document_keywords(&root);
+            document.metadata.created = metadata_date(&root, "dcterms.created");
+            document.metadata.modified = metadata_date(&root, "dcterms.modified");
         }
         log::info!("rendered {} page(s)", document.pages.len());
         render_timer.finish();
         Ok(document)
     }
 
-    /// Asynchronously renders and serializes this document as PDF bytes.
+    /// Asynchronously renders this document and serializes it as a PDF into
+    /// `writer`.
     ///
     /// ```no_run
-    /// # async fn render() -> quire::Result<()> {
-    /// let html = quire::Html::from_string("<p>Hello</p>");
-    /// let pdf = html
-    ///     .write_pdf_bytes(
-    ///         &quire::RenderOptions::default(),
-    ///         &quire::PdfOptions::default(),
-    ///     )
-    ///     .await?;
-    /// # let _ = pdf;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn write_pdf_bytes(
-        &self,
-        render_options: &RenderOptions,
-        pdf_options: &PdfOptions,
-    ) -> Result<Vec<u8>> {
-        let _timer = DebugTimer::start("rendering and writing PDF bytes");
-        self.render(render_options)
-            .await?
-            .write_pdf_bytes(pdf_options)
-    }
-
-    /// Asynchronously renders and serializes this document to a PDF file.
-    ///
-    /// ```no_run
-    /// # async fn render() -> quire::Result<()> {
+    /// # async fn render(output: &mut Vec<u8>) -> quire::Result<()> {
     /// let html = quire::Html::from_string("<p>Hello</p>");
     /// html
     ///     .write_pdf(
-    ///         "document.pdf",
+    ///         output,
     ///         &quire::RenderOptions::default(),
     ///         &quire::PdfOptions::default(),
     ///     )
@@ -480,17 +504,16 @@ impl Html {
     /// # Ok(())
     /// # }
     /// ```
-    #[cfg(not(target_arch = "wasm32"))]
-    pub async fn write_pdf<P: AsRef<Path>>(
+    pub async fn write_pdf<W: Write>(
         &self,
-        target: P,
+        writer: &mut W,
         render_options: &RenderOptions,
         pdf_options: &PdfOptions,
     ) -> Result<()> {
-        let bytes = self.write_pdf_bytes(render_options, pdf_options).await?;
-        let _timer = DebugTimer::start(format!("writing PDF file {}", target.as_ref().display()));
-        tokio::fs::write(target, bytes).await?;
-        Ok(())
+        let _timer = DebugTimer::start("rendering and writing PDF");
+        self.render(render_options)
+            .await?
+            .write_pdf(writer, pdf_options)
     }
 
     /// Returns the base URL used to resolve document-relative resources.
@@ -538,12 +561,13 @@ impl Html {
         let mut styles = Vec::new();
         for source in dom::stylesheet_sources_in_document_order(root) {
             match source {
-                dom::StylesheetSource::Embedded(css) => styles.push(
+                dom::StylesheetSource::Embedded { css, scope_anchor } => styles.push(
                     Css::from_string(embedded_style_css(&css))
                         .with_base_url(self.base_url.clone())
-                        .with_root_url(self.root_url.clone()),
+                        .with_root_url(self.root_url.clone())
+                        .with_scope_anchor(scope_anchor),
                 ),
-                dom::StylesheetSource::Link(href) => {
+                dom::StylesheetSource::Link { href, scope_anchor } => {
                     let Some(path) =
                         resource::resolve_fetchable_url(&href, self.base_url(), self.root_url())
                     else {
@@ -557,9 +581,11 @@ impl Html {
                     };
                     log::debug!("loading linked stylesheet {path}");
                     match Css::from_link_url_with_fetcher(path, resource_fetcher).await {
-                        Ok(Some(stylesheet)) => {
-                            styles.push(stylesheet.with_root_url(self.root_url.clone()))
-                        }
+                        Ok(Some(stylesheet)) => styles.push(
+                            stylesheet
+                                .with_root_url(self.root_url.clone())
+                                .with_scope_anchor(scope_anchor),
+                        ),
                         Ok(None) => {
                             log::debug!("ignoring linked stylesheet {href} with non-CSS MIME type");
                         }
@@ -623,7 +649,7 @@ impl Html {
             let mut iframe_options = options.clone();
             iframe_options.page_size =
                 layout::PageSize::from_points(width.max(1.0), height.max(10_000.0));
-            iframe_options.set_margin(layout_pt(0.0));
+            iframe_options.iframe_page_margins = Some(layout::PageMargins::all(layout_pt(0.0)));
             let iframe_result = match source.source {
                 // `srcdoc` wins over `src` and its URL is `about:srcdoc`; its
                 // fallback base URL is inherited from the embedding document.
@@ -680,6 +706,38 @@ impl Html {
         }
         documents
     }
+}
+
+fn document_keywords(root: &dom::Node) -> Vec<String> {
+    let mut keywords = Vec::new();
+    for content in dom::meta_contents(root, "keywords") {
+        for keyword in content
+            .split(',')
+            .map(|keyword| keyword.trim_matches(is_html_space))
+            .filter(|keyword| !keyword.is_empty())
+        {
+            if !keywords.iter().any(|existing| existing == keyword) {
+                keywords.push(keyword.to_string());
+            }
+        }
+    }
+    keywords
+}
+
+fn metadata_date(root: &dom::Node, name: &str) -> Option<DocumentDate> {
+    dom::meta_contents(root, name)
+        .into_iter()
+        .find_map(|content| match DocumentDate::parse(content.clone()) {
+            Some(date) => Some(date),
+            None => {
+                log::warn!("invalid date in <meta name={name:?}>: {content:?}");
+                None
+            }
+        })
+}
+
+fn is_html_space(character: char) -> bool {
+    matches!(character, ' ' | '\t' | '\n' | '\u{000C}' | '\r')
 }
 
 fn resource_paths(
@@ -783,11 +841,17 @@ fn object_has_supported_static_image(
     };
     if data.starts_with("data:") {
         return resource_cache
-            .data_image_asset_with_orientation(data, false)
+            .data_image_asset_with_orientation(data, false, crate::svg::SvgImageContext::default())
             .is_some();
     }
     resource::resolve_url(data, base_url, root_url)
-        .and_then(|url| resource_cache.image_asset_url_with_orientation(&url, false))
+        .and_then(|url| {
+            resource_cache.image_asset_url_with_orientation(
+                &url,
+                false,
+                crate::svg::SvgImageContext::default(),
+            )
+        })
         .is_some()
 }
 
@@ -932,11 +996,14 @@ fn starts_with_xml_declaration(source: &str) -> bool {
 /// <https://html.spec.whatwg.org/multipage/semantics.html#the-style-element>
 /// and <https://www.w3.org/TR/css-syntax-3/#style-rules>.
 fn embedded_style_css(source: &str) -> String {
-    let trimmed = source.trim();
-    let unwrapped = trimmed
+    // Preserve ordinary style text byte-for-byte. In particular, the newline
+    // after an unterminated quote is a CSS Syntax BadString boundary; trimming
+    // it would incorrectly turn the value into an EOF-closed string.
+    let cdata_candidate = source.trim();
+    let unwrapped = cdata_candidate
         .strip_prefix("<![CDATA[")
         .and_then(|value| value.strip_suffix("]]>"))
-        .unwrap_or(trimmed);
+        .unwrap_or(source);
     unwrapped.to_string()
 }
 
@@ -944,6 +1011,12 @@ fn embedded_style_css(source: &str) -> String {
 mod tests {
     use super::*;
     use crate::{CssColor, FetchErrorPolicy, ResourcePolicy, dom};
+
+    #[test]
+    fn embedded_style_text_preserves_a_bad_string_newline() {
+        let source = "\ncolor: var(--tone, \"\n";
+        assert_eq!(embedded_style_css(source), source);
+    }
 
     #[tokio::test]
     async fn missing_image_is_an_optional_visual_subresource() {
@@ -1055,9 +1128,10 @@ mod tests {
             document.pages[0].images[0].source,
             crate::document::paint::images::RenderedImageSource::Stored { .. }
         ));
+        let mut pdf = Vec::new();
         assert!(
             document
-                .write_pdf_bytes(&crate::PdfOptions::default())
+                .write_pdf(&mut pdf, &crate::PdfOptions::default())
                 .is_ok()
         );
     }
@@ -1071,12 +1145,11 @@ mod tests {
 
         assert_eq!(document.image_store.len(), 0);
         assert_eq!(document.pages[0].gradient_patterns.len(), 1);
-        assert!(
-            !document
-                .write_pdf_bytes(&crate::PdfOptions::default())
-                .unwrap()
-                .is_empty()
-        );
+        let mut pdf = Vec::new();
+        document
+            .write_pdf(&mut pdf, &crate::PdfOptions::default())
+            .unwrap();
+        assert!(!pdf.is_empty());
     }
 
     #[test]
@@ -1117,6 +1190,24 @@ mod tests {
             .with_input_syntax(InputSyntax::Html);
 
         assert_eq!(html.document_syntax(), dom::DocumentSyntax::Html);
+    }
+
+    #[tokio::test]
+    async fn xml_rendering_does_not_apply_html_presentational_hints() {
+        let document = Html::from_xml_string(
+            "<html><body marginwidth=\"100\"><p style=\"margin: 0; font-size: 10pt; line-height: 10pt\">Text</p></body></html>",
+        )
+        .with_stylesheet(Css::from_string("@page { size: 160pt 100pt; margin: 10pt }"))
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+
+        let text = document.pages[0]
+            .lines()
+            .iter()
+            .find(|line| line.text == "Text")
+            .expect("the XML paragraph should render");
+        assert_eq!(text.x(), 16.0);
     }
 
     #[tokio::test]

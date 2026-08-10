@@ -43,8 +43,29 @@ ellipsis-fitting and line-clamp reference fixtures. Script-driven mutation
 fixtures (017–023, 026, 048, and `dynamic-001`) are intentionally excluded:
 Quire does not implement JavaScript or CSSOM mutation.
 
-Remaining CSS Overflow Level 4 gaps are the independently cascaded
-`max-lines`, `block-ellipsis`, and `continue` longhands, `line-clamp: auto`,
-and `continue: discard`.
+Quire cascades `max-lines`, inherited `block-ellipsis`, and `continue`
+independently. The line-clamp shorthands expand into those longhands, and a
+non-zero/exhausted layout budget prevents a zero available-line state. A
+positive `max-lines` value also supplies the cutoff for `continue: discard`.
+
+For a direct inline formatting context, Quire selects an automatic cutoff from
+measured line-box block advances when a finite absolute, line-height-relative,
+or definite containing-block percentage used block-size constraint overflows.
+An absolute or line-height-relative constraint is also propagated as a typed
+remaining content-box allowance through eligible in-flow descendant blocks;
+their computed longhands remain independent, and a block-only cutoff cannot
+create a marker. It then reselects the terminal line with the marker reserved.
+The same local endpoint path handles an unforced `continue: discard` break; it
+omits following in-flow source without materializing a page or column
+fragmentainer. A direct multicolumn child traversal captures a non-empty opaque
+source prefix at its first local region break, replays only that prefix for
+balancing and box sizing, and suppresses later spanners and column sets.
+
+Remaining CSS Overflow Level 4 gaps are automatic constraints which depend on
+the enclosing block's final percentage basis through mixed or nested block
+flow, reevaluation through multicol balancing, and full Category-3 region
+fragmentation through mixed or nested formatting contexts. Those cases still
+need a block-flow-local region remainder controller rather than the
+direct-inline and direct-child multicol cutoff paths.
 
 <https://drafts.csswg.org/css-overflow-4/#line-clamp>

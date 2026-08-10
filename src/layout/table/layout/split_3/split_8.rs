@@ -837,7 +837,7 @@ impl<'a> LayoutBuilder<'a> {
             style.border_widths = css::Edges::ZERO;
             style.border_width_values = css::CssEdges::all(css::ComputedLengthPercentage::ZERO);
             style.border_styles = css::BorderStyles::NONE;
-            style.background_color = css::BackgroundColor::TRANSPARENT;
+            style.background.background_color = css::BackgroundColor::TRANSPARENT;
             set_style_auto_width(&mut style);
             set_style_auto_height(&mut style);
             style.box_values.min_width = css::ComputedLengthPercentageOrAuto::Auto;

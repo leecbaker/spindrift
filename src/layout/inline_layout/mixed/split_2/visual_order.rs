@@ -1,6 +1,6 @@
 use super::*;
 use crate::css::{Edges, LineFitEdge, TextBoxTrim};
-use crate::text::line_end_letter_spacing_width;
+use crate::text::{bidi_mirroring_glyph, line_end_letter_spacing_width};
 use std::rc::Rc;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -73,7 +73,9 @@ fn inline_fragment_uses_text_edge_layout(fragment: &InlineFragment) -> bool {
 fn inline_item_has_no_line_box_extent(item: &InlineLineItem) -> bool {
     match item {
         InlineLineItem::Fragment(fragment) => {
-            fragment.style().font_size == 0.0 || fragment.style().line_height == 0.0
+            matches!(fragment.source(), InlineTextSource::BlockEllipsis)
+                || fragment.style().font_size == 0.0
+                || fragment.style().line_height == 0.0
         }
         InlineLineItem::Atom(atom) => {
             matches!(
@@ -169,6 +171,50 @@ pub(in crate::layout) struct InlineBaselineExtents {
     descent: f32,
 }
 
+/// The parent text box's over/under baselines measured from its alphabetic
+/// line baseline.
+///
+/// A tate-chu-yoko composition aligns the center of its one-em square to the
+/// parent inline box's central baseline, which CSS Writing Modes defines as
+/// centered between these two baselines. Keeping this pair distinct from a
+/// line box's leading makes it impossible to accidentally center the square
+/// around the alphabetic baseline instead.
+/// <https://drafts.csswg.org/css-writing-modes-4/#text-combine-layout>
+#[derive(Debug, Clone, Copy)]
+struct ParentTextOverUnderBaselines {
+    over_from_alphabetic_baseline: f32,
+    under_from_alphabetic_baseline: f32,
+}
+
+impl ParentTextOverUnderBaselines {
+    fn from_metrics(metrics: InlineTextBoxMetrics) -> Self {
+        Self {
+            over_from_alphabetic_baseline: metrics.content_baseline_offset,
+            under_from_alphabetic_baseline: metrics.content_block_size
+                - metrics.content_baseline_offset,
+        }
+    }
+
+    /// Return a composition square's signed line extents after aligning its
+    /// central baseline to the parent text's central baseline.
+    fn text_combine_upright_square_extents(
+        self,
+        square_block_size: f32,
+        baseline_shift: f32,
+    ) -> InlineBaselineExtents {
+        debug_assert!(square_block_size >= 0.0);
+        let parent_central_baseline_from_alphabetic =
+            (self.over_from_alphabetic_baseline - self.under_from_alphabetic_baseline) / 2.0;
+        let composition_baseline_offset =
+            parent_central_baseline_from_alphabetic + square_block_size / 2.0;
+        InlineBaselineExtents::from_shifted_baseline_and_block_size(
+            composition_baseline_offset,
+            square_block_size,
+            baseline_shift,
+        )
+    }
+}
+
 impl InlineBaselineExtents {
     fn new(baseline_offset: f32, descent: f32) -> Self {
         Self {
@@ -211,16 +257,15 @@ impl InlineBaselineExtents {
 }
 
 impl<'a> LayoutBuilder<'a> {
-    /// Retain logical source shaping for a joining run before UAX #9 splits it
-    /// into visual fragments.
+    /// Retain logical source shaping before UAX #9 splits it into visual
+    /// fragments.
     ///
     /// CSS Text shapes a typographic character unit in logical order, then
     /// the bidi algorithm selects visual line fragments. Re-shaping those
-    /// fragments independently changes Arabic joining forms at transparent
-    /// inline boundaries. This deliberately applies only to joining scripts:
-    /// non-joining ligatures are already shaped as one paint-preparation
-    /// group, while a source slice through a ligature cluster cannot be
-    /// represented by separate inline fragments.
+    /// fragments independently changes contextual forms at transparent inline
+    /// boundaries. A boundary can also divide a non-joining OpenType cluster
+    /// such as lam-alef, so the complete source shape is retained even when
+    /// no individual fragment can own a strict glyph slice.
     /// <https://www.w3.org/TR/css-text-3/#boundary-shaping> and
     /// <https://www.w3.org/TR/css-writing-modes-4/#bidi-linebox>.
     fn preserve_logical_joining_source_shapes(
@@ -272,26 +317,9 @@ impl<'a> LayoutBuilder<'a> {
                 .get(index)
                 .is_some_and(|item| matches!(&item.item, InlineLineItem::Atom(atom) if inline_atom_is_logical_shaping_boundary(atom)));
 
-            let joins = fragment_indices.iter().any(|&fragment_index| {
-                match &items[fragment_index].item {
-                    InlineLineItem::Fragment(fragment) => {
-                        fragment.text().chars().any(|character| {
-                            // An authored join-control-only span is a shaping
-                            // boundary participant in its own right. It must
-                            // keep adjacent text in one group even when neither
-                            // visible neighbor has Arabic/Syriac-style joining
-                            // behavior (for example `A<span>ZWNJ</span>B`).
-                            character_is_join_control(character)
-                                || character_has_joining_behavior(character)
-                        })
-                    }
-                    InlineLineItem::Atom(_) | InlineLineItem::Float(_) => false,
-                }
-            });
-            if (!starts_after_shaping_boundary
+            if !starts_after_shaping_boundary
                 && !ends_before_shaping_boundary
-                && fragment_indices.len() < 2)
-                || !joins
+                && fragment_indices.len() < 2
             {
                 output.extend_from_slice(&items[start..index]);
                 continue;
@@ -306,17 +334,6 @@ impl<'a> LayoutBuilder<'a> {
                 unreachable!("the fragment grouping loop only yields fragments");
             };
             let source_style = first_fragment.style();
-            // CSS Text has already applied `text-transform` before shaping,
-            // and `display` creates a transparent inline boundary. If those
-            // are the only style differences, use one Parley text style so a
-            // ligature such as lam-alef remains eligible across the element
-            // edge.
-            let one_text_style = fragment_indices.iter().all(|&fragment_index| {
-                let InlineLineItem::Fragment(fragment) = &items[fragment_index].item else {
-                    return false;
-                };
-                styles_have_equivalent_text_shaping_inputs(source_style, fragment.style())
-            });
             if starts_after_shaping_boundary {
                 text.push('\u{200c}');
                 spans.push(StyledTextSpan {
@@ -335,11 +352,7 @@ impl<'a> LayoutBuilder<'a> {
                 ranges.push(start..text.len());
                 spans.push(StyledTextSpan {
                     text: fragment.text(),
-                    style: if one_text_style {
-                        source_style
-                    } else {
-                        fragment.style()
-                    },
+                    style: fragment.style(),
                 });
                 unshaped_width += item.width;
             }
@@ -355,39 +368,75 @@ impl<'a> LayoutBuilder<'a> {
                     style: last_fragment.style(),
                 });
             }
-            let Some(shaped) = self.font_system.shape_styled_inline_fragments(
+            let line_height = line_height.expect("a fragment group always has a first style");
+            let shaped = self.font_system.shape_styled_inline_fragments(
                 &spans,
                 text,
                 unshaped_width,
-                line_height.expect("a fragment group always has a first style"),
+                line_height,
                 0.0,
                 tab_metric_style,
-            ) else {
+            );
+            let Some(shaped) = shaped else {
                 output.extend_from_slice(&items[start..index]);
                 continue;
             };
             let shaped = Rc::new(shaped);
-            let slices: Option<Vec<_>> = ranges
-                .into_iter()
-                .map(|range| shaped.source_slice(range).map(Rc::new))
-                .collect();
-            let Some(slices) = slices else {
-                output.extend_from_slice(&items[start..index]);
-                continue;
+            // A nonzero edge is a true shaping boundary. Its synthetic ZWNJ
+            // belongs only to this logical shape, not to a reusable source
+            // shared by its members.
+            let boundary_source = (!starts_after_shaping_boundary && !ends_before_shaping_boundary)
+                .then(|| {
+                    Rc::new(BoundaryShapedSource {
+                        shaped: Rc::clone(&shaped),
+                        fragment_ranges: Rc::from(ranges.clone().into_boxed_slice()),
+                    })
+                });
+            let slices = ranges
+                .iter()
+                .cloned()
+                .map(|range| shaped.source_slice(range))
+                .collect::<Vec<_>>();
+            let original_fragment_width = fragment_indices
+                .iter()
+                .map(|&fragment_index| items[fragment_index].width)
+                .sum::<f32>();
+            // An explicit join control can make the backend report one
+            // cluster spanning several lexical fragments. Those fragments
+            // still need the full source's aggregate advance for bidi
+            // alignment; distribute it proportionally until paint consumes
+            // the shared glyph stream once.
+            let fallback_width_scale = if slices.iter().any(Option::is_none) {
+                shaped.advance_width() / original_fragment_width.max(f32::EPSILON)
+            } else {
+                1.0
             };
-
-            let mut shaped_fragments = slices.into_iter();
+            let mut fragment_ranges = ranges.into_iter();
+            let mut slices = slices.into_iter();
             for item in &items[start..index] {
                 if let InlineLineItem::Fragment(fragment) = &item.item {
-                    let shaped = shaped_fragments
+                    let range = fragment_ranges
                         .next()
-                        .expect("every logical shaping fragment has one slice");
+                        .expect("every logical shaping fragment has one source range");
                     let mut fragment = fragment.clone();
-                    fragment.set_preserves_source_shaping(true);
+                    if let Some(boundary_source) = &boundary_source {
+                        fragment
+                            .set_boundary_shaped_source(Rc::clone(boundary_source), range.clone());
+                    }
+                    let slice = slices
+                        .next()
+                        .expect("every logical shaping fragment has one source slice");
+                    if slice.is_some() {
+                        fragment.set_preserves_source_shaping(true);
+                    }
+                    let width = slice
+                        .as_ref()
+                        .map(ShapedInlineLine::advance_width)
+                        .unwrap_or(item.width * fallback_width_scale);
                     output.push(MeasuredInlineItem {
                         item: InlineLineItem::Fragment(fragment),
-                        width: shaped.advance_width(),
-                        shaped: Some(shaped),
+                        width,
+                        shaped: slice.map(Rc::new).or_else(|| item.shaped.clone()),
                     });
                 } else {
                     output.push(item.clone());
@@ -412,6 +461,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         items: &[MeasuredInlineItem],
         block_style: &ComputedStyle,
+        line_direction: Direction,
         bidi_scope_continuations: &BidiLineScopeContinuations,
     ) -> Vec<MeasuredInlineItem> {
         let logical_items = self.preserve_logical_joining_source_shapes(items, block_style);
@@ -436,8 +486,8 @@ impl<'a> LayoutBuilder<'a> {
         let mut visual_ranges = normalize_mixed_inline_visual_ranges(
             &text,
             self.font_system
-                .visual_ranges_for_unwrapped_text(&text, block_style),
-            match block_style.used_direction() {
+                .visual_ranges_for_unwrapped_text(&text, line_direction),
+            match line_direction {
                 Direction::Ltr => ResolvedBidiDirection::Ltr,
                 Direction::Rtl => ResolvedBidiDirection::Rtl,
             },
@@ -456,6 +506,7 @@ impl<'a> LayoutBuilder<'a> {
                 &ranged_items,
                 visual_range.range.start,
                 true,
+                visual_range.direction,
                 &mut emitted,
                 &mut output,
             );
@@ -463,6 +514,7 @@ impl<'a> LayoutBuilder<'a> {
                 &ranged_items,
                 visual_range.range.end,
                 true,
+                visual_range.direction,
                 &mut emitted,
                 &mut output,
             );
@@ -488,6 +540,7 @@ impl<'a> LayoutBuilder<'a> {
                 &ranged_items,
                 visual_range.range.start,
                 false,
+                visual_range.direction,
                 &mut emitted,
                 &mut output,
             );
@@ -495,6 +548,7 @@ impl<'a> LayoutBuilder<'a> {
                 &ranged_items,
                 visual_range.range.end,
                 false,
+                visual_range.direction,
                 &mut emitted,
                 &mut output,
             );
@@ -543,6 +597,7 @@ impl<'a> LayoutBuilder<'a> {
     ) -> Option<MeasuredInlineItem> {
         match &ranged.item.item {
             InlineLineItem::Fragment(fragment) => {
+                let complete_boundary_source = fragment.boundary_shaped_source_and_range();
                 let visual_slice = expand_visual_slice_with_owned_join_controls(
                     fragment.text(),
                     ranged.range.clone(),
@@ -569,15 +624,36 @@ impl<'a> LayoutBuilder<'a> {
                 // pre-resolution shaping leak into visual painting, so shape
                 // selected visual text under the internal unscoped style.
                 // <https://drafts.csswg.org/css-writing-modes-4/#bidi-algo>
-                let mut selected_shaped =
-                    (!line_has_bidi_scope_controls)
-                        .then(|| {
-                            ranged.item.shaped.as_deref().and_then(|shaped| {
-                                shaped.source_slice(relative_start..relative_end)
-                            })
-                        })
-                        .flatten();
+                // A cached source shape may already include a fragment-local
+                // `rtlm` substitution for punctuation before this full line
+                // has established its final UAX #9 level. Re-shape mirrored
+                // characters under that final level; all other source slices
+                // retain their contextual glyph forms and joining behavior.
+                let mut selected_shaped = (!line_has_bidi_scope_controls
+                    && !text
+                        .chars()
+                        .any(|character| bidi_mirroring_glyph(character).is_some()))
+                .then(|| {
+                    ranged
+                        .item
+                        .shaped
+                        .as_deref()
+                        .and_then(|shaped| shaped.source_slice(relative_start..relative_end))
+                })
+                .flatten();
                 fragment.set_text(text);
+                // Bidi formatting and join controls are not paint text, so
+                // `set_text` can legitimately change the selected string
+                // even when this visual item still represents the complete
+                // authored fragment.  Restore the shared logical source in
+                // that case; a partial selection remains deliberately
+                // ineligible and follows the ordinary strict-slice path.
+                if relative_start == 0
+                    && relative_end == ranged.range.len()
+                    && let Some((source, range)) = complete_boundary_source
+                {
+                    fragment.set_boundary_shaped_source(source, range);
+                }
                 fragment.set_resolved_bidi_direction(Some(resolved_direction));
                 // The source line has already been shaped and resolved by
                 // UAX #9. Preserve its selected glyph slice in every visual
@@ -665,6 +741,7 @@ impl<'a> LayoutBuilder<'a> {
         ranged_items: &[RangedMeasuredMixedInlineLineItem],
         boundary: usize,
         precedes_visual_content: bool,
+        visual_direction: ResolvedBidiDirection,
         emitted: &mut [bool],
         output: &mut Vec<MeasuredInlineItem>,
     ) {
@@ -672,7 +749,7 @@ impl<'a> LayoutBuilder<'a> {
             if emitted[edge_index]
                 || ranged.range.start != boundary
                 || !measured_item_is_transparent_mixed_inline_edge(&ranged.item)
-                || transparent_inline_edge_precedes_visual_content(&ranged.item)
+                || transparent_inline_edge_precedes_visual_content(&ranged.item, visual_direction)
                     .is_none_or(|precedes| precedes != precedes_visual_content)
             {
                 continue;
@@ -755,6 +832,18 @@ impl<'a> LayoutBuilder<'a> {
                 } else {
                     self.inline_style_line_extents(atom.style(), atom.baseline_shift)
                 }
+            }
+            InlineLineItem::Atom(atom)
+                if matches!(atom.content(), InlineAtomContent::TextCombineUpright { .. })
+                    && block_style.writing_mode.has_vertical_lines() =>
+            {
+                let parent_text_baselines = ParentTextOverUnderBaselines::from_metrics(
+                    self.inline_text_box_metrics(block_style, None, 0.0),
+                );
+                parent_text_baselines.text_combine_upright_square_extents(
+                    inline_atom_logical_block_size(atom, block_style),
+                    atom.baseline_shift,
+                )
             }
             InlineLineItem::Atom(atom) => {
                 Self::inline_atom_line_baseline_extents(atom, block_style)
@@ -846,12 +935,11 @@ impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn inline_line_item_has_line_relative_baseline_shift(
         item: &InlineLineItem,
     ) -> bool {
-        let vertical_align = match item {
-            InlineLineItem::Fragment(fragment) => fragment.style().vertical_align.clone(),
-            InlineLineItem::Atom(atom) => atom.style().vertical_align.clone(),
-            InlineLineItem::Float(_) => VerticalAlign::BASELINE,
-        };
-        vertical_align.has_line_relative_baseline_shift()
+        match item {
+            InlineLineItem::Fragment(fragment) => fragment.line_relative_alignment().is_some(),
+            InlineLineItem::Atom(atom) => atom.line_relative_alignment().is_some(),
+            InlineLineItem::Float(_) => false,
+        }
     }
 
     fn inline_line_item_parent_content_edge_extents(
@@ -999,6 +1087,23 @@ impl<'a> LayoutBuilder<'a> {
             if inline_item_has_no_line_box_extent(&item.item) {
                 continue;
             }
+            // Regular-inline edges carry lexical structure and decoration
+            // geometry, but do not independently establish a baseline.
+            // Counting their originating style here can make a `top` or
+            // `bottom` inline shift the very baseline against which its
+            // aligned subtree is placed. Its text and atomic descendants are
+            // accounted for through their scoped line-relative alignment.
+            // <https://www.w3.org/TR/CSS22/visuren.html#inline-boxes>
+            if matches!(
+                item.as_ref(),
+                InlineLineItem::Atom(atom)
+                    if matches!(
+                        atom.content(),
+                        InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(_))
+                    )
+            ) {
+                continue;
+            }
             if Self::inline_line_item_has_line_relative_baseline_shift(&item.item) {
                 continue;
             }
@@ -1025,6 +1130,36 @@ impl<'a> LayoutBuilder<'a> {
         for item in items {
             let item = item.as_ref();
             if Self::inline_line_item_is_initial_letter(item) {
+                continue;
+            }
+            if Self::inline_line_item_has_line_relative_baseline_shift(item) {
+                // A regular inline's `top`/`bottom` alignment owns its
+                // aligned subtree rather than only the style copied to a
+                // descendant text fragment. Include both the scope's strut
+                // and the selected participant so empty scopes, smaller
+                // children, and atomic descendants retain their required
+                // line-box extent.
+                // <https://www.w3.org/TR/CSS22/visudet.html#propdef-vertical-align>
+                let participant_height = match item {
+                    InlineLineItem::Fragment(fragment) => {
+                        self.inline_text_box_metrics(fragment.style(), None, 0.0)
+                            .line_block_size
+                    }
+                    InlineLineItem::Atom(_) | InlineLineItem::Float(_) => {
+                        inline_line_item_logical_block_size(item, block_style)
+                    }
+                };
+                let scope_height = match item {
+                    InlineLineItem::Fragment(fragment) => fragment.line_relative_scope(),
+                    InlineLineItem::Atom(atom) => atom.line_relative_scope(),
+                    InlineLineItem::Float(_) => None,
+                }
+                .map(|scope| {
+                    self.inline_text_box_metrics(scope.line_relative_style(), None, 0.0)
+                        .line_block_size
+                })
+                .unwrap_or(0.0);
+                height = height.max(participant_height.max(scope_height));
                 continue;
             }
             // Inline-edge atoms are lexical/paint markers for a regular
@@ -1244,6 +1379,41 @@ mod tests {
     }
 
     #[test]
+    fn tcy_square_uses_the_parent_text_central_baseline() {
+        let parent_text_baselines =
+            ParentTextOverUnderBaselines::from_metrics(InlineTextBoxMetrics {
+                content_block_size: 60.0,
+                content_baseline_offset: 48.0,
+                line_block_size: 60.0,
+                block_start_leading: 0.0,
+                block_end_leading: 0.0,
+                line_baseline_offset: 48.0,
+            });
+
+        let extents = parent_text_baselines.text_combine_upright_square_extents(60.0, 0.0);
+
+        // The parent central baseline lies 18pt above its alphabetic
+        // baseline. Aligning a 60pt composition square to it preserves the
+        // parent's 48pt-over / 12pt-under text extent, rather than expanding
+        // the line with a symmetric 30pt / 30pt extent.
+        assert_eq!(extents.baseline_offset, 48.0);
+        assert_eq!(extents.descent, 12.0);
+    }
+
+    #[test]
+    fn tcy_square_applies_baseline_shift_after_central_alignment() {
+        let parent_text_baselines = ParentTextOverUnderBaselines {
+            over_from_alphabetic_baseline: 48.0,
+            under_from_alphabetic_baseline: 12.0,
+        };
+
+        let extents = parent_text_baselines.text_combine_upright_square_extents(60.0, 5.0);
+
+        assert_eq!(extents.baseline_offset, 53.0);
+        assert_eq!(extents.descent, 7.0);
+    }
+
+    #[test]
     fn negative_baseline_shift_lowers_atomic_extents() {
         let style = ComputedStyle::initial();
         let atom = InlineAtom::new(
@@ -1300,7 +1470,9 @@ mod tests {
                 WritingMode::SidewaysRl | WritingMode::SidewaysLr => unreachable!(),
             };
             let atom = InlineAtom::new(
-                InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace),
+                InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace(
+                    InlineTextBoundarySpacing::new(layout_pt(size.width), false),
+                )),
                 style.clone(),
                 None,
                 size,
@@ -1335,7 +1507,9 @@ mod tests {
                 WritingMode::SidewaysRl | WritingMode::SidewaysLr => unreachable!(),
             };
             let atom = InlineAtom::new(
-                InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace),
+                InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace(
+                    InlineTextBoundarySpacing::new(layout_pt(size.width), false),
+                )),
                 style.clone(),
                 None,
                 size,
@@ -1371,7 +1545,9 @@ mod tests {
                 WritingMode::SidewaysRl | WritingMode::SidewaysLr => unreachable!(),
             };
             let atom = InlineAtom::new(
-                InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace),
+                InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace(
+                    InlineTextBoundarySpacing::new(layout_pt(size.width), false),
+                )),
                 style.clone(),
                 None,
                 size,

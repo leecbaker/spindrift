@@ -1,4 +1,5 @@
 use super::*;
+use crate::layout::assets::PendingPositionedFragmentation;
 use crate::layout::inline_collect::TextDecorationPropagationContext;
 use crate::units::LayoutSize;
 use std::collections::HashSet;
@@ -54,6 +55,8 @@ impl<'a> LayoutBuilder<'a> {
             target_references: config.target_references,
             has_normal_flow_target_references: false,
             document_canvas_background: None,
+            document_canvas_scroll_translation: PaintTranslation::identity(),
+            document_canvas_root_positioning_area: None,
             document_canvas_overflow: DocumentCanvasResolution::default(),
             document_canvas_fragment_insets: Vec::new(),
             document_root_generates_box: true,
@@ -62,6 +65,8 @@ impl<'a> LayoutBuilder<'a> {
             current_page_has_named_page_flow_content: false,
             current_page_selected_name: None,
             last_block_layout_outcome: BlockLayoutOutcome::default(),
+            last_principal_transform_box: None,
+            preserve_3d_context_depth: 0,
             current_page_name: None,
             current_page_context: page_context,
             initial_viewport_context: page_context,
@@ -88,6 +93,7 @@ impl<'a> LayoutBuilder<'a> {
             speculative_auto_float_margin_box_heights: HashMap::new(),
             active_auto_float_measurements: Vec::new(),
             active_auto_float_measurement_fallbacks: Vec::new(),
+            inherited_adjoining_start_margins: Vec::new(),
             cursor_y: page_context.top(),
             content_left: page_context.left(),
             content_right: page_context.right(),
@@ -98,6 +104,7 @@ impl<'a> LayoutBuilder<'a> {
             root_pseudo_block_projection: None,
             inline_split_float_exclusion_query_offset: RelativeOffset::zero(),
             content_logical_inline_size_stack: Vec::new(),
+            container_unit_contexts: Vec::new(),
             multicol_column_containing_blocks: Vec::new(),
             intrinsic_inline_percentage_basis_stack: Vec::new(),
             inline_static_position: None,
@@ -129,6 +136,7 @@ impl<'a> LayoutBuilder<'a> {
             definite_block_size_stack: Vec::new(),
             replayed_flex_item_percentage_height_bases: Vec::new(),
             table_wrapper_block_size_overrides: Vec::new(),
+            positioned_table_sizing: Vec::new(),
             truncate_page_start_margins: false,
             avoid_inside_retry_depth: 0,
             out_of_flow_prebreak_suppression_depth: 0,
@@ -157,11 +165,17 @@ impl<'a> LayoutBuilder<'a> {
             font_system: Box::new(config.font_system),
             bookmarks: Vec::new(),
             positioned_layers: Vec::new(),
+            committed_positioned_paint_identities: HashSet::new(),
+            positioned_paint_transaction_depth: 0,
+            positioned_scratch_page_limit: None,
             fixed_layers: Vec::new(),
             deferred_multicol_positioned_children: Vec::new(),
+            multicol_positioned_containing_block_spans: Vec::new(),
+            next_multicol_positioned_containing_block_span_id: 1,
+            active_multicol_positioned_containing_block_spans: Vec::new(),
             multicol_positioned_replay_capture_depth: 0,
             absolute_positioned_page_span_target: None,
-            pending_positioned_page_span_target: None,
+            pending_positioned_fragmentation: PendingPositionedFragmentation::default(),
             next_paint_source_order: 1,
             overflow_clips: Vec::new(),
             active_scroll_snap_scopes: Vec::new(),
@@ -265,17 +279,21 @@ impl<'a> LayoutBuilder<'a> {
                 // <https://www.w3.org/TR/css-backgrounds-3/#special-backgrounds>
                 if let Some((_, _, style, _)) = child.element_parts()
                     && style.visibility == Visibility::Visible
-                    && (style.background_color.visible_color(style.color).is_some()
-                        || style.background_image.is_image()
+                    && (style
+                        .background
+                        .background_color
+                        .visible_color(style.color)
+                        .is_some()
+                        || style.background.background_image.is_image()
                         || style
+                            .background
                             .background_layers
                             .iter()
                             .any(|layer| layer.image.is_image()))
                 {
                     self.document_canvas_background = Some(DocumentCanvasBackground {
                         style: canvas_background_style(style),
-                        root_background_defined: true,
-                        root_positioning_area: None,
+                        source: DocumentCanvasBackgroundSource::Root,
                     });
                 }
                 self.definite_block_size_stack
@@ -994,16 +1012,17 @@ impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn resolve_style_viewport_lengths(
         style: &mut ComputedStyle,
         viewport: LayoutSize,
+        container_physical: LayoutSize,
     ) {
-        style.resolve_viewport_lengths_for_viewport(viewport);
+        style.resolve_viewport_lengths_for_viewport_and_container(viewport, container_physical);
         if let Some(style) = &mut style.marker_style {
-            Self::resolve_style_viewport_lengths(style, viewport);
+            Self::resolve_style_viewport_lengths(style, viewport, container_physical);
         }
         if let Some(style) = &mut style.before_style {
-            Self::resolve_style_viewport_lengths(style, viewport);
+            Self::resolve_style_viewport_lengths(style, viewport, container_physical);
         }
         if let Some(style) = &mut style.after_style {
-            Self::resolve_style_viewport_lengths(style, viewport);
+            Self::resolve_style_viewport_lengths(style, viewport, container_physical);
         }
     }
 
@@ -1053,17 +1072,75 @@ impl<'a> LayoutBuilder<'a> {
         // geometry rather than the document viewport.
         // <https://www.w3.org/TR/css-page-3/#page-model>
         // <https://www.w3.org/TR/css-values-4/#viewport-relative-lengths>
+        let viewport = self
+            .iframe_viewport
+            .map(PageSize::layout_size)
+            .unwrap_or_else(|| {
+                LayoutSize::new(
+                    self.initial_viewport_context.area_width(),
+                    self.initial_viewport_context.area_height(),
+                )
+            });
         Self::resolve_style_viewport_lengths(
             style,
-            self.iframe_viewport
-                .map(PageSize::layout_size)
-                .unwrap_or_else(|| {
-                    LayoutSize::new(
-                        self.initial_viewport_context.area_width(),
-                        self.initial_viewport_context.area_height(),
-                    )
-                }),
+            viewport,
+            self.current_container_unit_physical(viewport),
         );
+    }
+
+    /// Select the nearest eligible query container independently for the
+    /// physical width and height axes. The CSS unit resolver maps those
+    /// physical values to `cqi`/`cqb` using the consuming style's writing
+    /// mode.
+    /// <https://drafts.csswg.org/css-conditional-5/#container-lengths>
+    fn current_container_unit_physical(&self, fallback: LayoutSize) -> LayoutSize {
+        let mut width = None;
+        let mut height = None;
+        for context in self.container_unit_contexts.iter().rev().copied() {
+            if width.is_none() && context.supplies_physical_width() {
+                width = Some(context.physical_width.points());
+            }
+            if height.is_none() && context.supplies_physical_height() {
+                height = Some(context.physical_height.points());
+            }
+            if width.is_some() && height.is_some() {
+                break;
+            }
+        }
+        LayoutSize::new(
+            width.unwrap_or(fallback.width),
+            height.unwrap_or(fallback.height),
+        )
+    }
+
+    /// Enter one layout-time query-container scope after its used content box
+    /// has been resolved. `container-type: normal` deliberately adds no
+    /// record, keeping unrelated descendants out of the selection walk.
+    /// <https://drafts.csswg.org/css-conditional-5/#container-lengths>
+    pub(in crate::layout) fn push_container_unit_context(
+        &mut self,
+        style: &ComputedStyle,
+        physical_width: PhysicalContentWidth,
+        physical_height: PhysicalContentHeight,
+    ) -> bool {
+        if matches!(style.container_type, ContainerType::Normal) {
+            return false;
+        }
+        self.container_unit_contexts.push(ContainerUnitContext {
+            physical_width,
+            physical_height,
+            writing_mode: style.writing_mode,
+            container_type: style.container_type,
+        });
+        true
+    }
+
+    pub(in crate::layout) fn pop_container_unit_context(&mut self, active: bool) {
+        if active {
+            self.container_unit_contexts
+                .pop()
+                .expect("container unit scopes must be lexically balanced");
+        }
     }
 
     pub(in crate::layout) fn resolve_font_metric_lengths_in_box(
@@ -1752,6 +1829,8 @@ impl<'a> LayoutBuilder<'a> {
     ) {
         let counter_scope = self.begin_pseudo_counter_scope(element, source, style);
         self.element_side_effect_suppression_depth += 1;
+        let consuming_root_canvas =
+            !style.display.is_block_level() && self.begin_root_inline_canvas_continuation(element);
         let previous_root_pseudo_block_projection = self.root_pseudo_block_projection;
         if element.tag.eq_ignore_ascii_case("html")
             && style.writing_mode == WritingMode::VerticalLr
@@ -1771,9 +1850,100 @@ impl<'a> LayoutBuilder<'a> {
             child_boxes,
             table_fragment,
         );
+        if consuming_root_canvas {
+            self.finish_root_inline_canvas_continuation();
+        }
         self.root_pseudo_block_projection = previous_root_pseudo_block_projection;
         self.element_side_effect_suppression_depth -= 1;
         self.end_counter_scope(counter_scope);
+    }
+
+    /// Resolves a propagated body's completed document canvas immediately
+    /// before the next source-ordered root inline sequence is laid out.
+    ///
+    /// This is a layout transition, rather than a paint-fragment adjustment:
+    /// the source page is already committed by the body traversal when this
+    /// method is reached.
+    /// <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
+    pub(in crate::layout) fn begin_root_inline_canvas_continuation(
+        &mut self,
+        element: &Element,
+    ) -> bool {
+        if !element.tag.eq_ignore_ascii_case("html")
+            || !self.principal_flow.has_propagated_body()
+            || self
+                .root_principal_flow_context
+                .active_root_inline_canvas
+                .is_some()
+        {
+            return false;
+        }
+        let axes = WritingModeAxes::new(
+            self.principal_flow.writing_mode,
+            self.principal_flow.used_direction(),
+        );
+        if !axes.swaps_physical_axes() {
+            return false;
+        }
+        let Some(continuation) = self.root_principal_flow_context.completed_canvas.take() else {
+            return false;
+        };
+        debug_assert_eq!(continuation.source_page.get(), self.pages.len());
+        let placement = continuation.resolve_root_inline_placement(
+            axes,
+            PageInlineSpan::from_edges(self.content_left, self.content_right),
+        );
+        match placement {
+            RootInlineCanvasPlacement::RemainingTrack {
+                block_track,
+                inline_origin,
+            } => {
+                self.content_left = block_track.left_x();
+                self.content_right = block_track.right_x();
+                self.cursor_y = inline_origin.points();
+            }
+            RootInlineCanvasPlacement::NextPage { .. } => {
+                // The preceding body has completed its page-owned canvas
+                // before this root sequence begins. Mark that normal-flow
+                // occupancy so page finalization cannot coalesce the source
+                // page away, then establish the destination inline origin
+                // before line construction starts.
+                self.mark_current_page_flow_content();
+                self.push_page();
+                self.cursor_y = match inline_start_side(
+                    self.principal_flow.writing_mode,
+                    self.principal_flow.used_direction(),
+                ) {
+                    PhysicalSide::Top => self.page_top(),
+                    // A bottom-origin principal flow reaches the following
+                    // page at the body canvas's inline end. Its inset lies
+                    // beyond the new fragmentainer's physical bottom, so the
+                    // next root inline sequence is clipped there by ordinary
+                    // line layout rather than replaying a translated paint
+                    // fragment from the source page.
+                    PhysicalSide::Bottom => {
+                        self.page_bottom() - continuation.inline_end_inset.points()
+                    }
+                    PhysicalSide::Left | PhysicalSide::Right => {
+                        unreachable!("a vertical principal flow has a vertical inline axis")
+                    }
+                };
+            }
+        }
+        self.root_principal_flow_context.active_root_inline_canvas = Some(continuation);
+        true
+    }
+
+    /// Completes the root inline sequence that consumed the propagated body
+    /// continuation. The state remains live through line layout so nested
+    /// paint and pagination paths cannot observe a partially consumed canvas.
+    pub(in crate::layout) fn finish_root_inline_canvas_continuation(&mut self) {
+        debug_assert!(
+            self.root_principal_flow_context
+                .active_root_inline_canvas
+                .is_some()
+        );
+        self.root_principal_flow_context.active_root_inline_canvas = None;
     }
 
     pub(in crate::layout) fn layout_element(

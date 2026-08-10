@@ -156,6 +156,9 @@ impl<'a> LayoutBuilder<'a> {
         let source = match group.source {
             InlineTextSource::Normal
             | InlineTextSource::Generated
+            | InlineTextSource::GeneratedWbr
+            | InlineTextSource::WordSpaceTransform(_)
+            | InlineTextSource::BlockEllipsis
             | InlineTextSource::FootnoteCall(_)
             | InlineTextSource::BidiControl => RenderedLineSource::Normal,
             InlineTextSource::RunIn => RenderedLineSource::RunIn,
@@ -179,7 +182,7 @@ impl<'a> LayoutBuilder<'a> {
         // the prepared product so each copied source slice uses the same
         // lexical effect chain.
         let paint_opacity = if group.paint_scope_ancestry.is_empty() {
-            group.style.opacity
+            group.style.opacity.value()
         } else {
             group.paint_opacity
         };
@@ -273,6 +276,7 @@ impl<'a> LayoutBuilder<'a> {
             group.shaped.baseline_adjustment,
         ))
         .with_source_run(Rc::clone(&group.source_run));
+        apply_word_space_transform_actual_text(&mut rendered_line, group.source);
         let glyph_ink_bounds =
             glyph_ink_bounds_for_rendered_line(&self.font_system, &rendered_line);
         rendered_line = rendered_line.with_glyph_ink_bounds(glyph_ink_bounds);
@@ -385,8 +389,12 @@ impl<'a> LayoutBuilder<'a> {
             || fragment.style().display.is_atomic_inline()
             || rect.width() <= 0.0
             || rect.height() <= 0.0
-            || (fragment.style().background_color.is_transparent()
-                && fragment.style().background_image.is_none()
+            || (fragment
+                .style()
+                .background
+                .background_color
+                .is_transparent()
+                && fragment.style().background.background_image.is_none()
                 && used_border_width(fragment.style()) == layout_pt(0.0))
         {
             return;
@@ -409,6 +417,25 @@ impl<'a> LayoutBuilder<'a> {
         {
             self.push_primitive_in_band(PaintBand::Inline, primitive);
         }
+    }
+}
+
+/// Restore the source stream for a layout-only `word-space-transform` word.
+///
+/// Its shaped glyphs deliberately remain the replacement space so CSS layout,
+/// paint, and decoration use its advance. PDF `/ActualText` instead exposes
+/// the source U+200B or no text for HTML `<wbr>`.
+/// <https://drafts.csswg.org/css-text-4/#word-space-transform>
+fn apply_word_space_transform_actual_text(line: &mut RenderedLine, source: InlineTextSource) {
+    let InlineTextSource::WordSpaceTransform(separator) = source else {
+        return;
+    };
+    let actual_text = Rc::<str>::from(separator.extraction_text().unwrap_or(""));
+    for run in &mut line.runs {
+        run.actual_text = Some(Rc::from(""));
+    }
+    if let Some(first) = line.runs.first_mut() {
+        first.actual_text = Some(actual_text);
     }
 }
 
@@ -447,4 +474,54 @@ pub(in crate::layout) fn rendered_line_font_size(
         .find(|run| !run.text.is_empty())
         .map(|run| run.font_size)
         .unwrap_or(fallback)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line() -> RenderedLine {
+        RenderedLine::new(
+            " ".into(),
+            0.0,
+            0.0,
+            12.0,
+            None,
+            CssColor::BLACK,
+            vec![RenderedTextRun {
+                text: Rc::from(" "),
+                actual_text: None,
+                x_offset: 0.0,
+                y_offset: 0.0,
+                text_matrix: RenderedTextMatrix::IDENTITY,
+                font_size: 12.0,
+                font_id: None,
+                glyphs: None,
+            }],
+        )
+    }
+
+    #[test]
+    fn word_space_transform_restores_authored_zero_width_space_for_extraction() {
+        let mut line = line();
+        apply_word_space_transform_actual_text(
+            &mut line,
+            InlineTextSource::WordSpaceTransform(
+                ExplicitWordSeparatorSource::AuthoredZeroWidthSpace,
+            ),
+        );
+        assert_eq!(line.text, " ");
+        assert_eq!(line.runs[0].actual_text.as_deref(), Some("\u{200b}"));
+    }
+
+    #[test]
+    fn word_space_transform_omits_generated_wbr_from_extraction() {
+        let mut line = line();
+        apply_word_space_transform_actual_text(
+            &mut line,
+            InlineTextSource::WordSpaceTransform(ExplicitWordSeparatorSource::HtmlWbr),
+        );
+        assert_eq!(line.text, " ");
+        assert_eq!(line.runs[0].actual_text.as_deref(), Some(""));
+    }
 }

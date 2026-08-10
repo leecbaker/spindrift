@@ -51,9 +51,39 @@ impl FontSystem {
         )
     }
 
-    /// Returns the CSS `ic` basis: the selected font's U+6C34 WATER advance,
-    /// with the specification's one-em fallback when no such glyph is usable.
-    /// <https://www.w3.org/TR/css-values-4/#ic>
+    /// Select the verified face and glyph used to measure a font-relative
+    /// metric character.
+    ///
+    /// Metric characters participate in the element's ordinary font-stack
+    /// selection, including `unicode-range` and character fallback. Looking
+    /// up U+0020's line-metric face instead can select a face that cannot
+    /// render the metric character at all.
+    /// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>
+    pub(super) fn metric_glyph_match_for_style(
+        &mut self,
+        style: &ComputedStyle,
+        character: char,
+    ) -> Option<CharacterFontMatch> {
+        self.character_font_match(style, character)
+    }
+
+    /// Return a glyph advance from the face selected for the metric
+    /// character, retaining the selected face's effective CSS font size.
+    /// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>
+    fn selected_font_glyph_advance_for_style(
+        &mut self,
+        style: &ComputedStyle,
+        character: char,
+    ) -> Option<f32> {
+        let matched = self.metric_glyph_match_for_style(style, character)?;
+        let font_size = self.used_font_size_for_font(style, matched.font_id)?;
+        let font = self.document_fonts.get(matched.font_id)?;
+        let face = ttf_parser::Face::parse(&font.data, font.face_index).ok()?;
+        let units_per_em = font.units_per_em.max(1) as f32;
+        let advance = face.glyph_hor_advance(matched.glyph_id.raw())?;
+        Some(advance as f32 * font_size / units_per_em)
+    }
+
     /// Return the used CSS `ic` advance as a semantic layout length.
     ///
     /// CSS Values defines `ic` from the selected font's U+6C34 advance, with
@@ -68,7 +98,7 @@ impl FontSystem {
             );
         }
         layout_pt(
-            self.font_glyph_advance_for_style(style, '水')
+            self.selected_font_glyph_advance_for_style(style, '水')
                 .unwrap_or(style.font_size),
         )
     }
@@ -80,7 +110,7 @@ impl FontSystem {
         style: &ComputedStyle,
     ) -> LayoutLength {
         layout_pt(
-            self.font_glyph_advance_for_style(style, '水')
+            self.selected_font_glyph_advance_for_style(style, '水')
                 .unwrap_or(style.font_size),
         )
     }
@@ -657,7 +687,7 @@ pub(in crate::text) fn font_feature_family(font_family: &FontFamily) -> Option<S
         FontFamily::UiMonospace => Some("ui-monospace".to_string()),
         FontFamily::UiRounded => Some("ui-rounded".to_string()),
         FontFamily::List(families) => families.first().and_then(font_feature_family),
-        FontFamily::Names(names) => names.first().cloned(),
+        FontFamily::Named(name) => Some(name.as_str().to_owned()),
     }
 }
 

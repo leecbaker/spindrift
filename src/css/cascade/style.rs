@@ -1,5 +1,7 @@
 use super::*;
 use crate::css::html5_user_agent_stylesheet;
+use crate::css::parse::LayerRegistry;
+use cssparser::{Parser, ParserInput, Token};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
@@ -70,6 +72,251 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn svg_transform_presentation_tracks_absent_invalid_none_and_affine_values() {
+        let absent = SvgPresentationAttributeDeclarations::transform_properties(None, None, None);
+        let invalid =
+            SvgPresentationAttributeDeclarations::transform_properties(Some("none"), None, None);
+        let none =
+            SvgPresentationAttributeDeclarations::transform_properties(Some(" \t"), None, None);
+        let affine = SvgPresentationAttributeDeclarations::transform_properties(
+            Some("translate(10)"),
+            None,
+            None,
+        );
+
+        assert_eq!(
+            absent.transform_attribute(),
+            SvgTransformPresentationAttribute::Absent
+        );
+        assert_eq!(
+            invalid.transform_attribute(),
+            SvgTransformPresentationAttribute::Invalid
+        );
+        assert!(!invalid.has_declarations());
+        assert_eq!(
+            none.transform_attribute(),
+            SvgTransformPresentationAttribute::ExplicitNone
+        );
+        assert!(none.has_valid_transform());
+        assert_eq!(
+            affine.transform_attribute(),
+            SvgTransformPresentationAttribute::Affine
+        );
+    }
+
+    #[test]
+    fn invalid_svg_transform_attribute_does_not_block_css_cascade() {
+        let stylesheet = crate::css::parse_stylesheet(&Css::from_string(
+            "rect { transform: scale(2) !important }",
+        ));
+        let stylesheets = Stylesheets::for_document(
+            html5_user_agent_stylesheet(),
+            None,
+            std::slice::from_ref(&stylesheet),
+        );
+        let invalid =
+            SvgPresentationAttributeDeclarations::transform_properties(Some("none"), None, None);
+        let style = style_for_element_with_signature_and_svg_presentation(
+            ElementSignature::new("rect", HashMap::new()),
+            None,
+            invalid.has_declarations().then_some(&invalid),
+            &stylesheets,
+            None,
+            &[],
+        );
+
+        assert_eq!(style.transform, parse_transform("scale(2)", 16.0).unwrap());
+    }
+
+    #[test]
+    fn author_css_and_inline_none_override_svg_transform_presentation() {
+        let stylesheet =
+            crate::css::parse_stylesheet(&Css::from_string("rect { transform: scale(2) }"));
+        let stylesheets = Stylesheets::for_document(
+            html5_user_agent_stylesheet(),
+            None,
+            std::slice::from_ref(&stylesheet),
+        );
+        let presentation = SvgPresentationAttributeDeclarations::transform_properties(
+            Some("translate(10)"),
+            None,
+            None,
+        );
+        let author_style = style_for_element_with_signature_and_svg_presentation(
+            ElementSignature::new("rect", HashMap::new()),
+            None,
+            Some(&presentation),
+            &stylesheets,
+            None,
+            &[],
+        );
+        let inline_none_style = style_for_element_with_signature_and_svg_presentation(
+            ElementSignature::new("rect", HashMap::new()),
+            Some("transform: none"),
+            Some(&presentation),
+            &stylesheets,
+            None,
+            &[],
+        );
+
+        assert_eq!(
+            author_style.transform,
+            parse_transform("scale(2)", 16.0).unwrap()
+        );
+        assert!(!inline_none_style.has_transform());
+        assert!(presentation.has_valid_transform());
+    }
+
+    #[test]
+    fn typed_attr_resolution_uses_function_tokens_not_source_substrings() {
+        let element = ElementSignature::new(
+            "div",
+            HashMap::from([("data-color".to_string(), "red".to_string())]),
+        );
+        let value = r#""attr(data-color type(<color>))" \61 ttr(data-color type(<color>))"#;
+
+        assert_eq!(
+            resolve_typed_attr_value(value, &element, None),
+            Some(r#""attr(data-color type(<color>))" red"#.to_string())
+        );
+    }
+
+    #[test]
+    fn typed_attr_name_lookup_follows_html_host_language_rules() {
+        let html = ElementSignature::new(
+            "p",
+            HashMap::from([
+                ("result".to_string(), "lowercase".to_string()),
+                ("RESULT".to_string(), "uppercase".to_string()),
+            ]),
+        );
+        assert_eq!(
+            resolve_typed_attr_value("attr(RESULT, fallback)", &html, None),
+            Some("lowercase".to_string())
+        );
+
+        let html_with_only_uppercase = ElementSignature::new(
+            "p",
+            HashMap::from([("RESULT".to_string(), "uppercase".to_string())]),
+        );
+        assert_eq!(
+            resolve_typed_attr_value("attr(RESULT, fallback)", &html_with_only_uppercase, None),
+            Some("fallback".to_string())
+        );
+
+        let mathml = ElementSignature::new(
+            "math",
+            HashMap::from([("definitionURL".to_string(), "casematch".to_string())]),
+        )
+        .with_namespace(
+            "http://www.w3.org/1998/Math/MathML",
+            vec![ElementAttributeSignature::new(
+                "",
+                "definitionURL",
+                "casematch",
+            )],
+        );
+        assert_eq!(
+            resolve_typed_attr_value("attr(definitionURL, fallback)", &mathml, None),
+            Some("casematch".to_string())
+        );
+        assert_eq!(
+            resolve_typed_attr_value("attr(definitionurl, fallback)", &mathml, None),
+            Some("fallback".to_string())
+        );
+
+        let svg = ElementSignature::new(
+            "svg",
+            HashMap::from([("testCase".to_string(), "green".to_string())]),
+        )
+        .with_namespace(
+            "http://www.w3.org/2000/svg",
+            vec![ElementAttributeSignature::new("", "testCase", "green")],
+        );
+        assert_eq!(
+            resolve_typed_attr_value("attr(testCase, fallback)", &svg, None),
+            Some("green".to_string())
+        );
+        assert_eq!(
+            resolve_typed_attr_value("attr(testcase, fallback)", &svg, None),
+            Some("fallback".to_string())
+        );
+
+        let namespaced = ElementSignature::new(
+            "p",
+            HashMap::from([("testCase".to_string(), "wrong namespace".to_string())]),
+        )
+        .with_namespace(
+            "http://www.w3.org/1999/xhtml",
+            vec![ElementAttributeSignature::new(
+                "urn:example",
+                "testCase",
+                "namespaced",
+            )],
+        );
+        assert_eq!(
+            resolve_typed_attr_value("attr(testCase, fallback)", &namespaced, None),
+            Some("fallback".to_string())
+        );
+    }
+
+    #[test]
+    fn animation_snapshot_matches_keyframes_names_case_sensitively() {
+        let stylesheet = crate::css::parse_stylesheet(&Css::from_string(
+            "@keyframes fade { from { opacity: 0 } to { opacity: .2 } } \
+             @keyframes FADE { from { opacity: 0 } to { opacity: 1 } }",
+        ));
+        let declarations = crate::css::parse_declarations("animation: fade 1s -0.5s");
+        let mut style = ComputedStyle::initial();
+        apply_declarations(&mut style, &declarations);
+        let stylesheets = Stylesheets::document_only(std::slice::from_ref(&stylesheet));
+
+        assert_eq!(
+            animation_snapshot_declarations(&style.animation_snapshot, &stylesheets)
+                .get("opacity")
+                .map(String::as_str),
+            Some("calc((0) * 0.5 + (.2) * 0.5)")
+        );
+
+        let stylesheet = crate::css::parse_stylesheet(&Css::from_string(
+            "@keyframes \"quoted name\" { from { opacity: 0 } to { opacity: 1 } }",
+        ));
+        let declarations = crate::css::parse_declarations(
+            "animation-name: \"quoted name\"; animation-duration: 1s; animation-delay: -0.5s",
+        );
+        let mut style = ComputedStyle::initial();
+        apply_declarations(&mut style, &declarations);
+        let stylesheets = Stylesheets::document_only(std::slice::from_ref(&stylesheet));
+
+        assert_eq!(
+            animation_snapshot_declarations(&style.animation_snapshot, &stylesheets)
+                .get("opacity")
+                .map(String::as_str),
+            Some("calc((0) * 0.5 + (1) * 0.5)")
+        );
+
+        let stylesheet = crate::css::parse_stylesheet(&Css::from_string(
+            "@keyframes fade { from { opacity: 0 } to { opacity: .2 } } \
+             @keyframes FADE { from { opacity: 0 } to { opacity: 1 } } \
+             p { animation: fade 1s -0.5s }",
+        ));
+        let stylesheets = Stylesheets::document_only(std::slice::from_ref(&stylesheet));
+        let style = style_for_element_with_signature(
+            ElementSignature::new("p", HashMap::new()),
+            None,
+            &stylesheets,
+            None,
+            &[],
+        );
+        assert_eq!(
+            animation_snapshot_declarations(&style.animation_snapshot, &stylesheets)
+                .get("opacity")
+                .map(String::as_str),
+            Some("calc((0) * 0.5 + (.2) * 0.5)")
+        );
+    }
 }
 
 /// Build the style for a generated anonymous block box.
@@ -114,8 +361,134 @@ pub(crate) fn style_for_element_with_signature<Collection: StylesheetCollection 
         parent,
         ancestors,
         parent_ch_advance,
+        None,
         true,
     )
+}
+
+/// Build a style while treating SVG presentation attributes as the first
+/// author-origin declarations. SVG 2 maps presentation attributes into the
+/// author cascade with specificity zero, before ordinary author rules:
+/// <https://www.w3.org/TR/SVG2/styling.html#PresentationAttributes>.
+pub(crate) fn style_for_element_with_signature_and_svg_presentation<
+    Collection: StylesheetCollection + ?Sized,
+>(
+    current: ElementSignature,
+    inline_style: Option<&str>,
+    svg_presentation: Option<&SvgPresentationAttributeDeclarations>,
+    stylesheets: &Collection,
+    parent: Option<&ComputedStyle>,
+    ancestors: &[ElementSignature],
+) -> ComputedStyle {
+    let stylesheets = stylesheets.stylesheet_view();
+    let initial_style = ComputedStyle::initial();
+    let parent_ch_advance = fallback_ch_advance_for_style(parent.unwrap_or(&initial_style));
+    style_for_element_with_signature_inner(
+        current,
+        inline_style,
+        &stylesheets,
+        parent,
+        ancestors,
+        parent_ch_advance,
+        svg_presentation,
+        true,
+    )
+}
+
+/// Valid SVG presentation attributes projected into the host CSS cascade.
+///
+/// SVG 2 presentation attributes are declarations at author origin with zero
+/// specificity. Keeping this as a typed payload prevents callers from
+/// injecting arbitrary CSS text at that cascade boundary.
+/// <https://www.w3.org/TR/SVG2/styling.html#PresentationAttributes>
+#[derive(Debug, Clone)]
+pub(crate) struct SvgPresentationAttributeDeclarations {
+    declarations: Declarations,
+    transform: SvgTransformPresentationAttribute,
+}
+
+/// The source-level state of an SVG `transform` presentation attribute.
+///
+/// Keeping invalid input distinct from a valid empty list prevents a malformed
+/// source attribute from being serialized as an explicit winning `none`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SvgTransformPresentationAttribute {
+    Absent,
+    Invalid,
+    ExplicitNone,
+    Affine,
+}
+
+impl SvgPresentationAttributeDeclarations {
+    /// Build the static SVG transform presentation declarations. Invalid SVG
+    /// syntax contributes no declaration, allowing a lower-priority valid
+    /// declaration to remain the cascade winner.
+    pub(crate) fn transform_properties(
+        transform: Option<&str>,
+        transform_origin: Option<&str>,
+        transform_box: Option<&str>,
+    ) -> Self {
+        let mut source = String::new();
+        let transform = match transform {
+            None => SvgTransformPresentationAttribute::Absent,
+            Some(value) => match parse_svg_transform_attribute(value) {
+                None => SvgTransformPresentationAttribute::Invalid,
+                Some(SvgTransformAttributeValue::None) => {
+                    source.push_str("transform: none;");
+                    SvgTransformPresentationAttribute::ExplicitNone
+                }
+                Some(SvgTransformAttributeValue::Affine(matrix)) => {
+                    let matrix: CssTransform = matrix.into_space(euclid::Scale::new(1.0));
+                    source.push_str(&format!(
+                        "transform: matrix({} {} {} {} {} {});",
+                        matrix.m11, matrix.m12, matrix.m21, matrix.m22, matrix.m31, matrix.m32
+                    ));
+                    SvgTransformPresentationAttribute::Affine
+                }
+            },
+        };
+        if let Some(transform) =
+            transform_origin.and_then(svg_transform_origin_presentation_declaration)
+        {
+            source.push_str(&transform);
+            source.push(';');
+        }
+        if let Some(transform_box) =
+            transform_box.filter(|value| parse_transform_box(value).is_some())
+        {
+            source.push_str("transform-box:");
+            source.push_str(transform_box);
+            source.push(';');
+        }
+        Self {
+            declarations: parse_declarations(&source),
+            transform,
+        }
+    }
+
+    pub(crate) fn has_declarations(&self) -> bool {
+        !self.declarations.is_empty()
+    }
+
+    /// Returns whether this element supplied a valid transform declaration at
+    /// SVG presentation-attribute precedence. This is intentionally false for
+    /// malformed source values, even though they are present in the DOM.
+    pub(crate) fn has_valid_transform(&self) -> bool {
+        matches!(
+            self.transform,
+            SvgTransformPresentationAttribute::ExplicitNone
+                | SvgTransformPresentationAttribute::Affine
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transform_attribute(&self) -> SvgTransformPresentationAttribute {
+        self.transform
+    }
+
+    fn declarations(&self) -> &Declarations {
+        &self.declarations
+    }
 }
 
 pub(crate) fn style_for_element_with_signature_and_parent_ch_advance<
@@ -136,6 +509,7 @@ pub(crate) fn style_for_element_with_signature_and_parent_ch_advance<
         parent,
         ancestors,
         parent_ch_advance,
+        None,
         false,
     )
 }
@@ -143,7 +517,7 @@ pub(crate) fn style_for_element_with_signature_and_parent_ch_advance<
 struct ElementCascadeContext<'a> {
     chain: std::rc::Rc<Vec<std::borrow::Cow<'a, ElementSignature>>>,
     selector_caches: SelectorCaches,
-    layer_order: HashMap<String, usize>,
+    layer_order: HashMap<StylesheetOrigin, LayerRegistry>,
     matching_rules: Vec<MatchedRule<'a>>,
     cascaded_declarations: Vec<CascadedDeclaration<'a>>,
 }
@@ -211,6 +585,10 @@ impl<'a> ElementCascadeContext<'a> {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The cascade entry point keeps inherited metrics and optional SVG presentation input explicit."
+)]
 fn style_for_element_with_signature_inner(
     mut current: ElementSignature,
     inline_style: Option<&str>,
@@ -218,6 +596,7 @@ fn style_for_element_with_signature_inner(
     parent: Option<&ComputedStyle>,
     ancestors: &[ElementSignature],
     parent_ch_advance: LayoutLength,
+    svg_presentation: Option<&SvgPresentationAttributeDeclarations>,
     apply_pseudos: bool,
 ) -> ComputedStyle {
     let initial_style = ComputedStyle::initial();
@@ -246,9 +625,7 @@ fn style_for_element_with_signature_inner(
         .or_else(|| current.attrs.get("xml:lang"))
         .map(|language| ResolvedLanguage::from_html_attribute(language))
         .unwrap_or_else(|| match &current.resolved_language {
-            ResolvedLanguage::Unresolved => {
-                ResolvedLanguage::from_computed(style.language.as_deref())
-            }
+            ResolvedLanguage::Unresolved => ResolvedLanguage::from_computed(&style.language),
             language => language.clone(),
         });
     style.language = resolved_language.as_computed_language();
@@ -289,6 +666,13 @@ fn style_for_element_with_signature_inner(
             stylesheets.html_container_frame_body_margins(),
         );
     }
+    if let Some(svg_presentation) = svg_presentation {
+        push_cascaded_rule_declarations(
+            &mut cascade.cascaded_declarations,
+            svg_presentation.declarations(),
+            RuleCascadeMeta::svg_presentation_attribute(),
+        );
+    }
     if let Some(inline_declarations) = &inline_declarations {
         push_cascaded_rule_declarations(
             &mut cascade.cascaded_declarations,
@@ -301,8 +685,24 @@ fn style_for_element_with_signature_inner(
     }
     resolve_typed_attr_references(&mut cascade.cascaded_declarations, &current, stylesheets);
     sort_cascaded_declarations(&mut cascade.cascaded_declarations);
+    // The animation origin must be injected before the element's ordinary
+    // declarations are applied, but its selected keyframes depend on the
+    // same typed cascade, variables, defaulting, and parent inheritance as
+    // every other property. Resolve that small computed-state subset on a
+    // disposable style first, then use it to synthesize the animation-origin
+    // declarations for the real cascade.
+    let mut animation_state = style.clone();
+    apply_cascaded_declarations_with_inheritance_source_and_parent_ch_advance(
+        &mut animation_state,
+        &cascade.cascaded_declarations,
+        inheritance_source,
+        parent_ch_advance,
+        is_document_root,
+        stylesheets.color_scheme_preference(),
+    );
+    style.animation_snapshot = animation_state.animation_snapshot;
     let animation_declarations =
-        animation_snapshot_declarations(&cascade.cascaded_declarations, stylesheets);
+        animation_snapshot_declarations(&style.animation_snapshot, stylesheets);
     if !animation_declarations.is_empty() {
         // The animation origin wins over all ordinary author declarations but
         // loses to author-important declarations. Its synthetic source-order
@@ -361,10 +761,7 @@ fn style_for_element_with_signature_inner(
 /// selection is a rendering-environment decision, not declaration parsing.
 /// <https://drafts.csswg.org/css-images-4/#image-set-notation>
 fn select_style_image_sets(style: &mut ComputedStyle, resolution_dppx: f32) {
-    style.background_image.select_image_set(resolution_dppx);
-    for layer in &mut style.background_layers {
-        layer.image.select_image_set(resolution_dppx);
-    }
+    style.background.select_image_sets(resolution_dppx);
     style.border_image.source.select_image_set(resolution_dppx);
     style.list_style_image.select_image_set(resolution_dppx);
     match &mut style.content {
@@ -433,7 +830,11 @@ fn apply_forced_color_used_values(
     if let CssColorOrCurrentColor::Color(color) = style.text_fill_color {
         style.text_fill_color = CssColorOrCurrentColor::Color(resolve_or(color, style.color));
     }
-    let had_nondefault_border_color = style.border_color != CssColor::BLACK
+    let has_nondefault_border_color = |color: CssColorOrCurrentColor| {
+        matches!(color, CssColorOrCurrentColor::Color(color)
+            if color.system_color().is_some() || color != CssColor::BLACK)
+    };
+    let had_nondefault_border_color = has_nondefault_border_color(style.border_color)
         || [
             style.border_colors.top,
             style.border_colors.right,
@@ -441,13 +842,27 @@ fn apply_forced_color_used_values(
             style.border_colors.left,
         ]
         .into_iter()
-        .any(|color| color.system_color().is_some() || color != CssColor::BLACK);
-    style.border_color = resolve_or(style.border_color, palette.canvas_text);
+        .any(has_nondefault_border_color);
+    style.border_color = style
+        .border_color
+        .map_concrete(|color| resolve_or(color, palette.canvas_text));
     style.border_colors = BorderColors {
-        top: resolve_or(style.border_colors.top, palette.canvas_text),
-        right: resolve_or(style.border_colors.right, palette.canvas_text),
-        bottom: resolve_or(style.border_colors.bottom, palette.canvas_text),
-        left: resolve_or(style.border_colors.left, palette.canvas_text),
+        top: style
+            .border_colors
+            .top
+            .map_concrete(|color| resolve_or(color, palette.canvas_text)),
+        right: style
+            .border_colors
+            .right
+            .map_concrete(|color| resolve_or(color, palette.canvas_text)),
+        bottom: style
+            .border_colors
+            .bottom
+            .map_concrete(|color| resolve_or(color, palette.canvas_text)),
+        left: style
+            .border_colors
+            .left
+            .map_concrete(|color| resolve_or(color, palette.canvas_text)),
     };
     // Preserve a visible visited-link border when the cascaded shorthand
     // supplied only a non-default color. The forced-color used value is a
@@ -473,17 +888,24 @@ fn apply_forced_color_used_values(
         style.border_width_values = CssEdges::all(width);
         style.border_width = CSS_PX_TO_PT;
     }
-    style.outline_color = resolve_or(style.outline_color, palette.canvas_text);
-    style.background_color = BackgroundColor::Color(
+    style.outline_color = style
+        .outline_color
+        .map_concrete(|color| resolve_or(color, palette.canvas_text));
+    style.background.background_color = BackgroundColor::Color(
         match style
+            .background
             .background_color
             .resolved_color(style.color)
             .system_color()
         {
             Some(system) => palette.color(system),
-            None => palette
-                .canvas
-                .with_alpha(style.background_color.resolved_color(style.color).alpha()),
+            None => palette.canvas.with_alpha(
+                style
+                    .background
+                    .background_color
+                    .resolved_color(style.color)
+                    .alpha(),
+            ),
         },
     );
     if current.namespace_url == "http://www.w3.org/2000/svg" {
@@ -518,8 +940,8 @@ fn apply_forced_color_used_values(
     if !style_has_url_background_image(style)
         || (style.display.is_inline_level() && !style.display.is_atomic_inline())
     {
-        style.background_image = ComputedImage::None;
-        style.background_layers.clear();
+        style.background.background_image = ComputedImage::None;
+        style.background.background_layers.clear();
     }
     apply_forced_color_used_values_to_pseudos(style, palette);
 }
@@ -542,19 +964,23 @@ fn apply_forced_color_used_values_to_pseudos(
     {
         if pseudo.forced_color_adjust == ForcedColorAdjust::Auto {
             pseudo.color = palette.canvas_text;
-            pseudo.background_color = BackgroundColor::Color(
-                palette
-                    .canvas
-                    .with_alpha(pseudo.background_color.resolved_color(pseudo.color).alpha()),
+            pseudo.background.background_color = BackgroundColor::Color(
+                palette.canvas.with_alpha(
+                    pseudo
+                        .background
+                        .background_color
+                        .resolved_color(pseudo.color)
+                        .alpha(),
+                ),
             );
-            pseudo.border_color = palette.canvas_text;
+            pseudo.border_color = CssColorOrCurrentColor::Color(palette.canvas_text);
             pseudo.border_colors = BorderColors {
-                top: palette.canvas_text,
-                right: palette.canvas_text,
-                bottom: palette.canvas_text,
-                left: palette.canvas_text,
+                top: CssColorOrCurrentColor::Color(palette.canvas_text),
+                right: CssColorOrCurrentColor::Color(palette.canvas_text),
+                bottom: CssColorOrCurrentColor::Color(palette.canvas_text),
+                left: CssColorOrCurrentColor::Color(palette.canvas_text),
             };
-            pseudo.outline_color = palette.canvas_text;
+            pseudo.outline_color = CssColorOrCurrentColor::Color(palette.canvas_text);
             pseudo.box_shadow.clear();
             pseudo.text_shadow.clear();
         } else {
@@ -569,14 +995,14 @@ fn resolve_style_system_colors(style: &mut ComputedStyle, palette: ForcedColorPa
         None => color,
     };
     style.color = resolve(style.color);
-    style.border_color = resolve(style.border_color);
-    style.border_colors.top = resolve(style.border_colors.top);
-    style.border_colors.right = resolve(style.border_colors.right);
-    style.border_colors.bottom = resolve(style.border_colors.bottom);
-    style.border_colors.left = resolve(style.border_colors.left);
-    style.outline_color = resolve(style.outline_color);
-    if let BackgroundColor::Color(color) = style.background_color {
-        style.background_color = BackgroundColor::Color(resolve(color));
+    style.border_color = style.border_color.map_concrete(resolve);
+    style.border_colors.top = style.border_colors.top.map_concrete(resolve);
+    style.border_colors.right = style.border_colors.right.map_concrete(resolve);
+    style.border_colors.bottom = style.border_colors.bottom.map_concrete(resolve);
+    style.border_colors.left = style.border_colors.left.map_concrete(resolve);
+    style.outline_color = style.outline_color.map_concrete(resolve);
+    if let BackgroundColor::Color(color) = style.background.background_color {
+        style.background.background_color = BackgroundColor::Color(resolve(color));
     }
     for paint in [&mut style.svg_fill, &mut style.svg_stroke] {
         if let SvgPaint::Color(color) = paint.paint {
@@ -601,25 +1027,12 @@ fn background_image_contains_url(image: &ComputedImage) -> bool {
 }
 
 fn style_has_url_background_image(style: &ComputedStyle) -> bool {
-    background_image_contains_url(&style.background_image)
+    background_image_contains_url(&style.background.background_image)
         || style
+            .background
             .background_layers
             .iter()
             .any(|layer| background_image_contains_url(&layer.image))
-}
-
-/// The portions of one CSS animation instance needed for static rendering.
-///
-/// A paged render has no advancing timeline, so its snapshot time is the
-/// animation's creation time. Negative delay moves that snapshot into the
-/// active interval, which is sufficient for deterministic CSS animations in
-/// a document renderer:
-/// <https://www.w3.org/TR/css-animations-1/#animation-delay>.
-#[derive(Debug, Clone)]
-struct AnimationSnapshot {
-    name: String,
-    duration_seconds: f32,
-    delay_seconds: f32,
 }
 
 /// Produces active keyframe declarations for the static document snapshot.
@@ -629,12 +1042,9 @@ struct AnimationSnapshot {
 /// CSS comparison functions retain their existing used-value behavior:
 /// <https://www.w3.org/TR/css-animations-1/#keyframes>.
 fn animation_snapshot_declarations(
-    declarations: &[CascadedDeclaration<'_>],
+    animation: &ComputedAnimationSnapshot,
     stylesheets: &Stylesheets<'_>,
 ) -> Declarations {
-    let Some(animation) = animation_snapshot_from_declarations(declarations) else {
-        return Declarations::new();
-    };
     if animation.duration_seconds <= 0.0 {
         return Declarations::new();
     }
@@ -642,11 +1052,14 @@ fn animation_snapshot_declarations(
     if !(0.0..=1.0).contains(&progress) {
         return Declarations::new();
     }
+    let Some(name) = animation.name.as_ref() else {
+        return Declarations::new();
+    };
     let keyframes = stylesheets
         .iter()
         .flat_map(|stylesheet| stylesheet.keyframes.iter())
         .rev()
-        .find(|rule| rule.name.eq_ignore_ascii_case(&animation.name));
+        .find(|rule| rule.name == *name);
     let Some(keyframes) = keyframes else {
         return Declarations::new();
     };
@@ -693,56 +1106,17 @@ fn animation_snapshot_declarations(
         .collect()
 }
 
-fn animation_snapshot_from_declarations(
-    declarations: &[CascadedDeclaration<'_>],
-) -> Option<AnimationSnapshot> {
-    let mut animation = AnimationSnapshot {
-        name: "none".to_string(),
-        duration_seconds: 0.0,
-        delay_seconds: 0.0,
-    };
-    for declaration in declarations {
-        let value = trim_css_value(&declaration.value);
-        match declaration.name.as_ref() {
-            "animation" => apply_animation_shorthand(&mut animation, value),
-            "animation-name" => {
-                animation.name =
-                    crate::css::component_values::split_css_top_level_delimiter(value, ',')
-                        .first()?
-                        .trim()
-                        .to_string();
-            }
-            "animation-duration" => {
-                animation.duration_seconds = parse_animation_time(
-                    crate::css::component_values::split_css_top_level_delimiter(value, ',')
-                        .first()?,
-                )?;
-            }
-            "animation-delay" => {
-                animation.delay_seconds = parse_animation_time(
-                    crate::css::component_values::split_css_top_level_delimiter(value, ',')
-                        .first()?,
-                )?;
-            }
-            _ => {}
-        }
-    }
-    (!animation.name.eq_ignore_ascii_case("none")).then_some(animation)
-}
-
-fn apply_animation_shorthand(animation: &mut AnimationSnapshot, value: &str) {
-    *animation = AnimationSnapshot {
-        name: "none".to_string(),
-        duration_seconds: 0.0,
-        delay_seconds: 0.0,
-    };
+pub(in crate::css) fn parse_animation_snapshot_shorthand(
+    value: &str,
+) -> Option<ComputedAnimationSnapshot> {
+    let mut animation = ComputedAnimationSnapshot::INITIAL;
     let mut time_count = 0;
     let first_animation = crate::css::component_values::split_css_top_level_delimiter(value, ',')
         .into_iter()
         .next()
         .unwrap_or(value);
     for component in split_css_component_values(first_animation) {
-        if let Some(time) = parse_animation_time(component) {
+        if let Some(time) = parse_animation_snapshot_time(component) {
             if time_count == 0 {
                 animation.duration_seconds = time;
             } else if time_count == 1 {
@@ -767,12 +1141,22 @@ fn apply_animation_shorthand(animation: &mut AnimationSnapshot, value: &str) {
                 | "backwards"
                 | "both"
         ) {
-            animation.name = component.to_string();
+            animation.name = parse_animation_snapshot_name(component)?;
         }
+    }
+    Some(animation)
+}
+
+pub(in crate::css) fn parse_animation_snapshot_name(value: &str) -> Option<Option<KeyframesName>> {
+    let value = trim_css_value(value);
+    if value.eq_ignore_ascii_case("none") {
+        Some(None)
+    } else {
+        KeyframesName::parse_css(value).map(Some)
     }
 }
 
-fn parse_animation_time(value: &str) -> Option<f32> {
+pub(in crate::css) fn parse_animation_snapshot_time(value: &str) -> Option<f32> {
     let value = value.trim().to_ascii_lowercase();
     value
         .strip_suffix("ms")
@@ -783,6 +1167,51 @@ fn parse_animation_time(value: &str) -> Option<f32> {
                 .strip_suffix('s')
                 .and_then(|seconds| seconds.trim().parse::<f32>().ok())
         })
+}
+
+/// Applies one canonical animation snapshot longhand. The normal cascade
+/// driver owns keyword defaulting; this parser only consumes ordinary values.
+pub(in crate::css) fn apply_animation_snapshot_longhand(
+    style: &mut ComputedStyle,
+    name: &str,
+    value: &str,
+) -> bool {
+    match name {
+        "animation-name" => {
+            let Some(name) =
+                crate::css::component_values::split_css_top_level_delimiter(value, ',')
+                    .first()
+                    .and_then(|value| parse_animation_snapshot_name(value))
+            else {
+                return false;
+            };
+            style.animation_snapshot.name = name;
+            true
+        }
+        "animation-duration" => {
+            let Some(duration) =
+                crate::css::component_values::split_css_top_level_delimiter(value, ',')
+                    .first()
+                    .and_then(|value| parse_animation_snapshot_time(value))
+            else {
+                return false;
+            };
+            style.animation_snapshot.duration_seconds = duration;
+            true
+        }
+        "animation-delay" => {
+            let Some(delay) =
+                crate::css::component_values::split_css_top_level_delimiter(value, ',')
+                    .first()
+                    .and_then(|value| parse_animation_snapshot_time(value))
+            else {
+                return false;
+            };
+            style.animation_snapshot.delay_seconds = delay;
+            true
+        }
+        _ => false,
+    }
 }
 
 fn interpolate_keyframe_value(from: &str, to: &str, progress: f32) -> String {
@@ -818,7 +1247,7 @@ fn resolve_typed_attr_references(
         // layout-time capture points.  Replacing a bare `attr(name)` here
         // would inject an unquoted string into their token stream and make a
         // valid declaration invalid.
-        if declaration_defers_attr_evaluation(declaration.name.as_ref()) {
+        if declaration_defers_attr_evaluation(declaration.property.css_name()) {
             continue;
         }
         let value = declaration.value.as_ref();
@@ -857,20 +1286,62 @@ fn resolve_typed_attr_value(
     element: &ElementSignature,
     namespaces: Option<&HashMap<String, String>>,
 ) -> Option<String> {
+    let mut input = ParserInput::new(value);
+    let mut parser = Parser::new(&mut input);
     let mut output = String::with_capacity(value.len());
-    let mut remaining = value;
-    loop {
-        let lower = remaining.to_ascii_lowercase();
-        let Some(start) = lower.find("attr(") else {
-            output.push_str(remaining);
-            return Some(output);
+    let mut copied_through = 0;
+
+    while !parser.is_exhausted() {
+        let token_start = parser.position().byte_index();
+        let token = parser
+            .next_including_whitespace_and_comments()
+            .ok()?
+            .clone();
+        if token.is_parse_error() {
+            return None;
+        }
+        let Token::Function(name) = token else {
+            continue;
         };
-        output.push_str(&remaining[..start]);
-        let after_open = &remaining[start + "attr(".len()..];
-        let (arguments, rest) = split_function_argument(after_open)?;
-        output.push_str(&resolve_one_typed_attr(arguments, element, namespaces)?);
-        remaining = rest;
+        let body_start = parser.position().byte_index();
+        let body = parser
+            .parse_nested_block(css_nested_component_source)
+            .ok()?;
+        let function_end = parser.position().byte_index();
+        if name.eq_ignore_ascii_case("attr") {
+            output.push_str(&value[copied_through..token_start]);
+            output.push_str(&resolve_one_typed_attr(body, element, namespaces)?);
+        } else {
+            output.push_str(&value[copied_through..body_start]);
+            output.push_str(&resolve_typed_attr_value(body, element, namespaces)?);
+            output.push_str(&value[body_start + body.len()..function_end]);
+        }
+        copied_through = function_end;
     }
+    output.push_str(&value[copied_through..]);
+    Some(output)
+}
+
+fn css_nested_component_source<'i, 't>(
+    parser: &mut Parser<'i, 't>,
+) -> Result<&'i str, cssparser::ParseError<'i, ()>> {
+    let start = parser.position();
+    while !parser.is_exhausted() {
+        let token = parser.next_including_whitespace_and_comments()?;
+        if token.is_parse_error() {
+            return Err(parser.new_custom_error(()));
+        }
+        if matches!(
+            token,
+            Token::Function(_)
+                | Token::ParenthesisBlock
+                | Token::SquareBracketBlock
+                | Token::CurlyBracketBlock
+        ) {
+            parser.parse_nested_block(css_nested_component_source)?;
+        }
+    }
+    Ok(parser.slice_from(start))
 }
 
 fn resolve_one_typed_attr(
@@ -904,36 +1375,13 @@ fn attr_value_for_element<'a>(
             })
             .map(|attribute| attribute.value.as_str());
     }
-    if element.document_is_html {
-        return element
-            .attrs
-            .iter()
-            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.as_str());
-    }
-    element
-        .namespace_attrs
-        .iter()
-        .find(|attribute| attribute.namespace_url.is_empty() && attribute.local_name == name)
-        .map(|attribute| attribute.value.as_str())
+    element.unprefixed_css_attr(name)
 }
 
 fn split_attr_fallback(arguments: &str) -> (&str, Option<&str>) {
-    let mut depth = 0usize;
-    for (index, character) in arguments.char_indices() {
-        match character {
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
-                return (
-                    arguments[..index].trim(),
-                    Some(arguments[index + 1..].trim()),
-                );
-            }
-            _ => {}
-        }
-    }
-    (arguments.trim(), None)
+    crate::css::component_values::split_css_top_level_once(arguments, ',')
+        .map(|(head, fallback)| (head, Some(fallback.trim())))
+        .unwrap_or((arguments.trim(), None))
 }
 
 fn typed_attr_replacement<'a>(raw: &'a str, type_syntax: &str) -> Option<&'a str> {
@@ -968,7 +1416,7 @@ fn typed_attr_replacement<'a>(raw: &'a str, type_syntax: &str) -> Option<&'a str
 
 /// Adds the value-dependent portion of HTML's user-agent list rules.
 ///
-/// Unlike optional legacy presentational hints, `ol[start]`, `ol[reversed]`,
+/// Unlike legacy presentational hints, `ol[start]`, `ol[reversed]`,
 /// and `li[value]` define the list's semantic ordinal. Expressing them as UA
 /// counter declarations lets the ordinary cascade give author CSS precedence:
 /// <https://html.spec.whatwg.org/multipage/rendering.html#lists>.
@@ -1007,7 +1455,7 @@ fn push_dynamic_html_list_user_agent_declarations(
         }
     {
         output.push(CascadedDeclaration {
-            name: std::borrow::Cow::Borrowed("font-size"),
+            property: CascadedProperty::from_name(std::borrow::Cow::Borrowed("font-size")),
             value: std::borrow::Cow::Borrowed(value),
             origin: StylesheetOrigin::UserAgent,
             base_url: None,
@@ -1056,7 +1504,7 @@ fn push_dynamic_html_list_user_agent_declarations(
         return;
     };
     output.push(CascadedDeclaration {
-        name: std::borrow::Cow::Borrowed(name),
+        property: CascadedProperty::from_name(std::borrow::Cow::Borrowed(name)),
         value: std::borrow::Cow::Owned(value),
         origin: StylesheetOrigin::UserAgent,
         base_url: None,
@@ -1589,7 +2037,7 @@ fn push_dynamic_html_presentational_hint_declaration<'a>(
     value: String,
 ) {
     output.push(CascadedDeclaration {
-        name: std::borrow::Cow::Borrowed(name),
+        property: CascadedProperty::from_name(std::borrow::Cow::Borrowed(name)),
         value: std::borrow::Cow::Owned(value),
         origin: StylesheetOrigin::Author,
         base_url: stylesheet.base_url.as_ref(),
@@ -1740,7 +2188,7 @@ fn push_html_direction_declaration<'a>(
     direction: Direction,
 ) {
     output.push(CascadedDeclaration {
-        name: std::borrow::Cow::Borrowed("direction"),
+        property: CascadedProperty::from_name(std::borrow::Cow::Borrowed("direction")),
         value: std::borrow::Cow::Borrowed(match direction {
             Direction::Ltr => "ltr",
             Direction::Rtl => "rtl",
@@ -2149,7 +2597,8 @@ fn typographic_pseudo_style_with_context<'a>(
     cascade.rebuild_cascaded_declarations();
     sort_cascaded_declarations(&mut cascade.cascaded_declarations);
     cascade.cascaded_declarations.retain(|declaration| {
-        declaration.name.starts_with("--") || allows_property(declaration.name.as_ref())
+        declaration.property.custom_name().is_some()
+            || allows_property(declaration.property.css_name())
     });
     apply_cascaded_declarations_with_inheritance_source_and_parent_ch_advance(
         &mut pseudo_style,
@@ -2203,6 +2652,8 @@ fn is_first_line_allowed_property(name: &str) -> bool {
                 | "vertical-align"
                 | "word-spacing"
                 | "ruby-position"
+                | "ruby-align"
+                | "ruby-overhang"
         )
 }
 
@@ -2231,25 +2682,26 @@ fn push_cascaded_rule_declarations<'a>(
     declarations: &'a Declarations,
     meta: RuleCascadeMeta,
 ) {
-    output.extend(
-        declarations
-            .iter()
-            .enumerate()
-            .map(|(declaration_order, (name, value))| CascadedDeclaration {
-                name: std::borrow::Cow::Borrowed(name.as_str()),
+    output.extend(declarations.iter().enumerate().filter_map(
+        |(declaration_order, (name, value))| {
+            Some(CascadedDeclaration {
+                property: CascadedProperty::try_from_name(std::borrow::Cow::Borrowed(
+                    name.as_str(),
+                ))?,
                 value: std::borrow::Cow::Borrowed(value.as_str()),
                 origin: meta.origin,
                 base_url: declarations.base_url(),
                 root_url: declarations.root_url(),
                 important: declaration_is_important(value),
-                layer_order: meta.layer_order,
+                layer_order: meta.layer_order.clone(),
                 specificity: meta.specificity,
                 scope_proximity: meta.scope_proximity,
                 stylesheet_index: meta.stylesheet_index,
                 rule_order: meta.rule_order,
                 declaration_order,
-            }),
-    );
+            })
+        },
+    ));
 }
 
 /// Cascade-sort metadata shared by all declarations from one matched rule.
@@ -2257,23 +2709,26 @@ fn push_cascaded_rule_declarations<'a>(
 /// CSS Cascade Level 5 sorts declarations by origin, layer, specificity,
 /// scoped proximity, and source order before computed-value resolution:
 /// <https://www.w3.org/TR/css-cascade-5/#cascade-sort>.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct RuleCascadeMeta {
     origin: StylesheetOrigin,
     specificity: u32,
     scope_proximity: usize,
-    layer_order: Option<usize>,
+    layer_order: Option<LayerOrder>,
     stylesheet_index: usize,
     rule_order: usize,
 }
 
 impl RuleCascadeMeta {
-    fn from_matched(matched: &MatchedRule<'_>, layer_order: &HashMap<String, usize>) -> Self {
+    fn from_matched(
+        matched: &MatchedRule<'_>,
+        layer_order: &HashMap<StylesheetOrigin, LayerRegistry>,
+    ) -> Self {
         Self {
             origin: matched.origin,
             specificity: matched.specificity,
             scope_proximity: matched.scope_proximity,
-            layer_order: rule_layer_order(matched.rule, layer_order),
+            layer_order: rule_layer_order(matched.origin, matched.rule, layer_order),
             stylesheet_index: matched.stylesheet_index,
             rule_order: matched.rule.order,
         }
@@ -2287,6 +2742,19 @@ impl RuleCascadeMeta {
             layer_order: None,
             stylesheet_index: usize::MAX,
             rule_order: usize::MAX,
+        }
+    }
+
+    /// SVG presentation attributes are author-origin, specificity-zero
+    /// declarations placed before ordinary author style sheets.
+    fn svg_presentation_attribute() -> Self {
+        Self {
+            origin: StylesheetOrigin::Author,
+            specificity: 0,
+            scope_proximity: usize::MAX,
+            layer_order: None,
+            stylesheet_index: 0,
+            rule_order: 0,
         }
     }
 
@@ -2308,20 +2776,25 @@ impl RuleCascadeMeta {
 /// first declaration order. Origin sorting is handled separately, so sharing
 /// this map across UA and author sheets does not change origin precedence:
 /// <https://www.w3.org/TR/css-cascade-5/#layer-order>.
-fn global_layer_order(stylesheets: &Stylesheets<'_>) -> HashMap<String, usize> {
+fn global_layer_order(stylesheets: &Stylesheets<'_>) -> HashMap<StylesheetOrigin, LayerRegistry> {
     let mut result = HashMap::new();
     for stylesheet in stylesheets.iter() {
+        let registry = result
+            .entry(stylesheet.origin)
+            .or_insert_with(LayerRegistry::default);
         for layer_name in &stylesheet.layer_names {
-            let next_order = result.len();
-            result.entry(layer_name.clone()).or_insert(next_order);
+            registry.register(layer_name);
         }
     }
     result
 }
 
-fn rule_layer_order(rule: &StyleRule, layer_order: &HashMap<String, usize>) -> Option<usize> {
+fn rule_layer_order(
+    origin: StylesheetOrigin,
+    rule: &StyleRule,
+    layer_order: &HashMap<StylesheetOrigin, LayerRegistry>,
+) -> Option<LayerOrder> {
     rule.layer_name
         .as_ref()
-        .and_then(|layer_name| layer_order.get(layer_name))
-        .cloned()
+        .and_then(|layer_name| layer_order.get(&origin)?.order_for(layer_name))
 }

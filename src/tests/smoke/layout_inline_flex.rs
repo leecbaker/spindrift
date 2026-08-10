@@ -2829,24 +2829,22 @@ async fn grid_outer_margins_adjoin_block_siblings_while_item_margins_stay_contai
 
 #[tokio::test]
 async fn document_canvas_top_inset_is_invariant_to_anonymous_grid_item_splitting() {
-    let mut options = RenderOptions::default();
-    options.set_page_margins(quire::PageMargins::all_points(0.0));
     let grid = Html::from_string(
-        "<!DOCTYPE html><meta charset=\"utf-8\"><title>CSS Grid Test: Anonymous grid items - non-contiguous text runs - position:absolute</title>\
+        "<!DOCTYPE html><style>@page { margin: 0 }</style><meta charset=\"utf-8\"><title>CSS Grid Test: Anonymous grid items - non-contiguous text runs - position:absolute</title>\
          <link rel=\"author\" title=\"Rune Lillesveen\" href=\"mailto:futhark@chromium.org\">\
          <p>The words \"Two\" and \"lines\" should not be on the same line.</p>\
          <div style=\"display:grid\">Two <span style=\"position:absolute\"></span>lines</div>",
     )
-    .render(&options)
+    .render(&RenderOptions::default())
     .await
     .unwrap();
     let reference = Html::from_string(
-        "<!DOCTYPE html><meta charset=\"utf-8\"><title>CSS Reftest Reference</title>\
+        "<!DOCTYPE html><style>@page { margin: 0 }</style><meta charset=\"utf-8\"><title>CSS Reftest Reference</title>\
          <link rel=\"author\" title=\"Rune Lillesveen\" href=\"mailto:futhark@chromium.org\">\
          <p>The words \"Two\" and \"lines\" should not be on the same line.</p>\
          Two<br>lines",
     )
-    .render(&options)
+    .render(&RenderOptions::default())
     .await
     .unwrap();
 
@@ -2866,18 +2864,16 @@ async fn document_canvas_top_inset_is_invariant_to_anonymous_grid_item_splitting
 
 #[tokio::test]
 async fn document_canvas_body_start_margin_collapses_with_first_child() {
-    let mut options = RenderOptions::default();
-    options.set_page_margins(quire::PageMargins::all_points(0.0));
     let with_canvas_inset = Html::from_string(
-        "<style>body { margin: 8px } p { margin: 12pt 0 0; font-size: 10pt; line-height: 10pt }</style><p>Inset</p>",
+        "<style>@page { margin: 0 } body { margin: 8px } p { margin: 12pt 0 0; font-size: 10pt; line-height: 10pt }</style><p>Inset</p>",
     )
-    .render(&options)
+    .render(&RenderOptions::default())
     .await
     .unwrap();
     let without_canvas_inset = Html::from_string(
-        "<style>body { margin: 0 } p { margin: 12pt 0 0; font-size: 10pt; line-height: 10pt }</style><p>Inset</p>",
+        "<style>@page { margin: 0 } body { margin: 0 } p { margin: 12pt 0 0; font-size: 10pt; line-height: 10pt }</style><p>Inset</p>",
     )
-    .render(&options)
+    .render(&RenderOptions::default())
     .await
     .unwrap();
 

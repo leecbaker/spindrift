@@ -421,6 +421,7 @@ impl<'a> LayoutBuilder<'a> {
             root_url.as_ref(),
             self.resource_cache,
             style.image_orientation == css::ImageOrientation::FromImage,
+            crate::svg::SvgImageContext::from_used_color_scheme(style.used_color_scheme),
             request_modifiers,
         )?;
         // Candidate density selects SVG options but does not rescale their

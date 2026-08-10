@@ -6,12 +6,134 @@
 //! input while making their structural decisions from tokens instead of bytes.
 //! <https://www.w3.org/TR/css-syntax-3/#component-value>
 
-use cssparser::{Parser, ParserInput, SourcePosition, Token};
+use cssparser::{Parser, ParserInput, SourcePosition, ToCss, Token, TokenSerializationType};
+
+/// An owned, canonical CSS component-value stream.
+///
+/// CSS Variables substitutes component values, rather than concatenating
+/// source text.  Retaining a token-aware serialization at this boundary keeps
+/// adjacent substituted values from being tokenized again as a different CSS
+/// value and rejects CSS Syntax tokenizer errors before cascade processing.
+/// <https://www.w3.org/TR/css-syntax-3/#component-value>
+/// <https://www.w3.org/TR/css-variables-1/#using-variables>
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CssComponentValueList {
+    css: String,
+}
+
+impl CssComponentValueList {
+    /// Parses and serializes a complete component-value list.
+    ///
+    /// CSS Syntax permits EOF-closed simple blocks, but its bad-string,
+    /// bad-URL, and unmatched closing-delimiter tokens are parse errors and
+    /// therefore cannot form a declaration value.
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        let mut input = ParserInput::new(value);
+        let mut parser = Parser::new(&mut input);
+        serialize_component_values(&mut parser)
+            .ok()
+            .map(|stream| Self { css: stream.css })
+    }
+
+    pub(crate) fn as_css(&self) -> &str {
+        &self.css
+    }
+}
+
+#[derive(Default)]
+struct SerializedComponentValues {
+    css: String,
+    last_token_type: TokenSerializationType,
+}
+
+impl SerializedComponentValues {
+    fn push_component(&mut self, css: &str, token_type: TokenSerializationType) {
+        if self.last_token_type.needs_separator_when_before(token_type) {
+            // A comment is a CSS token boundary without imposing whitespace
+            // semantics on grammars where whitespace is observable.
+            self.css.push_str("/**/");
+        }
+        self.css.push_str(css);
+        self.last_token_type = token_type;
+    }
+}
+
+fn serialize_component_values(
+    parser: &mut Parser<'_, '_>,
+) -> Result<SerializedComponentValues, ()> {
+    let mut output = SerializedComponentValues::default();
+    while !parser.is_exhausted() {
+        let token = parser
+            .next_including_whitespace_and_comments()
+            .map_err(|_| ())?;
+        if token.is_parse_error() {
+            return Err(());
+        }
+        let token = token.clone();
+        let token_type = token.serialization_type();
+        let css = match token {
+            Token::Function(_) => {
+                let mut css = token.to_css_string();
+                let nested = parser
+                    .parse_nested_block(|nested| {
+                        serialize_component_values(nested)
+                            .map_err(|_| nested.new_custom_error::<(), ()>(()))
+                    })
+                    .map_err(|_| ())?;
+                css.push_str(&nested.css);
+                css.push(')');
+                css
+            }
+            Token::ParenthesisBlock => {
+                let mut css = token.to_css_string();
+                let nested = parser
+                    .parse_nested_block(|nested| {
+                        serialize_component_values(nested)
+                            .map_err(|_| nested.new_custom_error::<(), ()>(()))
+                    })
+                    .map_err(|_| ())?;
+                css.push_str(&nested.css);
+                css.push(')');
+                css
+            }
+            Token::SquareBracketBlock => {
+                let mut css = token.to_css_string();
+                let nested = parser
+                    .parse_nested_block(|nested| {
+                        serialize_component_values(nested)
+                            .map_err(|_| nested.new_custom_error::<(), ()>(()))
+                    })
+                    .map_err(|_| ())?;
+                css.push_str(&nested.css);
+                css.push(']');
+                css
+            }
+            Token::CurlyBracketBlock => {
+                let mut css = token.to_css_string();
+                let nested = parser
+                    .parse_nested_block(|nested| {
+                        serialize_component_values(nested)
+                            .map_err(|_| nested.new_custom_error::<(), ()>(()))
+                    })
+                    .map_err(|_| ())?;
+                css.push_str(&nested.css);
+                css.push('}');
+                css
+            }
+            _ => token.to_css_string(),
+        };
+        output.push_component(&css, token_type);
+    }
+    Ok(output)
+}
 
 fn consume_nested_block(parser: &mut Parser<'_, '_>) -> bool {
     parser
         .parse_nested_block(|nested| {
             while let Ok(token) = nested.next_including_whitespace_and_comments() {
+                if token.is_parse_error() {
+                    return Err(nested.new_custom_error(()));
+                }
                 if is_simple_block(token) && !consume_nested_block(nested) {
                     return Err(nested.new_custom_error(()));
                 }
@@ -35,14 +157,6 @@ fn source_offset(parser: &Parser<'_, '_>, source_start: SourcePosition) -> usize
     parser.slice_from(source_start).len()
 }
 
-/// Finds an ASCII substring without allocating a case-folded copy.
-pub(in crate::css) fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
-    haystack
-        .as_bytes()
-        .windows(needle.len())
-        .position(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
-}
-
 /// Removes CSS declaration priority syntax before property value parsing.
 ///
 /// CSS Cascade Level 5 defines `!important` as declaration priority rather
@@ -62,151 +176,91 @@ pub(crate) fn trim_css_value(value: &str) -> &str {
 }
 
 pub(crate) fn parse_css_string_token(value: &str) -> Option<(String, &str)> {
-    let mut chars = value.char_indices();
-    let (_, quote) = chars.next()?;
-    if !matches!(quote, '"' | '\'') {
+    let mut input = ParserInput::new(value);
+    let mut parser = Parser::new(&mut input);
+    let token = parser.next().ok()?.clone();
+    let Token::QuotedString(text) = token else {
         return None;
-    }
-    let mut output = String::new();
-    while let Some((index, character)) = chars.next() {
-        if character == '\\' {
-            push_css_string_escape(&mut output, &mut chars);
-        } else if character == quote {
-            return Some((output, &value[index + character.len_utf8()..]));
-        } else {
-            output.push(character);
-        }
-    }
-    None
+    };
+    Some((
+        text.to_string(),
+        trim_css_component_value_start(&value[parser.position().byte_index()..]),
+    ))
 }
 
-/// Decodes one escaped CSS string component.
+/// Skip CSS whitespace and comments before the next component value.
 ///
-/// CSS Syntax defines string escapes as either up to six hexadecimal digits
-/// plus optional trailing whitespace, or a single escaped code point:
-/// <https://www.w3.org/TR/css-syntax-3/#consume-escaped-code-point>.
-pub(in crate::css) fn push_css_string_escape(
-    output: &mut String,
-    chars: &mut std::str::CharIndices<'_>,
-) {
-    let mut clone = chars.clone();
-    let mut hex = String::new();
-    while hex.len() < 6 {
-        let Some((_, character)) = clone.next() else {
-            break;
+/// Variable substitution uses comments as token separators. They are not
+/// property data, so string-token consumers must not expose a comment-only
+/// tail as another component to parse.
+pub(crate) fn trim_css_component_value_start(value: &str) -> &str {
+    let mut input = ParserInput::new(value);
+    let mut parser = Parser::new(&mut input);
+    loop {
+        let token_start = parser.position().byte_index();
+        match parser.next_including_whitespace_and_comments() {
+            Ok(Token::WhiteSpace(_) | Token::Comment(_)) => {}
+            Ok(_) => return &value[token_start..],
+            Err(_) => return &value[value.len()..],
+        }
+    }
+}
+
+/// Removes only leading and trailing CSS whitespace/comment tokens.
+///
+/// A complete `var()` substitution can be surrounded by the resolver's token
+/// separators even when no authored component is adjacent to it. Those
+/// separators are not part of a property's value at this boundary, while
+/// comments between two significant tokens must remain so they continue to
+/// prevent accidental token merging.
+pub(crate) fn trim_css_component_value_edges(value: &str) -> &str {
+    let mut input = ParserInput::new(value);
+    let mut parser = Parser::new(&mut input);
+    let mut first = None;
+    let mut last = 0;
+
+    loop {
+        let token_start = parser.position().byte_index();
+        let token = match parser.next_including_whitespace_and_comments() {
+            Ok(token) => token,
+            Err(_) => break,
         };
-        if character.is_ascii_hexdigit() {
-            hex.push(character);
-        } else {
-            break;
+        let is_ignorable = matches!(token, Token::WhiteSpace(_) | Token::Comment(_));
+        if !is_ignorable && is_simple_block(token) && !consume_nested_block(&mut parser) {
+            return value;
+        }
+        let token_end = parser.position().byte_index();
+        if !is_ignorable {
+            first.get_or_insert(token_start);
+            last = token_end;
         }
     }
-    if !hex.is_empty() {
-        for _ in 0..hex.len() {
-            chars.next();
-        }
-        if let Ok(codepoint) = u32::from_str_radix(&hex, 16)
-            && let Some(character) = char::from_u32(codepoint)
-        {
-            output.push(character);
-        }
-        if chars
-            .clone()
-            .next()
-            .is_some_and(|(_, character)| character.is_whitespace())
-        {
-            chars.next();
-        }
-        return;
-    }
-    if let Some((_, character)) = chars.next()
-        && !matches!(character, '\n' | '\r' | '\u{000c}')
-    {
-        output.push(character);
-    }
-}
 
-/// Decode CSS escapes in an identifier-like token.
-///
-/// CSS Syntax uses the same escaped-code-point algorithm for identifiers and
-/// strings.  Keeping the decoding at the token boundary lets callers retain
-/// their own identifier comparison rules (for example, CSS font family names
-/// are ASCII-case-insensitive while `@font-feature-values` aliases are
-/// case-sensitive):
-/// <https://www.w3.org/TR/css-syntax-3/#consume-escaped-code-point>.
-pub(crate) fn decode_css_escapes(value: &str) -> String {
-    let mut output = String::with_capacity(value.len());
-    let mut characters = value.char_indices();
-    while let Some((_, character)) = characters.next() {
-        if character == '\\' {
-            push_css_string_escape(&mut output, &mut characters);
-        } else {
-            output.push(character);
-        }
-    }
-    output
-}
-
-pub(crate) fn strip_ascii_function<'a>(value: &'a str, name: &str) -> Option<&'a str> {
-    let prefix_len = name.len();
-    let prefix = value.get(..prefix_len)?;
-    if !prefix.eq_ignore_ascii_case(name) {
-        return None;
-    }
-    let after_name = value[prefix_len..].trim_start();
-    after_name.strip_prefix('(')
-}
-
-pub(crate) fn split_function_argument(value_after_open: &str) -> Option<(&str, &str)> {
-    let mut depth = 0usize;
-    let mut quote = None;
-    let mut escaped = false;
-    for (index, character) in value_after_open.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if quote.is_some() {
-            if character == '\\' {
-                escaped = true;
-            } else if Some(character) == quote {
-                quote = None;
-            }
-            continue;
-        }
-        match character {
-            '"' | '\'' => quote = Some(character),
-            '(' => depth += 1,
-            ')' if depth == 0 => {
-                return Some((&value_after_open[..index], &value_after_open[index + 1..]));
-            }
-            ')' => depth = depth.checked_sub(1)?,
-            _ => {}
-        }
-    }
-    None
-}
-
-pub(crate) fn is_css_ident_continue(character: char) -> bool {
-    character == '-'
-        || character == '_'
-        || character.is_ascii_alphanumeric()
-        || !character.is_ascii()
+    first.map_or(&value[value.len()..], |first| &value[first..last])
 }
 
 /// Splits at CSS whitespace component-value boundaries.
 pub(in crate::css) fn split_css_component_values(value: &str) -> Vec<&str> {
+    try_split_css_component_values(value).unwrap_or_default()
+}
+
+/// Splits at CSS whitespace component-value boundaries, rejecting malformed
+/// component streams rather than treating a valid prefix as a complete value.
+pub(in crate::css) fn try_split_css_component_values(value: &str) -> Option<Vec<&str>> {
     let mut input = ParserInput::new(value);
     let mut parser = Parser::new(&mut input);
     let mut parts = Vec::new();
     let mut component_start = None;
 
-    loop {
+    while !parser.is_exhausted() {
         let token_start = parser.position();
-        let token = match parser.next_including_whitespace_and_comments() {
-            Ok(token) => token.clone(),
-            Err(_) => break,
-        };
+        let token = parser
+            .next_including_whitespace_and_comments()
+            .ok()?
+            .clone();
+        if token.is_parse_error() {
+            return None;
+        }
         if matches!(token, Token::WhiteSpace(_) | Token::Comment(_)) {
             if let Some(start) = component_start.take() {
                 let part = parser.slice(start..token_start).trim();
@@ -218,7 +272,7 @@ pub(in crate::css) fn split_css_component_values(value: &str) -> Vec<&str> {
         }
         component_start.get_or_insert(token_start);
         if is_simple_block(&token) && !consume_nested_block(&mut parser) {
-            break;
+            return None;
         }
     }
     if let Some(start) = component_start {
@@ -227,33 +281,45 @@ pub(in crate::css) fn split_css_component_values(value: &str) -> Vec<&str> {
             parts.push(part);
         }
     }
-    parts
+    Some(parts)
 }
 
 /// Splits at an outermost CSS delimiter token.
-pub(in crate::css) fn split_css_top_level_delimiter(value: &str, delimiter: char) -> Vec<&str> {
+pub(crate) fn split_css_top_level_delimiter(value: &str, delimiter: char) -> Vec<&str> {
+    try_split_css_top_level_delimiter(value, delimiter).unwrap_or_default()
+}
+
+/// Splits at an outermost CSS delimiter token, rejecting malformed component
+/// streams rather than returning components parsed before the error.
+pub(in crate::css) fn try_split_css_top_level_delimiter(
+    value: &str,
+    delimiter: char,
+) -> Option<Vec<&str>> {
     let mut input = ParserInput::new(value);
     let mut parser = Parser::new(&mut input);
     let mut parts = Vec::new();
     let source_start = parser.position();
     let mut start = 0usize;
-    loop {
+    while !parser.is_exhausted() {
         let token_start = source_offset(&parser, source_start);
-        let token = match parser.next_including_whitespace_and_comments() {
-            Ok(token) => token.clone(),
-            Err(_) => break,
-        };
+        let token = parser
+            .next_including_whitespace_and_comments()
+            .ok()?
+            .clone();
+        if token.is_parse_error() {
+            return None;
+        }
         let is_delimiter = matches!(token, Token::Comma) && delimiter == ','
             || matches!(token, Token::Delim(found) if found == delimiter);
         if is_delimiter {
             parts.push(value[start..token_start].trim());
             start = source_offset(&parser, source_start);
         } else if is_simple_block(&token) && !consume_nested_block(&mut parser) {
-            break;
+            return None;
         }
     }
     parts.push(value[start..].trim());
-    parts
+    Some(parts)
 }
 
 /// Splits at an outermost CSS delimiter, discarding empty trimmed components.
@@ -269,6 +335,50 @@ pub(in crate::css) fn split_nonempty_css_top_level_delimiter(
         .map(trim_css_value)
         .filter(|part| !part.is_empty())
         .collect()
+}
+
+/// Parses a complete CSS function list and returns decoded names with their
+/// raw, token-validated argument component streams.
+///
+/// Property grammars such as `transform` need to retain argument source for
+/// their own semantic parsing, but function boundaries and names must still
+/// follow CSS Syntax rather than byte searches.
+pub(in crate::css) fn css_function_list(value: &str) -> Option<Vec<(String, &str)>> {
+    let mut input = ParserInput::new(value);
+    let mut parser = Parser::new(&mut input);
+    let mut functions = Vec::new();
+
+    while !parser.is_exhausted() {
+        let token = parser
+            .next_including_whitespace_and_comments()
+            .ok()?
+            .clone();
+        if matches!(token, Token::WhiteSpace(_) | Token::Comment(_)) {
+            continue;
+        }
+        let Token::Function(name) = token else {
+            return None;
+        };
+        let body = parser
+            .parse_nested_block(|nested| {
+                let start = nested.position();
+                while let Ok(token) = nested.next_including_whitespace_and_comments() {
+                    if token.is_parse_error()
+                        || (is_simple_block(token) && !consume_nested_block(nested))
+                    {
+                        return Err(nested.new_custom_error(()));
+                    }
+                }
+                if nested.is_exhausted() {
+                    Ok::<_, cssparser::ParseError<'_, ()>>(nested.slice_from(start))
+                } else {
+                    Err(nested.new_custom_error(()))
+                }
+            })
+            .ok()?;
+        functions.push((name.to_string(), body));
+    }
+    Some(functions)
 }
 
 /// Splits once at an outermost CSS delimiter token.
@@ -312,7 +422,9 @@ pub(in crate::css) fn css_single_function(value: &str) -> Option<(String, &str)>
         .parse_nested_block(|nested| {
             let start = nested.position();
             while let Ok(token) = nested.next_including_whitespace_and_comments() {
-                if is_simple_block(token) && !consume_nested_block(nested) {
+                if token.is_parse_error()
+                    || (is_simple_block(token) && !consume_nested_block(nested))
+                {
                     return Err(nested.new_custom_error(()));
                 }
             }
@@ -341,7 +453,9 @@ pub(crate) fn css_leading_function(value: &str) -> Option<(String, &str, &str)> 
         .parse_nested_block(|nested| {
             let start = nested.position();
             while let Ok(token) = nested.next_including_whitespace_and_comments() {
-                if is_simple_block(token) && !consume_nested_block(nested) {
+                if token.is_parse_error()
+                    || (is_simple_block(token) && !consume_nested_block(nested))
+                {
                     return Err(nested.new_custom_error(()));
                 }
             }
@@ -349,6 +463,29 @@ pub(crate) fn css_leading_function(value: &str) -> Option<(String, &str, &str)> 
         })
         .ok()?;
     Some((name, body, &value[parser.position().byte_index()..]))
+}
+
+/// Parses one leading CSS function with a particular decoded name.
+///
+/// The function and its nested component values are consumed by `cssparser`;
+/// callers receive only the token-bounded argument stream and the remaining
+/// declaration source for grammars that contain multiple component values.
+pub(crate) fn css_leading_function_matching<'a>(
+    value: &'a str,
+    expected_name: &str,
+) -> Option<(&'a str, &'a str)> {
+    let (name, body, tail) = css_leading_function(value)?;
+    name.eq_ignore_ascii_case(expected_name)
+        .then_some((body, tail))
+}
+
+/// Parses one leading CSS identifier and returns its decoded value and tail.
+pub(crate) fn css_leading_ident(value: &str) -> Option<(String, &str)> {
+    let value = trim_css_component_value_start(value);
+    let mut input = ParserInput::new(value);
+    let mut parser = Parser::new(&mut input);
+    let ident = parser.expect_ident_cloned().ok()?.to_string();
+    Some((ident, &value[parser.position().byte_index()..]))
 }
 
 /// Collect URL sources that can occur in CSS `<image>` values.
@@ -391,11 +528,10 @@ fn collect_css_image_candidate_urls(value: &str, urls: &mut Vec<String>) {
                                 if !url.is_empty() {
                                     urls.push(url);
                                 }
-                            } else if let Some(url) = split_css_component_values(body).first() {
-                                let url = decode_css_escapes(url);
-                                if !url.is_empty() {
-                                    urls.push(url);
-                                }
+                            } else if let Some(url) = css_single_ident(body)
+                                && !url.is_empty()
+                            {
+                                urls.push(url);
                             }
                         }
                         if name.eq_ignore_ascii_case("image-set")
@@ -450,7 +586,7 @@ pub(in crate::css) fn css_function_body<'a>(value: &'a str, name: &str) -> Optio
 }
 
 /// Returns one decoded identifier when it is the complete component value.
-pub(in crate::css) fn css_single_ident(value: &str) -> Option<String> {
+pub(crate) fn css_single_ident(value: &str) -> Option<String> {
     let mut input = ParserInput::new(value);
     let mut parser = Parser::new(&mut input);
     let ident = parser.expect_ident_cloned().ok()?.to_string();
@@ -484,59 +620,32 @@ pub(in crate::css) fn split_css_top_level_keyword<'a>(
     parts
 }
 
-/// Finds the next outermost `{` token from `start` and returns its byte offset.
-pub(in crate::css) fn find_next_top_level_open_brace(source: &str, start: usize) -> Option<usize> {
-    let source = source.get(start..)?;
-    let mut input = ParserInput::new(source);
+/// Returns the source range of the first outermost decoded identifier matching
+/// `keyword`. Nested component values, strings, comments, and escapes are
+/// handled according to CSS Syntax.
+pub(in crate::css) fn find_css_top_level_keyword_range(
+    value: &str,
+    keyword: &str,
+) -> Option<std::ops::Range<usize>> {
+    let mut input = ParserInput::new(value);
     let mut parser = Parser::new(&mut input);
-    let source_start = parser.position();
-    loop {
-        let token_start = source_offset(&parser, source_start);
+    while !parser.is_exhausted() {
+        let start = parser.position().byte_index();
         let token = parser
             .next_including_whitespace_and_comments()
             .ok()?
             .clone();
-        if matches!(token, Token::CurlyBracketBlock) {
-            return Some(start + token_start);
+        if token.is_parse_error() {
+            return None;
+        }
+        if matches!(token, Token::Ident(ref name) if name.eq_ignore_ascii_case(keyword)) {
+            return Some(start..parser.position().byte_index());
         }
         if is_simple_block(&token) && !consume_nested_block(&mut parser) {
             return None;
         }
     }
-}
-
-/// Finds the matching close for a `{` token using CSS tokenization.
-pub(in crate::css) fn find_matching_brace(
-    source: &str,
-    open: usize,
-    recover_eof: bool,
-) -> Option<usize> {
-    let suffix = source.get(open..)?;
-    let mut input = ParserInput::new(suffix);
-    let mut parser = Parser::new(&mut input);
-    if !matches!(
-        parser.next_including_whitespace_and_comments().ok()?,
-        Token::CurlyBracketBlock
-    ) {
-        return None;
-    }
-    let body_len = parser
-        .parse_nested_block(|nested| {
-            let body_start = nested.position();
-            while let Ok(token) = nested.next_including_whitespace_and_comments() {
-                if is_simple_block(token) && !consume_nested_block(nested) {
-                    return Err(nested.new_custom_error(()));
-                }
-            }
-            Ok::<_, cssparser::ParseError<'_, ()>>(nested.slice_from(body_start).len())
-        })
-        .ok()?;
-    let close = open + 1 + body_len;
-    if source.as_bytes().get(close) == Some(&b'}') {
-        Some(close)
-    } else {
-        recover_eof.then_some(source.len())
-    }
+    None
 }
 
 #[cfg(test)]
@@ -544,10 +653,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn component_value_stream_rejects_css_syntax_error_tokens() {
+        for value in ["red)", "var(--color, \"\n", "var(--color, url(\"\n"] {
+            assert!(CssComponentValueList::parse(value).is_none(), "{value}");
+        }
+    }
+
+    #[test]
+    fn component_value_stream_accepts_balanced_blocks_and_cdo_cdc() {
+        for value in [
+            "{ [ var(--color) ] }",
+            "var(--color) <!--",
+            "--> var(--color)",
+        ] {
+            assert!(CssComponentValueList::parse(value).is_some(), "{value}");
+        }
+    }
+
+    #[test]
     fn component_boundaries_follow_css_tokens() {
         assert_eq!(
             split_css_component_values("solid /* separator */ rgb(1 2 3) 'x y'"),
             ["solid", "rgb(1 2 3)", "'x y'"]
+        );
+        assert_eq!(
+            split_css_component_values("foo/**/bar 1/**/2px"),
+            ["foo", "bar", "1", "2px"]
         );
         assert_eq!(
             split_css_top_level_delimiter("a, func(1, 2), 'x,y'", ','),
@@ -560,6 +691,59 @@ mod tests {
         assert_eq!(
             split_nonempty_css_top_level_delimiter("first, , func(1, 2),  ", ','),
             ["first", "func(1, 2)"]
+        );
+    }
+
+    #[test]
+    fn strict_value_boundaries_reject_invalid_prefixes() {
+        for value in ["red)", "url(\"\n"] {
+            assert!(try_split_css_component_values(value).is_none(), "{value}");
+            assert!(
+                try_split_css_top_level_delimiter(value, ',').is_none(),
+                "{value}"
+            );
+        }
+        assert_eq!(split_css_component_values("red)"), Vec::<&str>::new());
+        assert_eq!(
+            try_split_css_component_values("calc(1px"),
+            Some(vec!["calc(1px"])
+        );
+        assert_eq!(
+            try_split_css_top_level_delimiter(r#"url("a,b"), c"#, ','),
+            Some(vec![r#"url("a,b")"#, "c"])
+        );
+    }
+
+    #[test]
+    fn css_function_lists_decode_names_and_preserve_token_boundaries() {
+        let functions = css_function_list(r"tr\61 nslate(10px/**/, 20px) /**/ sc\61 le(2)")
+            .expect("valid CSS function list");
+        assert_eq!(
+            functions,
+            vec![
+                ("translate".to_owned(), "10px/**/, 20px"),
+                ("scale".to_owned(), "2"),
+            ]
+        );
+        assert!(css_function_list("scale(2) nope").is_none());
+        assert!(css_function_list("scale(2").is_some());
+    }
+
+    #[test]
+    fn token_consumers_ignore_comment_boundaries() {
+        let (text, tail) = parse_css_string_token("/**/\"hello\"/**/ \"there\"")
+            .expect("comment-delimited string token");
+        assert_eq!(text, "hello");
+        assert_eq!(tail, "\"there\"");
+        assert_eq!(trim_css_component_value_edges("/**/10px/**/"), "10px");
+        assert_eq!(
+            trim_css_component_value_edges("/**/calc(1px)/**/"),
+            "calc(1px)"
+        );
+        assert_eq!(trim_css_component_value_edges("foo/**/bar"), "foo/**/bar");
+        assert_eq!(
+            split_css_top_level_delimiter("/**/Ahem/**/,/**/sans-serif/**/", ','),
+            ["/**/Ahem/**/", "/**/sans-serif/**/"]
         );
     }
 
@@ -591,26 +775,5 @@ mod tests {
             css_image_candidate_urls(r#"image-set(image(url("nested.png")) 1x type("not-a-url"))"#),
             ["nested.png"]
         );
-    }
-
-    #[test]
-    fn block_scanning_ignores_braces_in_components_and_recovers_eof() {
-        let source = "a { content: \"}\"; fn({ x }) { color: red; } }";
-        let open = find_next_top_level_open_brace(source, 0).unwrap();
-        assert_eq!(find_matching_brace(source, open, false), source.rfind('}'));
-
-        let eof = "a { content: \"}\"; fn({ x })";
-        let open = find_next_top_level_open_brace(eof, 0).unwrap();
-        assert_eq!(find_matching_brace(eof, open, false), None);
-        assert_eq!(find_matching_brace(eof, open, true), Some(eof.len()));
-    }
-
-    #[test]
-    fn ascii_source_search_ignores_case_without_allocating() {
-        assert_eq!(
-            find_ascii_case_insensitive("before @FoNt-FaCe after", "@font-face"),
-            Some(7)
-        );
-        assert_eq!(find_ascii_case_insensitive("stylesheet", "@media"), None);
     }
 }

@@ -6,12 +6,14 @@ use pdf_writer::types::{
     MaskType, PaintType, SystemInfo, TilingType,
 };
 use pdf_writer::{Content, Filter, Name, Pdf, Rect, Ref, Settings, Str, TextStr};
+use std::io::Write;
 use std::time::Duration;
 
-pub(crate) fn write_document(
+pub(crate) fn write_document<W: Write>(
     document: &Document,
     options: &crate::PdfOptions,
-) -> crate::Result<Vec<u8>> {
+    writer: &mut W,
+) -> crate::Result<()> {
     let profile = options.profile;
     let font_embedding = options.font_embedding;
     let compression = options.compression;
@@ -230,6 +232,7 @@ pub(crate) fn write_document(
             catalog_id,
             pages_id,
             metadata_id,
+            &document.metadata,
             outline_plan.as_ref(),
             &color_plan,
         );
@@ -328,7 +331,8 @@ pub(crate) fn write_document(
     });
     let total = total_timer.finish();
     timings.log_summary(total);
-    Ok(bytes)
+    writer.write_all(&bytes)?;
+    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -446,12 +450,16 @@ fn write_catalog(
     catalog_id: usize,
     pages_id: usize,
     metadata_id: usize,
+    metadata: &DocumentMetadata,
     outline_plan: Option<&OutlinePlan>,
     color_plan: &PdfColorPlan,
 ) {
     let mut catalog = pdf.catalog(pdf_ref(catalog_id));
     catalog.pages(pdf_ref(pages_id));
     catalog.metadata(pdf_ref(metadata_id));
+    if let Some(language) = metadata.language.as_deref() {
+        catalog.lang(TextStr(language));
+    }
     if let Some(plan) = outline_plan {
         catalog.outlines(pdf_ref(plan.root_id));
     }
@@ -862,6 +870,12 @@ fn write_image_patterns(
         if stream.uses_flate() {
             pattern_writer.filter(Filter::FlateDecode);
         }
+        let matrix = crate::document::paint::geometry::PaintTransform::translate(
+            crate::document::paint::geometry::PaintTranslation::new(
+                pattern.tiling.origin.x,
+                pattern.tiling.origin.y,
+            ),
+        );
         pattern_writer
             .paint_type(PaintType::Colored)
             .tiling_type(TilingType::ConstantSpacing)
@@ -873,14 +887,7 @@ fn write_image_patterns(
             ))
             .x_step(pattern.tiling.step.width)
             .y_step(pattern.tiling.step.height)
-            .matrix([
-                1.0,
-                0.0,
-                0.0,
-                1.0,
-                pattern.tiling.origin.x,
-                pattern.tiling.origin.y,
-            ]);
+            .matrix(matrix.pdf_components());
         {
             let mut resources = pattern_writer.resources();
             let mut xobjects = resources.x_objects();
@@ -1005,6 +1012,12 @@ fn write_gradient_patterns(
         if stream.uses_flate() {
             writer.filter(Filter::FlateDecode);
         }
+        let matrix = crate::document::paint::geometry::PaintTransform::translate(
+            crate::document::paint::geometry::PaintTranslation::new(
+                pattern.tiling.origin.x,
+                pattern.tiling.origin.y,
+            ),
+        );
         writer
             .paint_type(PaintType::Colored)
             .tiling_type(TilingType::ConstantSpacing)
@@ -1016,14 +1029,7 @@ fn write_gradient_patterns(
             ))
             .x_step(pattern.tiling.step.width)
             .y_step(pattern.tiling.step.height)
-            .matrix([
-                1.0,
-                0.0,
-                0.0,
-                1.0,
-                pattern.tiling.origin.x,
-                pattern.tiling.origin.y,
-            ]);
+            .matrix(matrix.pdf_components());
         let mut resources = writer.resources();
         resources.patterns().pair(
             pdf_name(&plan.shading_pattern_name),
@@ -1554,7 +1560,11 @@ fn write_form_xobjects(
                 form.bbox.y() + form.bbox.height(),
             ));
             if form.transparency_group {
-                form_writer.group().transparency();
+                let mut group = form_writer.group();
+                group.transparency().isolated(true);
+                group
+                    .color_space()
+                    .icc_based(pdf_ref(color_plan.srgb_profile_object_id()));
             }
             {
                 let mut resources = form_writer.resources();
@@ -1942,6 +1952,14 @@ impl PdfFileIdentifierHash {
         self.write_optional_str(metadata.title.as_deref());
         self.write_optional_str(metadata.author.as_deref());
         self.write_optional_str(metadata.creator.as_deref());
+        self.write_optional_str(metadata.language.as_deref());
+        self.write_optional_str(metadata.description.as_deref());
+        self.write_usize(metadata.keywords.len());
+        for keyword in &metadata.keywords {
+            self.write_str(keyword);
+        }
+        self.write_optional_str(metadata.created.as_ref().map(crate::DocumentDate::as_str));
+        self.write_optional_str(metadata.modified.as_ref().map(crate::DocumentDate::as_str));
     }
 
     fn write_source_rect(&mut self, rect: RenderedImageSourceRect) {

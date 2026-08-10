@@ -1,6 +1,73 @@
 use super::*;
 
 impl<'a> LayoutBuilder<'a> {
+    /// Collect the single table-wrapper sizing contract consumed by Flexbox.
+    ///
+    /// The intrinsic block probe deliberately clears authored block-size
+    /// constraints. Those constraints are preferred-size suggestions during
+    /// flexing; they are not the table grid's automatic minimum.
+    /// <https://www.w3.org/TR/css-flexbox-1/#min-size-auto>
+    /// <https://drafts.csswg.org/css-tables-3/#computing-the-table-height>
+    pub(in crate::layout) fn table_wrapper_flex_sizing_from_fragment(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &Stylesheets<'_>,
+        fragment: &box_tree::TableFragment<'_>,
+        available_outer_width: f32,
+    ) -> TableWrapperFlexSizing {
+        let (grid_min_content, grid_max_content) = self.table_intrinsic_widths_from_fragment(
+            element,
+            style,
+            stylesheets,
+            fragment,
+            available_outer_width,
+        );
+        let (_, wrapper_preferred) = self.table_parent_intrinsic_content_widths_from_fragment(
+            element,
+            style,
+            stylesheets,
+            fragment,
+            available_outer_width,
+        );
+        let intrinsic_block_style = intrinsic_table_wrapper_block_probe_style(style);
+        let wrapper_intrinsic_block = (self.estimate_table_height(
+            element,
+            &intrinsic_block_style,
+            stylesheets,
+            available_outer_width,
+            fragment,
+        ) - style.margin.top
+            - style.margin.bottom)
+            .max(0.0);
+        let borders = used_border_widths(style);
+        let padding = used_padding_edges(
+            style,
+            PercentageBasis::definite(layout_pt(available_outer_width)),
+        );
+        TableWrapperFlexSizing {
+            grid_min_content_inline: LogicalInlineContentSize::new(content_box_pt(
+                grid_min_content,
+            )),
+            grid_max_content_inline: LogicalInlineContentSize::new(content_box_pt(
+                grid_max_content,
+            )),
+            wrapper_preferred_inline: LogicalInlineContentSize::new(content_box_pt(
+                wrapper_preferred,
+            )),
+            wrapper_intrinsic_block: LogicalBlockContentSize::new(content_box_pt(
+                wrapper_intrinsic_block,
+            )),
+            inline_non_content: non_content_pt(
+                borders.left + borders.right + padding.left.points() + padding.right.points(),
+            ),
+            block_non_content: non_content_pt(
+                borders.top + borders.bottom + padding.top.points() + padding.bottom.points(),
+            ),
+            margins: style.margin,
+        }
+    }
+
     /// Return min-content and max-content grid widths for a durable table fragment.
     ///
     /// CSS Tables computes intrinsic table widths from the row/column grid and
@@ -388,6 +455,7 @@ impl<'a> LayoutBuilder<'a> {
             table_metrics: table_metrics.clone(),
             collapsed_geometry: collapsed_geometry.as_ref(),
             wrapper_border_box_block_size: None,
+            positioned_table_block_content_size: None,
             wrapper_non_grid_block_size: layout_pt(0.0),
         };
         let height_plan = self.table_height_plan(&context);
@@ -513,6 +581,7 @@ impl<'a> LayoutBuilder<'a> {
             table_metrics: table_metrics.clone(),
             collapsed_geometry: collapsed_geometry.as_ref(),
             wrapper_border_box_block_size: None,
+            positioned_table_block_content_size: None,
             wrapper_non_grid_block_size: layout_pt(0.0),
         };
         let table_height_plan = self.table_height_plan(&table_context);
@@ -677,7 +746,7 @@ impl<'a> LayoutBuilder<'a> {
         self.ancestors.truncate(ancestor_depth);
 
         let mut atom_style = style.clone();
-        atom_style.background_color = css::BackgroundColor::TRANSPARENT;
+        atom_style.background.background_color = css::BackgroundColor::TRANSPARENT;
         atom_style.border_width = 0.0;
         atom_style.border_widths = css::Edges::ZERO;
         atom_style.border_width_values = css::CssEdges::all(css::ComputedLengthPercentage::ZERO);
@@ -687,7 +756,9 @@ impl<'a> LayoutBuilder<'a> {
         let atom = InlineAtom::new(
             InlineAtomContent::InlineFragment {
                 fragment: Box::new(fragment),
+                replay_coordinates: AtomicInlineFragmentReplayCoordinates::border_box_local(),
                 table_cell_context,
+                contents_overflow_clip_applied: false,
             },
             atom_style,
             None,
@@ -720,7 +791,32 @@ impl<'a> LayoutBuilder<'a> {
         available_outer_width: f32,
         fragment: &box_tree::TableFragment<'_>,
     ) -> f32 {
-        let estimate_key = (element.id, available_outer_width.to_bits());
+        let constraint_basis = PercentageBasis::definite(content_box_pt(available_outer_width));
+        let block_constraint_key = (
+            used_content_box_height_or_auto_with_basis(
+                style,
+                constraint_basis,
+                non_content_pt(0.0),
+            )
+            .map(|value| value.points().to_bits()),
+            used_min_height(
+                style,
+                PercentageBasis::definite(layout_pt(available_outer_width)),
+            )
+            .map(|value| value.points().to_bits()),
+            used_max_height(
+                style,
+                PercentageBasis::definite(layout_pt(available_outer_width)),
+            )
+            .map(|value| value.points().to_bits()),
+        );
+        let estimate_key = (
+            element.id,
+            available_outer_width.to_bits(),
+            block_constraint_key.0,
+            block_constraint_key.1,
+            block_constraint_key.2,
+        );
         if let Some(&height) = self.speculative_table_height_estimates.get(&estimate_key) {
             return height;
         }
@@ -817,6 +913,7 @@ impl<'a> LayoutBuilder<'a> {
             table_metrics: table_metrics.clone(),
             collapsed_geometry: collapsed_geometry.as_ref(),
             wrapper_border_box_block_size: None,
+            positioned_table_block_content_size: None,
             wrapper_non_grid_block_size: layout_pt(0.0),
         };
         let table_height_plan = self.table_height_plan(&table_context);

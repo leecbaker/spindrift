@@ -48,37 +48,33 @@ pub(in crate::layout::flex) fn measured_item_cross_axis_baseline(
     baseline_set: FlexBaselineSet,
     physical_direction: FlexDirection,
 ) -> FlexCrossOffset {
-    let axes = FlexAxes::from_physical_direction(PhysicalFlexDirection::new(physical_direction));
     if physical_direction.is_row_axis() {
-        return item.cross_start(axes)
-            + FlexCrossLength::new(style.margin.top)
-            + flex_cross_length_from_vertical_baseline(measured_item_border_box_baseline(
-                item,
-                estimate,
-                style,
-                container_style,
-                baseline_set,
-            ));
+        let baseline = flex_item_vertical_border_box_baseline_coordinate(
+            item,
+            measured_item_border_box_baseline(item, estimate, style, container_style, baseline_set),
+        );
+        return FlexCrossOffset::new(baseline.points());
     }
-    item.cross_start(axes)
-        + FlexCrossLength::new(style.margin.left)
-        + flex_cross_length_from_horizontal_baseline(measured_item_horizontal_border_box_baseline(
+    let baseline = flex_item_horizontal_border_box_baseline_coordinate(
+        item,
+        measured_item_horizontal_border_box_baseline(
             item,
             estimate,
             style,
             container_style,
             baseline_set,
-        ))
+        ),
+    );
+    FlexCrossOffset::new(baseline.points())
 }
 
 /// Return the first and last baseline sets exported by a flex container.
 ///
-/// CSS Flexbox derives a container's baseline sets from its first and last
-/// flex lines. A shared line baseline wins; otherwise the startmost/endmost
-/// item contributes its parallel baseline (or a synthesized border-box
-/// baseline). This runs after the flex lines and items have their final
-/// placement, so wrapping, `order`, `wrap-reverse`, and `align-content` are
-/// already reflected in the exported coordinates:
+/// Flexbox has two selection algorithms: when the container inline axis is
+/// its main axis it first considers the startmost/endmost flex *line* and its
+/// shared baseline; when the inline axis is its cross axis it selects the
+/// startmost/endmost flex *item* directly. Both operate after `order` and
+/// `flex-direction`, and after final placement:
 /// <https://www.w3.org/TR/css-flexbox-1/#flex-baselines>.
 pub(in crate::layout::flex) fn flex_container_baselines(
     lines: &[FlexLineLayout],
@@ -87,123 +83,268 @@ pub(in crate::layout::flex) fn flex_container_baselines(
     children: &[StyledChild<'_>],
     container_style: &ComputedStyle,
     physical_direction: FlexDirection,
-) -> FlexContainerBaselineEstimate {
+) -> FlexContainerBaselineSets {
     let Some((first_line, last_line)) = flex_container_baseline_lines(lines, container_style)
     else {
-        return FlexContainerBaselineEstimate::default();
+        return FlexContainerBaselineSets::default();
     };
-
-    // In horizontal writing mode, a column flex container exports the text
-    // baseline of its first/last item along the physical vertical main axis.
-    // This is not the column's physical horizontal cross-axis coordinate.
-    // The old implementation recognized only the wrapped case and therefore
-    // made ordinary inline column flexboxes fall back to a synthesized atom
-    // baseline.
-    if container_style.writing_mode == WritingMode::HorizontalTb
-        && container_style.flex_direction.is_column_axis()
-        && physical_direction.is_column_axis()
-    {
-        let main_axis_baseline = |line: &FlexLineLayout, baseline_set| {
-            let index = flex_line_baseline_item_index(line, physical_direction, baseline_set)?;
-            Some(FlexVerticalBaselineOffset::new(
-                items[index].y().points()
-                    + children[index].style.margin.top
-                    + measured_item_vertical_border_box_baseline_for_line_axis(
-                        &items[index],
-                        &estimates[index],
-                        &children[index].style,
-                        container_style,
-                        baseline_set,
-                        PhysicalAxis::Horizontal,
-                    )
-                    .points(),
-            ))
-        };
-        let baselines = FlexContainerBaselineEstimate {
-            vertical: FlexItemBaselinePair {
-                first: main_axis_baseline(first_line, FlexBaselineSet::First),
-                last: main_axis_baseline(last_line, FlexBaselineSet::Last),
-            },
-            horizontal: FlexItemBaselinePair::default(),
-        };
-        return baselines;
-    }
-
-    let first = flex_line_content_baseline(
-        first_line,
-        items,
-        estimates,
-        children,
-        container_style,
-        FlexBaselineSet::First,
-        physical_direction,
-    );
-    let last = flex_line_content_baseline(
-        last_line,
-        items,
-        estimates,
-        children,
-        container_style,
-        FlexBaselineSet::Last,
-        physical_direction,
-    );
-    if physical_direction.is_row_axis() {
-        FlexContainerBaselineEstimate {
-            vertical: FlexItemBaselinePair {
-                first: first.map(|baseline| FlexVerticalBaselineOffset::new(baseline.points())),
-                last: last.map(|baseline| FlexVerticalBaselineOffset::new(baseline.points())),
-            },
-            horizontal: FlexItemBaselinePair::default(),
-        }
+    let inline_axis = inline_start_side(
+        container_style.writing_mode,
+        container_style.used_direction(),
+    )
+    .axis();
+    let main_axis = flex_baseline_line_axis(container_style);
+    let first = if inline_axis == main_axis {
+        flex_line_content_baseline(
+            first_line,
+            items,
+            estimates,
+            children,
+            container_style,
+            FlexBaselineSet::First,
+            physical_direction,
+        )
+        .map(|baseline| flex_cross_offset_as_physical_baseline(baseline, physical_direction))
     } else {
-        FlexContainerBaselineEstimate {
-            vertical: FlexItemBaselinePair::default(),
-            horizontal: FlexItemBaselinePair {
-                first: first.map(|baseline| FlexHorizontalBaselineOffset::new(baseline.points())),
-                last: last.map(|baseline| FlexHorizontalBaselineOffset::new(baseline.points())),
+        flex_container_baseline_item(
+            lines,
+            items,
+            children,
+            container_style,
+            physical_direction,
+            FlexBaselineSet::First,
+        )
+        .map(|index| {
+            flex_item_baseline_for_container_axis(
+                index,
+                items,
+                estimates,
+                children,
+                container_style,
+                FlexBaselineSet::First,
+                inline_axis,
+            )
+        })
+    };
+    let last = if inline_axis == main_axis {
+        flex_line_content_baseline(
+            last_line,
+            items,
+            estimates,
+            children,
+            container_style,
+            FlexBaselineSet::Last,
+            physical_direction,
+        )
+        .map(|baseline| flex_cross_offset_as_physical_baseline(baseline, physical_direction))
+    } else {
+        flex_container_baseline_item(
+            lines,
+            items,
+            children,
+            container_style,
+            physical_direction,
+            FlexBaselineSet::Last,
+        )
+        .map(|index| {
+            flex_item_baseline_for_container_axis(
+                index,
+                items,
+                estimates,
+                children,
+                container_style,
+                FlexBaselineSet::Last,
+                inline_axis,
+            )
+        })
+    };
+    FlexContainerBaselineSets {
+        vertical: FlexItemBaselinePair {
+            first: match first {
+                Some(FlexPhysicalBaselineOffset::Vertical(baseline)) => Some(baseline),
+                _ => None,
             },
-        }
+            last: match last {
+                Some(FlexPhysicalBaselineOffset::Vertical(baseline)) => Some(baseline),
+                _ => None,
+            },
+        },
+        horizontal: FlexItemBaselinePair {
+            first: match first {
+                Some(FlexPhysicalBaselineOffset::Horizontal(baseline)) => Some(baseline),
+                _ => None,
+            },
+            last: match last {
+                Some(FlexPhysicalBaselineOffset::Horizontal(baseline)) => Some(baseline),
+                _ => None,
+            },
+        },
     }
 }
 
-/// Select the startmost and endmost flex lines for container baseline export.
+fn flex_cross_offset_as_physical_baseline(
+    baseline: FlexCrossOffset,
+    physical_direction: FlexDirection,
+) -> FlexPhysicalBaselineOffset {
+    if physical_direction.is_row_axis() {
+        FlexPhysicalBaselineOffset::Vertical(flex_vertical_baseline_from_points(baseline.points()))
+    } else {
+        FlexPhysicalBaselineOffset::Horizontal(flex_horizontal_baseline_from_points(
+            baseline.points(),
+        ))
+    }
+}
+
+fn flex_container_baseline_item(
+    lines: &[FlexLineLayout],
+    items: &[FlexItemLayout],
+    children: &[StyledChild<'_>],
+    container_style: &ComputedStyle,
+    physical_direction: FlexDirection,
+    baseline_set: FlexBaselineSet,
+) -> Option<usize> {
+    let axes = WritingModeAxes::new(
+        container_style.writing_mode,
+        container_style.used_direction(),
+    );
+    let main_start = match container_style.flex_direction {
+        FlexDirection::Row => LogicalSide::InlineStart,
+        FlexDirection::RowReverse => LogicalSide::InlineEnd,
+        FlexDirection::Column => LogicalSide::BlockStart,
+        FlexDirection::ColumnReverse => LogicalSide::BlockEnd,
+    };
+    let main_start = axes.physical_side(main_start);
+
+    // `FlexLineLayout::item_indices` preserves order-modified order.  Final
+    // main-axis edges select the CSS startmost/endmost item, while this rank
+    // resolves geometrically coincident items without falling back to DOM
+    // order.  In particular, a reverse direction changes the physical edge
+    // which is startmost; it must not be implemented by reversing a source
+    // list after layout.
+    // <https://www.w3.org/TR/css-flexbox-1/#flex-baselines>
+    let ordered_items = lines
+        .iter()
+        .flat_map(|line| line.item_indices.iter().copied())
+        .filter(|&index| {
+            children
+                .get(index)
+                .is_some_and(|child| !flex_item_is_collapsed(&child.style))
+        })
+        .enumerate()
+        .collect::<Vec<_>>();
+    let main_progress = |index: usize| {
+        let (start, end) = item_outer_main_bounds(
+            items.get(index).expect("flex line item has final geometry"),
+            &children[index].style,
+            physical_direction,
+        );
+        if main_start.is_start_edge() {
+            start.points()
+        } else {
+            -end.points()
+        }
+    };
+    let compare = |left: &(usize, usize), right: &(usize, usize)| {
+        main_progress(left.1)
+            .partial_cmp(&main_progress(right.1))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.0.cmp(&right.0))
+    };
+    match baseline_set {
+        FlexBaselineSet::First => ordered_items
+            .iter()
+            .min_by(|left, right| compare(left, right))
+            .map(|(_, index)| *index),
+        FlexBaselineSet::Last => ordered_items
+            .iter()
+            .max_by(|left, right| compare(left, right))
+            .map(|(_, index)| *index),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flex_item_baseline_for_container_axis(
+    index: usize,
+    items: &[FlexItemLayout],
+    estimates: &[FlexItemEstimate],
+    children: &[StyledChild<'_>],
+    container_style: &ComputedStyle,
+    baseline_set: FlexBaselineSet,
+    baseline_line_axis: PhysicalAxis,
+) -> FlexPhysicalBaselineOffset {
+    let item = &items[index];
+    let child_style = &children[index].style;
+    match baseline_line_axis {
+        PhysicalAxis::Horizontal => {
+            FlexPhysicalBaselineOffset::Vertical(flex_item_vertical_border_box_baseline_coordinate(
+                item,
+                measured_item_vertical_border_box_baseline_for_line_axis(
+                    item,
+                    &estimates[index],
+                    child_style,
+                    container_style,
+                    baseline_set,
+                    baseline_line_axis,
+                ),
+            ))
+        }
+        PhysicalAxis::Vertical => FlexPhysicalBaselineOffset::Horizontal(
+            flex_item_horizontal_border_box_baseline_coordinate(
+                item,
+                measured_item_horizontal_border_box_baseline_for_line_axis(
+                    item,
+                    &estimates[index],
+                    child_style,
+                    container_style,
+                    baseline_set,
+                    baseline_line_axis,
+                ),
+            ),
+        ),
+    }
+}
+
+/// Select the startmost and endmost finalized flex lines for baseline export.
 ///
-/// Flex container baseline sets are defined after `order` and flex-direction,
-/// from the startmost/endmost line rather than the incidental storage order of
-/// line records.  This matters for `wrap-reverse`, vertical writing modes,
-/// and later `align-content` adjustments:
+/// This is intentionally based on final physical line geometry, rather than
+/// the order-modified line membership. `wrap-reverse` changes the flex
+/// cross-start edge, so it also changes which physical line is startmost;
+/// `align-content` likewise has to be reflected before export:
 /// <https://www.w3.org/TR/css-flexbox-1/#flex-baselines>.
 fn flex_container_baseline_lines<'a>(
     lines: &'a [FlexLineLayout],
     container_style: &ComputedStyle,
 ) -> Option<(&'a FlexLineLayout, &'a FlexLineLayout)> {
-    let cross_start_is_low_coordinate = flex_cross_start_side(container_style).is_start_edge();
-    let first = if cross_start_is_low_coordinate {
-        lines.iter().min_by(|left, right| {
-            left.cross_start
-                .partial_cmp(&right.cross_start)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
+    let cross_start = flex_cross_start_side(container_style);
+    let (first, last) = if cross_start.is_start_edge() {
+        (
+            lines.iter().min_by(|left, right| {
+                left.cross_start
+                    .partial_cmp(&right.cross_start)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }),
+            lines.iter().max_by(|left, right| {
+                left.cross_end
+                    .partial_cmp(&right.cross_end)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }),
+        )
     } else {
-        lines.iter().max_by(|left, right| {
-            left.cross_end
-                .partial_cmp(&right.cross_end)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-    }?;
-    let last = if cross_start_is_low_coordinate {
-        lines.iter().max_by(|left, right| {
-            left.cross_end
-                .partial_cmp(&right.cross_end)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-    } else {
-        lines.iter().min_by(|left, right| {
-            left.cross_start
-                .partial_cmp(&right.cross_start)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-    }?;
+        (
+            lines.iter().max_by(|left, right| {
+                left.cross_end
+                    .partial_cmp(&right.cross_end)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }),
+            lines.iter().min_by(|left, right| {
+                left.cross_start
+                    .partial_cmp(&right.cross_start)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }),
+        )
+    };
+    let first = first?;
+    let last = last?;
     Some((first, last))
 }
 
@@ -320,7 +461,6 @@ pub(in crate::layout::flex) fn apply_line_cross_size_dependent_item_remeasuremen
                     ),
                 FlexLineCrossRemeasureKind::None => continue,
             };
-
             // Taffy's stretch adapter accepts only numeric maxima. Preserve
             // CSS intrinsic maxima here, then remeasure auto main sizes at the
             // used cross size so float and inline wrapping observe the same
@@ -1042,9 +1182,87 @@ mod tests {
     }
 
     #[test]
+    fn exported_item_baselines_use_final_border_box_origins_without_reapplying_margins() {
+        let item = FlexItemLayout::new(ContainerRect::new(
+            ContainerPoint::new(13.0, 17.0),
+            ContainerSize::new(30.0, 40.0),
+        ));
+        let mut estimate = FlexItemEstimate::fixed(
+            PhysicalContentWidth::new(content_box_pt(30.0)),
+            PhysicalContentHeight::new(content_box_pt(40.0)),
+        );
+        estimate.baselines.vertical.first = Some(flex_vertical_baseline_from_points(7.0));
+        estimate.baselines.horizontal.first = Some(flex_horizontal_baseline_from_points(11.0));
+        let mut child_style = ComputedStyle::initial();
+        child_style.margin.top = 19.0;
+        child_style.margin.left = 23.0;
+        let container_style = ComputedStyle::initial();
+
+        // The final item rect has already incorporated these margins. Both
+        // cross-axis sharing and container export must therefore use only its
+        // border-box origin plus the measured border-box baseline.
+        assert_eq!(
+            measured_item_cross_axis_baseline(
+                &item,
+                &estimate,
+                &child_style,
+                &container_style,
+                FlexBaselineSet::First,
+                FlexDirection::Row,
+            ),
+            FlexCrossOffset::new(24.0),
+        );
+        assert_eq!(
+            measured_item_cross_axis_baseline(
+                &item,
+                &estimate,
+                &child_style,
+                &container_style,
+                FlexBaselineSet::First,
+                FlexDirection::Column,
+            ),
+            FlexCrossOffset::new(24.0),
+        );
+
+        let children = vec![StyledChild {
+            kind: FormattingContextChildKind::AnonymousContent {
+                children: Vec::new(),
+            },
+            style: child_style,
+        }];
+        let items = vec![item];
+        let estimates = vec![estimate];
+        assert_eq!(
+            flex_item_baseline_for_container_axis(
+                0,
+                &items,
+                &estimates,
+                &children,
+                &container_style,
+                FlexBaselineSet::First,
+                PhysicalAxis::Horizontal,
+            ),
+            FlexPhysicalBaselineOffset::Vertical(flex_vertical_baseline_from_points(24.0)),
+        );
+        assert_eq!(
+            flex_item_baseline_for_container_axis(
+                0,
+                &items,
+                &estimates,
+                &children,
+                &container_style,
+                FlexBaselineSet::First,
+                PhysicalAxis::Vertical,
+            ),
+            FlexPhysicalBaselineOffset::Horizontal(flex_horizontal_baseline_from_points(24.0)),
+        );
+    }
+
+    #[test]
     fn horizontal_column_synthesizes_a_vertical_inline_baseline() {
         let line = FlexLineLayout {
             item_indices: vec![0],
+            logical_cross_start_rank: 0,
             source_start: 0,
             source_end: 1,
             main_start: FlexMainOffset::new(0.0),
@@ -1083,7 +1301,7 @@ mod tests {
             )
             .vertical
             .first,
-            Some(FlexVerticalBaselineOffset::new(10.0)),
+            Some(flex_vertical_baseline_from_points(10.0)),
         );
     }
 
@@ -1091,6 +1309,7 @@ mod tests {
     fn horizontal_column_exports_its_first_item_main_axis_baseline() {
         let line = FlexLineLayout {
             item_indices: vec![0],
+            logical_cross_start_rank: 0,
             source_start: 0,
             source_end: 1,
             main_start: FlexMainOffset::new(0.0),
@@ -1109,7 +1328,7 @@ mod tests {
             PhysicalContentWidth::new(content_box_pt(10.0)),
             PhysicalContentHeight::new(content_box_pt(10.0)),
         );
-        estimate.baselines.vertical.first = Some(FlexVerticalBaselineOffset::new(5.0));
+        estimate.baselines.vertical.first = Some(flex_vertical_baseline_from_points(5.0));
         let child = StyledChild {
             kind: FormattingContextChildKind::AnonymousContent {
                 children: Vec::new(),
@@ -1129,7 +1348,7 @@ mod tests {
             )
             .vertical
             .first,
-            Some(FlexVerticalBaselineOffset::new(8.0)),
+            Some(flex_vertical_baseline_from_points(8.0)),
         );
     }
 
@@ -1137,6 +1356,7 @@ mod tests {
     fn horizontal_column_synthesizes_a_vertical_export_baseline() {
         let line = FlexLineLayout {
             item_indices: vec![0],
+            logical_cross_start_rank: 0,
             source_start: 0,
             source_end: 1,
             main_start: FlexMainOffset::new(0.0),
@@ -1174,14 +1394,15 @@ mod tests {
             )
             .vertical
             .first,
-            Some(FlexVerticalBaselineOffset::new(13.0)),
+            Some(flex_vertical_baseline_from_points(13.0)),
         );
     }
 
     #[test]
-    fn horizontal_column_reverse_uses_the_startmost_ordered_item() {
+    fn horizontal_column_reverse_uses_the_final_main_start_item() {
         let line = FlexLineLayout {
             item_indices: vec![0, 1],
+            logical_cross_start_rank: 0,
             source_start: 0,
             source_end: 2,
             main_start: FlexMainOffset::new(0.0),
@@ -1206,9 +1427,9 @@ mod tests {
             PhysicalContentWidth::new(content_box_pt(10.0)),
             PhysicalContentHeight::new(content_box_pt(10.0)),
         );
-        first.baselines.vertical.first = Some(FlexVerticalBaselineOffset::new(2.0));
+        first.baselines.vertical.first = Some(flex_vertical_baseline_from_points(2.0));
         let mut second = first;
-        second.baselines.vertical.first = Some(FlexVerticalBaselineOffset::new(5.0));
+        second.baselines.vertical.first = Some(flex_vertical_baseline_from_points(5.0));
         let children = vec![
             StyledChild {
                 kind: FormattingContextChildKind::AnonymousContent {
@@ -1237,7 +1458,7 @@ mod tests {
             )
             .vertical
             .first,
-            Some(FlexVerticalBaselineOffset::new(5.0)),
+            Some(flex_vertical_baseline_from_points(18.0)),
         );
     }
 
@@ -1246,6 +1467,7 @@ mod tests {
         let lines = vec![
             FlexLineLayout {
                 item_indices: vec![0, 1],
+                logical_cross_start_rank: 0,
                 source_start: 0,
                 source_end: 2,
                 main_start: FlexMainOffset::new(0.0),
@@ -1258,6 +1480,7 @@ mod tests {
             },
             FlexLineLayout {
                 item_indices: vec![2, 3],
+                logical_cross_start_rank: 1,
                 source_start: 2,
                 source_end: 4,
                 main_start: FlexMainOffset::new(0.0),
@@ -1294,8 +1517,8 @@ mod tests {
             );
             4
         ];
-        estimates[0].baselines.vertical.first = Some(FlexVerticalBaselineOffset::new(4.0));
-        estimates[3].baselines.vertical.last = Some(FlexVerticalBaselineOffset::new(8.0));
+        estimates[0].baselines.vertical.first = Some(flex_vertical_baseline_from_points(4.0));
+        estimates[3].baselines.vertical.last = Some(flex_vertical_baseline_from_points(8.0));
         let children = (0..4)
             .map(|_| StyledChild {
                 kind: FormattingContextChildKind::AnonymousContent {
@@ -1315,11 +1538,51 @@ mod tests {
         );
         assert_eq!(
             exported.vertical.first,
-            Some(FlexVerticalBaselineOffset::new(4.0)),
+            Some(flex_vertical_baseline_from_points(4.0)),
         );
         assert_eq!(
             exported.vertical.last,
-            Some(FlexVerticalBaselineOffset::new(18.0)),
+            Some(flex_vertical_baseline_from_points(18.0)),
         );
+    }
+
+    #[test]
+    fn wrap_reverse_export_uses_final_flex_cross_start_line() {
+        let lines = vec![
+            FlexLineLayout {
+                // This is order-modified first, but `wrap-reverse` packed it
+                // at the block-end side of a horizontal writing-mode box.
+                item_indices: vec![2, 3],
+                logical_cross_start_rank: 0,
+                source_start: 2,
+                source_end: 4,
+                main_start: FlexMainOffset::new(0.0),
+                main_end: FlexMainOffset::new(20.0),
+                cross_start: FlexCrossOffset::new(10.0),
+                cross_end: FlexCrossOffset::new(20.0),
+                first_baseline: None,
+                last_baseline: None,
+                collapsed_struts: Vec::new(),
+            },
+            FlexLineLayout {
+                item_indices: vec![0, 1],
+                logical_cross_start_rank: 1,
+                source_start: 0,
+                source_end: 2,
+                main_start: FlexMainOffset::new(0.0),
+                main_end: FlexMainOffset::new(20.0),
+                cross_start: FlexCrossOffset::new(0.0),
+                cross_end: FlexCrossOffset::new(10.0),
+                first_baseline: None,
+                last_baseline: None,
+                collapsed_struts: Vec::new(),
+            },
+        ];
+        let mut style = ComputedStyle::initial();
+        style.flex_wrap = FlexWrap::WrapReverse;
+
+        let (first, last) = flex_container_baseline_lines(&lines, &style).unwrap();
+        assert_eq!(first.logical_cross_start_rank, 0);
+        assert_eq!(last.logical_cross_start_rank, 1);
     }
 }

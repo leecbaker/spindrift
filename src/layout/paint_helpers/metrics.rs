@@ -77,26 +77,27 @@ impl UsedBorder {
 /// layout, painting, and table-collapse interpretations:
 /// <https://www.w3.org/TR/css-backgrounds-3/#the-border-style>.
 pub(crate) fn used_border(style: &ComputedStyle) -> UsedBorder {
+    let colors = style.border_colors.resolve(style.color);
     UsedBorder {
         top: UsedBorderSide::new(
             layout_pt(style.border_widths.top),
             style.border_styles.top,
-            style.border_colors.top,
+            colors.top,
         ),
         right: UsedBorderSide::new(
             layout_pt(style.border_widths.right),
             style.border_styles.right,
-            style.border_colors.right,
+            colors.right,
         ),
         bottom: UsedBorderSide::new(
             layout_pt(style.border_widths.bottom),
             style.border_styles.bottom,
-            style.border_colors.bottom,
+            colors.bottom,
         ),
         left: UsedBorderSide::new(
             layout_pt(style.border_widths.left),
             style.border_styles.left,
-            style.border_colors.left,
+            colors.left,
         ),
     }
 }

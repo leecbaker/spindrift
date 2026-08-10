@@ -172,16 +172,12 @@ pub(in crate::css) fn apply_cascaded_layout_declaration(
             }
         }
         "flex-grow" => {
-            if let Some(value) = parse_css_number(value)
-                && value >= 0.0
-            {
+            if let Some(value) = parse_css_number(value).and_then(FlexGrowFactor::new) {
                 style.flex_grow = value;
             }
         }
         "flex-shrink" => {
-            if let Some(value) = parse_css_number(value)
-                && value >= 0.0
-            {
+            if let Some(value) = parse_css_number(value).and_then(FlexShrinkFactor::new) {
                 style.flex_shrink = value;
             }
         }
@@ -197,10 +193,10 @@ pub(in crate::css) fn apply_cascaded_layout_declaration(
         }
         "flex" => {
             if let Some((grow, shrink, basis)) = parse_flex_shorthand_components(value) {
-                if let Some(grow) = parse_css_number(&grow) {
+                if let Some(grow) = parse_css_number(&grow).and_then(FlexGrowFactor::new) {
                     style.flex_grow = grow;
                 }
-                if let Some(shrink) = parse_css_number(&shrink) {
+                if let Some(shrink) = parse_css_number(&shrink).and_then(FlexShrinkFactor::new) {
                     style.flex_shrink = shrink;
                 }
                 if let Some(basis) = parse_computed_flex_basis(&basis, style.font_size) {
@@ -563,37 +559,37 @@ pub(in crate::css) fn apply_cascaded_layout_declaration(
             }
         }
         "border-color" => {
-            if let Some(colors) = parse_border_colors(value, style.color) {
+            if let Some(colors) = parse_border_colors(value) {
                 style.border_colors = colors;
                 style.border_color = colors.top;
-            } else if let Some(color) = parse_border_color(value, style.color) {
+            } else if let Some(color) = parse_border_color(value) {
                 style.border_color = color;
                 style.border_colors = border_colors_all(color);
             }
         }
         "border-top-color" => {
-            if let Some(color) = parse_border_color(value, style.color) {
+            if let Some(color) = parse_border_color(value) {
                 style.border_colors.top = color;
                 style.border_color = color;
             }
         }
         "border-right-color" => {
-            if let Some(color) = parse_border_color(value, style.color) {
+            if let Some(color) = parse_border_color(value) {
                 style.border_colors.right = color;
             }
         }
         "border-bottom-color" => {
-            if let Some(color) = parse_border_color(value, style.color) {
+            if let Some(color) = parse_border_color(value) {
                 style.border_colors.bottom = color;
             }
         }
         "border-left-color" => {
-            if let Some(color) = parse_border_color(value, style.color) {
+            if let Some(color) = parse_border_color(value) {
                 style.border_colors.left = color;
             }
         }
         "border-block-color" => {
-            if let Some([start, end]) = parse_logical_border_colors(value, style.color)
+            if let Some([start, end]) = parse_logical_border_colors(value)
                 && let Some([start_side, end_side]) =
                     logical_axis_sides(name, style.direction, style.writing_mode)
             {
@@ -602,7 +598,7 @@ pub(in crate::css) fn apply_cascaded_layout_declaration(
             }
         }
         "border-inline-color" => {
-            if let Some([start, end]) = parse_logical_border_colors(value, style.color)
+            if let Some([start, end]) = parse_logical_border_colors(value)
                 && let Some([start_side, end_side]) =
                     logical_axis_sides(name, style.direction, style.writing_mode)
             {
@@ -615,7 +611,7 @@ pub(in crate::css) fn apply_cascaded_layout_declaration(
         | "border-inline-start-color"
         | "border-inline-end-color" => {
             if let Some(side) = logical_border_side(name, style.direction, style.writing_mode)
-                && let Some(color) = parse_border_color(value, style.color)
+                && let Some(color) = parse_border_color(value)
             {
                 set_border_side_color(style, side, color);
             }
@@ -640,7 +636,7 @@ pub(in crate::css) fn apply_cascaded_layout_declaration(
             }
         }
         "outline-color" => {
-            if let Some(color) = parse_border_color(value, style.color) {
+            if let Some(color) = parse_border_color(value) {
                 style.outline_color = color;
             }
         }

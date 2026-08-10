@@ -22,6 +22,19 @@ pub(in crate::layout) struct BlockFlowChildrenPhaseInput<'a, 'boxes> {
     /// Whether a preceding direct inline run establishes the source side of
     /// the first class-A child boundary.
     pub(in crate::layout) has_preceding_inline_flow_content: bool,
+    /// A direct inline sequence already selected an automatic clamp point or
+    /// captured local discard break. Later in-flow block source is beyond the
+    /// same cutoff and must not enter ordinary traversal.
+    pub(in crate::layout) preceding_inline_local_cutoff: bool,
+    /// Maximum number of local multicol regions which this traversal may
+    /// enter for `continue: discard`. This is not a page/column fragmentainer
+    /// limit; it only decides when later source is omitted.
+    pub(in crate::layout) discard_region_limit: Option<super::children::state::DiscardRegionLimit>,
+    /// A finite absolute/font-relative automatic clamp constraint resolved at
+    /// this owning block. Descendant traversal carries its remaining portion
+    /// as a layout-only controller; percentage constraints resolve later.
+    pub(in crate::layout) direct_automatic_block_size_constraint:
+        Option<crate::units::ContentBoxLength>,
     pub(in crate::layout) definite_content_height: Option<f32>,
     pub(in crate::layout) descendant_percentage_height_basis: Option<BlockSizePercentageBasis>,
 }
@@ -37,4 +50,10 @@ pub(in crate::layout) struct BlockFlowChildrenPhaseOutcome {
     /// Slots exported by nested block formatting contexts. Direct inline runs
     /// are retained by the enclosing block's capture instead.
     pub(in crate::layout) descendant_clamp_line_slots: usize,
+    /// A descendant captured a local automatic/discard continuation cutoff.
+    pub(in crate::layout) has_local_continuation_cutoff: bool,
+    /// Retained direct-child source before the first local discard break.
+    /// This is intentionally a source endpoint, never a page/column index.
+    pub(in crate::layout) discard_source_prefix:
+        Option<super::children::state::DiscardSourcePrefix>,
 }

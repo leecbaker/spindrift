@@ -269,6 +269,41 @@ impl RenderedPath {
         self
     }
 
+    /// Project this retained path, including its PDF clip scope, into a
+    /// destination paint space.
+    ///
+    /// Path clips are installed before the path's own CTM by the PDF writer,
+    /// so clip contours must be transformed explicitly while path geometry and
+    /// gradient paint remain under the composed CTM. This keeps a fragmented
+    /// structural background's source clip and ink in the same destination:
+    /// <https://www.w3.org/TR/css-transforms-1/#transform-rendering> and
+    /// ISO 32000-2:2020, 8.5.4.
+    pub(crate) fn transformed(mut self, transform: PaintTransform) -> Self {
+        self.transform = transform.multiply(self.transform);
+        if let Some(rect) = self.opaque_coverage_rect {
+            self.opaque_coverage_rect = Some(
+                transform
+                    .apply_clip_to_aabb(PaintClip::from_paint_rect(rect))
+                    .paint_rect(),
+            );
+        }
+        if let Some(clip) = &mut self.clip {
+            clip.transform(transform);
+        }
+        // PDF shading-pattern matrices are resolved independently of the
+        // path CTM.  Project the retained gradient matrix alongside its path
+        // geometry so the fill remains registered with the transformed clip.
+        for paint in [&mut self.fill_paint, &mut self.stroke_paint]
+            .into_iter()
+            .flatten()
+        {
+            if let RenderedPathPaint::Gradient(gradient) = paint {
+                gradient.transform = transform.multiply(gradient.transform);
+            }
+        }
+        self
+    }
+
     /// Mark this path as an opaque replacement for `rect`.
     ///
     /// Callers must establish that every point in the rectangle is covered
@@ -397,6 +432,17 @@ impl RenderedPathClip {
         }
         self
     }
+
+    pub(crate) fn transform(&mut self, transform: PaintTransform) {
+        for command in &mut self.commands {
+            command.transform(transform);
+        }
+        for clip in &mut self.additional_clips {
+            for command in &mut clip.commands {
+                command.transform(transform);
+            }
+        }
+    }
 }
 
 /// One additional PDF clipping path intersected with an active clip scope.
@@ -483,6 +529,24 @@ impl RenderedPathCommand {
                 *control_1 = offset.transform_point(*control_1);
                 *control_2 = offset.transform_point(*control_2);
                 *end = offset.transform_point(*end);
+            }
+            Self::Close => {}
+        }
+    }
+
+    pub(crate) fn transform(&mut self, transform: PaintTransform) {
+        match self {
+            Self::MoveTo(point) | Self::LineTo(point) => {
+                *point = transform.apply_point(*point);
+            }
+            Self::CurveTo {
+                control_1,
+                control_2,
+                end,
+            } => {
+                *control_1 = transform.apply_point(*control_1);
+                *control_2 = transform.apply_point(*control_2);
+                *end = transform.apply_point(*end);
             }
             Self::Close => {}
         }

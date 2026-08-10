@@ -697,6 +697,40 @@ impl FlowAxes {
         self.axes.physical_side(LogicalSide::InlineStart)
     }
 
+    /// Return the physical edge at the containing flow's logical block-start.
+    ///
+    /// Normal-flow static placement uses the containing block's axes, even
+    /// when an orthogonal child's sizing algorithm used different axes:
+    /// <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>.
+    pub(super) fn block_start_side(self) -> PhysicalSide {
+        self.axes.physical_side(LogicalSide::BlockStart)
+    }
+
+    /// Translate continuous logical block coordinates into a fragmentainer's
+    /// local paint coordinates.
+    ///
+    /// A later multicolumn source slice restarts its temporary page at logical
+    /// block zero.  Paint resolved against the continuous containing block
+    /// must therefore move back by the slice's logical block origin before
+    /// the source-to-destination fragmentainer projection is applied.
+    /// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+    /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+    pub(in crate::layout) fn continuous_block_to_local_paint_translation(
+        self,
+        source_block_start: LayoutLength,
+    ) -> PaintTranslation {
+        let offset = source_block_start.points();
+        match self.block_start_side() {
+            // Logical block progression is downward in page-top coordinates
+            // but upward in paint coordinates, so continuous-to-local is its
+            // inverse.
+            PhysicalSide::Top => PaintTranslation::new(0.0, offset),
+            PhysicalSide::Bottom => PaintTranslation::new(0.0, -offset),
+            PhysicalSide::Left => PaintTranslation::new(-offset, 0.0),
+            PhysicalSide::Right => PaintTranslation::new(offset, 0.0),
+        }
+    }
+
     pub(super) const fn writing_mode(self) -> WritingMode {
         self.axes.writing_mode()
     }
@@ -819,6 +853,25 @@ mod tests {
                 ContainerSize::new(30.0, 20.0)
             )
         );
+    }
+
+    #[test]
+    fn localizes_continuous_block_offsets_in_each_writing_mode() {
+        let offset = layout_pt(12.0);
+        for (writing_mode, expected) in [
+            (WritingMode::HorizontalTb, PaintTranslation::new(0.0, 12.0)),
+            (WritingMode::VerticalLr, PaintTranslation::new(-12.0, 0.0)),
+            (WritingMode::VerticalRl, PaintTranslation::new(12.0, 0.0)),
+            (WritingMode::SidewaysLr, PaintTranslation::new(-12.0, 0.0)),
+            (WritingMode::SidewaysRl, PaintTranslation::new(12.0, 0.0)),
+        ] {
+            assert_eq!(
+                FlowAxes::new(writing_mode, Direction::Ltr)
+                    .continuous_block_to_local_paint_translation(offset),
+                expected,
+                "{writing_mode:?} must restore a later source slice to local paint coordinates",
+            );
+        }
     }
 
     #[test]

@@ -4,6 +4,7 @@ use super::state::{
 };
 use super::*;
 use crate::layout::inline_collect::TextDecorationPropagationContext;
+use std::num::NonZeroUsize;
 
 impl<'a> LayoutBuilder<'a> {
     #[allow(clippy::too_many_arguments)]
@@ -23,19 +24,6 @@ impl<'a> LayoutBuilder<'a> {
         run_in_inline_items_laid_out: bool,
         traversal_state: &mut BlockFlowChildTraversalState,
     ) -> ChildFlowTraversalOutcome {
-        if element.tag.eq_ignore_ascii_case("html") {
-            self.root_principal_flow_context.has_inline_root_pseudo = style
-                .before_style
-                .iter()
-                .chain(style.after_style.iter())
-                .any(|pseudo| !pseudo.display.is_block_level())
-                || child_boxes.iter().any(|child| match child {
-                    box_tree::FormattingBox::AnonymousBlock(anonymous) => {
-                        anonymous_block_wraps_root_principal_pseudo(&anonymous.children)
-                    }
-                    _ => false,
-                });
-        }
         let mut collapsed_end_margin = false;
         let mut pending_end_margin_collapse = None;
         let mut collapsed_start_margin_offset = layout_pt(0.0);
@@ -81,6 +69,16 @@ impl<'a> LayoutBuilder<'a> {
             .flatten();
         let mut child_box_index = 0usize;
         while child_box_index < child_boxes.len() {
+            if traversal_state.has_reached_discard_region_limit(self.pages.len()) {
+                let child_count = NonZeroUsize::new(child_box_index);
+                debug_assert!(child_count.is_some(), "a local region break retains source");
+                if let Some(child_count) = child_count {
+                    traversal_state.capture_discard_source_prefix(child_count);
+                } else {
+                    traversal_state.mark_local_continuation_cutoff();
+                }
+                break;
+            }
             let replaying_adjoining_target = if replaying_adjoining_until == Some(child_box_index) {
                 replaying_adjoining_until = None;
                 self.adjoining_float_origin_y.take();
@@ -110,6 +108,7 @@ impl<'a> LayoutBuilder<'a> {
                 .is_some_and(|(_, _, child_style, _)| child_style.float != Float::None);
             if traversal_state.is_exhausted() && (raw_child_is_in_normal_flow || raw_child_is_float)
             {
+                traversal_state.capture_forced_discard_before_later_child(child_box_index);
                 // A later float belongs to the discarded source just like a
                 // later in-flow box. Positioned descendants retain their
                 // independent containing-block layout pass.
@@ -263,28 +262,24 @@ impl<'a> LayoutBuilder<'a> {
             if let box_tree::FormattingBox::AnonymousBlock(box_) = child_box {
                 self.flush_float_run(&mut float_run);
                 let root_principal_inline_pseudo = element.tag.eq_ignore_ascii_case("html")
-                    && self.principal_flow.is_source_body(element)
+                    && self.principal_flow.has_propagated_body()
                     && WritingModeAxes::new(style.writing_mode, style.used_direction())
                         .swaps_physical_axes()
                     && anonymous_block_wraps_root_principal_pseudo(&box_.children);
-                let root_canvas_block_cursor = root_principal_inline_pseudo
-                    .then_some(self.root_principal_flow_context.completed_body)
-                    .flatten();
-                let root_canvas_page_index = self.pages.len();
-                let root_canvas_paint_checkpoint =
-                    root_canvas_block_cursor.map(|_| self.current_page.paint_checkpoint());
+                let consuming_root_canvas = root_principal_inline_pseudo
+                    && self.begin_root_inline_canvas_continuation(element);
                 // An anonymous inline wrapper following a propagated
                 // sideways-lr body (notably a root ::after) shares the
                 // bottom-origin inline axis. The legacy pagination cursor is
                 // top-origin, so use a scratch line and project its paint
                 // back to the canvas edge just as for block children.
                 // <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
-                let bottom_inline_start =
-                    WritingModeAxes::new(style.writing_mode, style.used_direction())
+                let bottom_inline_start = !consuming_root_canvas
+                    && WritingModeAxes::new(style.writing_mode, style.used_direction())
                         .swaps_physical_axes()
-                        && self.active_fragmentainer_kind() == FragmentainerKind::Page
-                        && inline_start_side(style.writing_mode, style.used_direction())
-                            == PhysicalSide::Bottom;
+                    && self.active_fragmentainer_kind() == FragmentainerKind::Page
+                    && inline_start_side(style.writing_mode, style.used_direction())
+                        == PhysicalSide::Bottom;
                 let inline_cursor = self.cursor_y;
                 let page_index = self.pages.len();
                 let paint_checkpoint =
@@ -321,27 +316,8 @@ impl<'a> LayoutBuilder<'a> {
                             initial_first_formatted_line,
                         )
                     });
-                if let (Some(contribution), Some(checkpoint)) =
-                    (root_canvas_block_cursor, root_canvas_paint_checkpoint)
-                    && self.pages.len() == root_canvas_page_index
-                {
-                    // Keep inline line construction in the complete initial
-                    // canvas. The body contribution changes only the root
-                    // logical block coordinate, so project the completed
-                    // anonymous fragment through the writing-mode axes rather
-                    // than narrowing its inline measure and accidentally
-                    // changing wrapping.
-                    // <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
-                    let fragment = self.current_page.take_paint_fragment_since(checkpoint);
-                    let x = match block_start_side(style.writing_mode) {
-                        PhysicalSide::Left => contribution.logical_block_advance.points(),
-                        PhysicalSide::Right => -contribution.logical_block_advance.points(),
-                        PhysicalSide::Top | PhysicalSide::Bottom => unreachable!(
-                            "a vertical writing mode must have a horizontal block axis"
-                        ),
-                    };
-                    self.current_page
-                        .append_paint_fragment_owned(fragment, PaintTranslation::new(x, 0.0));
+                if consuming_root_canvas {
+                    self.finish_root_inline_canvas_continuation();
                 }
                 if let Some(checkpoint) = paint_checkpoint
                     && self.pages.len() == page_index
@@ -365,7 +341,7 @@ impl<'a> LayoutBuilder<'a> {
                 if inline_outcome.has_non_phantom_line {
                     first_formatted_line.consume_next_formatted_line();
                 }
-                traversal_state.debit(inline_outcome.clamp_line_slots);
+                traversal_state.debit_inline_outcome(inline_outcome);
                 self.flush_float_run(&mut float_run);
                 if inline_outcome.has_flow_effects {
                     trim_block_start_adjoining_margins = false;
@@ -396,6 +372,22 @@ impl<'a> LayoutBuilder<'a> {
             };
             let decoration_context = TextDecorationPropagationContext::from_style(style);
             let mut child_style = Box::new(decoration_context.used_child_style(child_style));
+            // A block container whose first in-flow child is block-level takes
+            // its first formatted line from that child. Carry the originating
+            // typographic pseudo into the child's layout style so a deeper
+            // block descent continues to find the same first line instead of
+            // treating the ancestor pseudo as consumed before any line exists.
+            // <https://drafts.csswg.org/css-pseudo-4/#first-line-pseudo>
+            let child_receives_originating_first_line = first_formatted_line
+                .applies_to_next_inline_run()
+                && style_is_in_normal_flow(&child_style)
+                && child_style.display.is_block_level();
+            if child_receives_originating_first_line
+                && let Some(style_with_originating_pseudos) =
+                    style_with_originating_typographic_pseudos(&child_style, style)
+            {
+                *child_style = style_with_originating_pseudos;
+            }
             let child_shares_clamp_context =
                 self.child_shares_line_clamp_formatting_context(child_element, &child_style);
             if child_shares_clamp_context {
@@ -596,6 +588,7 @@ impl<'a> LayoutBuilder<'a> {
 
             let mut collapses_with_parent_end = false;
             let mut adjoining_start_margin_paint_offset = None;
+            let mut inherited_adjoining_start_margin = None;
             if is_flow_child {
                 let collapses_with_parent = is_collapsible_block_child(child_element, &child_style);
                 let collapses_with_sibling =
@@ -617,6 +610,7 @@ impl<'a> LayoutBuilder<'a> {
                     && collapses_with_parent
                     && !physical_top_is_inline_axis;
                 if adjoins_parent_start {
+                    inherited_adjoining_start_margin = Some(adjoining_start_margin.value());
                     if let Some(previous_margin) = previous_flow_bottom_margin {
                         // An earlier self-collapsing sibling has
                         // already contributed its adjoining margin at
@@ -683,30 +677,6 @@ impl<'a> LayoutBuilder<'a> {
                 - child_style.margin.left
                 - child_style.margin.right)
                 .max(child_style.font_size);
-            let avoid_run_starts_on_empty_page = fragmentainer_kind == FragmentainerKind::Page
-                && avoid_run_candidate
-                    .as_ref()
-                    .is_some_and(AvoidBreakRunCandidate::starts_on_empty_page);
-            // The estimate is only consumed to move or extend a contiguous
-            // `break-inside: avoid` run.  Measuring every ordinary child
-            // here duplicates expensive table row layout before the real
-            // fragmenting pass has selected a page.
-            // <https://www.w3.org/TR/css-break-3/#break-between>
-            let child_estimated_height = ((avoid_run_start_decision.is_avoid_boundary
-                || avoid_run_start_decision.seeds_later_avoid_boundary)
-                && !self.cursor_is_at_page_top()
-                && self.fragmentation_suppression_depth == 0
-                && !avoid_run_starts_on_empty_page)
-                .then(|| {
-                    self.estimate_element_height(
-                        child_element,
-                        &child_style,
-                        stylesheets,
-                        available_outer_width,
-                        Some(child_children),
-                    )
-                })
-                .flatten();
             let mut run_start_candidate = if is_flow_child {
                 if avoid_run_start_decision.is_avoid_boundary {
                     Some(avoid_run_candidate.take().unwrap_or_else(|| {
@@ -724,19 +694,53 @@ impl<'a> LayoutBuilder<'a> {
             } else {
                 None
             };
+            let avoid_run_retry_context =
+                run_start_candidate
+                    .as_ref()
+                    .map(|candidate| AvoidRunRetryContext {
+                        current_fragmentainer: self.fragmentainer_from_page_cursor(
+                            PageTopBlockPosition::new(self.cursor_y),
+                        ),
+                        empty_destination_fragmentainer: self
+                            .next_empty_fragmentainer(fragmentainer_kind),
+                        source_occupancy: candidate.source_fragmentainer_occupancy(),
+                    });
+            // The estimate is only consumed to move or extend a contiguous
+            // `break-inside: avoid` run. Measuring every ordinary child here
+            // duplicates expensive table row layout before the real
+            // fragmenting pass has selected a destination. An empty source
+            // probes only when that destination is strictly larger, so equal
+            // temporary columns relax the avoid preference instead of
+            // replaying forever.
+            // <https://www.w3.org/TR/css-break-3/#break-between>
+            let child_estimated_height = ((avoid_run_start_decision.is_avoid_boundary
+                || avoid_run_start_decision.seeds_later_avoid_boundary)
+                && !self.cursor_is_at_page_top()
+                && self.fragmentation_suppression_depth == 0
+                && avoid_run_retry_context.is_some_and(AvoidRunRetryContext::can_advance))
+            .then(|| {
+                self.estimate_element_height(
+                    child_element,
+                    &child_style,
+                    stylesheets,
+                    available_outer_width,
+                    Some(child_children),
+                )
+            })
+            .flatten();
             if is_flow_child
                 && avoid_run_start_decision.is_avoid_boundary
                 && let Some(child_height) = child_estimated_height
+                && let Some(retry_context) = avoid_run_retry_context
                 && let Some(candidate) = run_start_candidate.as_ref()
-                && should_move_avoid_break_run_to_next_fragmentainer(
-                    candidate.height(),
-                    child_height.min(
+                && should_move_avoid_break_run_to_next_fragmentainer(AvoidRunPrebreakInput {
+                    run_height: candidate.height(),
+                    next_height: child_height.min(
                         child_style.margin.top
-                            + child_style.line_height * child_style.orphans.max(1) as f32,
+                            + child_style.line_height * child_style.orphans.get() as f32,
                     ),
-                    self.fragmentainer_from_page_cursor(PageTopBlockPosition::new(self.cursor_y)),
-                    avoid_run_starts_on_empty_page,
-                )
+                    retry_context,
+                })
             {
                 if std::env::var_os("QUIRE_TRACE_FLOATS").is_some() {
                     eprintln!(
@@ -779,7 +783,18 @@ impl<'a> LayoutBuilder<'a> {
                 child_box_index = index;
                 avoid_run_candidate = None;
                 previous_break_after = PageBreak::Auto;
-                self.push_page_if_nonempty();
+                // A retry from an empty source is permitted only when the
+                // destination fragmentainer is larger. Restoring that source
+                // also restores its empty temporary fragmentainer, so the ordinary
+                // conditional transition would be a no-op and re-run the
+                // exact same avoid boundary forever. Materialize the larger
+                // destination fragmentainer before replaying the run.
+                // <https://www.w3.org/TR/css-break-3/#breaking-rules>
+                if retry_context.source_occupancy == AvoidRunSourceFragmentainerOccupancy::Empty {
+                    self.push_page();
+                } else {
+                    self.push_page_if_nonempty();
+                }
                 continue;
             }
             let closes_adjoining_float_replay = is_flow_child
@@ -864,6 +879,9 @@ impl<'a> LayoutBuilder<'a> {
                 .last()
                 .map(|context| context.shapes.len())
                 .unwrap_or(0);
+            if let Some(margin) = inherited_adjoining_start_margin {
+                self.inherited_adjoining_start_margins.push(margin);
+            }
             // `layout_block` normalizes a fieldset into a frozen child list
             // with its selected rendered legend at index zero.  Keep the
             // source-fragment identity with that selection so continuation
@@ -951,34 +969,6 @@ impl<'a> LayoutBuilder<'a> {
             // <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
             let source_body_canvas =
                 principal_vertical_flow && self.principal_flow.is_source_body(child_element);
-            if source_body_canvas {
-                self.root_principal_flow_context.active_body = Some(child_element.id);
-                self.root_principal_flow_context
-                    .active_body_inline_end_inset = layout_pt(
-                    match inline_start_side(child_style.writing_mode, child_style.used_direction())
-                    {
-                        PhysicalSide::Top => child_style.margin.bottom,
-                        PhysicalSide::Bottom => child_style.margin.top,
-                        PhysicalSide::Left | PhysicalSide::Right => {
-                            unreachable!("a vertical writing mode must have a vertical inline axis")
-                        }
-                    },
-                );
-            }
-            // The legacy page-fragment cursor follows the physical top edge,
-            // whereas a sideways-lr body begins its inline progression at the
-            // physical bottom. Lay out each of its block children against an
-            // empty top-origin scratch line, then project the resulting
-            // fragment back to that bottom inline edge below. Otherwise the
-            // generic page-break check mistakes the bottom-origin cursor for
-            // an exhausted fragmentainer and creates a second page.
-            // <https://www.w3.org/TR/css-writing-modes-4/#logical-to-physical>
-            let body_bottom_inline_start = source_body_canvas
-                && inline_start_side(style.writing_mode, style.used_direction())
-                    == PhysicalSide::Bottom;
-            if body_bottom_inline_start {
-                self.cursor_y = self.page_top();
-            }
             self.last_block_layout_outcome = BlockLayoutOutcome::default();
             let mut rendered_legend_style;
             let child_layout_style =
@@ -1150,6 +1140,9 @@ impl<'a> LayoutBuilder<'a> {
                 if let Some(previous) = previous_block_static_position_y_offset {
                     self.block_static_position_y_offset = previous;
                 }
+                if inherited_adjoining_start_margin.is_some() {
+                    self.inherited_adjoining_start_margins.pop();
+                }
                 if rendered_fieldset_legend
                     && self.pages.len() == fieldset_legend_page_index
                     && let Some(border_box) = self.last_block_layout_outcome.static_border_box
@@ -1264,21 +1257,14 @@ impl<'a> LayoutBuilder<'a> {
                             "a vertical writing mode must have a horizontal block axis"
                         ),
                     };
-                    self.root_principal_flow_context.completed_body =
-                        Some(PrincipalFlowContribution {
-                            logical_block_advance: layout_pt(trailing_child_margin),
-                        });
+                    let active_canvas = self
+                        .root_principal_flow_context
+                        .active_canvas
+                        .as_mut()
+                        .expect("a propagated body keeps an active document canvas");
+                    debug_assert_eq!(active_canvas.body, Some(element.id));
+                    active_canvas.trailing_child_block_margin = layout_pt(trailing_child_margin);
                 }
-                let inline_translation = if body_bottom_inline_start {
-                    fragment
-                        .bounds()
-                        .map(|bounds| {
-                            self.page_bottom() + self.principal_inline_end_inset - bounds.y()
-                        })
-                        .unwrap_or(0.0)
-                } else {
-                    0.0
-                };
                 let canvas_child_block_start_translation =
                     if self.principal_flow.is_source_body(element)
                         && style.writing_mode == WritingMode::VerticalRl
@@ -1296,7 +1282,7 @@ impl<'a> LayoutBuilder<'a> {
                     };
                 self.current_page.append_paint_fragment_owned(
                     fragment,
-                    PaintTranslation::new(canvas_child_block_start_translation, inline_translation),
+                    PaintTranslation::new(canvas_child_block_start_translation, 0.0),
                 );
                 self.cursor_y = principal_flow_inline_cursor;
                 if !source_body_canvas {
@@ -1315,38 +1301,6 @@ impl<'a> LayoutBuilder<'a> {
                             )
                         }
                     }
-                }
-                if source_body_canvas {
-                    // The selected body supplies the document canvas, not a
-                    // viewport-sized block sibling. Its used block-end canvas
-                    // inset remains visible to later root inline content,
-                    // while the automatic canvas span itself does not advance
-                    // the root's logical cursor.
-                    // <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
-                    let block_end_inset = match block_start_side(style.writing_mode) {
-                        PhysicalSide::Left => child_style.margin.right,
-                        PhysicalSide::Right => child_style.margin.left,
-                        PhysicalSide::Top | PhysicalSide::Bottom => unreachable!(
-                            "a vertical writing mode must have a horizontal block axis"
-                        ),
-                    };
-                    let trailing_body_child_margin = self
-                        .root_principal_flow_context
-                        .completed_body
-                        .map(|contribution| contribution.logical_block_advance.points())
-                        .unwrap_or(0.0);
-                    let logical_block_advance = root_inline_body_canvas_completion(
-                        style.writing_mode,
-                        block_end_inset,
-                        trailing_body_child_margin,
-                    );
-                    self.root_principal_flow_context.completed_body =
-                        Some(PrincipalFlowContribution {
-                            logical_block_advance: layout_pt(logical_block_advance),
-                        });
-                    self.root_principal_flow_context.active_body = None;
-                    self.root_principal_flow_context
-                        .active_body_inline_end_inset = layout_pt(0.0);
                 }
             }
             if self.applied_clearance_count == clearance_count_before_child
@@ -1430,7 +1384,13 @@ impl<'a> LayoutBuilder<'a> {
                 }
             }
             if child_uses_block_layout && child_shares_clamp_context {
-                traversal_state.debit(self.last_block_layout_outcome.clamp_line_slots);
+                traversal_state
+                    .debit_rendered_slots(self.last_block_layout_outcome.clamp_line_slots);
+                if traversal_state.has_active_clamp()
+                    && self.last_block_layout_outcome.has_local_continuation_cutoff
+                {
+                    traversal_state.mark_local_continuation_cutoff();
+                }
             }
             if zero_height_page_boundary {
                 if let Some(child_page_start) = effective_child_page_start {
@@ -1491,33 +1451,4 @@ fn anonymous_block_wraps_root_principal_pseudo(children: &[box_tree::FormattingB
                 )
         })
     })
-}
-
-/// Returns the root-flow continuation left by a propagated body canvas.
-///
-/// The selected body supplies the initial canvas rather than an ordinary
-/// root block. Its automatic span is therefore discarded, but its used
-/// block-end canvas inset and its final child margin remain observable at the
-/// root inline continuation. The physical combination follows the principal
-/// writing-mode axes: sideways modes retain both edges, while the two
-/// vertical directions retain the edge that is traversed by their respective
-/// root inline continuation.
-///
-/// <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
-fn root_inline_body_canvas_completion(
-    writing_mode: WritingMode,
-    block_end_canvas_inset: f32,
-    trailing_child_block_margin: f32,
-) -> f32 {
-    match writing_mode {
-        WritingMode::SidewaysRl | WritingMode::SidewaysLr => {
-            block_end_canvas_inset + trailing_child_block_margin
-        }
-        WritingMode::VerticalRl => trailing_child_block_margin,
-        WritingMode::VerticalLr => block_end_canvas_inset,
-        WritingMode::HorizontalTb => {
-            let _ = (block_end_canvas_inset, trailing_child_block_margin);
-            0.0
-        }
-    }
 }

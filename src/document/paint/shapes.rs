@@ -63,6 +63,13 @@ pub struct RenderedRect {
     pub fill: Option<CssColor>,
     pub stroke: Option<CssColor>,
     pub stroke_width: PaintStrokeWidth,
+    /// An opaque decorative rectangle may explicitly remove the hidden
+    /// background beneath it during PDF realization. Gap rules use this to
+    /// prevent the background from leaking through a rasterized rule edge.
+    pub(crate) culls_opaque_underpaint: bool,
+    /// A PDF-private background for a later opaque edge; it is intentionally
+    /// retained so that edge's fractional coverage has the correct backdrop.
+    pub(crate) preserves_opaque_backdrop: bool,
 }
 
 impl RenderedRect {
@@ -83,7 +90,19 @@ impl RenderedRect {
             fill,
             stroke,
             stroke_width,
+            culls_opaque_underpaint: false,
+            preserves_opaque_backdrop: false,
         }
+    }
+
+    pub(crate) fn with_opaque_underpaint_culling(mut self) -> Self {
+        self.culls_opaque_underpaint = true;
+        self
+    }
+
+    pub(crate) fn with_opaque_backdrop_preservation(mut self) -> Self {
+        self.preserves_opaque_backdrop = true;
+        self
     }
 
     pub(crate) fn from_paint_rect(rect: PaintRect, fill: Option<CssColor>) -> Self {
@@ -92,6 +111,8 @@ impl RenderedRect {
             fill,
             stroke: None,
             stroke_width: PaintStrokeWidth::ZERO,
+            culls_opaque_underpaint: false,
+            preserves_opaque_backdrop: false,
         }
     }
 

@@ -27,11 +27,11 @@ fn can_shape_inline_text_prep_spans_together<F: InlineFragmentAccess>(
 ) -> bool {
     if inline_text_prep_span_is_join_control_only(left) {
         return !inline_box_edge_breaks_shaping(right.fragment.style())
-            && !inline_box_bidi_isolation_breaks_shaping(right.fragment.style());
+            && !inline_bidi_isolation_boundary_breaks_shaping(left.fragment, right.fragment);
     }
     if inline_text_prep_span_is_join_control_only(right) {
         return !inline_box_edge_breaks_shaping(left.fragment.style())
-            && !inline_box_bidi_isolation_breaks_shaping(left.fragment.style());
+            && !inline_bidi_isolation_boundary_breaks_shaping(left.fragment, right.fragment);
     }
     left.fragment.style().vertical_align == right.fragment.style().vertical_align
         && left.fragment.style().writing_mode == right.fragment.style().writing_mode
@@ -48,8 +48,7 @@ fn can_shape_inline_text_prep_spans_together<F: InlineFragmentAccess>(
         && left.fragment.resolved_bidi_direction() == right.fragment.resolved_bidi_direction()
         && !inline_box_edge_breaks_shaping(left.fragment.style())
         && !inline_box_edge_breaks_shaping(right.fragment.style())
-        && !inline_box_bidi_isolation_breaks_shaping(left.fragment.style())
-        && !inline_box_bidi_isolation_breaks_shaping(right.fragment.style())
+        && !inline_bidi_isolation_boundary_breaks_shaping(left.fragment, right.fragment)
 }
 
 /// Join visual fragments that retain glyphs from selected source slices.
@@ -94,6 +93,36 @@ fn compose_selected_source_shapes<F: InlineFragmentAccess>(
     result.text = Rc::from(text);
     result.width = width;
     Some(result)
+}
+
+/// Return a complete shaped source shared by every member of this paint group.
+///
+/// A strict source slice intentionally rejects a range that cuts through an
+/// OpenType cluster. That is correct for soft-wrap selection, but not for a
+/// transparent inline boundary: the complete selected source remains present
+/// in this group and must be emitted once with its original cluster geometry.
+/// <https://www.w3.org/TR/css-text-3/#boundary-shaping>.
+fn complete_boundary_shaped_source<F: InlineFragmentAccess>(
+    group: &[InlineTextPrepSpan<'_, F>],
+) -> Option<ShapedInlineLine> {
+    let first = group.first()?;
+    let source = first.fragment.boundary_shaped_source()?;
+    if !group.iter().all(|span| {
+        span.fragment
+            .boundary_shaped_source()
+            .is_some_and(|candidate| std::ptr::eq(source, candidate))
+    }) {
+        return None;
+    }
+
+    let mut selected_ranges = group
+        .iter()
+        .map(|span| span.fragment.boundary_shaped_range().cloned())
+        .collect::<Option<Vec<_>>>()?;
+    let mut source_ranges = source.fragment_ranges.to_vec();
+    selected_ranges.sort_by_key(|range| range.start);
+    source_ranges.sort_by_key(|range| range.start);
+    (selected_ranges == source_ranges).then(|| source.shaped.as_ref().clone())
 }
 
 impl<'a> LayoutBuilder<'a> {
@@ -169,11 +198,9 @@ impl<'a> LayoutBuilder<'a> {
             let has_join_control = group_text
                 .chars()
                 .any(crate::text::character_is_join_control);
-            let has_only_zwnj_controls = has_join_control
-                && group_text
-                    .chars()
-                    .filter(|character| crate::text::character_is_join_control(*character))
-                    .all(|character| character == '\u{200c}');
+            let has_joining_behavior = group_text
+                .chars()
+                .any(crate::text::character_has_joining_behavior);
             // Visual reordering reverses the order of the separate inline
             // fragments in an RTL run, while retaining the source order
             // inside each fragment. Keep join controls as their own spans so
@@ -182,24 +209,78 @@ impl<'a> LayoutBuilder<'a> {
             // RTL shaper, and is therefore ready for painting.
             // <https://www.w3.org/TR/css-text-3/#boundary-shaping> and
             // <https://www.unicode.org/reports/tr9/#Reordering_Resolved_Levels>
-            let logical_joining_spans = (has_join_control
+            let logical_joining_spans = ((has_join_control || has_joining_behavior)
                 && resolved_direction == ResolvedBidiDirection::Rtl)
-                .then(|| spans.iter().rev().copied().collect::<Vec<_>>());
+                .then(|| {
+                    let shared_boundary_source = group
+                        .first()
+                        .and_then(|span| span.fragment.boundary_shaped_source());
+                    let all_share_boundary_source = shared_boundary_source.is_some_and(|source| {
+                        group.iter().all(|span| {
+                            span.fragment
+                                .boundary_shaped_source()
+                                .is_some_and(|candidate| std::ptr::eq(source, candidate))
+                        })
+                    });
+                    if all_share_boundary_source {
+                        let mut indices = (0..group.len()).collect::<Vec<_>>();
+                        indices.sort_by_key(|&index| {
+                            group[index]
+                                .fragment
+                                .boundary_shaped_range()
+                                .expect("shared boundary source has ranges")
+                                .start
+                        });
+                        indices
+                            .into_iter()
+                            .map(|index| spans[index])
+                            .collect::<Vec<_>>()
+                    } else {
+                        // UAX #9 gives join controls no visual position. When
+                        // an author puts one in its own transparent inline span,
+                        // it can consequently appear after the visible
+                        // character that precedes it in visual order. Keep
+                        // that control with the preceding visual unit before
+                        // reversing RTL units back into their shaping order.
+                        // This restores `beh ZWNJ` rather than turning it
+                        // into `ZWNJ beh`.
+                        // <https://www.unicode.org/reports/tr9/#X9> and
+                        // <https://www.w3.org/TR/alreq/#h_joining-enforcement>
+                        let mut units = Vec::<Vec<StyledTextSpan<'_>>>::new();
+                        for span in &spans {
+                            if span.text.chars().all(character_is_join_control)
+                                && let Some(unit) = units.last_mut()
+                            {
+                                unit.push(*span);
+                            } else {
+                                units.push(vec![*span]);
+                            }
+                        }
+                        units.into_iter().rev().flatten().collect()
+                    }
+                });
             let shaping_spans = logical_joining_spans.as_deref().unwrap_or(&spans);
-            let reused_selected_shape = if !group_text.contains('\t')
-                && group.len() == 1
-                && (!has_join_control || has_only_zwnj_controls)
-                && group[0].text == group[0].fragment.text()
-            {
-                group[0].fragment.selected_shaped().cloned()
-            } else if !group_text.contains('\t')
-                && (!has_join_control || has_only_zwnj_controls)
-                && group.iter().all(|span| span.text == span.fragment.text())
-            {
-                compose_selected_source_shapes(group, &group_text)
-            } else {
-                None
-            };
+            let reused_boundary_shape = (!group_text.contains('\t'))
+                .then(|| complete_boundary_shaped_source(group))
+                .flatten();
+            let reused_selected_shape = reused_boundary_shape.or_else(|| {
+                if !group_text.contains('\t')
+                    && group.len() == 1
+                    && !has_join_control
+                    && !has_joining_behavior
+                    && group[0].text == group[0].fragment.text()
+                {
+                    group[0].fragment.selected_shaped().cloned()
+                } else if !group_text.contains('\t')
+                    && !has_join_control
+                    && !has_joining_behavior
+                    && group.iter().all(|span| span.text == span.fragment.text())
+                {
+                    compose_selected_source_shapes(group, &group_text)
+                } else {
+                    None
+                }
+            });
             let shaped = reused_selected_shape.or_else(|| {
                 self.font_system.shape_visually_ordered_inline_fragments(
                     shaping_spans,
@@ -257,8 +338,8 @@ impl<'a> LayoutBuilder<'a> {
         let paint_opacity = first
             .ancestor_inline_decorations()
             .iter()
-            .fold(first.style().opacity, |opacity, decoration| {
-                opacity * decoration.style.opacity
+            .fold(first.style().opacity.value(), |opacity, decoration| {
+                opacity * decoration.style.opacity.value()
             });
         let paint_scope_ancestry = Rc::from(
             first
@@ -305,5 +386,64 @@ impl<'a> LayoutBuilder<'a> {
             .apply_inter_word_justification(extra_per_separator, separator_count);
         group.set_width(group.width() + added_width);
         Some(group)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shared_source() -> Rc<BoundaryShapedSource> {
+        Rc::new(BoundaryShapedSource {
+            shaped: Rc::new(ShapedInlineLine {
+                text: Rc::from("علا"),
+                width: 30.0,
+                offset: 0.0,
+                aligned_by_parley: false,
+                line_height: 20.0,
+                baseline_adjustment: 0.0,
+                runs: Vec::new(),
+            }),
+            fragment_ranges: Rc::from(vec![0..2, 2..4, 4..6].into_boxed_slice()),
+        })
+    }
+
+    #[test]
+    fn complete_boundary_source_requires_every_original_fragment() {
+        let style = ComputedStyle::initial();
+        let source = shared_source();
+        let mut left = InlineFragment::new(
+            "ع",
+            style,
+            0.0,
+            None,
+            true,
+            InlineTextSource::Normal,
+            false,
+            InlineHangingEdges::default(),
+            Vec::new(),
+        );
+        let mut middle = left.clone();
+        middle.set_text("ل");
+        let mut right = left.clone();
+        right.set_text("ا");
+        left.set_boundary_shaped_source(Rc::clone(&source), 0..2);
+        middle.set_boundary_shaped_source(Rc::clone(&source), 2..4);
+        right.set_boundary_shaped_source(source, 4..6);
+
+        let complete = vec![
+            InlineTextPrepSpan::new(&left),
+            InlineTextPrepSpan::new(&middle),
+            InlineTextPrepSpan::new(&right),
+        ];
+        let complete_shape = complete_boundary_shaped_source(&complete)
+            .expect("complete boundary group should reuse its full shape");
+        assert_eq!(complete_shape.text.as_ref(), "علا");
+
+        let partial = vec![
+            InlineTextPrepSpan::new(&left),
+            InlineTextPrepSpan::new(&middle),
+        ];
+        assert!(complete_boundary_shaped_source(&partial).is_none());
     }
 }

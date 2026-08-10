@@ -25,6 +25,102 @@ fn element_contains(element: &Element, target: crate::dom::ElementId) -> bool {
         })
 }
 
+/// The entry point for the in-flow surrogate used to format an already
+/// resolved positioned box. It is intentionally separate from static-position
+/// geometry: the positioned resolver supplies a physical border-box origin,
+/// while this adapter enters the surrogate through the exact inline bridge
+/// that makes block-flow replay return to that border-box origin.
+/// <https://drafts.csswg.org/css-position-3/#staticpos-rect>
+/// <https://drafts.csswg.org/css-writing-modes-4/#inline-flow>
+#[derive(Debug, Clone, Copy)]
+struct PositionedFlowOrigin {
+    content_left: f32,
+    content_right: f32,
+    cursor_y: f32,
+}
+
+impl PositionedFlowOrigin {
+    fn from_resolved_positioned_box(
+        resolved_border_box: PageTopRect,
+        surrogate_inline_bridge: f32,
+    ) -> Self {
+        // A positioned principal is already resolved in page coordinates.
+        // Re-entering its flow surrogate must begin at that physical top edge,
+        // regardless of the logical inline-start side. Directional text
+        // preparation owns its own advance; moving the whole surrogate to a
+        // logical bottom edge displaces the principal border box.
+        // <https://drafts.csswg.org/css-writing-modes-4/#logical-to-physical>
+        let cursor_y = {
+            // Positioned layout has already resolved the physical border-box
+            // top. Re-entering its flow surrogate must preserve that edge;
+            // subtracting the logical inline extent moves a vertical
+            // positioned principal down by its entire height.
+            // <https://drafts.csswg.org/css-position-3/#absolute-positioning>
+            resolved_border_box.top_y()
+        };
+        Self {
+            // Block layout removes the full physical inline non-content
+            // extent while resolving a surrogate's outer border box. Passing
+            // the resolved border-box start here therefore replayed RTL and
+            // vertical-rl boxes one non-content extent away from the box used
+            // to select its snap position.
+            // This bridge intentionally stays physical: writing-mode
+            // projection happens in the normal block layout path.
+            // <https://www.w3.org/TR/css-position-3/#absolute-positioning>
+            content_left: resolved_border_box.x() + surrogate_inline_bridge,
+            content_right: resolved_border_box.x()
+                + surrogate_inline_bridge
+                + resolved_border_box.width(),
+            cursor_y,
+        }
+    }
+}
+
+/// Build the table-specific sizing contract from the absolute containing
+/// block and the already-resolved positioned content box.
+///
+/// The containing block supplies the available logical inline size for CSS
+/// Tables' auto-width algorithm. The resolved content size is forwarded only
+/// when the authored table has a definite logical block size; an intrinsic
+/// auto block size must remain owned by table row sizing. The final inset
+/// equation continues to own placement and is deliberately not represented in
+/// this record:
+/// <https://drafts.csswg.org/css-tables-3/#computing-the-table-width>,
+/// <https://drafts.csswg.org/css-tables-3/#computing-the-table-height>,
+/// <https://www.w3.org/TR/css-position-3/#absolute-positioning>, and
+/// <https://drafts.csswg.org/css-writing-modes-4/#dimension-mapping>.
+pub(in crate::layout) fn positioned_table_sizing_for_geometry(
+    source_style: &ComputedStyle,
+    style: &ComputedStyle,
+    containing_block: ContainingBlock,
+    content_width: PhysicalContentWidth,
+    content_height: PhysicalContentHeight,
+) -> PositionedTableSizing {
+    let writing_mode = style.writing_mode;
+    let available_inline_size = if writing_mode.has_vertical_lines() {
+        LogicalInlineContentSize::new(content_box_pt(containing_block.height()))
+    } else {
+        LogicalInlineContentSize::new(content_box_pt(containing_block.width()))
+    };
+    let authored_block_size_is_definite = if writing_mode.has_vertical_lines() {
+        !source_style.box_values.width.is_auto()
+    } else {
+        !source_style.box_values.height.is_auto()
+    };
+    let definite_block_content_size = authored_block_size_is_definite.then(|| {
+        LogicalBlockContentSize::new(if writing_mode.has_vertical_lines() {
+            content_width.content_box_length()
+        } else {
+            content_height.content_box_length()
+        })
+    });
+    PositionedTableSizing {
+        available_inline_size,
+        definite_block_content_size,
+        writing_mode,
+    }
+}
+
 impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn layout_positioned_block(
         &mut self,
@@ -37,6 +133,29 @@ impl<'a> LayoutBuilder<'a> {
         let positioned_style = self.positioned_used_style(style);
         let source_style = positioned_style.source();
         let style = positioned_style.used();
+        let source_static_rect = self
+            .absolute_static_position
+            .and_then(AbsoluteStaticPosition::horizontal_block_static_rectangle)
+            .map(|rect| {
+                PositionedChildStaticRect::new(rect.x(), rect.x() + rect.width(), rect.top_y())
+            })
+            .unwrap_or_else(|| {
+                PositionedChildStaticRect::new(self.content_left, self.content_right, self.cursor_y)
+            });
+        let captures_multicol_positioned_principal =
+            self.capture_multicol_positioned_principal(element, source_style, source_static_rect);
+        if captures_multicol_positioned_principal && self.multicol_balance_probe_depth > 0 {
+            // A balance probe asks only whether in-flow content fits a
+            // candidate column height. Its temporary pages do not own the
+            // positioned principal, and the deferred descriptor above keeps
+            // the final static-position source for the one committed replay.
+            // Running the surrogate here would allocate (and then clone on
+            // restore) speculative positioned paint for every binary-search
+            // candidate.
+            // <https://drafts.csswg.org/css-multicol-1/#column-balancing>
+            // <https://drafts.csswg.org/css-position/#abspos-breaking>
+            return;
+        }
         // Positioned table roots bypass the normal table dispatcher, which
         // ordinarily materializes this frozen structure before table layout.
         // The absolute-position equation needs the conflict-resolved outer
@@ -66,16 +185,19 @@ impl<'a> LayoutBuilder<'a> {
             table_fragment
         };
         let containment = used_property_containment(element, style);
-        let paint_checkpoint = self.current_page.paint_checkpoint();
         let paint_page_index = self.pages.len();
-        let static_scroll_snap_scope = self.begin_static_scroll_snap_scope(style, false);
+        // The positioned principal's resolved in-flow surrogate owns static
+        // scroll-snap capture. At this boundary its final block size is not
+        // available yet; opening a scope here would construct a zero-height
+        // snapport before the surrogate has established the used padding box.
+        // <https://www.w3.org/TR/css-scroll-snap-1/#scroll-snap-model>
+        let static_scroll_snap_scope = false;
         let positioned_layer_start = self.positioned_layers.len();
         let fixed_layer_start = self.fixed_layers.len();
         let retained_viewport_fixed_descendant = self
             .fixed_layers
             .iter()
             .any(|layer| element_contains(element, layer.source_element));
-        let pagination_state = self.positioned_pagination_state();
         let previous_left = self.content_left;
         let previous_right = self.content_right;
         let previous_cursor_y = self.cursor_y;
@@ -443,49 +565,139 @@ impl<'a> LayoutBuilder<'a> {
                     true,
                 )
             });
-        // Ordinary flow has no layout-specific abspos alignment record, but
-        // explicit self-alignment still uses its static-position rectangle
-        // when both insets are automatic. The positioned containing block is
-        // the conservative complete rectangle available at this boundary;
-        // Flexbox and Grid install their more specific records above.
+        // The static-position rectangle is an alignment container derived
+        // from the formatting context the box would have joined, not the
+        // actual absolute-position containing block. For ordinary block flow
+        // it has zero block-axis thickness; for inline flow it has zero
+        // inline-axis thickness and spans the hypothetical line box.
+        // <https://drafts.csswg.org/css-position-3/#staticpos-rect>
         // <https://drafts.csswg.org/css-align-3/#align-abspos>
-        if absolute_static_position.is_none()
-            && (style.justify_self.keyword != SelfAlignmentKeyword::Auto
-                || style.align_self.keyword != SelfAlignmentKeyword::Auto)
-        {
-            let inline = if style.justify_self.keyword == SelfAlignmentKeyword::Auto {
-                css::SelfAlignment::NORMAL
+        let static_context = self.block_static_position_contexts.last().copied();
+        let retained_static_rectangle =
+            absolute_static_position.and_then(AbsoluteStaticPosition::static_position_rectangle);
+        let inline_static_position = self.inline_static_position;
+        let (area, writing_mode, direction, default_inline, default_block) =
+            if let Some(rectangle) = retained_static_rectangle {
+                (
+                    rectangle.area,
+                    rectangle.writing_mode,
+                    rectangle.direction,
+                    rectangle.justify_items,
+                    rectangle.align_items,
+                )
+            } else if style.abspos_static_source.is_inline_level()
+                && let Some(position) = inline_static_position
+            {
+                (
+                    position.rectangle.area,
+                    position.rectangle.writing_mode,
+                    position.rectangle.direction,
+                    position.rectangle.justify_items,
+                    position.rectangle.align_items,
+                )
+            } else if let Some((context, area)) = static_context
+                .filter(|context| !context.axes.writing_mode().has_vertical_lines())
+                .zip(
+                    absolute_static_position
+                        .and_then(AbsoluteStaticPosition::horizontal_block_static_rectangle),
+                )
+            {
+                // The child may be replayed after its block formatting scope
+                // has unwound (notably from an atomic inline). The retained
+                // hypothetical source position is therefore the authoritative
+                // inline span, rather than the current outer builder span.
+                (
+                    area,
+                    context.axes.writing_mode(),
+                    context.axes.direction(),
+                    context.justify_items,
+                    context.align_items,
+                )
+            } else if let Some(context) = static_context {
+                let area = if context.axes.writing_mode().has_vertical_lines() {
+                    let x = match block_start_side(context.axes.writing_mode()) {
+                        PhysicalSide::Left => context.content_rect.x(),
+                        PhysicalSide::Right => {
+                            context.content_rect.x() + context.content_rect.width()
+                        }
+                        PhysicalSide::Top | PhysicalSide::Bottom => {
+                            unreachable!("a vertical writing mode has a horizontal block axis")
+                        }
+                    };
+                    PageTopRect::new(
+                        x,
+                        context.content_rect.top_y(),
+                        0.0,
+                        context.content_rect.height(),
+                    )
+                } else {
+                    PageTopRect::new(
+                        context.content_rect.x(),
+                        previous_cursor_y,
+                        context.content_rect.width(),
+                        0.0,
+                    )
+                };
+                (
+                    area,
+                    context.axes.writing_mode(),
+                    context.axes.direction(),
+                    context.justify_items,
+                    context.align_items,
+                )
             } else {
-                style.justify_self
-            };
-            let block = if style.align_self.keyword == SelfAlignmentKeyword::Auto {
-                css::SelfAlignment::NORMAL
-            } else {
-                style.align_self
-            };
-            absolute_static_position = Some(source_static_position.with_static_alignment(
-                AbsposStaticAlignment::new(
-                    containing_block.rect,
+                // Page-margin and detached replay roots have no active block
+                // context. Retain a degenerate ordinary-flow rectangle rather
+                // than accidentally expanding it to the actual containing
+                // block.
+                (
+                    PageTopRect::new(static_source_left, previous_cursor_y, 0.0, 0.0),
                     self.containing_block_writing_mode,
                     self.containing_block_direction,
-                    inline,
-                    block,
-                ),
-            ));
+                    css::SelfAlignment::NORMAL,
+                    css::SelfAlignment::NORMAL,
+                )
+            };
+        // `auto` inherits the parent's default only while determining the
+        // static position; it behaves as `normal` for final abspos layout.
+        // <https://drafts.csswg.org/css-align-3/#justify-self-property>
+        let inline = if style.justify_self.keyword == SelfAlignmentKeyword::Auto {
+            default_inline
+        } else {
+            style.justify_self
+        };
+        let block = if style.align_self.keyword == SelfAlignmentKeyword::Auto {
+            default_block
+        } else {
+            style.align_self
+        };
+        // An ordinary-flow rectangle is authoritative even when an earlier
+        // speculative pass attached stale alignment geometry. Flex and Grid
+        // never install this payload, so their formatting-context-specific
+        // static rectangles remain untouched.
+        if retained_static_rectangle.is_some()
+            || (absolute_static_position
+                .and_then(AbsoluteStaticPosition::static_alignment)
+                .is_none()
+                && (inline.keyword != SelfAlignmentKeyword::Normal
+                    || block.keyword != SelfAlignmentKeyword::Normal))
+        {
+            absolute_static_position = Some(
+                absolute_static_position
+                    .unwrap_or(source_static_position)
+                    .with_static_alignment(AbsposStaticAlignment::new(
+                        area,
+                        writing_mode,
+                        direction,
+                        style.writing_mode,
+                        style.used_direction(),
+                        inline,
+                        block,
+                    )),
+            );
         }
         let inline_auto_static_y =
             style.abspos_static_source.is_inline_level() && vertical_insets_are_auto;
-        let inline_static_position = self.inline_static_position;
-        let inline_static_uses_margin_box_top = inline_auto_static_y
-            && inline_static_position.is_some_and(|position| position.use_margin_box_top);
-        // A margin-box static rectangle already fixes the positioned
-        // fragment's block-start. Translating its first line again from a
-        // baseline would shift atomic inline sources twice. Baseline-mode
-        // placeholders instead use the prepared line baseline below.
-        let inline_static_baseline_position = (inline_auto_static_y
-            && !inline_static_uses_margin_box_top)
-            .then_some(inline_static_position)
-            .flatten();
         let inline_auto_static_x =
             style.abspos_static_source.is_inline_level() && horizontal_insets_are_auto;
         let mut static_horizontal_position =
@@ -496,9 +708,10 @@ impl<'a> LayoutBuilder<'a> {
                     .then_some(inline_static_position)
                     .flatten()
                     .map(|position| {
-                        StaticHorizontalPosition::new(
-                            position.start_x - containing_block.x(),
-                            containing_block.x() + containing_block.width() - position.end_x,
+                        PhysicalStaticAxisFallback::new(
+                            position.rectangle.area.x() - containing_block.x(),
+                            containing_block.x() + containing_block.width()
+                                - (position.rectangle.area.x() + position.rectangle.area.width()),
                         )
                     })
                     .unwrap_or_else(|| source_static_position.horizontal_position(containing_block))
@@ -509,8 +722,8 @@ impl<'a> LayoutBuilder<'a> {
                 absolute_static_position.filter(|position| position.has_vertical_position())
         {
             position.vertical_start(containing_block)
-        } else if inline_static_uses_margin_box_top && let Some(position) = inline_static_position {
-            containing_block.top_y() - position.top_y
+        } else if inline_auto_static_y && let Some(position) = inline_static_position {
+            containing_block.top_y() - position.rectangle.area.top_y()
         } else {
             // The static position is a signed offset from the containing
             // block and may legitimately fall before its block-start edge.
@@ -617,17 +830,51 @@ impl<'a> LayoutBuilder<'a> {
             && let Some(static_alignment) =
                 absolute_static_position.and_then(AbsoluteStaticPosition::static_alignment)
         {
-            static_horizontal_position = static_alignment.horizontal_static_position(
-                containing_block,
-                static_alignment_border_width,
-                style.margin.left,
-                style.margin.right,
-            );
+            let formatting_context_static_alignment = absolute_static_position
+                .is_some_and(AbsoluteStaticPosition::has_formatting_context_static_alignment);
+            static_horizontal_position = if static_alignment.inline.keyword
+                == SelfAlignmentKeyword::Normal
+                && !formatting_context_static_alignment
+                && (style.position == Position::Fixed
+                    || style.display.is_table()
+                    || !style.abspos_static_source.is_inline_level())
+            {
+                // Ordinary-flow block rectangles retain both physical
+                // inline-side distances. CSS 2 selects `left` or `right`
+                // only later, from the static containing block's direction;
+                // reducing this rectangle to its left edge moves RTL sources
+                // outside their containing block.
+                // <https://drafts.csswg.org/css-position-3/#resolving-auto-insets>
+                // <https://www.w3.org/TR/CSS22/visudet.html#abs-non-replaced-width>
+                let start = static_alignment.area.x() - containing_block.x();
+                let end = containing_block.x() + containing_block.width()
+                    - (static_alignment.area.x() + static_alignment.area.width());
+                PhysicalStaticAxisFallback::new_unclamped(start, end)
+            } else {
+                static_alignment.horizontal_static_position(
+                    containing_block,
+                    static_alignment_border_width,
+                    style.margin.left,
+                    style.margin.right,
+                )
+            };
         }
-        let containing_horizontal_direction = physical_horizontal_axis_direction(
-            self.containing_block_writing_mode,
-            self.containing_block_direction,
-        );
+        let containing_horizontal_direction = retained_static_rectangle
+            .map(StaticPositionRectangle::css2_horizontal_direction)
+            .unwrap_or_else(|| physical_horizontal_axis_direction(writing_mode, direction));
+        // Static-position alignment is defined in the static-position
+        // containing block's logical axes. When a physical inset pair is
+        // explicit, its available area becomes the actual containing block,
+        // but that does not retag `justify-self` and `align-self` with the
+        // actual containing block's writing mode.
+        // <https://drafts.csswg.org/css-align-3/#align-abspos>
+        let final_alignment_container_axes = absolute_static_position
+            .and_then(AbsoluteStaticPosition::static_alignment)
+            .map(|alignment| (alignment.writing_mode, alignment.direction))
+            .unwrap_or((
+                self.containing_block_writing_mode,
+                self.containing_block_direction,
+            ));
         let mut positioned_x = resolve_absolute_horizontal_with_non_content(
             style,
             containing_block,
@@ -650,6 +897,33 @@ impl<'a> LayoutBuilder<'a> {
             containing_horizontal_direction,
             horizontal_non_content,
         );
+        // When both physical insets are specified, CSS Box Alignment aligns
+        // the subject inside the inset-modified containing block. This is a
+        // final abspos alignment step, distinct from deriving a static inset
+        // pair for a double-auto axis.
+        // <https://drafts.csswg.org/css-align-3/#abspos-align>
+        if left_inset.is_some()
+            && right_inset.is_some()
+            && style.justify_self.keyword != SelfAlignmentKeyword::Auto
+        {
+            let alignment = AbsposStaticAlignment::new(
+                containing_block.rect,
+                final_alignment_container_axes.0,
+                final_alignment_container_axes.1,
+                style.writing_mode,
+                style.used_direction(),
+                style.justify_self,
+                style.align_self,
+            );
+            positioned_x.start = alignment
+                .horizontal_static_position(
+                    containing_block,
+                    static_alignment_border_width,
+                    style.margin.left,
+                    style.margin.right,
+                )
+                .left;
+        }
         // An absolutely positioned table is laid out against the containing
         // block's available size, even when the generic absolute-position
         // equation has two opposing insets that would span a larger range.
@@ -755,12 +1029,33 @@ impl<'a> LayoutBuilder<'a> {
             && let Some(static_alignment) =
                 absolute_static_position.and_then(AbsoluteStaticPosition::static_alignment)
         {
-            static_vertical_start = static_alignment.vertical_static_start(
-                containing_block,
-                static_alignment_border_height,
-                style.margin.top,
-                style.margin.bottom,
-            );
+            let formatting_context_static_alignment = absolute_static_position
+                .is_some_and(AbsoluteStaticPosition::has_formatting_context_static_alignment);
+            static_vertical_start = if static_alignment.block.keyword
+                == SelfAlignmentKeyword::Normal
+                && !formatting_context_static_alignment
+                && WritingModeAxes::new(static_alignment.writing_mode, static_alignment.direction)
+                    .logical_axis_for_physical(PhysicalAxis::Vertical)
+                    == LogicalAxis::Block
+                && (style.position == Position::Fixed
+                    || style.display.is_table()
+                    || (!style.abspos_static_source.is_inline_level()
+                        && style.used_direction() == Direction::Ltr))
+            {
+                // As on the horizontal axis, an ordinary-flow normal static
+                // rectangle is already pinned to its hypothetical start
+                // edge. Let the absolute-position equation apply the margin
+                // once rather than adding it while deriving that edge.
+                // <https://drafts.csswg.org/css-position-3/#resolving-auto-insets>
+                containing_block.top_y() - static_alignment.area.top_y()
+            } else {
+                static_alignment.vertical_static_start(
+                    containing_block,
+                    static_alignment_border_height,
+                    style.margin.top,
+                    style.margin.bottom,
+                )
+            };
         }
         let positioned_y = resolve_absolute_vertical(
             style,
@@ -780,6 +1075,27 @@ impl<'a> LayoutBuilder<'a> {
             static_vertical_start,
             vertical_border_width_for_positioning,
         );
+        let mut positioned_y = positioned_y;
+        if top_inset.is_some()
+            && bottom_inset.is_some()
+            && style.align_self.keyword != SelfAlignmentKeyword::Auto
+        {
+            let alignment = AbsposStaticAlignment::new(
+                containing_block.rect,
+                final_alignment_container_axes.0,
+                final_alignment_container_axes.1,
+                style.writing_mode,
+                style.used_direction(),
+                style.justify_self,
+                style.align_self,
+            );
+            positioned_y.start = alignment.vertical_static_start(
+                containing_block,
+                static_alignment_border_height,
+                style.margin.top,
+                style.margin.bottom,
+            );
+        }
         let positioned_content_height = positioned_y.size;
         // A min/max constraint on an automatic block size transfers through
         // the preferred aspect ratio to constrain the automatic inline size.
@@ -846,22 +1162,40 @@ impl<'a> LayoutBuilder<'a> {
         let positioned_border_box_width = positioned_content_width + horizontal_non_content;
         self.content_left = containing_block.x() + positioned_x.start + positioned_x.margin_start;
         self.content_right = self.content_left + positioned_border_box_width;
-        let positioned_margin_top = if inline_auto_static_y {
-            if inline_static_uses_margin_box_top {
-                // The hypothetical atomic inline supplies its margin-box
-                // block-start as the static rectangle. The absolute-position
-                // equation has already selected that edge, so subtracting
-                // the positioned box's start margin here would apply it a
-                // second time.
-                // <https://www.w3.org/TR/css-position-3/#staticpos-rect>
-                0.0
-            } else {
-                ((style.line_height - style.font_size) / 2.0).max(0.0)
-            }
+        // A direct atomic-inline placeholder is already anchored at its
+        // hypothetical margin-box block start. A formatting-context or
+        // ordinary static-alignment payload, however, supplies the same
+        // margin-box inset to the absolute-position equation and therefore
+        // still needs the one normal margin-to-border conversion here.
+        let static_alignment_uses_margin_box_inset = absolute_static_position
+            .and_then(AbsoluteStaticPosition::static_alignment)
+            .is_some();
+        let positioned_margin_top = if inline_auto_static_y
+            && style.abspos_static_source.is_atomic_inline()
+            && !static_alignment_uses_margin_box_inset
+        {
+            0.0
         } else {
             positioned_y.margin_start
         };
         self.cursor_y = containing_block.top_y() - positioned_y.start - positioned_margin_top;
+        log::trace!(
+            target: "quire::layout::static_position",
+            "checkpoint=resolved-box element={:?} css2_horizontal_direction={:?} text_indent={:.2} positioned=(x_start:{:.2},x_margin:{:.2},y_start:{:.2},y_margin:{:.2},content_width:{:.2},content_height:{:.2}) page_border_box=(x:{:.2},top:{:.2},width:{:.2},height:{:.2})",
+            element.id,
+            containing_horizontal_direction,
+            style.text_indent.amount.length_points(),
+            positioned_x.start,
+            positioned_x.margin_start,
+            positioned_y.start,
+            positioned_margin_top,
+            positioned_content_width,
+            positioned_content_height,
+            self.content_left,
+            self.cursor_y,
+            positioned_border_box_width,
+            positioned_content_height + style.padding.top + style.padding.bottom + vertical_border_width_for_positioning,
+        );
         // Enter the destination fragmentainer's local coordinate space before
         // laying out the positioned subtree. Keeping a continuous coordinate
         // below the source page and translating captured paint afterward loses
@@ -871,10 +1205,21 @@ impl<'a> LayoutBuilder<'a> {
         if positioned_page_offset > 0 {
             self.cursor_y += positioned_page_offset as f32 * self.page_area_height().max(1.0);
         }
+        let positioned_flow_margin_box_top = self.cursor_y;
         let positioned_border_box_height = positioned_content_height
             + style.padding.top
             + style.padding.bottom
             + vertical_border_width_for_positioning;
+        let positioned_table_sizing =
+            (style.display.is_table() && table_fragment.is_some()).then(|| {
+                positioned_table_sizing_for_geometry(
+                    source_style,
+                    style,
+                    containing_block,
+                    PhysicalContentWidth::new(content_box_pt(positioned_content_width)),
+                    PhysicalContentHeight::new(content_box_pt(positioned_content_height)),
+                )
+            });
         let positioned_border_box = PageTopRect::new(
             self.content_left,
             self.cursor_y,
@@ -903,9 +1248,8 @@ impl<'a> LayoutBuilder<'a> {
 
         let mut flow_style = style.clone();
         flow_style.position = Position::Static;
-        // This positioned principal box owns the scroll-capture boundary;
-        // its blockified flow surrogate must not open a duplicate scope.
-        flow_style.scroll_snap_type = css::ScrollSnapType::None;
+        // The blockified flow surrogate has the final used padding box, so it
+        // owns static scroll capture for this positioned scroll container.
         // The surrogate is laid out at its static-flow origin solely to
         // capture the positioned principal's contents.  It is not a second
         // CSS box, so it must not contribute a duplicate snap area at that
@@ -947,6 +1291,62 @@ impl<'a> LayoutBuilder<'a> {
         let previous_overflow_clips = self.overflow_clips.clone();
         self.overflow_clips =
             positioned_applicable_overflow_clips(&previous_overflow_clips, containing_block);
+        let positioned_paint_reach =
+            PositionedPaintReach::from_overflow_clips(&self.overflow_clips);
+        // Resolve the complete continuous positioned extent before its
+        // surrogate enters scratch fragmentation. The resulting plan is the
+        // only authority for a proven clipped materialization bound; applying
+        // it after capture would merely discard the already-allocated tail.
+        // <https://drafts.csswg.org/css-position/#abspos-breaking>
+        let principal_page_span_target = self.absolute_positioned_page_span_target(
+            style,
+            containing_block,
+            positioned_y,
+            vertical_border_width_for_positioning,
+            containing_block_origin_page_index.saturating_sub(
+                if containing_block_origin_page_index > 0 {
+                    positioned_page_offset
+                } else {
+                    0
+                },
+            ),
+        );
+        let mut positioned_fragmentation_plan = if style.position == Position::Absolute {
+            PositionedFragmentationPlan::for_absolute_box(
+                positioned_origin_page_index,
+                principal_page_span_target,
+                self.page_top(),
+                layout_pt(self.page_area_height()),
+                positioned_paint_reach,
+            )
+        } else {
+            PositionedFragmentationPlan::for_absolute_box(
+                paint_page_index,
+                None,
+                self.page_top(),
+                layout_pt(self.page_area_height()),
+                PositionedPaintReach::PotentiallyVisible,
+            )
+        };
+        let positioned_paint_transaction = PositionedPaintTransaction::begin(
+            self,
+            positioned_fragmentation_plan.scratch_page_limit(),
+        );
+        let previous_fragmentainer_override = self.fragmentainer_override;
+        if self.fragmentainer_override.is_none() && style.position == Position::Absolute {
+            // An absolutely positioned principal establishes one continuous
+            // formatting context. Its internally generated fragmentainers
+            // use the initial page-area geometry; later document pages may
+            // have different margin boxes without changing the principal's
+            // used block formatting context.
+            self.fragmentainer_override = Some(FragmentainerOverride {
+                kind: FragmentainerKind::Page,
+                initial_context: self.initial_viewport_context,
+                initial_fragmentainer_count: 0,
+                context: self.initial_viewport_context,
+                relax_widows_orphans: false,
+            });
+        }
         let previous_defer_block_decoration_promotion = self.defer_next_block_decoration_promotion;
         // The positioned stacking context owns its principal decoration. Keep
         // that decoration in the background/border band so overflow and paint
@@ -960,6 +1360,48 @@ impl<'a> LayoutBuilder<'a> {
         // its auto block-size; floats created inside remain local to it.
         // <https://www.w3.org/TR/CSS22/visuren.html#dis-pos-flo>
         self.push_float_context();
+        if let Some(sizing) = positioned_table_sizing {
+            self.push_positioned_table_sizing(sizing);
+        }
+        let positioned_flow_origin = PositionedFlowOrigin::from_resolved_positioned_box(
+            PageTopRect::new(
+                self.content_left,
+                positioned_flow_margin_box_top,
+                positioned_content_width,
+                positioned_content_height,
+            ),
+            // An explicit physical inset has already resolved the surrogate's
+            // border-box origin.  Only a static inline position is produced
+            // from its hypothetical content insertion edge and needs the
+            // block-flow non-content bridge on replay.
+            // <https://drafts.csswg.org/css-position-3/#staticpos-rect>
+            if horizontal_insets_are_auto && style.abspos_static_source.is_inline_level() {
+                positioned_border_widths.left
+                    + positioned_border_widths.right
+                    + flow_style.padding.left
+                    + flow_style.padding.right
+            } else {
+                0.0
+            },
+        );
+        self.content_left = positioned_flow_origin.content_left;
+        self.content_right = positioned_flow_origin.content_right;
+        self.cursor_y = positioned_flow_origin.cursor_y;
+        log::trace!(
+            target: "quire::layout::static_position",
+            "checkpoint=positioned-flow-origin element={:?} content=(x:{:.2},top:{:.2},bottom:{:.2},width:{:.2},height:{:.2}) axes=({:?},{:?}) inline_start={:?} cursor_y={:.2}",
+            element.id,
+            self.content_left,
+            positioned_flow_margin_box_top,
+            positioned_flow_margin_box_top - positioned_content_height,
+            positioned_content_width,
+            positioned_content_height,
+            style.writing_mode,
+            style.used_direction(),
+            WritingModeAxes::new(style.writing_mode, style.used_direction())
+                .physical_side(LogicalSide::InlineStart),
+            self.cursor_y,
+        );
         // The positioned stacking context assembled below owns the principal
         // transform, opacity, and clipping effects for this box.  Re-entering
         // the generic element dispatcher with its normal effect capture would
@@ -979,6 +1421,16 @@ impl<'a> LayoutBuilder<'a> {
             table_fragment,
             false,
         );
+        self.fragmentainer_override = previous_fragmentainer_override;
+        log::trace!(
+            target: "quire::layout::static_position",
+            "checkpoint=positioned-flow-outcome element={:?} block_outcome={:?}",
+            element.id,
+            self.last_block_layout_outcome,
+        );
+        if positioned_table_sizing.is_some() {
+            self.positioned_table_sizing.pop();
+        }
         self.pop_float_context();
         self.defer_next_block_decoration_promotion = previous_defer_block_decoration_promotion;
         self.overflow_clips = previous_overflow_clips;
@@ -992,50 +1444,60 @@ impl<'a> LayoutBuilder<'a> {
             Vec::new()
         };
         let has_principal_decoration = style.visibility == Visibility::Visible
-            && (style.background_color.is_potentially_visible()
-                || style.background_image.is_image()
+            && (style.background.background_color.is_potentially_visible()
+                || style.background.background_image.is_image()
                 || style.border_image.source.is_image()
                 || used_border_width(style) > layout_pt(0.0)
                 || (style.outline_width > 0.0 && !style.outline_style.suppresses_used_width()));
         let viewport_fixed_descendant =
             retained_viewport_fixed_descendant || self.fixed_layers.len() > fixed_layer_start;
-        // A transparent absolute principal still occupies a sequence of page
-        // fragmentainers.  That structural span is independent from whether
-        // the principal itself has background/border paint: viewport-fixed
-        // descendants replay on every occupied page.
-        // https://drafts.csswg.org/css-position-3/#fragmenting-absolutely-positioned-elements
-        let principal_page_span_target = self.absolute_positioned_page_span_target(
-            style,
-            containing_block,
-            positioned_y,
-            vertical_border_width_for_positioning,
-            containing_block_origin_page_index.saturating_sub(
-                if containing_block_origin_page_index > 0 {
-                    positioned_page_offset
-                } else {
-                    0
-                },
-            ),
+        let scroll_padding_box = paint_space_rect(
+            positioned_border_box.x() + positioned_border_widths.left,
+            positioned_border_box.y() + positioned_border_widths.bottom,
+            (positioned_border_box.width()
+                - positioned_border_widths.left
+                - positioned_border_widths.right)
+                .max(0.0),
+            (positioned_border_box.height()
+                - positioned_border_widths.top
+                - positioned_border_widths.bottom)
+                .max(0.0),
         );
-        let mut positioned_fragments =
-            self.take_positioned_fragments_since(paint_page_index, paint_checkpoint);
-        if has_principal_decoration && let Some(target_page_index) = principal_page_span_target {
-            let captured_last_page_index = positioned_fragments
-                .iter()
-                .map(|(page_index, _)| *page_index)
-                .max()
-                .unwrap_or(paint_page_index);
-            self.extend_positioned_principal_decoration_fragments(
-                &mut positioned_fragments,
-                style,
-                positioned_border_box,
-                paint_page_index,
-                captured_last_page_index,
-                target_page_index,
-                pagination_state.current_page_context,
+        // A positioned box without a z-index is still the clipping owner for
+        // its positioned descendants when both *used* overflow axes clip.
+        // Root/body overflow propagated to the viewport becomes `visible` on
+        // the source element, so this reconstruction must not read the
+        // computed longhands directly.
+        // <https://www.w3.org/TR/css-overflow-3/#overflow-clipping>
+        // <https://www.w3.org/TR/css-overflow-3/#overflow-propagation>
+        let used_positioned_overflow = self.used_overflow_axes_for_element(element, style);
+        let positioned_contents_clip = (used_positioned_overflow.clips_x()
+            && used_positioned_overflow.clips_y())
+        .then_some(scroll_padding_box);
+        let static_scroll_offset = self.finish_static_scroll_snap_scope(
+            static_scroll_snap_scope,
+            scroll_padding_box,
+            scroll_padding_box,
+        );
+        // A positioned principal's scratch paint has one escape route: the
+        // transaction drains it, restores the parent page sequence, and
+        // returns non-cloneable scratch fragments. This must happen before
+        // any final positioned layer is assembled.
+        let captured_paint = positioned_paint_transaction.capture_and_restore(self);
+        let initial_page_context = captured_paint.initial_page_context;
+        // A viewport-fixed descendant is output-relevant on every final
+        // page. Its presence invalidates the otherwise safe clipped scratch
+        // bound, so retain the full conceptual span for this transaction.
+        if style.position == Position::Absolute && viewport_fixed_descendant {
+            positioned_fragmentation_plan = PositionedFragmentationPlan::for_absolute_box(
+                positioned_origin_page_index,
+                principal_page_span_target,
+                self.page_top(),
+                layout_pt(self.page_area_height()),
+                PositionedPaintReach::PotentiallyVisible,
             );
         }
-        if style.position == Position::Absolute {
+        let mut positioned_fragments = if style.position == Position::Absolute {
             // Preserve every captured slice when moving scratch pagination to
             // the absolute box's destination sequence. A slice can contain
             // only background, border, or another non-text paint primitive;
@@ -1043,9 +1505,8 @@ impl<'a> LayoutBuilder<'a> {
             // drops those observable fragments.
             // <https://www.w3.org/TR/css-break-3/#fragmentation-model>
             // <https://drafts.csswg.org/css-position-3/#fragmenting-absolutely-positioned-elements>
-            self.remap_absolute_positioned_fragments(
-                &mut positioned_fragments,
-                paint_page_index,
+            captured_paint.into_final_absolute(AbsoluteFragmentPlacement::new(
+                0,
                 // Scratch pagination starts at the containing formatting
                 // context's source fragment, while an explicitly offset
                 // nested absolute box has already entered the containing
@@ -1059,67 +1520,95 @@ impl<'a> LayoutBuilder<'a> {
                     } else {
                         0
                     },
-            );
-            // A descendant positioned box resolves its containing block from
-            // this box's destination-page origin. Its layer page index is
-            // therefore already final, even though the parent principal
-            // fragments above were captured in scratch fragmentainers.
-            // Remapping it again would shift a nested absolute box by the
-            // parent page offset a second time.
-            // <https://drafts.csswg.org/css-position-3/#fragmenting-absolutely-positioned-elements>
+            ))
+        } else {
+            captured_paint.into_final_same_pages()
+        };
+        let observed_positioned_target_page_index = positioned_fragments
+            .iter()
+            .filter(|fragment| !fragment.fragment().is_empty())
+            .map(|fragment| fragment.destination_page().get())
+            .max();
+        // A principal's own page span is not an output bound for independently
+        // positioned descendants. In particular, a transparent absolute box
+        // can own a nested absolute descendant whose resolved destination is
+        // later than the parent principal. Only a non-scrollable overflow
+        // clip proves that such a tail cannot paint.
+        // <https://drafts.csswg.org/css-position/#abspos-breaking>
+        if matches!(positioned_paint_reach, PositionedPaintReach::Clipped { .. })
+            && let Some(materialized_end) =
+                positioned_fragmentation_plan.materialized_destination_end()
+        {
+            positioned_fragments
+                .retain(|fragment| fragment.destination_page().get() <= materialized_end);
+            child_positioned_layers.retain(|layer| layer.page_index <= materialized_end);
         }
-        let scroll_padding_box = paint_space_rect(
-            positioned_border_box.x() + positioned_border_widths.left,
-            positioned_border_box.y() + positioned_border_widths.bottom,
-            (positioned_border_box.width()
-                - positioned_border_widths.left
-                - positioned_border_widths.right)
-                .max(0.0),
-            (positioned_border_box.height()
-                - positioned_border_widths.top
-                - positioned_border_widths.bottom)
-                .max(0.0),
-        );
-        let static_scroll_offset = self.finish_static_scroll_snap_scope(
-            static_scroll_snap_scope,
-            scroll_padding_box,
-            scroll_padding_box,
-        );
+        if has_principal_decoration
+            && let Some(target_page_index) = if style.box_values.height.is_auto() {
+                observed_positioned_target_page_index
+            } else {
+                positioned_fragmentation_plan.materialized_destination_end()
+            }
+        {
+            let captured_last_page_index = positioned_fragments
+                .iter()
+                .map(|fragment| fragment.destination_page().get())
+                .max()
+                .unwrap_or(paint_page_index);
+            self.extend_positioned_principal_decoration_fragments(
+                &mut positioned_fragments,
+                style,
+                positioned_border_box,
+                paint_page_index,
+                captured_last_page_index,
+                target_page_index,
+                initial_page_context,
+            );
+        }
         if static_scroll_offset.x != 0.0 || static_scroll_offset.y != 0.0 {
             let translation =
                 crate::layout::scroll_snap::static_scroll_translation(static_scroll_offset, style);
-            for (_, fragment) in &mut positioned_fragments {
-                *fragment = fragment.clone().translated(translation);
+            for fragment in &mut positioned_fragments {
+                *fragment.fragment_mut() = fragment.fragment().clone().translated(translation);
             }
             for layer in &mut child_positioned_layers {
                 *layer = layer.clone().translated(translation);
             }
         }
-        for layer in &child_positioned_layers {
+        let mut child_layers_by_page =
+            PendingPageLocalLayers::from_positioned_layers(child_positioned_layers);
+        let child_layer_pages = child_layers_by_page.page_indices().collect::<Vec<_>>();
+        for page_index in child_layer_pages {
             if !positioned_fragments
                 .iter()
-                .any(|(page_index, _)| *page_index == layer.page_index)
+                .any(|fragment| fragment.destination_page() == page_index)
             {
-                positioned_fragments.push((
-                    layer.page_index,
-                    PaintFragment::from_primitives(Vec::new(), Vec::new()),
-                ));
+                positioned_fragments.push(FinalPositionedFragment::empty(page_index));
             }
         }
         let target_page_index = if style.position == Position::Absolute {
             positioned_fragments
                 .iter()
-                .filter(|(_, fragment)| !fragment.is_empty())
-                .map(|(page_index, _)| *page_index)
-                .chain(child_positioned_layers.iter().map(|layer| layer.page_index))
+                .filter(|fragment| !fragment.fragment().is_empty())
+                .map(|fragment| fragment.destination_page().get())
+                .chain(
+                    child_layers_by_page
+                        .page_indices()
+                        .map(DocumentPageIndex::get),
+                )
                 .chain(
                     (has_principal_decoration || viewport_fixed_descendant)
-                        .then_some(principal_page_span_target)
+                        .then_some(positioned_fragmentation_plan.materialized_destination_end())
                         .flatten(),
                 )
                 .max()
         } else {
             None
+        };
+        let target_page_index = if style.box_values.height.is_auto() {
+            observed_positioned_target_page_index
+        } else {
+            target_page_index
         };
         // A retry lays this subtree out in scratch fragmentainers after its
         // viewport-fixed descendants have already been committed. The retry
@@ -1134,17 +1623,14 @@ impl<'a> LayoutBuilder<'a> {
             } else {
                 target_page_index
             };
-        let nested_positioned_page_span_target = self.pending_positioned_page_span_target;
-        let nested_absolute_positioned_page_span_target = self.absolute_positioned_page_span_target;
-        self.restore_positioned_pagination_state(pagination_state);
-        self.pending_positioned_page_span_target = merged_positioned_page_span_target(
-            self.pending_positioned_page_span_target,
-            nested_positioned_page_span_target,
-        );
-        self.absolute_positioned_page_span_target = merged_positioned_page_span_target(
-            self.absolute_positioned_page_span_target,
-            nested_absolute_positioned_page_span_target,
-        );
+        positioned_fragmentation_plan = if style.box_values.height.is_auto() {
+            // Auto-height principals have no independently specified
+            // fragment span; materialize only the fragments actually
+            // produced by their continuous formatting context.
+            positioned_fragmentation_plan.with_observed_destination_end(target_page_index)
+        } else {
+            positioned_fragmentation_plan.with_materialized_destination_end(target_page_index)
+        };
         self.content_left = previous_left;
         self.content_right = previous_right;
         self.cursor_y = previous_cursor_y;
@@ -1152,7 +1638,7 @@ impl<'a> LayoutBuilder<'a> {
         self.block_static_position_y_offset = previous_block_static_position_y_offset;
         self.absolute_static_position = previous_absolute_static_position;
         self.retain_absolute_positioned_page_span(principal_page_span_target);
-        self.ensure_positioned_page_span(target_page_index);
+        self.ensure_positioned_page_span(positioned_fragmentation_plan);
 
         // A positioned box owns its principal decoration even when its
         // contained formatting context contributes no fragment. This occurs
@@ -1161,11 +1647,12 @@ impl<'a> LayoutBuilder<'a> {
         // background, border, or outline.
         // <https://www.w3.org/TR/css-position-3/#absolute-positioning> and
         // <https://www.w3.org/TR/css-contain-1/#containment-size>
-        if positioned_fragments.is_empty()
-            && child_positioned_layers.is_empty()
+        if positioned_fragments
+            .iter()
+            .all(|fragment| fragment.fragment().is_empty())
+            && child_layers_by_page.is_empty()
             && style.visibility == Visibility::Visible
-            && positioned_border_box.width() > 0.0
-            && positioned_border_box.height() > 0.0
+            && has_principal_decoration
         {
             let mut fragment = PaintFragment::from_primitives(Vec::new(), Vec::new());
             fragment.prepend_primitives_in_band(
@@ -1193,33 +1680,27 @@ impl<'a> LayoutBuilder<'a> {
                 ),
             );
             if !fragment.is_empty() {
-                positioned_fragments.push((positioned_origin_page_index, fragment));
+                // An empty scratch page is only a capture placeholder.  It
+                // must not prevent the positioned principal's own border or
+                // background from reaching its parent stacking context.
+                positioned_fragments.clear();
+                positioned_fragments.push(FinalPositionedFragment::new(
+                    DocumentPageIndex::new(positioned_origin_page_index),
+                    fragment,
+                ));
             }
         }
 
-        for (_, positioned_fragment) in &mut positioned_fragments {
-            if let (Some(static_position), Some(fragment_baseline_y)) = (
-                inline_static_baseline_position,
-                positioned_fragment.first_line_y(),
-            ) {
-                *positioned_fragment =
-                    positioned_fragment
-                        .clone()
-                        .translated(PaintTranslation::new(
-                            0.0,
-                            static_position.baseline_y - fragment_baseline_y,
-                        ));
-            }
-        }
         if positioned_fragments
             .iter()
-            .all(|(_, fragment)| fragment.is_empty())
-            && child_positioned_layers.is_empty()
+            .all(|fragment| fragment.fragment().is_empty())
+            && child_layers_by_page.is_empty()
         {
             return;
         }
-        let child_layers_by_page = child_positioned_layers;
-        for (page_index, mut positioned_fragment) in positioned_fragments {
+        for mut positioned_fragment in positioned_fragments {
+            let destination_page = positioned_fragment.destination_page();
+            let page_index = destination_page.get();
             if style.position == Position::Absolute
                 && !style.box_values.height.is_auto()
                 && retained_viewport_fixed_descendant
@@ -1227,12 +1708,8 @@ impl<'a> LayoutBuilder<'a> {
             {
                 continue;
             }
-            let child_layers = child_layers_by_page
-                .iter()
-                .filter(|layer| layer.page_index == page_index)
-                .cloned()
-                .collect::<Vec<_>>();
-            let mut links = positioned_fragment.links.clone();
+            let mut child_layers = child_layers_by_page.drain_for_page(destination_page);
+            let mut links = positioned_fragment.links().to_vec();
             let bounds = positioned_border_box;
             if containment.size {
                 positioned_fragment =
@@ -1247,8 +1724,7 @@ impl<'a> LayoutBuilder<'a> {
                 // its source box has used `overflow: visible` and must not
                 // retain a local clipping effect when positioned.
                 // <https://drafts.csswg.org/css-overflow-3/#overflow-propagation>
-                policy.effects.overflow_clip = None;
-                policy.effects.rounded_overflow_clip = None;
+                policy.effects.clear_overflow_clip_effects();
             }
             if uses_initial_page_containing_block
                 && !uses_escaped_atom_outer_containing_block
@@ -1297,20 +1773,22 @@ impl<'a> LayoutBuilder<'a> {
                     || bounds.x() + bounds.width() > page_clip.x() + page_clip.width()
                     || bounds.y() + bounds.height() > page_clip.y() + page_clip.height();
                 if box_overflows_page {
-                    policy.effects.overflow_clip = Some(page_clip);
+                    policy
+                        .effects
+                        .set_rectangular_overflow_clip(Some(page_clip));
                 }
             }
             if positioned_fragment.contains_overflow_clip()
                 && policy
                     .effects
-                    .overflow_clip
+                    .overflow_clip_bounds()
                     .is_some_and(|clip| clip.width() <= 0.0 || clip.height() <= 0.0)
             {
                 // The measured formatting context already owns this empty
                 // used padding-box clip. Applying the reconstructed empty clip
                 // around that nested context would also erase the principal
                 // decoration, which lies outside the contents clip.
-                policy.effects.overflow_clip = None;
+                policy.effects.clear_overflow_clip_effects();
             }
             let escaped_atom_translation = if self.escaped_atom_positioning_depth > 0 {
                 let containing_block_is_atom_local =
@@ -1323,28 +1801,46 @@ impl<'a> LayoutBuilder<'a> {
                         || (vertical_insets_are_auto
                             && absolute_static_position
                                 .is_some_and(AbsoluteStaticPosition::has_vertical_position)),
-                    !containing_block_is_atom_local,
+                    // An auto horizontal static position is already local to
+                    // the escaped atom's temporary formatting context. The
+                    // atom replay translates that local coordinate into the
+                    // outer containing block; subtracting the outer block
+                    // origin here would apply that normalization twice.
+                    // <https://www.w3.org/TR/css-position-3/#static-position>
+                    !containing_block_is_atom_local && !horizontal_insets_are_auto,
                 )
             } else {
                 EscapedAtomTranslation::none()
             };
-            let captures_positioned_descendants =
-                policy.is_real_stacking_context && policy.captures_positioned_descendants;
-            let mut child_contexts = if captures_positioned_descendants {
-                for layer in &child_layers {
-                    links.extend(layer.links.clone());
+            // Overflow clipping is not itself a stacking context, but it is
+            // nevertheless an isolation boundary for the clipped contents.
+            // Keep positioned descendants in the locally captured fragment so
+            // the padding-box clip applies to them before their parent-level
+            // stacking phase is selected.
+            // <https://www.w3.org/TR/css-overflow-3/#overflow-clipping>
+            let captures_positioned_descendants = (policy.is_real_stacking_context
+                && policy.captures_positioned_descendants)
+                || policy.effects.overflow_clip_effect.is_some()
+                || positioned_contents_clip.is_some();
+            let mut child_contexts = Vec::new();
+            if captures_positioned_descendants {
+                for layer in child_layers.drain(..) {
+                    let layer = layer.into_layer();
+                    links.extend(layer.links);
+                    child_contexts.push(layer.context);
                 }
-                child_layers
-                    .iter()
-                    .cloned()
-                    .map(|layer| layer.context)
-                    .collect()
-            } else {
-                Vec::new()
+            }
+            let positioned_overflow_clip = match policy.effects.overflow_clip_effect.take() {
+                Some(crate::document::paint::contours::OverflowClipEffect::Rect(clip)) => {
+                    Some(clip)
+                }
+                Some(effect) => {
+                    policy.effects.overflow_clip_effect = Some(effect);
+                    positioned_contents_clip.map(PaintClip::from_paint_rect)
+                }
+                None => positioned_contents_clip.map(PaintClip::from_paint_rect),
             };
-            if containment.paint
-                && let Some(overflow_clip) = policy.effects.overflow_clip.take()
-            {
+            if let Some(overflow_clip) = positioned_overflow_clip {
                 // Overflow and paint containment clip the positioned box's
                 // contents and captured descendants, not its own background,
                 // border, or outline. Keep that clip inside the positioned
@@ -1360,22 +1856,30 @@ impl<'a> LayoutBuilder<'a> {
             let has_positioned_paint =
                 !positioned_fragment.is_empty() || !child_contexts.is_empty();
             if has_positioned_paint {
-                let context = PaintStackingContext::from_banded_fragment_with_stack_level(
-                    policy.stack_level,
-                    positioned_fragment,
-                    child_contexts,
-                )
-                .with_source_order(positioned_source_order)
-                .with_effects(policy.effects)
-                .with_bounds(bounds);
+                if captures_multicol_positioned_principal {
+                    // Source layout still runs to materialize anonymous
+                    // columns and resolve intrinsic geometry, but the paint
+                    // belongs to the deferred principal replay. Letting it
+                    // enter this temporary page would also embed it in a
+                    // normal-flow ancestor's stacking context.
+                    continue;
+                }
                 if style.position == Position::Fixed && locally_contained_fixed_block.is_none() {
-                    let layer = FixedPaintLayer {
-                        source_element: element.id,
-                        source_style: source_style.clone(),
-                        stack_level: policy.stack_level,
-                        context,
-                        links,
-                    };
+                    let layer = positioned_fragment.into_viewport_fixed_layer(
+                        element.id,
+                        source_style.clone(),
+                        PositionedStackingMetadata {
+                            transaction_depth: self.positioned_paint_transaction_depth,
+                            source_is_target: element.is_target,
+                            stack_level: policy.stack_level,
+                            source_order: positioned_source_order,
+                            effects: policy.effects,
+                            bounds,
+                            child_contexts,
+                            links,
+                            escaped_atom_translation,
+                        },
+                    );
                     // Intrinsic and auto-size measurement can visit a
                     // viewport-fixed element before its final in-flow static
                     // position is known. A fixed layer is one replayable
@@ -1390,16 +1894,26 @@ impl<'a> LayoutBuilder<'a> {
                     self.fixed_layers.push(layer);
                     continue;
                 }
-                let layer = PositionedPaintLayer {
-                    page_index,
-                    source_element: Some(element.id),
-                    source_style: style.clone(),
-                    source_is_target: element.is_target,
-                    stack_level: policy.stack_level,
-                    context,
-                    links,
-                    escaped_atom_translation,
-                };
+                let layer = positioned_fragment
+                    .into_page_local_layer(
+                        PositionedPaintIdentity {
+                            source_element: Some(element.id),
+                            source_style: source_style.clone(),
+                            source_style_identity: source_style as *const ComputedStyle as usize,
+                        },
+                        PositionedStackingMetadata {
+                            transaction_depth: self.positioned_paint_transaction_depth,
+                            source_is_target: element.is_target,
+                            stack_level: policy.stack_level,
+                            source_order: positioned_source_order,
+                            effects: policy.effects,
+                            bounds,
+                            child_contexts,
+                            links,
+                            escaped_atom_translation,
+                        },
+                    )
+                    .into_layer();
                 // A block formatting retry can revisit this box after its
                 // final static position is known. Replace the provisional
                 // capture for that element/page before committing its final
@@ -1429,7 +1943,13 @@ impl<'a> LayoutBuilder<'a> {
                 }
             }
             if !captures_positioned_descendants {
-                self.positioned_layers.extend(child_layers);
+                // These child layers have escaped this principal. Their
+                // scratch transaction is complete, but an enclosing
+                // positioned transaction (if any) still owns them.
+                self.positioned_layers
+                    .extend(child_layers.into_iter().map(|layer| {
+                        layer.release_to_transaction_depth(self.positioned_paint_transaction_depth)
+                    }));
             }
         }
         if style.position == Position::Absolute
@@ -1450,11 +1970,40 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &Stylesheets<'_>,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
-        static_position: InlineStaticPosition,
+        static_position: StaticPositionCapture,
     ) {
         let previous = self.inline_static_position;
+        let previous_absolute_static_position = self.absolute_static_position;
+        let rectangle = static_position.rectangle;
+        self.absolute_static_position = Some(
+            self.absolute_static_position
+                .unwrap_or_else(|| {
+                    AbsoluteStaticPosition::from_page_rect(
+                        rectangle.area.x(),
+                        rectangle.area.x() + rectangle.area.width(),
+                        rectangle.area.top_y(),
+                    )
+                })
+                .with_static_position_rectangle(rectangle),
+        );
         self.inline_static_position = Some(static_position);
         self.layout_positioned_block(element, style, stylesheets, child_boxes, table_fragment);
         self.inline_static_position = previous;
+        self.absolute_static_position = previous_absolute_static_position;
+    }
+}
+
+#[cfg(test)]
+mod positioned_flow_origin_tests {
+    use super::*;
+
+    #[test]
+    fn enters_positioned_surrogates_at_the_resolved_page_top_cursor() {
+        let content_box = PageTopRect::new(20.0, 100.0, 12.0, 60.0);
+
+        let origin = PositionedFlowOrigin::from_resolved_positioned_box(content_box, 8.0);
+        assert_eq!(origin.cursor_y, 100.0);
+        assert_eq!(origin.content_left, 28.0);
+        assert_eq!(origin.content_right, 40.0);
     }
 }

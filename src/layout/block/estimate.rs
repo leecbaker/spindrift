@@ -334,13 +334,25 @@ impl<'a> LayoutBuilder<'a> {
                 inline_text_for_style(element, style)
             };
             if !text.is_empty() {
-                content_height += self.estimate_text_height(
-                    &text,
+                // A positioned ancestor's padding box is an absolute
+                // containing block, so its provisional auto height must use
+                // the same nested inline line metrics as its principal flow.
+                // Flattening this DOM subtree to text loses descendant
+                // font/line-height and `vertical-align` contributions; that
+                // makes an abspos inline's static line disagree with the
+                // containing block it is resolved against.
+                // <https://drafts.csswg.org/css-inline-3/#line-layout>
+                // <https://drafts.csswg.org/css-position-3/#def-cb>
+                let (inline_height, line_count) = self.intrinsic_inline_block_metrics_for_element(
+                    element,
                     style,
+                    stylesheets,
+                    None,
                     content_width,
-                    style.padding.left,
-                    style.padding.right,
                 );
+                if line_count > 0 {
+                    content_height += inline_height;
+                }
             }
             if has_direct_inline_replaced_row {
                 let (_, row_height) = self.measure_direct_inline_row(element, style, stylesheets);
@@ -674,6 +686,7 @@ impl<'a> LayoutBuilder<'a> {
                     self.root_url,
                     self.resource_cache,
                     style.image_orientation == css::ImageOrientation::FromImage,
+                    crate::svg::SvgImageContext::from_used_color_scheme(style.used_color_scheme),
                 )
             })
             .map(|asset| asset.intrinsic_size());

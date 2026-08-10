@@ -312,8 +312,15 @@ impl<'a> LayoutBuilder<'a> {
         let context = PaintStackingContext::from_banded_fragment(translated, Vec::new())
             .with_source_order(self.next_paint_source_order())
             .with_effects(PaintEffects {
-                overflow_clip: Some(slice_clip),
+                overflow_clip_effect: Some(
+                    crate::document::paint::contours::OverflowClipEffect::Rect(slice_clip),
+                ),
                 absolute_clip: Some(slice_clip),
+                // This is a replay/fragmentation scope rather than an
+                // element with a specified `transform-style`, so it must not
+                // flatten an enclosing CSS 3D rendering context.
+                three_d_participation:
+                    crate::document::paint::effects::ThreeDParticipation::TransparentLayoutBridge,
                 ..PaintEffects::default()
             })
             .with_bounds(bounds);
@@ -518,7 +525,7 @@ impl<'a> LayoutBuilder<'a> {
         Vec<PaintPrimitive>,
         Vec<RelativeTablePartStructuralPaint>,
     ) {
-        let top = fragment.plan.fragment_top;
+        let top = fragment.plan.placement.paint_top().points();
         let bottom = fragment.bottom();
         let height = (top - bottom).max(0.0);
         let fragment_has_occupied_row = fragment.plan.body_rows.iter().any(|row| !row.collapsed);
@@ -527,7 +534,19 @@ impl<'a> LayoutBuilder<'a> {
         let mut backgrounds = Vec::new();
         let mut outlines = Vec::new();
         let mut relative_part_paints = Vec::new();
-        if height <= 0.0 && vertical_edge_spacing <= 0.0 {
+        // A vertical table fragments across physical X. Its later body
+        // fragments retain the opening wrapper's physical Y origin, so the
+        // legacy `top - bottom` measure can be zero or negative despite a
+        // non-empty logical block slice. Structural paint is governed by the
+        // committed source rows in that case, not a physical-Y extent.
+        // <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+        // <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+        let has_logical_row_slice = fragment
+            .plan
+            .body_rows
+            .iter()
+            .any(|row| !row.collapsed && row.row_height > 0.0);
+        if !has_logical_row_slice && height <= 0.0 && vertical_edge_spacing <= 0.0 {
             return (backgrounds, outlines, relative_part_paints);
         }
 
@@ -537,8 +556,13 @@ impl<'a> LayoutBuilder<'a> {
         let fragment_row_offsets = fragment.row_offsets();
         let fragment_original_row_heights = fragment.original_row_heights();
         let grid_viewport = fragment.grid_viewport.as_ref();
+        let grid_projection = grid_viewport.map(|viewport| viewport.projection());
+        let root_background_source_placement =
+            grid_viewport.map(|viewport| viewport.root_background_source_placement());
+        let wrapper_timeline = grid_viewport.map(|viewport| viewport.wrapper_timeline());
+        let grid_fragmentainer_placement =
+            grid_viewport.map(|viewport| viewport.fragmentainer_placement());
         let grid_placement = grid_viewport.map(|viewport| viewport.destination_placement());
-        let source_grid_placement = grid_viewport.map(|viewport| viewport.source_placement());
         let grid_row_bounds = grid_viewport.map(|viewport| viewport.row_bounds());
         let background_top =
             top + vertical_edge_spacing + table_width.padding.top + table_width.border_widths.top;
@@ -564,21 +588,48 @@ impl<'a> LayoutBuilder<'a> {
             border_rect,
             table_style,
             table_width.border_widths,
-            table_style.background_clip,
+            table_style.background.background_clip,
         );
-        if let (Some(source_placement), Some(placement), Some(row_bounds)) =
-            (source_grid_placement, grid_placement, grid_row_bounds)
-        {
-            let is_unfragmented_root = fragment.plan.break_reason()
-                == TableFragmentBreakReason::TableStart
-                && fragment.plan.outgoing_boundary.is_none();
+        if let (
+            Some(projection),
+            Some(fragmentainer_placement),
+            Some(root_source_placement),
+            Some(wrapper_timeline),
+        ) = (
+            grid_projection,
+            grid_fragmentainer_placement,
+            root_background_source_placement,
+            wrapper_timeline,
+        ) {
             // Table-root backgrounds belong to the root paint area, not to
             // the cell grid.  Keep the color in destination space below the
             // structural grid layers; images retain their unfragmented root
             // positioning area and are translated into each fragmentainer.
             // <https://drafts.csswg.org/css-tables-3/#drawing-backgrounds>
-            if is_unfragmented_root {
+            let root_background_viewport = TableWrapperDecorationViewport::new(
+                projection,
+                fragmentainer_placement,
+                root_source_placement,
+                wrapper_timeline,
+                table_style,
+                table_width,
+                vertical_edge_spacing,
+            );
+            // An unfragmented root already has its exact wrapper border box in
+            // destination space.  In particular, collapsed-border outer
+            // maxima are represented by `border_rect`, rather than by the
+            // cell grid viewport.  Only project the color through row clips
+            // once a root genuinely spans fragmentainers.
+            let paints_complete_source_grid = fragment_rows.len() == rows.len()
+                && fragment_rows.iter().copied().eq(0..rows.len())
+                && fragment_row_offsets
+                    .iter()
+                    .all(|offset| offset.abs() <= 0.01);
+            let paints_unfragmented_root = !fragment.plan.metadata.continues_from_previous_page
+                && !fragment.plan.metadata.continues_to_next_page;
+            if paints_complete_source_grid || paints_unfragmented_root {
                 if let Some(fill) = table_style
+                    .background
                     .background_color
                     .visible_color(table_style.color)
                 {
@@ -587,44 +638,24 @@ impl<'a> LayoutBuilder<'a> {
                         Some(fill),
                     )));
                 }
-                backgrounds.extend(background_image_primitives_for_style_with_paint_areas(
-                    PaintBackgroundArea::from_paint_rect(border_rect),
-                    PaintBackgroundArea::from_paint_rect(clip_rect),
-                    table_style,
-                    self.base_url,
-                    self.root_url,
-                    self.resource_cache,
-                ));
             } else {
-                let root_background_viewport = TableRootBackgroundViewport::new(
-                    source_placement,
-                    placement,
-                    row_bounds,
-                    &fragment_rows,
-                    &fragment_row_heights,
-                    &fragment_row_offsets,
-                    table_style,
-                    table_width,
-                    vertical_edge_spacing,
-                );
-                if let Some(fill) = table_style
-                    .background_color
-                    .visible_color(table_style.color)
-                {
-                    backgrounds.push(PaintPrimitive::Rect(RenderedRect::from_paint_rect(
-                        clip_rect,
-                        Some(fill),
-                    )));
-                }
-                outlines.extend(root_background_viewport.image_primitives(
-                    table_style,
-                    self.base_url,
-                    self.root_url,
-                    self.resource_cache,
-                ));
+                backgrounds
+                    .extend(root_background_viewport.color_primitives(table_style, table_width));
             }
+            // Root images are table background layers. They must remain below
+            // the wrapper border replay; putting them in `Outline` makes a
+            // projected gradient cover the border edges of every continuation
+            // fragment.
+            // <https://www.w3.org/TR/CSS22/tables.html#table-layers>
+            backgrounds.extend(root_background_viewport.image_primitives(
+                table_style,
+                self.base_url,
+                self.root_url,
+                self.resource_cache,
+            ));
         } else {
             if let Some(fill) = table_style
+                .background
                 .background_color
                 .visible_color(table_style.color)
             {
@@ -672,13 +703,9 @@ impl<'a> LayoutBuilder<'a> {
             let column_group_style =
                 self.style_for_table_column_group(&column_group, table_style, stylesheets);
             let mut layer_primitives = Vec::new();
-            if let (Some(source_placement), Some(destination_placement), Some(row_bounds)) =
-                (source_grid_placement, grid_placement, grid_row_bounds)
-                && table_style.writing_mode.has_vertical_lines()
-            {
+            if let (Some(projection), Some(row_bounds)) = (grid_projection, grid_row_bounds) {
                 layer_primitives.extend(table_column_grid_background_primitives(
-                    source_placement,
-                    destination_placement,
+                    projection,
                     column_plan,
                     grid,
                     &fragment_rows,
@@ -784,13 +811,9 @@ impl<'a> LayoutBuilder<'a> {
         for (column_index, span, column) in column_spans {
             let column_style = self.style_for_table_column(column, table_style, stylesheets);
             let mut layer_primitives = Vec::new();
-            if let (Some(source_placement), Some(destination_placement), Some(row_bounds)) =
-                (source_grid_placement, grid_placement, grid_row_bounds)
-                && table_style.writing_mode.has_vertical_lines()
-            {
+            if let (Some(projection), Some(row_bounds)) = (grid_projection, grid_row_bounds) {
                 layer_primitives.extend(table_column_grid_background_primitives(
-                    source_placement,
-                    destination_placement,
+                    projection,
                     column_plan,
                     grid,
                     &fragment_rows,
@@ -871,12 +894,9 @@ impl<'a> LayoutBuilder<'a> {
                 self.style_for_table_row_group(&row_group, table_style, stylesheets);
             let background_start = backgrounds.len();
             let outline_start = outlines.len();
-            if let (Some(source_placement), Some(destination_placement), Some(row_bounds)) =
-                (source_grid_placement, grid_placement, grid_row_bounds)
-            {
+            if let (Some(projection), Some(row_bounds)) = (grid_projection, grid_row_bounds) {
                 backgrounds.extend(table_row_group_grid_background_primitives(
-                    source_placement,
-                    destination_placement,
+                    projection,
                     row_bounds,
                     column_plan,
                     grid,
@@ -891,6 +911,7 @@ impl<'a> LayoutBuilder<'a> {
                     self.resource_cache,
                 ));
             } else if let Some(fill) = row_group_style
+                .background
                 .background_color
                 .visible_color(row_group_style.color)
             {
@@ -972,16 +993,11 @@ impl<'a> LayoutBuilder<'a> {
                 local_row,
                 local_row + 1,
             ) {
-                let mut row_backgrounds = if let (
-                    Some(source_placement),
-                    Some(destination_placement),
-                    Some(row_bounds),
-                ) =
-                    (source_grid_placement, grid_placement, grid_row_bounds)
+                let mut row_backgrounds = if let (Some(projection), Some(row_bounds)) =
+                    (grid_projection, grid_row_bounds)
                 {
                     table_row_grid_background_primitives(
-                        source_placement,
-                        destination_placement,
+                        projection,
                         row_bounds,
                         column_plan,
                         grid,
@@ -1284,6 +1300,13 @@ impl<'a> LayoutBuilder<'a> {
                 (
                     element.id,
                     context.column_plan.total_width().points().to_bits(),
+                    context
+                        .wrapper_border_box_block_size
+                        .map(|size| size.points().to_bits()),
+                    context
+                        .positioned_table_block_content_size
+                        .map(|size| size.points().to_bits()),
+                    context.wrapper_non_grid_block_size.points().to_bits(),
                 )
             })
         });
@@ -1397,6 +1420,7 @@ impl<'a> LayoutBuilder<'a> {
             context.table_style,
             context.collapsed_geometry,
             context.wrapper_border_box_block_size,
+            context.positioned_table_block_content_size,
             context.wrapper_non_grid_block_size,
         );
         // With no resolved wrapper block-size target, the first row-layout

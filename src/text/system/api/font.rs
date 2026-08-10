@@ -220,10 +220,10 @@ impl FontSystem {
         font_id: usize,
     ) -> Option<f32> {
         let adjusted = match style.font_size_adjust {
-            FontSizeAdjust::None => {
-                let factor = self.document_fonts.font_size_adjust(font_id)?;
-                style.font_size * factor
-            }
+            FontSizeAdjust::None => self
+                .document_fonts
+                .font_size_adjust(font_id)
+                .map_or(style.font_size, |factor| style.font_size * factor),
             FontSizeAdjust::Value { metric, value } => {
                 let target_ratio = match value {
                     FontSizeAdjustValue::Number(value) => value,
@@ -261,17 +261,16 @@ impl FontSystem {
         };
         for family in families {
             let matched = match family {
-                FontFamily::Names(names) => names.iter().find_map(|name| {
-                    self.resolve_single_family(
-                        name,
+                FontFamily::Named(name) => self
+                    .resolve_single_family(
+                        name.as_str(),
                         style.font_weight,
                         style.font_style,
                         style.font_width,
                     )
                     .and_then(|font_id| {
                         self.document_fonts.character_font_match(font_id, character)
-                    })
-                }),
+                    }),
                 _ => self
                     .resolve_font_family(
                         family,
@@ -314,8 +313,9 @@ impl FontSystem {
         self.vertical_glyph_advance_for_style(style, '0')
     }
 
-    /// Returns a selected glyph's vertical advance for vertical CSS layout.
-    /// `ic` uses this for U+6C34 and `ch` uses it for upright U+0030.
+    /// Returns a metric glyph's vertical advance for vertical CSS layout.
+    /// `ic` uses U+6C34 and `ch` uses upright U+0030. The face is selected
+    /// for that character, including font-stack fallback and `unicode-range`.
     /// <https://www.w3.org/TR/css-values-4/#ch>
     /// <https://www.w3.org/TR/css-values-4/#ic>
     pub(super) fn vertical_glyph_advance_for_style(
@@ -323,18 +323,16 @@ impl FontSystem {
         style: &ComputedStyle,
         character: char,
     ) -> Option<f32> {
-        let font_id = self.font_for_character(style, character)?;
+        let matched = self.metric_glyph_match_for_style(style, character)?;
         let used_font_size = self
-            .font_size_adjusted_size_for_font_id(style, font_id)
+            .font_size_adjusted_size_for_font_id(style, matched.font_id)
             .unwrap_or(style.font_size);
-        let font = self.document_fonts.get(font_id)?;
+        let font = self.document_fonts.get(matched.font_id)?;
         let face = ttf_parser::Face::parse(&font.data, font.face_index).ok()?;
         let units_per_em = font.units_per_em.max(1) as f32;
         let advance = face
-            .glyph_index(character)
-            .and_then(|glyph| face.glyph_ver_advance(glyph))
+            .glyph_ver_advance(matched.glyph_id.raw())
             .map(|advance| advance as f32)
-            .filter(|advance| *advance > 0.0)
             .unwrap_or(units_per_em);
         Some(advance * used_font_size / units_per_em)
     }
@@ -342,7 +340,7 @@ impl FontSystem {
 
 pub(super) fn named_font_families(family: &FontFamily) -> Vec<String> {
     match family {
-        FontFamily::Names(names) => names.clone(),
+        FontFamily::Named(name) => vec![name.as_str().to_owned()],
         FontFamily::List(families) => families.iter().flat_map(named_font_families).collect(),
         _ => Vec::new(),
     }

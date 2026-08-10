@@ -13,29 +13,67 @@ pub(in crate::css) fn expand_modeled_shorthands<'a>(
 ) -> Vec<CascadedDeclaration<'a>> {
     let mut expanded = Vec::with_capacity(declarations.len());
     for declaration in declarations {
+        let is_all_shorthand = matches!(
+            declaration.property,
+            CascadedProperty::Modeled(ModeledProperty::All)
+        );
         if contains_css_variable_reference(&declaration.value)
-            || declaration_is_revert(&declaration.value)
-            || declaration_is_revert_layer(&declaration.value)
+            || (!is_all_shorthand
+                && (declaration_is_revert(&declaration.value)
+                    || declaration_is_revert_layer(&declaration.value)))
         {
             expanded.push(declaration.clone());
             continue;
         }
-        if let Some(parts) = expand_box_edge_shorthand(&declaration.name, &declaration.value) {
+        if is_all_shorthand {
+            // `all` is an ordinary shorthand at the cascade boundary. Expand
+            // it here, rather than applying it as a late bulk reset, so that
+            // property-specific prepasses and rollback keywords see the same
+            // longhand cascade as every other shorthand:
+            // <https://drafts.csswg.org/css-cascade-5/#all-shorthand>.
+            for target in all_shorthand_longhands() {
+                let mut longhand = declaration.clone();
+                longhand.property = CascadedProperty::Modeled(ModeledProperty::Longhand(target));
+                expanded.push(longhand);
+            }
+        } else if matches!(
+            declaration.property,
+            CascadedProperty::Modeled(ModeledProperty::Shorthand(ModeledShorthand::Font))
+        ) {
+            // `font` needs the inherited font metrics to parse its value, so
+            // retain its token stream while exposing one canonical component
+            // declaration per affected longhand. This gives rollback and
+            // variable-invalidity the same partial-longhand behavior as every
+            // other shorthand without prematurely resolving relative units.
+            for target in declaration
+                .property
+                .modeled()
+                .expect("font shorthand is modeled")
+                .resolve_targets(direction, writing_mode)
+            {
+                let mut component = declaration.clone();
+                component.property =
+                    CascadedProperty::Modeled(ModeledProperty::FontComponent(target));
+                expanded.push(component);
+            }
+        } else if let Some(parts) =
+            expand_box_edge_shorthand(declaration.property.css_name(), &declaration.value)
+        {
             for (name, value) in parts {
                 let mut longhand = declaration.clone();
-                longhand.name = Cow::Owned(name.to_string());
+                longhand.property = CascadedProperty::from_name(Cow::Borrowed(name));
                 longhand.value = Cow::Owned(value);
                 expanded.push(longhand);
             }
         } else if let Some(parts) = expand_simple_modeled_shorthand(
-            &declaration.name,
+            declaration.property.css_name(),
             &declaration.value,
             direction,
             writing_mode,
         ) {
             for (name, value) in parts {
                 let mut longhand = declaration.clone();
-                longhand.name = Cow::Owned(name.to_string());
+                longhand.property = CascadedProperty::from_name(Cow::Borrowed(name));
                 longhand.value = Cow::Owned(value);
                 expanded.push(longhand);
             }
@@ -98,7 +136,10 @@ pub(in crate::css) fn expand_simple_modeled_shorthand(
     writing_mode: WritingMode,
 ) -> Option<Vec<(&'static str, String)>> {
     match name {
+        "animation" => expand_animation_snapshot_shorthand(value),
         "gap" => expand_gap_shorthand(value),
+        "line-clamp" => expand_line_clamp_shorthand(value, false),
+        "-webkit-line-clamp" => expand_line_clamp_shorthand(value, true),
         "grid-gap" => expand_gap_shorthand(value),
         "grid-row-gap" => parse_gap(value, ROOT_FONT_SIZE_PT)
             .map(|_| vec![("row-gap", trim_css_value(value).to_string())]),
@@ -219,6 +260,95 @@ pub(in crate::css) fn expand_simple_modeled_shorthand(
     }
 }
 
+fn expand_animation_snapshot_shorthand(value: &str) -> Option<Vec<(&'static str, String)>> {
+    let animation = parse_animation_snapshot_shorthand(value)?;
+    Some(vec![
+        (
+            "animation-name",
+            animation
+                .name
+                .as_ref()
+                .map_or_else(|| "none".to_string(), KeyframesName::to_css_string),
+        ),
+        (
+            "animation-duration",
+            format!("{}s", animation.duration_seconds),
+        ),
+        ("animation-delay", format!("{}s", animation.delay_seconds)),
+    ])
+}
+
+/// Expand the CSS Overflow Level 4 line-clamp shorthands into independently
+/// cascaded longhands. Doing this before cascade defaulting is essential: a
+/// later `block-ellipsis` declaration must be able to override only the
+/// marker synthesized by an earlier shorthand.
+/// <https://drafts.csswg.org/css-overflow-4/#line-clamp>
+fn expand_line_clamp_shorthand(value: &str, webkit: bool) -> Option<Vec<(&'static str, String)>> {
+    let value = trim_css_value(value);
+    if value.eq_ignore_ascii_case("none") {
+        return Some(vec![
+            ("max-lines", "none".to_string()),
+            // The legacy shorthand always resets the inherited marker to
+            // `auto`, including for its `none` value.  The standardized
+            // shorthand's `none` value instead resets it to `no-ellipsis`.
+            // <https://drafts.csswg.org/css-overflow-4/#webkit-line-clamp>
+            (
+                "block-ellipsis",
+                if webkit { "auto" } else { "no-ellipsis" }.to_string(),
+            ),
+            ("continue", "auto".to_string()),
+        ]);
+    }
+
+    let components = split_css_component_values(value);
+    if components.is_empty() || (webkit && components.len() != 1) {
+        return None;
+    }
+    let mut max_lines = None;
+    let mut ellipsis = None;
+    let mut legacy = false;
+    for component in components {
+        if component.eq_ignore_ascii_case("-webkit-legacy") && !webkit && !legacy {
+            legacy = true;
+        } else if component.eq_ignore_ascii_case("auto") && ellipsis.is_none() {
+            ellipsis = Some("auto".to_string());
+        } else if component.eq_ignore_ascii_case("no-ellipsis") && ellipsis.is_none() {
+            ellipsis = Some("no-ellipsis".to_string());
+        } else if component.starts_with('"') || component.starts_with('\'') {
+            if ellipsis.is_some() {
+                return None;
+            }
+            // The longhand parser validates and unescapes the CSS string.
+            ellipsis = Some(component.to_string());
+        } else if max_lines.is_none()
+            && component
+                .parse::<usize>()
+                .ok()
+                .and_then(std::num::NonZeroUsize::new)
+                .is_some()
+        {
+            max_lines = Some(component.to_string());
+        } else {
+            return None;
+        }
+    }
+    Some(vec![
+        ("max-lines", max_lines.unwrap_or_else(|| "none".to_string())),
+        (
+            "block-ellipsis",
+            ellipsis.unwrap_or_else(|| "auto".to_string()),
+        ),
+        (
+            "continue",
+            if webkit || legacy {
+                "-webkit-legacy".to_string()
+            } else {
+                "collapse".to_string()
+            },
+        ),
+    ])
+}
+
 pub(in crate::css) fn expand_logical_size_value(
     name: &str,
     value: &str,
@@ -242,17 +372,26 @@ fn expand_logical_contain_intrinsic_size_value(
     value: &str,
     writing_mode: WritingMode,
 ) -> Option<Vec<(&'static str, String)>> {
+    let physical_name = logical_contain_intrinsic_size_physical_longhand(name, writing_mode)?;
+    Some(vec![(physical_name, trim_css_value(value).to_string())])
+}
+
+/// Return the physical containment sizing longhand addressed by a logical
+/// containment intrinsic-size property.
+pub(in crate::css) fn logical_contain_intrinsic_size_physical_longhand(
+    name: &str,
+    writing_mode: WritingMode,
+) -> Option<&'static str> {
     let axes = WritingModeAxes::new(writing_mode, Direction::Ltr);
     let axis = match name {
         "contain-intrinsic-inline-size" => axes.physical_axis(LogicalAxis::Inline),
         "contain-intrinsic-block-size" => axes.physical_axis(LogicalAxis::Block),
         _ => return None,
     };
-    let physical_name = match axis {
+    Some(match axis {
         PhysicalAxis::Horizontal => "contain-intrinsic-width",
         PhysicalAxis::Vertical => "contain-intrinsic-height",
-    };
-    Some(vec![(physical_name, trim_css_value(value).to_string())])
+    })
 }
 
 /// Return the physical sizing longhand addressed by a logical size property.
@@ -564,5 +703,43 @@ pub(in crate::css) fn radius_pair(horizontal: &str, vertical: &str) -> String {
         horizontal.to_string()
     } else {
         format!("{horizontal} {vertical}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn declaration(name: &'static str, value: &'static str) -> CascadedDeclaration<'static> {
+        CascadedDeclaration {
+            property: CascadedProperty::from_name(Cow::Borrowed(name)),
+            value: Cow::Borrowed(value),
+            origin: StylesheetOrigin::Author,
+            base_url: None,
+            root_url: None,
+            important: false,
+            layer_order: None,
+            specificity: 0,
+            scope_proximity: usize::MAX,
+            stylesheet_index: 0,
+            rule_order: 0,
+            declaration_order: 0,
+        }
+    }
+
+    #[test]
+    fn generated_canonical_longhand_names_are_borrowed() {
+        let declaration = declaration("margin", "1px 2px");
+        let expanded = expand_modeled_shorthands(
+            std::slice::from_ref(&declaration),
+            Direction::Ltr,
+            WritingMode::HorizontalTb,
+        );
+        assert_eq!(expanded.len(), 4);
+        assert!(
+            expanded
+                .iter()
+                .all(|declaration| declaration.property.css_name().starts_with("margin-"))
+        );
     }
 }

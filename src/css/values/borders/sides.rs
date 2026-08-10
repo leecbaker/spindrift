@@ -149,7 +149,11 @@ fn materialize_border_width_for_visible_side(style: &mut ComputedStyle, side: Bo
     style.border_width = max_edge(style.border_widths);
 }
 
-pub(crate) fn set_border_side_color(style: &mut ComputedStyle, side: BorderSide, color: CssColor) {
+pub(crate) fn set_border_side_color(
+    style: &mut ComputedStyle,
+    side: BorderSide,
+    color: CssColorOrCurrentColor,
+) {
     match side {
         BorderSide::Top => {
             style.border_colors.top = color;

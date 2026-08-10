@@ -140,15 +140,16 @@ fn grid_positioned_child_static_rect(
             )
         }
     };
-    if grid_abspos_has_explicit_alignment(child_style, container_style) {
-        static_rect.with_static_alignment(grid_abspos_static_alignment(
-            area,
-            child_style,
-            container_style,
-        ))
-    } else {
-        static_rect
-    }
+    // Grid supplies its own static-position alignment container even for an
+    // effective `normal` value.  In particular, `normal` is logical start,
+    // not the physical-left fallback used by ordinary block flow; omitting
+    // this payload breaks RTL and orthogonal grid children.
+    // <https://www.w3.org/TR/css-grid-1/#abspos-items>
+    static_rect.with_static_alignment(grid_abspos_static_alignment(
+        area,
+        child_style,
+        container_style,
+    ))
 }
 
 impl GridPositioningScope {
@@ -320,10 +321,11 @@ impl GridPositioningScope {
                 static_position: AbsoluteStaticPosition::from_page_rect_with_horizontal_outside(
                     left, right, top, true,
                 )
-                .with_static_alignment_if(
-                    grid_abspos_static_alignment(area, style, &self.container_style),
-                    grid_abspos_has_explicit_alignment(style, &self.container_style),
-                ),
+                .with_static_alignment(grid_abspos_static_alignment(
+                    area,
+                    style,
+                    &self.container_style,
+                )),
             }
         })
     }
@@ -371,6 +373,193 @@ fn grid_static_following_line_offset(start: f32, line_offsets: &[f32]) -> Option
         .windows(2)
         .find(|pair| (pair[0] - start).abs() <= 0.01)
         .map(|pair| pair[1])
+}
+
+/// Resolve the physical Grid area for a child whose four placement edges are
+/// explicit grid lines.
+///
+/// Taffy's final track geometry is stored in physical x/y arrays, while CSS
+/// placement always addresses the Grid's logical column/row axes.  Project
+/// the selected logical ranges exactly once at this boundary; in particular,
+/// a vertical Grid's columns use the final physical-y lines, and RTL reverses
+/// only its logical inline axis.
+/// <https://www.w3.org/TR/css-grid-1/#grid-placement-slot>
+/// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+fn grid_explicit_placement_area(
+    container_style: &ComputedStyle,
+    child_style: &ComputedStyle,
+    content_area: PageTopRect,
+    column_line_offsets: &[f32],
+    row_line_offsets: &[f32],
+) -> Option<PageTopRect> {
+    let axes = WritingModeAxes::new(
+        container_style.writing_mode,
+        container_style.used_direction(),
+    );
+    let (inline_start, inline_end) = grid_static_logical_axis_range(
+        LogicalAxis::Inline,
+        container_style,
+        child_style,
+        &axes,
+        content_area,
+        column_line_offsets,
+        row_line_offsets,
+    )?;
+    let (block_start, block_end) = grid_static_logical_axis_range(
+        LogicalAxis::Block,
+        container_style,
+        child_style,
+        &axes,
+        content_area,
+        column_line_offsets,
+        row_line_offsets,
+    )?;
+
+    let mut left = content_area.x();
+    let mut right = left + content_area.width();
+    let mut top = content_area.top_y();
+    let mut bottom = content_area.bottom_y();
+    grid_project_logical_range(
+        &mut left,
+        &mut right,
+        &mut top,
+        &mut bottom,
+        content_area,
+        axes.physical_start_side(LogicalAxis::Inline),
+        inline_start,
+        inline_end,
+    );
+    grid_project_logical_range(
+        &mut left,
+        &mut right,
+        &mut top,
+        &mut bottom,
+        content_area,
+        axes.physical_start_side(LogicalAxis::Block),
+        block_start,
+        block_end,
+    );
+    Some(PageTopRect::new(
+        left.min(right),
+        top.max(bottom),
+        (right - left).abs(),
+        (top - bottom).abs(),
+    ))
+}
+
+/// Resolve one Grid logical placement axis from its final physical track-line
+/// offsets. This intentionally accepts only directly resolved start/end lines:
+/// spans and missing line geometry continue through the existing hypothetical
+/// Grid probe, which is the authoritative fallback for those cases.
+fn grid_static_logical_axis_range(
+    axis: LogicalAxis,
+    container_style: &ComputedStyle,
+    child_style: &ComputedStyle,
+    axes: &WritingModeAxes,
+    content_area: PageTopRect,
+    column_line_offsets: &[f32],
+    row_line_offsets: &[f32],
+) -> Option<(f32, f32)> {
+    let (tracks, auto_tracks, start, end, gap, content_alignment) = match axis {
+        LogicalAxis::Inline => (
+            &container_style.grid_template_columns,
+            &container_style.grid_auto_columns,
+            &child_style.grid_column_start,
+            &child_style.grid_column_end,
+            container_style.column_gap.clone(),
+            container_style.justify_content,
+        ),
+        LogicalAxis::Block => (
+            &container_style.grid_template_rows,
+            &container_style.grid_auto_rows,
+            &child_style.grid_row_start,
+            &child_style.grid_row_end,
+            container_style.row_gap.clone(),
+            container_style.align_content,
+        ),
+    };
+    let line_offsets = match axes.physical_axis(axis) {
+        PhysicalAxis::Horizontal => column_line_offsets,
+        PhysicalAxis::Vertical => row_line_offsets,
+    };
+    let container_size = match axes.physical_axis(axis) {
+        PhysicalAxis::Horizontal => content_area.width(),
+        PhysicalAxis::Vertical => content_area.height(),
+    };
+    if matches!(start, css::GridPlacement::Auto) && matches!(end, css::GridPlacement::Auto) {
+        // With both placement lines automatic, this axis of Grid's static
+        // position rectangle is the grid container's padding-box axis.
+        // Preserve it while resolving the other axis from an explicit line.
+        // <https://www.w3.org/TR/css-grid-1/#abspos-items>
+        return Some((0.0, container_size));
+    }
+    let resolved_start = grid_static_line_offset(
+        tracks,
+        auto_tracks,
+        start,
+        line_offsets,
+        gap.clone(),
+        content_alignment,
+        container_size,
+    );
+    let resolved_end = grid_static_line_offset(
+        tracks,
+        auto_tracks,
+        end,
+        line_offsets,
+        gap,
+        content_alignment,
+        container_size,
+    );
+    // A specified Grid line remains a valid static-position edge when the
+    // opposite line is `auto`. Represent that unresolved side at the same
+    // coordinate here; the abspos Grid area step expands it to the padding
+    // edge. Falling back to Taffy's hypothetical item loses after-explicit
+    // implicit lines because the probe does not materialize them.
+    // <https://www.w3.org/TR/css-grid-1/#abspos-items>
+    let start = match (resolved_start, end) {
+        (Some(start), _) => start,
+        (None, css::GridPlacement::Auto) => resolved_end?,
+        (None, _) => return None,
+    };
+    let end = match (resolved_end, start) {
+        (Some(end), _) => end,
+        (None, _) if matches!(end, css::GridPlacement::Auto) => start,
+        (None, _) => return None,
+    };
+    (end >= start).then_some((start, end))
+}
+
+/// Project a logical start/end range into physical page-top rectangle edges.
+#[allow(clippy::too_many_arguments)]
+fn grid_project_logical_range(
+    left: &mut f32,
+    right: &mut f32,
+    top: &mut f32,
+    bottom: &mut f32,
+    content_area: PageTopRect,
+    start_side: PhysicalSide,
+    start: f32,
+    end: f32,
+) {
+    match start_side {
+        PhysicalSide::Left => {
+            *left = content_area.x() + start;
+            *right = content_area.x() + end;
+        }
+        PhysicalSide::Right => {
+            *left = content_area.x() + content_area.width() - end;
+            *right = content_area.x() + content_area.width() - start;
+        }
+        PhysicalSide::Top => {
+            *top = content_area.top_y() - start;
+            *bottom = content_area.top_y() - end;
+        }
+        PhysicalSide::Bottom => {
+            *top = content_area.bottom_y() + end;
+            *bottom = content_area.bottom_y() + start;
+        }
+    }
 }
 
 pub(super) struct GridPositioningGeometry<'a> {
@@ -427,7 +616,6 @@ impl<'a> LayoutBuilder<'a> {
             );
             return;
         }
-
         let hypothetical_child = positioned_grid_static_probe_child(child);
         let mut hypothetical_children = Vec::with_capacity(in_flow_children.len() + 1);
         hypothetical_children.extend_from_slice(in_flow_children);
@@ -482,6 +670,22 @@ impl<'a> LayoutBuilder<'a> {
                 )
             }),
         };
+        // A span is resolved as part of Grid placement, not as an independent
+        // grid line. Reuse the hypothetical item's resolved area when an end
+        // placement is a span (or named span), so the static-position
+        // rectangle sees the final line offset rather than a zero-width
+        // synthetic box.
+        // <https://www.w3.org/TR/css-grid-1/#line-placement>
+        let column_end = column_end.or_else(|| {
+            hypothetical.area.and_then(|area| {
+                content_aligned_grid_line_offset(
+                    context.container_style.justify_content,
+                    context.inner_width.points(),
+                    context.column_line_offsets,
+                    usize::from(area.column_end).saturating_sub(1),
+                )
+            })
+        });
         if let Some(x) = column_start {
             hypothetical.set_axis_geometry(GridAxis::Column, x, hypothetical.width());
         }
@@ -557,6 +761,16 @@ impl<'a> LayoutBuilder<'a> {
                 )
             }),
         };
+        let row_end = row_end.or_else(|| {
+            hypothetical.area.and_then(|area| {
+                content_aligned_grid_line_offset(
+                    context.container_style.align_content,
+                    row_container_size,
+                    context.row_line_offsets,
+                    usize::from(area.row_end).saturating_sub(1),
+                )
+            })
+        });
         if let Some(y) = row_start {
             hypothetical.set_axis_geometry(GridAxis::Row, y, hypothetical.height());
         }
@@ -641,12 +855,29 @@ impl<'a> LayoutBuilder<'a> {
             hypothetical.set_axis_geometry(GridAxis::Row, y, y_end - y_start);
         }
 
-        let placement_area = PageTopRect::new(
+        let probed_placement_area = PageTopRect::new(
             context.inner_x + hypothetical.x(),
             context.content_top - hypothetical.y(),
             hypothetical.width(),
             hypothetical.height(),
         );
+        // Prefer final line geometry for directly resolvable placements. The
+        // probe remains necessary for spans and incomplete line geometry, but
+        // must not be allowed to reinterpret a logical Grid axis as Taffy's
+        // physical x/y axis in RTL or vertical writing modes.
+        let placement_area = grid_explicit_placement_area(
+            context.container_style,
+            &child.style,
+            PageTopRect::new(
+                context.inner_x,
+                context.content_top,
+                context.inner_width.points(),
+                row_container_size,
+            ),
+            context.column_line_offsets,
+            context.row_line_offsets,
+        )
+        .unwrap_or(probed_placement_area);
         let static_area = grid_abspos_static_position_area(
             source,
             placement_area,
@@ -663,7 +894,16 @@ impl<'a> LayoutBuilder<'a> {
             grid_explicit_static_left_edge(&child.style, context.container_style, placement_area),
             grid_explicit_static_right_edge(&child.style, context.container_style, placement_area),
             grid_explicit_static_top_edge(&child.style, context.container_style, placement_area),
-        );
+        )
+        // Keep the logical Grid placement area as the alignment container.
+        // `static_area` expands automatic sides to padding edges; using it
+        // here would discard the explicitly selected static corner when that
+        // edge lies beyond the explicit grid in an implicit track.
+        .with_static_alignment(grid_abspos_static_alignment(
+            placement_area,
+            &child.style,
+            context.container_style,
+        ));
         self.layout_positioned_formatting_context_child(child, context.stylesheets, static_rect);
     }
 }
@@ -781,26 +1021,11 @@ fn grid_abspos_static_alignment(
         area,
         container_style.writing_mode,
         container_style.direction,
+        child_style.writing_mode,
+        child_style.used_direction(),
         effective_grid_abspos_alignment(child_style.justify_self, container_style.justify_items),
         effective_grid_abspos_alignment(child_style.align_self, container_style.align_items),
     )
-}
-
-/// `normal` does not add a Grid self-alignment offset to an absolutely
-/// positioned item's static rectangle. The generic abspos equations consume
-/// that rectangle directly, including their direction-dependent choice of an
-/// automatic inset. Record alignment only when an authored or inherited Grid
-/// alignment actually changes that static rectangle.
-/// <https://www.w3.org/TR/css-grid-1/#abspos-items>
-fn grid_abspos_has_explicit_alignment(
-    child_style: &ComputedStyle,
-    container_style: &ComputedStyle,
-) -> bool {
-    effective_grid_abspos_alignment(child_style.justify_self, container_style.justify_items).keyword
-        != SelfAlignmentKeyword::Normal
-        || effective_grid_abspos_alignment(child_style.align_self, container_style.align_items)
-            .keyword
-            != SelfAlignmentKeyword::Normal
 }
 
 /// Resolve a grid static-position line from final layout offsets, then from
@@ -824,13 +1049,14 @@ fn grid_static_line_offset(
         tracks,
         auto_tracks,
         placement,
+        gap.clone(),
         container_size,
     );
     if after_explicit_implicit_line {
         // The in-flow grid has already materialized this implicit track.
         // Replaying the definite track list would re-run `align-content` on
         // an over-constrained implicit grid and move the used line.
-        return grid_layout_line_static_offset_with_inferred_gaps(
+        let from_layout = grid_layout_line_static_offset_with_inferred_gaps(
             tracks,
             auto_tracks,
             placement,
@@ -841,8 +1067,8 @@ fn grid_static_line_offset(
                 container_size,
                 include_inferred_gaps: false,
             },
-        )
-        .or_else(|| {
+        );
+        return from_layout.or_else(|| {
             grid_line_static_offset(
                 tracks,
                 auto_tracks,
@@ -884,6 +1110,7 @@ fn grid_static_placement_is_after_explicit_line(
     tracks: &css::GridTrackList,
     auto_tracks: &css::GridAutoTrackList,
     placement: &css::GridPlacement,
+    gap: css::ComputedGap,
     container_size: f32,
 ) -> bool {
     let css::GridTrackList::Tracks {
@@ -893,7 +1120,19 @@ fn grid_static_placement_is_after_explicit_line(
     else {
         return false;
     };
-    let Some(line_names) = explicit_grid_line_names(components, trailing_names) else {
+    let line_names = if grid_track_list_has_auto_repeat(tracks) {
+        let Some(Some(auto_repeat_count)) =
+            simple_fixed_auto_repeat_count(components, gap, container_size)
+        else {
+            return false;
+        };
+        let Some(line_names) = auto_repeat_explicit_line_names(tracks, auto_repeat_count) else {
+            return false;
+        };
+        line_names
+    } else if let Some(line_names) = explicit_grid_line_names(components, trailing_names) {
+        line_names
+    } else {
         return false;
     };
     grid_line_static_offset_index(placement, &line_names, auto_tracks, container_size)

@@ -4,6 +4,49 @@ use crate::layout::table::layout::{
 };
 use crate::units::IntoLayoutLength;
 
+/// Parent-facing intrinsic sizing data for a table wrapper used as a flex item.
+///
+/// A table has two relevant boxes at the flex boundary: its grid supplies the
+/// table-specific automatic minimum, while its wrapper (including captions)
+/// supplies preferred and block-size contributions.  Keeping them together
+/// prevents flex estimation, stretch remeasurement, and replay from choosing
+/// incompatible table representations.
+/// <https://drafts.csswg.org/css-tables-3/#computing-the-table-width>
+/// <https://drafts.csswg.org/css-tables-3/#computing-the-table-height>
+#[allow(dead_code)] // Additional consumers are added at table-wrapper boundaries incrementally.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout) struct TableWrapperFlexSizing {
+    pub(in crate::layout) grid_min_content_inline: LogicalInlineContentSize,
+    pub(in crate::layout) grid_max_content_inline: LogicalInlineContentSize,
+    pub(in crate::layout) wrapper_preferred_inline: LogicalInlineContentSize,
+    pub(in crate::layout) wrapper_intrinsic_block: LogicalBlockContentSize,
+    /// Decoration belongs to the wrapper, not the grid content contribution.
+    pub(in crate::layout) inline_non_content: NonContentLength,
+    pub(in crate::layout) block_non_content: NonContentLength,
+    /// Margins remain outside table-grid sizing and are consumed only by the
+    /// parent flex outer-size calculation.
+    pub(in crate::layout) margins: css::Edges,
+}
+
+/// Prepare a table-wrapper probe for Flexbox's intrinsic automatic minimum.
+///
+/// The probe must not inherit the table's authored block preferred size or
+/// minimum. Flexbox consumes those at their own specified-size and minimum
+/// phases; using either while measuring the grid would turn them into a
+/// second automatic minimum.
+/// <https://www.w3.org/TR/css-flexbox-1/#min-size-auto>
+pub(in crate::layout) fn intrinsic_table_wrapper_block_probe_style(
+    style: &ComputedStyle,
+) -> ComputedStyle {
+    let mut probe = style.clone();
+    probe
+        .box_values
+        .height
+        .replace_with_used(css::ComputedLengthPercentageOrAuto::Auto);
+    probe.box_values.min_height = css::ComputedLengthPercentageOrAuto::Auto;
+    probe
+}
+
 /// Conflict-resolved table-wrapper border insets.
 ///
 /// In the collapsed border model CSS Tables assigns the table root half of
@@ -589,11 +632,15 @@ impl TableColumnMeasures {
 }
 
 pub(super) fn intrinsic_percentage_contribution(style: &ComputedStyle) -> f32 {
-    let min_width = length_percentage_percent(style.box_values.min_width.clone()).unwrap_or(0.0);
     let width = length_percentage_percent(style.box_values.width.clone()).unwrap_or(0.0);
     let max_width =
         length_percentage_percent(style.box_values.max_width.clone()).unwrap_or(f32::INFINITY);
-    min_width.max(width.min(max_width)).max(0.0)
+    // CSS Tables intentionally excludes `min-width` from a column's
+    // intrinsic percentage contribution. `width` already acts as a minimum
+    // during table layout, while a percentage min-width must not turn an
+    // otherwise auto table into a percentage-sized grid.
+    // <https://drafts.csswg.org/css-tables-3/#computing-column-measures>
+    width.min(max_width).max(0.0)
 }
 
 fn length_percentage_percent(value: css::ComputedLengthPercentageOrAuto) -> Option<f32> {
@@ -624,18 +671,28 @@ pub(super) fn constrain_table_intrinsic_width_with_floor(
     floor: f32,
 ) -> f32 {
     let min_width = intrinsic_length_constraint(style.box_values.min_width.clone());
-    let max_width = intrinsic_length_constraint(style.box_values.max_width.clone());
+    // CSS Sizing resolves a contradictory min/max pair in favour of the
+    // minimum. Preserve that ordering before applying the outer table measure
+    // rules, so `min-width: 100px; max-width: 0` contributes 100px rather
+    // than disappearing from the table grid.
+    // <https://www.w3.org/TR/css-sizing-3/#min-size-auto>
+    let max_width = intrinsic_length_constraint(style.box_values.max_width.clone())
+        .map(|maximum| maximum.max(min_width.unwrap_or(0.0)));
     constrain(value.max(floor), min_width, max_width)
 }
 
 fn intrinsic_length_constraint(value: css::ComputedLengthPercentageOrAuto) -> Option<f32> {
     match value {
         css::ComputedLengthPercentageOrAuto::LengthPercentage(value)
-            if value.percentage_coefficient().is_some() =>
+            if !value.needs_percentage_basis() =>
         {
-            (!value.length_is_zero() || value.percentage_coefficient_or_zero() == 0.0)
-                .then_some(value.length_max_zero().points())
+            Some(value.length_points())
         }
+        // A mixed length-percentage min/max value is cyclic while the table's
+        // intrinsic width is unknown. Its fixed component must not be used as
+        // a partial min/max constraint: that would make `calc(100px + 1%)`
+        // create a definite missing-column track.
+        // <https://drafts.csswg.org/css-tables-3/#computing-column-measures>
         css::ComputedLengthPercentageOrAuto::LengthPercentage(_) => None,
         css::ComputedLengthPercentageOrAuto::Auto
         | css::ComputedLengthPercentageOrAuto::MinContent
@@ -1488,6 +1545,37 @@ mod tests {
     }
 
     #[test]
+    fn mixed_min_and_max_widths_do_not_partially_constrain_intrinsic_columns() {
+        let mixed = css::ComputedLengthPercentage::from_affine(layout_pt(12.0), 0.5, true);
+        let fixed = css::ComputedLengthPercentage::from_points(12.0);
+
+        assert_eq!(
+            intrinsic_length_constraint(css::ComputedLengthPercentageOrAuto::LengthPercentage(
+                mixed
+            )),
+            None
+        );
+        assert_eq!(
+            intrinsic_length_constraint(css::ComputedLengthPercentageOrAuto::LengthPercentage(
+                fixed
+            )),
+            Some(12.0)
+        );
+    }
+
+    #[test]
+    fn intrinsic_column_constraints_give_min_width_precedence_over_max_width() {
+        let mut style = ComputedStyle::initial();
+        style.box_values.min_width = length(100.0);
+        style.box_values.max_width = length(0.0);
+
+        assert_eq!(
+            constrain_table_intrinsic_width_with_floor(&style, 0.0, 0.0),
+            100.0
+        );
+    }
+
+    #[test]
     fn table_width_content_box_expands_to_wrapper_border_box() {
         let mut style = style_with_width(length(150.0));
         style.border_collapse = css::BorderCollapse::Separate;
@@ -1651,5 +1739,21 @@ mod tests {
         let content = used_empty_table_grid_width(&style, 300.0, table_width);
 
         assert_eq!(content.points(), 0.0);
+    }
+
+    #[test]
+    fn intrinsic_table_wrapper_probe_does_not_promote_authored_block_sizes_to_grid_minimums() {
+        let mut style = ComputedStyle::initial();
+        style.box_values.height.replace_with_used(length(500.0));
+        style.box_values.min_height = length(80.0);
+
+        let probe = intrinsic_table_wrapper_block_probe_style(&style);
+
+        assert!(probe.box_values.height.is_auto());
+        assert_eq!(
+            probe.box_values.min_height,
+            css::ComputedLengthPercentageOrAuto::Auto
+        );
+        assert_eq!(probe.box_values.width, style.box_values.width);
     }
 }

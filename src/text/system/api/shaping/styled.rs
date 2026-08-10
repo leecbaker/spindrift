@@ -496,19 +496,17 @@ impl FontSystem {
         };
         for family in families {
             match family {
-                FontFamily::Names(names) => {
-                    for name in names {
-                        let Some(font_id) = self.resolve_single_family(
-                            name,
-                            style.font_weight,
-                            style.font_style,
-                            style.font_width,
-                        ) else {
-                            continue;
-                        };
-                        if self.document_fonts.font_has_character(font_id, character) {
-                            return Some(FontFamily::Names(vec![name.clone()]));
-                        }
+                FontFamily::Named(name) => {
+                    let Some(font_id) = self.resolve_single_family(
+                        name.as_str(),
+                        style.font_weight,
+                        style.font_style,
+                        style.font_width,
+                    ) else {
+                        continue;
+                    };
+                    if self.document_fonts.font_has_character(font_id, character) {
+                        return Some(FontFamily::Named(name.clone()));
                     }
                 }
                 generic => {
@@ -1383,7 +1381,7 @@ impl FontSystem {
                         == requested_color
             })
             .and_then(|font_id| self.document_fonts.get(font_id))
-            .map(|font| parley_font_family_source(&FontFamily::Names(vec![font.family.clone()])))
+            .map(|font| parley_font_family_source(&FontFamily::named(font.family.clone())))
     }
 
     /// Return the CSS stack's usable faces in precedence order, then the
@@ -1402,16 +1400,14 @@ impl FontSystem {
         let mut candidates = Vec::new();
         for family in families {
             match family {
-                FontFamily::Names(names) => {
-                    for name in names {
-                        if let Some(font_id) = self.resolve_single_family(
-                            &name,
-                            style.font_weight,
-                            style.font_style,
-                            style.font_width,
-                        ) {
-                            candidates.push(font_id);
-                        }
+                FontFamily::Named(name) => {
+                    if let Some(font_id) = self.resolve_single_family(
+                        name.as_str(),
+                        style.font_weight,
+                        style.font_style,
+                        style.font_width,
+                    ) {
+                        candidates.push(font_id);
                     }
                 }
                 generic => {

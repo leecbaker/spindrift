@@ -9,13 +9,23 @@ use super::*;
 ///
 /// <https://www.w3.org/TR/css-display-3/#the-display-properties>
 pub(crate) fn parse_display(value: &str, current: Display) -> Display {
-    let lower = value.trim().to_ascii_lowercase();
-    let parts = lower.split_whitespace().collect::<Vec<_>>();
+    let Some(parts) = crate::css::component_values::try_split_css_component_values(value) else {
+        return current;
+    };
+    let Some(parts) = parts
+        .into_iter()
+        .map(crate::css::component_values::css_single_ident)
+        .collect::<Option<Vec<_>>>()
+    else {
+        return current;
+    };
     if parts.is_empty() {
         return current;
     }
 
-    if let Some(parsed) = parse_display_legacy(&lower) {
+    if let [part] = parts.as_slice()
+        && let Some(parsed) = parse_display_legacy(&part.to_ascii_lowercase())
+    {
         return parsed;
     }
 
@@ -29,8 +39,8 @@ pub(crate) fn parse_display(value: &str, current: Display) -> Display {
     // <https://drafts.csswg.org/css-display-4/#math>
     let mut math_inner = false;
     let mut list_item = false;
-    for part in parts {
-        match part {
+    for part in &parts {
+        match part.to_ascii_lowercase().as_str() {
             "block" => {
                 if outer.replace(DisplayOuter::Block).is_some() {
                     return current;

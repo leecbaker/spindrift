@@ -2,8 +2,9 @@
 mod tests {
     use super::super::*;
     use crate::css::{
-        BoxDecorationBreak, ComputedLengthPercentage, Hyphens, StylesheetCollection, TextAlignLast,
-        TextBoxEdge, TextBoxTrim, TextEdgeMetric, TextEdgePair, TextOrientation,
+        BoxDecorationBreak, ComputedLengthPercentage, ContentLanguage, Hyphens,
+        StylesheetCollection, TextAlignLast, TextBoxEdge, TextBoxTrim, TextEdgeMetric,
+        TextEdgePair, TextOrientation,
     };
     use crate::layout::inline_collect::{InlineElementScopeOptions, InlinePlacement};
     use std::rc::Rc;
@@ -104,6 +105,83 @@ mod tests {
         )))
     }
 
+    /// Marker-only positioned inline scopes still select one CSS Inline
+    /// phantom record. Its source edges survive for positioned containing
+    /// block recovery, but it must not become an in-flow line.
+    /// <https://drafts.csswg.org/css-inline-3/#phantom-line-boxes>
+    #[test]
+    fn positioned_inline_edges_materialize_one_zero_advance_phantom_record() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let mut style = ComputedStyle::initial();
+        style.line_height = 96.0;
+        let source = InlinePositioningContainingBlockId(17);
+        let edge = |logical_edge| {
+            InlineItem::Atom(Box::new(InlineAtom::new(
+                InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(InlineBoxEdgeFragment {
+                    logical_edge,
+                    physical_side: match logical_edge {
+                        InlineLogicalEdge::Start => {
+                            inline_start_side(style.writing_mode, style.used_direction())
+                        }
+                        InlineLogicalEdge::End => {
+                            inline_end_side(style.writing_mode, style.used_direction())
+                        }
+                    },
+                    positioning_containing_block_id: Some(source),
+                    advance: 0.0,
+                    paint_extent: 0.0,
+                })),
+                style.clone(),
+                None,
+                InlineSize::new(0.0, style.line_height),
+                style.font_size,
+                0.0,
+                None,
+                None,
+            )))
+        };
+
+        let sequence = builder.collect_inline_line_sequence(
+            vec![edge(InlineLogicalEdge::Start), edge(InlineLogicalEdge::End)],
+            &style,
+            200.0,
+            0.0,
+            0.0,
+        );
+        assert_eq!(sequence.records.len(), 1, "{sequence:?}");
+        let record = &sequence.records[0];
+        assert!(record.is_phantom);
+        assert_eq!(record.height(), 0.0);
+        assert_eq!(record.block_advance(), 0.0);
+        assert!(!record.is_first_formatted_line);
+        assert!(!record.participates_in_widows_orphans());
+        let edges = record
+            .fragment
+            .as_ref()
+            .expect("phantom record retains its source edge atoms")
+            .items()
+            .iter()
+            .filter_map(|item| match &item.item {
+                InlineLineItem::Atom(atom) => match atom.content() {
+                    InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge))
+                        if edge.positioning_containing_block_id == Some(source) =>
+                    {
+                        Some(edge.logical_edge)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            edges,
+            vec![InlineLogicalEdge::Start, InlineLogicalEdge::End]
+        );
+    }
+
     fn measured_inline_box_edge(
         boundary: usize,
         logical_edge: InlineLogicalEdge,
@@ -142,7 +220,9 @@ mod tests {
         inline_layout::RangedMeasuredMixedInlineLineItem {
             item: inline_layout::MeasuredInlineItem {
                 item: InlineLineItem::Atom(InlineAtom::new(
-                    InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace),
+                    InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace(
+                        InlineTextBoundarySpacing::new(layout_pt(5.0), false),
+                    )),
                     style.clone(),
                     None,
                     InlineSize::new(5.0, 0.0),
@@ -487,6 +567,8 @@ mod tests {
             hanging_punctuation_reserve: 0.0,
             fragment_text_box_trim: TextBoxLineTrim::default(),
             has_flow_side_effects: false,
+            replay_float_scope: ReplayFloatScope::InheritContainingBlock,
+            has_local_continuation_cutoff: false,
         }
     }
 
@@ -597,6 +679,8 @@ mod tests {
                 block_end: 20.0,
             },
             has_flow_side_effects: false,
+            replay_float_scope: ReplayFloatScope::InheritContainingBlock,
+            has_local_continuation_cutoff: false,
         };
 
         let (_, records) = sequence.fragment_records_for_slice_paint(0.0, -100.01, -300.0);
@@ -829,6 +913,8 @@ mod tests {
             hanging_punctuation_reserve: 0.0,
             fragment_text_box_trim: TextBoxLineTrim::default(),
             has_flow_side_effects: false,
+            replay_float_scope: ReplayFloatScope::InheritContainingBlock,
+            has_local_continuation_cutoff: false,
         };
         let mut trimmed_first = first;
         trimmed_first.block_start_trim = 10.0;
@@ -840,6 +926,8 @@ mod tests {
             hanging_punctuation_reserve: 0.0,
             fragment_text_box_trim: TextBoxLineTrim::default(),
             has_flow_side_effects: false,
+            replay_float_scope: ReplayFloatScope::InheritContainingBlock,
+            has_local_continuation_cutoff: false,
         };
 
         let borders = css::Edges::ZERO;
@@ -904,6 +992,15 @@ mod tests {
         );
         assert_eq!(
             inline_item_boundary_role(&inline_box_edge(0.0, &style)),
+            InlineBoundaryRole::TransparentTextBoundary
+        );
+        assert_eq!(
+            inline_atom_boundary_role(&InlineAtomContent::InlineEdge(
+                InlineEdgeRole::TextAutospace(InlineTextBoundarySpacing::new(
+                    layout_pt(0.0),
+                    false,
+                )),
+            )),
             InlineBoundaryRole::TransparentTextBoundary
         );
         assert_eq!(
@@ -1297,7 +1394,7 @@ mod tests {
 
         let mut auto = style.clone();
         auto.hyphens = Hyphens::Auto;
-        auto.language = Some("en".to_string());
+        auto.language = ContentLanguage::from_html_attribute("en");
         let auto_available_width = builder.font_system.measure_text("ribo", &auto) + 0.1;
         let auto_sequence =
             raw_text_sequence(&mut builder, "ribonuclease", &auto, auto_available_width);
@@ -1315,7 +1412,7 @@ mod tests {
             "ribonuclease"
         );
 
-        auto.language = None;
+        auto.language = ContentLanguage::Unknown;
         let unknown_language =
             raw_text_sequence(&mut builder, "ribonuclease", &auto, auto_available_width);
         assert_eq!(
@@ -1576,12 +1673,15 @@ mod tests {
     }
 
     #[test]
-    fn inline_whitespace_processor_preserves_mandatory_control_breaks() {
+    fn inline_whitespace_processor_makes_non_whitespace_controls_visible() {
         let mut style = ComputedStyle::initial();
         style.font_family = css::FontFamily::SansSerif;
         let mut items = vec![inline_word("A\u{000b}\u{000c}\u{0099}B", &style)];
 
-        assert_eq!(normalized_inline_item_text(&mut items), "A||\u{fffd}B");
+        assert_eq!(
+            normalized_inline_item_text(&mut items),
+            "A\u{25a0}\u{25a0}\u{25a0}B"
+        );
     }
 
     #[test]
@@ -2375,6 +2475,28 @@ mod tests {
     }
 
     #[test]
+    fn color_only_arabic_boundary_preserves_shaping_group() {
+        let left = inline_fragment("ع", ComputedStyle::initial());
+        let mut right = inline_fragment("ع", ComputedStyle::initial());
+        right.style_mut().color = CssColor::new(0, 0, 255);
+
+        assert!(!can_paint_inline_fragments_together(&left, &right));
+        assert!(can_shape_inline_fragments_together(&left, &right));
+        assert!(can_queue_inline_fragments_for_shaping(&left, &right));
+
+        right.style_mut().padding.left = 1.0;
+        assert!(!can_queue_inline_fragments_for_shaping(&left, &right));
+
+        right.style_mut().padding.left = 0.0;
+        right.style_mut().unicode_bidi = css::UnicodeBidi::Isolate;
+        assert!(!can_queue_inline_fragments_for_shaping(&left, &right));
+
+        right.style_mut().unicode_bidi = css::UnicodeBidi::Normal;
+        right.style_mut().letter_spacing = ComputedLengthPercentage::from_points(1.0);
+        assert!(!can_queue_inline_fragments_for_shaping(&left, &right));
+    }
+
+    #[test]
     fn direction_change_alone_does_not_break_boundary_shaping() {
         let mut left_style = ComputedStyle::initial();
         left_style.direction = Direction::Rtl;
@@ -2574,7 +2696,6 @@ mod tests {
             0.0,
             200.0,
             0,
-            false,
             "\u{0628}\u{0640}",
         );
 
@@ -2681,7 +2802,6 @@ mod tests {
             0.0,
             200.0,
             0,
-            false,
             "AB",
         );
         let prepared = builder
@@ -2716,7 +2836,7 @@ mod tests {
             .paint_items
             .iter()
             .find_map(|item| match item {
-                PreparedInlinePaintItem::Atom(atom) => Some(atom.content_rect.x()),
+                PreparedInlinePaintItem::Atom(atom) => Some(atom.border_box.x()),
                 _ => None,
             })
             .expect("atom should be prepared");
@@ -2737,7 +2857,7 @@ mod tests {
         style.line_height = 150.0;
         style.border_widths.right = 150.0;
         style.border_styles.right = BorderStyle::Solid;
-        style.border_colors.right = CssColor::new(0, 128, 0);
+        style.border_colors.right = css::CssColorOrCurrentColor::Color(CssColor::new(0, 128, 0));
         style.margin.right = -150.0;
         builder.cursor_y = 180.0;
 
@@ -2772,7 +2892,6 @@ mod tests {
             0.0,
             300.0,
             0,
-            false,
             String::new(),
         );
 
@@ -2795,7 +2914,7 @@ mod tests {
             .paint_items
             .iter()
             .find_map(|item| match item {
-                PreparedInlinePaintItem::Atom(atom) => Some(atom.content_rect),
+                PreparedInlinePaintItem::Atom(atom) => Some(atom.border_box),
                 _ => None,
             })
             .expect("edge-only split inline should prepare an edge paint atom");
@@ -3066,7 +3185,6 @@ mod tests {
             0.0,
             available_width,
             0,
-            false,
             text,
         );
         let is_phantom = inline_layout::inline_line_fragment_is_phantom(&fragment);
@@ -3187,6 +3305,41 @@ mod tests {
         assert!((rect.y() - 73.0).abs() < 0.01);
         assert!((rect.width() - 20.0).abs() < 0.01);
         assert!((rect.height() - 12.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn inline_line_geometry_projects_atomic_margin_from_logical_block_start() {
+        for (writing_mode, expected_block_start) in [
+            (WritingMode::HorizontalTb, 97.0),
+            (WritingMode::VerticalRl, 77.0),
+            (WritingMode::VerticalLr, 3.0),
+        ] {
+            let mut style = ComputedStyle::initial();
+            style.writing_mode = writing_mode;
+            let mut geometry = InlineLineGeometry::new(
+                0.0,
+                100.0,
+                100.0,
+                20.0,
+                InlinePaintContext {
+                    block_style: &style,
+                    direction: style.direction,
+                    available_width: 100.0,
+                    padding_left: 0.0,
+                    line_indent: 0.0,
+                    text_align: TextAlign::Left,
+                    is_first_line: true,
+                    line_block_size: 20.0,
+                },
+            );
+
+            geometry.apply_logical_block_start_margin(3.0);
+
+            assert_eq!(
+                geometry.block_start, expected_block_start,
+                "{writing_mode:?} projects logical block-start toward its physical side"
+            );
+        }
     }
 
     #[test]
@@ -3908,7 +4061,7 @@ mod tests {
     }
 
     #[test]
-    fn principal_flow_projects_both_root_generated_pseudos() {
+    fn principal_flow_preserves_root_generated_pseudo_styles() {
         let mut root_style = ComputedStyle::initial();
         root_style.before_style = Some(Box::new(ComputedStyle::initial()));
         root_style.after_style = Some(Box::new(ComputedStyle::initial()));
@@ -3927,21 +4080,21 @@ mod tests {
                 .as_deref()
                 .expect("the root before pseudo remains present")
                 .writing_mode,
-            WritingMode::SidewaysRl
+            WritingMode::HorizontalTb
         );
         assert_eq!(
             used.after_style
                 .as_deref()
                 .expect("the root after pseudo remains present")
                 .writing_mode,
-            WritingMode::SidewaysRl
+            WritingMode::HorizontalTb
         );
         assert_eq!(
             used.after_style
                 .as_deref()
-                .expect("the root after pseudo inherits used direction")
+                .expect("the root after pseudo preserves its computed direction")
                 .direction,
-            Direction::Rtl
+            Direction::Ltr
         );
     }
 
@@ -4416,7 +4569,7 @@ mod tests {
             .paint_items
             .iter()
             .find_map(|item| match item {
-                PreparedInlinePaintItem::Atom(atom) => Some(atom.content_rect.x()),
+                PreparedInlinePaintItem::Atom(atom) => Some(atom.border_box.x()),
                 _ => None,
             })
             .expect("atom should be prepared");
@@ -4466,7 +4619,7 @@ mod tests {
             .paint_items
             .iter()
             .filter_map(|item| match item {
-                PreparedInlinePaintItem::Atom(atom) => Some(atom.content_rect.x()),
+                PreparedInlinePaintItem::Atom(atom) => Some(atom.border_box.x()),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -5510,7 +5663,9 @@ mod tests {
             .opportunities
             .iter()
             .cloned()
-            .find(|opportunity| opportunity.hangs && opportunity.position.run_index == 2)
+            .find(|opportunity| {
+                opportunity.hangs_from_fitting_measure() && opportunity.position.run_index == 2
+            })
             .expect("pre-wrap trailing spaces should create a hanging break");
 
         let broken = graph.materialize_line(
@@ -6376,8 +6531,8 @@ mod tests {
         style.border_styles.top = BorderStyle::Hidden;
         style.border_styles.right = BorderStyle::Solid;
         style.border_styles.bottom = BorderStyle::Solid;
-        style.border_colors.top = CssColor::new(255, 0, 0);
-        style.border_colors.bottom = CssColor::TRANSPARENT;
+        style.border_colors.top = css::CssColorOrCurrentColor::Color(CssColor::new(255, 0, 0));
+        style.border_colors.bottom = css::CssColorOrCurrentColor::Color(CssColor::TRANSPARENT);
 
         let border = used_border(&style);
 

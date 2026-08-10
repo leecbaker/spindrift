@@ -16,6 +16,9 @@ except where existing code already implements draft properties.
   transform individually. Its opaque full-em test glyph coverage now remains
   visually correct when a negative stacking-level reference is fully hidden
   beneath later text paint.
+- `text-transform: full-size-kana` implements all 58 mappings in CSS Text
+  Appendix G, including the nine mappings from small halfwidth Kana to their
+  full-size halfwidth equivalents; it does not normalize or width-convert them.
 - `text-indent` preserves its selected line geometry through PDF emission:
   opaque full-em coverage is batched only within one text-paint record, so
   adjacent indented lines retain their individual fractional-edge coverage.
@@ -57,6 +60,12 @@ except where existing code already implements draft properties.
   and never create U+FFFC-style opportunities. Whitespace normalization keeps
   `box-decoration-break: slice` start/end ownership only on source-adjacent
   visible text, so a soft-wrapped continuation cannot repaint either side.
+- Paint-only inline style changes such as `color` retain a shared cursive
+  shaping group across a transparent inline boundary. The resulting glyph runs
+  preserve Arabic joining while their independent paint state remains separate
+  through PDF emission. Alignment and justification use the final visual
+  advances, so source-preserved default-ignorable join controls do not shift an
+  RTL line's inline origin.
 - Horizontal mixed inline bidi reordering now operates on measured inline
   items, preserving neutral text fragments such as collapsed spaces and keeping
   regular inline box edge atoms attached to the adjacent visual content that
@@ -66,10 +75,12 @@ except where existing code already implements draft properties.
   boundaries for HTML `<bdi>` and CSS isolates, so the enclosing paragraph
   resolves each scope as one neutral isolate object.
 - Non-text inline edges are transparent to UAX #9: both regular box edges and
-  CSS Text autospace edges split the selected visual ranges and are reinserted
-  at their owned visual boundary. Autospace therefore contributes its selected
-  inline advance without becoming an object-replacement character that can
-  alter the surrounding bidi resolution.
+  CSS Text autospace adjustments split the selected visual ranges and are
+  reinserted at their owned source boundary. Autospace contributes the selected
+  `1/8ic` advance without becoming an object-replacement character or a UAX #14
+  atomic object that can alter surrounding bidi or line-break resolution. Its
+  `ic` metric comes from the selected face's WATER glyph, with CSS Values'
+  one-em fallback rather than a fallback CJK font.
 - Styled visual-line shaping applies the same font-neutral default-ignorable
   filtering as ordinary shaping. CGJ therefore remains available to line-break
   processing and source extraction without causing a visible Ahem or fallback
@@ -114,6 +125,11 @@ except where existing code already implements draft properties.
   UAX #14 `BK` and `NL` controls enter the same forced-break representation as
   explicit generated breaks, while LF and CR remain in CSS Text's separate
   segment-break transformation path.
+- Explicit CSS Text 4 expandable separators (authored U+200B and HTML
+  `<wbr>`) become layout-only transformed words after their transparent-edge
+  and forced-break context is known. Their replacement space participates in
+  layout and paint without replacing the authored U+200B in extraction or
+  adding text for `<wbr>`.
 - Language-sensitive text behavior resolves the content writing system once
   from BCP 47 language and ISO 15924 script subtags, with an explicit script
   overriding a language default. Segment-break removal and ICU line-breaking
@@ -123,6 +139,12 @@ except where existing code already implements draft properties.
   CSS Text `normal`/`loose` U+301C and U+30A0 opportunities without extending
   them to Korean or untagged content. The targeted writing-system line-break
   and segment-break WPT regressions pass.
+- Computed content language preserves HTML's distinction between unknown and
+  tagged language state. Empty `lang` is unknown; a well-formed but
+  unregistered BCP 47 tag remains authored while still supplying its parsed
+  locale to typography; malformed tags remain available for HTML round-trip
+  behavior but do not enter typography or `:lang()` matching. In particular,
+  underscore spellings are no longer normalized as language tags.
 - CSS Tables anonymous-object fixup recognizes a whole whitespace-only inline
   sequence around table-internal children independently of its inherited
   `white-space` mode. Preserved source indentation (including indentation split
@@ -155,6 +177,12 @@ except where existing code already implements draft properties.
   in the selected paint sequence, so an inline background or decoration covers
   the hanging separator even though the line's fitting measure excludes its
   advance.
+- U+202F NARROW NO-BREAK SPACE remains an other space separator for CSS Text
+  Phase II, but its UAX #14 `GL` behavior is represented separately at inline
+  boundaries. It therefore stays joined to French punctuation for ordinary
+  text and atomic-inline wrapping, while U+00A0 retains CSS Text's atomic
+  compatibility exception. Explicit `line-break:anywhere` and
+  `overflow-wrap:anywhere` still override the ordinary protection.
 - Selected-line edge scanning treats an interleaved sequence of Unicode other
   space separators and document spaces as one Phase II sequence across
   transparent inline edges. This keeps the complete sequence out of fitting
@@ -196,12 +224,12 @@ except where existing code already implements draft properties.
   manufacture a break beside a preserved separator; `line-break:anywhere` and
   `overflow-wrap:anywhere` retain their separate graph ownership.
 - Unicode other-space separators remain visible source content. In
-  `break-spaces`, their ordinary soft-wrap opportunity is after the separator;
-  a before-separator break is available only when an explicit line-break or
-  overflow-wrap policy supplies it. Legacy modes retain Phase II trailing
-  hanging without moving the separator to a line of its own. The hanging
-  suffix is excluded from fitting and alignment, but remains source for inline
-  backgrounds, decorations, and extraction.
+  `break-spaces`, their after-separator opportunity and full advance are
+  retained; U+202F additionally keeps its ordinary UAX #14 `GL` protection at
+  non-overridden text and atomic boundaries. Legacy modes retain Phase II
+  trailing hanging without moving the separator to a line of its own. The
+  hanging suffix is excluded from fitting and alignment, but remains source
+  for inline backgrounds, decorations, and extraction.
 - Ordinary UAX #14 candidates are finalized only after ICU and Quire's CJK
   fallback candidates have been combined. This retains the LB13 prohibition
   on beginning a line with any `NS` Nonstarter, including ideographic and
@@ -346,8 +374,11 @@ except where existing code already implements draft properties.
   and `baseline-shift` longhands. Percentages resolve against the aligned
   element's own line-height, `middle` uses the parent x-height,
   `text-top`/`text-bottom` use parent content-area metrics, and `top`/`bottom`
-  edge-aligned inline boxes contribute block-size without inflating baseline
-  ascent/descent. Mixed negative-leading lines use signed baseline extents so
+  aligned regular inline subtrees retain their owning scope through text
+  collection, bidi reordering, line fragmentation, line sizing, and paint.
+  They contribute block-size without inflating baseline ascent/descent, and
+  nested `top`/`bottom` scopes remain independently aligned. Mixed
+  negative-leading lines use signed baseline extents so
   the used `line-height` box can sit partly above or below the baseline without
   expanding the WPT line-box-edge cases, while `text-top`/`text-bottom` align
   child content edges to the parent content area and can increase line box

@@ -851,26 +851,23 @@ impl CollapsedBorder {
         origin: BorderOrigin,
         tie_position: usize,
     ) -> Self {
+        let colors = style.border_colors.resolve(style.color);
         let (width, border_style, color) = match side {
-            BorderSide::Top => (
-                style.border_widths.top,
-                style.border_styles.top,
-                style.border_colors.top,
-            ),
+            BorderSide::Top => (style.border_widths.top, style.border_styles.top, colors.top),
             BorderSide::Right => (
                 style.border_widths.right,
                 style.border_styles.right,
-                style.border_colors.right,
+                colors.right,
             ),
             BorderSide::Bottom => (
                 style.border_widths.bottom,
                 style.border_styles.bottom,
-                style.border_colors.bottom,
+                colors.bottom,
             ),
             BorderSide::Left => (
                 style.border_widths.left,
                 style.border_styles.left,
-                style.border_colors.left,
+                colors.left,
             ),
         };
         Self {
@@ -1141,10 +1138,10 @@ mod tests {
             left: BorderStyle::Solid,
         };
         style.border_colors = css::BorderColors {
-            top: color,
-            right: color,
-            bottom: color,
-            left: color,
+            top: css::CssColorOrCurrentColor::Color(color),
+            right: css::CssColorOrCurrentColor::Color(color),
+            bottom: css::CssColorOrCurrentColor::Color(color),
+            left: css::CssColorOrCurrentColor::Color(color),
         };
         style
     }

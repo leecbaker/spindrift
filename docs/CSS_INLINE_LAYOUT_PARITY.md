@@ -1,6 +1,6 @@
 # CSS Inline Layout Parity
 
-Last updated: 2026-07-31
+Last updated: 2026-08-07
 
 CSS Inline Layout Level 3 and CSS Pseudo-Elements Level 4 are the conformance
 targets for inline line construction, typographic pseudo-elements, and initial
@@ -29,6 +29,15 @@ comparisons, but it is not a complete `initial-letter` model.
   backgrounds, borders, and padding. That geometry is independent of
   `line-height` and glyph fallback; fallback faces may enlarge only a
   `line-height: normal` line box.
+- Regular inline `vertical-align: top` and `bottom` align their complete
+  scoped subtree to the final line-box edge. Lexical inline-edge markers do
+  not themselves establish a baseline, so they cannot shift the baseline that
+  their scoped text and atomic descendants are aligned against.
+- Marker-only inline scope streams retain one CSS Inline phantom line record.
+  The record has zero block advance and no ordinary paint or fragmentation
+  effect, but preserves its edge atoms so a positioned descendant can recover
+  the required zero-height containing-block fragment and replay once.
+  <https://drafts.csswg.org/css-inline-3/#phantom-line-boxes>
 - Specified `initial-letter` values compute `drop` to a sink equal to
   `floor(size)`, compute `raise` to sink `1`, preserve explicit sink values,
   and reject invalid zero, negative, fractional sink, or unknown keyword forms.
@@ -86,10 +95,19 @@ comparisons, but it is not a complete `initial-letter` model.
   box; the shared atomic-inline margin-box adapter accounts for margins once,
   so a block-end margin moves the painted border box without moving its
   margin-box baseline.
+- Baseline-participating atomic inlines derive the line paint anchor from the
+  same logical margin-box start used for their line metrics. Their border-box
+  replay then consumes that margin exactly once; line-relative alignment and
+  inline-table wrapper margins remain at their own placement boundary, across
+  horizontal and vertical writing modes.
 - Run-in sequences use the normalized formatting tree through block-flow
   traversal. Their inlinified prelude, including in-flow block descendants,
   merges with the target’s inline source exactly once, while intervening
   out-of-flow boxes keep their principal box type and static-position rules.
+
+`::first-line` replays inherited foreground changes into selected text, inline
+edge atoms, and ancestor inline-decoration snapshots, so deferred
+`currentcolor` paint resolves from the fragment-local foreground.
 
 ## Needed for Parity
 

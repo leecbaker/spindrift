@@ -1,461 +1,5 @@
 use super::*;
 
-pub(in crate::layout) fn evaluate_bookmark_label(
-    element: &Element,
-    style: &ComputedStyle,
-) -> String {
-    let mut output = String::new();
-    for part in &style.bookmark_label.parts {
-        match part {
-            BookmarkLabelPart::String(text) => output.push_str(text),
-            BookmarkLabelPart::ContentText => output.push_str(&inline_text(element)),
-            BookmarkLabelPart::Attr(name) => {
-                if let Some(value) = element.attrs.get(name) {
-                    output.push_str(value);
-                }
-            }
-        }
-    }
-    output
-}
-
-impl<'a> LayoutBuilder<'a> {
-    /// Resolves a same-document target reference against the preceding fresh
-    /// layout pass. The text is inserted before inline line selection, so it
-    /// participates in ordinary wrapping and pagination rather than paint
-    /// replay. CSS Generated Content Level 3 defines target values from the
-    /// target end of a link: <https://www.w3.org/TR/css-content-3/#cross-references>.
-    pub(in crate::layout) fn resolve_generated_target_counter(
-        &self,
-        origin: &Element,
-        target: &TargetReference,
-        name: &str,
-        style: Option<ListStyleType>,
-    ) -> Option<String> {
-        let anchor = self.target_anchor_for_reference(origin, target)?;
-        let value = if name.eq_ignore_ascii_case("page") {
-            i32::try_from(anchor.page_index.saturating_add(1)).unwrap_or(i32::MAX)
-        } else if name.eq_ignore_ascii_case("pages") {
-            i32::try_from(self.target_references.total_pages).unwrap_or(i32::MAX)
-        } else {
-            anchor.counters.get(name)?.last().copied()?
-        };
-        list::counter_text(
-            style.unwrap_or(ListStyleType::Decimal),
-            value,
-            &self.counter_styles,
-        )
-    }
-
-    pub(in crate::layout) fn resolve_generated_target_text(
-        &self,
-        origin: &Element,
-        target: &TargetReference,
-        keyword: css::NamedStringTargetTextKeyword,
-    ) -> Option<String> {
-        let anchor = self.target_anchor_for_reference(origin, target)?;
-        Some(match keyword {
-            css::NamedStringTargetTextKeyword::Content => anchor.text.content,
-            css::NamedStringTargetTextKeyword::Before => anchor.text.before,
-            css::NamedStringTargetTextKeyword::After => anchor.text.after,
-            css::NamedStringTargetTextKeyword::FirstLetter => anchor
-                .text
-                .content
-                .chars()
-                .next()
-                .map(|character| character.to_string())
-                .unwrap_or_default(),
-        })
-    }
-
-    fn target_anchor_for_reference(
-        &self,
-        origin: &Element,
-        target: &TargetReference,
-    ) -> Option<TargetAnchor> {
-        let target = match target {
-            TargetReference::Fragment(_) => target.literal_fragment_id()?.to_string(),
-            TargetReference::Attribute(name) => origin
-                .attrs
-                .get(name)
-                .and_then(|value| value.strip_prefix('#'))
-                .filter(|value| !value.is_empty())?
-                .to_string(),
-        };
-        self.target_references
-            .anchors
-            .get(&target)
-            .cloned()
-            .or_else(|| {
-                Some(TargetAnchor {
-                    page_index: *self.page_anchors.get(&target)?,
-                    text: self.page_anchor_text.get(&target)?.clone(),
-                    counters: self.page_anchor_counters.get(&target)?.clone(),
-                })
-            })
-    }
-}
-
-pub(in crate::layout) fn evaluate_generated_content_text(
-    element: &Element,
-    content: &[GeneratedContentPart],
-    counter_stack: &HashMap<String, Vec<i32>>,
-    counter_styles: &HashMap<String, CounterStyleRule>,
-) -> String {
-    let mut output = String::new();
-    for part in content {
-        match part {
-            GeneratedContentPart::Text(text) => output.push_str(text),
-            GeneratedContentPart::Contents => output.push_str(&inline_text(element)),
-            GeneratedContentPart::Attr { name, fallback } => {
-                if let Some(value) = element.attrs.get(name) {
-                    output.push_str(value);
-                } else if let Some(fallback) = fallback {
-                    output.push_str(fallback);
-                }
-            }
-            GeneratedContentPart::Counter {
-                name,
-                style: counter_style,
-            } => {
-                let value = counter_stack
-                    .get(name)
-                    .and_then(|values| values.last().cloned())
-                    .unwrap_or(0);
-                if let Some(counter) = list::counter_text(
-                    counter_style.clone().unwrap_or(ListStyleType::Decimal),
-                    value,
-                    counter_styles,
-                ) {
-                    output.push_str(&counter);
-                }
-            }
-            GeneratedContentPart::Counters {
-                name,
-                separator,
-                style: counter_style,
-            } => {
-                let style = counter_style.clone().unwrap_or(ListStyleType::Decimal);
-                let counters = counter_stack
-                    .get(name)
-                    .cloned()
-                    .unwrap_or_else(|| vec![0])
-                    .into_iter()
-                    .filter_map(|value| list::counter_text(style.clone(), value, counter_styles))
-                    .collect::<Vec<_>>();
-                output.push_str(&counters.join(separator));
-            }
-            GeneratedContentPart::Image { .. } => {}
-            GeneratedContentPart::TargetCounter { .. } => {}
-            GeneratedContentPart::TargetText { .. } => {}
-            GeneratedContentPart::Quote(_) => {}
-            GeneratedContentPart::Leader(text) => output.push_str(text),
-        }
-    }
-    output
-}
-
-pub(in crate::layout) fn evaluate_generated_alt_text(
-    element: &Element,
-    content: &[GeneratedAltTextPart],
-    counter_stack: &HashMap<String, Vec<i32>>,
-    counter_styles: &HashMap<String, CounterStyleRule>,
-) -> String {
-    let mut output = String::new();
-    for part in content {
-        match part {
-            GeneratedAltTextPart::Text(text) => output.push_str(text),
-            GeneratedAltTextPart::Attr { name, fallback } => {
-                if let Some(value) = element.attrs.get(name) {
-                    output.push_str(value);
-                } else if let Some(fallback) = fallback {
-                    output.push_str(fallback);
-                }
-            }
-            GeneratedAltTextPart::Counter {
-                name,
-                style: counter_style,
-            } => {
-                let value = counter_stack
-                    .get(name)
-                    .and_then(|values| values.last().cloned())
-                    .unwrap_or(0);
-                if let Some(counter) = list::counter_text(
-                    counter_style.clone().unwrap_or(ListStyleType::Decimal),
-                    value,
-                    counter_styles,
-                ) {
-                    output.push_str(&counter);
-                }
-            }
-            GeneratedAltTextPart::Counters {
-                name,
-                separator,
-                style: counter_style,
-            } => {
-                let style = counter_style.clone().unwrap_or(ListStyleType::Decimal);
-                let counters = counter_stack
-                    .get(name)
-                    .cloned()
-                    .unwrap_or_else(|| vec![0])
-                    .into_iter()
-                    .filter_map(|value| list::counter_text(style.clone(), value, counter_styles))
-                    .collect::<Vec<_>>();
-                output.push_str(&counters.join(separator));
-            }
-        }
-    }
-    output
-}
-
-/// Returns the logical alignment that applies to one inline line box.
-///
-/// CSS Text applies `text-align-last` only to the last line of a block or to a
-/// line before a forced break. `auto` keeps ordinary `text-align` behavior,
-/// except that a justified affected line falls back to logical start:
-/// <https://www.w3.org/TR/css-text-3/#text-align-last-property>.
-pub(in crate::layout) fn text_align_for_inline_line(
-    style: &ComputedStyle,
-    is_last_line: bool,
-) -> TextAlign {
-    if is_last_line {
-        logical_text_align_last(style)
-    } else {
-        style.text_align
-    }
-}
-
-pub(in crate::layout) fn logical_text_align_last(style: &ComputedStyle) -> TextAlign {
-    match style.text_align_last {
-        TextAlignLast::Align(align) => align,
-        TextAlignLast::Auto => match style.text_align {
-            TextAlign::Justify => TextAlign::Start,
-            TextAlign::JustifyAll => TextAlign::Justify,
-            align => align,
-        },
-    }
-}
-
-/// Returns the alignment that applies to one inline line box with line text.
-///
-/// CSS Writing Modes `unicode-bidi: plaintext` resolves each plaintext line's
-/// base direction from its own first strong character. CSS Text `start` and
-/// `end` alignment then resolve against that line direction rather than the
-/// containing block's inherited `direction`:
-/// <https://www.w3.org/TR/css-writing-modes-4/#valdef-unicode-bidi-plaintext>
-/// and <https://www.w3.org/TR/css-text-3/#text-align-property>.
-/// Returns line alignment while carrying plaintext paragraph direction state.
-///
-/// CSS Text says `unicode-bidi: plaintext` resolves paragraph direction using
-/// UAX #9 P2/P3. Paragraphs without strong characters use the previous
-/// paragraph direction when available, otherwise the containing block
-/// direction; `text-align: start/end` resolves against that used direction:
-/// <https://www.w3.org/TR/css-text-3/#bidi-linebox> and
-/// <https://www.unicode.org/reports/tr9/#P2>.
-pub(in crate::layout) fn text_align_for_inline_line_text_with_state(
-    style: &ComputedStyle,
-    is_last_line: bool,
-    line_text: &str,
-    plaintext_direction_state: &mut Option<Direction>,
-) -> TextAlign {
-    let mut effective_style;
-    let style = if style.unicode_bidi == UnicodeBidi::Plaintext {
-        let direction = plaintext_direction_for_text(line_text)
-            .or(*plaintext_direction_state)
-            .unwrap_or(style.used_direction());
-        *plaintext_direction_state = Some(direction);
-        effective_style = style.clone();
-        effective_style.direction = direction;
-        &effective_style
-    } else {
-        style
-    };
-    text_align_for_inline_line(style, is_last_line)
-}
-
-/// Returns the used inline offset for one formatted line.
-///
-/// CSS Text applies `text-indent` to the first formatted line of a block
-/// container and, with `each-line`, to lines after forced line breaks while
-/// excluding soft wraps. Percentages resolve against the containing block's
-/// inline size; existing caller-supplied hanging indents are retained for later
-/// line offsets:
-/// <https://www.w3.org/TR/css-text-3/#text-indent-property>.
-pub(in crate::layout) fn used_line_indent(
-    line_index: usize,
-    starts_after_forced_break: bool,
-    hanging_indent: f32,
-    style: &ComputedStyle,
-    available_width: f32,
-) -> f32 {
-    used_line_indent_for_formatted_line(
-        line_index == 0,
-        starts_after_forced_break,
-        hanging_indent,
-        style,
-        available_width,
-    )
-}
-
-/// Resolve `text-indent` from a selected line's formatted-line identity.
-///
-/// A float can consume physical line-box block-size before any inline content
-/// is selected. CSS Text applies indentation to the first *formatted* line,
-/// not to that empty float-excluded physical line:
-/// <https://www.w3.org/TR/css-text-3/#text-indent-property>.
-pub(in crate::layout) fn used_line_indent_for_formatted_line(
-    is_first_formatted_line: bool,
-    starts_after_forced_break: bool,
-    hanging_indent: f32,
-    style: &ComputedStyle,
-    available_width: f32,
-) -> f32 {
-    let is_indent_line =
-        is_first_formatted_line || (style.text_indent.each_line && starts_after_forced_break);
-    let applies_text_indent = is_indent_line != style.text_indent.hanging;
-    let text_indent = if applies_text_indent {
-        used_text_indent(style, layout_pt(available_width)).points()
-    } else {
-        0.0
-    };
-    text_indent
-        + if is_first_formatted_line {
-            0.0
-        } else {
-            hanging_indent
-        }
-}
-
-/// Resolve `text-indent` against the available inline size.
-///
-/// The inline line-construction algorithm consumes a scalar coordinate after
-/// this CSS used-value boundary.
-/// <https://www.w3.org/TR/css-text-3/#text-indent-property>
-pub(in crate::layout) fn used_text_indent(
-    style: &ComputedStyle,
-    available_width: LayoutLength,
-) -> LayoutLength {
-    style
-        .text_indent
-        .amount
-        .used_length_with_percentage_basis(PercentageBasis::definite(available_width))
-        .unwrap_or_else(|| layout_pt(style.text_indent.amount.length_points()))
-}
-
-impl<'a> LayoutBuilder<'a> {
-    /// Resolve the inline-level `vertical-align` shift for text fragments.
-    ///
-    /// CSS 2.2 defines most `vertical-align` values in terms of the parent
-    /// inline box's baseline, content area, or x-height. This helper returns a
-    /// shift where positive values raise the child inline box and negative
-    /// values lower it:
-    /// <https://www.w3.org/TR/CSS22/visudet.html#propdef-vertical-align>.
-    pub(in crate::layout) fn vertical_align_baseline_shift_for_inline_style(
-        &mut self,
-        style: &ComputedStyle,
-        parent_style: &ComputedStyle,
-    ) -> f32 {
-        let own_baseline = self
-            .font_system
-            .rendered_first_line_baseline_offset(style)
-            .points();
-        self.vertical_align_baseline_shift_for_box(
-            style,
-            parent_style,
-            style.line_height,
-            own_baseline,
-        )
-    }
-
-    /// Resolve the inline-level `vertical-align` shift for an atomic inline box.
-    ///
-    /// Atomic inline boxes expose synthesized baselines and margin-box extents,
-    /// but CSS 2.2 alignment values still use the containing inline box as the
-    /// reference:
-    /// <https://www.w3.org/TR/css-inline-3/#atomic-inline> and
-    /// <https://www.w3.org/TR/CSS22/visudet.html#propdef-vertical-align>.
-    pub(in crate::layout) fn vertical_align_baseline_shift_for_atom(
-        &mut self,
-        atom: &InlineAtom,
-        parent_style: &ComputedStyle,
-    ) -> f32 {
-        let own_block_size = inline_atom_logical_block_size(atom, parent_style);
-        let own_baseline = inline_atom_logical_margin_box_baseline_offset(atom, parent_style);
-        self.vertical_align_baseline_shift_for_box(
-            atom.style(),
-            parent_style,
-            own_block_size,
-            own_baseline,
-        )
-    }
-
-    pub(in crate::layout) fn vertical_align_baseline_shift_for_box(
-        &mut self,
-        style: &ComputedStyle,
-        parent_style: &ComputedStyle,
-        own_block_size: f32,
-        own_baseline: f32,
-    ) -> f32 {
-        let alignment_shift = match resolved_alignment_baseline_metric(style, parent_style) {
-            BaselineMetric::Alphabetic => 0.0,
-            BaselineMetric::Middle => {
-                let parent_x_height = self
-                    .font_system
-                    .used_x_height_for_style(parent_style)
-                    .points();
-                own_block_size / 2.0 - own_baseline + parent_x_height / 2.0
-            }
-            BaselineMetric::TextTop | BaselineMetric::Hanging => {
-                own_baseline
-                    - self
-                        .font_system
-                        .rendered_first_line_baseline_offset(parent_style)
-                        .points()
-            }
-            BaselineMetric::TextBottom | BaselineMetric::Ideographic => {
-                let parent_baseline = self
-                    .font_system
-                    .rendered_first_line_baseline_offset(parent_style)
-                    .points();
-                own_block_size - own_baseline - (parent_style.font_size - parent_baseline)
-            }
-            BaselineMetric::Central | BaselineMetric::Mathematical => {
-                own_block_size / 2.0 - own_baseline + parent_style.font_size / 2.0
-            }
-        };
-        let baseline_shift = match style.vertical_align.baseline_shift {
-            BaselineShift::LengthPercentage(_) => style
-                .vertical_align
-                .clone()
-                .length_percentage_shift(layout_pt(style.line_height))
-                .points(),
-            BaselineShift::Super => self
-                .font_system
-                .script_vertical_align_shift(style, BaselineShift::Super)
-                .unwrap_or(style.font_size * 0.45),
-            BaselineShift::Sub => self
-                .font_system
-                .script_vertical_align_shift(style, BaselineShift::Sub)
-                .unwrap_or(-style.font_size * 0.4),
-            BaselineShift::Top | BaselineShift::Center | BaselineShift::Bottom => 0.0,
-        };
-        css::clamp_used_layout_coordinate(layout_pt(alignment_shift + baseline_shift)).points()
-    }
-}
-
-pub(in crate::layout) fn resolved_alignment_baseline_metric(
-    style: &ComputedStyle,
-    parent_style: &ComputedStyle,
-) -> BaselineMetric {
-    match style.vertical_align.alignment_baseline {
-        AlignmentBaseline::Metric(metric) => metric,
-        AlignmentBaseline::Baseline => match parent_style.vertical_align.dominant_baseline {
-            DominantBaseline::Metric(metric) => metric,
-            DominantBaseline::Auto => BaselineMetric::Alphabetic,
-        },
-    }
-}
-
 /// Stateful CSS `text-transform` word-boundary context for one inline formatting context.
 ///
 /// CSS Text Level 3 defines `capitalize` word boundaries across inline box
@@ -1125,9 +669,11 @@ pub(in crate::layout) fn full_size_kana_text(text: &str) -> String {
 
 pub(in crate::layout) fn full_size_kana_character(character: char) -> &'static str {
     match character {
-        // Unicode 15 small Kana additions.
-        // <https://www.unicode.org/Public/15.0.0/ucd/UnicodeData.txt> and
-        // <https://www.w3.org/TR/css-text-3/#valdef-text-transform-full-size-kana>
+        // CSS Text Appendix G's normative small Kana mapping table, synchronized
+        // through Unicode 15.0. This is not Unicode normalization or a
+        // fullwidth conversion: the halfwidth mappings deliberately retain
+        // halfwidth output.
+        // <https://drafts.csswg.org/css-text-3/#small-kana-mappings>
         '\u{1b132}' => "こ",
         '\u{1b150}' => "ゐ",
         '\u{1b151}' => "ゑ",
@@ -1177,6 +723,15 @@ pub(in crate::layout) fn full_size_kana_character(character: char) -> &'static s
         'ㇽ' => "ル",
         'ㇾ' => "レ",
         'ㇿ' => "ロ",
+        'ｧ' => "ｱ",
+        'ｨ' => "ｲ",
+        'ｩ' => "ｳ",
+        'ｪ' => "ｴ",
+        'ｫ' => "ｵ",
+        'ｯ' => "ﾂ",
+        'ｬ' => "ﾔ",
+        'ｭ' => "ﾕ",
+        'ｮ' => "ﾖ",
         _ => "",
     }
 }
@@ -1228,13 +783,82 @@ mod tests {
     }
 
     #[test]
-    fn full_size_kana_maps_unicode_15_small_kana() {
-        assert_eq!(
-            full_size_kana_text(
-                "\u{1b132}\u{1b150}\u{1b151}\u{1b152}\u{1b155}\u{1b164}\u{1b165}\u{1b166}\u{1b167}"
-            ),
-            "こゐゑをコヰヱヲン"
-        );
+    fn full_size_kana_maps_every_css_text_appendix_g_pair() {
+        let mappings = [
+            ('ぁ', "あ"),
+            ('ぃ', "い"),
+            ('ぅ', "う"),
+            ('ぇ', "え"),
+            ('ぉ', "お"),
+            ('ゕ', "か"),
+            ('ゖ', "け"),
+            ('\u{1b132}', "こ"),
+            ('っ', "つ"),
+            ('ゃ', "や"),
+            ('ゅ', "ゆ"),
+            ('ょ', "よ"),
+            ('ゎ', "わ"),
+            ('\u{1b150}', "ゐ"),
+            ('\u{1b151}', "ゑ"),
+            ('\u{1b152}', "を"),
+            ('ァ', "ア"),
+            ('ィ', "イ"),
+            ('ゥ', "ウ"),
+            ('ェ', "エ"),
+            ('ォ', "オ"),
+            ('ヵ', "カ"),
+            ('ㇰ', "ク"),
+            ('ヶ', "ケ"),
+            ('\u{1b155}', "コ"),
+            ('ㇱ', "シ"),
+            ('ㇲ', "ス"),
+            ('ッ', "ツ"),
+            ('ㇳ', "ト"),
+            ('ㇴ', "ヌ"),
+            ('ㇵ', "ハ"),
+            ('ㇶ', "ヒ"),
+            ('ㇷ', "フ"),
+            ('ㇸ', "ヘ"),
+            ('ㇹ', "ホ"),
+            ('ㇺ', "ム"),
+            ('ャ', "ヤ"),
+            ('ュ', "ユ"),
+            ('ョ', "ヨ"),
+            ('ㇻ', "ラ"),
+            ('ㇼ', "リ"),
+            ('ㇽ', "ル"),
+            ('ㇾ', "レ"),
+            ('ㇿ', "ロ"),
+            ('ヮ', "ワ"),
+            ('\u{1b164}', "ヰ"),
+            ('\u{1b165}', "ヱ"),
+            ('\u{1b166}', "ヲ"),
+            ('\u{1b167}', "ン"),
+            ('ｧ', "ｱ"),
+            ('ｨ', "ｲ"),
+            ('ｩ', "ｳ"),
+            ('ｪ', "ｴ"),
+            ('ｫ', "ｵ"),
+            ('ｯ', "ﾂ"),
+            ('ｬ', "ﾔ"),
+            ('ｭ', "ﾕ"),
+            ('ｮ', "ﾖ"),
+        ];
+
+        for (small, full_size) in mappings {
+            assert_eq!(
+                full_size_kana_character(small),
+                full_size,
+                "U+{:04X}",
+                small as u32
+            );
+            assert_eq!(
+                full_size_kana_text(&small.to_string()),
+                full_size,
+                "U+{:04X}",
+                small as u32
+            );
+        }
     }
 
     #[test]

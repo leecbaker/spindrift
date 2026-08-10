@@ -1,4 +1,5 @@
 use super::*;
+use crate::layout::assets::{DocumentPageIndex, PendingPositionedFragmentation};
 use std::collections::HashSet;
 use std::rc::Rc;
 
@@ -79,6 +80,28 @@ impl InlineLineGeometry {
             inline_start,
             inline_size,
             block_start,
+        }
+    }
+
+    /// Move this line's physical block-start anchor by a logical block-start
+    /// margin while retaining the logical-to-physical projection at one
+    /// boundary.
+    ///
+    /// Page-top coordinates increase upward, so horizontal-tb's physical top
+    /// direction is negative `y`; vertical writing modes project the same
+    /// logical adjustment through their physical block-start side:
+    /// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>.
+    pub(in crate::layout) fn apply_logical_block_start_margin(&mut self, margin: f32) {
+        if margin == 0.0 {
+            return;
+        }
+        match WritingModeAxes::new(self.writing_mode, self.direction)
+            .physical_side(LogicalSide::BlockStart)
+        {
+            PhysicalSide::Top => self.block_start -= margin,
+            PhysicalSide::Bottom => self.block_start += margin,
+            PhysicalSide::Left => self.block_start += margin,
+            PhysicalSide::Right => self.block_start -= margin,
         }
     }
 
@@ -323,6 +346,10 @@ pub(in crate::layout) struct InlineAtomData {
     pub(in crate::layout) tracking_scope: Option<Rc<InlineTrackingScope>>,
     /// Paintless advance inserted before this item after visual ordering.
     pub(in crate::layout) leading_tracking: LayoutLength,
+    /// Fragment-local foreground used to resolve deferred `currentcolor` at a
+    /// selected inline box edge. The lexical style remains stable for source
+    /// edge-ownership matching.
+    pub(in crate::layout) current_color_override: Option<CssColor>,
 }
 
 #[derive(Debug, Clone)]
@@ -332,6 +359,10 @@ pub(in crate::layout) struct InlineAtom {
     pub(in crate::layout) baseline: InlineAtomBaseline,
     pub(in crate::layout) baseline_shift: f32,
     pub(in crate::layout) visual_offset: InlineVisualOffset,
+    /// Placement resolved only after this atom has been selected into a parent
+    /// inline line. Source ruby geometry remains independent of visual
+    /// neighbors and bidi ordering.
+    pub(in crate::layout) ruby_placement: Option<ruby::ResolvedRubyPlacement>,
 }
 
 /// The baseline an atomic inline contributes to its containing line.
@@ -352,6 +383,11 @@ pub(in crate::layout) enum InlineAtomBaseline {
     },
     ExportedTableBox {
         offset_from_table_box_block_start: f32,
+    },
+    /// Final Flex baseline sets retained in physical border-box coordinates
+    /// until the containing inline context selects its logical block axis.
+    FlexExported {
+        baselines: crate::layout::baseline::PhysicalBaselineSets,
     },
     SynthesizedBorderBoxBlockEnd,
 }
@@ -380,6 +416,7 @@ impl InlineAtom {
                 alt_text: alt_text.map(Rc::from),
                 tracking_scope: None,
                 leading_tracking: layout_pt(0.0),
+                current_color_override: None,
             }),
             size,
             baseline: InlineAtomBaseline::Exported {
@@ -387,6 +424,7 @@ impl InlineAtom {
             },
             baseline_shift,
             visual_offset: InlineVisualOffset::zero(),
+            ruby_placement: None,
         }
     }
 
@@ -398,6 +436,18 @@ impl InlineAtom {
         self
     }
 
+    pub(in crate::layout) fn with_ruby_placement(
+        mut self,
+        placement: ruby::ResolvedRubyPlacement,
+    ) -> Self {
+        self.ruby_placement = Some(placement);
+        self
+    }
+
+    pub(in crate::layout) fn ruby_placement(&self) -> Option<&ruby::ResolvedRubyPlacement> {
+        self.ruby_placement.as_ref()
+    }
+
     pub(in crate::layout) fn with_tracking_scope(mut self, scope: Rc<InlineTrackingScope>) -> Self {
         Rc::make_mut(&mut self.data).tracking_scope = Some(scope);
         self
@@ -405,6 +455,33 @@ impl InlineAtom {
 
     pub(in crate::layout) fn tracking_scope(&self) -> Option<&Rc<InlineTrackingScope>> {
         self.data.tracking_scope.as_ref()
+    }
+
+    pub(in crate::layout) fn line_relative_scope(&self) -> Option<&InlineTrackingScope> {
+        self.tracking_scope()
+            .and_then(|scope| scope.nearest_line_relative_scope())
+    }
+
+    pub(in crate::layout) fn line_relative_alignment(
+        &self,
+    ) -> Option<InlineScopeLineRelativeAlignment> {
+        // An inline edge represents its owning regular inline box, but its
+        // tracking scope is deliberately still the parent while the start
+        // edge is processed. Do not let the edge's style turn that
+        // parent-side marker into an independently line-relative atom.
+        // Non-edge atoms are atomic inlines, for which `vertical-align`
+        // applies directly to the atom.
+        (!self.content().is_inline_edge())
+            .then(|| {
+                InlineScopeLineRelativeAlignment::from_baseline_shift(
+                    &self.style().vertical_align.baseline_shift,
+                )
+            })
+            .flatten()
+            .or_else(|| {
+                self.line_relative_scope()
+                    .and_then(InlineTrackingScope::line_relative_alignment)
+            })
     }
 
     pub(in crate::layout) fn leading_tracking(&self) -> LayoutLength {
@@ -438,6 +515,14 @@ impl InlineAtom {
         &self.data.style
     }
 
+    pub(in crate::layout) fn set_current_color_override(&mut self, color: CssColor) {
+        Rc::make_mut(&mut self.data).current_color_override = Some(color);
+    }
+
+    pub(in crate::layout) fn current_color_override(&self) -> Option<CssColor> {
+        self.data.current_color_override
+    }
+
     /// Resolve this atom's baseline from its border-box logical block start.
     ///
     /// The caller supplies the border-box block size because atoms retain
@@ -446,6 +531,7 @@ impl InlineAtom {
     pub(in crate::layout) fn baseline_offset_from_border_box_block_start(
         &self,
         border_box_block_size: f32,
+        containing_style: &ComputedStyle,
     ) -> f32 {
         match self.baseline {
             InlineAtomBaseline::Exported {
@@ -454,6 +540,13 @@ impl InlineAtom {
             InlineAtomBaseline::ExportedTableBox {
                 offset_from_table_box_block_start,
             } => offset_from_table_box_block_start,
+            InlineAtomBaseline::FlexExported { baselines } => baselines
+                .first_from_logical_block_start(
+                    block_start_side(containing_style.writing_mode),
+                    layout_pt(border_box_block_size),
+                )
+                .map(LayoutLength::points)
+                .unwrap_or(border_box_block_size),
             InlineAtomBaseline::SynthesizedBorderBoxBlockEnd => border_box_block_size,
         }
     }
@@ -470,6 +563,7 @@ impl InlineAtom {
         &self,
         border_box_block_size: f32,
         block_start_margin: f32,
+        containing_style: &ComputedStyle,
     ) -> f32 {
         match self.baseline {
             InlineAtomBaseline::Exported {
@@ -478,6 +572,13 @@ impl InlineAtom {
             InlineAtomBaseline::ExportedTableBox {
                 offset_from_table_box_block_start,
             } => offset_from_table_box_block_start,
+            InlineAtomBaseline::FlexExported { .. } => {
+                block_start_margin
+                    + self.baseline_offset_from_border_box_block_start(
+                        border_box_block_size,
+                        containing_style,
+                    )
+            }
             InlineAtomBaseline::SynthesizedBorderBoxBlockEnd => {
                 block_start_margin + border_box_block_size
             }
@@ -501,6 +602,17 @@ impl InlineAtom {
         self.baseline = InlineAtomBaseline::ExportedTableBox {
             offset_from_table_box_block_start: offset_from_border_box_block_start,
         };
+        self
+    }
+
+    /// Store a finalized Flex baseline record without prematurely choosing a
+    /// physical axis. The enclosing inline formatting context owns that
+    /// writing-mode projection.
+    pub(in crate::layout) fn with_flex_exported_baselines(
+        mut self,
+        baselines: crate::layout::baseline::PhysicalBaselineSets,
+    ) -> Self {
+        self.baseline = InlineAtomBaseline::FlexExported { baselines };
         self
     }
 
@@ -709,10 +821,128 @@ pub(in crate::layout) enum InlineAtomContent {
     /// not infer writing mode from the enclosing inline line.
     InlineFragment {
         fragment: Box<PaintFragment>,
+        replay_coordinates: AtomicInlineFragmentReplayCoordinates,
         table_cell_context: Option<table::TableCellContentCoordinateContext>,
+        /// `true` when the captured descendants already carry the atom's
+        /// contents-only overflow clip. The outer atomic stacking context
+        /// must then leave the principal decoration outside that clip.
+        contents_overflow_clip_applied: bool,
     },
     InlineEdge(InlineEdgeRole),
     Leader(String),
+}
+
+/// A raw captured atomic fragment's border-box origin on its scratch canvas.
+///
+/// This is deliberately distinct from a parent-line margin-box position:
+/// captured descendants are positioned in the formatting context's border-box
+/// coordinate system.
+#[derive(Debug, Clone, Copy)]
+struct ScratchAtomicBorderBoxOrigin(PaintPoint);
+
+/// The final border-box origin selected by the parent inline line.
+#[derive(Debug, Clone, Copy)]
+struct FinalAtomicBorderBoxOrigin(PaintPoint);
+
+impl FinalAtomicBorderBoxOrigin {
+    fn from_prepared_border_box(border_box: PhysicalInlineRect) -> Self {
+        Self(PaintPoint::new(border_box.x(), border_box.y()))
+    }
+}
+
+/// Capture-space coordinates for one atomic inline formatting context.
+///
+/// Atomic layout paints descendants on an off-page scratch canvas, while the
+/// parent inline layout later places the atom's border box after resolving the
+/// margin-box participant. This frame retains only border-box origins, making
+/// it impossible for an outer margin to enter captured-fragment replay:
+/// <https://www.w3.org/TR/CSS22/visuren.html#inline-boxes>.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout) struct AtomicInlineCaptureFrame {
+    scratch_border_box_origin: ScratchAtomicBorderBoxOrigin,
+}
+
+impl AtomicInlineCaptureFrame {
+    /// Build a frame from the scratch border box. The replay target is also a
+    /// border box; outer CSS margins belong solely to parent line layout.
+    pub(in crate::layout) fn for_scratch_border_box(scratch_border_box_origin: PaintPoint) -> Self {
+        Self {
+            scratch_border_box_origin: ScratchAtomicBorderBoxOrigin(scratch_border_box_origin),
+        }
+    }
+
+    pub(in crate::layout) fn replay_coordinates(self) -> AtomicInlineFragmentReplayCoordinates {
+        AtomicInlineFragmentReplayCoordinates {
+            scratch_border_box_origin: self.scratch_border_box_origin,
+        }
+    }
+}
+
+/// Coordinate contract for replaying an atomic inline's raw captured paint.
+///
+/// The capture frame owns the scratch-to-border-box bridge. Replay receives a
+/// final border-box origin from inline line placement and must not infer a
+/// second normalization from the captured fragment.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout) struct AtomicInlineFragmentReplayCoordinates {
+    scratch_border_box_origin: ScratchAtomicBorderBoxOrigin,
+}
+
+impl AtomicInlineFragmentReplayCoordinates {
+    /// A fragment that has already been normalized to its border-box origin.
+    pub(in crate::layout) fn border_box_local() -> Self {
+        AtomicInlineCaptureFrame::for_scratch_border_box(PaintPoint::new(0.0, 0.0))
+            .replay_coordinates()
+    }
+
+    /// Translate the raw captured fragment directly into a final parent-line
+    /// border box. This is the only boundary that combines scratch-local and
+    /// parent-line paint coordinates.
+    pub(in crate::layout) fn replay_translation(
+        self,
+        final_border_box: PhysicalInlineRect,
+    ) -> PaintTranslation {
+        let scratch_origin = self.scratch_border_box_origin.0;
+        let final_origin = FinalAtomicBorderBoxOrigin::from_prepared_border_box(final_border_box);
+        debug_assert!(scratch_origin.x.is_finite());
+        debug_assert!(scratch_origin.y.is_finite());
+        debug_assert!(final_border_box.x().is_finite());
+        debug_assert!(final_border_box.y().is_finite());
+        let translation = PaintTranslation::new(
+            final_origin.0.x - scratch_origin.x,
+            final_origin.0.y - scratch_origin.y,
+        );
+        let replayed_origin = translation.transform_point(scratch_origin);
+        debug_assert!(
+            replayed_origin_matches_border_box(replayed_origin, final_origin.0, scratch_origin,),
+            "atomic-inline replay must map its scratch border box to the final border box"
+        );
+        translation
+    }
+}
+
+/// Account for the two rounding operations in `final - captured + captured`.
+///
+/// This verifies the coordinate contract without mistaking normal `f32`
+/// cancellation for a misplaced paint fragment. Eight ULPs covers the two
+/// arithmetic operations plus the transform adapter's scalar addition.
+fn replayed_origin_matches_border_box(
+    replayed: PaintPoint,
+    expected: PaintPoint,
+    captured: PaintPoint,
+) -> bool {
+    fn coordinate_matches(replayed: f32, expected: f32, captured: f32) -> bool {
+        const ROUND_TRIP_ULPS: f32 = 8.0;
+        let scale = replayed
+            .abs()
+            .max(expected.abs())
+            .max(captured.abs())
+            .max(1.0);
+        (replayed - expected).abs() <= ROUND_TRIP_ULPS * f32::EPSILON * scale
+    }
+
+    coordinate_matches(replayed.x, expected.x, captured.x)
+        && coordinate_matches(replayed.y, expected.y, captured.y)
 }
 
 /// A measured ruby base or annotation level together with the role that
@@ -726,14 +956,17 @@ pub(in crate::layout) enum InlineAtomContent {
 pub(in crate::layout) struct RubyInlineLevel {
     pub(in crate::layout) sequence: inline_layout::InlineLineSequence,
     pub(in crate::layout) style: Box<ComputedStyle>,
+    /// `ruby-overhang` applies to the annotation container, not the `rt`
+    /// segment. Keep this source explicit after anonymous ruby normalization.
+    pub(in crate::layout) overhang_policy: css::RubyOverhang,
     /// Logical inline extent occupied after `ruby-align: space-around`
     /// distribution. This can be narrower than its column: the remaining
     /// space is the equal half-opportunity at each content edge.
-    pub(in crate::layout) paint_inline_size: f32,
+    pub(in crate::layout) paint_inline_size: ruby::RubyPaintInlineSpan,
     /// Logical inline extent available for this level's paint replay. A
     /// spanning annotation owns the combined width of its paired base
     /// columns while the parent line still advances column by column.
-    pub(in crate::layout) containing_inline_size: f32,
+    pub(in crate::layout) containing_inline_size: ruby::RubyColumnInlineSpan,
     /// Whether this level starts its paired base span. Continuation columns
     /// retain an empty sidecar only to preserve annotation-level indexing.
     pub(in crate::layout) starts_span: bool,
@@ -770,7 +1003,48 @@ pub(in crate::layout) enum InlineLogicalEdge {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::layout) enum InlineEdgeRole {
     BoxEdge(InlineBoxEdgeFragment),
-    TextAutospace,
+    /// A CSS Text `text-autospace` advance bound to one logical text edge.
+    ///
+    /// The atom is only the graph carrier: it has no source text, paint, or
+    /// UAX #14 atomic-object role. Its semantic advance remains typed until
+    /// the inline-layout boundary converts it to a physical inline size.
+    /// <https://drafts.csswg.org/css-text-4/#text-autospace-property>
+    TextAutospace(InlineTextBoundarySpacing),
+}
+
+/// The non-text advance selected at one logical `text-autospace` boundary.
+///
+/// CSS Text defines this as `1/8ic` owned by the innermost inline containing
+/// the boundary. Keeping it distinct from an authored space prevents it from
+/// entering extraction or line-break text while preserving a CSS length's
+/// layout unit.
+/// <https://drafts.csswg.org/css-text-4/#text-autospace-property>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct InlineTextBoundarySpacing {
+    advance: LayoutLength,
+    /// The source-side character class identifies which visual edge remains
+    /// attached to the logical predecessor after UAX #9 reverses a run.
+    predecessor_is_ideograph: bool,
+}
+
+impl InlineTextBoundarySpacing {
+    pub(in crate::layout) const fn new(
+        advance: LayoutLength,
+        predecessor_is_ideograph: bool,
+    ) -> Self {
+        Self {
+            advance,
+            predecessor_is_ideograph,
+        }
+    }
+
+    pub(in crate::layout) const fn advance(self) -> LayoutLength {
+        self.advance
+    }
+
+    pub(in crate::layout) const fn predecessor_is_ideograph(self) -> bool {
+        self.predecessor_is_ideograph
+    }
 }
 
 impl InlineAtomContent {
@@ -858,6 +1132,8 @@ pub(in crate::layout) struct LayoutSnapshot {
     pub(in crate::layout) page_anchor_counters: HashMap<String, HashMap<String, Vec<i32>>>,
     pub(in crate::layout) has_normal_flow_target_references: bool,
     pub(in crate::layout) document_canvas_background: Option<DocumentCanvasBackground>,
+    pub(in crate::layout) document_canvas_scroll_translation: PaintTranslation,
+    pub(in crate::layout) document_canvas_root_positioning_area: Option<PaintBackgroundArea>,
     pub(in crate::layout) document_canvas_overflow: DocumentCanvasResolution,
     pub(in crate::layout) document_canvas_fragment_insets: Vec<FragmentOffsets>,
     pub(in crate::layout) current_page: Page,
@@ -865,6 +1141,7 @@ pub(in crate::layout) struct LayoutSnapshot {
     pub(in crate::layout) current_page_has_named_page_flow_content: bool,
     pub(in crate::layout) current_page_selected_name: Option<String>,
     pub(in crate::layout) last_block_layout_outcome: BlockLayoutOutcome,
+    pub(in crate::layout) last_principal_transform_box: Option<assets::TransformReferenceBox>,
     pub(in crate::layout) current_page_name: Option<String>,
     pub(in crate::layout) current_page_context: PageContext,
     pub(in crate::layout) initial_viewport_context: PageContext,
@@ -889,12 +1166,13 @@ pub(in crate::layout) struct LayoutSnapshot {
     pub(in crate::layout) root_pseudo_block_projection: Option<RootPseudoBlockProjection>,
     pub(in crate::layout) inline_split_float_exclusion_query_offset: RelativeOffset,
     pub(in crate::layout) content_logical_inline_size_stack: Vec<f32>,
+    pub(in crate::layout) container_unit_contexts: Vec<ContainerUnitContext>,
     pub(in crate::layout) multicol_column_containing_blocks: Vec<MulticolColumnContainingBlock>,
     pub(in crate::layout) intrinsic_inline_percentage_basis_stack:
         Vec<IntrinsicInlinePercentageBasis>,
-    pub(in crate::layout) inline_static_position: Option<InlineStaticPosition>,
+    pub(in crate::layout) inline_static_position: Option<StaticPositionCapture>,
     pub(in crate::layout) text_box_line_trim_stack: Vec<TextBoxLineTrim>,
-    pub(in crate::layout) clamp_line_slot_captures: Vec<usize>,
+    pub(in crate::layout) clamp_line_slot_captures: Vec<ClampLineSlotCapture>,
     pub(in crate::layout) positioned_inline_layout_suppression_depth: usize,
     /// Last prepared in-flow line baseline in the active layout coordinate space.
     pub(in crate::layout) last_in_flow_line_baseline_y: Option<f32>,
@@ -916,6 +1194,7 @@ pub(in crate::layout) struct LayoutSnapshot {
     pub(in crate::layout) replayed_flex_item_percentage_height_bases:
         Vec<Option<BlockSizePercentageBasis>>,
     pub(in crate::layout) table_wrapper_block_size_overrides: Vec<Option<BorderBoxLength>>,
+    pub(in crate::layout) positioned_table_sizing: Vec<Option<PositionedTableSizing>>,
     pub(in crate::layout) multicol_text_box_trim_end_child_indices: Option<Vec<usize>>,
     pub(in crate::layout) truncate_page_start_margins: bool,
     pub(in crate::layout) avoid_inside_retry_depth: usize,
@@ -923,6 +1202,7 @@ pub(in crate::layout) struct LayoutSnapshot {
     pub(in crate::layout) element_side_effect_suppression_depth: usize,
     pub(in crate::layout) containing_blocks: Vec<ContainingBlock>,
     pub(in crate::layout) fixed_containing_blocks: Vec<ContainingBlock>,
+    pub(in crate::layout) active_multicol_positioned_containing_block_spans: Vec<u64>,
     pub(in crate::layout) counter_set: CounterSet,
     pub(in crate::layout) counter_plan: CounterPlan,
     pub(in crate::layout) current_page_named_strings: HashMap<String, Vec<NamedStringAssignment>>,
@@ -935,9 +1215,13 @@ pub(in crate::layout) struct LayoutSnapshot {
     pub(in crate::layout) page_counter_initial_values: HashMap<String, i32>,
     pub(in crate::layout) bookmarks: Vec<Bookmark>,
     pub(in crate::layout) positioned_layers: Vec<PositionedPaintLayer>,
+    pub(in crate::layout) committed_positioned_paint_identities:
+        HashSet<(DocumentPageIndex, PositionedPaintCommitKey)>,
+    pub(in crate::layout) positioned_paint_transaction_depth: usize,
+    pub(in crate::layout) positioned_scratch_page_limit: Option<usize>,
     pub(in crate::layout) fixed_layers: Vec<FixedPaintLayer>,
     pub(in crate::layout) absolute_positioned_page_span_target: Option<usize>,
-    pub(in crate::layout) pending_positioned_page_span_target: Option<usize>,
+    pub(in crate::layout) pending_positioned_fragmentation: PendingPositionedFragmentation,
     pub(in crate::layout) next_paint_source_order: usize,
     pub(in crate::layout) overflow_clips: Vec<OverflowClip>,
     pub(in crate::layout) active_scroll_snap_scopes: Vec<scroll_snap::ActiveScrollSnapScope>,
@@ -968,7 +1252,30 @@ pub(in crate::layout) struct CommittedInlineFloat {
     /// representation into the layout-wide transaction state.
     pub(in crate::layout) marker: (usize, usize),
     pub(in crate::layout) selected_row: usize,
+    /// Source and physical-row data retained for an inline formatter replay.
+    ///
+    /// The exclusion itself remains the cross-traversal ownership record;
+    /// this metadata only lets a later source graph (for example after a
+    /// preserved forced break) select its first line against that committed
+    /// exclusion without laying out or painting the float again.
+    pub(in crate::layout) replay: InlineFloatReplayMetadata,
     pub(in crate::layout) exclusion: FloatShape,
+}
+
+/// Durable replay metadata for a source-order inline float.
+///
+/// CSS 2.2 float placement is source ordered even when an explicit break
+/// splits one inline formatting context into several opportunity graphs.  The
+/// formatter therefore retains the selected source range and the physical
+/// placement row independently of the float's paint ownership:
+/// <https://www.w3.org/TR/CSS22/visuren.html#floats>.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout) struct InlineFloatReplayMetadata {
+    pub(in crate::layout) source_range_start: (usize, usize),
+    pub(in crate::layout) source_range_end: (usize, usize),
+    pub(in crate::layout) physical_row: usize,
+    pub(in crate::layout) physical_block_offset: f32,
+    pub(in crate::layout) used_block_advance: f32,
 }
 
 impl CommittedInlineFloat {
@@ -978,6 +1285,7 @@ impl CommittedInlineFloat {
         self.marker.0 != usize::MAX
             && self.marker.1 != usize::MAX
             && self.selected_row != usize::MAX
+            && self.replay.physical_row != usize::MAX
             && self.exclusion.is_css_float()
     }
 }
@@ -1043,4 +1351,54 @@ pub(in crate::layout) struct TargetAnchor {
 pub(in crate::layout) struct TargetReferenceSnapshot {
     pub(in crate::layout) anchors: HashMap<String, TargetAnchor>,
     pub(in crate::layout) total_pages: usize,
+}
+
+#[cfg(test)]
+mod atomic_inline_capture_frame_tests {
+    use super::*;
+
+    #[test]
+    fn replay_origin_invariant_allows_f32_subtract_add_rounding() {
+        let captured = PaintPoint::new(20.0, 20.0);
+        let expected = PaintPoint::new(20.0, 39.999_996);
+        let replayed = PaintTranslation::new(expected.x - captured.x, expected.y - captured.y)
+            .transform_point(captured);
+
+        assert!(replayed_origin_matches_border_box(
+            replayed, expected, captured
+        ));
+    }
+
+    #[test]
+    fn replay_origin_invariant_rejects_meaningful_coordinate_errors() {
+        assert!(!replayed_origin_matches_border_box(
+            PaintPoint::new(20.0, 40.01),
+            PaintPoint::new(20.0, 40.0),
+            PaintPoint::new(20.0, 20.0),
+        ));
+    }
+
+    #[test]
+    fn border_box_capture_retains_the_scratch_border_origin() {
+        let frame = AtomicInlineCaptureFrame::for_scratch_border_box(PaintPoint::new(12.0, 34.0));
+        assert_eq!(
+            frame.scratch_border_box_origin.0,
+            PaintPoint::new(12.0, 34.0)
+        );
+    }
+
+    #[test]
+    fn replay_translation_maps_the_scratch_border_box_to_the_final_border_box() {
+        let frame = AtomicInlineCaptureFrame::for_scratch_border_box(PaintPoint::new(12.0, 34.0));
+        let translation = frame
+            .replay_coordinates()
+            .replay_translation(PhysicalInlineRect::new(InlineRect::new(
+                InlinePoint::new(20.0, 30.0),
+                InlineSize::new(10.0, 8.0),
+            )));
+        assert_eq!(
+            translation.transform_point(PaintPoint::new(12.0, 34.0)),
+            PaintPoint::new(20.0, 30.0),
+        );
+    }
 }

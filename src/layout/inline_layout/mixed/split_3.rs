@@ -508,6 +508,7 @@ pub(in crate::layout) fn split_mixed_inline_visual_ranges_at_transparent_inline_
 
 pub(in crate::layout) fn transparent_inline_edge_precedes_visual_content(
     item: &MeasuredInlineItem,
+    visual_direction: ResolvedBidiDirection,
 ) -> Option<bool> {
     let InlineLineItem::Atom(atom) = &item.item else {
         return None;
@@ -526,10 +527,15 @@ pub(in crate::layout) fn transparent_inline_edge_precedes_visual_content(
                 }
             })
         }
-        // Autospace belongs after the preceding selected typographic unit.
-        // Keeping it on that visual edge lets UAX #9 resolve the surrounding
-        // text without promoting the spacing itself to an atomic object.
-        InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace) => Some(false),
+        // Autospace belongs to the visual side of its logical predecessor.
+        // UAX #9 reverses that side in an RTL run, but the two autospace
+        // boundary directions need not occupy the same visual side once the
+        // surrounding typographic units have reordered.
+        // <https://drafts.csswg.org/css-text-4/#text-autospace-property>
+        InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace(spacing)) => Some(
+            matches!(visual_direction, ResolvedBidiDirection::Rtl)
+                && spacing.predecessor_is_ideograph(),
+        ),
         InlineAtomContent::Canvas
         | InlineAtomContent::Iframe(_)
         | InlineAtomContent::Image(_)

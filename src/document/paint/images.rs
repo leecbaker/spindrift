@@ -182,6 +182,22 @@ impl RenderedImage {
         self
     }
 
+    /// Project this image and its retained clip into a destination paint
+    /// space. The PDF image rectangle remains source-local and is transformed
+    /// at emission time; its clip is transformed here because PDF installs it
+    /// before the image CTM.
+    pub(crate) fn transformed(mut self, transform: PaintTransform) -> Self {
+        if transform == PaintTransform::identity() {
+            return self;
+        }
+        self.transform =
+            Some(transform.multiply(self.transform.unwrap_or_else(PaintTransform::identity)));
+        if let Some(clip) = &mut self.clip {
+            clip.transform(transform);
+        }
+        self
+    }
+
     pub(crate) fn clip(&self) -> Option<&RenderedPathClip> {
         self.clip.as_ref()
     }

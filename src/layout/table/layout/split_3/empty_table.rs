@@ -224,8 +224,8 @@ impl<'a> LayoutBuilder<'a> {
             captions,
             style,
             stylesheets,
-            table_x,
-            physical_grid_width.points(),
+            border_box_x,
+            TableCaptionOuterWidth::from_border_box(border_box_pt(border_box_width)),
             CaptionSide::Top,
         );
 
@@ -233,7 +233,7 @@ impl<'a> LayoutBuilder<'a> {
 
         let table_structure_paint_checkpoint = self.current_page.paint_checkpoint();
         let table_structure_paint_page_index = self.pages.len();
-        if let Some(fill) = style.background_color.visible_color(style.color) {
+        if let Some(fill) = style.background.background_color.visible_color(style.color) {
             let border_rect = paint_space_rect(
                 border_box_x,
                 table_box_top - border_box_height,
@@ -244,7 +244,7 @@ impl<'a> LayoutBuilder<'a> {
                 border_rect,
                 style,
                 table_width.border_widths,
-                style.background_clip,
+                style.background.background_clip,
             );
             if background_rect.size.width <= 0.0 || background_rect.size.height <= 0.0 {
                 // A zero-sized content box has no background painting area.
@@ -288,8 +288,8 @@ impl<'a> LayoutBuilder<'a> {
             captions,
             style,
             stylesheets,
-            table_x,
-            physical_grid_width.points(),
+            border_box_x,
+            TableCaptionOuterWidth::from_border_box(border_box_pt(border_box_width)),
             CaptionSide::Bottom,
         );
         if paint_containment_applies && self.pages.len() == top_caption_paint_page_index {
@@ -329,6 +329,20 @@ impl<'a> LayoutBuilder<'a> {
             self.pop_positioned_containing_block(scope);
         }
         self.pop_float_context();
+        self.last_principal_transform_box = Some(assets::TransformReferenceBox::table_wrapper(
+            PageTopRect::new(
+                table_x - table_width.padding.left - table_width.border_widths.left,
+                table_wrapper_top,
+                physical_grid_width.points()
+                    + table_width.padding.left
+                    + table_width.padding.right
+                    + table_width.border_widths.left
+                    + table_width.border_widths.right,
+                top_caption_height + border_box_height + bottom_caption_height,
+            )
+            .paint_clip()
+            .paint_rect(),
+        ));
         self.cursor_y -= style.margin.bottom;
         if matches!(style.position, Position::Relative | Position::Sticky) {
             self.cursor_y -= relative_offset.y();
@@ -562,6 +576,13 @@ impl<'a> LayoutBuilder<'a> {
         // Suppress element side effects while preserving paint replay.
         // <https://www.w3.org/TR/CSS22/tables.html#value-def-table-header-group>
         self.element_side_effect_suppression_depth += 1;
+        self.out_of_flow_prebreak_suppression_depth += 1;
+        // Repeated row groups are paint-only copies of source rows.  Their
+        // `page` values established source class-A boundaries already; letting
+        // the copies enter page-name scopes would change the destination page
+        // selected for the body row that follows them.
+        // <https://www.w3.org/TR/css-page-3/#using-named-pages>
+        self.push_page_name_scope_suppression();
         for (position, row_index) in repeated_rows.iter().cloned().enumerate() {
             let row = &rows[row_index];
             let row_style = self.style_for_table_row(row, table_style, stylesheets);
@@ -596,7 +617,11 @@ impl<'a> LayoutBuilder<'a> {
             // Collapsed-border conflict resolution for repeated fragments
             // still needs durable per-fragment table border grids.
             // https://www.w3.org/TR/CSS22/tables.html#table-display
-            if let Some(fill) = row_style.background_color.visible_color(row_style.color) {
+            if let Some(fill) = row_style
+                .background
+                .background_color
+                .visible_color(row_style.color)
+            {
                 self.push_rect_in_band(
                     PaintBand::InFlowBlock,
                     PageTopRect::new(occupied_x, row_top, occupied_width, row_height)
@@ -851,6 +876,8 @@ impl<'a> LayoutBuilder<'a> {
                 self.cursor_y -= table_metrics.spacing.vertical.length_points();
             }
         }
+        self.pop_page_name_scope_suppression();
+        self.out_of_flow_prebreak_suppression_depth -= 1;
         self.element_side_effect_suppression_depth -= 1;
         if let Some(geometry) = collapsed_geometry {
             let repeated_row_offsets = vec![0.0; repeated_rows.len()];
@@ -973,6 +1000,7 @@ impl<'a> LayoutBuilder<'a> {
         table_metrics: TableMetrics,
     ) {
         if let Some(fill) = table_style
+            .background
             .background_color
             .visible_color(table_style.color)
         {
@@ -1157,6 +1185,7 @@ impl<'a> LayoutBuilder<'a> {
             let row_group_style =
                 self.style_for_table_row_group(&row_group, table_style, stylesheets);
             if let Some(fill) = row_group_style
+                .background
                 .background_color
                 .visible_color(row_group_style.color)
             {

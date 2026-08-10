@@ -46,29 +46,36 @@ fn centered_content_bottom_y(
 /// <https://drafts.csswg.org/css-inline-3/#baseline-shift-property>.
 pub(in crate::layout) fn inline_fragment_horizontal_content_bottom_y(
     fragment: &(impl InlineFragmentAccess + ?Sized),
+    line_relative_alignment: Option<InlineScopeLineRelativeAlignment>,
     line_top: f32,
     line_height: f32,
     line_baseline_offset: f32,
     metrics: InlineTextBoxMetrics,
     parent_metrics: InlineTextBoxMetrics,
 ) -> Option<f32> {
-    match fragment.style().vertical_align.baseline_shift {
-        BaselineShift::Top => Some(
+    match line_relative_alignment {
+        Some(InlineScopeLineRelativeAlignment::Top) => Some(
             line_top - metrics.block_start_leading - metrics.content_block_size
                 + fragment.baseline_shift(),
         ),
-        BaselineShift::Bottom => {
+        Some(InlineScopeLineRelativeAlignment::Bottom) => {
             Some(line_top - line_height + metrics.block_end_leading + fragment.baseline_shift())
         }
-        BaselineShift::Center => Some(centered_content_bottom_y(
-            line_top,
-            line_height,
-            metrics.content_block_size,
-            0.0,
-            0.0,
-            fragment.baseline_shift(),
-        )),
-        BaselineShift::LengthPercentage(_) | BaselineShift::Sub | BaselineShift::Super => None,
+        None => match fragment.style().vertical_align.baseline_shift {
+            BaselineShift::Center => Some(centered_content_bottom_y(
+                line_top,
+                line_height,
+                metrics.content_block_size,
+                0.0,
+                0.0,
+                fragment.baseline_shift(),
+            )),
+            BaselineShift::LengthPercentage(_)
+            | BaselineShift::Sub
+            | BaselineShift::Super
+            | BaselineShift::Top
+            | BaselineShift::Bottom => None,
+        },
     }
     .or_else(|| {
         let parent_content_top =
@@ -206,28 +213,32 @@ pub(in crate::layout) fn inline_atom_horizontal_content_y(
     containing_style: &ComputedStyle,
     placement: InlineAtomHorizontalPlacement,
 ) -> f32 {
-    match atom.style().vertical_align.baseline_shift {
-        BaselineShift::Top => {
+    match atom.line_relative_alignment() {
+        Some(InlineScopeLineRelativeAlignment::Top) => {
             placement.line_top
                 - inline_atom_logical_block_start_margin(atom, containing_style)
                 - placement.content_block_size
                 + atom.baseline_shift
         }
-        BaselineShift::Bottom => {
+        Some(InlineScopeLineRelativeAlignment::Bottom) => {
             placement.line_top - placement.line_height
                 + inline_atom_logical_block_end_margin(atom, containing_style)
                 + atom.baseline_shift
         }
-        BaselineShift::Center => centered_content_bottom_y(
-            placement.line_top,
-            placement.line_height,
-            placement.content_block_size,
-            inline_atom_logical_block_start_margin(atom, containing_style),
-            inline_atom_logical_block_end_margin(atom, containing_style),
-            atom.baseline_shift,
-        ),
-        BaselineShift::LengthPercentage(_) | BaselineShift::Sub | BaselineShift::Super => {
-            match atom.style().vertical_align.alignment_baseline {
+        None => match atom.style().vertical_align.baseline_shift {
+            BaselineShift::Center => centered_content_bottom_y(
+                placement.line_top,
+                placement.line_height,
+                placement.content_block_size,
+                inline_atom_logical_block_start_margin(atom, containing_style),
+                inline_atom_logical_block_end_margin(atom, containing_style),
+                atom.baseline_shift,
+            ),
+            BaselineShift::LengthPercentage(_)
+            | BaselineShift::Sub
+            | BaselineShift::Super
+            | BaselineShift::Top
+            | BaselineShift::Bottom => match atom.style().vertical_align.alignment_baseline {
                 AlignmentBaseline::Metric(BaselineMetric::TextTop) => {
                     let parent_content_top = placement.line_top - placement.line_baseline_offset
                         + placement.parent_metrics.content_baseline_offset;
@@ -259,8 +270,8 @@ pub(in crate::layout) fn inline_atom_horizontal_content_y(
                         + atom.baseline_shift
                         - placement.line_rendered_baseline_shift
                 }
-            }
-        }
+            },
+        },
     }
 }
 
@@ -517,6 +528,48 @@ mod tests {
     }
 
     #[test]
+    fn top_alignment_applies_the_atomic_margin_once() {
+        let mut style = ComputedStyle::initial();
+        style.margin.top = 16.0;
+        style.vertical_align = style.vertical_align.with_baseline_shift(BaselineShift::Top);
+        let atom = InlineAtom::new(
+            InlineAtomContent::Canvas,
+            style.clone(),
+            None,
+            InlineSize::new(20.0, 32.0),
+            16.0,
+            0.0,
+            None,
+            None,
+        );
+
+        let content_bottom = inline_atom_horizontal_content_y(
+            &atom,
+            &style,
+            InlineAtomHorizontalPlacement {
+                line_top: 100.0,
+                line_height: 48.0,
+                line_baseline_offset: 32.0,
+                line_rendered_baseline_shift: 0.0,
+                content_block_size: 32.0,
+                parent_metrics: InlineTextBoxMetrics {
+                    content_block_size: 16.0,
+                    content_baseline_offset: 12.0,
+                    line_block_size: 16.0,
+                    block_start_leading: 0.0,
+                    block_end_leading: 0.0,
+                    line_baseline_offset: 12.0,
+                },
+            },
+        );
+
+        // The 1em outer margin is consumed by the atomic placement. A
+        // captured child margin belongs to `content_block_size`; shifting the
+        // whole line first would consume the outer margin twice.
+        assert_eq!(content_bottom, 52.0);
+    }
+
+    #[test]
     fn inline_table_placement_does_not_reapply_wrapper_margin() {
         let mut style = ComputedStyle::initial();
         style.margin.top = 50.0;
@@ -557,5 +610,59 @@ mod tests {
         // captured fragment owns its wrapper margin, so this border-box
         // placement must not add the 50px margin again.
         assert_eq!(content_bottom, 150.0);
+    }
+
+    #[test]
+    fn line_anchor_margin_only_comes_from_baseline_participants() {
+        let mut style = ComputedStyle::initial();
+        style.margin.top = 16.0;
+        let baseline_atom = InlineAtom::new(
+            InlineAtomContent::Canvas,
+            style.clone(),
+            None,
+            InlineSize::new(20.0, 32.0),
+            16.0,
+            0.0,
+            None,
+            None,
+        );
+        assert_eq!(
+            inline_atom_line_anchor_block_start_margin(&baseline_atom, &style),
+            16.0
+        );
+
+        for baseline_shift in [
+            BaselineShift::Top,
+            BaselineShift::Center,
+            BaselineShift::Bottom,
+        ] {
+            let mut aligned_style = style.clone();
+            aligned_style.vertical_align = aligned_style
+                .vertical_align
+                .with_baseline_shift(baseline_shift.clone());
+            let aligned_atom = InlineAtom::new(
+                InlineAtomContent::Canvas,
+                aligned_style.clone(),
+                None,
+                InlineSize::new(20.0, 32.0),
+                16.0,
+                0.0,
+                None,
+                None,
+            );
+            assert_eq!(
+                inline_atom_line_anchor_block_start_margin(&aligned_atom, &aligned_style),
+                0.0,
+                "{baseline_shift:?} aligns its own margin box"
+            );
+        }
+
+        assert_eq!(
+            inline_atom_line_anchor_block_start_margin(
+                &baseline_atom.with_exported_table_box_baseline(),
+                &style,
+            ),
+            0.0
+        );
     }
 }

@@ -680,7 +680,7 @@ pub(in crate::layout) fn solid_gap_rule_primitive_with_cross_offset_and_dash(
             GapRuleAxisKind::Column => {
                 let span = width
                     .centered_span(context.container.page_rect.x() + gap.center() + cross_offset);
-                PaintPrimitive::Rect(RenderedRect::new(
+                let rect = RenderedRect::new(
                     span.start,
                     context.container.page_rect.top_y() - segment.end.position,
                     span.size(),
@@ -688,7 +688,17 @@ pub(in crate::layout) fn solid_gap_rule_primitive_with_cross_offset_and_dash(
                     Some(color),
                     None,
                     PaintStrokeWidth::ZERO,
-                ))
+                );
+                // A multicolumn rule paints over its container background.
+                // Mark this opaque cover so PDF serialization can remove the
+                // fully hidden underpaint before rasterization exposes it at
+                // the rule's terminal edge.
+                // <https://drafts.csswg.org/css-gaps-1/#gap-rule-painting>
+                PaintPrimitive::Rect(if context.container_kind == GapContainerKind::Multicol {
+                    rect.with_opaque_underpaint_culling()
+                } else {
+                    rect
+                })
             }
             GapRuleAxisKind::Row => {
                 let span = width.centered_span(

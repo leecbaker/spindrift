@@ -11,11 +11,12 @@ pub(in crate::css) fn parse_will_change(value: &str) -> Option<WillChange> {
         return Some(WillChange::default());
     }
     let mut will_change = WillChange::default();
-    for token in value
-        .split(',')
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
-    {
+    let tokens = try_split_css_top_level_delimiter(value, ',')?;
+    if tokens.iter().any(|token| token.is_empty()) {
+        return None;
+    }
+    for token in tokens {
+        let token = css_single_ident(token)?;
         match token.to_ascii_lowercase().as_str() {
             "contents" => will_change.contents = true,
             "scroll-position" => will_change.scroll_position = true,
@@ -31,4 +32,16 @@ pub(in crate::css) fn parse_will_change(value: &str) -> Option<WillChange> {
         }
     }
     Some(will_change)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn will_change_uses_css_component_boundaries() {
+        assert!(parse_will_change(r"tr\61 nsform/**/, opacity").is_some());
+        assert!(parse_will_change("transform,").is_none());
+        assert!(parse_will_change("transform, url(\"\n").is_none());
+    }
 }

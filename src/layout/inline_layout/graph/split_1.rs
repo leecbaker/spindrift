@@ -433,6 +433,34 @@ pub(in crate::layout) enum BreakEffect {
     FloatPlacement,
 }
 
+/// CSS Text Phase II whitespace behavior selected at a line boundary.
+///
+/// This is independent from [`BreakEffect`]: the latter records why a break
+/// is available, while this records whether selected source is collapsed,
+/// hangs, or remains part of the line's used advance.
+/// <https://www.w3.org/TR/css-text-3/#white-space-phase-2>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) enum SelectedWhitespaceEdge {
+    None,
+    CollapseAtNextLineStart,
+    PreWrapHang,
+    BreakSpacesRetained,
+}
+
+impl SelectedWhitespaceEdge {
+    pub(in crate::layout) const fn trims_next_line_start(self) -> bool {
+        matches!(self, Self::CollapseAtNextLineStart)
+    }
+
+    pub(in crate::layout) const fn hangs_from_fitting_measure(self) -> bool {
+        matches!(self, Self::PreWrapHang)
+    }
+
+    pub(in crate::layout) const fn retains_break_spaces_advance(self) -> bool {
+        matches!(self, Self::BreakSpacesRetained)
+    }
+}
+
 /// Compatibility name for the graph's break effect.
 ///
 /// `BreakEffect` is the preferred name: it describes what happens when a
@@ -509,8 +537,7 @@ pub(in crate::layout) struct InlineBreakOpportunity {
     pub(in crate::layout) position: InlineGraphPosition,
     pub(in crate::layout) kind: BreakEffect,
     pub(in crate::layout) availability: BreakAvailability,
-    pub(in crate::layout) trims: bool,
-    pub(in crate::layout) hangs: bool,
+    pub(in crate::layout) whitespace_edge: SelectedWhitespaceEdge,
     /// Used behavior at this boundary.  `soft_hyphen` remains a compact
     /// classification for legacy priority/min-content policy; consumers that
     /// materialize the selected line must use this record instead.
@@ -518,6 +545,14 @@ pub(in crate::layout) struct InlineBreakOpportunity {
 }
 
 impl InlineBreakOpportunity {
+    pub(in crate::layout) const fn trims_next_line_start(self) -> bool {
+        self.whitespace_edge.trims_next_line_start()
+    }
+
+    pub(in crate::layout) const fn hangs_from_fitting_measure(self) -> bool {
+        self.whitespace_edge.hangs_from_fitting_measure()
+    }
+
     pub(in crate::layout) const fn is_discretionary(self) -> bool {
         self.discretionary.is_some()
     }
@@ -959,15 +994,18 @@ pub(in crate::layout) struct InlineLineFragment {
     /// the selected exclusion-band indent remains the paint origin.
     pub(in crate::layout) source_paint_indent: Option<f32>,
     pub(in crate::layout) available_width: f32,
-    /// Fragmentainer identity of the exclusion band used while selecting this
-    /// line. A collected line reuses that band on this page instead of
-    /// querying a context that later selection has already mutated.
-    /// <https://drafts.csswg.org/css-inline-3/#initial-letter-layout>
-    pub(in crate::layout) selected_float_page_index: usize,
-    pub(in crate::layout) suppress_float_adjust: bool,
+    /// Immutable policy for resolving float exclusions when this selected
+    /// source line is replayed.  This is deliberately a single value rather
+    /// than a page index plus a boolean: a replay site must state whether it
+    /// may consult ambient float state or must use the selection transaction.
+    pub(in crate::layout) float_replay: InlineFloatReplay,
     pub(in crate::layout) edge_effects: InlineLineEdgeEffects,
     pub(in crate::layout) bidi_scope_continuations: BidiLineScopeContinuations,
     pub(in crate::layout) text: Rc<str>,
+    /// The selected graph boundary after this line's source. It is retained
+    /// so automatic clamping can stay attached to source across a balanced
+    /// reflow instead of reusing a raw line ordinal.
+    pub(in crate::layout) source_end: Option<InlineGraphPosition>,
 }
 
 impl InlineLineFragment {
@@ -979,7 +1017,6 @@ impl InlineLineFragment {
         indent: f32,
         available_width: f32,
         selected_float_page_index: usize,
-        suppress_float_adjust: bool,
         text: impl Into<String>,
     ) -> Self {
         Self {
@@ -989,11 +1026,13 @@ impl InlineLineFragment {
             indent,
             source_paint_indent: None,
             available_width,
-            selected_float_page_index,
-            suppress_float_adjust,
+            float_replay: InlineFloatReplay::RequeryContainingBlock {
+                selected_float_page_index,
+            },
             edge_effects: InlineLineEdgeEffects::default(),
             bidi_scope_continuations: BidiLineScopeContinuations::default(),
             text: Rc::from(text.into()),
+            source_end: None,
         }
     }
 
@@ -1024,6 +1063,77 @@ impl InlineLineFragment {
     ) -> Self {
         self.bidi_scope_continuations = continuations;
         self
+    }
+
+    pub(in crate::layout) fn with_source_end(mut self, source_end: InlineGraphPosition) -> Self {
+        self.source_end = Some(source_end);
+        self
+    }
+
+    /// Preserve the float band selected by this source line when it is
+    /// replayed on the same fragmentainer.  A relocated line still resolves
+    /// exclusions at its destination.
+    pub(in crate::layout) fn freeze_float_band(&mut self) {
+        self.float_replay = self.float_replay.freeze_selected_band();
+    }
+
+    /// Restore ordinary containing-block float resolution after an abandoned
+    /// speculative placement.
+    pub(in crate::layout) fn requery_float_band(&mut self) {
+        self.float_replay = self.float_replay.requery_containing_block();
+    }
+
+    pub(in crate::layout) fn with_float_replay(mut self, replay: InlineFloatReplay) -> Self {
+        self.float_replay = replay;
+        self
+    }
+}
+
+/// Float visibility captured with a selected inline line.
+///
+/// Selection and replay are separate transactions.  Re-querying a mutable
+/// float stack is correct only for a normal containing-block replay; an
+/// inline-float or initial-letter transaction that already chose its band
+/// carries that fact explicitly.  This prevents a later replay from applying
+/// the same exclusion once while selecting and again while painting.
+/// <https://www.w3.org/TR/CSS22/visuren.html#floats>
+/// <https://drafts.csswg.org/css-inline-3/#line-boxes>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) enum InlineFloatReplay {
+    /// Resolve the current containing block's float band at the replay site.
+    RequeryContainingBlock { selected_float_page_index: usize },
+    /// Reuse selection geometry on its source fragmentainer; resolve a new
+    /// band only after fragmentation moves the line.
+    FrozenSelectedBand { selected_float_page_index: usize },
+}
+
+impl InlineFloatReplay {
+    pub(in crate::layout) fn selected_float_page_index(self) -> usize {
+        match self {
+            Self::RequeryContainingBlock {
+                selected_float_page_index,
+            }
+            | Self::FrozenSelectedBand {
+                selected_float_page_index,
+            } => selected_float_page_index,
+        }
+    }
+
+    pub(in crate::layout) fn reuses_selected_band_on(self, page_index: usize) -> bool {
+        matches!(self, Self::FrozenSelectedBand { .. })
+            && self.selected_float_page_index() == page_index
+    }
+
+    pub(in crate::layout) fn freeze_selected_band(self) -> Self {
+        Self::FrozenSelectedBand {
+            selected_float_page_index: self.selected_float_page_index(),
+        }
+    }
+
+    fn requery_containing_block(self) -> Self {
+        Self::RequeryContainingBlock {
+            selected_float_page_index: self.selected_float_page_index(),
+        }
     }
 }
 
@@ -1188,7 +1298,7 @@ fn split_fragment_for_first_letter_in_graph(
         used_style.color = fragment.style().color;
     }
     *letter.style_mut() = used_style;
-    if letter.style().opacity < 1.0 {
+    if letter.style().opacity.value() < 1.0 {
         // A `::first-letter` is a lexical paint subtree in its own right.
         // Its text style already carries the used opacity; this marker carries
         // only the opaque subtree identity so source splitting and bidi
@@ -1197,7 +1307,7 @@ fn split_fragment_for_first_letter_in_graph(
         // an inherited paint value when prepared text computes its used alpha.
         // <https://drafts.csswg.org/css-pseudo-4/#first-letter-styling>
         let mut marker_style = letter.style().clone();
-        marker_style.opacity = 1.0;
+        marker_style.opacity = css::Opacity::ONE;
         letter.push_ancestor_inline_decoration(InlineAncestorDecoration {
             style: marker_style,
             hanging_edges: InlineHangingEdges::default(),
@@ -1568,30 +1678,13 @@ where
 {
     let mut runs = Vec::new();
     let mut transform_state = TextTransformState::default();
-    let mut root_tracking_scope = InlineTrackingScope::root(block_style);
-    let mut tracking_scopes = vec![Rc::clone(&root_tracking_scope)];
+    let root_tracking_scope = InlineTrackingScope::root(block_style);
+    let mut tracking_scopes = vec![root_tracking_scope];
     for item in items {
         match item.as_ref() {
             InlineItem::Word(word) => {
                 let text = transform_text_with_state(&word.text, &word.style, &mut transform_state);
                 let text = synthesize_missing_font_caps_text(font_system, &text, &word.style);
-                // Some anonymous inline formatting contexts retain the
-                // block's inherited text style only on their first text
-                // item. Establish that implicit lexical scope before the
-                // paragraph receives any explicit inline-edge marker. Once
-                // an edge exists, its parent chain remains authoritative for
-                // nested-inline LCA ownership.
-                if runs.is_empty()
-                    && tracking_scopes.len() == 1
-                    && root_tracking_scope.letter_spacing().points() == 0.0
-                    && word.style.used_letter_spacing().points() != 0.0
-                {
-                    root_tracking_scope = InlineTrackingScope::root_with_boundary_policy(
-                        &word.style,
-                        root_tracking_scope.boundary_policy(),
-                    );
-                    tracking_scopes[0] = Rc::clone(&root_tracking_scope);
-                }
                 push_text_graph_runs(
                     font_system,
                     &mut runs,
@@ -1921,8 +2014,7 @@ fn automatic_opportunity_for_source_offset(
         position,
         kind: BreakEffect::Hyphenation,
         availability,
-        trims: false,
-        hangs: false,
+        whitespace_edge: SelectedWhitespaceEdge::None,
         discretionary: Some(DiscretionaryBreakEffect {
             source_boundary: position,
             marker_owner: DiscretionaryMarkerOwner {
@@ -2260,8 +2352,14 @@ pub(in crate::layout) fn push_text_graph_run_segment(
         // <https://drafts.csswg.org/css-content-3/#content-property>
         fragment.set_force_inline_background_paint(true);
     }
-    let mut shaped =
-        font_system.shape_untracked_inline_line(text, &word.style, word.style.line_height);
+    // CSS-generated bidi controls are UAX #9 input only. Their fallback
+    // glyph records must not contribute an inline advance or line metrics;
+    // they remain as source fragments so visual ordering can still consume
+    // the controls after line selection.
+    // <https://www.w3.org/TR/css-writing-modes-4/#unicode-bidi>
+    let mut shaped = (word.source != InlineTextSource::BidiControl)
+        .then(|| font_system.shape_untracked_inline_line(text, &word.style, word.style.line_height))
+        .flatten();
     let mut width = shaped
         .as_ref()
         .map(ShapedInlineLine::advance_width)
@@ -2297,10 +2395,10 @@ pub(in crate::layout) fn inline_run_has_nonzero_tracking(run: &InlineParagraphRu
     match &run.item {
         InlineLineItem::Fragment(fragment) => fragment
             .tracking_scope()
-            .is_some_and(|scope| scope.letter_spacing().points() != 0.0),
+            .is_some_and(|scope| scope.has_nonzero_letter_spacing_in_ancestry()),
         InlineLineItem::Atom(atom) => atom
             .tracking_scope()
-            .is_some_and(|scope| scope.letter_spacing().points() != 0.0),
+            .is_some_and(|scope| scope.has_nonzero_letter_spacing_in_ancestry()),
         InlineLineItem::Float(_) => false,
     }
 }
@@ -2508,6 +2606,10 @@ impl InlineOpportunityGraph {
         font_system: &mut FontSystem,
         block_style: &ComputedStyle,
     ) -> MaterializedInlineGraphLine {
+        debug_assert!(selected_break.is_none_or(|opportunity| {
+            !opportunity.trims_next_line_start()
+                || matches!(opportunity.kind, BreakEffect::PreservedSpace)
+        }));
         let mut items = self.line_measured_items_for_graph_range(range, font_system);
         let selected_manual_soft_hyphen = selected_break.is_some_and(|opportunity| {
             opportunity.is_discretionary()
@@ -2579,16 +2681,16 @@ impl InlineOpportunityGraph {
         // this is already visual order; bidi paint resolves the same typed
         // boundaries again after UBA reordering.
         apply_visual_tracking_boundaries(&mut items);
-        resolve_materialized_line_tab_advances(&mut items, font_system, block_style);
+        resolve_materialized_line_tab_and_ruby_geometry(&mut items, font_system, block_style);
         let widths = inline_content_width_for_line_items(&items, font_system, |item| item.width);
         // A `pre-wrap` run hangs at a selected soft boundary.  It also hangs
         // before an unconditionally hanging other-space separator, even when
         // the line itself ends at a forced break: that separator means the
         // preserved run is not immediately followed by the forced break.
         // <https://drafts.csswg.org/css-text-3/#white-space-phase-2>
-        let hanging_pre_wrap_width = if selected_break
-            .is_some_and(|opportunity| opportunity.hangs || opportunity_is_soft_wrap(opportunity))
-            || terminal_pre_wrap_hang
+        let hanging_pre_wrap_width = if selected_break.is_some_and(|opportunity| {
+            opportunity.hangs_from_fitting_measure() || opportunity_is_soft_wrap(opportunity)
+        }) || terminal_pre_wrap_hang
             || widths.trailing_space_width > 0.0
         {
             trailing_pre_wrap_hanging_width_with_unconditional_separators(&items, font_system)
@@ -2600,8 +2702,9 @@ impl InlineOpportunityGraph {
             pre_wrap_hanging_width: hanging_pre_wrap_width,
             hanging_space_separator_width: widths.trailing_space_width,
             trailing_tracking_width: widths.trailing_tracking_width,
-            retained_break_spaces_end: selected_break
-                .is_some_and(|opportunity| opportunity.kind == InlineBreakKind::BreakSpaces),
+            retained_break_spaces_end: selected_break.is_some_and(|opportunity| {
+                opportunity.whitespace_edge.retains_break_spaces_advance()
+            }),
             source_effects: selected_line_edge_source_effects(
                 &items,
                 trimmed_width > 0.0,
@@ -2791,9 +2894,20 @@ impl InlineOpportunityGraph {
         {
             return None;
         }
-        let ends_line = selected_break
-            .is_some_and(|opportunity| opportunity.hangs || opportunity_is_soft_wrap(opportunity))
-            || (selected_break.is_none() && range.end == self.end_position());
+        // Ruby overhang depends on selected neighboring source and may reduce
+        // the provisional widest-annotation advance. Intrinsic sizing must
+        // therefore take the same materialized path as final line layout.
+        if self.runs[run_range.clone()].iter().any(|run| {
+            matches!(
+                run.item,
+                InlineLineItem::Atom(ref atom) if matches!(atom.content(), InlineAtomContent::Ruby { .. })
+            )
+        }) {
+            return None;
+        }
+        let ends_line = selected_break.is_some_and(|opportunity| {
+            opportunity.hangs_from_fitting_measure() || opportunity_is_soft_wrap(opportunity)
+        }) || (selected_break.is_none() && range.end == self.end_position());
         let hanging_pre_wrap_width = if ends_line {
             trailing_pre_wrap_hanging_width_with_unconditional_separators(
                 &self.runs[run_range.clone()],
@@ -3343,6 +3457,365 @@ where
     adjustment
 }
 
+/// Tabs depend on the used inline cursor, while ruby overhang can reduce the
+/// preceding atom's used advance. Iterate the two selected-line operations to
+/// a small fixed point so a tab after ruby never retains a stop calculated
+/// from the source atom's conservative annotation width.
+fn resolve_materialized_line_tab_and_ruby_geometry(
+    items: &mut [MeasuredInlineItem],
+    font_system: &mut FontSystem,
+    block_style: &ComputedStyle,
+) {
+    const MAX_GEOMETRY_PASSES: usize = 4;
+    for _ in 0..MAX_GEOMETRY_PASSES {
+        let previous_widths = items.iter().map(|item| item.width).collect::<Vec<_>>();
+        resolve_materialized_line_tab_advances(items, font_system, block_style);
+        resolve_materialized_ruby_overhang(items, font_system, block_style);
+        if previous_widths
+            .iter()
+            .zip(items.iter())
+            .all(|(previous, current)| (previous - current.width).abs() < 0.01)
+        {
+            break;
+        }
+    }
+}
+
+/// Resolve ruby annotation overlap against the selected parent inline line.
+///
+/// Ruby source atoms are conservatively sized to their widest annotation for
+/// graph fitting. Once CSS Text has selected, trimmed, and tab-resolved a
+/// line, the annotation can borrow the permitted adjacent inline space and
+/// expose its smaller normal-flow base-column span. This pass owns no source
+/// text and clones only the selected atom, so another candidate line cannot
+/// inherit a placement from this one.
+/// <https://drafts.csswg.org/css-ruby-1/#ruby-overhang>
+fn resolve_materialized_ruby_overhang(
+    items: &mut [MeasuredInlineItem],
+    font_system: &mut FontSystem,
+    block_style: &ComputedStyle,
+) {
+    for item_index in 0..items.len() {
+        let Some(placement) =
+            resolved_ruby_placement_for_line_item(items, item_index, font_system, block_style)
+        else {
+            continue;
+        };
+        let flow_span = placement.flow_inline_span.points();
+        let InlineLineItem::Atom(atom) = &items[item_index].item else {
+            continue;
+        };
+        let mut atom = atom.clone().with_ruby_placement(placement);
+        match block_style.writing_mode {
+            WritingMode::HorizontalTb => atom.size.width = flow_span,
+            WritingMode::VerticalRl
+            | WritingMode::VerticalLr
+            | WritingMode::SidewaysRl
+            | WritingMode::SidewaysLr => atom.size.height = flow_span,
+        }
+        items[item_index].width = flow_span;
+        items[item_index].item = InlineLineItem::Atom(atom);
+    }
+}
+
+fn resolved_ruby_placement_for_line_item(
+    items: &[MeasuredInlineItem],
+    item_index: usize,
+    font_system: &mut FontSystem,
+    block_style: &ComputedStyle,
+) -> Option<ruby::ResolvedRubyPlacement> {
+    let InlineLineItem::Atom(atom) = &items.get(item_index)?.item else {
+        return None;
+    };
+    let InlineAtomContent::Ruby {
+        base, annotations, ..
+    } = atom.content()
+    else {
+        return None;
+    };
+    let column_span = base.containing_inline_size.points();
+    let spaces = ruby_adjacent_space_allowance(items, item_index, block_style);
+    let mut levels = Vec::with_capacity(annotations.len());
+    let mut maximum_start = 0.0_f32;
+    let mut maximum_end = 0.0_f32;
+    for annotation in annotations {
+        let available_span = annotation.containing_inline_size.points();
+        let paint_span = annotation.paint_inline_size.points();
+        let (alignment_offset, overhang) =
+            ruby_alignment_geometry(annotation.style.ruby_align, available_span, paint_span);
+        let policy_allowance = match annotation.overhang_policy {
+            css::RubyOverhang::Spaces => spaces,
+            css::RubyOverhang::Auto => ruby_auto_overhang_allowance(
+                items,
+                item_index,
+                annotation.style.as_ref(),
+                font_system,
+            ),
+        };
+        let resolved_overhang = resolve_ruby_overhang(overhang, policy_allowance);
+        maximum_start = maximum_start.max(resolved_overhang.unborrowed.inline_start.points());
+        maximum_end = maximum_end.max(resolved_overhang.unborrowed.inline_end.points());
+        levels.push((alignment_offset, overhang, resolved_overhang));
+    }
+    Some(ruby::ResolvedRubyPlacement {
+        flow_inline_span: ruby::RubyColumnInlineSpan::new(
+            column_span + maximum_start + maximum_end,
+        ),
+        base_inline_offset: ruby::RubyInlineDisplacement::new(maximum_start),
+        annotation_inline_offsets: levels
+            .iter()
+            .map(|(alignment_offset, overhang, _)| {
+                debug_assert!(
+                    (*alignment_offset + overhang.inline_start.points()).abs() < 0.01
+                        || overhang.inline_start.points() == 0.0
+                );
+                // `alignment_offset` includes the negative start overhang;
+                // the common flow start retains only unborrowed excess.
+                ruby::RubyInlineDisplacement::new(maximum_start + *alignment_offset)
+            })
+            .collect(),
+        overhang: levels
+            .into_iter()
+            .map(|(_, _, resolved)| resolved)
+            .collect(),
+    })
+}
+
+/// Consume the selected line's independent start and end offers. Any excess
+/// that cannot be borrowed stays in the ruby atom's normal-flow span.
+fn resolve_ruby_overhang(
+    overhang: ruby::RubyAlignedOverhang,
+    allowance: ruby::RubyOverhangAllowance,
+) -> ruby::ResolvedRubyOverhang {
+    let borrowed_start = overhang
+        .inline_start
+        .points()
+        .min(allowance.inline_start.points());
+    let borrowed_end = overhang
+        .inline_end
+        .points()
+        .min(allowance.inline_end.points());
+    ruby::ResolvedRubyOverhang {
+        borrowed: ruby::RubyOverhangAllowance {
+            inline_start: ruby::RubyInlineSpan::new(borrowed_start),
+            inline_end: ruby::RubyInlineSpan::new(borrowed_end),
+        },
+        unborrowed: ruby::RubyAlignedOverhang {
+            inline_start: ruby::RubyInlineSpan::new(
+                (overhang.inline_start.points() - borrowed_start).max(0.0),
+            ),
+            inline_end: ruby::RubyInlineSpan::new(
+                (overhang.inline_end.points() - borrowed_end).max(0.0),
+            ),
+        },
+    }
+}
+
+fn ruby_alignment_geometry(
+    align: css::RubyAlign,
+    available_span: f32,
+    paint_span: f32,
+) -> (f32, ruby::RubyAlignedOverhang) {
+    if paint_span <= available_span {
+        let offset = match align {
+            css::RubyAlign::Start => 0.0,
+            css::RubyAlign::Center | css::RubyAlign::SpaceBetween | css::RubyAlign::SpaceAround => {
+                (available_span - paint_span) / 2.0
+            }
+        };
+        return (offset, ruby::RubyAlignedOverhang::default());
+    }
+    let excess = paint_span - available_span;
+    let start = match align {
+        css::RubyAlign::Start => 0.0,
+        css::RubyAlign::Center | css::RubyAlign::SpaceBetween | css::RubyAlign::SpaceAround => {
+            excess / 2.0
+        }
+    };
+    (
+        -start,
+        ruby::RubyAlignedOverhang {
+            inline_start: ruby::RubyInlineSpan::new(start),
+            inline_end: ruby::RubyInlineSpan::new(excess - start),
+        },
+    )
+}
+
+fn ruby_adjacent_space_allowance(
+    items: &[MeasuredInlineItem],
+    item_index: usize,
+    block_style: &ComputedStyle,
+) -> ruby::RubyOverhangAllowance {
+    ruby::RubyOverhangAllowance {
+        inline_start: ruby::RubyInlineSpan::new(
+            item_index
+                .checked_sub(1)
+                .and_then(|index| ruby_inline_end_space_offer(&items[index], block_style))
+                .unwrap_or(0.0),
+        ),
+        inline_end: ruby::RubyInlineSpan::new(
+            items
+                .get(item_index + 1)
+                .and_then(|item| ruby_inline_start_space_offer(item, block_style))
+                .unwrap_or(0.0),
+        ),
+    }
+}
+
+fn ruby_auto_overhang_allowance(
+    items: &[MeasuredInlineItem],
+    item_index: usize,
+    style: &ComputedStyle,
+    font_system: &mut FontSystem,
+) -> ruby::RubyOverhangAllowance {
+    let maximum = font_system.ic_advance_for_style(style).points() / 2.0;
+    let neighbor_width = |index: Option<usize>| {
+        index
+            .and_then(|index| items.get(index))
+            .filter(|item| !matches!(item.item, InlineLineItem::Atom(_)))
+            .map_or(0.0, |item| ruby_auto_overhang_offer(item.width, maximum))
+    };
+    ruby::RubyOverhangAllowance {
+        inline_start: ruby::RubyInlineSpan::new(neighbor_width(item_index.checked_sub(1))),
+        inline_end: ruby::RubyInlineSpan::new(neighbor_width(
+            (item_index + 1 < items.len()).then_some(item_index + 1),
+        )),
+    }
+}
+
+/// Quire's deterministic `auto` policy: never borrow more than half an `ic`
+/// from either immediate visual neighbor.
+fn ruby_auto_overhang_offer(neighbor_inline_span: f32, half_ic: f32) -> f32 {
+    neighbor_inline_span.max(0.0).min(half_ic.max(0.0))
+}
+
+fn ruby_inline_end_space_offer(
+    item: &MeasuredInlineItem,
+    block_style: &ComputedStyle,
+) -> Option<f32> {
+    ruby_inline_adjacent_space_offer(item, block_style, true)
+}
+
+fn ruby_inline_start_space_offer(
+    item: &MeasuredInlineItem,
+    block_style: &ComputedStyle,
+) -> Option<f32> {
+    ruby_inline_adjacent_space_offer(item, block_style, false)
+}
+
+fn ruby_inline_adjacent_space_offer(
+    item: &MeasuredInlineItem,
+    block_style: &ComputedStyle,
+    at_end: bool,
+) -> Option<f32> {
+    let InlineLineItem::Fragment(fragment) = &item.item else {
+        return None;
+    };
+    let text = fragment.text();
+    let vertical = matches!(
+        block_style.text_layout_policy(),
+        css::TextLayoutPolicy::Vertical(_)
+    );
+    let boundary = if at_end {
+        text.char_indices().next_back()
+    } else {
+        text.char_indices().next()
+    }?;
+    let (offset, character) = boundary;
+    let character_end = offset + character.len_utf8();
+    let punctuation = crate::text::text_spacing_punctuation_class(
+        character,
+        fragment.style().language.as_deref(),
+        vertical,
+    );
+    let punctuation_share = ruby_punctuation_overhang_share(
+        at_end,
+        punctuation,
+        fragment.style().text_spacing_trim.resolved(),
+    );
+    if let Some(share) = punctuation_share {
+        return ruby_fragment_source_range_width(item, offset..character_end)
+            .map(|width| width * share);
+    }
+    let is_eligible_space =
+        |character: char| ruby_overhang_space_is_eligible(character, fragment.style());
+    if !is_eligible_space(character) {
+        return None;
+    }
+    let range = if at_end {
+        let start = text
+            .char_indices()
+            .rev()
+            .take_while(|(_, character)| is_eligible_space(*character))
+            .last()
+            .map_or(text.len(), |(offset, _)| offset);
+        start..text.len()
+    } else {
+        let end = text
+            .char_indices()
+            .take_while(|(_, character)| is_eligible_space(*character))
+            .last()
+            .map_or(0, |(offset, character)| offset + character.len_utf8());
+        0..end
+    };
+    ruby_fragment_source_range_width(item, range)
+}
+
+fn ruby_punctuation_overhang_share(
+    at_end: bool,
+    punctuation: Option<crate::text::TextSpacingPunctuationClass>,
+    text_spacing_trim: TextSpacingTrim,
+) -> Option<f32> {
+    if text_spacing_trim != TextSpacingTrim::SpaceAll {
+        return None;
+    }
+    match (at_end, punctuation) {
+        (true, Some(crate::text::TextSpacingPunctuationClass::Closing))
+        | (false, Some(crate::text::TextSpacingPunctuationClass::Opening)) => Some(0.5),
+        (_, Some(crate::text::TextSpacingPunctuationClass::MiddleDot)) => Some(0.25),
+        _ => None,
+    }
+}
+
+/// The `spaces` policy considers preserved document spaces/tabs, U+00A0, and
+/// Unicode General_Category `Zs` characters. It does not treat arbitrary
+/// control whitespace as borrowable inline space.
+fn ruby_overhang_space_is_eligible(character: char, style: &ComputedStyle) -> bool {
+    (matches!(character, ' ' | '\t') && !style.white_space.collapses_spaces())
+        || matches!(character, '\u{00a0}')
+        || crate::text::character_is_css_other_space_separator(character)
+}
+
+fn ruby_fragment_source_range_width(
+    item: &MeasuredInlineItem,
+    range: std::ops::Range<usize>,
+) -> Option<f32> {
+    let InlineLineItem::Fragment(fragment) = &item.item else {
+        return None;
+    };
+    let shaped = item.shaped.as_deref()?;
+    if range.start == 0 && range.end == fragment.text().len() {
+        return Some(item.width);
+    }
+    let range_width = shaped.source_range_advance_width(range.clone())?;
+    // Tab expansion has already updated the complete fragment's used width.
+    // Derive a leading/trailing tab run from the complementary shaped range so
+    // it receives the actual selected tab-stop advance.
+    if range.start == 0 {
+        let remainder = shaped
+            .source_range_advance_width(range.end..fragment.text().len())
+            .unwrap_or(0.0);
+        Some((item.width - remainder).max(0.0))
+    } else if range.end == fragment.text().len() {
+        let prefix = shaped
+            .source_range_advance_width(0..range.start)
+            .unwrap_or(0.0);
+        Some((item.width - prefix).max(0.0))
+    } else {
+        Some(range_width)
+    }
+}
+
 /// Resolve preserved tabs into the selected line's fragment measurements.
 ///
 /// A tab stop depends on the preceding *used* inline cursor, so keeping its
@@ -3833,7 +4306,7 @@ pub(in crate::layout) fn fragment_text_needs_materialized_normalization(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::css::{HyphenateCharacter, WritingMode};
+    use crate::css::{ContentLanguage, HyphenateCharacter, RubyAlign, WritingMode};
 
     fn bidi_scope_run(
         text: &str,
@@ -3884,6 +4357,111 @@ mod tests {
         if fragment.style().font_feature_settings.0.iter().any(|setting| {
             setting.tag == tag && setting.value == 1
         }))
+    }
+
+    #[test]
+    fn ruby_overhang_resolver_keeps_start_and_end_excess_independent() {
+        let (offset, overhang) = ruby_alignment_geometry(RubyAlign::Center, 20.0, 60.0);
+        assert_eq!(offset, -20.0);
+        assert_eq!(overhang.inline_start.points(), 20.0);
+        assert_eq!(overhang.inline_end.points(), 20.0);
+
+        let resolved = resolve_ruby_overhang(
+            overhang,
+            ruby::RubyOverhangAllowance {
+                inline_start: ruby::RubyInlineSpan::new(8.0),
+                inline_end: ruby::RubyInlineSpan::new(30.0),
+            },
+        );
+        assert_eq!(resolved.borrowed.inline_start.points(), 8.0);
+        assert_eq!(resolved.borrowed.inline_end.points(), 20.0);
+        assert_eq!(resolved.unborrowed.inline_start.points(), 12.0);
+        assert_eq!(resolved.unborrowed.inline_end.points(), 0.0);
+    }
+
+    #[test]
+    fn ruby_start_alignment_retains_all_excess_at_logical_end() {
+        let (offset, overhang) = ruby_alignment_geometry(RubyAlign::Start, 20.0, 60.0);
+        assert_eq!(offset, 0.0);
+        assert_eq!(overhang.inline_start.points(), 0.0);
+        assert_eq!(overhang.inline_end.points(), 40.0);
+    }
+
+    #[test]
+    fn ruby_spaces_accepts_only_preserved_and_unicode_space_separators() {
+        let collapsed = ComputedStyle::initial();
+        assert!(!ruby_overhang_space_is_eligible(' ', &collapsed));
+        assert!(!ruby_overhang_space_is_eligible('\t', &collapsed));
+        assert!(ruby_overhang_space_is_eligible('\u{00a0}', &collapsed));
+        assert!(ruby_overhang_space_is_eligible('\u{3000}', &collapsed));
+        assert!(!ruby_overhang_space_is_eligible('\n', &collapsed));
+
+        let mut preserved = ComputedStyle::initial();
+        preserved.white_space = WhiteSpace::Pre;
+        assert!(ruby_overhang_space_is_eligible(' ', &preserved));
+        assert!(ruby_overhang_space_is_eligible('\t', &preserved));
+    }
+
+    #[test]
+    fn ruby_spaces_punctuation_requires_an_untrimmed_boundary_side() {
+        use crate::text::TextSpacingPunctuationClass;
+
+        assert_eq!(
+            ruby_punctuation_overhang_share(
+                true,
+                Some(TextSpacingPunctuationClass::Closing),
+                TextSpacingTrim::SpaceAll,
+            ),
+            Some(0.5),
+        );
+        assert_eq!(
+            ruby_punctuation_overhang_share(
+                false,
+                Some(TextSpacingPunctuationClass::Opening),
+                TextSpacingTrim::SpaceAll,
+            ),
+            Some(0.5),
+        );
+        assert_eq!(
+            ruby_punctuation_overhang_share(
+                true,
+                Some(TextSpacingPunctuationClass::MiddleDot),
+                TextSpacingTrim::SpaceAll,
+            ),
+            Some(0.25),
+        );
+        assert_eq!(
+            ruby_punctuation_overhang_share(
+                true,
+                Some(TextSpacingPunctuationClass::Closing),
+                TextSpacingTrim::Normal,
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn ruby_line_edges_and_auto_collision_cap_do_not_offer_extra_space() {
+        let style = ComputedStyle::initial();
+        assert_eq!(
+            ruby_adjacent_space_allowance(&[], 0, &style),
+            ruby::RubyOverhangAllowance::default(),
+        );
+        assert_eq!(ruby_auto_overhang_offer(40.0, 10.0), 10.0);
+        assert_eq!(ruby_auto_overhang_offer(4.0, 10.0), 4.0);
+        assert_eq!(ruby_auto_overhang_offer(-4.0, 10.0), 0.0);
+    }
+
+    #[test]
+    fn ruby_overhang_geometry_is_logical_for_vertical_lines() {
+        let horizontal = ruby_alignment_geometry(RubyAlign::Center, 20.0, 60.0);
+        let mut vertical_style = ComputedStyle::initial();
+        vertical_style.writing_mode = WritingMode::VerticalRl;
+        // Ruby resolution operates in logical inline coordinates; the paint
+        // adapter alone projects this same geometry to physical height.
+        let vertical = ruby_alignment_geometry(RubyAlign::Center, 20.0, 60.0);
+        assert_eq!(horizontal, vertical);
+        assert_eq!(vertical_style.writing_mode, WritingMode::VerticalRl);
     }
 
     #[test]
@@ -4033,7 +4611,7 @@ mod tests {
     fn automatic_hyphenation_is_not_offered_for_line_break_anywhere() {
         let mut ordinary = ComputedStyle::initial();
         ordinary.hyphens = Hyphens::Auto;
-        ordinary.language = Some("en".into());
+        ordinary.language = ContentLanguage::from_html_attribute("en");
         let ordinary_runs = vec![bidi_scope_run(
             "hyphenation",
             ordinary.clone(),
@@ -4268,6 +4846,38 @@ mod tests {
     }
 
     #[test]
+    fn css_bidi_control_graph_run_has_no_shaped_advance() {
+        let style = ComputedStyle::initial();
+        let word = InlineWord {
+            text: "\u{202a}".to_string(),
+            style: inline_style(&style),
+            baseline_shift: 0.0,
+            visual_offset: InlineVisualOffset::zero(),
+            link_target: None,
+            mergeable: true,
+            source: InlineTextSource::BidiControl,
+            hanging_edges: InlineHangingEdges::default(),
+            ancestor_inline_decorations: Vec::new().into(),
+        };
+        let mut font_system = FontSystem::new();
+        let mut runs = Vec::new();
+
+        push_text_graph_run_segment(
+            &mut font_system,
+            &mut runs,
+            &word,
+            &word.text,
+            InlineHangingEdges::default(),
+            InlineTrackingScope::root(&style),
+            Rc::new(()),
+        );
+
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].width, 0.0);
+        assert!(runs[0].shaped.is_none());
+    }
+
+    #[test]
     fn unconditional_hanging_separator_does_not_constrain_fitting() {
         let style = ComputedStyle::initial();
         let fragment = InlineFragment::new(
@@ -4296,6 +4906,39 @@ mod tests {
         assert_eq!(widths.trailing_space_width, separator_width);
         assert_eq!(widths.fitting_width, 40.0);
         assert_eq!(widths.content_width, 40.0);
+    }
+
+    #[test]
+    fn break_spaces_keeps_narrow_no_break_space_in_the_fitting_measure() {
+        let mut style = ComputedStyle::initial();
+        style.white_space = WhiteSpace::BreakSpaces;
+        let fragment = InlineFragment::new(
+            "A\u{202f}",
+            style.clone(),
+            0.0,
+            None,
+            true,
+            InlineTextSource::Normal,
+            false,
+            InlineHangingEdges::default(),
+            Vec::new(),
+        );
+        let mut font_system = FontSystem::new();
+        let separator_width = font_system.measure_text("\u{202f}", &style);
+        let total_width = 40.0 + separator_width;
+        let widths = inline_content_width_for_line_items(
+            &[MeasuredInlineItem {
+                item: InlineLineItem::Fragment(fragment),
+                width: total_width,
+                shaped: None,
+            }],
+            &mut font_system,
+            |item| item.width,
+        );
+
+        assert_eq!(widths.trailing_space_width, 0.0);
+        assert_eq!(widths.fitting_width, total_width);
+        assert_eq!(widths.content_width, total_width);
     }
 
     #[test]
@@ -4364,7 +5007,7 @@ mod tests {
     #[test]
     fn automatic_marker_is_a_separate_selected_item_with_source_context() {
         let mut style = ComputedStyle::initial();
-        style.language = Some("ug".into());
+        style.language = ContentLanguage::from_html_attribute("ug");
         let source = InlineFragment::new(
             "دامي",
             style,
@@ -4500,5 +5143,18 @@ mod tests {
         );
 
         assert_eq!(used_discretionary_marker_text(&fragment), "\u{2010}");
+    }
+
+    #[test]
+    fn frozen_float_replay_never_reuses_a_source_band_after_relocation() {
+        let selected = InlineFloatReplay::RequeryContainingBlock {
+            selected_float_page_index: 3,
+        };
+        assert!(!selected.reuses_selected_band_on(3));
+
+        let frozen = selected.freeze_selected_band();
+        assert!(frozen.reuses_selected_band_on(3));
+        assert!(!frozen.reuses_selected_band_on(4));
+        assert_eq!(frozen.selected_float_page_index(), 3);
     }
 }

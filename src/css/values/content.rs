@@ -1,4 +1,5 @@
 use super::*;
+use crate::css::component_values::{css_leading_function_matching, css_leading_ident};
 
 pub(crate) fn parse_marker_content(value: &str) -> Option<MarkerContent> {
     let value = trim_css_value(value);
@@ -96,16 +97,11 @@ fn parse_generated_content_parts(
         } else if let Some((part, tail)) = parse_generated_image_token(rest, base_url, root_url) {
             parts.push(part);
             rest = tail;
-        } else if rest
-            .get(..8)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("contents"))
-            && rest[8..]
-                .chars()
-                .next()
-                .is_none_or(|character| !is_css_ident_continue(character))
+        } else if let Some((ident, tail)) = css_leading_ident(rest)
+            && ident.eq_ignore_ascii_case("contents")
         {
             parts.push(GeneratedContentPart::Contents);
-            rest = &rest[8..];
+            rest = tail;
         } else if let Some((quote, tail)) = parse_generated_quote_token(rest) {
             parts.push(GeneratedContentPart::Quote(quote));
             rest = tail;
@@ -185,15 +181,14 @@ pub(crate) fn parse_named_string_sets(value: &str) -> Option<Vec<NamedStringSet>
         if item.is_empty() {
             return None;
         }
-        let (name, rest) = split_leading_ident(item)?;
+        let (name, rest) = css_leading_ident(item)?;
         let mut rest = rest.trim_start();
         let mut parts = Vec::new();
         while !rest.is_empty() {
             if let Some((text, tail)) = parse_css_string_token(rest) {
                 parts.push(NamedStringPart::String(text));
                 rest = tail.trim_start();
-            } else if let Some(tail) = strip_ascii_function(rest, "content") {
-                let (argument, tail) = split_function_argument(tail)?;
+            } else if let Some((argument, tail)) = css_leading_function_matching(rest, "content") {
                 let argument = argument.trim().to_ascii_lowercase();
                 if argument.is_empty() || argument == "text" {
                     parts.push(NamedStringPart::ContentText);
@@ -287,8 +282,7 @@ pub(crate) fn parse_named_string_counters_token(value: &str) -> Option<(NamedStr
 }
 
 fn parse_named_string_attr_token(value: &str) -> Option<(NamedStringPart, &str)> {
-    let body = strip_ascii_function(value, "attr")?;
-    let (argument, tail) = split_function_argument(body)?;
+    let (argument, tail) = css_leading_function_matching(value, "attr")?;
     let mut parts = split_top_level_commas(argument);
     if parts.is_empty() || parts.len() > 2 {
         return None;
@@ -320,8 +314,7 @@ fn parse_named_string_image_token(value: &str) -> Option<(NamedStringPart, &str)
 }
 
 fn parse_named_string_target_counter(value: &str) -> Option<(NamedStringPart, &str)> {
-    let body = strip_ascii_function(value, "target-counter")?;
-    let (argument, tail) = split_function_argument(body)?;
+    let (argument, tail) = css_leading_function_matching(value, "target-counter")?;
     let arguments = split_top_level_commas(argument);
     if !(2..=3).contains(&arguments.len()) {
         return None;
@@ -347,8 +340,7 @@ fn parse_named_string_target_counter(value: &str) -> Option<(NamedStringPart, &s
 }
 
 fn parse_named_string_target_text(value: &str) -> Option<(NamedStringPart, &str)> {
-    let body = strip_ascii_function(value, "target-text")?;
-    let (argument, tail) = split_function_argument(body)?;
+    let (argument, tail) = css_leading_function_matching(value, "target-text")?;
     let arguments = split_top_level_commas(argument);
     if !(1..=2).contains(&arguments.len()) {
         return None;
@@ -386,23 +378,15 @@ fn parse_target_reference(value: &str) -> Option<TargetReference> {
     {
         return Some(TargetReference::Fragment(text));
     }
-    let body = strip_ascii_function(value, "url")?;
-    let (argument, tail) = split_function_argument(body)?;
+    let (target, tail) = parse_css_url_token(value)?;
     if !tail.trim().is_empty() {
         return None;
     }
-    if let Some((text, tail)) = parse_css_string_token(argument.trim())
-        && tail.trim().is_empty()
-    {
-        return Some(TargetReference::Fragment(text));
-    }
-    let target = argument.trim();
-    (!target.is_empty()).then(|| TargetReference::Fragment(target.to_string()))
+    (!target.is_empty()).then_some(TargetReference::Fragment(target))
 }
 
 fn parse_generated_attr_token(value: &str) -> Option<(GeneratedContentPart, &str)> {
-    let body = strip_ascii_function(value, "attr")?;
-    let (argument, tail) = split_function_argument(body)?;
+    let (argument, tail) = css_leading_function_matching(value, "attr")?;
     let mut parts = split_top_level_commas(argument);
     if parts.is_empty() || parts.len() > 2 {
         return None;
@@ -461,8 +445,7 @@ fn parse_generated_image_token<'a>(
             tail,
         ));
     }
-    if let Some(body) = strip_ascii_function(value, "image-set") {
-        let (argument, tail) = split_function_argument(body)?;
+    if let Some((argument, tail)) = css_leading_function_matching(value, "image-set") {
         let image = match crate::css::parse_css_image(
             &format!("image-set({argument})"),
             base_url,
@@ -481,10 +464,9 @@ fn parse_generated_image_token<'a>(
         "radial-gradient",
         "repeating-radial-gradient",
     ] {
-        let Some(body) = strip_ascii_function(value, name) else {
+        let Some((argument, tail)) = css_leading_function_matching(value, name) else {
             continue;
         };
-        let (argument, tail) = split_function_argument(body)?;
         let image_text = format!("{name}({argument})");
         let image = match crate::css::parse_css_image(&image_text, base_url, root_url) {
             crate::css::ParsedImage::Image(image) => image,
@@ -498,8 +480,7 @@ fn parse_generated_image_token<'a>(
 }
 
 fn parse_generated_target_counter_token(value: &str) -> Option<(GeneratedContentPart, &str)> {
-    let body = strip_ascii_function(value, "target-counter")?;
-    let (argument, tail) = split_function_argument(body)?;
+    let (argument, tail) = css_leading_function_matching(value, "target-counter")?;
     let arguments = split_top_level_commas(argument);
     if !(2..=3).contains(&arguments.len()) {
         return None;
@@ -525,8 +506,7 @@ fn parse_generated_target_counter_token(value: &str) -> Option<(GeneratedContent
 }
 
 fn parse_generated_target_text_token(value: &str) -> Option<(GeneratedContentPart, &str)> {
-    let body = strip_ascii_function(value, "target-text")?;
-    let (argument, tail) = split_function_argument(body)?;
+    let (argument, tail) = css_leading_function_matching(value, "target-text")?;
     let arguments = split_top_level_commas(argument);
     if !(1..=2).contains(&arguments.len()) {
         return None;
@@ -540,7 +520,7 @@ fn parse_generated_target_text_token(value: &str) -> Option<(GeneratedContentPar
 }
 
 fn parse_generated_quote_token(value: &str) -> Option<(GeneratedQuote, &str)> {
-    let (ident, tail) = split_leading_ident(value)?;
+    let (ident, tail) = css_leading_ident(value)?;
     let quote = match ident.to_ascii_lowercase().as_str() {
         "open-quote" => GeneratedQuote::Open,
         "close-quote" => GeneratedQuote::Close,
@@ -552,8 +532,7 @@ fn parse_generated_quote_token(value: &str) -> Option<(GeneratedQuote, &str)> {
 }
 
 fn parse_generated_leader_token(value: &str) -> Option<(String, &str)> {
-    let body = strip_ascii_function(value, "leader")?;
-    let (argument, tail) = split_function_argument(body)?;
+    let (argument, tail) = css_leading_function_matching(value, "leader")?;
     let argument = argument.trim();
     let leader = if let Some((text, string_tail)) = parse_css_string_token(argument) {
         if !string_tail.trim().is_empty() {
@@ -603,8 +582,7 @@ pub(crate) fn parse_quotes(value: &str, inherited: &Quotes) -> Option<Quotes> {
 }
 
 fn parse_counter_token(value: &str) -> Option<(String, Option<ListStyleType>, &str)> {
-    let body = strip_ascii_function(value, "counter")?;
-    let (argument, tail) = split_function_argument(body)?;
+    let (argument, tail) = css_leading_function_matching(value, "counter")?;
     let parts = split_top_level_commas(argument);
     if parts.is_empty() || parts.len() > 2 {
         return None;
@@ -619,8 +597,7 @@ fn parse_counter_token(value: &str) -> Option<(String, Option<ListStyleType>, &s
 }
 
 fn parse_counters_components(value: &str) -> Option<(String, String, Option<ListStyleType>, &str)> {
-    let body = strip_ascii_function(value, "counters")?;
-    let (argument, tail) = split_function_argument(body)?;
+    let (argument, tail) = css_leading_function_matching(value, "counters")?;
     let parts = split_top_level_commas(argument);
     if parts.len() < 2 || parts.len() > 3 {
         return None;
@@ -637,10 +614,13 @@ fn parse_counters_components(value: &str) -> Option<(String, String, Option<List
 
 fn parse_attr_name(value: &str) -> Option<String> {
     let value = value.trim().trim_matches('"').trim_matches('\'');
-    if value.is_empty() || value.split_whitespace().count() != 1 {
+    if value.is_empty()
+        || crate::css::component_values::try_split_css_component_values(value)
+            .is_none_or(|parts| parts.len() != 1)
+    {
         return None;
     }
-    Some(value.to_ascii_lowercase())
+    Some(value.to_string())
 }
 
 pub(crate) fn parse_counter_name(value: &str) -> Option<String> {
@@ -659,21 +639,6 @@ pub(crate) fn parse_counter_separator(value: &str) -> Option<String> {
     tail.trim().is_empty().then_some(value)
 }
 
-pub(crate) fn split_leading_ident(value: &str) -> Option<(&str, &str)> {
-    let mut end = None;
-    for (index, character) in value.char_indices() {
-        if index == 0 && !is_css_ident_start(character) {
-            return None;
-        }
-        if !is_css_ident_continue(character) {
-            end = Some(index);
-            break;
-        }
-    }
-    let end = end.unwrap_or(value.len());
-    Some((&value[..end], &value[end..]))
-}
-
 pub(crate) fn split_top_level_commas(value: &str) -> Vec<&str> {
     crate::css::component_values::split_css_top_level_delimiter(value, ',')
 }
@@ -682,8 +647,4 @@ fn split_top_level_slash(value: &str) -> (&str, Option<&str>) {
     crate::css::component_values::split_css_top_level_once(value, '/')
         .map(|(left, right)| (left, Some(right)))
         .unwrap_or((value, None))
-}
-
-pub(crate) fn is_css_ident_start(character: char) -> bool {
-    character == '_' || character == '-' || character.is_ascii_alphabetic() || !character.is_ascii()
 }

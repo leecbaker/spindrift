@@ -1,6 +1,6 @@
 # CSS Positioning Parity
 
-Last updated: 2026-07-31
+Last updated: 2026-08-10
 
 This document tracks current CSS positioning and stacking behavior in Quire.
 Known unresolved divergences belong in `SPEC_DIVERGENCES.md`; this file is a
@@ -17,6 +17,12 @@ working parity snapshot for implemented behavior and nearby follow-up areas.
   intrinsic auto size before the absolute-axis solver distributes remaining
   space to authored auto margins, including the corresponding block-axis
   table-height case.
+- Absolutely positioned table roots receive the nearest containing block's
+  logical inline available size before CSS Tables auto-width calculation, and
+  authored definite logical block sizes are forwarded to table row
+  distribution. Inset over-constraint affects only final placement; it does
+  not enlarge the table sizing basis. This covers the `absolute-tables-007`
+  through `016` matrix, including the four tentative cases.
 - Auto-sized absolutely positioned replaced images use their intrinsic
   dimensions and aspect ratio before resolving absolute insets.
 - Positioned layout prepares a zoom-normalized used style exactly once for
@@ -65,6 +71,23 @@ working parity snapshot for implemented behavior and nearby follow-up areas.
   the rectangle the box would have occupied in normal flow. Atomic inline
   sources such as inline-blocks also use the placeholder margin-box top for
   auto vertical placement, preserving explicit top margins and used heights.
+- Direct inline-level positioned children of block flow with active float
+  exclusions now enter that same placeholder path instead of inheriting a
+  preceding page line. The non-atomic inline hypothetical subject is reset to
+  `position: static`, `float: none`, and `clear: none`, with auto margins
+  treated as zero, while the surrounding line's preceding floats, clearance,
+  indentation, alignment, direction, and writing mode continue to select the
+  static rectangle. Existing atomic-inline source-display replay remains in
+  use where no live float needs a hypothetical line measurement.
+- Ordinary-flow absolute descendants retain a separate, spec-shaped
+  static-position rectangle during late positioning: block sources contribute
+  a zero block-axis rectangle at their hypothetical block start, while inline
+  sources contribute a zero inline-axis rectangle spanning their hypothetical
+  line. Same-page ordinary-flow placement resolves `auto` self alignment from
+  the source parent's item defaults, preserves source direction and vertical
+  writing-mode axes, and resolves the aligned edge without a second legacy
+  baseline translation. This is raster-exact for CSS Align's
+  `align-self-static-position-001` through `-008` matrix.
 - Temporary inline-block fragments use a matching scratch page and page
   context. Positioned descendants that escape a non-stacking inline-block
   therefore carry their page-area clips in the same coordinate space as their
@@ -85,6 +108,12 @@ working parity snapshot for implemented behavior and nearby follow-up areas.
   form a physical `ContainingBlock`, covering ordinary horizontal
   static-position cases without reducing the geometry to the block-flow
   cursor.
+- A marker-only positioned inline materializes a CSS Inline phantom line
+  record. Its zero-height edge geometry remains available to construct the
+  positioned descendant's containing block and replay its escaped paint layer
+  exactly once, while the source line remains absent from normal flow,
+  line-clamp, widows/orphans, margin collapse, and ordinary paint.
+  <https://drafts.csswg.org/css-inline-3/#phantom-line-boxes>
 - When an explicit-inset descendant occurs before its positioned inline
   ancestor closes, collection defers materialization until that final edge is
   present. A typed pending segment-break placement keeps collapsed boundary
@@ -102,6 +131,14 @@ working parity snapshot for implemented behavior and nearby follow-up areas.
   independently resolved destination-page ownership rather than being remapped
   again by an ancestor, and the final page-span requirement is merged across
   the nested subtree.
+- Positioned page-span bookkeeping separately records a logical tail and its
+  materialized paint prefix. A resolved ancestor `overflow: clip` bounds the
+  positioned scratch continuation before payload creation, while its logical
+  tail remains available to ordering and continuation bookkeeping. The clip
+  relation follows ancestor ownership rather than requiring the containing
+  block to fit inside the clip. Unresolved clip geometry still requires
+  deferred replay; `hidden`, `auto`, and `scroll` remain conservatively
+  potentially visible.
 - A decoration-free nested absolute box with no paint and no viewport-fixed
   replay requirement does not materialize otherwise blank document pages.
   Visible ordinary text retains its resolved destination page; a forced page
@@ -141,11 +178,22 @@ working parity snapshot for implemented behavior and nearby follow-up areas.
 - Positioned descendants produced while an atomic inline is measured, including
   relatively positioned table captions, likewise escape the atom's inline
   paint unit and retain their parent stacking level and source order.
+- A non-stacking atomic inline keeps its own background and border in the
+  parent inline paint phase while preserving an escaped negative-z positioned
+  descendant's original stack level, source order, effects, links, and page
+  ownership for replay in the nearest real parent context.
+- The root border remains in the root background/border phase; a negative-z
+  positioned body is inserted afterward in the root negative-z phase. Root and
+  body background propagation affects only canvas backgrounds and does not
+  promote borders or descendants across those paint phases.
 - Absolutely positioned children retain one typed static-alignment rectangle
   through automatic sizing and final placement. Flex supplies its sole-item
   main-axis and container cross-axis geometry, Grid supplies its grid area,
   and ordinary positioned descendants use their containing-block rectangle;
   all three resolve self-alignment through the same physical-axis path.
+- `align-self`, `justify-self`, and `place-self: anchor-center` use ordinary
+  center alignment when no default anchor exists, as required by CSS Anchor
+  Positioning. Full anchor positioning remains tracked as a divergence.
 - Intrinsic inline-block measurement suppresses positioned-descendant
   materialization, so committed atom layout—not an off-page intrinsic probe—
   creates escaped positioned layers.
@@ -154,6 +202,11 @@ working parity snapshot for implemented behavior and nearby follow-up areas.
   decoration while the root background continues to propagate to the canvas.
 - Static-position offsets remain signed through the absolute-position solver,
   so a hypothetical source may legitimately fall outside its containing block.
+- Static-position WPT validation is scoped to the 26 non-script tests in
+  `css/css-position/static-position/`; the ten script-driven
+  `top-layer-box-uses-icb-*` tests remain excluded pending JavaScript and HTML
+  top-layer support. A fresh cross-engine WPT matrix is still required after
+  the shared placeholder capture change.
 - Same-page non-positioned overflow clips apply to descendant paint without
   creating an atomic stacking context, so later normal-flow block backgrounds
   do not cover earlier clipped inline foregrounds.

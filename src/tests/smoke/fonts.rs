@@ -237,7 +237,9 @@ async fn visibility_hidden_preserves_layout_space() {
     assert_eq!(document.pages[0].lines()[0].text, "Visible");
     assert!(
         document.pages[0].lines()[0].y()
-            < options.page_size.height() - options.page_margins.top() - options.line_height()
+            < options.page_size.height()
+                - crate::layout::PageMargins::DEFAULT.top()
+                - options.line_height()
     );
 }
 
@@ -625,10 +627,11 @@ struct FontQueryAttributes {
 fn system_ttc_text_face_fixture(text: &str) -> Option<SystemTtcTextFaceFixture> {
     let mut collection = fontique::Collection::default();
     let mut source_cache = fontique::SourceCache::default();
-    let family_names = collection
+    let mut family_names = collection
         .family_names()
         .map(str::to_string)
         .collect::<Vec<_>>();
+    family_names.sort_unstable();
 
     for family_name in family_names {
         for attributes in system_ttc_text_face_fixture_attributes() {
@@ -808,6 +811,37 @@ async fn rtl_inline_margin_boundary_matches_zwnj_shaping_reference() {
         arabic_line_geometry(&target),
         arabic_line_geometry(&reference),
         "an inline-axis margin must isolate Arabic shaping without changing the visual placement of the span's two margin edges"
+    );
+}
+
+#[tokio::test]
+async fn rtl_inline_color_boundary_matches_zwj_shaping_reference() {
+    let render = |contents: &str| {
+        Html::from_string(format!(
+            "<style>\
+             @page {{ size: 800px 300px; margin: 0 }}\
+             @font-face {{ font-family: Naskh; src: url('tests/resources/fonts/NotoNaskhArabic-regular.woff2') format('woff2') }}\
+             body {{ margin: 0 }}\
+             div {{ border: 1px solid #02D7F6; margin: 20px; padding: 10px; width: 3em; font-size: 120px; font-family: Naskh }}\
+             .color {{ color: blue }}\
+             </style><div lang=\"ar\" dir=\"rtl\">{contents}</div>"
+        ))
+        .with_base_path(".")
+        .unwrap()
+    };
+    let target = render("ع<span class=\"color\">ع</span>ع")
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+    let reference = render("ع&zwj;<span class=\"color\">&zwj;ع&zwj;</span>&zwj;ع")
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        arabic_line_geometry(&target),
+        arabic_line_geometry(&reference),
+        "a paint-only color boundary and its ZWJ reference must use the same RTL line measure"
     );
 }
 
@@ -1107,14 +1141,15 @@ async fn uses_later_font_family_for_missing_glyph_runs() {
         .write_pdf_bytes(&crate::PdfOptions::default())
         .unwrap();
     let rendered = pdf_searchable_text(&pdf);
-    assert!(rendered.contains(&format!(
-        "<{}>",
-        fallback_character
-            .encode_utf16(&mut [0; 2])
-            .iter()
-            .map(|unit| format!("{unit:04X}"))
-            .collect::<String>()
-    )));
+    let encoded_fallback = fallback_character
+        .encode_utf16(&mut [0; 2])
+        .iter()
+        .map(|unit| format!("{unit:04X}"))
+        .collect::<String>();
+    assert!(
+        rendered.contains(&format!("<{encoded_fallback}>")),
+        "missing fallback character {encoded_fallback} from PDF text: {rendered}"
+    );
 }
 
 #[tokio::test]
@@ -1629,5 +1664,12 @@ fn standalone_system_font_faces() -> Vec<(Vec<u8>, u32)> {
         });
     }
 
+    // Fontique's collection order is platform-dependent. The fallback fixture
+    // selects the first matching primary/fallback pair, so normalize its input
+    // order before making that observable test choice.
+    faces.sort_unstable_by(|(left_data, left_index), (right_data, right_index)| {
+        left_data.cmp(right_data).then(left_index.cmp(right_index))
+    });
+    faces.dedup();
     faces
 }

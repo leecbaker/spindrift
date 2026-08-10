@@ -1,26 +1,57 @@
 use super::*;
+use crate::document::paint::geometry::{Affine3dPaintTransform, Projective3dPaintTransform};
 
-pub(in crate::layout) fn paint_transform_for_box(
+/// The untransformed box against which an HTML principal box resolves its
+/// transform-origin and percentage translations.
+///
+/// Paint bounds are intentionally not accepted here: ink can be smaller than
+/// the principal box, while CSS Transforms resolves the reference box after
+/// layout. Tables are the one CSS-layout exception: their transform reference
+/// box is the table wrapper's border box for both `content-box` and
+/// `border-box`.
+/// <https://drafts.csswg.org/css-transforms-1/#transform-box>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) enum TransformReferenceBox {
+    CssLayoutBorderBox(PaintRect),
+    TableWrapperBorderBox(PaintRect),
+}
+
+impl TransformReferenceBox {
+    pub(in crate::layout) fn css_layout(border_box: PaintRect) -> Self {
+        Self::CssLayoutBorderBox(border_box)
+    }
+
+    pub(in crate::layout) fn table_wrapper(border_box: PaintRect) -> Self {
+        Self::TableWrapperBorderBox(border_box)
+    }
+
+    fn resolve(self, style: &ComputedStyle) -> PaintRect {
+        match self {
+            Self::CssLayoutBorderBox(border_box) => html_transform_reference_box(style, border_box),
+            // CSS Transforms deliberately makes both content-box and
+            // border-box use the table wrapper border box. Do not run the
+            // normal CSS-box content inset adapter here.
+            Self::TableWrapperBorderBox(border_box) => border_box,
+        }
+    }
+}
+
+#[cfg(test)]
+fn paint_transform_for_box(style: &ComputedStyle, border_box: PaintRect) -> Option<PaintTransform> {
+    paint_transform_for_reference_box(style, TransformReferenceBox::css_layout(border_box))
+}
+
+pub(in crate::layout) fn paint_transform_for_reference_box(
     style: &ComputedStyle,
-    border_box: PaintRect,
+    reference_box: TransformReferenceBox,
 ) -> Option<PaintTransform> {
     if !style.has_transform() {
         return None;
     }
-    let border_box = transform_border_box_from_used_style(style, border_box);
-    let reference_box = html_transform_reference_box(style, border_box);
+    let reference_box = reference_box.resolve(style);
     if transform_list_contains_3d(&style.transform) {
-        let origin = style
-            .transform_origin
-            .clone()
-            .resolve_3d_against_paint_rect(reference_box);
-        let transform = compose_css_transform_3d_matrix(
-            origin,
-            style.individual_transforms.clone(),
-            &style.transform,
-            reference_box.size,
-        );
-        return affine_paint_transform_from_3d(transform).map(PaintTransform::from_transform);
+        return affine_3d_paint_transform_for_resolved_reference_box(style, reference_box)
+            .map(Affine3dPaintTransform::flatten_to_paint_transform);
     }
     let origin = style
         .transform_origin
@@ -52,34 +83,101 @@ pub(in crate::layout) fn transform_list_contains_3d(
     })
 }
 
-/// Whether a 3D transform must suppress its subtree. CSS Transforms treats a
-/// singular homogeneous matrix as non-rendering; a projective matrix is also
-/// suppressed for now because the PDF paint path only accepts affine CTMs.
-pub(in crate::layout) fn transform_3d_suppresses_paint(
+type PaintTransform3D = euclid::Transform3D<f32, PaintSpace, PaintSpace>;
+
+/// Resolve a local CSS 3D transform into an affine homogeneous paint matrix.
+///
+/// `None` represents a projective matrix, which the PDF backend deliberately
+/// does not approximate. Callers that need to distinguish a 2D style from an
+/// unsupported 3D value should first use [`transform_list_contains_3d`].
+#[cfg_attr(not(test), allow(dead_code))]
+pub(in crate::layout) fn affine_3d_paint_transform_for_reference_box(
     style: &ComputedStyle,
-    border_box: PaintRect,
-) -> bool {
-    if !transform_list_contains_3d(&style.transform) {
-        return false;
+    reference_box: TransformReferenceBox,
+) -> Option<Affine3dPaintTransform> {
+    if !style.has_transform() {
+        return None;
     }
-    let border_box = transform_border_box_from_used_style(style, border_box);
-    let reference_box = html_transform_reference_box(style, border_box);
+    affine_3d_paint_transform_for_resolved_reference_box(style, reference_box.resolve(style))
+}
+
+/// Resolve a CSS 3D transform without discarding perspective terms.
+///
+/// This is the retained-scene boundary. The caller may subsequently select
+/// the affine PDF fast path through `try_into_affine_pdf_ctm`, but projective
+/// matrices remain explicit until primitive lowering.
+pub(in crate::layout) fn projective_3d_paint_transform_for_reference_box(
+    style: &ComputedStyle,
+    reference_box: TransformReferenceBox,
+) -> Option<Projective3dPaintTransform> {
+    style.has_transform().then(|| {
+        let reference_box = reference_box.resolve(style);
+        let origin = style
+            .transform_origin
+            .clone()
+            .resolve_3d_against_paint_rect(reference_box);
+        Projective3dPaintTransform::from_transform(compose_css_transform_3d_matrix(
+            origin,
+            style.individual_transforms.clone(),
+            &style.transform,
+            reference_box.size,
+        ))
+    })
+}
+
+/// Matrix introduced by the `perspective` property for an element's
+/// descendants.  The owner itself stays in its parent's plane; only a child
+/// rendering context is multiplied by this matrix.
+/// <https://drafts.csswg.org/css-transforms-2/#perspective-property>
+pub(in crate::layout) fn perspective_property_3d_transform_for_reference_box(
+    style: &ComputedStyle,
+    reference_box: TransformReferenceBox,
+) -> Option<Projective3dPaintTransform> {
+    let distance = style.perspective.used_for_rendering()?.points();
+    let origin = style
+        .perspective_origin
+        .clone()
+        .resolve_against_paint_rect(reference_box.resolve(style));
+    let projection = PaintTransform3D::new(
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        -1.0 / distance,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    );
+    Some(Projective3dPaintTransform::from_transform(
+        PaintTransform3D::translation(-origin.x, -origin.y, 0.0)
+            .then(&projection)
+            .then(&PaintTransform3D::translation(origin.x, origin.y, 0.0)),
+    ))
+}
+
+fn affine_3d_paint_transform_for_resolved_reference_box(
+    style: &ComputedStyle,
+    reference_box: PaintRect,
+) -> Option<Affine3dPaintTransform> {
     let origin = style
         .transform_origin
         .clone()
         .resolve_3d_against_paint_rect(reference_box);
-    let transform = compose_css_transform_3d_matrix(
+    Affine3dPaintTransform::try_from_transform(compose_css_transform_3d_matrix(
         origin,
         style.individual_transforms.clone(),
         &style.transform,
         reference_box.size,
-    );
-    transform.inverse().is_none()
-        || affine_paint_transform_from_3d(transform).is_none()
-        || (style.backface_visibility == css::BackfaceVisibility::Hidden && transform.m33 < 0.0)
+    ))
 }
-
-type PaintTransform3D = euclid::Transform3D<f32, PaintSpace, PaintSpace>;
 
 /// Compose a CSS transform list in homogeneous 3D space, including ordinary
 /// 2D functions.  CSS Transforms Level 2 defines 2D functions as their 3D
@@ -153,10 +251,13 @@ fn paint_transform_3d_function_matrix(
                 rotation.angle,
             ))
         }
-        css::TransformFunction::Perspective(distance) => {
-            let distance =
-                used_length_percentage(distance, PercentageBasis::definite(layout_pt(0.0)))
-                    .points();
+        css::TransformFunction::Perspective(perspective) => {
+            let Some(distance) = perspective
+                .used_for_rendering()
+                .map(|distance| distance.points())
+            else {
+                return PaintTransform3D::identity();
+            };
             // A nonzero m34 makes the result projective. The affine extractor
             // below detects this and leaves perspective explicitly unsupported.
             PaintTransform3D::new(
@@ -229,35 +330,6 @@ fn promote_paint_transform(
     )
 }
 
-/// Extract the 2D affine image of a homogeneous transform. Any perspective
-/// terms are intentionally rejected rather than approximated as an affine PDF
-/// CTM. Components involving only z remain meaningful for later backface and
-/// preserve-3D support but do not affect the current flattened paint plane.
-fn affine_paint_transform_from_3d(
-    transform: PaintTransform3D,
-) -> Option<euclid::Transform2D<f32, PaintSpace, PaintSpace>> {
-    const EPSILON: f32 = 1e-6;
-    if transform.m14.abs() > EPSILON
-        || transform.m24.abs() > EPSILON
-        || transform.m34.abs() > EPSILON
-        || transform.m44.abs() <= EPSILON
-    {
-        return None;
-    }
-    // Homogeneous matrices are equivalent up to a nonzero scalar. CSS
-    // `matrix3d(..., m44)` therefore remains affine when it has no
-    // perspective terms; normalize by w before handing it to PDF.
-    let inverse_w = transform.m44.recip();
-    Some(normalize_affine_transform(euclid::Transform2D::new(
-        transform.m11 * inverse_w,
-        transform.m12 * inverse_w,
-        transform.m21 * inverse_w,
-        transform.m22 * inverse_w,
-        transform.m41 * inverse_w,
-        transform.m42 * inverse_w,
-    )))
-}
-
 /// Resolve the transform reference box for an HTML layout box.
 ///
 /// `view-box`, `fill-box`, and `stroke-box` are SVG concepts.  The CSS
@@ -280,50 +352,6 @@ fn html_transform_reference_box(style: &ComputedStyle, border_box: PaintRect) ->
         PaintSize::new(
             (border_box.size.width - horizontal_inset - borders.right - padding.right).max(0.0),
             (border_box.size.height - vertical_inset - borders.top - padding.top).max(0.0),
-        ),
-    )
-}
-
-/// Recover a box's definite declared border-box extent when paint capture only
-/// retained descendant ink bounds.
-///
-/// Effects are often scoped after a block's decorations have been promoted or
-/// suppressed (notably for root/body canvas handling). The capture bounds can
-/// then shrink to a child even though CSS percentages in `transform` resolve
-/// against the transformed element's own used border box. A definite declared
-/// size is already a used layout value at this boundary, so it may safely
-/// widen the retained paint bound without using descendant geometry as a
-/// percentage basis.
-/// <https://drafts.csswg.org/css-transforms-1/#transform-rendering>
-fn transform_border_box_from_used_style(style: &ComputedStyle, captured: PaintRect) -> PaintRect {
-    let borders = used_border_widths(style);
-    let horizontal_non_content =
-        borders.left + style.padding.left + style.padding.right + borders.right;
-    let vertical_non_content =
-        borders.bottom + style.padding.bottom + style.padding.top + borders.top;
-    let declared_border_extent = |declared: Option<f32>, non_content: f32, captured_extent: f32| {
-        declared
-            .map(|declared| match style.box_sizing {
-                css::BoxSizing::ContentBox => declared + non_content,
-                css::BoxSizing::BorderBox => declared,
-            })
-            .filter(|extent| extent.is_finite())
-            .map(|extent| extent.max(captured_extent))
-            .unwrap_or(captured_extent)
-    };
-    PaintRect::new(
-        captured.origin,
-        PaintSize::new(
-            declared_border_extent(
-                style.box_values.width.length_if_no_percent(),
-                horizontal_non_content,
-                captured.size.width,
-            ),
-            declared_border_extent(
-                style.box_values.height.length_if_no_percent(),
-                vertical_non_content,
-                captured.size.height,
-            ),
         ),
     )
 }
@@ -602,7 +630,29 @@ mod tests {
     }
 
     #[test]
-    fn definite_box_size_wins_over_descendant_ink_for_transform_percentages() {
+    fn perspective_property_uses_the_rendering_clamp_and_is_projective() {
+        let mut style = ComputedStyle::initial();
+        style.perspective = css::ComputedPerspective::Distance(
+            css::NonNegativeComputedLength::new(ComputedLengthPercentage::ZERO)
+                .expect("zero is a valid computed perspective"),
+        );
+        let transform = perspective_property_3d_transform_for_reference_box(
+            &style,
+            TransformReferenceBox::css_layout(paint_space_rect(0.0, 0.0, 100.0, 50.0)),
+        )
+        .expect("non-none perspective creates a descendant projection");
+        assert!(transform.try_into_affine_pdf_ctm().is_none());
+        assert!(
+            perspective_property_3d_transform_for_reference_box(
+                &ComputedStyle::initial(),
+                TransformReferenceBox::css_layout(paint_space_rect(0.0, 0.0, 100.0, 50.0)),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn supplied_used_border_box_is_not_reconstructed_from_paint_ink() {
         let mut style = ComputedStyle::initial();
         style.box_values.width = css::ComputedLengthPercentageOrAuto::LengthPercentage(
             css::ComputedLengthPercentage::from_points(300.0),
@@ -619,10 +669,38 @@ mod tests {
                 y: ComputedLengthPercentage::from_percent(0.1),
             }));
 
-        let transform = paint_transform_for_box(&style, paint_space_rect(10.0, 20.0, 75.0, 75.0))
-            .expect("translate establishes a transform");
+        let transform = paint_transform_for_reference_box(
+            &style,
+            TransformReferenceBox::css_layout(paint_space_rect(10.0, 20.0, 300.0, 300.0)),
+        )
+        .expect("translate establishes a transform");
         assert_eq!(transform.e(), 30.0);
         assert_eq!(transform.f(), -30.0);
+    }
+
+    #[test]
+    fn table_wrapper_uses_its_border_box_for_content_box_transforms() {
+        let mut style = ComputedStyle::initial();
+        style.transform_box = css::TransformBox::ContentBox;
+        style.padding.left = 10.0;
+        style.padding.right = 10.0;
+        style.padding.top = 5.0;
+        style.padding.bottom = 5.0;
+        style
+            .transform
+            .push(css::TransformFunction::Translate(CssTransformTranslation {
+                x: ComputedLengthPercentage::from_percent(0.5),
+                y: ComputedLengthPercentage::from_percent(0.5),
+            }));
+
+        let transform = paint_transform_for_reference_box(
+            &style,
+            TransformReferenceBox::table_wrapper(paint_space_rect(0.0, 0.0, 100.0, 50.0)),
+        )
+        .expect("translate establishes a transform");
+
+        assert_eq!(transform.e(), 50.0);
+        assert_eq!(transform.f(), -25.0);
     }
 
     #[test]
@@ -630,13 +708,14 @@ mod tests {
         let transform = PaintTransform3D::new(
             2.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 0.0, 4.0, 0.0, 5.0, 6.0, 7.0, 1.0,
         );
-        let affine = affine_paint_transform_from_3d(transform)
+        let affine = Affine3dPaintTransform::try_from_transform(transform)
             .expect("an affine homogeneous transform projects to PDF");
+        let affine = affine.flatten_to_paint_transform();
 
-        assert_eq!(affine.m11, 2.0);
-        assert_eq!(affine.m22, 3.0);
-        assert_eq!(affine.m31, 5.0);
-        assert_eq!(affine.m32, 6.0);
+        assert_eq!(affine.a(), 2.0);
+        assert_eq!(affine.d(), 3.0);
+        assert_eq!(affine.e(), 5.0);
+        assert_eq!(affine.f(), 6.0);
     }
 
     #[test]
@@ -649,14 +728,16 @@ mod tests {
                 y: 1.0,
                 z: 0.0,
             }));
-        assert!(transform_3d_suppresses_paint(
+        let transform = affine_3d_paint_transform_for_reference_box(
             &style,
-            paint_space_rect(0.0, 0.0, 10.0, 10.0),
-        ));
+            TransformReferenceBox::css_layout(paint_space_rect(0.0, 0.0, 10.0, 10.0)),
+        )
+        .expect("scale3d is affine");
+        assert!(!transform.is_invertible());
 
         let projective = PaintTransform3D::new(
             1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, -0.01, 0.0, 0.0, 0.0, 1.0,
         );
-        assert!(affine_paint_transform_from_3d(projective).is_none());
+        assert!(Affine3dPaintTransform::try_from_transform(projective).is_none());
     }
 }

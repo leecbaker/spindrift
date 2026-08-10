@@ -265,9 +265,9 @@ fn strip_blockified_inline_text_paint(children: &mut [box_tree::MutableFormattin
 }
 
 fn strip_text_fragment_paint(style: &mut ComputedStyle) {
-    style.background_color = css::BackgroundColor::TRANSPARENT;
-    style.background_image = css::ComputedImage::None;
-    style.background_layers.clear();
+    style.background.background_color = css::BackgroundColor::TRANSPARENT;
+    style.background.background_image = css::ComputedImage::None;
+    style.background.background_layers.clear();
     style.border_width = 0.0;
     style.border_widths = css::Edges::ZERO;
     style.border_styles = css::BorderStyles::NONE;

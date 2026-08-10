@@ -4,6 +4,7 @@
 //! domain that owns them rather than through a flat paint prelude.
 
 pub(crate) mod annotations;
+pub(crate) mod contours;
 pub(crate) mod display_list;
 pub(crate) mod effects;
 pub(crate) mod fragments;

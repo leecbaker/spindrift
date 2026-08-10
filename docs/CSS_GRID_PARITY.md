@@ -1,6 +1,6 @@
 # CSS Grid Parity
 
-Last updated: 2026-08-01
+Last updated: 2026-08-04
 
 This document tracks Quire's CSS Grid implementation. It is a living
 tracking document: update it whenever grid behavior is added, narrowed,
@@ -11,6 +11,11 @@ Fragmentation Level 3. WeasyPrint behavior is useful compatibility context,
 but spec conformance is the priority when they disagree.
 
 ## Current Implementation
+
+- `margin-trim` derives zero used margins from placed logical grid areas before
+  final track sizing and replay. It covers all logical edges and writing modes,
+  keeps empty tracks relevant, and ignores collapsed `auto-fit` tracks.
+  Fragmentation-specific trimming remains deferred.
 
 ### WPT snapshot
 
@@ -38,8 +43,11 @@ display semantics in addition to Grid.
 The last full local renderable `css/css-grid/` WPT run passed 661 of 1,414
 tests. The focused `css/css-grid/abspos/` run now passes 105 of 142 tests,
 including all 16 positioned grid-descendant containing-block tests and all 17
-orthogonal positioned-grid-item tests. This includes 257 of 736 renderable
-Grid Lanes tests. The remaining
+orthogonal positioned-grid-item tests. The focused
+`css/css-grid/grid-lanes/items/` run passes all 18 cases, including cyclic
+percentage item sizing, flexible-track automatic minima, and replaced items
+in `minmax(auto, 0)` tracks. This includes 257 of 736 renderable Grid Lanes
+tests. The remaining
 failures are concentrated in Level 3 Grid Lanes track sizing, subgrids,
 baseline alignment, positioned descendants, and the corresponding fragmented
 or writing-mode behavior.
@@ -148,7 +156,9 @@ or writing-mode behavior.
   `inline-grid` boxes now use the same child collection, intrinsic estimate,
   Taffy geometry, and item replay path inside an atomic inline fragment, with
   a same-page horizontal first exported baseline derived from the first
-  occupied grid row rather than paint order.
+  occupied grid row rather than paint order. Layout containment suppresses
+  both Grid-provided and captured descendant line baselines and uses the
+  synthesized border-box fallback consistently.
 - Child collection and the Taffy adapter are intentionally narrow first
   passes. Template-area rectangles and generated `area-start`/`area-end`
   line names are passed to Taffy for basic named-area and generated-line
@@ -411,9 +421,14 @@ or writing-mode behavior.
   component while preserving fixed length components. Cyclic percentage row
   gaps resolve against zero for simple same-page intrinsic grid height sizing.
   Simple indefinite percentage grid item block sizes behave as automatic sizes for min-content
-  row sizing; complete grid contribution rules, broader implicit-grid
-  placement, broader spanning-item effects, broader generated-area
-  interactions, flexible tracks, automatic minimum sizing, definite
+  row sizing. Cyclic preferred, minimum, and maximum item percentages remain
+  automatic for intrinsic track contributions, then resolve against the final
+  grid area with final min/max constraints (including mixed `calc()` values).
+  Explicit multi-track flexible spans receive Grid's zero automatic minimum,
+  while replaced automatic used sizes are retained for final placement rather
+  than incorrectly enlarging `minmax(auto, 0)` tracks. Complete grid
+  contribution rules, broader implicit-grid placement, broader spanning-item
+  effects, broader generated-area interactions, flexible tracks, definite
   auto-repeat intrinsic expansion, and full container intrinsic sizing remain
   incomplete.
 - [ ] Same-page grid layout paints normal-flow grid items, backgrounds,
@@ -705,6 +720,10 @@ or writing-mode behavior.
   percentage-sized items indefinite during that phase, includes simple spans,
   and resolves those item percentages only after their final lane area is
   known.
+- Grid item percentage sizing has two deliberate phases shared by ordinary
+  Grid and Grid Lanes: intrinsic track sizing treats cyclic percentages as
+  automatic, while final area placement resolves preferred/minimum/maximum
+  constraints and replay retains those physical used bounds.
 - Keep grid placement and track data in logical grid terms until the adapter
   maps through writing mode and direction into physical container coordinates.
 - Use explicit grid layout records rather than recovering structure from paint

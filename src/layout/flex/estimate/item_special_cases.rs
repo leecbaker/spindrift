@@ -19,8 +19,45 @@ pub(super) struct FlexItemEstimateContext<'a> {
     pub(super) containing_height_basis: FlexAvailablePercentageBasis,
     pub(super) containing_inline_size: LogicalInlineContentSize,
     pub(super) containing_inline_size_points: f32,
+    /// Whether `containing_inline_size` is the flex item's already-resolved
+    /// content box rather than its containing block.  The two values have the
+    /// same unit but require different box-model conversions before inline
+    /// line selection.
+    pub(super) inline_measurement_space: FlexInlineMeasurementSpace,
     pub(super) preferred_inline_basis: FlexAvailablePercentageBasis,
     pub(super) vertical_non_content: NonContentLength,
+}
+
+/// The box-model space represented by an inline measurement constraint.
+///
+/// A normal flex estimate begins with the container's content box, so the
+/// item must remove its inline padding before selecting text lines.  A
+/// definite preferred cross size and a post-flexing main size have already
+/// crossed that boundary: they are the item's content box.  Retaining this
+/// distinction prevents the item's padding from being removed twice, which
+/// otherwise creates an unpainted extra line in the flex item's used block
+/// size.
+/// <https://www.w3.org/TR/css-sizing-3/#box-model> and
+/// <https://www.w3.org/TR/css-flexbox-1/#algo-main-item>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FlexInlineMeasurementSpace {
+    ContainingBlockContentBox,
+    ResolvedItemContentBox,
+}
+
+impl FlexInlineMeasurementSpace {
+    pub(super) fn content_box_inline_width(
+        self,
+        available_inline_size: f32,
+        style: &ComputedStyle,
+    ) -> f32 {
+        match self {
+            Self::ContainingBlockContentBox => {
+                (available_inline_size - style.padding.left - style.padding.right).max(1.0)
+            }
+            Self::ResolvedItemContentBox => available_inline_size.max(1.0),
+        }
+    }
 }
 
 impl<'a> LayoutBuilder<'a> {
@@ -282,8 +319,8 @@ impl<'a> LayoutBuilder<'a> {
             },
             FlexItemBaselineEstimate {
                 vertical: FlexItemBaselinePair {
-                    first: Some(FlexVerticalBaselineOffset::new(first_baseline)),
-                    last: Some(FlexVerticalBaselineOffset::new(first_baseline)),
+                    first: Some(flex_vertical_baseline_from_points(first_baseline)),
+                    last: Some(flex_vertical_baseline_from_points(first_baseline)),
                 },
                 horizontal: FlexItemBaselinePair {
                     first: first_horizontal_text_baseline_offset(
@@ -638,8 +675,8 @@ impl<'a> LayoutBuilder<'a> {
             },
             FlexItemBaselineEstimate {
                 vertical: FlexItemBaselinePair {
-                    first: Some(FlexVerticalBaselineOffset::new(first_baseline)),
-                    last: Some(FlexVerticalBaselineOffset::new(last_baseline)),
+                    first: Some(flex_vertical_baseline_from_points(first_baseline)),
+                    last: Some(flex_vertical_baseline_from_points(last_baseline)),
                 },
                 horizontal: FlexItemBaselinePair {
                     first: first_horizontal_text_baseline_offset(
@@ -671,6 +708,17 @@ impl<'a> FlexItemEstimateContext<'a> {
         let containing_inline_size = available.inline_size(style);
         let containing_inline_size_points = containing_inline_size.points();
         let containing_inline_basis = available.inline_basis(style);
+        let inline_measurement_space = match containing_inline_basis {
+            PercentageBasis::Definite {
+                source:
+                    FlexAvailableSizeSource::DefinitePreferredCrossSize
+                    | FlexAvailableSizeSource::PostFlexingMainSize,
+                ..
+            } => FlexInlineMeasurementSpace::ResolvedItemContentBox,
+            PercentageBasis::Definite { .. } | PercentageBasis::Indefinite => {
+                FlexInlineMeasurementSpace::ContainingBlockContentBox
+            }
+        };
         let preferred_inline_basis = if containing_inline_basis.is_definite() {
             containing_inline_basis
         } else {
@@ -687,6 +735,7 @@ impl<'a> FlexItemEstimateContext<'a> {
             containing_height_basis,
             containing_inline_size,
             containing_inline_size_points,
+            inline_measurement_space,
             preferred_inline_basis,
             vertical_non_content,
         }

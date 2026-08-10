@@ -67,13 +67,13 @@ flowchart TD
   FLOW --> DOC["Document"]
 
   DOC --> META["Extract metadata"]
-  META --> PDF["write_pdf_bytes with PdfOptions synchronously"]
+  META --> PDF["write_pdf to a caller-provided Write sink synchronously"]
   PDF --> V["Validate paint operations"]
   V --> SH["Shape document text for PDF"]
   SH --> FP["Plan font embedding"]
   FP --> PC["Build page content streams, sequential per page"]
   PC --> OBJ["Write PDF objects"]
-  OBJ --> W["tokio::fs::write output file async"]
+  OBJ --> W["Write PDF bytes to the caller-provided sink"]
 ```
 
 ## PDF Output Opportunities

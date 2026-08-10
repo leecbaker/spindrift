@@ -1,7 +1,6 @@
 use super::*;
 use crate::CssColor;
-use crate::css::component_values::decode_css_escapes;
-use crate::css::component_values::{find_ascii_case_insensitive, find_matching_brace};
+use crate::css::parse::LayerRegistry;
 use crate::css::values::{
     parse_computed_length_percentage, parse_font_feature_settings, parse_font_variant,
     parse_font_variant_alternates, parse_font_variant_caps, parse_font_variant_east_asian,
@@ -10,39 +9,16 @@ use crate::css::values::{
 };
 use crate::css::{
     FontFeatureSettings, FontFeatureValue, FontFeatureValues, FontFeatureValuesBlock, FontPalette,
-    FontPaletteDefinition, FontPaletteValues, FontRelativeLengthBasis, FontVariantAlternates,
-    FontVariantCaps, FontVariantEastAsian, FontVariantLigatures, FontVariantNumeric,
-    FontVariantPosition, FontVariationSettings, ROOT_FONT_SIZE_PT, parse_font_palette,
+    FontPaletteDefinition, FontRelativeLengthBasis, FontVariantAlternates, FontVariantCaps,
+    FontVariantEastAsian, FontVariantLigatures, FontVariantNumeric, FontVariantPosition,
+    FontVariationSettings, ROOT_FONT_SIZE_PT, parse_font_palette,
 };
+use crate::css::{LayerName, LayerOrder};
 use crate::units::layout_pt;
-
-#[allow(
-    dead_code,
-    reason = "active @font-face rules are emitted by CssRuleParser"
-)]
-pub(super) fn parse_font_faces(css: &Css) -> Vec<CssFontFace> {
-    let mut faces = Vec::new();
-    let mut rest = css.source();
-    while let Some(font_face_start) = find_ascii_case_insensitive(rest, "@font-face") {
-        let font_face_rest = &rest[font_face_start + "@font-face".len()..];
-        let Some(open_offset) =
-            crate::css::component_values::find_next_top_level_open_brace(font_face_rest, 0)
-        else {
-            break;
-        };
-        let open = font_face_start + "@font-face".len() + open_offset;
-        let Some(close) = find_matching_brace(rest, open, false) else {
-            break;
-        };
-        if let Some(face) =
-            parse_font_face_rule(&rest[open + 1..close], css.base_url(), css.root_url())
-        {
-            faces.push(face);
-        }
-        rest = &rest[close + 1..];
-    }
-    faces
-}
+use cssparser::{
+    AtRuleParser, CowRcStr, DeclarationParser, Parser, ParserInput, ParserState,
+    QualifiedRuleParser, RuleBodyItemParser, RuleBodyParser,
+};
 
 /// Parse one active `@font-face` descriptor block.
 ///
@@ -304,29 +280,9 @@ pub(super) fn parse_font_face_sources(
     sources
 }
 
-#[allow(
-    dead_code,
-    reason = "active @font-feature-values rules are emitted by CssRuleParser"
-)]
-pub(super) fn parse_font_feature_values(
-    css: &Css,
-    media_environment: &MediaEnvironment,
-) -> FontFeatureValues {
-    let mut rules = Vec::new();
-    let mut layer_names = Vec::new();
-    collect_font_feature_values_rules(
-        css.source(),
-        None,
-        media_environment,
-        &mut layer_names,
-        &mut rules,
-    );
-    parse_font_feature_values_rules(rules, &layer_names)
-}
-
 pub(in crate::css) fn parse_font_feature_values_rules(
     mut rules: Vec<FontFeatureValuesRule>,
-    layer_names: &[String],
+    layers: &LayerRegistry,
 ) -> FontFeatureValues {
     for (order, rule) in rules.iter_mut().enumerate() {
         rule.order = order;
@@ -335,12 +291,8 @@ pub(in crate::css) fn parse_font_feature_values_rules(
         (
             rule.layer
                 .as_ref()
-                .and_then(|layer| {
-                    layer_names
-                        .iter()
-                        .position(|registered| registered == layer)
-                })
-                .unwrap_or(usize::MAX),
+                .and_then(|layer| layers.order_for(layer))
+                .unwrap_or(LayerOrder(vec![usize::MAX])),
             rule.order,
         )
     });
@@ -362,105 +314,8 @@ pub(in crate::css) fn parse_font_feature_values_rules(
 pub(in crate::css) struct FontFeatureValuesRule {
     pub(in crate::css) prelude: String,
     pub(in crate::css) block: String,
-    pub(in crate::css) layer: Option<String>,
+    pub(in crate::css) layer: Option<LayerName>,
     pub(in crate::css) order: usize,
-}
-
-#[allow(
-    dead_code,
-    reason = "active @font-feature-values rules are emitted by CssRuleParser"
-)]
-fn collect_font_feature_values_rules(
-    source: &str,
-    current_layer: Option<&str>,
-    media_environment: &MediaEnvironment,
-    layer_names: &mut Vec<String>,
-    rules: &mut Vec<FontFeatureValuesRule>,
-) {
-    let mut rest = source;
-    while let Some(at_index) = rest.find('@') {
-        let Some(after_at) = rest.get(at_index + 1..) else {
-            // A malformed recovery slice can end inside UTF-8 source text.
-            // Ignore it rather than letting auxiliary palette collection make
-            // stylesheet parsing panic.
-            break;
-        };
-        let name_end = after_at
-            .char_indices()
-            .find_map(|(index, character)| {
-                (!matches!(character, '-' | '_' | 'a'..='z' | 'A'..='Z' | '0'..='9'))
-                    .then_some(index)
-            })
-            .unwrap_or(after_at.len());
-        let name = &after_at[..name_end];
-        let after_name = &after_at[name_end..];
-        let semicolon_offset = after_name.find(';');
-        let Some(open_offset) =
-            crate::css::component_values::find_next_top_level_open_brace(after_name, 0)
-        else {
-            break;
-        };
-        if semicolon_offset.is_some_and(|semicolon| semicolon < open_offset) {
-            if name.eq_ignore_ascii_case("layer") {
-                for layer in
-                    parse_layer_name_list(current_layer, &after_name[..semicolon_offset.unwrap()])
-                {
-                    if !layer_names.iter().any(|registered| registered == &layer) {
-                        layer_names.push(layer);
-                    }
-                }
-            }
-            rest = &after_name[semicolon_offset.unwrap() + 1..];
-            continue;
-        };
-        let Some(close) = find_matching_brace(after_name, open_offset, false) else {
-            break;
-        };
-        let prelude = after_name[..open_offset].trim();
-        let block = &after_name[open_offset + 1..close];
-        if name.eq_ignore_ascii_case("font-feature-values") {
-            rules.push(FontFeatureValuesRule {
-                prelude: prelude.to_string(),
-                block: block.to_string(),
-                layer: current_layer.map(str::to_string),
-                order: rules.len(),
-            });
-        } else if name.eq_ignore_ascii_case("layer") {
-            let Some(layer) = qualify_layer_name(current_layer, prelude) else {
-                rest = &after_name[close + 1..];
-                continue;
-            };
-            if !layer_names.iter().any(|registered| registered == &layer) {
-                layer_names.push(layer.clone());
-            }
-            collect_font_feature_values_rules(
-                block,
-                Some(&layer),
-                media_environment,
-                layer_names,
-                rules,
-            );
-        } else if name.eq_ignore_ascii_case("media") {
-            if media_rule_applies_in_environment(prelude, media_environment) {
-                collect_font_feature_values_rules(
-                    block,
-                    current_layer,
-                    media_environment,
-                    layer_names,
-                    rules,
-                );
-            }
-        } else if name.eq_ignore_ascii_case("supports") && supports_condition_applies(prelude) {
-            collect_font_feature_values_rules(
-                block,
-                current_layer,
-                media_environment,
-                layer_names,
-                rules,
-            );
-        }
-        rest = &rest[close + 1..];
-    }
 }
 
 /// Parse named palette definitions from CSS Fonts Level 4.
@@ -469,19 +324,6 @@ fn collect_font_feature_values_rules(
 /// both are stylesheet-scoped resources consumed later by text painting rather
 /// than selector-matched declarations.
 /// <https://www.w3.org/TR/css-fonts-4/#font-palette-values>
-#[allow(
-    dead_code,
-    reason = "active @font-palette-values rules are emitted by CssRuleParser"
-)]
-pub(super) fn parse_font_palette_values(
-    css: &Css,
-    media_environment: &MediaEnvironment,
-) -> FontPaletteValues {
-    let mut values = FontPaletteValues::default();
-    collect_font_palette_values(css.source(), media_environment, &mut values);
-    values
-}
-
 pub(in crate::css) fn parse_font_palette_rule(
     prelude: &str,
     block: &str,
@@ -511,57 +353,6 @@ pub(in crate::css) fn parse_font_palette_rule(
             overrides,
         },
     ))
-}
-
-#[allow(
-    dead_code,
-    reason = "active @font-palette-values rules are emitted by CssRuleParser"
-)]
-fn collect_font_palette_values(
-    source: &str,
-    media_environment: &MediaEnvironment,
-    values: &mut FontPaletteValues,
-) {
-    let mut rest = source;
-    while let Some(at_index) = rest.find('@') {
-        let after_at = &rest[at_index + 1..];
-        let name_end = after_at
-            .char_indices()
-            .find_map(|(index, character)| {
-                (!matches!(character, '-' | '_' | 'a'..='z' | 'A'..='Z' | '0'..='9'))
-                    .then_some(index)
-            })
-            .unwrap_or(after_at.len());
-        let at_name = &after_at[..name_end];
-        let after_name = &after_at[name_end..];
-        let semicolon_offset = after_name.find(';');
-        let Some(open_offset) = after_name.find('{') else {
-            break;
-        };
-        if semicolon_offset.is_some_and(|semicolon| semicolon < open_offset) {
-            rest = &after_name[semicolon_offset.expect("known semicolon") + 1..];
-            continue;
-        }
-        let Some(close) = find_matching_brace(after_name, open_offset, false) else {
-            break;
-        };
-        let prelude = after_name[..open_offset].trim();
-        let block = &after_name[open_offset + 1..close];
-        if at_name.eq_ignore_ascii_case("font-palette-values") {
-            if let Some((name, definition)) = parse_font_palette_rule(prelude, block) {
-                values.insert(name, definition);
-            }
-        } else if at_name.eq_ignore_ascii_case("media") {
-            if media_rule_applies_in_environment(prelude, media_environment) {
-                collect_font_palette_values(block, media_environment, values);
-            }
-        } else if (at_name.eq_ignore_ascii_case("supports") && supports_condition_applies(prelude))
-            || at_name.eq_ignore_ascii_case("layer")
-        {
-            collect_font_palette_values(block, media_environment, values);
-        }
-        rest = &after_name[close + 1..];
-    }
 }
 
 fn parse_base_palette(value: &str) -> Option<FontPalette> {
@@ -620,37 +411,124 @@ fn parse_palette_override_index(value: &str) -> Option<u16> {
     u16::try_from(base.checked_add(sign)?).ok()
 }
 
-fn parse_font_feature_values_block(values: &mut FontFeatureValues, family: &str, mut source: &str) {
-    while let Some(at_index) = source.find('@') {
-        let after_at = &source[at_index + 1..];
-        let name_end = after_at
-            .char_indices()
-            .find_map(|(index, character)| {
-                (!matches!(character, '-' | '_' | 'a'..='z' | 'A'..='Z' | '0'..='9'))
-                    .then_some(index)
-            })
-            .unwrap_or(after_at.len());
-        let name = &after_at[..name_end];
-        let Some(block) = font_feature_values_block_kind(name) else {
-            source = &after_at[name_end..];
-            continue;
+fn parse_font_feature_values_block(values: &mut FontFeatureValues, family: &str, source: &str) {
+    let mut input = ParserInput::new(source);
+    let mut input = Parser::new(&mut input);
+    let mut parser = FontFeatureValuesBlockParser { values, family };
+    for _ in RuleBodyParser::new(&mut input, &mut parser) {}
+}
+
+struct FontFeatureValuesBlockParser<'a> {
+    values: &'a mut FontFeatureValues,
+    family: &'a str,
+}
+
+impl<'i> AtRuleParser<'i> for FontFeatureValuesBlockParser<'_> {
+    type Prelude = FontFeatureValuesBlock;
+    type AtRule = ();
+    type Error = ();
+
+    fn parse_prelude<'t>(
+        &mut self,
+        name: CowRcStr<'i>,
+        input: &mut Parser<'i, 't>,
+    ) -> Result<Self::Prelude, cssparser::ParseError<'i, Self::Error>> {
+        let Some(block) = font_feature_values_block_kind(&name) else {
+            return Err(input.new_custom_error(()));
         };
-        let after_name = &after_at[name_end..];
-        let Some(open_offset) =
-            crate::css::component_values::find_next_top_level_open_brace(after_name, 0)
-        else {
-            break;
-        };
-        let Some(close) = find_matching_brace(after_name, open_offset, false) else {
-            break;
-        };
-        parse_font_feature_values_declarations(
-            values,
-            family,
+        input.expect_exhausted()?;
+        Ok(block)
+    }
+
+    fn parse_block<'t>(
+        &mut self,
+        block: Self::Prelude,
+        _start: &ParserState,
+        input: &mut Parser<'i, 't>,
+    ) -> Result<Self::AtRule, cssparser::ParseError<'i, Self::Error>> {
+        let mut descriptors = FontFeatureDescriptorParser {
+            values: self.values,
+            family: self.family,
             block,
-            &after_name[open_offset + 1..close],
-        );
-        source = &after_name[close + 1..];
+        };
+        for _ in RuleBodyParser::new(input, &mut descriptors) {}
+        Ok(())
+    }
+}
+
+impl<'i> DeclarationParser<'i> for FontFeatureValuesBlockParser<'_> {
+    type Declaration = ();
+    type Error = ();
+}
+
+impl<'i> QualifiedRuleParser<'i> for FontFeatureValuesBlockParser<'_> {
+    type Prelude = ();
+    type QualifiedRule = ();
+    type Error = ();
+}
+
+impl<'i> RuleBodyItemParser<'i, (), ()> for FontFeatureValuesBlockParser<'_> {
+    fn parse_declarations(&self) -> bool {
+        false
+    }
+
+    fn parse_qualified(&self) -> bool {
+        false
+    }
+}
+
+impl<'i> DeclarationParser<'i> for FontFeatureDescriptorParser<'_> {
+    type Declaration = ();
+    type Error = ();
+
+    fn parse_value<'t>(
+        &mut self,
+        name: CowRcStr<'i>,
+        input: &mut Parser<'i, 't>,
+        _declaration_start: &ParserState,
+    ) -> Result<Self::Declaration, cssparser::ParseError<'i, Self::Error>> {
+        if !font_feature_value_name_is_valid(&name) {
+            return Err(input.new_custom_error(()));
+        }
+        let mut numbers = Vec::new();
+        while !input.is_exhausted() {
+            let number = input.expect_integer()?;
+            let number = u16::try_from(number).map_err(|_| input.new_custom_error(()))?;
+            numbers.push(number);
+        }
+        let value = parse_font_feature_value(self.block, &numbers)
+            .ok_or_else(|| input.new_custom_error(()))?;
+        self.values
+            .insert(self.family.to_string(), self.block, name.to_string(), value);
+        Ok(())
+    }
+}
+
+struct FontFeatureDescriptorParser<'a> {
+    values: &'a mut FontFeatureValues,
+    family: &'a str,
+    block: FontFeatureValuesBlock,
+}
+
+impl<'i> AtRuleParser<'i> for FontFeatureDescriptorParser<'_> {
+    type Prelude = ();
+    type AtRule = ();
+    type Error = ();
+}
+
+impl<'i> QualifiedRuleParser<'i> for FontFeatureDescriptorParser<'_> {
+    type Prelude = ();
+    type QualifiedRule = ();
+    type Error = ();
+}
+
+impl<'i> RuleBodyItemParser<'i, (), ()> for FontFeatureDescriptorParser<'_> {
+    fn parse_declarations(&self) -> bool {
+        true
+    }
+
+    fn parse_qualified(&self) -> bool {
+        false
     }
 }
 
@@ -663,43 +541,6 @@ fn font_feature_values_block_kind(name: &str) -> Option<FontFeatureValuesBlock> 
         "ornaments" => Some(FontFeatureValuesBlock::Ornaments),
         "annotation" => Some(FontFeatureValuesBlock::Annotation),
         _ => None,
-    }
-}
-
-fn parse_font_feature_values_declarations(
-    values: &mut FontFeatureValues,
-    family: &str,
-    block: FontFeatureValuesBlock,
-    source: &str,
-) {
-    for declaration in source.split(';') {
-        let Some((name, value)) = declaration.split_once(':') else {
-            continue;
-        };
-        // Font-feature-value aliases are case-sensitive CSS identifiers;
-        // family names are normalized later by `FontFeatureValues` according
-        // to CSS Fonts' case-insensitive family matching.
-        let name = decode_css_escapes(name.trim());
-        if name.is_empty() || !font_feature_value_name_is_valid(&name) {
-            continue;
-        }
-        let mut numbers = Vec::new();
-        let mut valid_numbers = true;
-        for token in split_css_component_values(value) {
-            if let Ok(number) = token.parse::<u16>() {
-                numbers.push(number);
-            } else {
-                valid_numbers = false;
-                break;
-            }
-        }
-        if !valid_numbers {
-            continue;
-        }
-        let Some(parsed) = parse_font_feature_value(block, &numbers) else {
-            continue;
-        };
-        values.insert(family.to_string(), block, name, parsed);
     }
 }
 
@@ -759,5 +600,69 @@ fn parse_font_feature_value(
             }
             _ => None,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn font_feature_values_nested_rules_and_descriptors_are_tokenized() {
+        let mut values = FontFeatureValues::default();
+        parse_font_feature_values_block(
+            &mut values,
+            "Feature Family",
+            r#"
+                /* @styleset { comment: 1; } */
+                @unknown { ignored: 1; }
+                @st\79 leset {
+                    \61 lias: 4;
+                    invalid: 2 calc(3);
+                    later: 5;
+                    quoted: "semicolon; colon:";
+                }
+            "#,
+        );
+
+        assert_eq!(
+            values
+                .get("Feature Family", FontFeatureValuesBlock::Styleset, "alias")
+                .map(|value| value.feature_index),
+            Some(4)
+        );
+        assert_eq!(
+            values
+                .get("Feature Family", FontFeatureValuesBlock::Styleset, "later")
+                .map(|value| value.feature_index),
+            Some(5)
+        );
+        assert!(
+            values
+                .get(
+                    "Feature Family",
+                    FontFeatureValuesBlock::Styleset,
+                    "invalid"
+                )
+                .is_none()
+        );
+        assert!(
+            values
+                .get("Feature Family", FontFeatureValuesBlock::Styleset, "quoted")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn font_feature_values_recovers_eof_closed_feature_blocks() {
+        let mut values = FontFeatureValues::default();
+        parse_font_feature_values_block(&mut values, "Feature Family", "@styleset { later: 5");
+
+        assert_eq!(
+            values
+                .get("Feature Family", FontFeatureValuesBlock::Styleset, "later")
+                .map(|value| value.feature_index),
+            Some(5)
+        );
     }
 }

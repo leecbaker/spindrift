@@ -1,34 +1,4 @@
 use super::*;
-use crate::css::component_values::{find_ascii_case_insensitive, find_matching_brace};
-
-#[allow(
-    dead_code,
-    reason = "active @counter-style rules are emitted by CssRuleParser"
-)]
-pub(super) fn parse_counter_styles(css: &Css) -> Vec<CounterStyleRule> {
-    let mut rules = Vec::new();
-    let mut rest = css.source();
-    while let Some(start) = find_ascii_case_insensitive(rest, "@counter-style") {
-        let after_at_rule = &rest[start + "@counter-style".len()..];
-        let Some(open_offset) =
-            crate::css::component_values::find_next_top_level_open_brace(after_at_rule, 0)
-        else {
-            break;
-        };
-        let name = after_at_rule[..open_offset].trim().to_ascii_lowercase();
-        let open = start + "@counter-style".len() + open_offset;
-        let Some(close) = find_matching_brace(rest, open, false) else {
-            break;
-        };
-        let body = &rest[open + 1..close];
-        if let Some(rule) = parse_counter_style_rule(&name, body) {
-            rules.push(rule);
-        }
-        rest = &rest[close + 1..];
-    }
-    rules
-}
-
 pub(super) fn parse_counter_style_rule(name: &str, body: &str) -> Option<CounterStyleRule> {
     if name.is_empty() || name.eq_ignore_ascii_case("none") {
         return None;

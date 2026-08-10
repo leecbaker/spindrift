@@ -20,7 +20,7 @@ source table's CSS Fragmentation behavior instead of adding a test-specific
 header/repetition exception; see `SPEC_DIVERGENCES.md`.
 
 On 2026-07-18, the local `quire-wpt` raw run of `css/css-page/` rendered 226
-reftests with the development binary and `--page-margin=0px`:
+reftests with the development binary and an equivalent author `@page` rule:
 
 - 175 passed;
 - 51 failed.
@@ -41,8 +41,8 @@ Page fixtures from the root-cause group with the release binary:
 - 0 failed.
 
 The run artifacts are under `/private/tmp/quire-wpt-css-page-pictured-final/`
-for this working session. The former CLI compatibility mismatch is resolved:
-Quire accepts the harness's `--presentational-hints` option.
+for this working session. HTML presentational hints are now unconditional
+renderer behavior rather than a CLI option.
 
 The corresponding fresh full `css/css-page/` reftest run exercised 226
 non-script tests with the same isolated Quire configuration:
@@ -54,7 +54,7 @@ This run is a fresh harness baseline, not directly comparable with the
 2026-07-18 multi-engine/development setup above. Its artifacts are under
 `/private/tmp/quire-wpt-css-page-full-final/` for this working session.
 
-On 2026-08-01, fresh exact `quire-wpt evaluate-test` runs rendered
+On 2026-08-04, fresh exact `quire-wpt evaluate-test` runs rendered
 `fixedpos-001-print.html`, `fixedpos-002-print.html`, and
 `fixedpos-004-print.html` as raster-exact matches.
 

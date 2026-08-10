@@ -38,10 +38,17 @@ pub(in crate::css) fn parse_canonical_declaration(
     raw_value: &str,
 ) -> DeclarationParseResult {
     let raw_name = raw_name.trim();
+    // Validate the original component stream before removing declaration
+    // whitespace. A newline after an unterminated quote is a BadString token,
+    // not ignorable trailing whitespace.
+    let Some(contains_variable_reference) = validate_component_values(raw_value, false, true)
+    else {
+        return DeclarationParseResult::InvalidValue;
+    };
     let value = raw_value.trim();
     if raw_name.is_empty()
         || (value.is_empty() && !is_custom_property_name(raw_name))
-        || !declaration_priority_is_valid(value)
+        || !declaration_priority_is_valid(raw_value)
     {
         return DeclarationParseResult::InvalidValue;
     }
@@ -63,14 +70,18 @@ pub(in crate::css) fn parse_canonical_declaration(
     // a declaration feature query true for every supported property.
     // <https://www.w3.org/TR/css-variables-1/#using-variables>
     // <https://www.w3.org/TR/css-conditional-3/#at-supports>
-    let Some(contains_variable_reference) = validate_component_values(value, false, true) else {
-        return DeclarationParseResult::InvalidValue;
-    };
     if is_custom_property_name(raw_name) {
         return DeclarationParseResult::Valid(DeclarationOperation {
             name: raw_name.to_string(),
             value: value.to_string(),
         });
+    }
+    // The typed cascade registry is the single ownership boundary for
+    // ordinary declarations.  Keep this check before value-specific parsing:
+    // accepting a name here without a typed identity would otherwise allow it
+    // to panic later while constructing a cascaded declaration.
+    if !supported_property_name(&name) {
+        return DeclarationParseResult::UnsupportedProperty;
     }
     if contains_variable_reference {
         return declaration_operation_for_modeled_property(&name, value);
@@ -105,6 +116,14 @@ pub(in crate::css) fn parse_canonical_declaration(
         "text-autospace" => supports_text_autospace_value(value),
         "text-spacing-trim" => supports_text_spacing_trim_value(value),
         "text-spacing" => supports_text_spacing_value(value),
+        "ruby-align" => matches!(
+            value.to_ascii_lowercase().as_str(),
+            "start" | "center" | "space-between" | "space-around"
+        ),
+        "ruby-overhang" => matches!(
+            value.to_ascii_lowercase().as_str(),
+            "auto" | "spaces" | "none"
+        ),
         "word-space-transform" => supports_word_space_transform_value(value),
         "initial-letter" => parse_initial_letter(value).is_some(),
         "initial-letter-align" => parse_initial_letter_align(value).is_some(),
@@ -157,6 +176,17 @@ pub(in crate::css) fn parse_canonical_declaration(
         "word-spacing" => {
             value.eq_ignore_ascii_case("normal") || parse_word_spacing(value, 12.0).is_some()
         }
+        "animation" => crate::css::cascade::parse_animation_snapshot_shorthand(value).is_some(),
+        "animation-name" => crate::css::component_values::split_css_top_level_delimiter(value, ',')
+            .first()
+            .and_then(|value| crate::css::cascade::parse_animation_snapshot_name(value))
+            .is_some(),
+        "animation-duration" | "animation-delay" => {
+            crate::css::component_values::split_css_top_level_delimiter(value, ',')
+                .first()
+                .and_then(|value| crate::css::cascade::parse_animation_snapshot_time(value))
+                .is_some()
+        }
         "font" => parse_font_shorthand(value, 12.0, FontWeight::NORMAL).is_some(),
         "font-feature-settings" => parse_font_feature_settings(value).is_some(),
         "font-variation-settings" => parse_font_variation_settings(value).is_some(),
@@ -203,7 +233,7 @@ pub(in crate::css) fn parse_canonical_declaration(
         "color-scheme" => ComputedColorScheme::parse(value).is_some(),
         "background-origin" => background_box_list_is_valid(value, false),
         "background-clip" => background_box_list_is_valid(value, true),
-        "border-color" => parse_border_colors(value, CssColor::BLACK).is_some(),
+        "border-color" => parse_border_colors(value).is_some(),
         "border-top-color"
         | "border-right-color"
         | "border-bottom-color"
@@ -211,11 +241,9 @@ pub(in crate::css) fn parse_canonical_declaration(
         | "border-block-start-color"
         | "border-block-end-color"
         | "border-inline-start-color"
-        | "border-inline-end-color" => parse_border_color(value, CssColor::BLACK).is_some(),
+        | "border-inline-end-color" => parse_border_color(value).is_some(),
         "border-block-color" | "border-inline-color" => {
-            component_list_is_valid(value, 1..=2, |part| {
-                parse_border_color(part, CssColor::BLACK).is_some()
-            })
+            component_list_is_valid(value, 1..=2, |part| parse_border_color(part).is_some())
         }
         "font-size" => parse_deferred_font_size(value).is_some(),
         "width" | "height" | "inline-size" | "block-size" | "min-width" | "max-width"
@@ -360,6 +388,13 @@ pub(in crate::css) fn parse_canonical_declaration(
                 | "luminosity"
         ),
         "filter" | "clip-path" | "mask" | "mask-image" | "will-change" => true,
+        "mask-border-source" => crate::css::parse_border_image_source(value).is_some(),
+        "mask-border" => {
+            crate::css::parse_mask_border_source(value, crate::css::ROOT_FONT_SIZE_PT).is_some()
+        }
+        "clip" => {
+            crate::css::cascade::parse_legacy_clip(value, crate::css::ROOT_FONT_SIZE_PT).is_some()
+        }
         "transform" => crate::css::parse_transform(value, crate::css::ROOT_FONT_SIZE_PT).is_some(),
         "translate" => {
             crate::css::parse_individual_translate(value, crate::css::ROOT_FONT_SIZE_PT).is_some()
@@ -490,7 +525,7 @@ fn border_shorthand_is_valid(value: &str) -> bool {
                 style = true;
                 return true;
             }
-            if !color && parse_border_color(component, CssColor::BLACK).is_some() {
+            if !color && parse_border_color(component).is_some() {
                 color = true;
                 return true;
             }
@@ -587,6 +622,10 @@ fn validate_component_values(
     reject_top_level_bang: bool,
     reject_top_level_semicolon: bool,
 ) -> Option<bool> {
+    // Parse the complete stream before inspecting individual constructs. This
+    // rejects CSS Syntax tokenizer errors (bad strings/URLs and unmatched
+    // closers) while retaining valid CDO/CDC tokens and EOF-closed blocks.
+    crate::css::component_values::CssComponentValueList::parse(value)?;
     let mut input = ParserInput::new(value);
     let mut parser = Parser::new(&mut input);
     validate_component_values_from_parser(
@@ -613,6 +652,9 @@ fn validate_component_values_from_parser(
     let mut contains_variable_reference = false;
     while !input.is_exhausted() {
         let token = input.next().ok()?.clone();
+        if token.is_parse_error() {
+            return None;
+        }
         match token {
             cssparser::Token::Function(name) => {
                 let is_variable = name.eq_ignore_ascii_case("var");

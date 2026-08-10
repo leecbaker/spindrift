@@ -29,6 +29,87 @@ impl RubyInlineSpan {
     }
 }
 
+/// The normal-flow logical inline span of a paired ruby column.
+///
+/// This is deliberately distinct from an annotation's ink span: annotations
+/// may paint outside this span after the parent line resolves overhang.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default)]
+pub(in crate::layout) struct RubyColumnInlineSpan(RubyInlineSpan);
+
+impl RubyColumnInlineSpan {
+    pub(in crate::layout) fn new(points: f32) -> Self {
+        Self(RubyInlineSpan::new(points))
+    }
+
+    pub(in crate::layout) fn points(self) -> f32 {
+        self.0.points()
+    }
+}
+
+/// The logical inline span occupied by a ruby level's ink after alignment and
+/// ruby justification have been applied.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default)]
+pub(in crate::layout) struct RubyPaintInlineSpan(RubyInlineSpan);
+
+impl RubyPaintInlineSpan {
+    pub(in crate::layout) fn new(points: f32) -> Self {
+        Self(RubyInlineSpan::new(points))
+    }
+
+    pub(in crate::layout) fn points(self) -> f32 {
+        self.0.points()
+    }
+}
+
+/// A signed logical inline displacement local to a ruby column.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub(in crate::layout) struct RubyInlineDisplacement(f32);
+
+impl RubyInlineDisplacement {
+    pub(in crate::layout) const ZERO: Self = Self(0.0);
+
+    pub(in crate::layout) fn new(points: f32) -> Self {
+        Self(points)
+    }
+
+    pub(in crate::layout) fn points(self) -> f32 {
+        self.0
+    }
+}
+
+/// Annotation ink extending beyond the corresponding base-column span.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub(in crate::layout) struct RubyAlignedOverhang {
+    pub(in crate::layout) inline_start: RubyInlineSpan,
+    pub(in crate::layout) inline_end: RubyInlineSpan,
+}
+
+/// Eligible parent-line space adjacent to a ruby atom.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub(in crate::layout) struct RubyOverhangAllowance {
+    pub(in crate::layout) inline_start: RubyInlineSpan,
+    pub(in crate::layout) inline_end: RubyInlineSpan,
+}
+
+/// The part of an annotation overhang borrowed from its selected line.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub(in crate::layout) struct ResolvedRubyOverhang {
+    pub(in crate::layout) borrowed: RubyOverhangAllowance,
+    pub(in crate::layout) unborrowed: RubyAlignedOverhang,
+}
+
+/// Line-local ruby placement after adjacent inline space has been resolved.
+///
+/// This is intentionally not part of the source ruby level: a ruby atom can
+/// be materialized on more than one candidate line with different neighbors.
+#[derive(Debug, Clone, PartialEq)]
+pub(in crate::layout) struct ResolvedRubyPlacement {
+    pub(in crate::layout) flow_inline_span: RubyColumnInlineSpan,
+    pub(in crate::layout) base_inline_offset: RubyInlineDisplacement,
+    pub(in crate::layout) annotation_inline_offsets: Vec<RubyInlineDisplacement>,
+    pub(in crate::layout) overhang: Vec<ResolvedRubyOverhang>,
+}
+
 /// Non-negative logical block extent of a ruby level.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default)]
 pub(in crate::layout) struct RubyBlockExtent(f32);
@@ -111,6 +192,10 @@ impl RubyPaintOrigin {
 pub(in crate::layout) struct NormalizedRuby<'a> {
     pub(in crate::layout) columns: Vec<RubyColumn<'a>>,
     pub(in crate::layout) annotation_level_count: usize,
+    /// The originating annotation-container style for every normalized level.
+    /// Direct `rt` children use an anonymous container and retain `None` so
+    /// collection can inherit from the ruby container.
+    pub(in crate::layout) annotation_container_styles: Vec<Option<Rc<ComputedStyle>>>,
 }
 
 /// One base segment and its annotation segments, ordered from the first
@@ -274,6 +359,7 @@ impl<'a> NormalizedRuby<'a> {
             ..RubySegment::default()
         };
         let mut levels: Vec<Vec<RubySegment<'a>>> = Vec::new();
+        let mut annotation_container_styles = Vec::new();
         let mut pending_direct_annotations = Vec::new();
 
         let in_flow = in_flow_children(children).collect::<Vec<_>>();
@@ -313,13 +399,19 @@ impl<'a> NormalizedRuby<'a> {
                     bases.push(segment_for_role(child));
                 }
                 DisplayInner::RubyTextContainer => {
-                    flush_annotation_level(&mut levels, &mut pending_direct_annotations);
+                    flush_annotation_level(
+                        &mut levels,
+                        &mut annotation_container_styles,
+                        &mut pending_direct_annotations,
+                        None,
+                    );
                     levels.push(
                         explicit_role_segments(child_children, DisplayInner::RubyText, Some(style))
                             .into_iter()
                             .map(RubyLevelItem::into_segment)
                             .collect(),
                     );
+                    annotation_container_styles.push(Some(Rc::new(style.clone())));
                 }
                 DisplayInner::RubyText => {
                     flush_segment(&mut bases, &mut pending_anonymous_base);
@@ -329,13 +421,22 @@ impl<'a> NormalizedRuby<'a> {
             }
         }
         flush_segment(&mut bases, &mut pending_anonymous_base);
-        flush_annotation_level(&mut levels, &mut pending_direct_annotations);
+        flush_annotation_level(
+            &mut levels,
+            &mut annotation_container_styles,
+            &mut pending_direct_annotations,
+            None,
+        );
 
         // Empty annotation containers have no annotation box and therefore
         // cannot add an interlinear level or displace a later direct `rt`.
         // Out-of-flow descendants were excluded before this normalization.
         // <https://drafts.csswg.org/css-ruby-1/#anon-gen-ruby>
-        levels.retain(|level| level.iter().any(|segment| !segment.is_empty()));
+        let (levels, annotation_container_styles): (Vec<_>, Vec<_>) = levels
+            .into_iter()
+            .zip(annotation_container_styles)
+            .filter(|(level, _)| level.iter().any(|segment| !segment.is_empty()))
+            .unzip();
 
         let annotation_level_count = levels.len();
         let mut columns = bases
@@ -353,6 +454,7 @@ impl<'a> NormalizedRuby<'a> {
         Self {
             columns,
             annotation_level_count,
+            annotation_container_styles,
         }
     }
 }
@@ -540,10 +642,13 @@ fn flush_segment<'a>(segments: &mut Vec<RubySegment<'a>>, pending: &mut RubySegm
 
 fn flush_annotation_level<'a>(
     levels: &mut Vec<Vec<RubySegment<'a>>>,
+    container_styles: &mut Vec<Option<Rc<ComputedStyle>>>,
     pending: &mut Vec<RubySegment<'a>>,
+    container_style: Option<Rc<ComputedStyle>>,
 ) {
     if !pending.is_empty() {
         levels.push(std::mem::take(pending));
+        container_styles.push(container_style);
     }
 }
 

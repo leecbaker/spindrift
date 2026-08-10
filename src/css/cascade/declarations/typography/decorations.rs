@@ -404,7 +404,7 @@ pub(in crate::css) fn parse_text_shadow(value: &str, font_size: f32) -> Option<V
     if value.eq_ignore_ascii_case("none") {
         return Some(Vec::new());
     }
-    let shadows = split_css_args(value, ',')
+    let shadows = try_split_css_top_level_delimiter(value, ',')?
         .into_iter()
         .map(|layer| parse_text_shadow_layer(layer, font_size))
         .collect::<Option<Vec<_>>>()?;
@@ -415,7 +415,7 @@ pub(in crate::css) fn parse_text_shadow_layer(value: &str, font_size: f32) -> Op
     let mut color = None;
     let mut inset = false;
     let mut lengths = Vec::new();
-    for part in split_css_component_values(value) {
+    for part in try_split_css_component_values(value)? {
         if part.eq_ignore_ascii_case("inset") && !inset {
             inset = true;
             continue;
@@ -465,7 +465,7 @@ pub(in crate::css) fn parse_box_shadow(value: &str, font_size: f32) -> Option<Ve
     if value.eq_ignore_ascii_case("none") {
         return Some(Vec::new());
     }
-    let shadows = split_css_args(value, ',')
+    let shadows = try_split_css_top_level_delimiter(value, ',')?
         .into_iter()
         .map(|layer| parse_box_shadow_layer(layer, font_size))
         .collect::<Option<Vec<_>>>()?;
@@ -476,7 +476,7 @@ pub(in crate::css) fn parse_box_shadow_layer(value: &str, font_size: f32) -> Opt
     let mut color = None;
     let mut inset = false;
     let mut lengths = Vec::new();
-    for part in split_css_component_values(value) {
+    for part in try_split_css_component_values(value)? {
         if part.eq_ignore_ascii_case("inset") && !inset {
             inset = true;
             continue;
@@ -606,4 +606,17 @@ pub(in crate::css) fn parse_text_decoration_shorthand(
     }
     apply_text_decoration_line(&mut decoration, line);
     Some(decoration)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shadow_lists_split_only_at_top_level_css_commas() {
+        assert!(parse_text_shadow("rgb(0, 0, 0) 1px 2px, blue 3px 4px", 12.0).is_some());
+        assert!(parse_box_shadow("rgb(0, 0, 0) 1px 2px, blue 3px 4px", 12.0).is_some());
+        assert!(parse_text_shadow("red 1px 2px,", 12.0).is_none());
+        assert!(parse_box_shadow("red 1px 2px, url(\"\n", 12.0).is_none());
+    }
 }

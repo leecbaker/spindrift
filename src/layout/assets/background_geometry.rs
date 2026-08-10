@@ -281,17 +281,17 @@ pub(in crate::layout) fn used_generated_background_size(
 pub(in crate::layout) fn background_layers_for_paint(
     style: &ComputedStyle,
 ) -> Vec<css::BackgroundLayer> {
-    if !style.background_layers.is_empty() {
-        return style.background_layers.clone();
+    if !style.background.background_layers.is_empty() {
+        return style.background.background_layers.clone();
     }
     vec![css::BackgroundLayer {
-        image: style.background_image.clone(),
-        position: style.background_position.clone(),
-        size: style.background_size.clone(),
-        repeat: style.background_repeat,
-        attachment: style.background_attachment,
-        origin: style.background_origin,
-        clip: style.background_clip,
+        image: style.background.background_image.clone(),
+        position: style.background.background_position.clone(),
+        size: style.background.background_size.clone(),
+        repeat: style.background.background_repeat,
+        attachment: style.background.background_attachment,
+        origin: style.background.background_origin,
+        clip: style.background.background_clip,
     }]
 }
 
@@ -333,45 +333,6 @@ pub(in crate::layout) fn background_positioning_area_for_layer<Space>(
         (css::BackgroundAttachment::Fixed, Some(area)) => area,
         _ => background_paint_area_for_box(positioning_border_area, style, layer.origin),
     }
-}
-
-/// Returns whether painting a border-box-clipped background below the border
-/// cannot affect the composited result.
-///
-/// A nonzero, opaque, square `solid` border completely covers the border area,
-/// so CSS Backgrounds and Borders' normal painting order makes a background
-/// below it unobservable. Restricting the emitted background to the padding
-/// box is therefore an equivalent paint elimination; it also avoids PDF
-/// rasterizers exposing a subpixel seam between two otherwise opaque paints.
-///
-/// <https://www.w3.org/TR/css-backgrounds-3/#layering> and
-/// <https://www.w3.org/TR/css-backgrounds-3/#the-background-clip>.
-pub(in crate::layout) fn background_border_box_paint_is_occluded(
-    style: &ComputedStyle,
-    clip_box: css::BackgroundBox,
-) -> bool {
-    if clip_box != css::BackgroundBox::Border
-        || !style.border_radius.clone().is_zero()
-        || style.border_image.source.is_image()
-    {
-        return false;
-    }
-
-    let widths = used_border_widths(style);
-    let styles = style.border_styles;
-    let colors = style.border_colors;
-    widths.top > 0.0
-        && widths.right > 0.0
-        && widths.bottom > 0.0
-        && widths.left > 0.0
-        && styles.top == css::BorderStyle::Solid
-        && styles.right == css::BorderStyle::Solid
-        && styles.bottom == css::BorderStyle::Solid
-        && styles.left == css::BorderStyle::Solid
-        && colors.top.is_opaque()
-        && colors.right.is_opaque()
-        && colors.bottom.is_opaque()
-        && colors.left.is_opaque()
 }
 
 /// Clip a raster background image to its destination-space paint area.

@@ -44,6 +44,55 @@ pub(in crate::layout) struct Scrollport {
     max_offset: ScrollOffset,
 }
 
+/// One resolved physical scroll axis expressed from the container's logical
+/// scroll-start side. Source geometry remains in physical paint coordinates;
+/// only candidate arithmetic is widened and normalized here.
+/// <https://www.w3.org/TR/css-scroll-snap-1/#scroll-snap-model>
+/// <https://drafts.csswg.org/css-writing-modes-4/#logical-to-physical>
+#[derive(Debug, Clone, Copy)]
+struct ResolvedScrollAxis {
+    physical_axis: PhysicalAxis,
+    logical_start: PhysicalSide,
+    port_start: f64,
+    port_end: f64,
+    max_offset: f64,
+}
+
+impl ResolvedScrollAxis {
+    fn for_scrollport(
+        port: Scrollport,
+        style: &ComputedStyle,
+        physical_axis: PhysicalAxis,
+    ) -> Self {
+        let logical = WritingModeAxes::new(style.writing_mode, style.used_direction());
+        let logical_start =
+            logical.physical_start_side(logical.logical_axis_for_physical(physical_axis));
+        let (port_start, port_end, max_offset) = match physical_axis {
+            PhysicalAxis::Horizontal => (
+                port.rect.origin.x as f64,
+                port.rect.max_x() as f64,
+                port.max_offset.x as f64,
+            ),
+            PhysicalAxis::Vertical => (
+                port.rect.origin.y as f64,
+                port.rect.max_y() as f64,
+                port.max_offset.y as f64,
+            ),
+        };
+        Self {
+            physical_axis,
+            logical_start,
+            port_start,
+            port_end,
+            max_offset: max_offset.max(0.0),
+        }
+    }
+
+    fn scroll_translation_sign(self) -> f64 {
+        scroll_translation_sign(self.physical_axis, self.logical_start) as f64
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(in crate::layout) struct ScrollSnapCandidate {
     /// Provisional normal-flow layout can visit an eventually positioned box.
@@ -94,28 +143,36 @@ impl<'a> LayoutBuilder<'a> {
         border_box: PaintRect,
     ) {
         let page_index = self.pages.len();
-        for scope in &mut self.active_scroll_snap_scopes {
-            if scope.page_index == page_index {
-                scope.overflow_bounds = Some(
-                    scope
-                        .overflow_bounds
-                        .map_or(border_box, |bounds| union_paint_rects(bounds, border_box)),
-                );
-                if style.scroll_snap_align != css::ScrollSnapAlign::default() {
-                    if let Some(candidate) = scope
-                        .candidates
-                        .iter_mut()
-                        .find(|candidate| candidate.source_element == element.id)
-                    {
-                        candidate.border_box = border_box;
-                        candidate.style = style.clone();
-                    } else {
-                        scope.candidates.push(ScrollSnapCandidate {
-                            source_element: element.id,
-                            border_box,
-                            style: style.clone(),
-                        });
-                    }
+        // Scroll snap areas belong to the nearest scroll container on the
+        // containing-block chain. Recording a descendant in every enclosing
+        // scope lets an outer container snap to an area captured by an inner
+        // scroller, contrary to CSS Scroll Snap's containment rule.
+        // <https://www.w3.org/TR/css-scroll-snap-1/#scroll-snap-model>
+        if let Some(scope) = self
+            .active_scroll_snap_scopes
+            .iter_mut()
+            .rev()
+            .find(|scope| scope.page_index == page_index)
+        {
+            scope.overflow_bounds = Some(
+                scope
+                    .overflow_bounds
+                    .map_or(border_box, |bounds| union_paint_rects(bounds, border_box)),
+            );
+            if style.scroll_snap_align != css::ScrollSnapAlign::default() {
+                if let Some(candidate) = scope
+                    .candidates
+                    .iter_mut()
+                    .find(|candidate| candidate.source_element == element.id)
+                {
+                    candidate.border_box = border_box;
+                    candidate.style = style.clone();
+                } else {
+                    scope.candidates.push(ScrollSnapCandidate {
+                        source_element: element.id,
+                        border_box,
+                        style: style.clone(),
+                    });
                 }
             }
         }
@@ -189,7 +246,18 @@ impl<'a> LayoutBuilder<'a> {
             })
             .unwrap_or(ScrollOffset::ZERO);
 
-        port.initial_offset(initial, &scope.style, &scope.candidates)
+        let offset = port.initial_offset(initial, &scope.style, &scope.candidates);
+        if scope.is_document_root && self.iframe_viewport.is_some() {
+            // A child browsing context materializes its propagated page canvas
+            // after normal root contents have been captured. Retain the same
+            // resolved root translation so that canvas paint cannot bypass
+            // fragment navigation or the iframe viewport clip.
+            // <https://www.w3.org/TR/css-scroll-snap-1/#scroll-snap-model>
+            let translation = static_scroll_translation(offset, &scope.style);
+            self.document_canvas_scroll_translation =
+                PaintTranslation::new(-translation.x, -translation.y);
+        }
+        offset
     }
 }
 
@@ -258,6 +326,10 @@ impl Scrollport {
             | css::ScrollSnapType::Both(strictness) => strictness,
         };
         let axes = snap_axes(container_style);
+        let horizontal =
+            ResolvedScrollAxis::for_scrollport(self, container_style, PhysicalAxis::Horizontal);
+        let vertical =
+            ResolvedScrollAxis::for_scrollport(self, container_style, PhysicalAxis::Vertical);
         let mut best_x = None;
         let mut best_y = None;
         for candidate in candidates {
@@ -272,30 +344,24 @@ impl Scrollport {
                 }
             }
             if axes.x
-                && let Some(offset) = axis_snap_offset(
-                    self.rect.origin.x,
-                    self.rect.max_x(),
+                && let Some(offset) = axis_snap_offset_resolved(
+                    horizontal,
                     area.origin.x,
                     area.max_x(),
                     candidate.style.scroll_snap_align,
                     container_style,
-                    PhysicalAxis::Horizontal,
-                    self.max_offset.x,
                     initial.x,
                 )
             {
                 best_x = closest_offset(best_x, offset, initial.x);
             }
             if axes.y
-                && let Some(offset) = axis_snap_offset(
-                    self.rect.origin.y,
-                    self.rect.max_y(),
+                && let Some(offset) = axis_snap_offset_resolved(
+                    vertical,
                     area.origin.y,
                     area.max_y(),
                     candidate.style.scroll_snap_align,
                     container_style,
-                    PhysicalAxis::Vertical,
-                    self.max_offset.y,
                     initial.y,
                 )
             {
@@ -437,11 +503,45 @@ fn axis_snap_offset(
     max_offset: f32,
     initial_offset: f32,
 ) -> Option<f32> {
+    axis_snap_offset_resolved(
+        ResolvedScrollAxis {
+            physical_axis: axis,
+            logical_start: WritingModeAxes::new(
+                container_style.writing_mode,
+                container_style.used_direction(),
+            )
+            .physical_start_side(
+                WritingModeAxes::new(
+                    container_style.writing_mode,
+                    container_style.used_direction(),
+                )
+                .logical_axis_for_physical(axis),
+            ),
+            port_start: port_start as f64,
+            port_end: port_end as f64,
+            max_offset: max_offset.max(0.0) as f64,
+        },
+        area_start,
+        area_end,
+        align,
+        container_style,
+        initial_offset,
+    )
+}
+
+fn axis_snap_offset_resolved(
+    axis: ResolvedScrollAxis,
+    area_start: f32,
+    area_end: f32,
+    align: css::ScrollSnapAlign,
+    container_style: &ComputedStyle,
+    initial_offset: f32,
+) -> Option<f32> {
     let logical = WritingModeAxes::new(
         container_style.writing_mode,
         container_style.used_direction(),
     );
-    let logical_axis = logical.logical_axis_for_physical(axis);
+    let logical_axis = logical.logical_axis_for_physical(axis.physical_axis);
     let alignment = match logical_axis {
         LogicalAxis::Block => align.block,
         LogicalAxis::Inline => align.inline,
@@ -449,9 +549,14 @@ fn axis_snap_offset(
     if alignment == css::ScrollSnapAlignment::None {
         return None;
     }
-    let start_side = logical.physical_start_side(logical_axis);
-    let sign = scroll_translation_sign(axis, start_side);
-    let max_offset = finite_nonnegative(max_offset);
+    let start_side = axis.logical_start;
+    let sign = axis.scroll_translation_sign();
+    let port_start = axis.port_start;
+    let port_end = axis.port_end;
+    let area_start = area_start as f64;
+    let area_end = area_end as f64;
+    let max_offset = axis.max_offset;
+    let initial_offset = initial_offset as f64;
 
     // A snap area larger than the snapport has a range of valid positions:
     // every position where it completely covers the snapport. Choose the
@@ -464,7 +569,7 @@ fn axis_snap_offset(
         let lower = offset_start.min(offset_end).max(0.0);
         let upper = offset_start.max(offset_end).min(max_offset);
         if lower.is_finite() && upper.is_finite() && lower <= upper {
-            return Some(initial_offset.clamp(lower, upper));
+            return finite_f64_to_f32(initial_offset.clamp(lower, upper));
         }
     }
     let desired = match alignment {
@@ -473,14 +578,14 @@ fn axis_snap_offset(
             ((port_start + port_end - area_start - area_end) * 0.5) / sign
         }
         css::ScrollSnapAlignment::Start => {
-            (side_coordinate(start_side, port_start, port_end)
-                - side_coordinate(start_side, area_start, area_end))
+            (side_coordinate_f64(start_side, port_start, port_end)
+                - side_coordinate_f64(start_side, area_start, area_end))
                 / sign
         }
         css::ScrollSnapAlignment::End => {
             let end_side = opposite_physical_side(start_side);
-            (side_coordinate(end_side, port_start, port_end)
-                - side_coordinate(end_side, area_start, area_end))
+            (side_coordinate_f64(end_side, port_start, port_end)
+                - side_coordinate_f64(end_side, area_start, area_end))
                 / sign
         }
     };
@@ -492,7 +597,14 @@ fn axis_snap_offset(
     if !desired.is_finite() || desired < 0.0 || desired > max_offset {
         return None;
     }
-    Some(desired)
+    finite_f64_to_f32(desired)
+}
+
+fn finite_f64_to_f32(value: f64) -> Option<f32> {
+    value
+        .is_finite()
+        .then_some(value as f32)
+        .filter(|value| value.is_finite())
 }
 
 fn scroll_translation_sign(axis: PhysicalAxis, logical_start: PhysicalSide) -> f32 {
@@ -506,6 +618,13 @@ fn scroll_translation_sign(axis: PhysicalAxis, logical_start: PhysicalSide) -> f
 }
 
 fn side_coordinate(side: PhysicalSide, start: f32, end: f32) -> f32 {
+    match side {
+        PhysicalSide::Left | PhysicalSide::Bottom => start,
+        PhysicalSide::Right | PhysicalSide::Top => end,
+    }
+}
+
+fn side_coordinate_f64(side: PhysicalSide, start: f64, end: f64) -> f64 {
     match side {
         PhysicalSide::Left | PhysicalSide::Bottom => start,
         PhysicalSide::Right | PhysicalSide::Top => end,

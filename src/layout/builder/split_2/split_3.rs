@@ -1,4 +1,5 @@
 use super::*;
+use crate::layout::assets::DocumentPageIndex;
 
 impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn snapshot(&self) -> LayoutSnapshot {
@@ -18,6 +19,8 @@ impl<'a> LayoutBuilder<'a> {
             page_anchor_counters: self.page_anchor_counters.clone(),
             has_normal_flow_target_references: self.has_normal_flow_target_references,
             document_canvas_background: self.document_canvas_background.clone(),
+            document_canvas_scroll_translation: self.document_canvas_scroll_translation,
+            document_canvas_root_positioning_area: self.document_canvas_root_positioning_area,
             document_canvas_overflow: self.document_canvas_overflow,
             document_canvas_fragment_insets: self.document_canvas_fragment_insets.clone(),
             current_page: self.current_page.clone(),
@@ -25,6 +28,7 @@ impl<'a> LayoutBuilder<'a> {
             current_page_has_named_page_flow_content: self.current_page_has_named_page_flow_content,
             current_page_selected_name: self.current_page_selected_name.clone(),
             last_block_layout_outcome: self.last_block_layout_outcome,
+            last_principal_transform_box: self.last_principal_transform_box,
             current_page_name: self.current_page_name.clone(),
             current_page_context: self.current_page_context,
             initial_viewport_context: self.initial_viewport_context,
@@ -51,6 +55,7 @@ impl<'a> LayoutBuilder<'a> {
             inline_split_float_exclusion_query_offset: self
                 .inline_split_float_exclusion_query_offset,
             content_logical_inline_size_stack: self.content_logical_inline_size_stack.clone(),
+            container_unit_contexts: self.container_unit_contexts.clone(),
             multicol_column_containing_blocks: self.multicol_column_containing_blocks.clone(),
             intrinsic_inline_percentage_basis_stack: self
                 .intrinsic_inline_percentage_basis_stack
@@ -81,6 +86,7 @@ impl<'a> LayoutBuilder<'a> {
                 .replayed_flex_item_percentage_height_bases
                 .clone(),
             table_wrapper_block_size_overrides: self.table_wrapper_block_size_overrides.clone(),
+            positioned_table_sizing: self.positioned_table_sizing.clone(),
             multicol_text_box_trim_end_child_indices: self
                 .multicol_text_box_trim_end_child_indices
                 .clone(),
@@ -90,6 +96,9 @@ impl<'a> LayoutBuilder<'a> {
             element_side_effect_suppression_depth: self.element_side_effect_suppression_depth,
             containing_blocks: self.containing_blocks.clone(),
             fixed_containing_blocks: self.fixed_containing_blocks.clone(),
+            active_multicol_positioned_containing_block_spans: self
+                .active_multicol_positioned_containing_block_spans
+                .clone(),
             counter_set: self.counter_set.clone(),
             counter_plan: self.counter_plan.clone(),
             quote_depth: self.quote_depth,
@@ -101,9 +110,14 @@ impl<'a> LayoutBuilder<'a> {
             page_counter_initial_values: self.page_counter_initial_values.clone(),
             bookmarks: self.bookmarks.clone(),
             positioned_layers: self.positioned_layers.clone(),
+            committed_positioned_paint_identities: self
+                .committed_positioned_paint_identities
+                .clone(),
+            positioned_paint_transaction_depth: self.positioned_paint_transaction_depth,
+            positioned_scratch_page_limit: self.positioned_scratch_page_limit,
             fixed_layers: self.fixed_layers.clone(),
             absolute_positioned_page_span_target: self.absolute_positioned_page_span_target,
-            pending_positioned_page_span_target: self.pending_positioned_page_span_target,
+            pending_positioned_fragmentation: self.pending_positioned_fragmentation,
             next_paint_source_order: self.next_paint_source_order,
             overflow_clips: self.overflow_clips.clone(),
             active_scroll_snap_scopes: self.active_scroll_snap_scopes.clone(),
@@ -138,6 +152,8 @@ impl<'a> LayoutBuilder<'a> {
         self.page_anchor_counters = snapshot.page_anchor_counters;
         self.has_normal_flow_target_references = snapshot.has_normal_flow_target_references;
         self.document_canvas_background = snapshot.document_canvas_background;
+        self.document_canvas_scroll_translation = snapshot.document_canvas_scroll_translation;
+        self.document_canvas_root_positioning_area = snapshot.document_canvas_root_positioning_area;
         self.document_canvas_overflow = snapshot.document_canvas_overflow;
         self.document_canvas_fragment_insets = snapshot.document_canvas_fragment_insets;
         self.current_page = snapshot.current_page;
@@ -146,6 +162,7 @@ impl<'a> LayoutBuilder<'a> {
             snapshot.current_page_has_named_page_flow_content;
         self.current_page_selected_name = snapshot.current_page_selected_name;
         self.last_block_layout_outcome = snapshot.last_block_layout_outcome;
+        self.last_principal_transform_box = snapshot.last_principal_transform_box;
         self.current_page_name = snapshot.current_page_name;
         self.current_page_context = snapshot.current_page_context;
         self.initial_viewport_context = snapshot.initial_viewport_context;
@@ -171,6 +188,7 @@ impl<'a> LayoutBuilder<'a> {
         self.inline_split_float_exclusion_query_offset =
             snapshot.inline_split_float_exclusion_query_offset;
         self.content_logical_inline_size_stack = snapshot.content_logical_inline_size_stack;
+        self.container_unit_contexts = snapshot.container_unit_contexts;
         self.multicol_column_containing_blocks = snapshot.multicol_column_containing_blocks;
         self.intrinsic_inline_percentage_basis_stack =
             snapshot.intrinsic_inline_percentage_basis_stack;
@@ -198,6 +216,7 @@ impl<'a> LayoutBuilder<'a> {
         self.replayed_flex_item_percentage_height_bases =
             snapshot.replayed_flex_item_percentage_height_bases;
         self.table_wrapper_block_size_overrides = snapshot.table_wrapper_block_size_overrides;
+        self.positioned_table_sizing = snapshot.positioned_table_sizing;
         self.multicol_text_box_trim_end_child_indices =
             snapshot.multicol_text_box_trim_end_child_indices;
         self.truncate_page_start_margins = snapshot.truncate_page_start_margins;
@@ -207,6 +226,8 @@ impl<'a> LayoutBuilder<'a> {
         self.element_side_effect_suppression_depth = snapshot.element_side_effect_suppression_depth;
         self.containing_blocks = snapshot.containing_blocks;
         self.fixed_containing_blocks = snapshot.fixed_containing_blocks;
+        self.active_multicol_positioned_containing_block_spans =
+            snapshot.active_multicol_positioned_containing_block_spans;
         self.counter_set = snapshot.counter_set;
         self.counter_plan = snapshot.counter_plan;
         self.quote_depth = snapshot.quote_depth;
@@ -218,9 +239,12 @@ impl<'a> LayoutBuilder<'a> {
         self.page_counter_initial_values = snapshot.page_counter_initial_values;
         self.bookmarks = snapshot.bookmarks;
         self.positioned_layers = snapshot.positioned_layers;
+        self.committed_positioned_paint_identities = snapshot.committed_positioned_paint_identities;
+        self.positioned_paint_transaction_depth = snapshot.positioned_paint_transaction_depth;
+        self.positioned_scratch_page_limit = snapshot.positioned_scratch_page_limit;
         self.fixed_layers = snapshot.fixed_layers;
         self.absolute_positioned_page_span_target = snapshot.absolute_positioned_page_span_target;
-        self.pending_positioned_page_span_target = snapshot.pending_positioned_page_span_target;
+        self.pending_positioned_fragmentation = snapshot.pending_positioned_fragmentation;
         self.next_paint_source_order = snapshot.next_paint_source_order;
         self.overflow_clips = snapshot.overflow_clips;
         self.active_scroll_snap_scopes = snapshot.active_scroll_snap_scopes;
@@ -454,17 +478,17 @@ impl<'a> LayoutBuilder<'a> {
                 );
                 for layer in page_background_layers_for_paint(&style).iter().rev() {
                     let mut layer_style = style.clone();
-                    layer_style.background_image = layer.image.clone();
-                    layer_style.background_size = layer.size.clone();
-                    layer_style.background_position = layer.position.clone();
-                    layer_style.background_repeat = layer.repeat;
-                    layer_style.background_origin = css::BackgroundBox::Border;
-                    layer_style.background_clip = css::BackgroundBox::Border;
+                    layer_style.background.background_image = layer.image.clone();
+                    layer_style.background.background_size = layer.size.clone();
+                    layer_style.background.background_position = layer.position.clone();
+                    layer_style.background.background_repeat = layer.repeat;
+                    layer_style.background.background_origin = css::BackgroundBox::Border;
+                    layer_style.background.background_clip = css::BackgroundBox::Border;
                     let mut paint_layer = layer.clone();
                     paint_layer.origin = css::BackgroundBox::Border;
                     paint_layer.clip = css::BackgroundBox::Border;
-                    layer_style.background_layers = vec![paint_layer];
-                    layer_style.background_image_layer_count = 1;
+                    layer_style.background.background_layers = vec![paint_layer];
+                    layer_style.background.background_image_layer_count = 1;
                     // Page-box geometry above already selected the authored
                     // origin and clip boxes.  The generic background painter
                     // must therefore receive a neutral border model, or it
@@ -504,8 +528,8 @@ impl<'a> LayoutBuilder<'a> {
                 let page = &mut self.pages[page_index];
 
                 let mut background_style = style.clone();
-                background_style.background_clip = css::BackgroundBox::Border;
-                for layer in &mut background_style.background_layers {
+                background_style.background.background_clip = css::BackgroundBox::Border;
+                for layer in &mut background_style.background.background_layers {
                     layer.clip = css::BackgroundBox::Border;
                 }
                 background_style.border_widths = css::Edges::ZERO;
@@ -569,9 +593,9 @@ impl<'a> LayoutBuilder<'a> {
                 }
 
                 let mut border_style = style;
-                border_style.background_color = css::BackgroundColor::TRANSPARENT;
-                border_style.background_image = css::ComputedImage::None;
-                border_style.background_layers.clear();
+                border_style.background.background_color = css::BackgroundColor::TRANSPARENT;
+                border_style.background.background_image = css::ComputedImage::None;
+                border_style.background.background_layers.clear();
                 let (rects, rounded_rects, paths, strokes) =
                     block_paint_ops(page_border_area, &border_style);
                 for rect in rects {
@@ -648,7 +672,7 @@ impl<'a> LayoutBuilder<'a> {
                 DocumentCanvasPoint::new(x, page_document_bottom + y),
                 DocumentCanvasSize::new(width, height),
             ));
-        let positioning_area = self.document_canvas_root_positioning_area(&background);
+        let positioning_area = self.document_canvas_root_positioning_area();
         let fixed_positioning_area = DocumentCanvasBackgroundArea::new(
             DocumentCanvasPoint::new(
                 page_context.left(),
@@ -667,12 +691,16 @@ impl<'a> LayoutBuilder<'a> {
                 self.root_url,
                 self.resource_cache,
             );
+        let canvas_scroll_translation = self.document_canvas_scroll_translation;
         let page = &mut self.pages[page_index];
+        let canvas_checkpoint = (canvas_scroll_translation.x != 0.0
+            || canvas_scroll_translation.y != 0.0)
+            .then(|| page.paint_checkpoint());
         // Root/background propagation paints the solid color layer over the
         // page canvas. Image positioning may remain relative to html's used
         // box, but that box's padding must not clip the canvas color layer.
         // <https://www.w3.org/TR/css-backgrounds-3/#special-backgrounds>
-        if let Some(fill) = style.background_color.visible_color(style.color) {
+        if let Some(fill) = style.background.background_color.visible_color(style.color) {
             page.push_document_canvas_rect(RenderedRect::new(
                 x,
                 y,
@@ -684,15 +712,15 @@ impl<'a> LayoutBuilder<'a> {
             ));
         }
         let mut non_color_style = style.clone();
-        non_color_style.background_color = css::BackgroundColor::TRANSPARENT;
+        non_color_style.background.background_color = css::BackgroundColor::TRANSPARENT;
         // Image layers above are projected from the root positioning area by
         // `background_image_primitives…`. Re-running the generic box painter
         // with those layers would replay a propagated gradient/image in the
         // page-local coordinate system (and double-composite translucent
         // layers).
         // <https://www.w3.org/TR/css-backgrounds-3/#special-backgrounds>
-        non_color_style.background_image = css::ComputedImage::None;
-        non_color_style.background_layers.clear();
+        non_color_style.background.background_image = css::ComputedImage::None;
+        non_color_style.background.background_layers.clear();
         let (rects, rounded_rects, paths, strokes) =
             block_paint_ops(paint_space_rect(x, y, width, height), &non_color_style);
         for rect in rects {
@@ -741,12 +769,36 @@ impl<'a> LayoutBuilder<'a> {
                 }
             }
         }
+        if let Some(checkpoint) = canvas_checkpoint {
+            page.translate_recorded_primitives_since(&checkpoint, canvas_scroll_translation);
+        }
     }
 
-    pub(in crate::layout) fn document_canvas_root_background_defined(&self) -> bool {
+    pub(in crate::layout) fn selected_document_canvas_background_source(
+        &self,
+    ) -> Option<DocumentCanvasBackgroundSource> {
         self.document_canvas_background
             .as_ref()
-            .is_some_and(|background| background.root_background_defined)
+            .map(|background| background.source)
+    }
+
+    /// Whether this element supplies the document canvas' propagated
+    /// background. The selected canvas background is always painted outside
+    /// element effect contexts, including root transforms.
+    /// <https://drafts.csswg.org/css-backgrounds-3/#special-backgrounds>
+    pub(in crate::layout) fn element_paints_document_canvas_background(
+        &self,
+        element: &Element,
+    ) -> bool {
+        match self.selected_document_canvas_background_source() {
+            Some(DocumentCanvasBackgroundSource::Root) => self
+                .document_canvas_overflow
+                .is_root_canvas_background_source(element),
+            Some(DocumentCanvasBackgroundSource::EligibleBodyFallback) => self
+                .document_canvas_overflow
+                .is_body_canvas_background_fallback_source(element),
+            None => false,
+        }
     }
 
     fn document_canvas_total_height(&self) -> f32 {
@@ -764,18 +816,14 @@ impl<'a> LayoutBuilder<'a> {
         total_height - height_through_page
     }
 
-    fn document_canvas_root_positioning_area(
-        &self,
-        background: &DocumentCanvasBackground,
-    ) -> DocumentCanvasBackgroundArea {
+    fn document_canvas_root_positioning_area(&self) -> DocumentCanvasBackgroundArea {
         let total_height = self.document_canvas_total_height();
         let first_page_bottom = self
             .pages
             .first()
             .map(|page| total_height - page.height())
             .unwrap_or(0.0);
-        background
-            .root_positioning_area
+        self.document_canvas_root_positioning_area
             .map(|area| {
                 let mapped_y = first_page_bottom + area.y();
                 // The root/background propagation rule expands the painting
@@ -855,9 +903,14 @@ impl<'a> LayoutBuilder<'a> {
         if !self.element_propagates_document_canvas_properties(element, style) {
             return;
         }
-        let has_background = style.background_color.visible_color(style.color).is_some()
-            || style.background_image.is_image()
+        let has_background = style
+            .background
+            .background_color
+            .visible_color(style.color)
+            .is_some()
+            || style.background.background_image.is_image()
             || style
+                .background
                 .background_layers
                 .iter()
                 .any(|layer| layer.image.is_image());
@@ -866,26 +919,17 @@ impl<'a> LayoutBuilder<'a> {
             .is_root_canvas_background_source(element)
         {
             if has_background {
-                let root_positioning_area = self
-                    .document_canvas_background
-                    .as_ref()
-                    .and_then(|background| background.root_positioning_area);
                 self.document_canvas_background = Some(DocumentCanvasBackground {
                     style: canvas_background_style(style),
-                    root_background_defined: true,
-                    root_positioning_area,
+                    source: DocumentCanvasBackgroundSource::Root,
                 });
             }
         } else if self
             .document_canvas_overflow
             .is_body_canvas_background_fallback_source(element)
-            && !self.document_canvas_root_background_defined()
+            && self.selected_document_canvas_background_source().is_none()
             && has_background
         {
-            let root_positioning_area = self
-                .document_canvas_background
-                .as_ref()
-                .and_then(|background| background.root_positioning_area);
             let mut canvas_style = canvas_background_style(style);
             // `forced-color-adjust` on the body affects its own box, but not
             // the document canvas. The root is the canvas's adjustment
@@ -895,14 +939,14 @@ impl<'a> LayoutBuilder<'a> {
             if style.forced_color_adjust == css::ForcedColorAdjust::None
                 && let Some(palette) = self.options.forced_colors.palette()
             {
-                canvas_style.background_color = css::BackgroundColor::Color(palette.canvas);
-                canvas_style.background_image = css::ComputedImage::None;
-                canvas_style.background_layers.clear();
+                canvas_style.background.background_color =
+                    css::BackgroundColor::Color(palette.canvas);
+                canvas_style.background.background_image = css::ComputedImage::None;
+                canvas_style.background.background_layers.clear();
             }
             self.document_canvas_background = Some(DocumentCanvasBackground {
                 style: canvas_style,
-                root_background_defined: false,
-                root_positioning_area,
+                source: DocumentCanvasBackgroundSource::EligibleBodyFallback,
             });
         }
     }
@@ -940,16 +984,11 @@ impl<'a> LayoutBuilder<'a> {
             self.current_page_context.area_width(),
             self.current_page_context.area_height(),
         );
-        if let Some(background) = &mut self.document_canvas_background
-            && background.root_background_defined
-        {
-            // A root background keeps its own used box as the image
-            // positioning area. A propagated body background instead
-            // positions on the document canvas; overwriting it here
-            // would reintroduce the root fragment's collapsed margin.
-            // <https://www.w3.org/TR/css-backgrounds-3/#special-backgrounds>
-            background.root_positioning_area = Some(area);
-        }
+        // An eligible body background is treated as if it were specified on
+        // the root, so both propagation sources size and position images in
+        // this root area while painting the page canvas.
+        // <https://www.w3.org/TR/css-backgrounds-3/#special-backgrounds>
+        self.document_canvas_root_positioning_area = Some(area);
     }
 
     /// Records the generated page containing an HTML anchor.
@@ -1012,16 +1051,16 @@ impl<'a> LayoutBuilder<'a> {
         }
     }
     pub(in crate::layout) fn flush_positioned_layers(&mut self) {
-        if self.positioned_layers.is_empty() {
+        if self.positioned_layers.is_empty() || self.positioned_paint_transaction_depth > 0 {
             return;
         }
         let mut future_layers = Vec::new();
         let mut positioned_layers = Vec::new();
         for layer in std::mem::take(&mut self.positioned_layers) {
-            if layer.page_index <= self.pages.len() {
-                positioned_layers.push(layer);
-            } else {
+            if layer.page_index > self.pages.len() {
                 future_layers.push(layer);
+            } else {
+                positioned_layers.push(layer);
             }
         }
         self.positioned_layers = future_layers;
@@ -1036,6 +1075,19 @@ impl<'a> LayoutBuilder<'a> {
             )
         });
         for layer in positioned_layers {
+            if let Some(identity) = layer.commit_key() {
+                // A positioned principal can be reached through an inline
+                // collector's retained source and its ruby-specific overlay.
+                // They describe the same page-local principal, which must be
+                // committed once even when both collection paths survive to
+                // final paint.
+                if !self
+                    .committed_positioned_paint_identities
+                    .insert((DocumentPageIndex::new(layer.page_index), identity))
+                {
+                    continue;
+                }
+            }
             let fragment = positioned_layer_fragment(&layer);
             let target_page = if layer.page_index < self.pages.len() {
                 &mut self.pages[layer.page_index]

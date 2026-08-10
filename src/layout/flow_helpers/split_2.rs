@@ -73,9 +73,17 @@ pub(in crate::layout) fn formatting_box_is_normal_block_flow_sibling(
         _ => child
             .element_parts()
             .is_some_and(|(child_element, _, child_style, _)| {
-                is_normal_block_flow_child(child_element, child_style)
-                    || document_canvas.is_document_canvas_flow_element(parent)
-                    || is_replaced_element(child_element)
+                // The document canvas can make an in-flow direct child a
+                // block-flow sibling, but it cannot pull an absolute or
+                // fixed child back into normal flow. In particular, root/body
+                // endpoint selection, margin adjacency, and fragmentation
+                // must look through positioned children.
+                // <https://www.w3.org/TR/css-position-3/#absolute-positioning>
+                // <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+                style_is_in_normal_flow(child_style)
+                    && (is_normal_block_flow_child(child_element, child_style)
+                        || document_canvas.is_document_canvas_flow_element(parent)
+                        || is_replaced_element(child_element))
             }),
     }
 }
@@ -336,15 +344,13 @@ pub(in crate::layout) fn is_self_collapsing_block_box(
     let has_line_box_content = has_direct_inline_content_box(child_boxes)
         || has_atomic_inline_formatting_box(child_boxes)
         || generated_content_has_non_phantom_inline_content(style);
-    // Clearance places the box after matching float margin boxes.  Although
-    // an otherwise empty cleared box has no own block-size, that placement is
-    // observable by its parent: treating it as an adjoining self-collapsing
-    // child would let the parent collapse through the clearance and omit the
-    // float-containing extent from its used auto height.
-    // <https://www.w3.org/TR/CSS22/visuren.html#flow-control>
+    // Clearance changes the placement of an otherwise empty box without
+    // creating an own block-size. Its margins therefore remain adjoining for
+    // self-collapsing classification; the block-flow cursor independently
+    // retains clearance for following in-flow content.
     // <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
-    style.clear == Clear::None
-        && is_collapsible_block_child(element, style)
+    // <https://www.w3.org/TR/CSS22/visuren.html#flow-control>
+    is_collapsible_block_child(element, style)
         && can_collapse_own_block_margins(
             element,
             style,
@@ -842,8 +848,7 @@ pub(in crate::layout) fn is_self_collapsing_block_dom_with_resolver(
         ancestors,
         resolver,
     );
-    style.clear == Clear::None
-        && is_collapsible_block_child(element, style)
+    is_collapsible_block_child(element, style)
         && can_collapse_own_block_margins(
             element,
             style,
@@ -980,23 +985,6 @@ fn dom_text_can_only_create_phantom_line_box(text: &str, style: &ComputedStyle) 
     style.white_space.collapses_spaces() && collapse_whitespace(text).is_empty()
 }
 
-pub(in crate::layout) fn has_direct_inline_content_dom_with_font_metrics(
-    element: &Element,
-    parent_style: &ComputedStyle,
-    stylesheets: &Stylesheets<'_>,
-    ancestors: &[ElementSignature],
-    font_system: &mut FontSystem,
-) -> bool {
-    let mut resolver = DomStyleResolver::with_font_system(font_system);
-    has_direct_inline_content_dom_with_resolver(
-        element,
-        parent_style,
-        stylesheets,
-        ancestors,
-        &mut resolver,
-    )
-}
-
 /// Return whether direct inline content precedes the first normal-flow block
 /// child in DOM order.
 ///
@@ -1030,7 +1018,7 @@ pub(in crate::layout) fn has_direct_inline_content_before_first_flow_child_dom_w
                 element_index += 1;
                 let child_style = resolver.style_for_element(
                     child,
-                    signature,
+                    signature.clone(),
                     stylesheets,
                     Some(parent_style),
                     ancestors,
@@ -1038,8 +1026,17 @@ pub(in crate::layout) fn has_direct_inline_content_before_first_flow_child_dom_w
                 if is_normal_block_flow_child(child, &child_style) {
                     return false;
                 }
+                let mut child_ancestors = ancestors.to_vec();
+                child_ancestors.push(signature);
                 if is_line_break_element(child)
-                    || (!is_replaced_element(child) && !inline_text(child).is_empty())
+                    || (child_style.display.is_inline_level()
+                        && !dom_inline_element_can_only_create_phantom_line_boxes(
+                            child,
+                            &child_style,
+                            stylesheets,
+                            &child_ancestors,
+                            &mut resolver,
+                        ))
                 {
                     return true;
                 }
@@ -1049,6 +1046,13 @@ pub(in crate::layout) fn has_direct_inline_content_before_first_flow_child_dom_w
     false
 }
 
+/// Return whether a raw DOM block container has any non-phantom direct inline
+/// contribution.
+///
+/// This is used for self-collapsing and parent/child-collapse checks, where an
+/// inline run after a block child still gives the parent non-zero content.
+/// A sized atomic inline box contributes a line box even when it has no text.
+/// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
 pub(in crate::layout) fn has_direct_inline_content_dom_with_resolver(
     element: &Element,
     parent_style: &ComputedStyle,
@@ -1070,14 +1074,23 @@ pub(in crate::layout) fn has_direct_inline_content_dom_with_resolver(
             element_index += 1;
             let child_style = resolver.style_for_element(
                 child,
-                signature,
+                signature.clone(),
                 stylesheets,
                 Some(parent_style),
                 ancestors,
             );
-            !is_normal_block_flow_child(child, &child_style)
-                && !is_replaced_element(child)
-                && !inline_text(child).is_empty()
+            if !child_style.display.is_inline_level() {
+                return false;
+            }
+            let mut child_ancestors = ancestors.to_vec();
+            child_ancestors.push(signature);
+            !dom_inline_element_can_only_create_phantom_line_boxes(
+                child,
+                &child_style,
+                stylesheets,
+                &child_ancestors,
+                resolver,
+            )
         }
     })
 }
@@ -1222,6 +1235,44 @@ mod tests {
             image,
             &ComputedStyle::initial()
         ));
+    }
+
+    #[tokio::test]
+    async fn sized_atomic_inline_blocks_start_margin_collapse_but_empty_inline_does_not() {
+        let stylesheets = Stylesheets::for_document(css::html5_user_agent_stylesheet(), None, &[]);
+        let mut font_system = FontSystem::start_loading()
+            .load_stylesheet_fonts(&stylesheets)
+            .finish()
+            .await;
+
+        let atomic_root = dom::parse(
+            "<html><body><div><span style=\"display:inline-block; width:100px; height:100px\"></span><div></div></div></body></html>",
+        );
+        let atomic_parent = first_element_by_tag(&atomic_root, "div")
+            .expect("expected the atomic inline's parent block");
+        assert!(
+            has_direct_inline_content_before_first_flow_child_dom_with_font_metrics(
+                atomic_parent,
+                &test_parent_style(),
+                &stylesheets,
+                &[],
+                &mut font_system,
+            )
+        );
+
+        let phantom_root =
+            dom::parse("<html><body><div><span></span><div></div></div></body></html>");
+        let phantom_parent = first_element_by_tag(&phantom_root, "div")
+            .expect("expected the phantom inline's parent block");
+        assert!(
+            !has_direct_inline_content_before_first_flow_child_dom_with_font_metrics(
+                phantom_parent,
+                &test_parent_style(),
+                &stylesheets,
+                &[],
+                &mut font_system,
+            )
+        );
     }
 
     #[test]

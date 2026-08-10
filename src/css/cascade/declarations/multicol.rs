@@ -394,7 +394,7 @@ pub(in crate::css) fn expand_columns_shorthand(value: &str) -> Option<Vec<(&'sta
     let mut count = "auto".to_string();
     let mut width = "auto".to_string();
     let mut saw_component = false;
-    for part in inline_components.split_whitespace() {
+    for part in try_split_css_component_values(inline_components)? {
         if part.eq_ignore_ascii_case("auto") {
             saw_component = true;
         } else if part

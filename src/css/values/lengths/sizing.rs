@@ -86,6 +86,16 @@ pub(crate) fn parse_computed_box_size(
             ComputedLengthPercentage::from_cap(value),
         ));
     }
+    if let Some(SpecifiedLength::FontRelativeLh(value)) = parse_specified_length(value) {
+        return Some(ComputedLengthPercentageOrAuto::LengthPercentage(
+            ComputedLengthPercentage::from_lh(value),
+        ));
+    }
+    if let Some(SpecifiedLength::RootFontRelativeRlh(value)) = parse_specified_length(value) {
+        return Some(ComputedLengthPercentageOrAuto::LengthPercentage(
+            ComputedLengthPercentage::from_rlh(value),
+        ));
+    }
     if let Some(argument) = fit_content_argument(value)
         && let Some(length) =
             parse_computed_length_percentage_with_root(argument, font_size, root_font_size)

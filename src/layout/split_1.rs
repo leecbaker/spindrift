@@ -1,5 +1,17 @@
 use super::*;
+use crate::layout::assets::{DocumentPageIndex, PendingPositionedFragmentation};
 use std::collections::HashSet;
+
+/// Cache key for a table wrapper height probe. The three optional values are
+/// the resolved preferred, minimum, and maximum block-size constraints.
+pub(in crate::layout) type TableHeightEstimateCacheKey =
+    (ElementId, u32, Option<u32>, Option<u32>, Option<u32>);
+
+/// Cache key for a table row-height distribution plan. The optional values
+/// distinguish flex/grid wrapper sizing from an absolutely positioned table's
+/// definite logical block-size contract.
+pub(in crate::layout) type TableHeightPlanCacheKey =
+    (ElementId, u32, Option<u32>, Option<u32>, u32);
 
 /// Paint captured speculatively for a fragmentainer that normal flow has not
 /// reached yet. Fragmented floats and fixed-size overflow use the same queue.
@@ -139,11 +151,9 @@ pub(in crate::layout) fn block_align_content_establishes_independent_formatting_
 #[derive(Debug, Clone, Copy, PartialEq)]
 /// A physical page size expressed in PDF points.
 ///
-/// ```
-/// let page_size = quire::PageSize::from_points(612.0, 792.0);
-/// assert_eq!(page_size.width(), 612.0);
-/// ```
-pub struct PageSize {
+/// CSS Paged Media controls the page size through the `@page` rule, for
+/// example `@page { size: 612pt 792pt }`.
+pub(crate) struct PageSize {
     pub(crate) width: LayoutLength,
     pub(crate) height: LayoutLength,
 }
@@ -152,18 +162,13 @@ pub(in crate::layout) const LIST_ITEM_COUNTER_NAME: &str = "list-item";
 
 impl PageSize {
     /// The ISO A4 page size in PDF points.
-    pub const A4_POINTS: Self = Self {
+    pub(crate) const A4_POINTS: Self = Self {
         width: layout_pt(595.2756),
         height: layout_pt(841.8898),
     };
 
     /// Creates a page size from width and height measured in PDF points.
-    ///
-    /// ```
-    /// let page_size = quire::PageSize::from_points(595.2756, 841.8898);
-    /// assert_eq!(page_size.height(), 841.8898);
-    /// ```
-    pub const fn from_points(width: f32, height: f32) -> Self {
+    pub(crate) const fn from_points(width: f32, height: f32) -> Self {
         Self {
             width: layout_pt(width),
             height: layout_pt(height),
@@ -171,22 +176,12 @@ impl PageSize {
     }
 
     /// Returns the page width in PDF points.
-    ///
-    /// ```
-    /// let page_size = quire::PageSize::from_points(612.0, 792.0);
-    /// assert_eq!(page_size.width(), 612.0);
-    /// ```
-    pub fn width(&self) -> f32 {
+    pub(crate) fn width(&self) -> f32 {
         layout_points(self.width)
     }
 
     /// Returns the page height in PDF points.
-    ///
-    /// ```
-    /// let page_size = quire::PageSize::from_points(612.0, 792.0);
-    /// assert_eq!(page_size.height(), 792.0);
-    /// ```
-    pub fn height(&self) -> f32 {
+    pub(crate) fn height(&self) -> f32 {
         layout_points(self.height)
     }
 
@@ -212,11 +207,9 @@ impl PageSize {
 #[derive(Debug, Clone, Copy, PartialEq)]
 /// Page margins expressed in PDF points.
 ///
-/// ```
-/// let margins = quire::PageMargins::all_points(36.0);
-/// assert_eq!(margins.left(), 36.0);
-/// ```
-pub struct PageMargins {
+/// CSS Paged Media controls page margins through the `@page` rule. This
+/// internal type represents the resolved geometry of one page box.
+pub(crate) struct PageMargins {
     pub(crate) top: LayoutLength,
     pub(crate) right: LayoutLength,
     pub(crate) bottom: LayoutLength,
@@ -225,9 +218,9 @@ pub struct PageMargins {
 
 impl PageMargins {
     /// WeasyPrint's default page margin in PDF points.
-    pub const WEASYPRINT_DEFAULT_POINTS: f32 = 56.25;
+    pub(crate) const WEASYPRINT_DEFAULT_POINTS: f32 = 56.25;
     /// The default margin on every page edge.
-    pub const DEFAULT: Self = Self {
+    pub(crate) const DEFAULT: Self = Self {
         top: layout_pt(Self::WEASYPRINT_DEFAULT_POINTS),
         right: layout_pt(Self::WEASYPRINT_DEFAULT_POINTS),
         bottom: layout_pt(Self::WEASYPRINT_DEFAULT_POINTS),
@@ -245,22 +238,12 @@ impl PageMargins {
     }
 
     /// Creates equal margins from a PDF-point value.
-    ///
-    /// ```
-    /// let margins = quire::PageMargins::all_points(18.0);
-    /// assert_eq!(margins.top(), 18.0);
-    /// ```
-    pub const fn all_points(value: f32) -> Self {
+    pub(crate) const fn all_points(value: f32) -> Self {
         Self::all(layout_pt(value))
     }
 
     /// Creates margins from top, right, bottom, and left PDF-point values.
-    ///
-    /// ```
-    /// let margins = quire::PageMargins::from_points(18.0, 24.0, 36.0, 48.0);
-    /// assert_eq!(margins.bottom(), 36.0);
-    /// ```
-    pub const fn from_points(top: f32, right: f32, bottom: f32, left: f32) -> Self {
+    pub(crate) const fn from_points(top: f32, right: f32, bottom: f32, left: f32) -> Self {
         Self {
             top: layout_pt(top),
             right: layout_pt(right),
@@ -270,42 +253,22 @@ impl PageMargins {
     }
 
     /// Returns the top margin in PDF points.
-    ///
-    /// ```
-    /// let margins = quire::PageMargins::all_points(18.0);
-    /// assert_eq!(margins.top(), 18.0);
-    /// ```
-    pub fn top(&self) -> f32 {
+    pub(crate) fn top(&self) -> f32 {
         layout_points(self.top)
     }
 
     /// Returns the right margin in PDF points.
-    ///
-    /// ```
-    /// let margins = quire::PageMargins::all_points(18.0);
-    /// assert_eq!(margins.right(), 18.0);
-    /// ```
-    pub fn right(&self) -> f32 {
+    pub(crate) fn right(&self) -> f32 {
         layout_points(self.right)
     }
 
     /// Returns the bottom margin in PDF points.
-    ///
-    /// ```
-    /// let margins = quire::PageMargins::all_points(18.0);
-    /// assert_eq!(margins.bottom(), 18.0);
-    /// ```
-    pub fn bottom(&self) -> f32 {
+    pub(crate) fn bottom(&self) -> f32 {
         layout_points(self.bottom)
     }
 
     /// Returns the left margin in PDF points.
-    ///
-    /// ```
-    /// let margins = quire::PageMargins::all_points(18.0);
-    /// assert_eq!(margins.left(), 18.0);
-    /// ```
-    pub fn left(&self) -> f32 {
+    pub(crate) fn left(&self) -> f32 {
         layout_points(self.left)
     }
 }
@@ -313,35 +276,44 @@ impl PageMargins {
 #[derive(Debug, Clone, PartialEq)]
 /// Inputs that control document parsing, cascade, and layout.
 ///
-/// ```
-/// let options = quire::RenderOptions::default();
-/// assert!(options.font_size() > 0.0);
+/// ```no_run
+/// use quire::{Html, PdfOptions, RenderOptions};
+/// use std::fs::File;
+///
+/// # async fn render() -> quire::Result<()> {
+/// let mut render_options = RenderOptions::default();
+/// render_options.target_fragment = Some("summary".to_string());
+/// let mut output = File::create("document.pdf")?;
+/// Html::from_file("document.html")
+///     .await?
+///     .write_pdf(&mut output, &render_options, &PdfOptions::default())
+///     .await?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct RenderOptions {
     /// Output medium and viewport used by CSS Media Queries.
     pub media_type: crate::css::MediaType,
+    /// User color-scheme preference exposed to CSS color-scheme selection and
+    /// `prefers-color-scheme` media queries.
+    pub color_scheme_preference: crate::css::ColorSchemePreference,
     /// Forced-colors palette used for CSS CssColor Adjustment and media queries.
     pub forced_colors: crate::css::ForcedColorsMode,
     /// Device pixel density exposed to CSS resolution media queries and used
     /// to select CSS Images `image-set()` candidates.
     pub(crate) device_resolution_dppx: f32,
-    /// The physical page size.
-    pub page_size: PageSize,
-    /// A compatibility margin applied uniformly unless `page_margins` is set.
-    pub(crate) margin: LayoutLength,
-    /// The per-edge page margins.
-    pub page_margins: PageMargins,
+    /// The initial physical page box used before `@page` rules select a page
+    /// size. This is an implementation fallback, not a public render input:
+    /// document page size is controlled by CSS Paged Media's `@page size`.
+    pub(crate) page_size: PageSize,
+    /// The embedding viewport's initial page margins for an iframe document.
+    /// Top-level documents always use [`PageMargins::DEFAULT`]; iframe layout
+    /// starts at the embedding content edge until author `@page` rules apply.
+    pub(crate) iframe_page_margins: Option<PageMargins>,
     /// The initial font size in layout units.
     pub(crate) font_size: LayoutLength,
     /// The initial line height in layout units.
     pub(crate) line_height: LayoutLength,
-    /// Apply HTML presentational hints as zero-specificity author CSS.
-    ///
-    /// HTML maps these legacy attributes into the CSS cascade as
-    /// presentational hints. They are enabled by default for HTML documents;
-    /// callers that need CSS-only compatibility can explicitly disable them:
-    /// <https://html.spec.whatwg.org/multipage/rendering.html#presentational-hints>.
-    pub presentational_hints: bool,
     /// URL fragment target used by Selectors `:target` and `:target-within`.
     ///
     /// Static PDF rendering has no browsing session, so the target element is
@@ -369,45 +341,6 @@ impl RenderOptions {
         self.device_resolution_dppx = resolution_dppx;
         Ok(())
     }
-    /// Sets an equal margin on all page edges.
-    pub(crate) fn set_margin(&mut self, margin: LayoutLength) {
-        self.margin = margin;
-        self.page_margins = PageMargins::all(margin);
-    }
-
-    /// Sets an equal margin on all page edges from a PDF-point value.
-    ///
-    /// ```
-    /// let mut options = quire::RenderOptions::default();
-    /// options.set_margin_points(24.0);
-    /// assert_eq!(options.margin(), 24.0);
-    /// ```
-    pub fn set_margin_points(&mut self, margin: f32) {
-        self.set_margin(layout_pt(margin));
-    }
-
-    /// Sets the per-edge page margins.
-    ///
-    /// ```
-    /// let mut options = quire::RenderOptions::default();
-    /// options.set_page_margins(quire::PageMargins::all_points(24.0));
-    /// assert_eq!(options.page_margins().top(), 24.0);
-    /// ```
-    pub fn set_page_margins(&mut self, margins: PageMargins) {
-        self.margin = margins.top;
-        self.page_margins = margins;
-    }
-
-    /// Returns the compatibility margin in PDF points.
-    ///
-    /// ```
-    /// let options = quire::RenderOptions::default();
-    /// assert!(options.margin() > 0.0);
-    /// ```
-    pub fn margin(&self) -> f32 {
-        layout_points(self.margin)
-    }
-
     /// Returns the initial font size in PDF points.
     ///
     /// ```
@@ -428,22 +361,6 @@ impl RenderOptions {
         layout_points(self.line_height)
     }
 
-    /// Returns the effective per-edge page margins.
-    ///
-    /// ```
-    /// let options = quire::RenderOptions::default();
-    /// assert!(options.page_margins().top() > 0.0);
-    /// ```
-    pub fn page_margins(&self) -> PageMargins {
-        if self.page_margins == PageMargins::DEFAULT
-            && (self.margin() - PageMargins::WEASYPRINT_DEFAULT_POINTS).abs() > 0.01
-        {
-            PageMargins::all(self.margin)
-        } else {
-            self.page_margins
-        }
-    }
-
     pub(crate) fn media_environment(&self) -> crate::css::MediaEnvironment {
         crate::css::MediaEnvironment::new(
             self.media_type,
@@ -454,6 +371,7 @@ impl RenderOptions {
         )
         .with_resolution_dppx(self.device_resolution_dppx)
         .with_forced_colors(self.forced_colors)
+        .with_color_scheme_preference(self.color_scheme_preference)
     }
 }
 
@@ -462,14 +380,13 @@ impl Default for RenderOptions {
         let font_size = 12.0;
         Self {
             media_type: crate::css::MediaType::Print,
+            color_scheme_preference: crate::css::ColorSchemePreference::None,
             forced_colors: crate::css::ForcedColorsMode::Inactive,
             device_resolution_dppx: 1.0,
             page_size: PageSize::A4_POINTS,
-            margin: layout_pt(PageMargins::WEASYPRINT_DEFAULT_POINTS),
-            page_margins: PageMargins::DEFAULT,
+            iframe_page_margins: None,
             font_size: layout_pt(font_size),
             line_height: layout_pt(font_size * 1.2),
-            presentational_hints: true,
             target_fragment: None,
         }
     }
@@ -532,7 +449,7 @@ impl PageContext {
     pub(in crate::layout) fn from_options(options: &RenderOptions) -> Self {
         Self {
             size: options.page_size,
-            margins: options.page_margins(),
+            margins: options.iframe_page_margins.unwrap_or(PageMargins::DEFAULT),
             edges: PageBoxEdges::ZERO,
             rotation: 0,
         }
@@ -658,14 +575,17 @@ pub(crate) fn layout_prepared_dom(config: PreparedDomLayout<'_>) -> Document {
     } else {
         1.2
     };
-    let parent_style = Box::new(ComputedStyle {
-        font_size: options.font_size(),
-        deferred_font_size: css::DeferredFontSize::Absolute(options.font_size()),
-        line_height_value: css::ComputedLineHeight::Number(default_line_height_multiplier),
-        line_height: options.line_height(),
-        color: CssColor::BLACK,
-        ..ComputedStyle::initial()
-    });
+    // Build from the stylesheet's typed initial state instead of a struct
+    // update. CSS-private cascade snapshots must retain their own initial
+    // value at this layout boundary.
+    let mut parent_style = ComputedStyle::initial();
+    parent_style.font_size = options.font_size();
+    parent_style.deferred_font_size = css::DeferredFontSize::Absolute(options.font_size());
+    parent_style.line_height_value =
+        css::ComputedLineHeight::Number(default_line_height_multiplier);
+    parent_style.line_height = options.line_height();
+    parent_style.color = CssColor::BLACK;
+    let parent_style = Box::new(parent_style);
     resource_cache.set_inline_svg_presentation_overrides(inline_svg_presentation_overrides(
         root,
         &stylesheets,
@@ -828,9 +748,13 @@ fn collect_inline_svg_presentation_overrides(
     svg_source_has_system_color: bool,
     overrides: &mut crate::svg::SvgPresentationOverrides,
 ) {
-    let style = style_for_layout_element(
-        element,
-        signature.clone(),
+    let svg_presentation = svg_transform_presentation_declarations(element);
+    let style = css::style_for_element_with_signature_and_svg_presentation(
+        layout_element_signature(element, signature.clone(), Some(parent_style)),
+        element.attrs.get("style").map(String::as_str),
+        svg_presentation
+            .has_declarations()
+            .then_some(&svg_presentation),
         stylesheets,
         Some(parent_style),
         ancestors,
@@ -844,10 +768,26 @@ fn collect_inline_svg_presentation_overrides(
     // inherited SVG paint for its scene descendants.
     let applies_to_svg_scene = inside_inline_svg || enters_inline_svg;
     if applies_to_svg_scene && svg_transformable_element(element) {
-        let transform = (!enters_inline_svg && style.has_transform())
-            .then(|| svg_css_transform_is_resolvable(&style))
-            .filter(|resolvable| *resolvable)
-            .and_then(|_| svg_css_transform_attribute_for_element(&style, element));
+        let transform = if !enters_inline_svg
+            && !style.has_transform()
+            && svg_presentation.has_valid_transform()
+        {
+            // A higher-priority CSS `transform: none` suppresses the SVG
+            // presentation attribute rather than falling back to it.
+            Some(crate::svg::SvgTransformOverride::Scene(
+                crate::svg::SvgUsedTransform::None,
+            ))
+        } else {
+            (!enters_inline_svg && style.has_transform())
+                .then(|| svg_css_transform_is_resolvable(&style))
+                .filter(|resolvable| *resolvable)
+                .and_then(|_| svg_css_transform_for_element(&style, element))
+                .map(|transform| {
+                    crate::svg::SvgTransformOverride::Scene(crate::svg::SvgUsedTransform::Affine(
+                        transform,
+                    ))
+                })
+        };
         let force_colors = forced_color_palette.filter(|_| {
             style.forced_color_adjust == css::ForcedColorAdjust::Auto
                 && !svg_source_has_system_color
@@ -1033,29 +973,53 @@ fn svg_transformable_element(element: &Element) -> bool {
         )
 }
 
+/// Translate an SVG transform presentation attribute into the first
+/// author-origin CSS declaration for the host cascade. SVG's attribute grammar
+/// is normalized to a CSS matrix before it enters the cascade, so its
+/// unitless angles and `rotate(angle cx cy)` form never leak into CSS parsing.
+fn svg_transform_presentation_declarations(
+    element: &Element,
+) -> css::SvgPresentationAttributeDeclarations {
+    css::SvgPresentationAttributeDeclarations::transform_properties(
+        element.attrs.get("transform").map(String::as_str),
+        element.attrs.get("transform-origin").map(String::as_str),
+        element.attrs.get("transform-box").map(String::as_str),
+    )
+}
+
 /// Resolve CSS transforms on basic SVG graphics using the selected geometry
 /// reference box. The scene serializer receives the resulting typed affine
 /// SVG matrix rather than a CSS string override, so percentage translations
 /// and origins use the same box.
-fn svg_css_transform_attribute_for_element(
+fn svg_css_transform_for_element(
     style: &ComputedStyle,
     element: &Element,
-) -> Option<String> {
-    let Some((x, y, width, height)) = svg_rect_transform_reference_box(element, style) else {
-        return svg_css_transform_attribute_without_reference_box(style);
+) -> Option<crate::svg::SvgElementTransform> {
+    let Some(reference_boxes) = svg_rect_transform_reference_boxes(element, style) else {
+        return svg_css_transform_without_reference_box(style);
     };
-    let origin_x = svg_css_used_length_in_user_units(style.transform_origin.x.clone(), width) + x;
-    let origin_y = svg_css_used_length_in_user_units(style.transform_origin.y.clone(), height) + y;
+    let reference_box = reference_boxes
+        .select(style.transform_box)
+        // SVG graphical elements have a fill-box fallback until their local
+        // viewport is represented by the typed SVG geometry tree.
+        .or_else(|| reference_boxes.select(css::TransformBox::FillBox))?;
+    let rect = reference_box.rect();
+    let origin = if style.transform_origin.is_initial {
+        // CSS Transforms defines the initial SVG graphics origin as `0 0`.
+        reference_box.origin(0.0, 0.0)
+    } else {
+        reference_box.origin(
+            svg_css_used_length_in_user_units(style.transform_origin.x.clone(), rect.width()),
+            svg_css_used_length_in_user_units(style.transform_origin.y.clone(), rect.height()),
+        )
+    };
     let transform = crate::layout::assets::compose_css_transform_matrix(
-        crate::svg::SvgSourcePoint::new(origin_x, origin_y),
+        origin.point(),
         style.individual_transforms.clone(),
         &style.transform,
-        |function| svg_css_transform_function_matrix_for_box(function, width, height),
+        |function| svg_css_transform_function_matrix_for_box(function, rect.width(), rect.height()),
     );
-    Some(format!(
-        "matrix({} {} {} {} {} {})",
-        transform.m11, transform.m12, transform.m21, transform.m22, transform.m31, transform.m32
-    ))
+    Some(transform)
 }
 
 /// Convert a transform which has no dependency on an SVG reference box.
@@ -1066,8 +1030,10 @@ fn svg_css_transform_attribute_for_element(
 /// width/height attributes use CSS units.  Preserving this path avoids
 /// dropping valid transforms merely because its source geometry is not a
 /// plain unitless `<rect>`.
-fn svg_css_transform_attribute_without_reference_box(style: &ComputedStyle) -> Option<String> {
-    let origin_is_resolvable = style.transform_origin == css::TransformOrigin::INITIAL
+fn svg_css_transform_without_reference_box(
+    style: &ComputedStyle,
+) -> Option<crate::svg::SvgElementTransform> {
+    let origin_is_resolvable = style.transform_origin.is_initial
         || (svg_css_length_is_absolute(&style.transform_origin.x)
             && svg_css_length_is_absolute(&style.transform_origin.y));
     let transforms_are_resolvable =
@@ -1097,10 +1063,10 @@ fn svg_css_transform_attribute_without_reference_box(style: &ComputedStyle) -> O
     if !(origin_is_resolvable && transforms_are_resolvable) {
         return None;
     }
-    let origin = if style.transform_origin == css::TransformOrigin::INITIAL {
-        crate::svg::SvgSourcePoint::new(0.0, 0.0)
+    let origin = if style.transform_origin.is_initial {
+        crate::svg::SvgElementPoint::new(0.0, 0.0)
     } else {
-        crate::svg::SvgSourcePoint::new(
+        crate::svg::SvgElementPoint::new(
             svg_css_length_in_user_units(style.transform_origin.x.clone()),
             svg_css_length_in_user_units(style.transform_origin.y.clone()),
         )
@@ -1111,19 +1077,16 @@ fn svg_css_transform_attribute_without_reference_box(style: &ComputedStyle) -> O
         &style.transform,
         svg_css_transform_function_matrix,
     );
-    Some(format!(
-        "matrix({} {} {} {} {} {})",
-        transform.m11, transform.m12, transform.m21, transform.m22, transform.m31, transform.m32
-    ))
+    Some(transform)
 }
 
 /// Basic SVG fill-box support for CSS transforms. `stroke-box` and `view-box`
 /// remain scene-level work because they require stroke and nested-viewport
 /// geometry that is not preserved by this DOM bridge.
-fn svg_rect_transform_reference_box(
+fn svg_rect_transform_reference_boxes(
     element: &Element,
     style: &ComputedStyle,
-) -> Option<(f32, f32, f32, f32)> {
+) -> Option<crate::svg::SvgTransformReferenceBoxes> {
     match style.transform_box {
         css::TransformBox::FillBox
         | css::TransformBox::ContentBox
@@ -1138,8 +1101,31 @@ fn svg_rect_transform_reference_box(
                 .map_or(Some(0.0), |value| value.parse().ok())?;
             let width = element.attrs.get("width")?.parse().ok()?;
             let height = element.attrs.get("height")?.parse().ok()?;
-            (element.tag == "rect" && width >= 0.0 && height >= 0.0)
-                .then_some((x, y, width, height))
+            if element.tag != "rect" || width < 0.0 || height < 0.0 {
+                return None;
+            }
+            let fill = crate::svg::SvgElementRect::new(
+                crate::svg::SvgElementPoint::new(x, y),
+                crate::svg::SvgElementSize::new(width, height),
+            );
+            // SVG's initial transform-box is view-box. The root viewport's
+            // origin is the current SVG user-space origin, not this graphic's
+            // fill-box origin; absolute transform origins must therefore not
+            // gain the rectangle's x/y offset. Width/height are a temporary
+            // local extent until the ancestor viewport geometry tree supplies
+            // an exact nested viewBox.
+            let view = crate::svg::SvgElementRect::new(
+                crate::svg::SvgElementPoint::new(0.0, 0.0),
+                crate::svg::SvgElementSize::new(width, height),
+            );
+            // The current DOM bridge does not yet retain SVG stroke geometry
+            // or nested viewports. Retaining the candidates in one typed
+            // record keeps those later additions local to this resolver.
+            Some(crate::svg::SvgTransformReferenceBoxes::new(
+                fill,
+                fill,
+                Some(view),
+            ))
         }
         css::TransformBox::StrokeBox | css::TransformBox::ViewBox => None,
     }
@@ -1191,8 +1177,7 @@ fn svg_css_length_is_absolute(value: &css::ComputedLengthPercentage) -> bool {
     value.is_definitely_absolute()
 }
 
-type SvgCssTransform =
-    euclid::Transform2D<f32, crate::svg::SvgSourceSpace, crate::svg::SvgSourceSpace>;
+type SvgCssTransform = crate::svg::SvgElementTransform;
 
 fn svg_css_transform_function_matrix(function: css::TransformFunction) -> SvgCssTransform {
     match function {
@@ -1310,11 +1295,6 @@ fn layout_dom_with_font_system(
     builder.containing_block_direction = principal_flow.used_direction();
     builder.document_root_generates_box = !builder.page_margin_inherited_style.display.is_none();
     builder.rebuild_empty_current_page_context();
-    if inline_start_side(principal_flow.writing_mode, principal_flow.used_direction())
-        == PhysicalSide::Bottom
-    {
-        builder.cursor_y = builder.current_page_context.bottom();
-    }
     if !builder.document_root_generates_box {
         // Paged media still has an initial page when the document root does
         // not generate a principal box (for example `html { display: none }`).
@@ -1481,16 +1461,64 @@ pub(in crate::layout) enum PrincipalFlowSource {
     Body(ElementId),
 }
 
-/// Logical block progression exported by the propagated body canvas to the
-/// HTML root's principal formatting context.
+/// State retained while the propagated HTML body is laid out as the document
+/// canvas.
 ///
-/// This deliberately carries a logical advance instead of a physical box
-/// width: vertical and sideways document flows project the same completion to
-/// opposite physical directions.
+/// The body remains a real layout box, but its automatic canvas span is not a
+/// root-sibling contribution. Its inline-end inset and trailing child margin
+/// are instead retained until the root's following inline content has been
+/// placed in the principal flow.
 /// <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub(in crate::layout) struct PrincipalFlowContribution {
-    pub(in crate::layout) logical_block_advance: LayoutLength,
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct ActiveDocumentCanvas {
+    pub(in crate::layout) body: Option<ElementId>,
+    pub(in crate::layout) inline_end_inset: LayoutLength,
+    /// The physical page-inline origin used by the canvas's first child.
+    pub(in crate::layout) inline_origin: PageTopBlockPosition,
+    /// Logical block track occupied by the document canvas itself. This is
+    /// not derived from descendant ink or child box spans: an automatic body
+    /// canvas occupies the resolved initial containing-block track.
+    pub(in crate::layout) block_track_occupancy: LayoutLength,
+    pub(in crate::layout) trailing_child_block_margin: LayoutLength,
+}
+
+/// The observable continuation left by a propagated HTML body after its
+/// canvas layout has completed.
+///
+/// Keep the source facts separate rather than pre-combining them into a
+/// writing-mode-specific scalar. The root principal-flow traversal projects
+/// this record through the resolved principal-flow axes before it enters the
+/// following inline sequence.
+/// <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct CompletedDocumentCanvas {
+    pub(in crate::layout) body: Option<ElementId>,
+    pub(in crate::layout) source_page: DocumentPageIndex,
+    pub(in crate::layout) source_block_track: PageInlineSpan,
+    pub(in crate::layout) inline_origin: PageTopBlockPosition,
+    /// The canvas inset beyond its inline end, retained so bottom-origin
+    /// flows can establish a fresh fragmentainer origin without paint replay.
+    pub(in crate::layout) inline_end_inset: LayoutLength,
+    pub(in crate::layout) block_end_inset: LayoutLength,
+    pub(in crate::layout) block_track_occupancy: LayoutLength,
+    pub(in crate::layout) trailing_child_block_margin: LayoutLength,
+}
+
+/// Root-owned placement selected before one source-ordered root inline
+/// sequence consumes a completed propagated document canvas.
+///
+/// This is deliberately layout state, not a paint translation. It gives line
+/// construction the fragmentainer and logical track that the canvas leaves
+/// behind.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) enum RootInlineCanvasPlacement {
+    RemainingTrack {
+        block_track: PageInlineSpan,
+        inline_origin: PageTopBlockPosition,
+    },
+    NextPage {
+        inline_origin: PageTopBlockPosition,
+    },
 }
 
 /// Shared state between a propagated document body and root inline content.
@@ -1501,14 +1529,12 @@ pub(in crate::layout) struct PrincipalFlowContribution {
 /// <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(in crate::layout) struct RootPrincipalFlowContext {
-    pub(in crate::layout) active_body: Option<ElementId>,
-    /// Whether the root has an inline generated pseudo-element that continues
-    /// after the body canvas in the principal formatting context.
-    pub(in crate::layout) has_inline_root_pseudo: bool,
-    /// The active body's physical inline-end canvas inset, retained while
-    /// collecting descendants that belong to the propagated canvas.
-    pub(in crate::layout) active_body_inline_end_inset: LayoutLength,
-    pub(in crate::layout) completed_body: Option<PrincipalFlowContribution>,
+    pub(in crate::layout) active_canvas: Option<ActiveDocumentCanvas>,
+    pub(in crate::layout) completed_canvas: Option<CompletedDocumentCanvas>,
+    /// A completion currently being consumed by one source-ordered root
+    /// inline sequence. Keeping it until that sequence returns avoids
+    /// treating a page transition as a paint-time side effect.
+    pub(in crate::layout) active_root_inline_canvas: Option<CompletedDocumentCanvas>,
 }
 
 /// Placement adjustment for a generated root pseudo-element whose computed
@@ -1544,6 +1570,12 @@ impl DocumentPrincipalFlow {
         self.source == PrincipalFlowSource::Body(element.id)
     }
 
+    /// Whether the used principal flow is supplied by an eligible propagated
+    /// body, rather than by the HTML root itself.
+    pub(in crate::layout) fn has_propagated_body(self) -> bool {
+        matches!(self.source, PrincipalFlowSource::Body(_))
+    }
+
     /// Returns the used inline base direction of the resolved principal flow.
     pub(in crate::layout) fn used_direction(self) -> Direction {
         if self.writing_mode.has_vertical_lines()
@@ -1566,23 +1598,74 @@ impl DocumentPrincipalFlow {
         used.writing_mode = self.writing_mode;
         used.direction = self.direction;
         used.text_orientation = self.text_orientation;
-        // Inline root generated content participates in the principal inline
-        // flow. A block-level pseudo establishes its own formatting context,
-        // so it retains its computed writing mode as an orthogonal child.
-        // Keep the cached computed pseudo styles on the unmodified root box.
-        for pseudo in [
-            used.before_style.as_deref_mut(),
-            used.after_style.as_deref_mut(),
-        ]
-        .into_iter()
-        .flatten()
-        .filter(|pseudo| !pseudo.display.is_block_level())
-        {
-            pseudo.writing_mode = self.writing_mode;
-            pseudo.direction = self.direction;
-            pseudo.text_orientation = self.text_orientation;
-        }
         used
+    }
+}
+
+impl CompletedDocumentCanvas {
+    /// Resolves the completed canvas into the root principal flow's logical
+    /// block-track advance.
+    ///
+    /// This is intentionally the only writing-mode projection of the canvas
+    /// completion. Callers either reserve this much of the current root track
+    /// or begin a new fragmentainer before laying out the next inline run.
+    /// <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
+    pub(in crate::layout) fn root_inline_block_track_advance(
+        self,
+        axes: WritingModeAxes,
+    ) -> LayoutLength {
+        match axes.writing_mode() {
+            WritingMode::SidewaysRl | WritingMode::SidewaysLr => {
+                self.block_track_occupancy + self.block_end_inset + self.trailing_child_block_margin
+            }
+            WritingMode::VerticalRl => {
+                self.block_track_occupancy + self.trailing_child_block_margin
+            }
+            WritingMode::VerticalLr => self.block_track_occupancy + self.block_end_inset,
+            WritingMode::HorizontalTb => layout_pt(0.0),
+        }
+    }
+
+    pub(in crate::layout) fn exhausts_root_block_track(
+        self,
+        axes: WritingModeAxes,
+        available_block_track: f32,
+    ) -> bool {
+        self.root_inline_block_track_advance(axes).points() >= available_block_track - 0.01
+    }
+
+    /// Selects the fragmentainer-local placement for the following root
+    /// inline sequence without altering paint already committed by the body.
+    /// <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
+    pub(in crate::layout) fn resolve_root_inline_placement(
+        self,
+        axes: WritingModeAxes,
+        available_block_track: PageInlineSpan,
+    ) -> RootInlineCanvasPlacement {
+        if self.exhausts_root_block_track(axes, available_block_track.width()) {
+            RootInlineCanvasPlacement::NextPage {
+                inline_origin: self.inline_origin,
+            }
+        } else {
+            let advance = self.root_inline_block_track_advance(axes).points();
+            let block_track = match axes.physical_side(LogicalSide::BlockStart) {
+                PhysicalSide::Left => PageInlineSpan::from_edges(
+                    available_block_track.left_x() + advance,
+                    available_block_track.right_x(),
+                ),
+                PhysicalSide::Right => PageInlineSpan::from_edges(
+                    available_block_track.left_x(),
+                    available_block_track.right_x() - advance,
+                ),
+                PhysicalSide::Top | PhysicalSide::Bottom => {
+                    unreachable!("a vertical principal flow has a horizontal block track")
+                }
+            };
+            RootInlineCanvasPlacement::RemainingTrack {
+                block_track,
+                inline_origin: self.inline_origin,
+            }
+        }
     }
 }
 
@@ -1683,6 +1766,17 @@ pub(in crate::layout) struct LayoutBuilder<'a> {
     pub(in crate::layout) target_references: TargetReferenceSnapshot,
     pub(in crate::layout) has_normal_flow_target_references: bool,
     pub(in crate::layout) document_canvas_background: Option<DocumentCanvasBackground>,
+    /// The resolved static scroll translation for an embedded document root.
+    /// A child document's propagated canvas paint is materialized after root
+    /// layout, so it must retain the same viewport-relative translation as
+    /// the captured root contents.
+    /// <https://www.w3.org/TR/css-scroll-snap-1/#scroll-snap-model>
+    pub(in crate::layout) document_canvas_scroll_translation: PaintTranslation,
+    /// The root box area used to size and position a propagated canvas image.
+    ///
+    /// This belongs to the document canvas rather than its selected paint
+    /// source: an eligible body background is treated as root-specified.
+    pub(in crate::layout) document_canvas_root_positioning_area: Option<PaintBackgroundArea>,
     pub(in crate::layout) document_canvas_overflow: DocumentCanvasResolution,
     /// Insets introduced by active document-canvas (`html`/`body`) boxes.
     ///
@@ -1712,6 +1806,14 @@ pub(in crate::layout) struct LayoutBuilder<'a> {
     /// named blank page.
     pub(in crate::layout) current_page_selected_name: Option<String>,
     pub(in crate::layout) last_block_layout_outcome: BlockLayoutOutcome,
+    /// Exact used geometry reported by the most recently completed principal
+    /// formatting context for its transform effect. This survives paint-tree
+    /// capture so transforms never infer their reference box from ink.
+    pub(in crate::layout) last_principal_transform_box: Option<assets::TransformReferenceBox>,
+    /// Number of active real-element `preserve-3d` rendering contexts during
+    /// layout. Ordinary DOM descendants need retained `flat` boundaries even
+    /// when they have no independent paint effect.
+    pub(in crate::layout) preserve_3d_context_depth: usize,
     pub(in crate::layout) current_page_name: Option<String>,
     pub(in crate::layout) current_page_context: PageContext,
     /// Immutable initial containing block used by document viewport-relative
@@ -1733,15 +1835,19 @@ pub(in crate::layout) struct LayoutBuilder<'a> {
     /// fragmentainer must not re-cascade that subtree.
     pub(in crate::layout) dom_page_boundary_summaries:
         HashMap<(ElementId, Option<String>), (ResolvedPageBoundaryValues, PageBoundaryValues)>,
-    /// Pure auto-height table estimates reused by speculative pagination
-    /// probes. The key includes the source table and its containing inline
-    /// span; rollback never changes either input.
-    pub(in crate::layout) speculative_table_height_estimates: HashMap<(ElementId, u32), f32>,
+    /// Table wrapper height estimates reused by speculative pagination
+    /// probes. The key includes the source table, containing inline span, and
+    /// resolved block-size constraints so an intrinsic flex probe cannot
+    /// reuse a specified or stretched wrapper measurement.
+    pub(in crate::layout) speculative_table_height_estimates:
+        HashMap<TableHeightEstimateCacheKey, f32>,
     /// Row-height plans produced while probing an avoid-constrained table.
-    /// They are reusable by the accepted table layout when its source rows
-    /// and resolved track width are unchanged.
+    /// They are reusable by the accepted table layout only when its source
+    /// rows, resolved track width, and wrapper block-size constraint agree.
+    /// A flex/grid stretch replay supplies that last constraint after an
+    /// intrinsic probe has already measured the same rows.
     pub(in crate::layout) speculative_table_height_plans:
-        HashMap<(ElementId, u32), table::TableHeightPlan>,
+        HashMap<TableHeightPlanCacheKey, table::TableHeightPlan>,
     pub(in crate::layout) footnote_measurements: Vec<FootnoteMeasurement>,
     /// Measurements captured from the paint-producing pagination pass. They
     /// validate that the committed call-to-page assignment matches the page
@@ -1791,6 +1897,11 @@ pub(in crate::layout) struct LayoutBuilder<'a> {
     /// its own isolated measurement. This second stack prevents the estimator
     /// from recursively invoking itself through an intervening floated child.
     pub(in crate::layout) active_auto_float_measurement_fallbacks: Vec<ElementId>,
+    /// Complete adjoining block-start margin sets handed from a parent flow
+    /// traversal to the child currently being laid out. The child retains its
+    /// local margin delta for placement, but needs the complete set when its
+    /// own transparent first child continues the same collapse.
+    pub(in crate::layout) inherited_adjoining_start_margins: Vec<LayoutLength>,
     pub(in crate::layout) cursor_y: f32,
     pub(in crate::layout) content_left: f32,
     pub(in crate::layout) content_right: f32,
@@ -1814,6 +1925,8 @@ pub(in crate::layout) struct LayoutBuilder<'a> {
     /// that needs the visual coordinate space.
     pub(in crate::layout) inline_split_float_exclusion_query_offset: RelativeOffset,
     pub(in crate::layout) content_logical_inline_size_stack: Vec<f32>,
+    /// Active query containers, scoped to their descendants' used styles.
+    pub(in crate::layout) container_unit_contexts: Vec<ContainerUnitContext>,
     /// Definite content-box inline sizes of active anonymous multicolumns.
     ///
     /// This is distinct from an element's own logical inline-size stack: a
@@ -1822,13 +1935,13 @@ pub(in crate::layout) struct LayoutBuilder<'a> {
     pub(in crate::layout) multicol_column_containing_blocks: Vec<MulticolColumnContainingBlock>,
     pub(in crate::layout) intrinsic_inline_percentage_basis_stack:
         Vec<IntrinsicInlinePercentageBasis>,
-    pub(in crate::layout) inline_static_position: Option<InlineStaticPosition>,
+    pub(in crate::layout) inline_static_position: Option<StaticPositionCapture>,
     pub(in crate::layout) text_box_line_trim_stack: Vec<TextBoxLineTrim>,
     /// Per-block capture stack for line slots selected by inline layout.
     ///
     /// A nested block owns a nested capture and exports its result through
     /// `BlockLayoutOutcome`, preventing ancestors from double-counting it.
-    pub(in crate::layout) clamp_line_slot_captures: Vec<usize>,
+    pub(in crate::layout) clamp_line_slot_captures: Vec<ClampLineSlotCapture>,
     /// Suppress positioned-layer creation while a formatting context collects
     /// line items before a dedicated positioned-descendant pass.
     pub(in crate::layout) positioned_inline_layout_suppression_depth: usize,
@@ -1896,6 +2009,9 @@ pub(in crate::layout) struct LayoutBuilder<'a> {
     /// One-shot wrapper block sizes passed from flex/grid item placement to a
     /// root table formatting context.
     pub(in crate::layout) table_wrapper_block_size_overrides: Vec<Option<BorderBoxLength>>,
+    /// One-shot containing-block sizing contracts passed to absolutely
+    /// positioned table roots.
+    pub(in crate::layout) positioned_table_sizing: Vec<Option<PositionedTableSizing>>,
     pub(in crate::layout) truncate_page_start_margins: bool,
     pub(in crate::layout) avoid_inside_retry_depth: usize,
     pub(in crate::layout) out_of_flow_prebreak_suppression_depth: usize,
@@ -1937,21 +2053,43 @@ pub(in crate::layout) struct LayoutBuilder<'a> {
     pub(in crate::layout) font_system: Box<FontSystem>,
     pub(in crate::layout) bookmarks: Vec<Bookmark>,
     pub(in crate::layout) positioned_layers: Vec<PositionedPaintLayer>,
+    /// Logical positioned principals already committed to a final page.
+    /// This is a debug-time backstop for speculative retries, which ownership
+    /// alone cannot relate across separate executions.
+    pub(in crate::layout) committed_positioned_paint_identities:
+        HashSet<(DocumentPageIndex, PositionedPaintCommitKey)>,
+    /// Nested positioned scratch layout owns its pending page-local layers
+    /// until its transaction restores the enclosing page sequence. A page
+    /// break reached during that scratch pass must not flush a provisional
+    /// layer into the real document.
+    pub(in crate::layout) positioned_paint_transaction_depth: usize,
+    /// Exclusive page count for the scratch layout of a positioned subtree
+    /// whose ancestor `overflow: clip` chain proves later fragments cannot
+    /// affect static PDF output. `None` preserves normal, potentially-visible
+    /// fragmentation semantics.
+    pub(in crate::layout) positioned_scratch_page_limit: Option<usize>,
     pub(in crate::layout) fixed_layers: Vec<FixedPaintLayer>,
     /// Positioned flex descendants captured during temporary multicolumn
     /// layout, awaiting replay against the committed containing block.
     pub(in crate::layout) deferred_multicol_positioned_children:
         Vec<DeferredMulticolPositionedChild>,
+    pub(in crate::layout) multicol_positioned_containing_block_spans:
+        Vec<MulticolPositionedContainingBlockSpan>,
+    pub(in crate::layout) next_multicol_positioned_containing_block_span_id: u64,
+    /// Open positioned-containing-block spans while temporary multicolumn
+    /// layout is capturing descendants. This mirrors `containing_blocks` so a
+    /// deferred descendant can retain the stable span identity of its owner.
+    pub(in crate::layout) active_multicol_positioned_containing_block_spans: Vec<u64>,
     /// Nesting depth of temporary multicolumn layout that captures positioned
     /// flex descendants. Only the outermost owner may replay the queue.
     pub(in crate::layout) multicol_positioned_replay_capture_depth: usize,
     /// Furthest page reached by a committed absolutely positioned margin box.
     ///
-    /// This is deliberately separate from `pending_positioned_page_span_target`:
+    /// This is deliberately separate from `pending_positioned_fragmentation`:
     /// transparent abspos geometry normally does not create blank pages, but a
     /// viewport-fixed layer must replay across its complete final page span.
     pub(in crate::layout) absolute_positioned_page_span_target: Option<usize>,
-    pub(in crate::layout) pending_positioned_page_span_target: Option<usize>,
+    pub(in crate::layout) pending_positioned_fragmentation: PendingPositionedFragmentation,
     pub(in crate::layout) next_paint_source_order: usize,
     pub(in crate::layout) overflow_clips: Vec<OverflowClip>,
     pub(in crate::layout) active_scroll_snap_scopes: Vec<scroll_snap::ActiveScrollSnapScope>,
@@ -2010,11 +2148,24 @@ pub(in crate::layout) struct FootnoteMeasurement {
 /// area is page-dependent in paged media, but image sizing and positioning stay
 /// anchored to the root background positioning area:
 /// <https://www.w3.org/TR/css-backgrounds-3/#special-backgrounds>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) enum DocumentCanvasBackgroundSource {
+    /// The HTML root supplied the propagated canvas background.
+    Root,
+    /// The eligible first `body` supplied the fallback canvas background.
+    EligibleBodyFallback,
+}
+
+/// The selected propagated canvas background and its CSS-defined source.
+///
+/// The source is significant: a root background prevents the eligible body's
+/// background from propagating, while a body fallback has initial used
+/// background values on the body itself.
+/// <https://www.w3.org/TR/css-backgrounds-3/#special-backgrounds>.
 #[derive(Debug, Clone, PartialEq)]
 pub(in crate::layout) struct DocumentCanvasBackground {
     pub(in crate::layout) style: ComputedStyle,
-    pub(in crate::layout) root_background_defined: bool,
-    pub(in crate::layout) root_positioning_area: Option<PaintBackgroundArea>,
+    pub(in crate::layout) source: DocumentCanvasBackgroundSource,
 }
 
 /// Pending block-container text-box trimming for one inline formatting context.
@@ -2071,6 +2222,33 @@ impl FirstFormattedLineState {
     pub(in crate::layout) fn consume_next_formatted_line(&mut self) {
         self.pending_first_formatted_line = false;
         self.pending_typographic_pseudos = false;
+    }
+}
+
+/// One ancestor eligible to provide container-relative length axes.
+///
+/// The physical content-box axes are retained independently because CSS
+/// container-relative units select the nearest eligible container per axis.
+/// <https://drafts.csswg.org/css-conditional-5/#container-lengths>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct ContainerUnitContext {
+    pub(in crate::layout) physical_width: PhysicalContentWidth,
+    pub(in crate::layout) physical_height: PhysicalContentHeight,
+    pub(in crate::layout) writing_mode: WritingMode,
+    pub(in crate::layout) container_type: ContainerType,
+}
+
+impl ContainerUnitContext {
+    pub(in crate::layout) fn supplies_physical_width(self) -> bool {
+        matches!(self.container_type, ContainerType::Size)
+            || (matches!(self.container_type, ContainerType::InlineSize)
+                && !self.writing_mode.has_vertical_lines())
+    }
+
+    pub(in crate::layout) fn supplies_physical_height(self) -> bool {
+        matches!(self.container_type, ContainerType::Size)
+            || (matches!(self.container_type, ContainerType::InlineSize)
+                && self.writing_mode.has_vertical_lines())
     }
 }
 
@@ -2138,6 +2316,10 @@ pub(in crate::layout) struct BlockLayoutOutcome {
     pub(in crate::layout) static_border_box: Option<PaintRect>,
     /// Line-selection slots produced by this block's in-flow contents.
     pub(in crate::layout) clamp_line_slots: usize,
+    /// This block selected a local automatic clamp point or captured a local
+    /// discard-region break. Its following in-flow siblings are outside that
+    /// continuation; this is not a page or column break.
+    pub(in crate::layout) has_local_continuation_cutoff: bool,
     /// The last destination fragment committed by an in-flow child before
     /// this block applies its own used block-size constraints.
     ///
@@ -2149,6 +2331,20 @@ pub(in crate::layout) struct BlockLayoutOutcome {
     /// the parent tests its next normal-flow sibling for overflow.
     /// <https://www.w3.org/TR/css-break-3/#box-splitting>
     pub(in crate::layout) in_flow_child_fragment_end: Option<InFlowFragmentEnd>,
+}
+
+/// Result captured while one block lays out its direct inline line sequence.
+///
+/// The line count crosses the legacy inline-layout boundary, while the local
+/// cutoff flag preserves the distinct Overflow 4 continuation controller.
+/// <https://drafts.csswg.org/css-overflow-4/#line-clamp-containers>
+#[derive(Debug, Clone, Copy, Default)]
+pub(in crate::layout) struct ClampLineSlotCapture {
+    pub(in crate::layout) line_slots: usize,
+    /// Measured content-box advance of the selected inline source. This is
+    /// the automatic-clamp traversal's debit at a mixed-flow boundary.
+    pub(in crate::layout) block_advance: crate::units::ContentBoxLength,
+    pub(in crate::layout) has_local_continuation_cutoff: bool,
 }
 
 /// A destination-page flow endpoint committed by a descendant formatting
@@ -2208,14 +2404,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn render_options_enable_html_presentational_hints_by_default() {
-        assert!(RenderOptions::default().presentational_hints);
+    fn document_canvas_background_sources_remain_distinct() {
+        assert_ne!(
+            DocumentCanvasBackgroundSource::Root,
+            DocumentCanvasBackgroundSource::EligibleBodyFallback
+        );
+    }
 
-        let options = RenderOptions {
-            presentational_hints: false,
-            ..RenderOptions::default()
-        };
-        assert!(!options.presentational_hints);
+    #[test]
+    fn render_options_do_not_expose_document_page_geometry() {
+        let options = RenderOptions::default();
+        assert_eq!(
+            PageContext::from_options(&options).margins,
+            PageMargins::DEFAULT
+        );
     }
 
     #[test]
@@ -2227,6 +2429,18 @@ mod tests {
         assert_eq!(options.media_environment().resolution_dppx, 2.0);
         assert!(options.set_device_resolution_dppx(0.0).is_err());
         assert!(options.set_device_resolution_dppx(f32::NAN).is_err());
+    }
+
+    #[test]
+    fn render_options_carry_color_scheme_preference_into_media_environment() {
+        let options = RenderOptions {
+            color_scheme_preference: crate::css::ColorSchemePreference::Dark,
+            ..RenderOptions::default()
+        };
+        assert_eq!(
+            options.media_environment().color_scheme_preference,
+            crate::css::ColorSchemePreference::Dark,
+        );
     }
 
     #[test]
@@ -2255,5 +2469,95 @@ mod tests {
         assert_eq!(context.logical_block_size(WritingMode::VerticalRl), 600.0);
         assert_eq!(context.logical_inline_size(WritingMode::SidewaysLr), 400.0);
         assert_eq!(context.logical_block_size(WritingMode::SidewaysLr), 600.0);
+    }
+
+    #[test]
+    fn completed_document_canvas_projects_root_track_for_vertical_and_sideways_flows() {
+        let completion = CompletedDocumentCanvas {
+            body: None,
+            source_page: DocumentPageIndex::new(0),
+            source_block_track: PageInlineSpan::from_edges(0.0, 100.0),
+            inline_origin: PageTopBlockPosition::new(12.0),
+            inline_end_inset: layout_pt(0.0),
+            block_track_occupancy: layout_pt(100.0),
+            block_end_inset: layout_pt(7.0),
+            trailing_child_block_margin: layout_pt(11.0),
+        };
+
+        let vertical_rl = WritingModeAxes::new(WritingMode::VerticalRl, Direction::Ltr);
+        let vertical_lr = WritingModeAxes::new(WritingMode::VerticalLr, Direction::Ltr);
+        let sideways_rl = WritingModeAxes::new(WritingMode::SidewaysRl, Direction::Ltr);
+        let sideways_lr = WritingModeAxes::new(WritingMode::SidewaysLr, Direction::Ltr);
+
+        assert_eq!(
+            completion.root_inline_block_track_advance(vertical_rl),
+            layout_pt(111.0)
+        );
+        assert_eq!(
+            completion.root_inline_block_track_advance(vertical_lr),
+            layout_pt(107.0)
+        );
+        assert_eq!(
+            completion.root_inline_block_track_advance(sideways_rl),
+            layout_pt(118.0)
+        );
+        assert_eq!(
+            completion.root_inline_block_track_advance(sideways_lr),
+            layout_pt(118.0)
+        );
+    }
+
+    #[test]
+    fn completed_document_canvas_selects_remaining_or_next_root_track() {
+        let completion = CompletedDocumentCanvas {
+            body: None,
+            source_page: DocumentPageIndex::new(0),
+            source_block_track: PageInlineSpan::from_edges(0.0, 100.0),
+            inline_origin: PageTopBlockPosition::new(12.0),
+            inline_end_inset: layout_pt(0.0),
+            block_track_occupancy: layout_pt(100.0),
+            block_end_inset: layout_pt(0.0),
+            trailing_child_block_margin: layout_pt(0.0),
+        };
+        let axes = WritingModeAxes::new(WritingMode::VerticalRl, Direction::Ltr);
+
+        assert!(!completion.exhausts_root_block_track(axes, 101.0));
+        assert!(completion.exhausts_root_block_track(axes, 100.0));
+    }
+
+    #[test]
+    fn completed_document_canvas_resolves_a_page_local_root_placement() {
+        let completion = CompletedDocumentCanvas {
+            body: None,
+            source_page: DocumentPageIndex::new(2),
+            source_block_track: PageInlineSpan::from_edges(0.0, 100.0),
+            inline_origin: PageTopBlockPosition::new(17.0),
+            inline_end_inset: layout_pt(0.0),
+            block_track_occupancy: layout_pt(40.0),
+            block_end_inset: layout_pt(0.0),
+            trailing_child_block_margin: layout_pt(0.0),
+        };
+        let remaining = completion.resolve_root_inline_placement(
+            WritingModeAxes::new(WritingMode::VerticalLr, Direction::Ltr),
+            PageInlineSpan::from_edges(0.0, 100.0),
+        );
+        assert_eq!(
+            remaining,
+            RootInlineCanvasPlacement::RemainingTrack {
+                block_track: PageInlineSpan::from_edges(40.0, 100.0),
+                inline_origin: PageTopBlockPosition::new(17.0),
+            }
+        );
+
+        let next_page = completion.resolve_root_inline_placement(
+            WritingModeAxes::new(WritingMode::VerticalLr, Direction::Ltr),
+            PageInlineSpan::from_edges(0.0, 40.0),
+        );
+        assert_eq!(
+            next_page,
+            RootInlineCanvasPlacement::NextPage {
+                inline_origin: PageTopBlockPosition::new(17.0),
+            }
+        );
     }
 }

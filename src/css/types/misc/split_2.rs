@@ -10,6 +10,7 @@ impl ElementSignature {
             attrs,
             namespace_attrs,
             opaque_id: next_element_signature_opaque_id(),
+            source_element_id: None,
             sibling_index: None,
             sibling_signatures: ElementSiblingSignatureList::empty(),
             child_signatures: ElementSiblingSignatureList::empty(),
@@ -21,6 +22,28 @@ impl ElementSignature {
             resolved_direction: None,
             resolved_language: ResolvedLanguage::Unresolved,
         }
+    }
+
+    /// Return the null-namespace attribute addressed by an unprefixed CSS
+    /// `attr()` name on this selector snapshot.
+    ///
+    /// This mirrors DOM lookup so computed-time typed `attr()` substitutions
+    /// retain the host-language case semantics used by deferred generated
+    /// content.
+    /// <https://drafts.csswg.org/css-values-5/#attr-notation>
+    pub(crate) fn unprefixed_css_attr(&self, name: &str) -> Option<&str> {
+        self.namespace_attrs
+            .iter()
+            .find(|attribute| {
+                crate::css::unprefixed_attr_name_matches(
+                    &self.namespace_url,
+                    self.document_is_html,
+                    &attribute.namespace_url,
+                    &attribute.local_name,
+                    name,
+                )
+            })
+            .map(|attribute| attribute.value.as_str())
     }
 
     #[cfg(test)]
@@ -65,6 +88,7 @@ impl ElementSignature {
         let has_target_descendant =
             selected_sibling.is_some_and(|sibling| sibling.has_target_descendant);
         let document_direction = selected_sibling.and_then(|sibling| sibling.document_direction);
+        let source_element_id = selected_sibling.and_then(|sibling| sibling.source_element_id);
         Self {
             tag: tag.into(),
             namespace_url: selected_sibling
@@ -78,6 +102,7 @@ impl ElementSignature {
                 .map(|sibling| sibling.namespace_attrs.clone())
                 .unwrap_or(fallback_namespace_attrs),
             opaque_id,
+            source_element_id,
             sibling_index: Some(sibling_index),
             sibling_signatures,
             child_signatures,
@@ -187,6 +212,7 @@ impl ElementSignature {
             attrs: sibling.attrs,
             namespace_attrs: sibling.namespace_attrs,
             opaque_id: sibling.opaque_id,
+            source_element_id: sibling.source_element_id,
             sibling_index: Some(index),
             sibling_signatures: self.sibling_signatures.clone(),
             child_signatures: sibling.children,
@@ -209,6 +235,7 @@ impl ElementSignature {
             attrs: child.attrs,
             namespace_attrs: child.namespace_attrs,
             opaque_id: child.opaque_id,
+            source_element_id: child.source_element_id,
             sibling_index: Some(index),
             sibling_signatures: self.child_signatures.clone(),
             child_signatures: child.children,

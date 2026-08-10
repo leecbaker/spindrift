@@ -4,10 +4,23 @@ use crate::text::{
     inter_character_gap_allowed_between_text, is_css_preserved_document_space,
     line_end_letter_spacing_width, trim_css_collapsible_whitespace,
     trim_end_css_collapsible_whitespace, trim_start_css_collapsible_whitespace,
-    typographic_unit_count, typographic_unit_ranges,
+    typographic_unit_ranges,
 };
+use std::rc::Rc;
 
-mod split_1;
-pub(in crate::layout) use self::split_1::*;
-mod split_2;
-pub(in crate::layout) use self::split_2::*;
+mod anonymous_content;
+pub(in crate::layout) use self::anonymous_content::*;
+mod atom_geometry;
+pub(in crate::layout) use self::atom_geometry::*;
+mod hanging_punctuation;
+pub(in crate::layout) use self::hanging_punctuation::*;
+mod justification;
+pub(in crate::layout) use self::justification::*;
+mod pseudo_elements;
+pub(in crate::layout) use self::pseudo_elements::*;
+mod text_paint;
+pub(in crate::layout) use self::text_paint::*;
+mod text_shaping;
+pub(in crate::layout) use self::text_shaping::*;
+mod whitespace;
+pub(in crate::layout) use self::whitespace::*;

@@ -1,8 +1,37 @@
 use super::system::span_boundary_needs_join_control;
 use crate::CssColor;
-use crate::css::{ComputedLineHeight, WritingMode};
+use crate::css::{ComputedLineHeight, ContentLanguage, WritingMode};
 use crate::document::paint::geometry::PaintDisplacement;
 use crate::document::paint::text::{RenderedGlyph, RenderedGlyphKind, RenderedLine};
+
+#[test]
+fn css_text_classifies_controls_before_whitespace_processing() {
+    assert_eq!(
+        classify_css_text_scalar('\u{000c}'),
+        CssTextScalar::VisibleControl(VisibleControlCharacter('\u{000c}'))
+    );
+    assert_eq!(
+        classify_css_text_scalar('\r'),
+        CssTextScalar::CarriageReturn
+    );
+    assert_eq!(classify_css_text_scalar('\n'), CssTextScalar::SegmentBreak);
+    assert_eq!(classify_css_text_scalar('\t'), CssTextScalar::Tab);
+    assert_eq!(
+        classify_css_text_scalar('\u{0080}'),
+        CssTextScalar::VisibleControl(VisibleControlCharacter('\u{0080}'))
+    );
+    assert!(is_css_collapsible_whitespace('\r'));
+    assert!(!is_css_collapsible_whitespace('\u{000c}'));
+}
+
+#[test]
+fn css_text_materializes_controls_as_visible_common_symbols() {
+    assert_eq!(
+        css_text_rendering_text("A\u{000b}\u{000c}\u{007f}\u{009f}B"),
+        "A\u{25a0}\u{25a0}\u{25a0}\u{25a0}B"
+    );
+    assert_eq!(css_text_rendering_text("A\rB\tC\nD"), "A B\tC\nD");
+}
 
 #[test]
 fn rendered_line_alignment_reverses_the_stored_glyph_origin_adjustment() {
@@ -28,7 +57,7 @@ fn arabic_visual_ranges_are_emitted_in_reverse_cluster_order() {
     let mut style = ComputedStyle::initial();
     style.direction = Direction::Ltr;
     let mut system = FontSystem::new();
-    let ranges = system.visual_ranges_for_unwrapped_text("السلامعليكم", &style);
+    let ranges = system.visual_ranges_for_unwrapped_text("السلامعليكم", style.used_direction());
     assert_eq!(
         ranges
             .iter()
@@ -65,7 +94,7 @@ fn rtl_flag_emoji_visual_range_precedes_the_hebrew_run() {
     let mut system = FontSystem::new();
 
     let visual_text = system
-        .visual_ranges_for_unwrapped_text(text, &style)
+        .visual_ranges_for_unwrapped_text(text, style.used_direction())
         .into_iter()
         .map(|range| &text[range.range])
         .collect::<String>();
@@ -137,6 +166,63 @@ fn ch_advance_preserves_layout_length_type() {
     let ch_advance: LayoutLength = system.ch_advance(&style);
 
     assert!(ch_advance > layout_pt(0.0));
+}
+
+#[tokio::test]
+async fn glyph_metrics_use_the_css_font_size_without_size_adjust() {
+    let stylesheet = parse_stylesheet(
+        &Css::from_string(
+            r#"@font-face {
+                font-family: MetricFace;
+                src: url("tests/fixtures/wpt/css/css-fonts/Ahem.ttf");
+            }"#,
+        )
+        .with_base_path(".")
+        .expect("current directory should be a valid file URL"),
+    );
+    let mut system = FontSystem::start_loading()
+        .load_stylesheet_fonts(&[stylesheet])
+        .finish()
+        .await;
+    let mut style = ComputedStyle::initial();
+    style.font_family = FontFamily::Names(vec!["MetricFace".to_string()]);
+    style.font_size = 40.0;
+
+    let font_id = system
+        .font_for_character(&style, '0')
+        .expect("the loaded face should cover U+0030");
+    assert_eq!(system.used_font_size_for_font(&style, font_id), Some(40.0));
+}
+
+#[tokio::test]
+async fn upright_ch_uses_the_zero_glyph_face_and_its_size_adjustment() {
+    let stylesheet = parse_stylesheet(
+        &Css::from_string(
+            r#"@font-face {
+                font-family: MetricZero;
+                src: url("tests/fixtures/wpt/css/css-fonts/Ahem.ttf");
+                size-adjust: 50%;
+                unicode-range: U+0030;
+            }"#,
+        )
+        .with_base_path(".")
+        .expect("current directory should be a valid file URL"),
+    );
+    let mut system = FontSystem::start_loading()
+        .load_stylesheet_fonts(&[stylesheet])
+        .finish()
+        .await;
+    let mut style = ComputedStyle::initial();
+    style.font_family = FontFamily::Names(vec!["MetricZero".to_string()]);
+    style.font_size = 40.0;
+    style.line_height = 40.0;
+    style.writing_mode = WritingMode::VerticalRl;
+    style.text_orientation = TextOrientation::Upright;
+
+    // Ahem lacks a vertical advance table, so CSS falls back to the matched
+    // face's one-em advance. Its `size-adjust` makes that 20pt, rather than
+    // the 40pt U+0020 line-metric fallback face.
+    assert_eq!(system.ch_advance(&style), layout_pt(20.0));
 }
 
 #[test]
@@ -354,6 +440,53 @@ fn rtl_visual_slice_mirrors_glyph_without_rewriting_source_text() {
 }
 
 #[test]
+fn ltr_visual_slice_does_not_mirror_punctuation_from_its_fragment_direction() {
+    let mut system = FontSystem::new();
+    let mut rtl_fragment_style = ComputedStyle::initial();
+    rtl_fragment_style.font_family = FontFamily::SansSerif;
+    rtl_fragment_style.font_size = 12.0;
+    rtl_fragment_style.line_height = 14.4;
+    rtl_fragment_style.direction = Direction::Rtl;
+
+    let fragment = system
+        .shape_visual_ordered_line(
+            ">",
+            &rtl_fragment_style,
+            rtl_fragment_style.line_height,
+            ResolvedBidiDirection::Ltr,
+        )
+        .expect("visual text should shape");
+    let mut ltr_reference_style = rtl_fragment_style.clone();
+    ltr_reference_style.direction = Direction::Ltr;
+    let ltr_reference = system
+        .shape_visual_ordered_line(
+            ">",
+            &ltr_reference_style,
+            ltr_reference_style.line_height,
+            ResolvedBidiDirection::Ltr,
+        )
+        .expect("LTR reference should shape");
+
+    let glyph = fragment
+        .runs
+        .iter()
+        .flat_map(|run| run.glyphs.iter())
+        .find(|glyph| glyph.source_text() == ">")
+        .expect("source punctuation should emit a glyph");
+    let reference_glyph = ltr_reference
+        .runs
+        .iter()
+        .flat_map(|run| run.glyphs.iter())
+        .find(|glyph| glyph.source_text() == ">")
+        .expect("reference punctuation should emit a glyph");
+
+    assert_eq!(
+        glyph.rendered.painted_id(),
+        reference_glyph.rendered.painted_id()
+    );
+}
+
+#[test]
 fn isolate_override_uses_first_strong_isolate_controls() {
     let mut style = ComputedStyle::initial();
     style.unicode_bidi = UnicodeBidi::IsolateOverride;
@@ -392,7 +525,7 @@ fn isolate_override_resolves_the_full_line_before_visual_paint_shaping() {
     let text = "> \u{2068}\u{202e}אבגד > abcd\u{202c}\u{2069} >";
 
     let visual_text = system
-        .visual_ranges_for_unwrapped_text(text, &style)
+        .visual_ranges_for_unwrapped_text(text, style.used_direction())
         .into_iter()
         .map(|range| text_without_bidi_format_controls(&text[range.range]).into_owned())
         .collect::<String>();
@@ -444,7 +577,7 @@ fn rtl_base_direction_marks_neutral_punctuation_as_an_rtl_visual_slice() {
     style.direction = Direction::Rtl;
     let text = "> a > ב > c >";
 
-    let ranges = system.visual_ranges_for_unwrapped_text(text, &style);
+    let ranges = system.visual_ranges_for_unwrapped_text(text, style.used_direction());
 
     assert!(ranges.iter().any(|visual_range| {
         text.get(visual_range.range.clone()) == Some(">")
@@ -460,7 +593,7 @@ fn isolate_controls_keep_the_outer_bidi_sequence_neutral() {
     let text = "a - \u{2066}[1]\u{2069}...";
 
     let visual_text = system
-        .visual_ranges_for_unwrapped_text(text, &style)
+        .visual_ranges_for_unwrapped_text(text, style.used_direction())
         .into_iter()
         .map(|range| text_without_bidi_format_controls(&text[range.range]).into_owned())
         .collect::<String>();
@@ -516,7 +649,7 @@ fn reusable_parley_layout_does_not_invalidate_prior_shaping() {
     ]);
     assert!(!styled.is_empty());
 
-    let visual_ranges = system.visual_ranges_for_unwrapped_text("abc אבג", &style);
+    let visual_ranges = system.visual_ranges_for_unwrapped_text("abc אבג", style.used_direction());
     assert!(!visual_ranges.is_empty());
     let later = system.shape_text_runs_with_parley("later shaped run", &style);
 
@@ -1924,7 +2057,7 @@ async fn measured_keep_all_retains_hyphen_boundaries() {
 #[tokio::test]
 async fn normal_thai_named_entities_remain_one_complex_context_unit() {
     let mut style = ComputedStyle::initial();
-    style.language = Some("th".to_string());
+    style.language = ContentLanguage::from_html_attribute("th");
     let text = "กรุงเทพคือสวยงาม";
 
     assert_eq!(
@@ -1937,7 +2070,7 @@ async fn normal_thai_named_entities_remain_one_complex_context_unit() {
 async fn auto_phrase_uses_icu_word_boundaries_for_known_languages() {
     let mut style = ComputedStyle::initial();
     style.word_break = CssWordBreak::AutoPhrase;
-    style.language = Some("ja".to_string());
+    style.language = ContentLanguage::from_html_attribute("ja");
     let text = "東京へ行きましょう。";
 
     let auto_phrase = measured_break_opportunities(text, &style);
@@ -1980,7 +2113,7 @@ async fn auto_phrase_uses_kham_thai_named_entity_boundaries() {
     let text = "กรุงเทพคือสวยงาม";
     let mut style = ComputedStyle::initial();
     style.word_break = CssWordBreak::AutoPhrase;
-    style.language = Some("th".to_string());
+    style.language = ContentLanguage::from_html_attribute("th");
     let breaks = measured_break_opportunities(text, &style);
     let mut expected = phrase_boundaries(text, AutoPhraseLanguage::Thai)
         .expect("declared Thai has Kham phrase analysis")
@@ -1994,7 +2127,7 @@ async fn auto_phrase_uses_kham_thai_named_entity_boundaries() {
 async fn auto_phrase_keeps_gl_wj_and_zwj_boundaries_protected() {
     let mut style = ComputedStyle::initial();
     style.word_break = CssWordBreak::AutoPhrase;
-    style.language = Some("ja".to_string());
+    style.language = ContentLanguage::from_html_attribute("ja");
 
     for text in [
         "東京\u{00a0}へ\u{00a0}行きましょう。",
@@ -2018,7 +2151,7 @@ async fn auto_phrase_keeps_gl_wj_and_zwj_boundaries_protected() {
 async fn auto_phrase_suppresses_authored_soft_hyphens() {
     let mut style = ComputedStyle::initial();
     style.word_break = CssWordBreak::AutoPhrase;
-    style.language = Some("en".to_string());
+    style.language = ContentLanguage::from_html_attribute("en");
     let text = "con\u{00ad}sid\u{00ad}eration";
 
     assert_eq!(

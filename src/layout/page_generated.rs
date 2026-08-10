@@ -1,4 +1,8 @@
 use super::*;
+use crate::css::component_values::{
+    css_leading_function_matching, css_leading_ident, parse_css_string_token,
+    split_css_top_level_delimiter,
+};
 use crate::text::is_css_collapsible_whitespace;
 use crate::text::trim_css_collapsible_whitespace;
 
@@ -580,9 +584,8 @@ fn parse_page_content(value: &str) -> Option<Vec<PageContentPart>> {
 }
 
 fn parse_page_attr_function(value: &str) -> Option<(PageContentPart, &str)> {
-    let body = strip_ascii_function(value, "attr")?;
-    let (argument, tail) = split_balanced_function_argument(body)?;
-    let mut parts = split_top_level_commas(argument);
+    let (argument, tail) = css_leading_function_matching(value, "attr")?;
+    let mut parts = split_css_top_level_delimiter(argument, ',');
     if parts.is_empty() || parts.len() > 2 {
         return None;
     }
@@ -596,7 +599,7 @@ fn parse_page_attr_function(value: &str) -> Option<(PageContentPart, &str)> {
 }
 
 fn parse_page_image_token(value: &str) -> Option<(BackgroundImage, &str)> {
-    if let Some((src, tail)) = parse_css_url_token(value) {
+    if let Some((src, tail)) = css::parse_css_url_token(value) {
         return Some((
             BackgroundImage::Url {
                 src,
@@ -630,58 +633,11 @@ fn parse_page_image_token(value: &str) -> Option<(BackgroundImage, &str)> {
 }
 
 fn starts_with_ident(value: &str, ident: &str) -> bool {
-    let Some(prefix) = value.get(..ident.len()) else {
-        return false;
-    };
-    prefix.eq_ignore_ascii_case(ident)
-        && value[ident.len()..]
-            .chars()
-            .next()
-            .is_none_or(|character| !is_css_ident_continue(character))
-}
-
-fn is_css_ident_continue(character: char) -> bool {
-    character == '-'
-        || character == '_'
-        || character.is_ascii_alphanumeric()
-        || character as u32 >= 0x80
-}
-
-fn split_leading_ident(value: &str) -> Option<(&str, &str)> {
-    let value = value.trim_start();
-    let mut end = 0usize;
-    for (index, character) in value.char_indices() {
-        if index == 0 {
-            if !(character == '_'
-                || character == '-'
-                || character.is_ascii_alphabetic()
-                || character as u32 >= 0x80)
-            {
-                return None;
-            }
-        } else if !is_css_ident_continue(character) {
-            break;
-        }
-        end = index + character.len_utf8();
-    }
-    (end > 0).then(|| (&value[..end], &value[end..]))
-}
-
-fn parse_css_url_token(value: &str) -> Option<(String, &str)> {
-    let body = strip_ascii_function(value, "url")?;
-    let (argument, tail) = split_balanced_function_argument(body)?;
-    let argument = argument.trim();
-    if let Some((url, string_tail)) = parse_css_string_token(argument) {
-        if string_tail.trim().is_empty() {
-            return Some((url, tail));
-        }
-        return None;
-    }
-    (!argument.is_empty()).then(|| (argument.to_string(), tail))
+    css_leading_ident(value).is_some_and(|(found, _)| found.eq_ignore_ascii_case(ident))
 }
 
 fn parse_generated_quote_token(value: &str) -> Option<(GeneratedQuote, &str)> {
-    let (ident, tail) = split_leading_ident(value)?;
+    let (ident, tail) = css_leading_ident(value)?;
     let quote = match ident.to_ascii_lowercase().as_str() {
         "open-quote" => GeneratedQuote::Open,
         "close-quote" => GeneratedQuote::Close,
@@ -693,8 +649,7 @@ fn parse_generated_quote_token(value: &str) -> Option<(GeneratedQuote, &str)> {
 }
 
 fn parse_generated_leader_function(value: &str) -> Option<(String, &str)> {
-    let body = strip_ascii_function(value, "leader")?;
-    let (argument, tail) = split_balanced_function_argument(body)?;
+    let (argument, tail) = css_leading_function_matching(value, "leader")?;
     let argument = argument.trim();
     let leader = if let Some((text, string_tail)) = parse_css_string_token(argument) {
         if !string_tail.trim().is_empty() {
@@ -713,29 +668,23 @@ fn parse_generated_leader_function(value: &str) -> Option<(String, &str)> {
 }
 
 fn parse_content_function(value: &str) -> Option<(PageContentPart, &str)> {
-    if let Some(after_open) = strip_ascii_function(value, "counter") {
-        let (argument, tail) = split_balanced_function_argument(after_open)?;
+    if let Some((argument, tail)) = css_leading_function_matching(value, "counter") {
         return parse_counter_function(argument).map(|part| (part, tail));
     }
-    if let Some(after_open) = strip_ascii_function(value, "counters") {
-        let (argument, tail) = split_balanced_function_argument(after_open)?;
+    if let Some((argument, tail)) = css_leading_function_matching(value, "counters") {
         return parse_counters_function(argument).map(|part| (part, tail));
     }
-    if let Some(after_open) = strip_ascii_function(value, "target-counter") {
-        let (argument, tail) = split_balanced_function_argument(after_open)?;
+    if let Some((argument, tail)) = css_leading_function_matching(value, "target-counter") {
         return parse_target_counter_function(argument).map(|part| (part, tail));
     }
-    if let Some(after_open) = strip_ascii_function(value, "target-text") {
-        let (argument, tail) = split_balanced_function_argument(after_open)?;
+    if let Some((argument, tail)) = css_leading_function_matching(value, "target-text") {
         return parse_target_text_function(argument).map(|part| (part, tail));
     }
-    if let Some(after_open) = strip_ascii_function(value, "string") {
-        let (argument, tail) = split_balanced_function_argument(after_open)?;
+    if let Some((argument, tail)) = css_leading_function_matching(value, "string") {
         let (name, keyword) = parse_named_assignment_arguments(argument)?;
         return Some((PageContentPart::NamedString { name, keyword }, tail));
     }
-    if let Some(after_open) = strip_ascii_function(value, "element") {
-        let (argument, tail) = split_balanced_function_argument(after_open)?;
+    if let Some((argument, tail)) = css_leading_function_matching(value, "element") {
         let (name, keyword) = parse_named_assignment_arguments(argument)?;
         return Some((PageContentPart::RunningElement { name, keyword }, tail));
     }
@@ -743,7 +692,7 @@ fn parse_content_function(value: &str) -> Option<(PageContentPart, &str)> {
 }
 
 fn parse_counters_function(argument: &str) -> Option<PageContentPart> {
-    let arguments = split_top_level_commas(argument);
+    let arguments = split_css_top_level_delimiter(argument, ',');
     if !(2..=3).contains(&arguments.len()) {
         return None;
     }
@@ -765,7 +714,7 @@ fn parse_counters_function(argument: &str) -> Option<PageContentPart> {
 }
 
 fn parse_counter_function(argument: &str) -> Option<PageContentPart> {
-    let arguments = split_top_level_commas(argument);
+    let arguments = split_css_top_level_delimiter(argument, ',');
     let name = arguments.first()?.trim();
     let style = if let Some(argument) = arguments.get(1) {
         Some(css::parse_list_style_type(argument.trim())?)
@@ -795,7 +744,7 @@ fn parse_counter_function(argument: &str) -> Option<PageContentPart> {
 /// the typed target for the later, post-pagination resolution step:
 /// <https://www.w3.org/TR/css-gcpm-3/#target-counter>.
 fn parse_target_counter_function(argument: &str) -> Option<PageContentPart> {
-    let arguments = split_top_level_commas(argument);
+    let arguments = split_css_top_level_delimiter(argument, ',');
     if !(2..=3).contains(&arguments.len()) {
         return None;
     }
@@ -823,7 +772,7 @@ fn parse_target_counter_function(argument: &str) -> Option<PageContentPart> {
 /// taken from a target element:
 /// <https://www.w3.org/TR/css-gcpm-3/#target-text>.
 fn parse_target_text_function(argument: &str) -> Option<PageContentPart> {
-    let arguments = split_top_level_commas(argument);
+    let arguments = split_css_top_level_delimiter(argument, ',');
     if !(1..=2).contains(&arguments.len()) {
         return None;
     }
@@ -851,14 +800,11 @@ fn parse_target_reference(value: &str) -> Option<css::TargetReference> {
     {
         return Some(css::TargetReference::Fragment(text));
     }
-    if let Some(after_open) = strip_ascii_function(value, "url") {
-        let (argument, tail) = split_balanced_function_argument(after_open)?;
+    if let Some((target, tail)) = css::parse_css_url_token(value) {
         if !tail.trim().is_empty() {
             return None;
         }
-        return Some(css::TargetReference::Fragment(strip_css_string_quotes(
-            argument.trim(),
-        )));
+        return Some(css::TargetReference::Fragment(target));
     }
     value
         .strip_prefix('#')
@@ -867,7 +813,7 @@ fn parse_target_reference(value: &str) -> Option<css::TargetReference> {
 }
 
 fn parse_named_assignment_arguments(argument: &str) -> Option<(String, String)> {
-    let arguments = split_top_level_commas(argument);
+    let arguments = split_css_top_level_delimiter(argument, ',');
     let name = arguments
         .first()?
         .trim()
@@ -928,106 +874,12 @@ fn assignment_starts_page_fragment(assignment: &NamedStringAssignment) -> bool {
     assignment.placement.starts_page_fragment && assignment.placement.border_box.is_some()
 }
 
-fn strip_ascii_function<'a>(value: &'a str, name: &str) -> Option<&'a str> {
-    let prefix = value.get(..name.len())?;
-    if !prefix.eq_ignore_ascii_case(name) {
-        return None;
-    }
-    value[name.len()..].trim_start().strip_prefix('(')
-}
-
-fn split_balanced_function_argument(value_after_open: &str) -> Option<(&str, &str)> {
-    let mut depth = 0usize;
-    let mut quote = None;
-    let mut escaped = false;
-    for (index, character) in value_after_open.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if quote.is_some() {
-            if character == '\\' {
-                escaped = true;
-            } else if Some(character) == quote {
-                quote = None;
-            }
-            continue;
-        }
-        match character {
-            '"' | '\'' => quote = Some(character),
-            '(' => depth += 1,
-            ')' if depth == 0 => {
-                return Some((&value_after_open[..index], &value_after_open[index + 1..]));
-            }
-            ')' => depth = depth.checked_sub(1)?,
-            _ => {}
-        }
-    }
-    None
-}
-
-fn split_top_level_commas(value: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut start = 0usize;
-    let mut depth = 0usize;
-    let mut quote = None;
-    let mut escaped = false;
-    for (index, character) in value.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if quote.is_some() {
-            if character == '\\' {
-                escaped = true;
-            } else if Some(character) == quote {
-                quote = None;
-            }
-            continue;
-        }
-        match character {
-            '"' | '\'' => quote = Some(character),
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
-                parts.push(&value[start..index]);
-                start = index + 1;
-            }
-            _ => {}
-        }
-    }
-    parts.push(&value[start..]);
-    parts
-}
-
-fn parse_css_string_token(value: &str) -> Option<(String, &str)> {
-    let mut chars = value.char_indices();
-    let (_, quote) = chars.next()?;
-    if !matches!(quote, '"' | '\'') {
-        return None;
-    }
-    let mut output = String::new();
-    let mut escaped = false;
-    for (index, character) in chars {
-        if escaped {
-            output.push('\\');
-            output.push(character);
-            escaped = false;
-        } else if character == '\\' {
-            escaped = true;
-        } else if character == quote {
-            return Some((output, &value[index + character.len_utf8()..]));
-        } else {
-            output.push(character);
-        }
-    }
-    None
-}
-
-fn strip_css_string_quotes(value: &str) -> String {
-    value.replace(['"', '\''], "")
-}
-
+/// Decode escapes in already-selected page-generated text.
+///
+/// This operates on stored text fragments after CSS declaration parsing, not
+/// on CSS component values. It remains local to the page-generated-text
+/// grammar because feeding arbitrary text back through a CSS tokenizer would
+/// incorrectly assign identifier or string-token semantics to it.
 fn decode_css_escapes(value: &str) -> String {
     let mut output = String::new();
     let mut chars = value.chars().peekable();

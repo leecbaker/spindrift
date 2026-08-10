@@ -15,6 +15,43 @@ use std::collections::BTreeMap;
 /// untouched; only the emitted glyph ink changes.
 const SYNTHETIC_BOLD_STROKE_EM: f32 = 1.0 / 24.0;
 
+/// Apply a Filter Effects lowering in encoded sRGB immediately before the
+/// PDF output conversion.  This is the color-space boundary required by
+/// Filter Effects Level 1, rather than a matrix in whichever ICC space the
+/// source CSS color happened to use.
+fn filtered_color(
+    color: crate::CssColor,
+    transform: crate::css::BoundedSrgbColorTransform,
+) -> crate::CssColor {
+    // A filter-free scope must retain the CSS color until the PDF output
+    // boundary chooses its final calibrated space. Converting even an
+    // identity transform through sRGB here clips wide-gamut samples before
+    // `PdfColorPlan` can select Display-P3.
+    // <https://www.w3.org/TR/css-color-4/#color-conversion>
+    if transform == crate::css::BoundedSrgbColorTransform::IDENTITY {
+        return color;
+    }
+    crate::color::apply_bounded_srgb_filter_transform(color, transform)
+}
+
+fn set_filtered_fill_color(
+    content: &mut Content,
+    color: crate::CssColor,
+    color_mode: PdfColorMode,
+    transform: crate::css::BoundedSrgbColorTransform,
+) {
+    set_fill_color(content, filtered_color(color, transform), color_mode);
+}
+
+fn set_filtered_stroke_color(
+    content: &mut Content,
+    color: crate::CssColor,
+    color_mode: PdfColorMode,
+    transform: crate::css::BoundedSrgbColorTransform,
+) {
+    set_stroke_color(content, filtered_color(color, transform), color_mode);
+}
+
 pub(super) fn page_content_render<'a>(
     page: &crate::Page,
     embedded_fonts: &EmbeddedFontPlans<'_>,
@@ -42,14 +79,14 @@ pub(super) fn page_content_render<'a>(
         page_image_sources,
         page_image_pattern_sources,
         active_paint_transform: crate::document::paint::geometry::PaintTransform::identity(),
+        active_filter_color_transform: crate::css::BoundedSrgbColorTransform::IDENTITY,
     };
-    write_paint_tree(
-        &mut content,
-        page,
-        page.paint_tree(),
-        embedded_fonts,
-        &mut state,
-    );
+    // PDF only has affine 2D graphics-state transforms. Resolve retained
+    // CSS 3D rendering contexts at this backend boundary, after layout has
+    // completed and before the display list is consumed.
+    let mut paint_tree = page.paint_tree().clone();
+    paint_tree.resolve_affine_3d_contexts(page);
+    write_paint_tree(&mut content, page, &paint_tree, embedded_fonts, &mut state);
     PageContentRender {
         stream: content.finish().into_vec(),
         form_xobjects: forms,
@@ -67,7 +104,7 @@ fn write_paint_tree(
     embedded_fonts: &EmbeddedFontPlans<'_>,
     state: &mut PaintTreeRenderState<'_, '_>,
 ) {
-    write_stacking_context(content, page, &tree.root, embedded_fonts, state);
+    write_stacking_context(content, page, &tree.root, embedded_fonts, state, true);
 }
 
 struct PaintTreeRenderState<'a, 'b> {
@@ -86,6 +123,21 @@ struct PaintTreeRenderState<'a, 'b> {
     /// pattern matrices are page resources, so they must retain this mapping
     /// rather than assuming their tile origin is always page-aligned.
     active_paint_transform: crate::document::paint::geometry::PaintTransform,
+    /// An exact Filter Effects color transform inherited from isolated
+    /// ancestor groups.  CSS filters operate in sRGB before outer clips,
+    /// masks, and opacity; this state is therefore changed only while writing
+    /// the group's Form XObject contents.
+    active_filter_color_transform: crate::css::BoundedSrgbColorTransform,
+}
+
+impl PaintTreeRenderState<'_, '_> {
+    fn push_exact_filter(
+        &mut self,
+        filter: crate::css::ExactFilterLowering,
+    ) -> crate::css::UnitFilterAmount {
+        self.active_filter_color_transform = self.active_filter_color_transform.then(filter.color);
+        filter.alpha
+    }
 }
 
 impl PaintTreeRenderState<'_, '_> {
@@ -152,8 +204,10 @@ impl VectorPaintResources {
         pattern: &crate::document::paint::patterns::RenderedGradientPattern,
         next_object_id: &mut usize,
         page_size: PdfSize,
+        color_transform: crate::css::BoundedSrgbColorTransform,
     ) -> String {
-        let shading = self.gradient_resource(&pattern.gradient, next_object_id, page_size);
+        let gradient = transformed_gradient(&pattern.gradient, color_transform);
+        let shading = self.gradient_resource(&gradient, next_object_id, page_size);
         let name = format!("GP{}", self.tilings.len() + 1);
         let id = *next_object_id;
         *next_object_id += 1;
@@ -244,12 +298,29 @@ fn gradient_key(gradient: &RenderedGradient) -> String {
     format!("{gradient:?}")
 }
 
+fn transformed_gradient(
+    gradient: &RenderedGradient,
+    transform: crate::css::BoundedSrgbColorTransform,
+) -> RenderedGradient {
+    let mut gradient = gradient.clone();
+    let transform_stop = |stop: &mut crate::document::paint::paths::RenderedGradientStop| {
+        stop.color = filtered_color(stop.color, transform);
+    };
+    gradient.stops.iter_mut().for_each(transform_stop);
+    if let Some(periodic) = &mut gradient.periodic {
+        periodic.stops.iter_mut().for_each(transform_stop);
+    }
+    gradient.color_space = crate::css::CssColorSpace::Srgb;
+    gradient
+}
+
 fn write_stacking_context(
     content: &mut Content,
     page: &crate::Page,
     context: &crate::document::paint::stacking::PaintStackingContext,
     embedded_fonts: &EmbeddedFontPlans<'_>,
     state: &mut PaintTreeRenderState<'_, '_>,
+    is_page_root: bool,
 ) {
     if context.effects.suppresses_paint() {
         return;
@@ -293,8 +364,31 @@ fn write_stacking_context(
             crate::document::paint::effects::PaintEffectStep::ClipUnion(clips) => {
                 write_rect_union_clip(content, clips.clips())
             }
-            crate::document::paint::effects::PaintEffectStep::RoundedClip(clip) => {
-                write_rounded_clip(content, &clip)
+            crate::document::paint::effects::PaintEffectStep::ContouredOverflowClip(clip) => {
+                write_rect_clip(content, clip.bounds);
+                match &clip.contour {
+                    crate::document::paint::contours::BoxContentContour::Rect => {}
+                    crate::document::paint::contours::BoxContentContour::Rounded(rounded) => {
+                        write_rounded_clip(content, rounded)
+                    }
+                    crate::document::paint::contours::BoxContentContour::Path(path) => {
+                        write_rendered_path_clip(content, path)
+                    }
+                    crate::document::paint::contours::BoxContentContour::Empty => {
+                        write_rect_clip(
+                            content,
+                            crate::document::paint::geometry::PaintClip::new(
+                                clip.bounds.x(),
+                                clip.bounds.y(),
+                                0.0,
+                                0.0,
+                            ),
+                        );
+                    }
+                }
+            }
+            crate::document::paint::effects::PaintEffectStep::ScenePlaneClip(clip) => {
+                write_polygon_clip(content, &clip);
             }
             crate::document::paint::effects::PaintEffectStep::ClipPath(clip) => match clip {
                 crate::document::paint::effects::PaintClipPathEffect::Polygon(clip) => {
@@ -317,22 +411,27 @@ fn write_stacking_context(
             | crate::document::paint::effects::PaintEffectStep::Isolation => {}
         }
     }
-    // Direct primitive records retain their CSS paint order. A recursive
-    // effect-free context, however, preserves structural bands whose parent
-    // decoration can be emitted before its descendant records; it is not a
-    // proof that a descendant primitive is later composited paint.
-    let is_page_root = context.source_order == 0 && context.bounds.is_none();
-    let direct_paint_sequence = items.iter().all(|item| {
-        matches!(
-            item,
-            crate::document::paint::display_list::PaintDisplayItem::Operation(_)
-                | crate::document::paint::display_list::PaintDisplayItem::Primitive(_)
-        )
-    });
-    let cull_hidden_opaque_background = (is_page_root && direct_paint_sequence)
+    // The page-root Appendix-E tree may contain recursive effect-free
+    // contexts. Their descendants still participate in the root's final
+    // composited output, so the opaque-coverage proof must traverse those
+    // contexts rather than requiring a flat primitive list.
+    let cull_hidden_opaque_background = is_page_root
         || (!context.effects.ordered_steps().is_empty()
             && (effects_are_rectangular_clips_only(&context.effects)
                 || effects_are_axis_selective_clips_only(&context.effects)));
+    // The root's Appendix-E bands establish a complete paint order even when
+    // their entries are recursive stacking contexts rather than direct PDF
+    // primitives. `write_display_items_with_pending_rects` carries each
+    // ancestor's later sibling list into that recursive serialization, and
+    // its coverage collector accepts only effect-free (or fully accounted
+    // rectangular-clip) descendants. That is sufficient proof for invisible
+    // text coverage, but not for general background culling: backgrounds can
+    // have retained paint significance even when their pixels are covered.
+    //
+    // CSS 2.2 Appendix E: <https://www.w3.org/TR/CSS22/zindex.html>.
+    // ISO 32000-2:2020, 9.3.6 defines the invisible-text realization.
+    let allow_opaque_text_coverage_elision =
+        opaque_text_coverage_elision_allowed_in_context(is_page_root, &context.effects);
     write_display_items(
         content,
         page,
@@ -345,7 +444,7 @@ fn write_stacking_context(
         // composited output. Eliding only that underpaint avoids PDF edge
         // antialiasing sampling a CSS-hidden backdrop.
         cull_hidden_opaque_background,
-        cull_hidden_opaque_background,
+        allow_opaque_text_coverage_elision,
     );
     if scoped {
         content.restore_state();
@@ -398,8 +497,31 @@ fn write_effect_scope(
             crate::document::paint::effects::PaintEffectStep::ClipUnion(clips) => {
                 write_rect_union_clip(content, clips.clips())
             }
-            crate::document::paint::effects::PaintEffectStep::RoundedClip(clip) => {
-                write_rounded_clip(content, &clip)
+            crate::document::paint::effects::PaintEffectStep::ContouredOverflowClip(clip) => {
+                write_rect_clip(content, clip.bounds);
+                match &clip.contour {
+                    crate::document::paint::contours::BoxContentContour::Rect => {}
+                    crate::document::paint::contours::BoxContentContour::Rounded(rounded) => {
+                        write_rounded_clip(content, rounded)
+                    }
+                    crate::document::paint::contours::BoxContentContour::Path(path) => {
+                        write_rendered_path_clip(content, path)
+                    }
+                    crate::document::paint::contours::BoxContentContour::Empty => {
+                        write_rect_clip(
+                            content,
+                            crate::document::paint::geometry::PaintClip::new(
+                                clip.bounds.x(),
+                                clip.bounds.y(),
+                                0.0,
+                                0.0,
+                            ),
+                        );
+                    }
+                }
+            }
+            crate::document::paint::effects::PaintEffectStep::ScenePlaneClip(clip) => {
+                write_polygon_clip(content, &clip);
             }
             crate::document::paint::effects::PaintEffectStep::ClipPath(clip) => match clip {
                 crate::document::paint::effects::PaintClipPathEffect::Polygon(clip) => {
@@ -432,9 +554,7 @@ fn write_effect_scope(
         // its retained geometry. Other effect scopes remain atomic.
         effects_are_rectangular_clips_only(&scope.effects)
             || effects_are_axis_selective_clips_only(&scope.effects),
-        scope.effects == crate::document::paint::effects::PaintEffects::default()
-            || effects_are_rectangular_clips_only(&scope.effects)
-            || effects_are_axis_selective_clips_only(&scope.effects),
+        opaque_text_coverage_elision_allowed_in_context(false, &scope.effects),
     );
     if scoped {
         content.restore_state();
@@ -465,9 +585,13 @@ fn write_effect_scope_group(
     let mut form_content = Content::new();
     let mut form_scope = scope.clone();
     form_scope.effects = form_scope.effects.without_group_effects();
+    let parent_filter_transform = state.active_filter_color_transform;
+    let filter_alpha = exact_filter_lowering_for_scope(scope, page)
+        .map(|lowering| state.push_exact_filter(lowering));
     state.begin_form_dependencies();
     write_effect_scope(&mut form_content, page, &form_scope, embedded_fonts, state);
     let form_dependencies = state.finish_form_dependencies();
+    state.active_filter_color_transform = parent_filter_transform;
     state.forms.push(FormXObjectRender {
         id: reference.id,
         name: reference.name.clone(),
@@ -477,8 +601,11 @@ fn write_effect_scope_group(
         transparency_group: true,
     });
     content.save_state();
-    if scope.effects.opacity < 1.0
-        && let Some(resource_name) = paint_opacity_resource_name(scope.effects.opacity)
+    let group_alpha = filter_alpha.map_or(scope.effects.opacity, |filter_alpha| {
+        scope.effects.opacity * filter_alpha.value()
+    });
+    if group_alpha < 1.0
+        && let Some(resource_name) = paint_opacity_resource_name(group_alpha)
     {
         content.set_parameters(pdf_name(&resource_name));
     }
@@ -507,6 +634,9 @@ fn write_effect_group(
     let mut form_content = Content::new();
     let mut form_context = context.clone();
     form_context.effects = form_context.effects.without_group_effects();
+    let parent_filter_transform = state.active_filter_color_transform;
+    let filter_alpha = exact_filter_lowering_for_context(context, page)
+        .map(|lowering| state.push_exact_filter(lowering));
     state.begin_form_dependencies();
     write_stacking_context(
         &mut form_content,
@@ -514,8 +644,10 @@ fn write_effect_group(
         &form_context,
         embedded_fonts,
         state,
+        false,
     );
     let form_dependencies = state.finish_form_dependencies();
+    state.active_filter_color_transform = parent_filter_transform;
     state.forms.push(FormXObjectRender {
         id: reference.id,
         name: reference.name.clone(),
@@ -525,8 +657,11 @@ fn write_effect_group(
         transparency_group: true,
     });
     content.save_state();
-    if context.effects.opacity < 1.0
-        && let Some(resource_name) = paint_opacity_resource_name(context.effects.opacity)
+    let group_alpha = filter_alpha.map_or(context.effects.opacity, |filter_alpha| {
+        context.effects.opacity * filter_alpha.value()
+    });
+    if group_alpha < 1.0
+        && let Some(resource_name) = paint_opacity_resource_name(group_alpha)
     {
         content.set_parameters(pdf_name(&resource_name));
     }
@@ -536,6 +671,126 @@ fn write_effect_group(
     content.x_object(pdf_name(&reference.name));
     state.record_form_dependency(reference);
     content.restore_state();
+}
+
+/// Decide whether an exact color lowering can be distributed through every
+/// paint source in a Filter Effects group.  Anything we cannot prove is
+/// ordinary source-over paint is retained as a non-rendered raster filter;
+/// emitting it partially would violate filter-group semantics.
+fn exact_filter_lowering_for_context(
+    context: &crate::document::paint::stacking::PaintStackingContext,
+    page: &crate::Page,
+) -> Option<crate::css::ExactFilterLowering> {
+    let crate::document::paint::effects::PaintFilterEffect::Exact(lowering) =
+        context.effects.filter
+    else {
+        return None;
+    };
+    (context.effects.blend_mode == crate::document::paint::effects::PaintBlendMode::Normal
+        && crate::document::paint::display_list::PaintBand::ORDER
+            .into_iter()
+            .all(|band| {
+                context.bands.bands[band.index()]
+                    .iter()
+                    .all(|item| filter_lowering_capable_item(item, page))
+            }))
+    .then_some(lowering)
+}
+
+fn exact_filter_lowering_for_scope(
+    scope: &crate::document::paint::effects::PaintEffectScope,
+    page: &crate::Page,
+) -> Option<crate::css::ExactFilterLowering> {
+    let crate::document::paint::effects::PaintFilterEffect::Exact(lowering) = scope.effects.filter
+    else {
+        return None;
+    };
+    (scope.effects.blend_mode == crate::document::paint::effects::PaintBlendMode::Normal
+        && scope
+            .items
+            .iter()
+            .all(|item| filter_lowering_capable_item(item, page)))
+    .then_some(lowering)
+}
+
+fn filter_lowering_capable_item(
+    item: &crate::document::paint::display_list::PaintDisplayItem,
+    page: &crate::Page,
+) -> bool {
+    use crate::document::paint::display_list::PaintDisplayItem;
+    use crate::document::paint::effects::{PaintBlendMode, PaintFilterEffect};
+    use crate::document::paint::page::{PaintOperation, PaintPrimitive};
+
+    match item {
+        PaintDisplayItem::Link(_) => true,
+        PaintDisplayItem::Operation(operation) => match operation {
+            PaintOperation::Rect(_)
+            | PaintOperation::RoundedRect(_)
+            | PaintOperation::Stroke(_) => true,
+            PaintOperation::Line(index) => page.lines.get(*index).is_some(),
+            PaintOperation::Path(index) => page
+                .paths
+                .get(*index)
+                .is_some_and(path_filter_lowering_capable),
+            PaintOperation::GradientPattern(_) => true,
+            PaintOperation::Image(_)
+            | PaintOperation::ImagePattern(_)
+            | PaintOperation::SvgPattern(_)
+            | PaintOperation::OpaqueTextCoverage(_) => false,
+        },
+        PaintDisplayItem::Primitive(primitive) => match primitive {
+            PaintPrimitive::Rect(_)
+            | PaintPrimitive::RoundedRect(_)
+            | PaintPrimitive::Stroke(_)
+            | PaintPrimitive::Line(_) => true,
+            PaintPrimitive::Path(path) => path_filter_lowering_capable(path),
+            PaintPrimitive::GradientPattern(_) => true,
+            PaintPrimitive::Image(_)
+            | PaintPrimitive::ImagePattern(_)
+            | PaintPrimitive::SvgPattern(_)
+            | PaintPrimitive::OpaqueTextCoverage { .. } => false,
+        },
+        PaintDisplayItem::StackingContext(context) => {
+            context.effects.blend_mode == PaintBlendMode::Normal
+                && !matches!(
+                    context.effects.filter,
+                    PaintFilterEffect::RequiresRasterBackend | PaintFilterEffect::WillChange
+                )
+                && crate::document::paint::display_list::PaintBand::ORDER
+                    .into_iter()
+                    .all(|band| {
+                        context.bands.bands[band.index()]
+                            .iter()
+                            .all(|item| filter_lowering_capable_item(item, page))
+                    })
+        }
+        PaintDisplayItem::EffectScope(scope) => {
+            scope.effects.blend_mode == PaintBlendMode::Normal
+                && !matches!(
+                    scope.effects.filter,
+                    PaintFilterEffect::RequiresRasterBackend | PaintFilterEffect::WillChange
+                )
+                && scope
+                    .items
+                    .iter()
+                    .all(|item| filter_lowering_capable_item(item, page))
+        }
+    }
+}
+
+fn path_filter_lowering_capable(path: &crate::document::paint::paths::RenderedPath) -> bool {
+    use crate::document::paint::paths::RenderedPathPaint;
+    path.fill_paint.as_ref().is_none_or(|paint| {
+        matches!(
+            paint,
+            RenderedPathPaint::Solid(_) | RenderedPathPaint::Gradient(_)
+        )
+    }) && path.stroke_paint.as_ref().is_none_or(|paint| {
+        matches!(
+            paint,
+            RenderedPathPaint::Solid(_) | RenderedPathPaint::Gradient(_)
+        )
+    })
 }
 
 fn write_display_items(
@@ -560,7 +815,12 @@ fn write_display_items(
         &[],
         &[],
     );
-    flush_pending_rects(content, &mut pending_rects, state.color_mode);
+    flush_pending_rects(
+        content,
+        &mut pending_rects,
+        state.color_mode,
+        state.active_filter_color_transform,
+    );
 }
 
 /// Serialize display items while retaining adjacent opaque fill rectangles.
@@ -638,13 +898,25 @@ fn write_display_items_with_pending_rects(
                     later_item_lists,
                     Some(state),
                 );
-            flush_pending_rects(content, pending_rects, state.color_mode);
-            write_line_with_visibility(content, line, embedded_fonts, state.color_mode, invisible);
+            flush_pending_rects(
+                content,
+                pending_rects,
+                state.color_mode,
+                state.active_filter_color_transform,
+            );
+            write_line_with_visibility(
+                content,
+                line,
+                embedded_fonts,
+                state.color_mode,
+                state.active_filter_color_transform,
+                invisible,
+            );
         } else if let Some(rect) = display_item_rect(page, item, state) {
-            // Preserve ordinary display-list paint in the PDF.  Fully
+            // Preserve ordinary display-list paint in the PDF. Fully
             // covered fills can be elided only while serializing a clipped
             // scope, where the optimization prevents a duplicated clip edge
-            // from showing through antialiasing.  Applying it to every
+            // from showing through antialiasing. Applying it to every
             // opaque rectangle changes the authored stacking-context output
             // (and can discard tagged or otherwise significant content).
             let position = DisplayListPaintPosition {
@@ -681,13 +953,28 @@ fn write_display_items_with_pending_rects(
                 let rect = rect_with_output_fill(rect, state.color_mode);
                 if is_mergeable_fill_rect(&rect) {
                     if !pending_rects.try_push(&rect) {
-                        flush_pending_rects(content, pending_rects, state.color_mode);
+                        flush_pending_rects(
+                            content,
+                            pending_rects,
+                            state.color_mode,
+                            state.active_filter_color_transform,
+                        );
                         let pushed = pending_rects.try_push(&rect);
                         debug_assert!(pushed);
                     }
                 } else {
-                    flush_pending_rects(content, pending_rects, state.color_mode);
-                    write_rect(content, &rect, state.color_mode);
+                    flush_pending_rects(
+                        content,
+                        pending_rects,
+                        state.color_mode,
+                        state.active_filter_color_transform,
+                    );
+                    write_rect(
+                        content,
+                        &rect,
+                        state.color_mode,
+                        state.active_filter_color_transform,
+                    );
                 }
             }
         } else if let crate::document::paint::display_list::PaintDisplayItem::StackingContext(
@@ -696,6 +983,14 @@ fn write_display_items_with_pending_rects(
             && (context.effects == crate::document::paint::effects::PaintEffects::default()
                 || effects_are_rectangular_clips_only(&context.effects))
         {
+            if context.pdf_paint_boundary {
+                flush_pending_rects(
+                    content,
+                    pending_rects,
+                    state.color_mode,
+                    state.active_filter_color_transform,
+                );
+            }
             let context_items = crate::document::paint::display_list::PaintBand::ORDER
                 .into_iter()
                 .flat_map(|band| context.bands.bands[band.index()].iter().cloned())
@@ -708,7 +1003,12 @@ fn write_display_items_with_pending_rects(
                     state,
                 );
             if clipped {
-                flush_pending_rects(content, pending_rects, state.color_mode);
+                flush_pending_rects(
+                    content,
+                    pending_rects,
+                    state.color_mode,
+                    state.active_filter_color_transform,
+                );
                 content.save_state();
                 write_rectangular_clip_effects(content, &context.effects, state);
             }
@@ -738,8 +1038,21 @@ fn write_display_items_with_pending_rects(
                 &context_later_item_lists,
             );
             if clipped {
-                flush_pending_rects(content, pending_rects, state.color_mode);
+                flush_pending_rects(
+                    content,
+                    pending_rects,
+                    state.color_mode,
+                    state.active_filter_color_transform,
+                );
                 content.restore_state();
+            }
+            if context.pdf_paint_boundary {
+                flush_pending_rects(
+                    content,
+                    pending_rects,
+                    state.color_mode,
+                    state.active_filter_color_transform,
+                );
             }
         } else if let crate::document::paint::display_list::PaintDisplayItem::EffectScope(scope) =
             item
@@ -754,7 +1067,12 @@ fn write_display_items_with_pending_rects(
                     state,
                 );
             if clipped {
-                flush_pending_rects(content, pending_rects, state.color_mode);
+                flush_pending_rects(
+                    content,
+                    pending_rects,
+                    state.color_mode,
+                    state.active_filter_color_transform,
+                );
                 content.save_state();
                 write_rectangular_clip_effects(content, &scope.effects, state);
             }
@@ -780,11 +1098,21 @@ fn write_display_items_with_pending_rects(
                 &scope_later_item_lists,
             );
             if clipped {
-                flush_pending_rects(content, pending_rects, state.color_mode);
+                flush_pending_rects(
+                    content,
+                    pending_rects,
+                    state.color_mode,
+                    state.active_filter_color_transform,
+                );
                 content.restore_state();
             }
         } else {
-            flush_pending_rects(content, pending_rects, state.color_mode);
+            flush_pending_rects(
+                content,
+                pending_rects,
+                state.color_mode,
+                state.active_filter_color_transform,
+            );
             write_display_item(content, page, item, embedded_fonts, state);
         }
     }
@@ -860,7 +1188,12 @@ fn write_opaque_text_coverage(
         // Two distinct CSS text records must not share a fill, even when
         // both use invisible PDF text. A following ordinary rectangle may
         // still merge with the preceding record's opaque glyph coverage.
-        flush_pending_rects(content, pending_rects, state.color_mode);
+        flush_pending_rects(
+            content,
+            pending_rects,
+            state.color_mode,
+            state.active_filter_color_transform,
+        );
     }
     let coverage_fully_hidden = allow_opaque_text_coverage_elision
         && opaque_text_coverage_is_fully_hidden_with_state(
@@ -885,9 +1218,21 @@ fn write_opaque_text_coverage(
     // PDF paint, so retaining the pending batch lets equal opaque coverage on
     // either side coalesce into one fill without changing CSS paint output.
     if !invisible {
-        flush_pending_rects(content, pending_rects, state.color_mode);
+        flush_pending_rects(
+            content,
+            pending_rects,
+            state.color_mode,
+            state.active_filter_color_transform,
+        );
     }
-    write_line_with_visibility(content, line, embedded_fonts, state.color_mode, invisible);
+    write_line_with_visibility(
+        content,
+        line,
+        embedded_fonts,
+        state.color_mode,
+        state.active_filter_color_transform,
+        invisible,
+    );
     if coverage_fully_hidden {
         return;
     }
@@ -906,14 +1251,24 @@ fn write_opaque_text_coverage(
         if let Some(path) = page.paths.get(*path_index) {
             if let Some(rect) = opaque_text_coverage_rect_for_batch(path, state.color_mode) {
                 if !pending_rects.try_push(&rect) {
-                    flush_pending_rects(content, pending_rects, state.color_mode);
+                    flush_pending_rects(
+                        content,
+                        pending_rects,
+                        state.color_mode,
+                        state.active_filter_color_transform,
+                    );
                     let pushed = pending_rects.try_push(&rect);
                     debug_assert!(pushed, "verified opaque coverage rect is mergeable");
                 }
             } else {
                 // Do not turn clipped, transformed, patterned, or otherwise
                 // non-equivalent paths into page-space rectangles.
-                flush_pending_rects(content, pending_rects, state.color_mode);
+                flush_pending_rects(
+                    content,
+                    pending_rects,
+                    state.color_mode,
+                    state.active_filter_color_transform,
+                );
                 write_path(
                     content,
                     path,
@@ -921,6 +1276,7 @@ fn write_opaque_text_coverage(
                     state.next_object_id,
                     state.page_size,
                     state.color_mode,
+                    state.active_filter_color_transform,
                 );
             }
         }
@@ -929,7 +1285,12 @@ fn write_opaque_text_coverage(
     // invisible text, the companion opaque paths are its only visible paint,
     // so an equal adjacent fill may remain pending and coalesce safely.
     if !invisible {
-        flush_pending_rects(content, pending_rects, state.color_mode);
+        flush_pending_rects(
+            content,
+            pending_rects,
+            state.color_mode,
+            state.active_filter_color_transform,
+        );
     }
     if invisible && !pending_rects.rects.is_empty() {
         pending_rects.ends_with_invisible_text_coverage = true;
@@ -1370,7 +1731,7 @@ fn visible_rect_after_later_display_rects(
     later_item_lists: &[&[crate::document::paint::display_list::PaintDisplayItem]],
     state: &PaintTreeRenderState<'_, '_>,
 ) -> Vec<crate::document::paint::shapes::RenderedRect> {
-    if !is_opaque_fill_rect(rect) {
+    if rect.preserves_opaque_backdrop || !is_opaque_fill_rect(rect) {
         return vec![rect.clone()];
     }
     let mut covers = Vec::new();
@@ -1398,6 +1759,14 @@ fn visible_rect_after_later_display_rects(
         .filter(|cover| cover.fill != output_rect.fill)
         .cloned()
         .collect::<Vec<_>>();
+    let opaque_underpaint_culls = different_color_covers
+        .iter()
+        .filter(|cover| cover.culls_opaque_underpaint)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !opaque_underpaint_culls.is_empty() {
+        return visible_after_later_opaque_rects(rect, opaque_underpaint_culls.iter());
+    }
     if rect_area_is_covered_by_rects(rect, &different_color_covers) {
         Vec::new()
     } else {
@@ -1434,11 +1803,7 @@ fn transformed_opaque_rect_container_rect(
         || effects.opacity != 1.0
         || effects.needs_group()
         || effects.suppresses_paint()
-        || effects
-            .overflow_clip
-            .is_some_and(|clip| clip.width() > 0.0 && clip.height() > 0.0)
-        || effects.overflow_clip_union.is_some()
-        || effects.rounded_overflow_clip.is_some()
+        || effects.overflow_clip_effect.is_some()
         || effects.absolute_clip.is_some()
         || !matches!(
             effects.clip_path,
@@ -1462,7 +1827,9 @@ fn transformed_opaque_rect_container_rect(
     if !is_opaque_fill_rect(&rect) {
         return None;
     }
-    if let Some(clip) = effects.axis_selective_overflow_clip {
+    if let Some(crate::document::paint::contours::OverflowClipEffect::AxisSelective(clip)) =
+        effects.overflow_clip_effect
+    {
         let bounds = clip.bounds();
         let rect_bounds = rect.paint_rect();
         if (clip.clips_x()
@@ -1739,6 +2106,28 @@ fn effects_are_axis_selective_clips_only(
         })
 }
 
+/// Whether this serialization scope has a complete, direct paint-order proof
+/// for opaque text coverage elision.
+///
+/// The page root's Appendix-E band sequence orders every top-level sibling,
+/// including recursive negative and in-flow stacking contexts. Descendant
+/// contexts intentionally do not inherit that authority: their parent list
+/// may establish containment without proving that arbitrary local paint is
+/// later composited coverage. A rectangular clip is separately safe because
+/// the coverage collector accounts for the clip before accepting a rectangle.
+///
+/// <https://www.w3.org/TR/CSS22/zindex.html>
+fn opaque_text_coverage_elision_allowed_in_context(
+    is_page_root: bool,
+    effects: &crate::document::paint::effects::PaintEffects,
+) -> bool {
+    let has_effect_free_rectangular_clip = !effects.ordered_steps().is_empty()
+        && (effects_are_rectangular_clips_only(effects)
+            || effects_are_axis_selective_clips_only(effects));
+    (is_page_root && *effects == crate::document::paint::effects::PaintEffects::default())
+        || has_effect_free_rectangular_clip
+}
+
 /// Apply a pure rectangular-clip scope while retaining its descendants in the
 /// surrounding paint-order analysis. A clip changes geometry but not
 /// compositing, so its later opaque descendants can still prove coverage only
@@ -1772,6 +2161,16 @@ fn rectangular_clips_are_redundant_for_solid_images(
     let Some(clips) = rectangular_clips(effects) else {
         return false;
     };
+    // The page media box already bounds every page content stream. Repeating
+    // that same clip is a no-op, but it would split otherwise mergeable
+    // opaque fills into separate PDF graphics states and expose a fractional
+    // antialias seam at their shared CSS edge.
+    if clips
+        .iter()
+        .all(|clip| clip_is_page_media_box(*clip, state))
+    {
+        return true;
+    }
     !items.is_empty()
         && items.iter().all(|item| {
             matches!(
@@ -1911,7 +2310,12 @@ fn write_contained_opaque_rect_layer(
             .then_with(|| left.x().total_cmp(&right.x()))
     });
     for rect in &visible {
-        write_rect(content, rect, PdfColorMode::PreserveCssSpace);
+        write_rect(
+            content,
+            rect,
+            PdfColorMode::PreserveCssSpace,
+            crate::css::BoundedSrgbColorTransform::IDENTITY,
+        );
     }
 }
 
@@ -1984,7 +2388,7 @@ fn write_display_item(
             write_page_operation(content, page, operation, embedded_fonts, state);
         }
         crate::document::paint::display_list::PaintDisplayItem::StackingContext(context) => {
-            write_stacking_context(content, page, context, embedded_fonts, state);
+            write_stacking_context(content, page, context, embedded_fonts, state, false);
         }
         crate::document::paint::display_list::PaintDisplayItem::EffectScope(scope) => {
             write_effect_scope(content, page, scope, embedded_fonts, state);
@@ -2004,12 +2408,22 @@ fn write_page_operation(
     match operation {
         crate::document::paint::page::PaintOperation::Rect(index) => {
             if let Some(rect) = page.rects.get(*index) {
-                write_rect(content, rect, state.color_mode);
+                write_rect(
+                    content,
+                    rect,
+                    state.color_mode,
+                    state.active_filter_color_transform,
+                );
             }
         }
         crate::document::paint::page::PaintOperation::RoundedRect(index) => {
             if let Some(rect) = page.rounded_rects.get(*index) {
-                write_rounded_rect(content, rect, state.color_mode);
+                write_rounded_rect(
+                    content,
+                    rect,
+                    state.color_mode,
+                    state.active_filter_color_transform,
+                );
             }
         }
         crate::document::paint::page::PaintOperation::Path(index) => {
@@ -2021,12 +2435,18 @@ fn write_page_operation(
                     state.next_object_id,
                     state.page_size,
                     state.color_mode,
+                    state.active_filter_color_transform,
                 );
             }
         }
         crate::document::paint::page::PaintOperation::Stroke(index) => {
             if let Some(stroke) = page.strokes.get(*index) {
-                write_stroke(content, stroke, state.color_mode);
+                write_stroke(
+                    content,
+                    stroke,
+                    state.color_mode,
+                    state.active_filter_color_transform,
+                );
             }
         }
         crate::document::paint::page::PaintOperation::Image(index) => {
@@ -2060,6 +2480,7 @@ fn write_page_operation(
                     state.vector_paints,
                     state.next_object_id,
                     state.page_size,
+                    state.active_filter_color_transform,
                 );
             }
         }
@@ -2070,7 +2491,13 @@ fn write_page_operation(
         }
         crate::document::paint::page::PaintOperation::Line(index) => {
             if let Some(line) = page.lines.get(*index) {
-                write_line(content, line, embedded_fonts, state.color_mode);
+                write_line(
+                    content,
+                    line,
+                    embedded_fonts,
+                    state.color_mode,
+                    state.active_filter_color_transform,
+                );
             }
         }
         crate::document::paint::page::PaintOperation::OpaqueTextCoverage(index) => {
@@ -2078,7 +2505,13 @@ fn write_page_operation(
                 return;
             };
             if let Some(line) = page.lines.get(coverage.line_index) {
-                write_line(content, line, embedded_fonts, state.color_mode);
+                write_line(
+                    content,
+                    line,
+                    embedded_fonts,
+                    state.color_mode,
+                    state.active_filter_color_transform,
+                );
             }
             for path_index in &coverage.path_indices {
                 if let Some(path) = page.paths.get(*path_index) {
@@ -2089,6 +2522,7 @@ fn write_page_operation(
                         state.next_object_id,
                         state.page_size,
                         state.color_mode,
+                        state.active_filter_color_transform,
                     );
                 }
             }
@@ -2215,11 +2649,11 @@ impl PendingFillRects {
         if !is_mergeable_fill_rect(rect) {
             return false;
         }
-        let Some(first) = self.rects.first() else {
+        let Some(first_fill) = self.rects.first().and_then(|first| first.fill) else {
             self.rects.push(rect.clone());
             return true;
         };
-        if first.fill != rect.fill {
+        if Some(first_fill) != rect.fill {
             return false;
         }
         for pending in &mut self.rects {
@@ -2242,6 +2676,14 @@ impl PendingFillRects {
             .iter()
             .any(|pending| rects_intersect(pending, rect))
         {
+            // A single nonzero fill of overlapping opaque rectangles is their
+            // geometric union. Keeping it in this batch preserves CSS's
+            // composited output while preventing PDF rasterizers from
+            // antialiasing a shared fractional edge against an earlier fill.
+            if first_fill.is_opaque() {
+                self.rects.push(rect.clone());
+                return true;
+            }
             return false;
         }
         self.rects.push(rect.clone());
@@ -2253,13 +2695,14 @@ fn flush_pending_rects(
     content: &mut Content,
     pending: &mut PendingFillRects,
     color_mode: PdfColorMode,
+    color_transform: crate::css::BoundedSrgbColorTransform,
 ) {
     let Some(fill) = pending.rects.first().and_then(|rect| rect.fill) else {
         pending.ends_with_invisible_text_coverage = false;
         return;
     };
     let scoped_alpha = write_alpha_graphics_state(content, fill);
-    set_fill_color(content, fill, color_mode);
+    set_filtered_fill_color(content, fill, color_mode, color_transform);
     for rect in pending.rects.drain(..) {
         let rect = crate::document::paint::geometry::paint_rect_to_pdf(rect.paint_rect());
         content.rect(
@@ -2391,13 +2834,14 @@ pub(super) fn write_rect(
     content: &mut Content,
     rect: &crate::document::paint::shapes::RenderedRect,
     color_mode: PdfColorMode,
+    color_transform: crate::css::BoundedSrgbColorTransform,
 ) {
     let pdf_rect = crate::document::paint::geometry::paint_rect_to_pdf(rect.paint_rect());
     if let Some(fill) = rect.fill
         && fill.is_visible()
     {
         let scoped_alpha = write_alpha_graphics_state(content, fill);
-        set_fill_color(content, fill, color_mode);
+        set_filtered_fill_color(content, fill, color_mode, color_transform);
         content
             .rect(
                 pdf_rect.origin.x,
@@ -2413,7 +2857,7 @@ pub(super) fn write_rect(
     {
         let scoped_alpha = write_alpha_graphics_state(content, stroke);
         content.set_line_width(rect.stroke_width.points());
-        set_stroke_color(content, stroke, color_mode);
+        set_filtered_stroke_color(content, stroke, color_mode, color_transform);
         content
             .rect(
                 pdf_rect.origin.x,
@@ -2430,12 +2874,13 @@ pub(super) fn write_rounded_rect(
     content: &mut Content,
     rect: &RenderedRoundedRect,
     color_mode: PdfColorMode,
+    color_transform: crate::css::BoundedSrgbColorTransform,
 ) {
     if let Some(fill) = rect.fill
         && fill.is_visible()
     {
         let scoped_alpha = write_alpha_graphics_state(content, fill);
-        set_fill_color(content, fill, color_mode);
+        set_filtered_fill_color(content, fill, color_mode, color_transform);
         write_rounded_rect_path(content, rect);
         content.fill_nonzero();
         close_alpha_graphics_state(content, scoped_alpha);
@@ -2445,7 +2890,7 @@ pub(super) fn write_rounded_rect(
     {
         let scoped_alpha = write_alpha_graphics_state(content, stroke);
         content.set_line_width(rect.stroke_width.points());
-        set_stroke_color(content, stroke, color_mode);
+        set_filtered_stroke_color(content, stroke, color_mode, color_transform);
         write_rounded_rect_path(content, rect);
         content.stroke();
         close_alpha_graphics_state(content, scoped_alpha);
@@ -2538,6 +2983,7 @@ fn write_path(
     next_object_id: &mut usize,
     page_size: PdfSize,
     color_mode: PdfColorMode,
+    color_transform: crate::css::BoundedSrgbColorTransform,
 ) {
     if path.commands.is_empty() {
         return;
@@ -2567,6 +3013,7 @@ fn write_path(
                 next_object_id,
                 page_size,
                 color_mode,
+                color_transform,
             );
             write_path_stroke(
                 content,
@@ -2575,6 +3022,7 @@ fn write_path(
                 next_object_id,
                 page_size,
                 color_mode,
+                color_transform,
             );
         }
         RenderedPathPaintOrder::StrokeThenFill => {
@@ -2585,6 +3033,7 @@ fn write_path(
                 next_object_id,
                 page_size,
                 color_mode,
+                color_transform,
             );
             write_path_fill(
                 content,
@@ -2593,6 +3042,7 @@ fn write_path(
                 next_object_id,
                 page_size,
                 color_mode,
+                color_transform,
             );
         }
     }
@@ -2611,6 +3061,7 @@ fn write_path_fill(
     next_object_id: &mut usize,
     page_size: PdfSize,
     color_mode: PdfColorMode,
+    color_transform: crate::css::BoundedSrgbColorTransform,
 ) {
     let Some(fill) = path.fill_paint.as_ref() else {
         return;
@@ -2622,6 +3073,7 @@ fn write_path_fill(
         next_object_id,
         page_size,
         color_mode,
+        color_transform,
     ) else {
         return;
     };
@@ -2640,6 +3092,7 @@ fn write_path_stroke(
     next_object_id: &mut usize,
     page_size: PdfSize,
     color_mode: PdfColorMode,
+    color_transform: crate::css::BoundedSrgbColorTransform,
 ) {
     let Some(stroke) = path.stroke_paint.as_ref() else {
         return;
@@ -2651,6 +3104,7 @@ fn write_path_stroke(
         next_object_id,
         page_size,
         color_mode,
+        color_transform,
     ) else {
         return;
     };
@@ -2681,16 +3135,18 @@ fn write_path_fill_paint(
     next_object_id: &mut usize,
     page_size: PdfSize,
     color_mode: PdfColorMode,
+    color_transform: crate::css::BoundedSrgbColorTransform,
 ) -> Option<bool> {
     match paint {
         RenderedPathPaint::Solid(color) if color.is_visible() => {
             let alpha = write_alpha_graphics_state(content, *color);
-            set_fill_color(content, *color, color_mode);
+            set_filtered_fill_color(content, *color, color_mode, color_transform);
             Some(alpha)
         }
         RenderedPathPaint::Solid(_) => None,
         RenderedPathPaint::Gradient(gradient) => {
-            let resource = vector_paints.gradient_resource(gradient, next_object_id, page_size);
+            let gradient = transformed_gradient(gradient, color_transform);
+            let resource = vector_paints.gradient_resource(&gradient, next_object_id, page_size);
             if let Some(name) = &resource.alpha_gstate_name {
                 content.save_state().set_parameters(pdf_name(name));
             }
@@ -2720,16 +3176,18 @@ fn write_path_stroke_paint(
     next_object_id: &mut usize,
     page_size: PdfSize,
     color_mode: PdfColorMode,
+    color_transform: crate::css::BoundedSrgbColorTransform,
 ) -> Option<bool> {
     match paint {
         RenderedPathPaint::Solid(color) if color.is_visible() => {
             let alpha = write_alpha_graphics_state(content, *color);
-            set_stroke_color(content, *color, color_mode);
+            set_filtered_stroke_color(content, *color, color_mode, color_transform);
             Some(alpha)
         }
         RenderedPathPaint::Solid(_) => None,
         RenderedPathPaint::Gradient(gradient) => {
-            let resource = vector_paints.gradient_resource(gradient, next_object_id, page_size);
+            let gradient = transformed_gradient(gradient, color_transform);
+            let resource = vector_paints.gradient_resource(&gradient, next_object_id, page_size);
             if let Some(name) = &resource.alpha_gstate_name {
                 content.save_state().set_parameters(pdf_name(name));
             }
@@ -2822,6 +3280,7 @@ pub(super) fn write_stroke(
     content: &mut Content,
     stroke: &crate::document::paint::shapes::RenderedStroke,
     color_mode: PdfColorMode,
+    color_transform: crate::css::BoundedSrgbColorTransform,
 ) {
     if !stroke.color.is_visible() {
         return;
@@ -2839,7 +3298,7 @@ pub(super) fn write_stroke(
     let start = crate::document::paint::geometry::paint_point_to_pdf(start);
     let end = crate::document::paint::geometry::paint_point_to_pdf(end);
     content.set_line_width(stroke.stroke_width.points());
-    set_stroke_color(content, stroke.color, color_mode);
+    set_filtered_stroke_color(content, stroke.color, color_mode, color_transform);
     content
         .move_to(start.x, start.y)
         .line_to(end.x, end.y)
@@ -2966,11 +3425,12 @@ pub(super) fn write_image_pattern(
     pattern: &crate::document::paint::patterns::RenderedImagePattern,
     index: usize,
 ) {
-    write_tiling_pattern_fill(
+    write_transformed_tiling_pattern_fill(
         content,
         pattern.paint_rect(),
         &format!("P{}", index + 1),
         pattern.clip(),
+        pattern.transform(),
     );
 }
 
@@ -3014,8 +3474,10 @@ fn write_gradient_tiling_pattern(
     vector_paints: &mut VectorPaintResources,
     next_object_id: &mut usize,
     page_size: PdfSize,
+    color_transform: crate::css::BoundedSrgbColorTransform,
 ) {
-    let name = vector_paints.tiling_gradient_resource(pattern, next_object_id, page_size);
+    let name =
+        vector_paints.tiling_gradient_resource(pattern, next_object_id, page_size, color_transform);
     write_transformed_tiling_pattern_fill(
         content,
         pattern.paint_rect(),
@@ -3072,6 +3534,7 @@ fn write_svg_tiling_pattern(
             state.next_object_id,
             state.page_size,
             state.color_mode,
+            state.active_filter_color_transform,
         );
     }
     state.forms.push(FormXObjectRender {
@@ -3105,7 +3568,13 @@ fn write_svg_tiling_pattern(
             ),
         ),
     });
-    write_tiling_pattern_fill(content, pattern.paint_rect(), &name, pattern.clip());
+    write_transformed_tiling_pattern_fill(
+        content,
+        pattern.paint_rect(),
+        &name,
+        pattern.clip(),
+        pattern.transform(),
+    );
 }
 
 /// Serialize the supported solid-vector subset of an SVG paint-server cell.
@@ -3129,6 +3598,7 @@ pub(super) fn svg_path_pattern_tile_content(
             // should a supported vector paint require one.
             PdfSize::new(pattern.tile_size.width, pattern.tile_size.height),
             color_mode,
+            crate::css::BoundedSrgbColorTransform::IDENTITY,
         );
     }
     debug_assert!(resources.plans.is_empty());
@@ -3143,8 +3613,16 @@ pub(super) fn write_line(
     line: &crate::document::paint::text::RenderedLine,
     embedded_fonts: &EmbeddedFontPlans<'_>,
     color_mode: PdfColorMode,
+    color_transform: crate::css::BoundedSrgbColorTransform,
 ) {
-    write_line_with_visibility(content, line, embedded_fonts, color_mode, false);
+    write_line_with_visibility(
+        content,
+        line,
+        embedded_fonts,
+        color_mode,
+        color_transform,
+        false,
+    );
 }
 
 /// Serialize a retained CSS text-paint record, optionally without visible ink.
@@ -3159,9 +3637,17 @@ fn write_line_with_visibility(
     line: &crate::document::paint::text::RenderedLine,
     embedded_fonts: &EmbeddedFontPlans<'_>,
     color_mode: PdfColorMode,
+    color_transform: crate::css::BoundedSrgbColorTransform,
     invisible: bool,
 ) {
-    let wrote_line = write_rendered_line(content, line, embedded_fonts, color_mode, invisible);
+    let wrote_line = write_rendered_line(
+        content,
+        line,
+        embedded_fonts,
+        color_mode,
+        color_transform,
+        invisible,
+    );
     if !wrote_line && !line.text.is_empty() && line.runs.is_empty() {
         log::warn!(
             "skipping unshaped text line without a resolved embedded font: {:?}",
@@ -3175,6 +3661,7 @@ pub(super) fn write_rendered_line(
     line: &crate::document::paint::text::RenderedLine,
     embedded_fonts: &EmbeddedFontPlans<'_>,
     color_mode: PdfColorMode,
+    color_transform: crate::css::BoundedSrgbColorTransform,
     invisible: bool,
 ) -> bool {
     if !line.color.is_visible() {
@@ -3248,7 +3735,7 @@ pub(super) fn write_rendered_line(
         }
         if !text_started {
             scoped_alpha = write_alpha_graphics_state(content, line.color);
-            set_fill_color(content, line.color, color_mode);
+            set_filtered_fill_color(content, line.color, color_mode, color_transform);
             content.begin_text();
             if invisible {
                 content.set_text_rendering_mode(TextRenderingMode::Invisible);
@@ -3272,7 +3759,7 @@ pub(super) fn write_rendered_line(
             active_text_rendering_mode = visible_mode;
         }
         if synthetic_bold {
-            set_stroke_color(content, line.color, color_mode);
+            set_filtered_stroke_color(content, line.color, color_mode, color_transform);
             content.set_line_width(run.font_size * SYNTHETIC_BOLD_STROKE_EM);
         }
         let pdf_font_size = quantized_pdf_font_size(run.font_size);
@@ -3577,7 +4064,7 @@ fn pdf_name(name: &str) -> Name<'_> {
 #[cfg(test)]
 mod content_tests {
     use super::*;
-    use crate::document::paint::effects::{PaintEffectScope, PaintEffects};
+    use crate::document::paint::effects::{PaintBlendMode, PaintEffectScope, PaintEffects};
     use crate::document::paint::geometry::PaintStrokeWidth;
     use crate::document::paint::geometry::{PaintPoint, PaintRect, PaintSize};
     use crate::document::paint::images::RenderedImage;
@@ -3597,6 +4084,28 @@ mod content_tests {
             Vec::new(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn opaque_text_coverage_elision_requires_page_root_or_proven_clip_scope() {
+        let default = PaintEffects::default();
+        assert!(opaque_text_coverage_elision_allowed_in_context(
+            true, &default
+        ));
+        assert!(!opaque_text_coverage_elision_allowed_in_context(
+            false, &default
+        ));
+
+        let opacity = PaintEffects {
+            opacity: 0.5,
+            ..PaintEffects::default()
+        };
+        assert!(!opaque_text_coverage_elision_allowed_in_context(
+            true, &opacity
+        ));
+        assert!(!opaque_text_coverage_elision_allowed_in_context(
+            false, &opacity
+        ));
     }
 
     fn opaque_coverage_path(x: f32, width: f32) -> RenderedPath {
@@ -3702,6 +4211,7 @@ mod content_tests {
             page_image_sources: &[],
             page_image_pattern_sources: &[],
             active_paint_transform: crate::document::paint::geometry::PaintTransform::identity(),
+            active_filter_color_transform: crate::css::BoundedSrgbColorTransform::IDENTITY,
         };
         visible_rect_after_later_display_rects(page, items, 0, &page.rects[0], &[], &state)
     }
@@ -3781,6 +4291,44 @@ mod content_tests {
     }
 
     #[test]
+    fn serializer_proves_coverage_through_a_later_effect_free_stacking_context() {
+        let page = coverage_page(10.0);
+        let mut negative_z_context = crate::document::paint::stacking::PaintStackingContext {
+            source_order: 0,
+            stack_level: crate::document::paint::stacking::StackLevel::Integer(-1),
+            pdf_paint_boundary: false,
+            bands: crate::document::paint::display_list::PaintBandList::default(),
+            effects: PaintEffects::default(),
+            bounds: None,
+        };
+        negative_z_context.bands.bands
+            [crate::document::paint::display_list::PaintBand::Inline.index()]
+        .push(coverage_operation(0));
+        let mut later_context = crate::document::paint::stacking::PaintStackingContext {
+            source_order: 1,
+            stack_level: crate::document::paint::stacking::StackLevel::Auto,
+            pdf_paint_boundary: false,
+            bands: crate::document::paint::display_list::PaintBandList::default(),
+            effects: PaintEffects::default(),
+            bounds: None,
+        };
+        later_context.bands.bands[crate::document::paint::display_list::PaintBand::Inline.index()]
+            .push(coverage_operation(1));
+        let later = vec![
+            crate::document::paint::display_list::PaintDisplayItem::StackingContext(later_context),
+        ];
+
+        assert!(opaque_text_coverage_is_fully_hidden(
+            &page,
+            &page.opaque_text_coverages[0],
+            &negative_z_context.bands.bands
+                [crate::document::paint::display_list::PaintBand::Inline.index()],
+            0,
+            &[&later],
+        ));
+    }
+
+    #[test]
     fn serializer_retains_partially_covered_opaque_text_coverage() {
         let page = coverage_page(5.0);
         let items = vec![coverage_operation(0), coverage_operation(1)];
@@ -3803,6 +4351,105 @@ mod content_tests {
                 PaintEffectScope::new(
                     PaintEffects {
                         opacity: 0.5,
+                        ..PaintEffects::default()
+                    },
+                    None,
+                    vec![coverage_operation(1)],
+                ),
+            ),
+        ];
+
+        assert!(!opaque_text_coverage_is_fully_hidden(
+            &page,
+            &page.opaque_text_coverages[0],
+            &items,
+            0,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn serializer_rejects_non_direct_or_reversed_text_coverage() {
+        let page = coverage_page(10.0);
+
+        for effects in [
+            PaintEffects {
+                opacity: 0.5,
+                ..PaintEffects::default()
+            },
+            PaintEffects {
+                blend_mode: PaintBlendMode::Multiply,
+                ..PaintEffects::default()
+            },
+            PaintEffects {
+                isolation: true,
+                ..PaintEffects::default()
+            },
+            PaintEffects {
+                transform: Some(crate::document::paint::geometry::PaintTransform::translate(
+                    crate::document::paint::geometry::PaintTranslation::new(1.0, 0.0),
+                )),
+                ..PaintEffects::default()
+            },
+        ] {
+            let items = vec![
+                coverage_operation(0),
+                crate::document::paint::display_list::PaintDisplayItem::EffectScope(
+                    PaintEffectScope::new(effects, None, vec![coverage_operation(1)]),
+                ),
+            ];
+            assert!(!opaque_text_coverage_is_fully_hidden(
+                &page,
+                &page.opaque_text_coverages[0],
+                &items,
+                0,
+                &[],
+            ));
+        }
+
+        // A preceding context is not later composited paint just because it
+        // contains a matching opaque path.
+        let mut preceding_context = crate::document::paint::stacking::PaintStackingContext {
+            source_order: 0,
+            stack_level: crate::document::paint::stacking::StackLevel::Auto,
+            pdf_paint_boundary: false,
+            bands: crate::document::paint::display_list::PaintBandList::default(),
+            effects: PaintEffects::default(),
+            bounds: None,
+        };
+        preceding_context.bands.bands
+            [crate::document::paint::display_list::PaintBand::Inline.index()]
+        .push(coverage_operation(1));
+        let reversed_items = vec![
+            crate::document::paint::display_list::PaintDisplayItem::StackingContext(
+                preceding_context,
+            ),
+            coverage_operation(0),
+        ];
+        assert!(!opaque_text_coverage_is_fully_hidden(
+            &page,
+            &page.opaque_text_coverages[0],
+            &reversed_items,
+            1,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn serializer_rejects_coverage_truncated_by_a_rectangular_clip() {
+        let page = coverage_page(10.0);
+        let items = vec![
+            coverage_operation(0),
+            crate::document::paint::display_list::PaintDisplayItem::EffectScope(
+                PaintEffectScope::new(
+                    PaintEffects {
+                        overflow_clip_effect: Some(
+                            crate::document::paint::contours::OverflowClipEffect::Rect(
+                                crate::document::paint::geometry::PaintClip::new(
+                                    0.0, 0.0, 5.0, 10.0,
+                                ),
+                            ),
+                        ),
                         ..PaintEffects::default()
                     },
                     None,
@@ -3896,7 +4543,7 @@ mod content_tests {
     }
 
     #[test]
-    fn pending_fills_deduplicate_only_exactly_coincident_rectangles() {
+    fn pending_fills_batch_overlapping_opaque_rectangles_as_one_union() {
         let exact = opaque_rect(0.0, 10.0);
         let partial_overlap = opaque_rect(5.0, 10.0);
         let mut pending = PendingFillRects::default();
@@ -3904,8 +4551,8 @@ mod content_tests {
         assert!(pending.try_push(&exact));
         assert!(pending.try_push(&exact));
         assert_eq!(pending.rects.len(), 1);
-        assert!(!pending.try_push(&partial_overlap));
-        assert_eq!(pending.rects.len(), 1);
+        assert!(pending.try_push(&partial_overlap));
+        assert_eq!(pending.rects.len(), 2);
     }
 
     #[test]

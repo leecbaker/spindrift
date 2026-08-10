@@ -33,9 +33,12 @@ part of this parity measure rather than a separate raster-only baseline.
   painting, rather than being replaced with a CSS solid rectangle; this
   preserves source-coordinate extent, clipping, and edge coverage.
 - URL SVG background paths receive the CSS `background-clip` even when their
-  own redundant root-viewport clip has been elided. Positioned non-repeating
-  tiles therefore cannot leak outside the selected background painting area,
-  and retain the same visible edge geometry as equivalent replaced SVGs.
+  own redundant root-viewport clip has been elided. Fully non-repeating tiles
+  instead crop the root SVG source viewport to their resolved visible
+  destination before PDF path emission, avoiding a separate rectangular PDF
+  clip and its device-pixel edge seam. Positioned tiles therefore cannot leak
+  outside the selected background painting area and retain the same visible
+  edge geometry as equivalent replaced SVGs.
 - CSS Images 5 `object-view-box` resolves source selection before
   concrete-object sizing and uses the same mapping for inline, block, raster,
   and SVG replaced content. Empty, negative, and inapplicable source bounds

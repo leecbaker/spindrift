@@ -19,6 +19,7 @@ impl<'a> LayoutBuilder<'a> {
         table_style: &ComputedStyle,
         collapsed_geometry: Option<&CollapsedTableGeometry>,
         wrapper_border_box_block_size: Option<BorderBoxLength>,
+        positioned_table_block_content_size: Option<LogicalBlockContentSize>,
         wrapper_non_grid_block_size: LayoutLength,
     ) -> Option<ContentBoxLength> {
         let vertical_non_content =
@@ -69,6 +70,13 @@ impl<'a> LayoutBuilder<'a> {
                     assigned_grid_content_size.min(constraint_target)
                 }),
             );
+        }
+        if let Some(positioned_table_block_content_size) = positioned_table_block_content_size {
+            // Absolute positioning has already resolved this definite size in
+            // content-box space. Preserve that result as the table grid's
+            // distribution target instead of re-measuring the intrinsic row
+            // height from the cell contents.
+            return Some(positioned_table_block_content_size.content_box_length());
         }
         used_table_target_content_height(
             table_style,

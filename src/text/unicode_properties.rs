@@ -258,19 +258,44 @@ pub(crate) fn character_is_mandatory_line_break(character: char) -> bool {
     )
 }
 
-/// Return whether a character suppresses CSS Text's otherwise mandatory soft
-/// wrap opportunity adjacent to an atomic inline.
+/// The UAX #14 class that protects a CSS Text atomic-inline boundary.
 ///
-/// CSS Text makes replaced elements and other atomic inlines breakable on both
-/// sides, including next to U+00A0 NO-BREAK SPACE. The remaining `GL`, `WJ`,
-/// and `ZWJ` line-break classes retain their non-breaking behavior.
+/// Atomic inlines normally gain soft-wrap opportunities on both sides, but
+/// CSS Text keeps the UAX #14 `GL`, `WJ`, and `ZWJ` protections. U+00A0 is a
+/// deliberate compatibility exception to that atomic-inline override; other
+/// `GL` characters, including U+202F NARROW NO-BREAK SPACE, remain protected.
+///
+/// Keeping this distinct from CSS Text's *other space separator* classification
+/// prevents line-edge whitespace processing from accidentally changing UAX #14
+/// break behavior.
+/// <https://www.w3.org/TR/css-text-3/#line-breaking>
 /// <https://www.w3.org/TR/css-text-3/#line-break-details>
-pub(crate) fn character_blocks_atomic_inline_break(character: char) -> bool {
-    character != '\u{00a0}'
-        && matches!(
-            line_break_class(character),
-            LineBreak::Glue | LineBreak::WordJoiner | LineBreak::ZWJ
-        )
+/// <https://www.unicode.org/reports/tr14/#GL>
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Uax14BoundaryProtection {
+    None,
+    Glue,
+    WordJoiner,
+    ZeroWidthJoiner,
+}
+
+/// Classify a character's retained UAX #14 protection at an atomic-inline
+/// boundary.
+///
+/// This is intentionally not a generic line-break predicate: ordinary text
+/// boundaries are resolved by the complete UAX #14 segmenter, which preserves
+/// context-sensitive exceptions such as LB12a's break before `GL` after a
+/// regular space or hyphen.
+pub(crate) fn uax14_atomic_boundary_protection(character: char) -> Uax14BoundaryProtection {
+    if character == '\u{00a0}' {
+        return Uax14BoundaryProtection::None;
+    }
+    match line_break_class(character) {
+        LineBreak::Glue => Uax14BoundaryProtection::Glue,
+        LineBreak::WordJoiner => Uax14BoundaryProtection::WordJoiner,
+        LineBreak::ZWJ => Uax14BoundaryProtection::ZeroWidthJoiner,
+        _ => Uax14BoundaryProtection::None,
+    }
 }
 
 /// Neighboring text and writing-system context used to transform a collapsible
@@ -1050,6 +1075,27 @@ mod tests {
         assert!(!character_is_css_other_space_separator('\u{00a0}'));
         assert!(character_is_css_word_separator('\u{00a0}'));
         assert!(character_is_css_other_space_separator('\u{3000}'));
+    }
+
+    #[test]
+    fn atomic_boundary_protection_keeps_narrow_no_break_space_glue() {
+        assert_eq!(
+            uax14_atomic_boundary_protection('\u{00a0}'),
+            Uax14BoundaryProtection::None,
+            "CSS Text's atomic-inline compatibility override retains NBSP"
+        );
+        assert_eq!(
+            uax14_atomic_boundary_protection('\u{202f}'),
+            Uax14BoundaryProtection::Glue
+        );
+        assert_eq!(
+            uax14_atomic_boundary_protection('\u{2060}'),
+            Uax14BoundaryProtection::WordJoiner
+        );
+        assert_eq!(
+            uax14_atomic_boundary_protection('\u{200d}'),
+            Uax14BoundaryProtection::ZeroWidthJoiner
+        );
     }
 
     #[test]

@@ -327,6 +327,31 @@ impl BlockLayoutGeometry {
         self.content_logical_inline_size
     }
 
+    /// Re-anchor this block's border box at the normal-flow span selected by
+    /// float avoidance.
+    ///
+    /// The float-free band is an available-space constraint, not a replacement
+    /// containing block. Width and percentage resolution may use that band,
+    /// but a fixed-width block's used margin must not be applied again when
+    /// the final border-box origin is replayed. The candidate span is measured
+    /// before relative positioning, so restore that offset only for the final
+    /// normal-flow geometry:
+    /// <https://www.w3.org/TR/CSS22/visuren.html#floats>.
+    pub(in crate::layout) fn reanchor_float_avoiding_border_box(
+        &mut self,
+        normal_flow_border_box_span: PageInlineSpan,
+    ) {
+        let outer_span = PageInlineSpan::new(
+            normal_flow_border_box_span.left_x() + self.relative_offset.x(),
+            normal_flow_border_box_span.width(),
+        );
+        self.outer_inline = BlockBorderBoxInlineBounds::new(outer_span);
+        self.content_inline = BlockContentBoxInlineBounds::new(PageInlineSpan::new(
+            outer_span.left_x() + self.border_edges.left.points() + self.style.padding.left,
+            self.content_inline.width().points(),
+        ));
+    }
+
     /// Form the normal-flow border-box candidate used to avoid earlier float
     /// margin boxes.
     ///

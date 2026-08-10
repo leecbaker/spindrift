@@ -81,7 +81,9 @@ pub(in crate::layout) fn block_paint_ops_with_phases(
     if paint_outer_shadows {
         paint_box_shadows(&mut rects, &mut paths, geometry, style, false);
     }
-    if paint_backgrounds && let Some(fill) = style.background_color.visible_color(style.color) {
+    if paint_backgrounds
+        && let Some(fill) = style.background.background_color.visible_color(style.color)
+    {
         let color_clip = style.background_color_clip();
         // CSS paints the background over the selected clip box before it
         // paints the border.  Keep that complete paint area even if an opaque
@@ -162,13 +164,21 @@ pub(in crate::layout) fn block_paint_ops_with_phases(
             if let Some(clip) =
                 rounded_background_clip_for_box(rect, style, border_insets, color_clip)
             {
+                // `corner-shape` establishes the background's contour, but
+                // it does not turn the source background layer into that
+                // contour.  Keep the complete clip-box surface and apply the
+                // contour as a PDF clip.  Besides matching CSS's paint model,
+                // this avoids rasterizer-dependent coverage differences
+                // between filling a bevel directly and clipping its
+                // background surface to the same bevel.
+                // <https://drafts.csswg.org/css-borders-4/#corner-shaping>
                 paths.push(RenderedPath::new(
-                    clip.commands,
+                    paint_rect_path_commands(area),
                     Some(fill),
-                    clip.fill_rule,
+                    RenderedPathFillRule::NonZero,
                     None,
                     PaintStrokeWidth::ZERO,
-                    None,
+                    Some(clip),
                 ));
             } else {
                 rects.push(RenderedRect::from_paint_rect(area, Some(fill)));
@@ -211,7 +221,7 @@ pub(in crate::layout) fn block_paint_ops_with_phases(
         // Outline synthesis clears backgrounds before reusing this paint
         // helper. Its two-shape contour is still an annular border and must
         // therefore paint from the relevant synthetic outline side.
-        if style.background_color.is_transparent() {
+        if style.background.background_color.is_transparent() {
             let ring_fill = if style.svg_fill.is_overridden() {
                 style
                     .svg_fill
@@ -349,7 +359,7 @@ pub(in crate::layout) fn border_shape_outline_paths(
     let outer = resolved_outer_border_shape(border_rect, style, used_border_widths(style))?;
     let outline_offset = style.outline_offset.length_points();
     let outline_width = style.outline_width;
-    let color = style.outline_color;
+    let color = style.outline_color.resolve(style.color);
     let paint_band = |outer: ResolvedBorderShape, inner: Option<ResolvedBorderShape>| {
         let has_inner = inner.is_some();
         let mut commands = outer.commands();
@@ -677,27 +687,12 @@ impl ResolvedBorderShapeEllipse {
     }
 }
 
-/// Resolve the inner edge of a single circular `border-shape` for overflow
-/// clipping. The shape path is centered on its border stroke, so the inner
-/// visible edge is half a used stroke width inward:
-/// <https://drafts.csswg.org/css-borders-4/#border-shape>.
-pub(in crate::layout) fn single_border_shape_overflow_clip(
-    rect: PaintRect,
-    style: &ComputedStyle,
-    border_insets: css::Edges,
-) -> Option<BorderShapeOverflowClip> {
-    let shape = resolved_single_border_shape(rect, style, border_insets)?;
-    // A shape without a renderable border still establishes its own overflow
-    // contour; in that case its inside edge is the path itself.
-    let stroke_width = relevant_border_shape_side(style).map_or(0.0, |side| side.used_width.get());
-    shape.inner_overflow_path_clip(stroke_width / 2.0)
-}
-
 /// Resolve the exact inner shape contour for atomic descendant content.
 ///
 /// Image and inline-SVG primitives can carry a full PDF path clip, avoiding
 /// the chord error of the compact polygon retained by normal-flow effects.
 /// <https://drafts.csswg.org/css-borders-4/#border-shape>
+#[allow(dead_code)]
 pub(in crate::layout) fn single_border_shape_overflow_path_clip(
     rect: PaintRect,
     style: &ComputedStyle,
@@ -752,6 +747,30 @@ fn resolved_inset_border_shape(
     // analytically offset circle and ellipse contours.
     let stroke_width = relevant_border_shape_side(style).map_or(0.0, |side| side.used_width.get());
     resolved_outer_border_shape(rect, style, border_insets)?.outset(-stroke_width / 2.0)
+}
+
+/// Resolve the inner visible contour of a `border-shape` for any contained
+/// paint, including descendant overflow and replaced content.
+///
+/// Two-path shapes supply this contour directly. For one path, CSS Borders 4
+/// paints the stroke centered on that path, so the content side is offset by
+/// half the relevant used border width.
+pub(in crate::layout) fn border_shape_inner_content_clip(
+    rect: PaintRect,
+    style: &ComputedStyle,
+    border_insets: css::Edges,
+) -> Option<BorderShapeOverflowClip> {
+    let shape = resolved_inset_border_shape(rect, style, border_insets)?;
+    let commands = shape.commands();
+    (!commands.is_empty())
+        .then(|| {
+            BorderShapeOverflowClip::Path(RenderedPathClip::new(
+                commands,
+                RenderedPathFillRule::NonZero,
+                Vec::new(),
+            ))
+        })
+        .or(Some(BorderShapeOverflowClip::Empty))
 }
 
 fn resolved_border_shape_pair(
@@ -1585,17 +1604,17 @@ pub(in crate::layout) fn fixed_gradient_is_hard_stop(stops: &[FixedGradientStop]
 pub(in crate::layout) fn background_layers_for_gradient_paint(
     style: &ComputedStyle,
 ) -> Vec<css::BackgroundLayer> {
-    if !style.background_layers.is_empty() {
-        return style.background_layers.clone();
+    if !style.background.background_layers.is_empty() {
+        return style.background.background_layers.clone();
     }
     vec![css::BackgroundLayer {
-        image: style.background_image.clone(),
-        position: style.background_position.clone(),
-        size: style.background_size.clone(),
-        repeat: style.background_repeat,
-        attachment: style.background_attachment,
-        origin: style.background_origin,
-        clip: style.background_clip,
+        image: style.background.background_image.clone(),
+        position: style.background.background_position.clone(),
+        size: style.background.background_size.clone(),
+        repeat: style.background.background_repeat,
+        attachment: style.background.background_attachment,
+        origin: style.background.background_origin,
+        clip: style.background.background_clip,
     }]
 }
 

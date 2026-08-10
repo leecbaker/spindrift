@@ -30,13 +30,14 @@ impl<'a> LayoutBuilder<'a> {
             containing_height_basis,
             containing_inline_size,
             containing_inline_size_points,
+            inline_measurement_space,
             preferred_inline_basis,
             vertical_non_content,
         } = context;
         let definition_list_column_height =
             self.estimate_definition_list_column_height(child, stylesheets, containing_inline_size);
         let inline_content_width =
-            (containing_inline_size_points - style.padding.left - style.padding.right).max(1.0);
+            inline_measurement_space.content_box_inline_width(containing_inline_size_points, style);
         let inline_percentage_basis = if style.box_values.width.is_auto() {
             PercentageBasis::indefinite()
         } else {
@@ -141,6 +142,67 @@ impl<'a> LayoutBuilder<'a> {
                 block: logical_block_size,
             },
         );
+        if style.display.is_table() && style.writing_mode == WritingMode::HorizontalTb {
+            let table_sizing = self.with_ancestor_signature(signature.clone(), |layout| {
+                let built_child_boxes;
+                let table_child_boxes = if let Some(child_boxes) = child_boxes {
+                    child_boxes
+                } else {
+                    built_child_boxes = layout.build_frozen_child_boxes_with_current_ancestors(
+                        element,
+                        stylesheets,
+                        style,
+                    );
+                    &built_child_boxes
+                };
+                let fragment =
+                    box_tree::build_frozen_table_fragment(element, signature, table_child_boxes);
+                layout.table_wrapper_flex_sizing_from_fragment(
+                    element,
+                    style,
+                    stylesheets,
+                    &fragment,
+                    containing_width.points(),
+                )
+            });
+            physical_intrinsic.preferred_width = PhysicalContentWidth::new(
+                table_sizing.wrapper_preferred_inline.content_box_length(),
+            );
+            let table_automatic_minimum = used_length_percentage_or_auto_with_basis(
+                style.box_values.width.clone(),
+                preferred_inline_basis,
+            )
+            .map(|authored_width| {
+                // A specified table width participates in Flexbox's
+                // automatic minimum as the preferred table wrapper size;
+                // a cell's wider preferred width may expand a standalone
+                // table, but must not make the flex item refuse its own
+                // specified width before flexible-length resolution.
+                // <https://www.w3.org/TR/css-flexbox-1/#min-size-auto>
+                // <https://drafts.csswg.org/css-tables-3/#computing-the-table-width>
+                table_sizing
+                    .grid_min_content_inline
+                    .points()
+                    .min(authored_width.points())
+            })
+            .unwrap_or_else(|| table_sizing.grid_min_content_inline.points());
+            physical_intrinsic.preferred_min_width =
+                PhysicalContentWidth::new(content_box_pt(table_automatic_minimum));
+            // The wrapper's block contribution is a main-axis automatic
+            // minimum for a physical column. In a row it is merely the
+            // hypothetical cross contribution: an authored table `height`
+            // must remain free to establish the used cross size.
+            if physical_direction.is_column_axis() {
+                physical_intrinsic.min_content_height = PhysicalContentHeight::new(
+                    table_sizing.wrapper_intrinsic_block.content_box_length(),
+                );
+                if style.box_values.height.is_auto() {
+                    physical_intrinsic.intrinsic_content_height = PhysicalContentHeight::new(
+                        table_sizing.wrapper_intrinsic_block.content_box_length(),
+                    );
+                }
+            }
+        }
         // An orthogonal item's own inline formatting context can be empty
         // even when an in-flow descendant gives it a definite physical block
         // extent. The block-stack estimator currently has no orthogonal-child
@@ -164,12 +226,26 @@ impl<'a> LayoutBuilder<'a> {
             physical_intrinsic.preferred_min_width =
                 PhysicalContentWidth::new(content_box_pt(child_intrinsic.min_content.points()));
         }
-        let mut content_width = used_length_percentage_or_auto_with_basis(
-            style.box_values.width.clone(),
-            preferred_inline_basis,
-        )
-        .map(|width| width.points())
-        .unwrap_or(physical_intrinsic.preferred_width.points());
+        let mut content_width =
+            if remeasuring_post_flexed_main_size && physical_direction.is_row_axis() {
+                // Flexible-length resolution has already turned this item's
+                // physical main size into `available.width`.  Re-resolving an
+                // authored percentage width against that item-local width would
+                // apply the percentage twice (for example 30% becomes 9% of the
+                // flex container) and inflate the resulting cross measurement.
+                // The final content width is the correct containing block for
+                // this item's descendants during the post-flexing remeasurement.
+                // <https://www.w3.org/TR/css-flexbox-1/#resolve-flexible-lengths>
+                // <https://www.w3.org/TR/css-flexbox-1/#algo-cross-item>
+                available.width.points()
+            } else {
+                used_length_percentage_or_auto_with_basis(
+                    style.box_values.width.clone(),
+                    preferred_inline_basis,
+                )
+                .map(|width| width.points())
+                .unwrap_or(physical_intrinsic.preferred_width.points())
+            };
         let block_height_probe_width = if style.box_values.width.is_auto()
             && matches!(style.writing_mode, WritingMode::HorizontalTb)
             && physical_direction.is_row_axis()
@@ -498,10 +574,10 @@ impl<'a> LayoutBuilder<'a> {
             FlexItemBaselineEstimate {
                 vertical: FlexItemBaselinePair {
                     first: (inline_measurement.line_count() > 0)
-                        .then_some(FlexVerticalBaselineOffset::new(first_text_baseline))
+                        .then_some(flex_vertical_baseline_from_points(first_text_baseline))
                         .or(descendant_baselines.vertical.first),
                     last: (inline_measurement.line_count() > 0)
-                        .then_some(FlexVerticalBaselineOffset::new(last_text_baseline))
+                        .then_some(flex_vertical_baseline_from_points(last_text_baseline))
                         .or(descendant_baselines.vertical.last),
                 },
                 horizontal: FlexItemBaselinePair {

@@ -5,13 +5,13 @@ use clap_complete::{Shell, generate};
 use log::LevelFilter;
 use quire::{
     Css, FetchErrorPolicy, FontEmbeddingMode, ForcedColorPalette, ForcedColorsMode, Html,
-    InputSyntax, MediaType, PageMargins, PageSize, PdfCompression, PdfOptions, PdfProfile,
-    RenderOptions, ResourcePolicy, Url,
+    HttpRequestTimeout, MediaType, PdfCompression, PdfOptions, PdfProfile, RenderOptions,
+    ResourcePolicy, Url,
 };
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // Layout recursively traverses CSS box and inline trees. Keep command-line
 // rendering off the platform main thread so a valid deeply nested document is
@@ -38,21 +38,6 @@ struct Cli {
     #[arg(short = 'q', long = "quiet")]
     quiet: bool,
 
-    /// Disable HTML presentational hints.
-    #[arg(long = "no-presentational-hints")]
-    no_presentational_hints: bool,
-
-    /// Enable HTML presentational hints (the default).
-    ///
-    /// Kept as a compatibility spelling for renderer harnesses that pass an
-    /// explicit affirmative option instead of relying on the default.
-    #[arg(
-        long = "presentational-hints",
-        conflicts_with = "no_presentational_hints",
-        hide = true
-    )]
-    presentational_hints: bool,
-
     /// URL fragment target for :target and :target-within selectors.
     #[arg(long = "target-fragment", value_name = "FRAGMENT")]
     target_fragment: Option<String>,
@@ -74,15 +59,6 @@ struct Cli {
         value_hint = ValueHint::DirPath
     )]
     base_url: Option<String>,
-
-    /// Input syntax to use for document parsing.
-    #[arg(
-        long = "input-syntax",
-        value_name = "SYNTAX",
-        default_value = "auto",
-        value_parser = parse_input_syntax
-    )]
-    input_syntax: InputSyntax,
 
     /// PDF output profile to generate.
     #[arg(
@@ -106,6 +82,15 @@ struct Cli {
     #[arg(long = "no-http-redirects")]
     no_http_redirects: bool,
 
+    /// Time limit in whole seconds for each HTTP(S) resource request.
+    #[arg(
+        short = 't',
+        long = "timeout",
+        value_name = "SECONDS",
+        value_parser = parse_http_request_timeout
+    )]
+    http_timeout: Option<HttpRequestTimeout>,
+
     /// Continue rendering when optional external resource fetches fail.
     #[arg(long = "allow-fetch-errors")]
     allow_fetch_errors: bool,
@@ -118,41 +103,22 @@ struct Cli {
     #[arg(long = "forced-colors", value_enum, default_value_t = CliForcedColors::None)]
     forced_colors: CliForcedColors,
 
-    /// Initial page-box width and height, as CSS absolute lengths.
-    ///
-    /// This is the initial page box used by `@page size: auto` and viewport
-    /// units in page rules. Document `@page size` declarations may override it.
-    #[arg(
-        long = "page-size",
-        value_names = ["WIDTH", "HEIGHT"],
-        num_args = 2,
-        value_parser = parse_absolute_page_length
-    )]
-    page_size: Option<Vec<f32>>,
-
-    /// Initial page margins in CSS shorthand order, as absolute lengths.
-    ///
-    /// One to four values map to all, block/inline, top/inline/bottom, or
-    /// top/right/bottom/left respectively. Document `@page` declarations may
-    /// override these initial margins.
-    #[arg(
-        long = "page-margin",
-        value_name = "LENGTH",
-        num_args = 1..=4,
-        value_delimiter = ',',
-        require_equals = true,
-        value_parser = parse_absolute_page_margin_length
-    )]
-    page_margin: Option<Vec<f32>>,
-
     /// Generate a shell completion script to standard output.
-    #[arg(long = "generate-completion", value_name = "SHELL")]
+    #[arg(
+        long = "generate-completion",
+        value_name = "SHELL",
+        conflicts_with = "info"
+    )]
     generate_completion: Option<Shell>,
+
+    /// Print system information useful in bug reports and exit.
+    #[arg(short = 'i', long = "info", conflicts_with = "generate_completion")]
+    info: bool,
 
     /// Input HTML path, file URL, or HTTP(S) URL.
     #[arg(
         value_name = "INPUT",
-        required_unless_present = "generate_completion",
+        required_unless_present_any = ["generate_completion", "info"],
         value_hint = ValueHint::AnyPath
     )]
     input: Option<String>,
@@ -160,11 +126,10 @@ struct Cli {
     /// Output PDF path.
     #[arg(
         value_name = "OUTPUT",
-        required_unless_present = "generate_completion",
-        value_hint = ValueHint::FilePath,
-        value_parser = canonicalize_output_path
+        required_unless_present_any = ["generate_completion", "info"],
+        value_hint = ValueHint::FilePath
     )]
-    output: Option<PathBuf>,
+    output: Option<String>,
 }
 
 impl Cli {
@@ -220,6 +185,14 @@ impl From<CliMediaType> for MediaType {
 
 fn main() {
     let args = Cli::parse();
+    if args.info {
+        if let Err(error) = print_info_report(&mut io::stdout()) {
+            eprintln!("failed to write info report: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     initialize_logger(&args);
     let cli_started = Instant::now();
     let result = match thread::Builder::new()
@@ -270,6 +243,7 @@ async fn run(args: Cli) -> quire::Result<()> {
 
     let resource_policy = ResourcePolicy {
         follow_http_redirects: !args.no_http_redirects,
+        http_timeout: args.http_timeout.unwrap_or_default(),
         error_policy: if args.allow_fetch_errors {
             FetchErrorPolicy::Allow
         } else {
@@ -299,6 +273,7 @@ async fn run(args: Cli) -> quire::Result<()> {
         .output
         .as_deref()
         .ok_or_else(|| quire::Error::InvalidInput("expected output argument".to_string()))?;
+    let output = canonicalize_output_path(output).map_err(quire::Error::InvalidInput)?;
     let mut html = if let Some(url) = parse_resource_url(input) {
         log::debug!("loading HTML from URL {input}");
         Html::from_url_with_resource_policy(url, resource_policy).await?
@@ -313,9 +288,7 @@ async fn run(args: Cli) -> quire::Result<()> {
             html.with_base_path(base_url)?
         };
     }
-    html = html
-        .with_input_syntax(args.input_syntax)
-        .with_resource_policy(resource_policy);
+    html = html.with_resource_policy(resource_policy);
     for stylesheet in stylesheets {
         html = html.with_stylesheet(stylesheet);
     }
@@ -325,7 +298,6 @@ async fn run(args: Cli) -> quire::Result<()> {
     let mut options = RenderOptions::default();
     options.media_type = args.media_type.into();
     options.forced_colors = args.forced_colors.into();
-    options.presentational_hints = args.presentational_hints || !args.no_presentational_hints;
     options.target_fragment = args.target_fragment;
     let pdf_options = PdfOptions {
         profile: args.pdf_profile,
@@ -341,86 +313,28 @@ async fn run(args: Cli) -> quire::Result<()> {
         },
         ..PdfOptions::default()
     };
-    if let Some(page_size) = args.page_size {
-        // Clap enforces exactly two arguments for `--page-size` above.
-        options.page_size = PageSize::from_points(page_size[0], page_size[1]);
-    }
-    if let Some(page_margin) = args.page_margin {
-        options.set_page_margins(page_margins_from_shorthand(&page_margin));
-    }
-    log::debug!("initial page margins: {:?}", options.page_margins);
-    html.write_pdf(output, &options, &pdf_options).await?;
+    let mut output_file = std::fs::File::create(&output)?;
+    html.write_pdf(&mut output_file, &options, &pdf_options)
+        .await?;
     log::debug!("generated PDF in {:.3?}", started.elapsed());
     Ok(())
 }
 
-fn parse_input_syntax(value: &str) -> Result<InputSyntax, String> {
-    match value {
-        "auto" => Ok(InputSyntax::Auto),
-        "html" => Ok(InputSyntax::Html),
-        "xml" => Ok(InputSyntax::Xml),
-        _ => Err(format!("unsupported input syntax: {value}")),
-    }
+/// Write diagnostic host and binary information without initializing rendering.
+fn print_info_report(output: &mut impl Write) -> io::Result<()> {
+    let system = os_info::get();
+    write_info_report(output, &system)
 }
 
-/// Parses CSS absolute lengths for the command-line initial page box.
-///
-/// CSS Values and Units defines the absolute-length conversions:
-/// <https://www.w3.org/TR/css-values-4/#absolute-lengths>.
-fn parse_absolute_page_length(value: &str) -> Result<f32, String> {
-    let points = parse_absolute_length(value)?;
-    if points < 0.0 {
-        return Err(format!(
-            "page size must be a finite non-negative length, got {value:?}"
-        ));
-    }
-    Ok(points)
-}
+/// Format the stable CLI information report.
+fn write_info_report(output: &mut impl Write, system: &os_info::Info) -> io::Result<()> {
+    let architecture = system.architecture().unwrap_or(std::env::consts::ARCH);
 
-fn parse_absolute_page_margin_length(value: &str) -> Result<f32, String> {
-    parse_absolute_length(value)
-}
-
-fn parse_absolute_length(value: &str) -> Result<f32, String> {
-    let value = value.trim();
-    let (number, factor) = if let Some(number) = value.strip_suffix("px") {
-        (number, 72.0 / 96.0)
-    } else if let Some(number) = value.strip_suffix("in") {
-        (number, 72.0)
-    } else if let Some(number) = value.strip_suffix("cm") {
-        (number, 72.0 / 2.54)
-    } else if let Some(number) = value.strip_suffix("mm") {
-        (number, 72.0 / 25.4)
-    } else if let Some(number) = value.strip_suffix("q") {
-        (number, 72.0 / 101.6)
-    } else if let Some(number) = value.strip_suffix("pt") {
-        (number, 1.0)
-    } else {
-        return Err(format!(
-            "expected a CSS absolute length such as 5in or 210mm, got {value:?}"
-        ));
-    };
-    let number = number
-        .parse::<f32>()
-        .map_err(|_| format!("expected a number before the unit in {value:?}"))?;
-    let points = number * factor;
-    if !points.is_finite() {
-        return Err(format!(
-            "expected a finite CSS absolute length, got {value:?}"
-        ));
-    }
-    Ok(points)
-}
-
-fn page_margins_from_shorthand(values: &[f32]) -> PageMargins {
-    let [top, right, bottom, left] = match values {
-        [all] => [*all; 4],
-        [block, inline] => [*block, *inline, *block, *inline],
-        [top, inline, bottom] => [*top, *inline, *bottom, *inline],
-        [top, right, bottom, left] => [*top, *right, *bottom, *left],
-        _ => unreachable!("clap constrains --page-margin to one through four values"),
-    };
-    PageMargins::from_points(top, right, bottom, left)
+    writeln!(output, "System: {}", system.os_type())?;
+    writeln!(output, "Machine: {architecture}")?;
+    writeln!(output, "Version: {}", system.version())?;
+    writeln!(output)?;
+    writeln!(output, "Quire version: {}", env!("CARGO_PKG_VERSION"))
 }
 
 fn canonicalize_output_path(value: &str) -> Result<PathBuf, String> {
@@ -458,6 +372,13 @@ fn parse_resource_url(value: &str) -> Option<Url> {
         .filter(|url| matches!(url.scheme(), "file" | "http" | "https"))
 }
 
+fn parse_http_request_timeout(value: &str) -> Result<HttpRequestTimeout, String> {
+    let seconds = value
+        .parse::<u64>()
+        .map_err(|_| "timeout must be a positive whole number of seconds".to_string())?;
+    HttpRequestTimeout::try_from(Duration::from_secs(seconds)).map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,11 +395,9 @@ mod tests {
         assert!(!cli.full_fonts);
         assert!(!cli.uncompressed_pdf);
         assert!(!cli.no_http_redirects);
+        assert_eq!(cli.http_timeout, None);
         assert!(!cli.allow_fetch_errors);
-        assert_eq!(
-            cli.output.as_deref().and_then(Path::file_name),
-            Some("output.pdf".as_ref())
-        );
+        assert_eq!(cli.output.as_deref(), Some("output.pdf"));
     }
 
     #[test]
@@ -507,10 +426,40 @@ mod tests {
     }
 
     #[test]
-    fn cli_rejects_removed_html_string_flags() {
-        for flag in ["--string", "--strings"] {
+    fn cli_rejects_removed_non_weasyprint_flags() {
+        for flag in [
+            "--string",
+            "--strings",
+            "--input-syntax",
+            "--page-size",
+            "--page-margin",
+            "--presentational-hints",
+            "--no-presentational-hints",
+        ] {
             assert!(Cli::try_parse_from(["quire", flag, "<p>test</p>", "output.pdf"]).is_err());
         }
+    }
+
+    #[test]
+    fn cli_info_requires_no_rendering_positionals() {
+        for flag in ["-i", "--info"] {
+            let cli = Cli::try_parse_from(["quire", flag]).unwrap();
+
+            assert!(cli.info);
+            assert!(cli.input.is_none());
+            assert!(cli.output.is_none());
+        }
+    }
+
+    #[test]
+    fn cli_info_conflicts_with_completion_generation() {
+        assert!(Cli::try_parse_from(["quire", "--info", "--generate-completion", "bash"]).is_err());
+    }
+
+    #[test]
+    fn cli_rendering_still_requires_both_positionals() {
+        assert!(Cli::try_parse_from(["quire"]).is_err());
+        assert!(Cli::try_parse_from(["quire", "input.html"]).is_err());
     }
 
     #[test]
@@ -583,64 +532,16 @@ mod tests {
     }
 
     #[test]
-    fn cli_accepts_initial_page_size() {
-        let cli = Cli::try_parse_from([
-            "quire",
-            "--page-size",
-            "5in",
-            "3in",
-            "input.html",
-            "output.pdf",
-        ])
-        .unwrap();
+    fn cli_parses_non_zero_http_request_timeout() {
+        let cli = Cli::try_parse_from(["quire", "-t", "15", "input.html", "output.pdf"]).unwrap();
 
-        assert_eq!(cli.page_size, Some(vec![360.0, 216.0]));
-    }
-
-    #[test]
-    fn cli_rejects_relative_initial_page_size() {
-        let error = Cli::try_parse_from([
-            "quire",
-            "--page-size",
-            "100vw",
-            "3in",
-            "input.html",
-            "output.pdf",
-        ])
-        .unwrap_err();
-
-        assert!(error.to_string().contains("CSS absolute length"));
-    }
-
-    #[test]
-    fn cli_accepts_page_margin_shorthand() {
-        let cli = Cli::try_parse_from([
-            "quire",
-            "--page-margin=0.5in,12px",
-            "input.html",
-            "output.pdf",
-        ])
-        .unwrap();
-
-        assert_eq!(cli.page_margin, Some(vec![36.0, 9.0]));
         assert_eq!(
-            page_margins_from_shorthand(cli.page_margin.as_deref().unwrap()),
-            PageMargins::from_points(36.0, 9.0, 36.0, 9.0)
+            cli.http_timeout.unwrap().duration(),
+            Duration::from_secs(15)
         );
-    }
-
-    #[test]
-    fn cli_accepts_input_syntax() {
-        let cli = Cli::try_parse_from([
-            "quire",
-            "--input-syntax",
-            "xml",
-            "input.xhtml",
-            "output.pdf",
-        ])
-        .unwrap();
-
-        assert_eq!(cli.input_syntax, InputSyntax::Xml);
+        assert!(
+            Cli::try_parse_from(["quire", "--timeout", "0", "input.html", "output.pdf"]).is_err()
+        );
     }
 
     #[test]
@@ -662,8 +563,7 @@ mod tests {
 
     #[test]
     fn cli_canonicalizes_output_path() {
-        let cli = Cli::try_parse_from(["quire", "input.html", "output.pdf"]).unwrap();
-        let output = cli.output.unwrap();
+        let output = canonicalize_output_path("output.pdf").unwrap();
 
         assert!(output.is_absolute());
         assert_eq!(output.file_name(), Some("output.pdf".as_ref()));
@@ -673,12 +573,27 @@ mod tests {
     fn cli_rejects_output_with_missing_parent() {
         let missing_parent = format!("quire-missing-output-parent-{}", std::process::id());
         let output = format!("{missing_parent}/output.pdf");
-        let error = Cli::try_parse_from(["quire", "input.html", output.as_str()]).unwrap_err();
+        let error = canonicalize_output_path(&output).unwrap_err();
 
-        assert!(
-            error
-                .to_string()
-                .contains("failed to canonicalize output directory")
+        assert!(error.contains("failed to canonicalize output directory"));
+    }
+
+    #[test]
+    fn info_report_uses_compiled_architecture_when_host_architecture_is_unknown() {
+        let system = os_info::Info::unknown();
+        let mut report = Vec::new();
+
+        write_info_report(&mut report, &system).unwrap();
+
+        assert_eq!(
+            String::from_utf8(report).unwrap(),
+            format!(
+                "System: {}\nMachine: {}\nVersion: {}\n\nQuire version: {}\n",
+                system.os_type(),
+                std::env::consts::ARCH,
+                system.version(),
+                env!("CARGO_PKG_VERSION"),
+            )
         );
     }
 }

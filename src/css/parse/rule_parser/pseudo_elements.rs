@@ -1,10 +1,42 @@
 use super::*;
+use crate::css::LayerName;
+use cssparser::Delimiter;
+
+/// Splits a selector list only at CSS Syntax comma delimiters.  This is kept
+/// with pseudo-element routing because it works on selector source retained
+/// for that routing path, rather than being part of CSS Nesting expansion.
+pub(in crate::css) fn split_selector_list(selectors: &str) -> Vec<&str> {
+    let mut input = ParserInput::new(selectors);
+    let mut parser = Parser::new(&mut input);
+    let mut parts = Vec::new();
+    while !parser.is_exhausted() {
+        let start = parser.position();
+        if parser
+            .parse_until_before(Delimiter::Comma, |input| {
+                while input.next_including_whitespace_and_comments().is_ok() {}
+                Ok::<(), cssparser::ParseError<'_, ()>>(())
+            })
+            .is_err()
+        {
+            return Vec::new();
+        }
+        let part = parser.slice_from(start).trim();
+        if part.is_empty() {
+            return Vec::new();
+        }
+        parts.push(part);
+        if parser.next().is_err() {
+            break;
+        }
+    }
+    parts
+}
 
 pub(in crate::css) fn split_pseudo_element_rule(
     selector_text: &str,
     selector_parser: &QuireSelectorParser,
     declarations: &Declarations,
-    layer_name: Option<String>,
+    layer_name: Option<LayerName>,
     scopes: Vec<ScopeRule>,
 ) -> Vec<ParsedCssRule> {
     // CSS Pseudo-Elements 4 pseudo rules are matched against their originating

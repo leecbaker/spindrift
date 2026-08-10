@@ -1,5 +1,7 @@
 use super::*;
-use cssparser::{Parser, ParserInput, Token};
+use cssparser::{
+    AtRuleParser, BasicParseErrorKind, Parser, ParserInput, ParserState, StyleSheetParser, Token,
+};
 use std::future::Future;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
@@ -9,18 +11,29 @@ use url::Url;
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// A stylesheet source and its resource-loading context.
 ///
-/// ```
-/// use quire::Css;
+/// ```no_run
+/// use quire::{Css, Html, PdfOptions, RenderOptions};
+/// use std::fs::File;
 ///
-/// let stylesheet = Css::from_string("p { color: navy }");
+/// # async fn render() -> quire::Result<()> {
+/// let stylesheet = Css::from_file("print.css").await?.with_user_origin();
+/// let html = Html::from_file("report.html")
+///     .await?
+///     .with_stylesheet(stylesheet);
+/// let mut output = File::create("report.pdf")?;
+/// html.write_pdf(&mut output, &RenderOptions::default(), &PdfOptions::default())
+///     .await?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct Css {
     source: String,
     origin: StylesheetOrigin,
     base_url: Option<Url>,
     root_url: Option<Url>,
-    layer_order_prefix: Vec<String>,
-    import_layer_name: Option<String>,
+    layer_order_prefix: Vec<LayerName>,
+    import_layer_name: Option<LayerName>,
+    scope_anchor: StylesheetScopeAnchor,
     specificity_override: Option<u32>,
     resource_policy: crate::ResourcePolicy,
 }
@@ -41,6 +54,7 @@ impl Css {
             root_url: None,
             layer_order_prefix: Vec::new(),
             import_layer_name: None,
+            scope_anchor: StylesheetScopeAnchor::DocumentRoot,
             specificity_override: None,
             resource_policy: crate::ResourcePolicy::default(),
         }
@@ -67,6 +81,7 @@ impl Css {
             root_url: None,
             layer_order_prefix: Vec::new(),
             import_layer_name: None,
+            scope_anchor: StylesheetScopeAnchor::DocumentRoot,
             specificity_override: None,
             resource_policy: crate::ResourcePolicy::default(),
         })
@@ -167,6 +182,7 @@ impl Css {
                 root_url: None,
                 layer_order_prefix: Vec::new(),
                 import_layer_name: None,
+                scope_anchor: StylesheetScopeAnchor::DocumentRoot,
                 specificity_override: None,
                 resource_policy: fetcher.policy(),
             },
@@ -280,12 +296,21 @@ impl Css {
         self.root_url.as_ref()
     }
 
-    pub(crate) fn layer_order_prefix(&self) -> &[String] {
+    pub(crate) fn layer_order_prefix(&self) -> &[LayerName] {
         &self.layer_order_prefix
     }
 
-    pub(crate) fn import_layer_name(&self) -> Option<&str> {
-        self.import_layer_name.as_deref()
+    pub(crate) fn import_layer_name(&self) -> Option<&LayerName> {
+        self.import_layer_name.as_ref()
+    }
+
+    pub(crate) fn scope_anchor(&self) -> StylesheetScopeAnchor {
+        self.scope_anchor
+    }
+
+    pub(crate) fn with_scope_anchor(mut self, scope_anchor: StylesheetScopeAnchor) -> Self {
+        self.scope_anchor = scope_anchor;
+        self
     }
 
     pub(crate) fn specificity_override(&self) -> Option<u32> {
@@ -294,8 +319,8 @@ impl Css {
 
     fn with_layer_context(
         mut self,
-        layer_order_prefix: Vec<String>,
-        layer_name: Option<String>,
+        layer_order_prefix: Vec<LayerName>,
+        layer_name: Option<LayerName>,
     ) -> Self {
         self.layer_order_prefix = layer_order_prefix;
         self.import_layer_name = layer_name;
@@ -336,6 +361,7 @@ impl Css {
                             stylesheet
                                 .with_origin(self.origin)
                                 .with_root_url(self.root_url.clone())
+                                .with_scope_anchor(self.scope_anchor)
                                 .with_layer_context(import.layer_order_prefix, import.layer_name)
                                 .collect_with_imports(fetcher, seen, stylesheets)
                                 .await?;
@@ -373,8 +399,8 @@ fn is_css_mime_type(content_type: &str) -> bool {
 #[derive(Debug)]
 struct StylesheetImport {
     url: Url,
-    layer_name: Option<String>,
-    layer_order_prefix: Vec<String>,
+    layer_name: Option<LayerName>,
+    layer_order_prefix: Vec<LayerName>,
 }
 
 /// Extracts top-level `@import` rules and their Cascade 5 layer context.
@@ -390,19 +416,18 @@ fn imported_stylesheet_rules(
     source: &str,
     base_url: Option<&Url>,
     root_url: Option<&Url>,
-    parent_layer: Option<&str>,
-    inherited_layer_prefix: &[String],
+    parent_layer: Option<&LayerName>,
+    inherited_layer_prefix: &[LayerName],
 ) -> Vec<StylesheetImport> {
     let mut imports = Vec::new();
     let mut layer_order = inherited_layer_prefix.to_vec();
     if let Some(parent_layer) = parent_layer {
-        push_unique_layer_name(&mut layer_order, parent_layer.to_string());
+        push_unique_layer_name(&mut layer_order, parent_layer.clone());
     }
-    let mut anonymous_import_count = 0usize;
 
     for at_rule in top_level_at_rules(source) {
         if at_rule.name.eq_ignore_ascii_case("layer") {
-            for name in parse_import_layer_name_list(parent_layer, at_rule.prelude) {
+            for name in parse_import_layer_name_list(parent_layer, &at_rule.prelude) {
                 push_unique_layer_name(&mut layer_order, name);
             }
             continue;
@@ -410,24 +435,19 @@ fn imported_stylesheet_rules(
         if !at_rule.name.eq_ignore_ascii_case("import") {
             continue;
         }
-        let Some(parsed) = parse_import_prelude(at_rule.prelude) else {
+        let Some(parsed) = parse_import_prelude(&at_rule.prelude) else {
             continue;
         };
         if !parsed.applies {
             continue;
         }
         let layer_name = match parsed.layer {
-            ImportLayer::None => parent_layer.map(ToOwned::to_owned),
-            ImportLayer::Named(name) => qualify_import_layer_name(parent_layer, &name),
-            ImportLayer::Anonymous => {
-                let name = if let Some(parent_layer) = parent_layer {
-                    format!("{parent_layer}.__import_anonymous_layer_{anonymous_import_count}")
-                } else {
-                    format!("__import_anonymous_layer_{anonymous_import_count}")
-                };
-                anonymous_import_count = anonymous_import_count.saturating_add(1);
-                Some(name)
-            }
+            ImportLayer::None => parent_layer.cloned(),
+            ImportLayer::Named(name) => Some(qualify_import_layer_name(parent_layer, name)),
+            ImportLayer::Anonymous => Some(qualify_import_layer_name(
+                parent_layer,
+                LayerName::anonymous(),
+            )),
         };
         if let Some(layer_name) = &layer_name {
             push_unique_layer_name(&mut layer_order, layer_name.clone());
@@ -445,175 +465,82 @@ fn imported_stylesheet_rules(
 }
 
 #[derive(Debug)]
-struct TopLevelAtRule<'a> {
-    name: &'a str,
-    prelude: &'a str,
+struct TopLevelAtRule {
+    name: String,
+    prelude: String,
 }
 
-fn top_level_at_rules(source: &str) -> Vec<TopLevelAtRule<'_>> {
-    let mut rules = Vec::new();
-    let mut index = 0usize;
-    let bytes = source.as_bytes();
-    while index < bytes.len() {
-        match bytes[index] {
-            b'/' if bytes.get(index + 1) == Some(&b'*') => {
-                index = skip_css_comment(source, index);
-            }
-            b'\'' | b'"' => {
-                index = skip_css_string(source, index);
-            }
-            b'{' => {
-                index = find_matching_top_level_brace(source, index)
-                    .map(|close| close.saturating_add(1))
-                    .unwrap_or(bytes.len());
-            }
-            b'@' => {
-                let name_start = index + 1;
-                let name_end = scan_css_identifier(source, name_start);
-                if name_end == name_start {
-                    index += 1;
-                    continue;
-                }
-                let prelude_start = name_end;
-                let Some(prelude_end) = find_top_level_at_rule_end(source, prelude_start) else {
-                    break;
-                };
-                rules.push(TopLevelAtRule {
-                    name: &source[name_start..name_end],
-                    prelude: source[prelude_start..prelude_end].trim(),
-                });
-                index = if bytes.get(prelude_end) == Some(&b'{') {
-                    find_matching_top_level_brace(source, prelude_end)
-                        .map(|close| close.saturating_add(1))
-                        .unwrap_or(bytes.len())
-                } else {
-                    prelude_end.saturating_add(1)
-                };
-            }
-            _ => index += 1,
-        }
-    }
-    rules
+fn top_level_at_rules(source: &str) -> Vec<TopLevelAtRule> {
+    let mut input = ParserInput::new(source);
+    let mut css_parser = Parser::new(&mut input);
+    let mut parser = ImportRuleCollector;
+    StyleSheetParser::new(&mut css_parser, &mut parser)
+        .flatten()
+        .flatten()
+        .collect()
 }
 
-fn skip_css_comment(source: &str, start: usize) -> usize {
-    source[start + 2..]
-        .find("*/")
-        .map(|offset| start + 2 + offset + 2)
-        .unwrap_or(source.len())
-}
+struct ImportRuleCollector;
 
-fn skip_css_whitespace_and_comments(source: &str, mut index: usize) -> usize {
-    let bytes = source.as_bytes();
-    while index < bytes.len() {
-        if bytes[index].is_ascii_whitespace() {
-            index += 1;
-        } else if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'*') {
-            index = skip_css_comment(source, index);
-        } else {
-            break;
-        }
-    }
-    index
-}
+impl<'i> AtRuleParser<'i> for ImportRuleCollector {
+    type Prelude = TopLevelAtRule;
+    type AtRule = Option<TopLevelAtRule>;
+    type Error = BasicParseErrorKind<'i>;
 
-fn skip_css_string(source: &str, start: usize) -> usize {
-    let quote = source.as_bytes()[start];
-    let mut index = start + 1;
-    let bytes = source.as_bytes();
-    while index < bytes.len() {
-        if bytes[index] == b'\\' {
-            index = index.saturating_add(2);
-        } else if bytes[index] == quote {
-            return index + 1;
-        } else {
-            index += 1;
-        }
-    }
-    source.len()
-}
-
-fn skip_balanced_parentheses(source: &str, open: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    let mut index = open;
-    let bytes = source.as_bytes();
-    while index < bytes.len() {
-        match bytes[index] {
-            b'/' if bytes.get(index + 1) == Some(&b'*') => {
-                index = skip_css_comment(source, index);
-                continue;
-            }
-            b'\'' | b'"' => {
-                index = skip_css_string(source, index);
-                continue;
-            }
-            b'(' => depth = depth.saturating_add(1),
-            b')' => {
-                depth = depth.checked_sub(1)?;
-                if depth == 0 {
-                    return Some(index.saturating_add(1));
-                }
-            }
-            _ => {}
-        }
-        index += 1;
-    }
-    None
-}
-
-fn find_matching_top_level_brace(source: &str, open: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    let mut index = open;
-    let bytes = source.as_bytes();
-    while index < bytes.len() {
-        match bytes[index] {
-            b'/' if bytes.get(index + 1) == Some(&b'*') => {
-                index = skip_css_comment(source, index);
-                continue;
-            }
-            b'\'' | b'"' => {
-                index = skip_css_string(source, index);
-                continue;
-            }
-            b'{' => depth = depth.saturating_add(1),
-            b'}' => {
-                depth = depth.checked_sub(1)?;
-                if depth == 0 {
-                    return Some(index);
-                }
-            }
-            _ => {}
-        }
-        index += 1;
-    }
-    None
-}
-
-fn scan_css_identifier(source: &str, start: usize) -> usize {
-    source[start..]
-        .find(|character: char| {
-            !(character == '-' || character == '_' || character.is_ascii_alphanumeric())
+    fn parse_prelude<'t>(
+        &mut self,
+        name: cssparser::CowRcStr<'i>,
+        input: &mut Parser<'i, 't>,
+    ) -> Result<Self::Prelude, cssparser::ParseError<'i, Self::Error>> {
+        let start = input.position();
+        while input.next_including_whitespace_and_comments().is_ok() {}
+        Ok(TopLevelAtRule {
+            name: name.to_string(),
+            prelude: input.slice_from(start).trim().to_string(),
         })
-        .map(|offset| start + offset)
-        .unwrap_or(source.len())
+    }
+
+    fn rule_without_block(
+        &mut self,
+        prelude: Self::Prelude,
+        _start: &ParserState,
+    ) -> Result<Self::AtRule, ()> {
+        Ok(Some(prelude))
+    }
+
+    fn parse_block<'t>(
+        &mut self,
+        _prelude: Self::Prelude,
+        _start: &ParserState,
+        input: &mut Parser<'i, 't>,
+    ) -> Result<Self::AtRule, cssparser::ParseError<'i, Self::Error>> {
+        while input.next_including_whitespace_and_comments().is_ok() {}
+        Ok(None)
+    }
 }
 
-fn find_top_level_at_rule_end(source: &str, start: usize) -> Option<usize> {
-    let mut index = start;
-    let bytes = source.as_bytes();
-    while index < bytes.len() {
-        match bytes[index] {
-            b'/' if bytes.get(index + 1) == Some(&b'*') => {
-                index = skip_css_comment(source, index);
-            }
-            b'\'' | b'"' => {
-                index = skip_css_string(source, index);
-            }
-            b';' | b'{' => return Some(index),
-            _ => index += 1,
-        }
+impl<'i> cssparser::QualifiedRuleParser<'i> for ImportRuleCollector {
+    type Prelude = ();
+    type QualifiedRule = Option<TopLevelAtRule>;
+    type Error = BasicParseErrorKind<'i>;
+
+    fn parse_prelude<'t>(
+        &mut self,
+        input: &mut Parser<'i, 't>,
+    ) -> Result<Self::Prelude, cssparser::ParseError<'i, Self::Error>> {
+        while input.next_including_whitespace_and_comments().is_ok() {}
+        Ok(())
     }
-    None
+
+    fn parse_block<'t>(
+        &mut self,
+        _prelude: Self::Prelude,
+        _start: &ParserState,
+        input: &mut Parser<'i, 't>,
+    ) -> Result<Self::QualifiedRule, cssparser::ParseError<'i, Self::Error>> {
+        while input.next_including_whitespace_and_comments().is_ok() {}
+        Ok(None)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -626,7 +553,7 @@ struct ParsedImportPrelude {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ImportLayer {
     None,
-    Named(String),
+    Named(LayerName),
     Anonymous,
 }
 
@@ -634,51 +561,67 @@ fn parse_import_prelude(prelude: &str) -> Option<ParsedImportPrelude> {
     let mut input = ParserInput::new(prelude);
     let mut parser = Parser::new(&mut input);
     let url = parser.expect_url_or_string().ok()?.to_string();
-    let conditional_prelude = parser.slice_from(parser.position()).trim().to_string();
     let mut layer = ImportLayer::None;
     let mut applies = true;
+    let mut saw_layer = false;
+    let mut saw_supports = false;
+    let mut media_start = None;
 
     while !parser.is_exhausted() {
+        let start = parser.position();
         let Ok(token) = parser.next_including_whitespace_and_comments() else {
-            break;
+            return None;
         };
         match token {
             Token::WhiteSpace(_) | Token::Comment(_) => {}
             Token::Ident(name) if name.eq_ignore_ascii_case("layer") => {
+                if saw_layer {
+                    return None;
+                }
                 layer = ImportLayer::Anonymous;
+                saw_layer = true;
             }
             Token::Function(name) if name.eq_ignore_ascii_case("layer") => {
+                if saw_layer {
+                    return None;
+                }
                 let parsed_layer = parser.parse_nested_block(
-                    |input| -> Result<String, cssparser::ParseError<'_, ()>> {
+                    |input| -> Result<LayerName, cssparser::ParseError<'_, ()>> {
                         parse_layer_name_from_parser(input)
                             .ok_or_else(|| input.new_custom_error(()))
                     },
                 );
-                if let Ok(name) = parsed_layer {
-                    layer = ImportLayer::Named(name);
-                }
+                layer = ImportLayer::Named(parsed_layer.ok()?);
+                saw_layer = true;
             }
             Token::Function(name) if name.eq_ignore_ascii_case("supports") => {
+                if saw_supports {
+                    return None;
+                }
                 let condition = parser
                     .parse_nested_block(|input| {
                         let start = input.position();
-                        while !input.is_exhausted() {
-                            input.next_including_whitespace_and_comments()?;
-                        }
+                        while input.next_including_whitespace_and_comments().is_ok() {}
                         Ok::<_, cssparser::ParseError<'_, ()>>(
                             input.slice_from(start).trim().to_string(),
                         )
                     })
-                    .ok();
-                if let Some(condition) = condition {
-                    applies &= crate::css::supports_condition_applies(&condition);
-                }
+                    .ok()?;
+                applies &= import_supports_condition_applies(&condition);
+                saw_supports = true;
             }
-            Token::Ident(_) => {}
-            _ => {}
+            _ => {
+                media_start = Some(start);
+                // `slice_from` ends at the parser's current position. Consume
+                // the rest of the prelude before extracting the complete media
+                // query list rather than evaluating only its first token.
+                while parser.next_including_whitespace_and_comments().is_ok() {}
+                break;
+            }
         }
     }
-    if let Some(media_query_list) = import_media_query_list(&conditional_prelude) {
+    if let Some(media_start) = media_start {
+        let media_query_list = parser.slice_from(media_start).trim();
         applies &= crate::css::media_rule_applies(media_query_list);
     }
 
@@ -689,80 +632,43 @@ fn parse_import_prelude(prelude: &str) -> Option<ParsedImportPrelude> {
     })
 }
 
-/// Extracts the trailing media query list from an `@import` prelude.
+/// Evaluates the `<supports-condition>` carried by an `@import` `supports()`
+/// function.
 ///
-/// CSS Cascade Level 5 defines `@import` as a URL followed by optional
-/// `layer()`/`supports()` conditions and then an optional media query list.
-/// The media list is evaluated with the same print-context Media Queries
-/// subset used for ordinary `@media` rules:
-/// <https://www.w3.org/TR/css-cascade-5/#at-import> and
-/// <https://www.w3.org/TR/mediaqueries-4/#mq-list>.
-fn import_media_query_list(prelude_after_url: &str) -> Option<&str> {
-    let mut index = 0usize;
-    while index < prelude_after_url.len() {
-        index = skip_css_whitespace_and_comments(prelude_after_url, index);
-        if index >= prelude_after_url.len() {
-            return None;
-        }
-        let ident_end = scan_css_identifier(prelude_after_url, index);
-        if ident_end == index {
-            let media = prelude_after_url[index..].trim();
-            return (!media.is_empty()).then_some(media);
-        }
-        let ident = &prelude_after_url[index..ident_end];
-        let after_ident = skip_css_whitespace_and_comments(prelude_after_url, ident_end);
-        if ident.eq_ignore_ascii_case("layer") {
-            index = if prelude_after_url.as_bytes().get(after_ident) == Some(&b'(') {
-                skip_balanced_parentheses(prelude_after_url, after_ident)
-                    .unwrap_or(prelude_after_url.len())
-            } else {
-                ident_end
-            };
-            continue;
-        }
-        if ident.eq_ignore_ascii_case("supports")
-            && prelude_after_url.as_bytes().get(after_ident) == Some(&b'(')
-        {
-            index = skip_balanced_parentheses(prelude_after_url, after_ident)
-                .unwrap_or(prelude_after_url.len());
-            continue;
-        }
-        let media = prelude_after_url[index..].trim();
-        return (!media.is_empty()).then_some(media);
-    }
-    None
+/// The function's parentheses themselves delimit a declaration condition, so
+/// `supports(display: block)` has the same meaning as the parenthesized
+/// `(display: block)` condition in an `@supports` rule. Other condition forms
+/// (such as logical and selector conditions) are already accepted directly by
+/// the shared evaluator.
+/// <https://www.w3.org/TR/css-cascade-5/#at-import>
+/// <https://www.w3.org/TR/css-conditional-3/#at-supports>
+fn import_supports_condition_applies(condition: &str) -> bool {
+    crate::css::supports_condition_applies(condition)
+        || crate::css::supports_condition_applies(&format!("({condition})"))
 }
 
-fn parse_layer_name_from_parser(input: &mut Parser<'_, '_>) -> Option<String> {
-    let first = input.expect_ident().ok()?.to_string();
-    let mut name = first;
-    while input.try_parse(|input| input.expect_delim('.')).is_ok() {
-        let next = input.expect_ident().ok()?;
-        name.push('.');
-        name.push_str(next);
-    }
-    input.is_exhausted().then_some(name)
+fn parse_layer_name_from_parser(input: &mut Parser<'_, '_>) -> Option<LayerName> {
+    crate::css::parse::parse_layer_name(input).ok()
 }
 
-fn parse_import_layer_name_list(parent_layer: Option<&str>, prelude: &str) -> Vec<String> {
-    prelude
-        .split(',')
-        .filter_map(|name| qualify_import_layer_name(parent_layer, name))
-        .collect()
+fn parse_import_layer_name_list(parent_layer: Option<&LayerName>, prelude: &str) -> Vec<LayerName> {
+    let mut input = ParserInput::new(prelude);
+    let mut parser = Parser::new(&mut input);
+    crate::css::parse::parse_layer_name_list(&mut parser)
+        .map(|names| {
+            names
+                .into_iter()
+                .map(|name| qualify_import_layer_name(parent_layer, name))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
-fn qualify_import_layer_name(parent_layer: Option<&str>, name: &str) -> Option<String> {
-    let name = name.trim();
-    if name.is_empty() {
-        return None;
-    }
-    match parent_layer {
-        Some(parent_layer) if !parent_layer.is_empty() => Some(format!("{parent_layer}.{name}")),
-        _ => Some(name.to_string()),
-    }
+fn qualify_import_layer_name(parent_layer: Option<&LayerName>, name: LayerName) -> LayerName {
+    parent_layer.map_or(name.clone(), |parent| parent.nested(name))
 }
 
-fn push_unique_layer_name(layer_order: &mut Vec<String>, name: String) {
+fn push_unique_layer_name(layer_order: &mut Vec<LayerName>, name: LayerName) {
     if !layer_order.iter().any(|existing| existing == &name) {
         layer_order.push(name);
     }

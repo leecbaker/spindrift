@@ -30,7 +30,7 @@ pub(in crate::layout) struct AvoidBreakRunCandidateMeta {
     pub(in crate::layout) collapsed_end_margin: bool,
     pub(in crate::layout) previous_child_page_end: Option<Option<String>>,
     pub(in crate::layout) float_run: FloatRunState,
-    pub(in crate::layout) remaining_line_clamp: Option<usize>,
+    pub(in crate::layout) remaining_line_clamp: Option<css::RemainingLineSlots>,
     pub(in crate::layout) height: f32,
 }
 
@@ -41,6 +41,67 @@ pub(in crate::layout) struct PendingAvoidBreakRunCandidate {
 pub(in crate::layout) struct AvoidBreakRunCandidate {
     snapshot: Box<LayoutSnapshot>,
     pub(in crate::layout) meta: AvoidBreakRunCandidateMeta,
+}
+
+/// Whether the source boundary of an avoid-run retry belongs to an occupied
+/// fragmentainer or starts a fresh one.
+///
+/// An empty source may advance only when the next fragmentainer has strictly
+/// more usable block capacity. Keeping this distinct from a page-top cursor
+/// prevents temporary multicolumn pages from being treated as ordinary page
+/// continuations.
+/// <https://www.w3.org/TR/css-break-3/#breaking-rules>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) enum AvoidRunSourceFragmentainerOccupancy {
+    Empty,
+    Occupied,
+}
+
+/// Geometry and source occupancy needed to retry an avoided sibling run.
+///
+/// CSS Fragmentation chooses the destination before moving a source run. The
+/// record keeps the current remaining capacity separate from the next empty
+/// capacity, which can differ for the first short anonymous column in a
+/// nested multicolumn context.
+/// <https://www.w3.org/TR/css-break-3/#unforced-breaks>
+/// <https://www.w3.org/TR/css-multicol-1/#pagination-and-overflow-outside-multicol>
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout) struct AvoidRunRetryContext {
+    pub(in crate::layout) current_fragmentainer: Fragmentainer,
+    pub(in crate::layout) empty_destination_fragmentainer: Fragmentainer,
+    pub(in crate::layout) source_occupancy: AvoidRunSourceFragmentainerOccupancy,
+}
+
+impl AvoidRunRetryContext {
+    /// Whether an unforced retry can make progress before source sizing is
+    /// considered.
+    pub(in crate::layout) fn can_advance(self) -> bool {
+        match self.source_occupancy {
+            AvoidRunSourceFragmentainerOccupancy::Occupied => true,
+            AvoidRunSourceFragmentainerOccupancy::Empty => {
+                self.empty_destination_fragmentainer
+                    .fragmentainer_block_size()
+                    .points()
+                    > self
+                        .current_fragmentainer
+                        .fragmentainer_block_size()
+                        .points()
+                        + 0.01
+            }
+        }
+    }
+}
+
+/// Inputs for moving an avoid-constrained sibling run before the next child.
+///
+/// Grouping the source and destination fragmentainers with the run sizes
+/// avoids accidentally comparing the next child against current remaining
+/// space or using a page-only empty-state flag for a column continuation.
+/// <https://www.w3.org/TR/css-break-3/#break-between>
+pub(in crate::layout) struct AvoidRunPrebreakInput {
+    pub(in crate::layout) run_height: f32,
+    pub(in crate::layout) next_height: f32,
+    pub(in crate::layout) retry_context: AvoidRunRetryContext,
 }
 
 impl PendingAvoidBreakRunCandidate {
@@ -64,14 +125,21 @@ impl AvoidBreakRunCandidate {
         self
     }
 
-    /// A class-A avoid retry must not move a run that begins on an empty
-    /// page: the destination has the same available geometry, so doing so
-    /// would only manufacture a blank fragmentainer. This is stronger than a
-    /// cursor-at-top comparison because leading margins may have collapsed
-    /// before the first in-flow box is committed.
+    /// Return the occupancy of the fragmentainer at the saved source boundary.
+    ///
+    /// This is stronger than a cursor-at-top comparison because leading
+    /// margins may have collapsed before the first in-flow box is committed.
+    /// The snapshot can represent an anonymous multicolumn fragmentainer as
+    /// well as an ordinary page.
     /// <https://www.w3.org/TR/css-break-3/#breaking-rules>
-    pub(in crate::layout) fn starts_on_empty_page(&self) -> bool {
-        !self.snapshot.current_page_has_flow_content
+    pub(in crate::layout) fn source_fragmentainer_occupancy(
+        &self,
+    ) -> AvoidRunSourceFragmentainerOccupancy {
+        if self.snapshot.current_page_has_flow_content {
+            AvoidRunSourceFragmentainerOccupancy::Occupied
+        } else {
+            AvoidRunSourceFragmentainerOccupancy::Empty
+        }
     }
 
     pub(in crate::layout) fn restore(
@@ -137,19 +205,45 @@ impl AdjoiningFloatReplayCandidate {
 }
 
 pub(in crate::layout) fn should_move_avoid_break_run_to_next_fragmentainer(
-    run_height: f32,
-    next_height: f32,
-    current_fragmentainer: Fragmentainer,
-    at_page_top: bool,
+    input: AvoidRunPrebreakInput,
 ) -> bool {
     FragmentPrebreakDecision::choose(FragmentPrebreakInput {
-        can_advance: !at_page_top,
-        current_fragmentainer,
-        required_block_size: layout_pt(next_height),
-        empty_fragmentainer: current_fragmentainer,
-        empty_fit_block_size: layout_pt(run_height + next_height),
+        can_advance: input.retry_context.can_advance(),
+        current_fragmentainer: input.retry_context.current_fragmentainer,
+        required_block_size: layout_pt(input.next_height),
+        empty_fragmentainer: input.retry_context.empty_destination_fragmentainer,
+        empty_fit_block_size: layout_pt(input.run_height + input.next_height),
     })
     .should_break
+}
+
+impl LayoutBuilder<'_> {
+    /// Return the empty destination selected by the next unforced break.
+    ///
+    /// The initial anonymous multicolumn fragmentainer can be shorter than
+    /// its continuations. Resolve the next override context here instead of
+    /// reusing current remaining capacity at individual avoid-run call sites.
+    /// <https://www.w3.org/TR/css-break-3/#breaking-rules>
+    /// <https://www.w3.org/TR/css-multicol-1/#pagination-and-overflow-outside-multicol>
+    pub(in crate::layout) fn next_empty_fragmentainer(
+        &mut self,
+        fragmentainer_kind: FragmentainerKind,
+    ) -> Fragmentainer {
+        let capacity = match fragmentainer_kind {
+            FragmentainerKind::Page => self
+                .resolved_page_context(self.pages.len() + 2, false)
+                .area_height(),
+            FragmentainerKind::Column => self
+                .fragmentainer_override
+                .map(|override_| {
+                    override_
+                        .context_for_fragmentainer(self.pages.len() + 1)
+                        .area_height()
+                })
+                .unwrap_or_else(|| self.page_area_height()),
+        };
+        Fragmentainer::new(layout_pt(capacity), layout_pt(capacity))
+    }
 }
 
 /// Returns whether a definite-height normal-flow block should start a new page.

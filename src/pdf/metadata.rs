@@ -1,5 +1,5 @@
-use crate::{DocumentMetadata, PdfCompression, PdfProfile};
-use pdf_writer::{Filter, Pdf, Ref, TextStr};
+use crate::{DocumentDate, DocumentMetadata, PdfCompression, PdfProfile};
+use pdf_writer::{Filter, Name, Pdf, Ref, TextStr};
 
 /// Writes synchronized PDF document information and XMP metadata.
 ///
@@ -23,6 +23,21 @@ pub(super) fn write_document_info(
     }
     if let Some(creator) = metadata.creator {
         info.creator(TextStr(creator));
+    }
+    if let Some(description) = metadata.description {
+        info.subject(TextStr(description));
+    }
+    if !metadata.keywords.is_empty() {
+        let keywords = metadata.keywords.join(", ");
+        info.keywords(TextStr(&keywords));
+    }
+    if let Some(created) = metadata.created {
+        let created = created.pdf_info_value();
+        info.pair(Name(b"CreationDate"), TextStr(&created));
+    }
+    if let Some(modified) = metadata.modified {
+        let modified = modified.pdf_info_value();
+        info.pair(Name(b"ModDate"), TextStr(&modified));
     }
 }
 
@@ -53,6 +68,11 @@ struct PdfDocumentMetadata<'a> {
     title: Option<&'a str>,
     author: Option<&'a str>,
     creator: Option<&'a str>,
+    language: Option<&'a str>,
+    description: Option<&'a str>,
+    keywords: &'a [String],
+    created: Option<&'a DocumentDate>,
+    modified: Option<&'a DocumentDate>,
     producer: &'a str,
 }
 
@@ -62,6 +82,11 @@ impl<'a> PdfDocumentMetadata<'a> {
             title: metadata.title.as_deref(),
             author: metadata.author.as_deref(),
             creator: metadata.creator.as_deref(),
+            language: metadata.language.as_deref(),
+            description: metadata.description.as_deref(),
+            keywords: &metadata.keywords,
+            created: metadata.created.as_ref(),
+            modified: metadata.modified.as_ref(),
             producer,
         }
     }
@@ -94,6 +119,21 @@ impl<'a> PdfDocumentMetadata<'a> {
         }
         if let Some(creator) = self.creator {
             Self::push_simple_element(&mut packet, "xmp:CreatorTool", creator);
+        }
+        if let Some(language) = self.language {
+            Self::push_language(&mut packet, language);
+        }
+        if let Some(description) = self.description {
+            Self::push_lang_alt(&mut packet, "dc:description", description);
+        }
+        if !self.keywords.is_empty() {
+            Self::push_simple_element(&mut packet, "pdf:Keywords", &self.keywords.join(", "));
+        }
+        if let Some(created) = self.created {
+            Self::push_simple_element(&mut packet, "xmp:CreateDate", created.as_str());
+        }
+        if let Some(modified) = self.modified {
+            Self::push_simple_element(&mut packet, "xmp:ModifyDate", modified.as_str());
         }
         packet.push_str("</rdf:RDF>\n");
         packet.push_str("</x:xmpmeta>\n");
@@ -130,6 +170,12 @@ impl<'a> PdfDocumentMetadata<'a> {
         packet.push_str(r#"<rdf:Description rdf:about=""><dc:creator><rdf:Seq><rdf:li>"#);
         push_xml_escaped(packet, value);
         packet.push_str("</rdf:li></rdf:Seq></dc:creator></rdf:Description>\n");
+    }
+
+    fn push_language(packet: &mut String, value: &str) {
+        packet.push_str(r#"<rdf:Description rdf:about=""><dc:language><rdf:Bag><rdf:li>"#);
+        push_xml_escaped(packet, value);
+        packet.push_str("</rdf:li></rdf:Bag></dc:language></rdf:Description>\n");
     }
 }
 

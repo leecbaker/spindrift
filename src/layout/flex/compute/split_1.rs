@@ -1,5 +1,6 @@
 use super::super::estimate::FlexIntrinsicItem;
 use super::*;
+use crate::layout::flex::layout::placed_flex_item_style;
 use crate::layout::taffy_bridge;
 use crate::units::IntoLayoutLength;
 
@@ -17,6 +18,42 @@ impl FlexCollapseMode {
 
 impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout::flex) fn compute_flex_layout(
+        &mut self,
+        children: &[StyledChild<'_>],
+        style: &ComputedStyle,
+        stylesheets: &Stylesheets<'_>,
+        available: FlexAvailableSpace,
+    ) -> Option<FlexLayout> {
+        if style.flex_wrap.wraps()
+            && (style.margin_trim.block_start
+                || style.margin_trim.block_end
+                || style.margin_trim.inline_start
+                || style.margin_trim.inline_end)
+        {
+            let placement_probe = self.compute_flex_layout_without_margin_trim(
+                children,
+                style,
+                stylesheets,
+                available,
+            )?;
+            let plan = flex_margin_trim_plan(style, &placement_probe.lines, children.len());
+            if !plan.is_empty() {
+                let mut trimmed_children = children.to_vec();
+                for (index, child) in trimmed_children.iter_mut().enumerate() {
+                    plan.apply_to_style(index, &mut child.style);
+                }
+                return self.compute_flex_layout_without_margin_trim(
+                    &trimmed_children,
+                    style,
+                    stylesheets,
+                    available,
+                );
+            }
+        }
+        self.compute_flex_layout_without_margin_trim(children, style, stylesheets, available)
+    }
+
+    fn compute_flex_layout_without_margin_trim(
         &mut self,
         children: &[StyledChild<'_>],
         style: &ComputedStyle,
@@ -210,6 +247,18 @@ impl<'a> LayoutBuilder<'a> {
             } else {
                 child_style.box_values.width.is_auto()
             };
+            // A table is an independent formatting context whose caption and
+            // grid are measured after Flexbox assigns the final cross slot.
+            // Give Taffy that definite wrapper constraint while constructing
+            // the line, rather than letting its generic leaf measurement
+            // retain the pre-stretch caption-only height. Table replay then
+            // consumes the same wrapper border-box span through
+            // `PlacedFormattingContext`.
+            // <https://drafts.csswg.org/css-flexbox-1/#algo-stretch>
+            // <https://drafts.csswg.org/css-tables-3/#computing-the-table-height>
+            let table_wrapper_cross_stretch = child_style.display.is_table()
+                && cross_size_is_auto
+                && stretched_cross_size.is_some();
             let cross_axis_has_constraint = if physical_direction.is_row_axis() {
                 !child_style.box_values.min_height.is_auto()
                     || !child_style.box_values.max_height.is_auto()
@@ -291,12 +340,19 @@ impl<'a> LayoutBuilder<'a> {
             // value (for example, `min-width: 50px`), allowing a 100px
             // min-content table to shrink to 50px as a flex item.
             // <https://drafts.csswg.org/css-tables/#used-min-width-of-table>
-            let flex_min_width =
-                if child_style.display.is_table() && !child_style.box_values.min_width.is_auto() {
-                    css::ComputedLengthPercentageOrAuto::MinContent
-                } else {
-                    child_style.box_values.min_width.clone()
-                };
+            let flex_min_width = if child_style.display.is_table() {
+                css::ComputedLengthPercentageOrAuto::MinContent
+            } else {
+                child_style.box_values.min_width.clone()
+            };
+            // The corresponding table-wrapper block minimum is the grid and
+            // caption min-content contribution. A specified `height` or
+            // `min-height: 0` is a preferred-size suggestion for Flexbox; it
+            // must not erase the table's used minimum and let later flex
+            // items overlap the replayed grid.
+            // <https://drafts.csswg.org/css-tables-3/#computing-the-table-height>
+            // <https://drafts.csswg.org/css-flexbox-1/#min-size-auto>
+            let flex_min_height = child_style.box_values.min_height.clone();
             // Taffy's leaf measurement callback must use the same resolved
             // flex basis supplied to its flex algorithm. In particular,
             // `flex-basis:auto` can acquire a definite main size by
@@ -331,8 +387,10 @@ impl<'a> LayoutBuilder<'a> {
                 },
                 preferred_aspect_ratio,
             };
-            let taffy_flex_basis =
-                taffy_flex_basis(child_style, &estimated_size, flex_basis_context);
+            let resolved_flex_basis =
+                resolve_taffy_flex_basis(child_style, &estimated_size, flex_basis_context);
+            estimated_size.set_main_size_provenance(resolved_flex_basis.provenance);
+            let taffy_flex_basis = resolved_flex_basis.dimension;
             // Taffy asks a leaf measure function for an automatic main size
             // even when the flex basis is a definite length. Its generic
             // fallback would then return this item's authored main-size
@@ -386,7 +444,8 @@ impl<'a> LayoutBuilder<'a> {
                                     percentage_basis: available.width_basis,
                                     stretch: horizontal_stretch,
                                     flex_basis_overrides_main_size,
-                                    auto_cross_uses_stretch_fit: uses_balanced_line_cross_stretch,
+                                    auto_cross_uses_stretch_fit: uses_balanced_line_cross_stretch
+                                        || table_wrapper_cross_stretch,
                                     auto_cross_fit_content: wrapping_column_cross_fit_content,
                                 },
                             ),
@@ -401,7 +460,8 @@ impl<'a> LayoutBuilder<'a> {
                                     percentage_basis: available.height_basis,
                                     stretch: vertical_stretch,
                                     flex_basis_overrides_main_size,
-                                    auto_cross_uses_stretch_fit: uses_balanced_line_cross_stretch,
+                                    auto_cross_uses_stretch_fit: uses_balanced_line_cross_stretch
+                                        || table_wrapper_cross_stretch,
                                     auto_cross_fit_content: None,
                                 },
                             ),
@@ -413,12 +473,18 @@ impl<'a> LayoutBuilder<'a> {
                                 estimated_size.min_width,
                                 estimated_size.content_width,
                                 FlexMinSizeDimensionContext {
-                                    definite_preferred_content_size:
+                                    definite_preferred_content_size: (!child_style
+                                        .display
+                                        .is_table()
+                                        || !physical_direction.is_row_axis())
+                                    .then(|| {
                                         used_content_box_width_or_auto_with_basis(
                                             child_style,
                                             available.width_basis,
                                             non_content_pt(horizontal_non_content),
-                                        ),
+                                        )
+                                    })
+                                    .flatten(),
                                     transferred_size_suggestion:
                                         automatic_minimum_transferred_size_suggestion(
                                             child_style,
@@ -452,16 +518,22 @@ impl<'a> LayoutBuilder<'a> {
                                 },
                             ),
                             height: flex_min_size_dimension(
-                                child_style.box_values.min_height.clone(),
+                                flex_min_height,
                                 estimated_size.min_height,
                                 estimated_size.content_height,
                                 FlexMinSizeDimensionContext {
-                                    definite_preferred_content_size:
+                                    definite_preferred_content_size: (!child_style
+                                        .display
+                                        .is_table()
+                                        || !physical_direction.is_column_axis())
+                                    .then(|| {
                                         used_content_box_height_or_auto_with_basis(
                                             child_style,
                                             available.height_basis,
                                             non_content_pt(vertical_non_content),
-                                        ),
+                                        )
+                                    })
+                                    .flatten(),
                                     transferred_size_suggestion:
                                         automatic_minimum_transferred_size_suggestion(
                                             child_style,
@@ -518,9 +590,9 @@ impl<'a> LayoutBuilder<'a> {
                                 0.0
                             }
                         } else {
-                            child_style.flex_grow
+                            child_style.flex_grow.value()
                         },
-                        flex_shrink: child_style.flex_shrink,
+                        flex_shrink: child_style.flex_shrink.value(),
                         flex_basis: taffy_flex_basis,
                         align_self: taffy_effective_align_self(
                             child_style,
@@ -650,6 +722,20 @@ impl<'a> LayoutBuilder<'a> {
             )
             .ok()?;
 
+        // Freeze the CSS Align decision before the Taffy bridge begins line
+        // construction. Taffy may use compatible placeholders for sizing,
+        // but it must not become the source of the final CSS placement mode.
+        let active_children = source_indices
+            .iter()
+            .map(|&index| children[index].clone())
+            .collect::<Vec<_>>();
+        let cross_alignments = resolve_flex_cross_alignments(
+            &active_estimates,
+            &active_children,
+            style,
+            physical_direction,
+        );
+
         tree.compute_layout_with_measure(
             root,
             taffy_layout::Size {
@@ -678,10 +764,21 @@ impl<'a> LayoutBuilder<'a> {
                 ))
             })
             .collect::<Option<Vec<_>>>()?;
-        let active_children = source_indices
-            .iter()
-            .map(|&index| children[index].clone())
-            .collect::<Vec<_>>();
+        self.measure_final_normal_flow_line_box_spans(
+            &active_items,
+            &mut active_estimates,
+            &active_children,
+            style,
+            stylesheets,
+            available,
+        );
+        apply_final_normal_flow_item_block_spans(
+            &mut active_items,
+            &active_estimates,
+            &active_children,
+            style,
+            physical_direction,
+        );
         let container_cross_size = FlexCrossSize::new(if physical_direction.is_row_axis() {
             root_rect.size.height
         } else {
@@ -693,6 +790,16 @@ impl<'a> LayoutBuilder<'a> {
             physical_direction,
             container_cross_size,
         );
+        let line_cross_axis_layout = FlexLineCrossAxisLayout {
+            constraint: line_cross_constraint,
+            gap: flex_line_cross_gap(
+                style,
+                physical_direction,
+                available,
+                physical_gap_width.clone(),
+                physical_gap_height.clone(),
+            ),
+        };
         let container_main_size = if physical_direction.is_row_axis() {
             available
                 .width_basis_content_box_length()
@@ -736,19 +843,38 @@ impl<'a> LayoutBuilder<'a> {
             FlexLineCollectionContext {
                 container_style: style,
                 physical_direction,
-                cross_constraint: line_cross_constraint,
+                cross_axis_layout: line_cross_axis_layout,
                 hypothetical_outer_main_sizes: &active_hypothetical_outer_main_sizes,
                 container_main_size,
                 main_gap,
             },
         );
+        // Normal-flow measurement may replace the provisional block extent of
+        // an automatic column item.  Re-run main-axis packing from those
+        // immutable final spans before any cross-axis line geometry is
+        // calculated; otherwise later items retain Taffy's stale origins.
+        if physical_direction.is_column_axis() {
+            repack_lines_after_main_size_adjustment(
+                &mut active_lines,
+                &mut active_items,
+                &active_children,
+                style,
+                physical_direction,
+                FlexMainSize::new(root_rect.size.height),
+                available.main_basis(physical_direction),
+            );
+        }
         let balanced_taffy_context = BalancedTaffyLayoutContext {
             template_tree: &tree,
             template_root: root,
             template_nodes: &nodes,
             estimates: &active_estimates,
             flex_axes,
-            available,
+            // Each isolated no-wrap Taffy tree represents a final balanced
+            // line, so it must receive the same reserved cross-axis slot
+            // used while estimating its members.  The record preserves the
+            // container percentage bases independently.
+            available: item_measure_available,
         };
         let balanced_hypothetical_main_sizes = if style.flex_wrap.balances_lines() {
             let active_indices = (0..nodes.len()).collect::<Vec<_>>();
@@ -763,8 +889,8 @@ impl<'a> LayoutBuilder<'a> {
         } else {
             None
         };
-        if style.flex_wrap.balances_lines()
-            && rebalance_flex_line_membership(
+        if style.flex_wrap.balances_lines() {
+            let _topology_changed = rebalance_flex_line_membership(
                 &mut active_lines,
                 &mut active_items,
                 &active_children,
@@ -795,9 +921,9 @@ impl<'a> LayoutBuilder<'a> {
                     cross_gap: FlexCrossSize::new(
                         used_flex_gap(
                             if physical_direction.is_row_axis() {
-                                physical_gap_height.clone()
+                                physical_gap_height
                             } else {
-                                physical_gap_width.clone()
+                                physical_gap_width
                             },
                             PercentageBasis::definite(content_box_pt(
                                 if physical_direction.is_row_axis() {
@@ -809,14 +935,17 @@ impl<'a> LayoutBuilder<'a> {
                         )
                         .points(),
                     ),
+                    reserved_line_cross_size: line_cross_constraint.reserved_balanced_line_slot(),
                     available_main_size: FlexMainSize::new(if physical_direction.is_row_axis() {
                         root_rect.size.width
                     } else {
                         root_rect.size.height
                     }),
                 },
-            )
-        {
+            );
+            // A balance plan is final topology, not a conditional correction:
+            // every selected line needs its own flexible-length resolution,
+            // even when its membership happens to match normal wrapping.
             resolve_balanced_line_flexible_lengths(
                 &balanced_taffy_context,
                 &active_lines,
@@ -842,7 +971,7 @@ impl<'a> LayoutBuilder<'a> {
                 &active_children,
                 style,
                 physical_direction,
-                line_cross_constraint,
+                line_cross_axis_layout,
             );
         }
         let collapsed_struts = if collapsed_struts.is_empty() {
@@ -868,13 +997,6 @@ impl<'a> LayoutBuilder<'a> {
         // metrics collected above.
         // <https://www.w3.org/TR/css-flexbox-1/#algo-cross-item>
         // <https://www.w3.org/TR/css-flexbox-1/#algo-cross-line>
-        let line_cross_gap = flex_line_cross_gap(
-            style,
-            physical_direction,
-            available,
-            physical_gap_width,
-            physical_gap_height,
-        );
         for _ in 0..2 {
             if !apply_line_cross_size_dependent_item_remeasurements(
                 self,
@@ -887,7 +1009,7 @@ impl<'a> LayoutBuilder<'a> {
                     stylesheets,
                     physical_direction,
                     available,
-                    line_cross_gap,
+                    line_cross_gap: line_cross_axis_layout.gap,
                     cross_constraint: line_cross_constraint,
                 },
             ) {
@@ -900,7 +1022,7 @@ impl<'a> LayoutBuilder<'a> {
                 &active_children,
                 style,
                 physical_direction,
-                line_cross_constraint,
+                line_cross_axis_layout,
             );
         }
         if apply_post_flexing_main_size_cross_remeasurements(
@@ -922,7 +1044,7 @@ impl<'a> LayoutBuilder<'a> {
                 &active_children,
                 style,
                 physical_direction,
-                line_cross_constraint,
+                line_cross_axis_layout,
             );
         }
         if apply_main_size_aspect_ratio_cross_size_corrections(
@@ -940,51 +1062,9 @@ impl<'a> LayoutBuilder<'a> {
                 &active_children,
                 style,
                 physical_direction,
-                line_cross_constraint,
+                line_cross_axis_layout,
             );
         }
-        resolve_flex_baseline_self_alignment(
-            &mut active_items,
-            &active_estimates,
-            &active_children,
-            &mut active_lines,
-            style,
-            physical_direction,
-        );
-        apply_baseline_align_content_offsets(
-            &mut active_items,
-            &mut active_lines,
-            &active_estimates,
-            &active_children,
-            style,
-            physical_direction,
-            container_cross_size,
-        );
-        // Content baseline alignment translates complete lines, so only its
-        // absolute exported coordinates need refreshing here.
-        refresh_flex_line_baselines(
-            &mut active_lines,
-            &active_items,
-            &active_estimates,
-            &active_children,
-            style,
-            physical_direction,
-        );
-        apply_subject_axis_self_alignment_offsets(
-            &mut active_items,
-            &active_children,
-            &active_lines,
-            style,
-            physical_direction,
-        );
-        refresh_flex_line_baselines(
-            &mut active_lines,
-            &active_items,
-            &active_estimates,
-            &active_children,
-            style,
-            physical_direction,
-        );
         if apply_main_axis_automatic_minimums(
             &mut active_items,
             &active_estimates,
@@ -1021,9 +1101,12 @@ impl<'a> LayoutBuilder<'a> {
                 &active_children,
                 style,
                 physical_direction,
-                line_cross_constraint,
+                line_cross_axis_layout,
             );
         }
+        // Resolve the stretch overflow fallback before later cross-axis
+        // metadata reconciliation. Those passes intentionally rebuild line
+        // bounds, but must retain the overflow group origin selected here.
         apply_stretch_align_content_overflow_fallback_offsets(
             &mut active_items,
             &mut active_lines,
@@ -1040,18 +1123,34 @@ impl<'a> LayoutBuilder<'a> {
                 &active_children,
                 style,
                 physical_direction,
-                line_cross_constraint,
+                line_cross_axis_layout,
             );
         }
-        // Main-size automatic minimums and non-negative content-box guards
-        // can make a final metadata pass rebuild wrapped line slots. Reapply
-        // the recorded baseline decisions after the last such rebuild. Later
-        // content-packing passes only translate complete lines.
-        resolve_flex_baseline_self_alignment(
+        // Every cross-axis placement now consumes the same post-sizing line
+        // slots. Later content-packing stages only translate whole lines.
+        finalize_flex_cross_axis_placement(
             &mut active_items,
             &active_estimates,
             &active_children,
             &mut active_lines,
+            style,
+            physical_direction,
+            &cross_alignments,
+        );
+        apply_baseline_align_content_offsets(
+            &mut active_items,
+            &mut active_lines,
+            &active_estimates,
+            &active_children,
+            style,
+            physical_direction,
+            container_cross_size,
+        );
+        refresh_flex_line_baselines(
+            &mut active_lines,
+            &active_items,
+            &active_estimates,
+            &active_children,
             style,
             physical_direction,
         );
@@ -1068,13 +1167,13 @@ impl<'a> LayoutBuilder<'a> {
             physical_direction,
             container_cross_size,
         );
-        if restore_distributed_flex_line_offsets(
+        if repack_final_flex_line_offsets(
             &mut active_items,
             &mut active_lines,
             style,
             physical_direction,
             container_cross_size,
-            line_cross_gap,
+            line_cross_axis_layout.gap,
         ) {
             // Translating complete lines also translates their absolute
             // baselines. Recompute only the exported baseline metadata: a
@@ -1119,6 +1218,7 @@ impl<'a> LayoutBuilder<'a> {
                     .map(|&active_index| source_indices[active_index])
                     .collect::<Vec<_>>();
                 FlexLineLayout {
+                    logical_cross_start_rank: line.logical_cross_start_rank,
                     source_start: item_indices
                         .iter()
                         .cloned()
@@ -1183,7 +1283,7 @@ impl<'a> LayoutBuilder<'a> {
             .filter(|(_, child)| !flex_item_is_collapsed(&child.style))
             .map(|(item, child)| finalized_outer_vertical_end(item, child))
             .fold(0.0f32, f32::max);
-        let height = if available.height_basis.is_definite() {
+        let height = if !style.box_values.height.is_auto() || available.height_basis.is_definite() {
             root_rect.size.height
         } else if physical_direction.is_row_axis() {
             // A fragmentainer may provide a physical available-height limit
@@ -1229,12 +1329,81 @@ impl<'a> LayoutBuilder<'a> {
         let fragment_plan = FlexFragmentPlan::default();
         Some(FlexLayout {
             height: PhysicalContentHeight::new(content_box_pt(height)),
+            main_gap,
             baselines,
             items,
             lines: source_lines,
             fragment_plan,
         })
     }
+}
+
+/// Select the margins trimmed by a wrapped flex container after line
+/// membership has been established.  Line membership is order-modified and
+/// excludes collapsed items, as required by CSS Flexbox and CSS Box.
+/// <https://drafts.csswg.org/css-box-4/#margin-trim-flex>.
+fn flex_margin_trim_plan(
+    style: &ComputedStyle,
+    lines: &[FlexLineLayout],
+    item_count: usize,
+) -> MarginTrimPlan {
+    let mut plan = MarginTrimPlan::for_item_count(item_count);
+    let axes = WritingModeAxes::new(style.writing_mode, style.used_direction());
+    let (main_start, main_end) = match style.flex_direction {
+        FlexDirection::Row => (LogicalSide::InlineStart, LogicalSide::InlineEnd),
+        FlexDirection::RowReverse => (LogicalSide::InlineEnd, LogicalSide::InlineStart),
+        FlexDirection::Column => (LogicalSide::BlockStart, LogicalSide::BlockEnd),
+        FlexDirection::ColumnReverse => (LogicalSide::BlockEnd, LogicalSide::BlockStart),
+    };
+    let main_start = axes.physical_side(main_start);
+    let main_end = axes.physical_side(main_end);
+
+    for (enabled, side) in [
+        (style.margin_trim.block_start, LogicalSide::BlockStart),
+        (style.margin_trim.block_end, LogicalSide::BlockEnd),
+        (style.margin_trim.inline_start, LogicalSide::InlineStart),
+        (style.margin_trim.inline_end, LogicalSide::InlineEnd),
+    ] {
+        if !enabled {
+            continue;
+        }
+        let physical_side = axes.physical_side(side);
+        if physical_side.axis() == main_start.axis() {
+            for line in lines {
+                let item = if physical_side == main_start {
+                    line.item_indices.first()
+                } else if physical_side == main_end {
+                    line.item_indices.last()
+                } else {
+                    None
+                };
+                if let Some(&item) = item {
+                    plan.trim(item, physical_side);
+                }
+            }
+            continue;
+        }
+
+        let edge_line = if physical_side.is_start_edge() {
+            lines.iter().min_by(|left, right| {
+                left.cross_start
+                    .partial_cmp(&right.cross_start)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        } else {
+            lines.iter().max_by(|left, right| {
+                left.cross_end
+                    .partial_cmp(&right.cross_end)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        };
+        if let Some(line) = edge_line {
+            for &item in &line.item_indices {
+                plan.trim(item, physical_side);
+            }
+        }
+    }
+    plan
 }
 
 /// Resolve one candidate balanced line through the same flex-length algorithm
@@ -1282,6 +1451,20 @@ fn balanced_taffy_line_layouts(
         .ok()?
         .clone();
     root_style.flex_wrap = taffy_layout::FlexWrap::NoWrap;
+    // The template root was built for the full container.  A balanced plan
+    // resolves one no-wrap Taffy tree per final line, so its cross axis must
+    // instead use the same reserved line slot that was used to estimate the
+    // items.  Child percentage dimensions have already been resolved against
+    // their original container bases while constructing the template styles;
+    // this changes only the line's layout constraint.
+    // <https://drafts.csswg.org/css-flexbox-2/#flex-line-count-property>
+    root_style.size.width = taffy_layout::Dimension::length(context.available.width.points());
+    root_style.size.height = context
+        .available
+        .height_constraint()
+        .map(PhysicalContentHeight::points)
+        .map(taffy_layout::Dimension::length)
+        .unwrap_or_else(taffy_layout::Dimension::auto);
     let root = tree.new_with_children(root_style, &nodes).ok()?;
     tree.compute_layout_with_measure(
         root,
@@ -1332,6 +1515,11 @@ fn resolve_balanced_line_flexible_lengths(
             };
             item.set_main_size(context.flex_axes, layout.main_size(context.flex_axes));
             item.set_main_start(context.flex_axes, layout.main_start(context.flex_axes));
+            // This no-wrap tree is the final balanced line, not a probe.
+            // Preserve its resolved cross size as well as its flexible main
+            // size so downstream line measurement and CSS Align placement do
+            // not retain a full-container normal-wrap box.
+            item.set_cross_size(context.flex_axes, layout.cross_size(context.flex_axes));
         }
     }
 }
@@ -1726,7 +1914,7 @@ pub(in crate::layout::flex) fn stretched_flex_item_cross_size(
             return None;
         }
         let container_cross_size =
-            flex_cross_size_from_content_box(available.height_basis_content_box_length()?);
+            balanced_flex_cross_measurement_size(container_style, physical_direction, available)?;
         Some(
             (container_cross_size
                 - FlexCrossLength::new(child_style.margin.top + child_style.margin.bottom))
@@ -1737,12 +1925,182 @@ pub(in crate::layout::flex) fn stretched_flex_item_cross_size(
             return None;
         }
         let container_cross_size =
-            flex_cross_size_from_content_box(available.width_basis_content_box_length()?);
+            balanced_flex_cross_measurement_size(container_style, physical_direction, available)?;
         Some(
             (container_cross_size
                 - FlexCrossLength::new(child_style.margin.left + child_style.margin.right))
             .non_negative_size(),
         )
+    }
+}
+
+/// Select the physical cross-size constraint that flex-item measurement may
+/// consume for stretching.
+///
+/// A balanced container with an explicit line count reserves one equal
+/// cross-axis slot for each planned line before item measurement.  That slot
+/// is a layout constraint, whereas the unmodified container content box
+/// remains the percentage basis for percentage-valued item properties.  Do
+/// not recover the slot from `FlexAvailableSpace::cross_basis`: doing so
+/// would discard the balanced constraint and make every item measure against
+/// the whole container again.
+/// <https://drafts.csswg.org/css-flexbox-2/#flex-line-count-property>
+fn balanced_flex_cross_measurement_size(
+    container_style: &ComputedStyle,
+    physical_direction: FlexDirection,
+    available: FlexAvailableSpace,
+) -> Option<FlexCrossSize> {
+    let has_explicit_balanced_line_count = container_style.flex_wrap.balances_lines()
+        && matches!(
+            container_style.flex_line_count,
+            css::FlexLineCount::Count(line_count) if line_count.get() > 1
+        );
+    if has_explicit_balanced_line_count {
+        return if physical_direction.is_row_axis() {
+            available
+                .height_constraint()
+                .map(|height| FlexCrossSize::new(height.points()))
+        } else {
+            Some(FlexCrossSize::new(available.width.points()))
+        };
+    }
+    available.definite_cross_size(physical_direction)
+}
+
+impl<'a> LayoutBuilder<'a> {
+    /// Measure the line-box span that an already-sized flex item produces in
+    /// its independent normal-flow formatting context.
+    ///
+    /// This probe deliberately uses the exact placed-item replay boundary.
+    /// The Taffy rectangle remains useful for resolving flexible lengths, but
+    /// it cannot stand in for the selected in-flow line boxes used by the
+    /// Flexbox cross-size algorithm.  Snapshot restoration makes the probe
+    /// geometry-only: paint, positioned descendants, and fragmentation keep
+    /// their ordinary replay ownership.
+    /// <https://www.w3.org/TR/css-flexbox-1/#algo-cross-line>
+    /// <https://www.w3.org/TR/css-inline-3/#line-box>
+    fn measure_final_normal_flow_line_box_spans(
+        &mut self,
+        items: &[FlexItemLayout],
+        estimates: &mut [FlexItemEstimate],
+        children: &[StyledChild<'_>],
+        container_style: &ComputedStyle,
+        stylesheets: &Stylesheets<'_>,
+        available: FlexAvailableSpace,
+    ) {
+        // Keep the normal-flow probe close to its local origin. The probe
+        // deliberately avoids the page-start branch, but subtracting two
+        // coordinates near the scratch page origin loses sub-point line-box
+        // precision in f32 and makes its result differ from ordinary replay.
+        const SCRATCH_TOP: f32 = 1.0;
+        let direction = PhysicalFlexDirection::new(physical_flex_direction(container_style));
+        for ((item, estimate), child) in items.iter().zip(estimates.iter_mut()).zip(children) {
+            if flex_item_is_collapsed(&child.style) {
+                continue;
+            }
+            let replay_dimensions = item.replay_dimensions();
+            let mut replay_style = child.style.clone();
+            freeze_replayed_item_padding(
+                &mut replay_style,
+                flex_item_used_padding(&child.style, container_style, available),
+            );
+            let placed_style = placed_flex_item_style(
+                &replay_style,
+                replay_dimensions.border_box_width(),
+                replay_dimensions.border_box_height(),
+                direction,
+            );
+            let snapshot = self.snapshot();
+            let span = self.with_placed_formatting_context(
+                PlacedFormattingContext {
+                    content_left: 0.0,
+                    content_width: replay_dimensions.available_width_for_replay(),
+                    content_height: Some(replay_dimensions.available_height_for_replay()),
+                    table_wrapper_border_box_block_size: auto_table_wrapper_block_size_override(
+                        &child.style,
+                        replay_dimensions.border_box_height(),
+                    ),
+                    writing_mode: placed_style.writing_mode,
+                    scope_content_logical_inline_size: child.anonymous_content().is_some(),
+                    cursor_y: SCRATCH_TOP,
+                    page_start_margin_policy: PageStartMarginPolicy::Suppress,
+                    float_scope: ReplayFloatScope::IsolatedFormattingContext,
+                },
+                &placed_style,
+                |layout| {
+                    layout.layout_flex_item_contents(
+                        child,
+                        &placed_style,
+                        stylesheets,
+                        PercentageBasis::indefinite(),
+                    );
+                    PhysicalContentHeight::new(content_box_pt(
+                        (SCRATCH_TOP - layout.cursor_y).max(0.0),
+                    ))
+                },
+            );
+            self.restore(snapshot);
+            estimate.set_normal_flow_line_box_span(span);
+        }
+    }
+}
+
+/// Replace the provisional physical block span of an automatic flex item
+/// with the span selected by its final normal-flow line boxes.
+///
+/// A column item's physical block axis is its flex main axis, so this must be
+/// done before canonical line collection and main-axis repacking.  For rows,
+/// only baseline participants need this early replacement: stretch receives
+/// its used cross size from the resolved line slot later in the algorithm.
+/// <https://www.w3.org/TR/css-flexbox-1/#algo-cross-item>
+/// <https://www.w3.org/TR/css-flexbox-1/#algo-cross-line>
+fn apply_final_normal_flow_item_block_spans(
+    items: &mut [FlexItemLayout],
+    estimates: &[FlexItemEstimate],
+    children: &[StyledChild<'_>],
+    container_style: &ComputedStyle,
+    physical_direction: FlexDirection,
+) {
+    for ((item, estimate), child) in items.iter_mut().zip(estimates).zip(children) {
+        if !final_normal_flow_block_span_replaces_provisional_height(
+            &child.style,
+            physical_direction,
+            estimate.main_size_provenance,
+        ) {
+            continue;
+        }
+        let Some(span) = estimate.normal_flow_line_box_span() else {
+            continue;
+        };
+        let baseline_participant = flex_baseline_set(&child.style, container_style).is_some()
+            && !flex_item_has_auto_cross_margin(&child.style, physical_direction)
+            && flex_item_baseline_axis_is_parallel_to_main_axis(&child.style, physical_direction);
+        if physical_direction.is_column_axis() || baseline_participant {
+            item.set_height(FlexPhysicalVerticalSize::new(span.points()));
+        }
+    }
+}
+
+/// Return whether final normal-flow block geometry replaces Taffy's
+/// provisional physical height for this item.
+///
+/// A row item's physical height is its cross-size, so its authored `height`
+/// remains authoritative unless the established automatic-height path needs
+/// the final line-box span. For a column, physical height is the main size:
+/// only normal-flow content can replace a provisional span. Taffy's numeric
+/// flex result no longer carries that distinction, so the resolved-basis
+/// provenance travels with the estimate to this correction boundary.
+/// <https://www.w3.org/TR/css-flexbox-1/#flex-basis-property>
+/// <https://www.w3.org/TR/css-flexbox-1/#algo-main-item>
+fn final_normal_flow_block_span_replaces_provisional_height(
+    style: &ComputedStyle,
+    physical_direction: FlexDirection,
+    main_size_provenance: FlexMainSizeProvenance,
+) -> bool {
+    if physical_direction.is_column_axis() {
+        main_size_provenance.permits_final_normal_flow_block_span()
+    } else {
+        style.box_values.height.is_auto()
     }
 }
 
@@ -1956,7 +2314,7 @@ pub(in crate::layout::flex) fn automatic_minimum_main_size(
     let preferred_aspect_ratio = child_style
         .aspect_ratio
         .preferred_ratio(child.is_replaced_element(), estimate.preferred_aspect_ratio);
-    let (specified_min, estimated_min, preferred_size, overflow) = if direction.is_row_axis() {
+    let (specified_min, estimated_min, mut preferred_size, overflow) = if direction.is_row_axis() {
         (
             child_style.box_values.min_width.clone(),
             estimate.min_width,
@@ -1987,6 +2345,15 @@ pub(in crate::layout::flex) fn automatic_minimum_main_size(
             flex_item_main_axis_overflow(child_style, direction),
         )
     };
+    // CSS Tables supplies a used grid minimum independently from the
+    // preferred wrapper size. A specified `width`/`height` can establish the
+    // flex base, but it must not cap that table-specific floor to zero during
+    // the generic Flexbox automatic-minimum calculation.
+    // <https://drafts.csswg.org/css-tables-3/#used-min-width-of-table>
+    // <https://drafts.csswg.org/css-tables-3/#computing-the-table-height>
+    if child_style.display.is_table() {
+        preferred_size = None;
+    }
     if !flex_min_size_uses_automatic_minimum(
         specified_min.clone(),
         child_style.writing_mode,
@@ -2368,5 +2735,56 @@ mod tests {
             ),
             PercentageBasis::indefinite(),
         );
+    }
+
+    fn definite_height_style() -> ComputedStyle {
+        let mut style = ComputedStyle::initial();
+        style.box_values.height.replace_with_used(
+            css::ComputedLengthPercentageOrAuto::LengthPercentage(
+                css::ComputedLengthPercentage::from_points(40.0),
+            ),
+        );
+        style
+    }
+
+    #[test]
+    fn content_basis_column_uses_final_block_span_despite_definite_height() {
+        let mut style = definite_height_style();
+        style.flex_basis = css::ComputedFlexBasis::Content;
+
+        assert!(final_normal_flow_block_span_replaces_provisional_height(
+            &style,
+            FlexDirection::Column,
+            FlexMainSizeProvenance::NormalFlowContent,
+        ));
+    }
+
+    #[test]
+    fn column_final_block_span_replacement_requires_normal_flow_content() {
+        let style = definite_height_style();
+
+        for provenance in [
+            FlexMainSizeProvenance::AspectRatioTransfer,
+            FlexMainSizeProvenance::MainSizeProperty,
+            FlexMainSizeProvenance::DefiniteFlexBasis,
+        ] {
+            assert!(!final_normal_flow_block_span_replaces_provisional_height(
+                &style,
+                FlexDirection::Column,
+                provenance,
+            ));
+        }
+    }
+
+    #[test]
+    fn row_content_basis_does_not_replace_definite_cross_height() {
+        let mut style = definite_height_style();
+        style.flex_basis = css::ComputedFlexBasis::Content;
+
+        assert!(!final_normal_flow_block_span_replaces_provisional_height(
+            &style,
+            FlexDirection::Row,
+            FlexMainSizeProvenance::NormalFlowContent,
+        ));
     }
 }

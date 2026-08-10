@@ -1,7 +1,10 @@
 use super::at_rules::collect_container_style_rules;
 use super::*;
-use crate::css::FontPaletteDefinition;
 use crate::css::PropertyRegistrationRule;
+use crate::css::{
+    FontPaletteDefinition, LayerName, LayerOrder, LayerSegment, StylesheetScopeAnchor,
+};
+use cssparser::{AtRuleParser, DeclarationParser, ToCss};
 
 #[derive(Debug)]
 pub(in crate::css) enum ParsedCssRule {
@@ -22,6 +25,7 @@ pub(in crate::css) enum ParsedCssRule {
     FontFeatureValues(FontFeatureValuesRule),
     FontPaletteValues(String, FontPaletteDefinition),
     Property(PropertyRegistrationRule),
+    Page(ParsedPageRule),
     Nested(Vec<ParsedCssRule>),
     Ignored,
 }
@@ -47,12 +51,55 @@ pub(in crate::css) struct CssRuleParser<'a> {
     pub(in crate::css) root_url: Option<&'a url::Url>,
     pub(in crate::css) layers: SharedLayerRegistry,
     pub(in crate::css) namespaces: SharedNamespaceRegistry,
-    pub(in crate::css) current_layer: Option<String>,
+    pub(in crate::css) current_layer: Option<LayerName>,
     pub(in crate::css) current_scopes: Vec<ScopeRule>,
+    pub(in crate::css) scope_anchor: StylesheetScopeAnchor,
     pub(in crate::css) media_environment: MediaEnvironment,
+    /// The nearest style rule while parsing a CSS Nesting block.  It is kept
+    /// as parsed selectors so `&` replacement follows Selectors' `:is()`
+    /// semantics instead of constructing selector strings.
+    /// <https://drafts.csswg.org/css-nesting-1/#nest-selector>
+    pub(in crate::css) nesting: Option<NestingContext>,
     /// `@namespace` is legal only in the stylesheet prelude, never in a
     /// conditional grouping rule.
     pub(in crate::css) namespace_prelude_open: bool,
+}
+
+#[derive(Clone)]
+pub(in crate::css) struct NestingContext {
+    selector_text: String,
+    selector: SelectorList<QuireSelectorImpl>,
+    /// Pseudo-element branches cannot be represented by CSS Nesting's `&`.
+    /// Direct declarations retain the complete selector list above.
+    nesting_parent: Option<SelectorList<QuireSelectorImpl>>,
+}
+
+impl NestingContext {
+    fn new(selector_text: String, selector: SelectorList<QuireSelectorImpl>) -> Self {
+        let branches = selector
+            .slice()
+            .iter()
+            .filter(|branch| !branch.has_pseudo_element())
+            .cloned()
+            .collect::<Vec<_>>();
+        let nesting_parent =
+            (!branches.is_empty()).then(|| SelectorList::from_iter(branches.into_iter()));
+        Self {
+            selector_text,
+            selector,
+            nesting_parent,
+        }
+    }
+
+    fn resolve(
+        &self,
+        relative: SelectorList<QuireSelectorImpl>,
+    ) -> Option<(String, SelectorList<QuireSelectorImpl>)> {
+        let selector = relative.replace_parent_selector(self.nesting_parent.as_ref()?);
+        let mut selector_text = String::new();
+        selector.to_css(&mut selector_text).ok()?;
+        Some((selector_text, selector))
+    }
 }
 
 pub(in crate::css) type SharedLayerRegistry = Rc<RefCell<LayerRegistry>>;
@@ -96,8 +143,14 @@ impl NamespaceRegistry {
 /// <https://www.w3.org/TR/css-cascade-5/#layer-order>.
 #[derive(Debug, Default)]
 pub(in crate::css) struct LayerRegistry {
-    pub(in crate::css) names: Vec<String>,
-    pub(in crate::css) anonymous_count: usize,
+    roots: Vec<LayerNode>,
+    names: Vec<LayerName>,
+}
+
+#[derive(Debug)]
+struct LayerNode {
+    segment: LayerSegment,
+    children: Vec<LayerNode>,
 }
 
 impl LayerRegistry {
@@ -105,21 +158,101 @@ impl LayerRegistry {
         Rc::new(RefCell::new(Self::default()))
     }
 
-    pub(in crate::css) fn names(&self) -> Vec<String> {
+    pub(in crate::css) fn names(&self) -> Vec<LayerName> {
         self.names.clone()
     }
 
-    pub(in crate::css) fn register(&mut self, name: &str) {
+    pub(in crate::css) fn register(&mut self, name: &LayerName) {
+        if name.is_empty() {
+            return;
+        }
+        let mut children = &mut self.roots;
+        for segment in &name.0 {
+            let index = children
+                .iter()
+                .position(|node| node.segment == *segment)
+                .unwrap_or_else(|| {
+                    children.push(LayerNode {
+                        segment: segment.clone(),
+                        children: Vec::new(),
+                    });
+                    children.len() - 1
+                });
+            children = &mut children[index].children;
+        }
         if !self.names.iter().any(|existing| existing == name) {
-            self.names.push(name.to_string());
+            self.names.push(name.clone());
         }
     }
 
-    pub(in crate::css) fn anonymous_name(&mut self) -> String {
-        let name = format!("__anonymous_layer_{}", self.anonymous_count);
-        self.anonymous_count = self.anonymous_count.saturating_add(1);
+    pub(in crate::css) fn anonymous_name(&mut self) -> LayerName {
+        let name = LayerName::anonymous();
         self.register(&name);
         name
+    }
+
+    /// Maps a layer to the implicit final sublayer that owns declarations
+    /// written directly in that layer.
+    pub(in crate::css) fn order_for(&self, name: &LayerName) -> Option<LayerOrder> {
+        let mut children = &self.roots;
+        let mut order = Vec::with_capacity(name.0.len() + 1);
+        for segment in &name.0 {
+            let index = children.iter().position(|node| node.segment == *segment)?;
+            order.push(index);
+            children = &children[index].children;
+        }
+        order.push(children.len());
+        Some(LayerOrder(order))
+    }
+}
+
+impl<'a> CssRuleParser<'a> {
+    fn with_nesting(&self, nesting: NestingContext) -> Self {
+        Self {
+            base_url: self.base_url,
+            root_url: self.root_url,
+            layers: Rc::clone(&self.layers),
+            namespaces: Rc::clone(&self.namespaces),
+            current_layer: self.current_layer.clone(),
+            current_scopes: self.current_scopes.clone(),
+            scope_anchor: self.scope_anchor,
+            media_environment: self.media_environment,
+            nesting: Some(nesting),
+            namespace_prelude_open: false,
+        }
+    }
+
+    fn style_rules(
+        &self,
+        selector_text: String,
+        selector: SelectorList<QuireSelectorImpl>,
+        declarations: Declarations,
+    ) -> Vec<ParsedCssRule> {
+        let routed_rules = split_pseudo_element_rule(
+            &selector_text,
+            &self.namespaces.borrow().selector_parser(),
+            &declarations,
+            self.current_layer.clone(),
+            self.current_scopes.clone(),
+        );
+        if !routed_rules.is_empty() {
+            return routed_rules;
+        }
+        let specificity = selector
+            .slice()
+            .iter()
+            .map(|branch| branch.specificity())
+            .max()
+            .unwrap_or(0);
+        vec![ParsedCssRule::Style(StyleRule {
+            selector_text,
+            selector,
+            declarations,
+            specificity,
+            order: 0,
+            layer_name: self.current_layer.clone(),
+            scopes: self.current_scopes.clone(),
+        })]
     }
 }
 
@@ -134,17 +267,30 @@ impl<'a, 'i> cssparser::QualifiedRuleParser<'i> for CssRuleParser<'a> {
     ) -> Result<Self::Prelude, cssparser::ParseError<'i, Self::Error>> {
         self.namespace_prelude_open = false;
         let start = input.position();
-        let parse_relative = if self.current_scopes.is_empty() {
+        let parse_relative = if self.nesting.is_some() {
+            ParseRelative::ForNesting
+        } else if self.current_scopes.is_empty() {
             ParseRelative::No
         } else {
             ParseRelative::ForScope
         };
         let selector_parser = self.namespaces.borrow().selector_parser();
+        let selector_parser = if self.nesting.is_some() {
+            selector_parser.with_parent_selector()
+        } else {
+            selector_parser
+        };
         let initial_state = input.state();
         match SelectorList::parse(&selector_parser, input, parse_relative) {
             Ok(selector) => {
-                let selector_text = input.slice_from(start).trim().to_string();
-                Ok((selector_text, selector))
+                if let Some(nesting) = &self.nesting {
+                    nesting
+                        .resolve(selector)
+                        .ok_or_else(|| input.new_custom_error(SelectorParseErrorKind::InvalidState))
+                } else {
+                    let selector_text = input.slice_from(start).trim().to_string();
+                    Ok((selector_text, selector))
+                }
             }
             Err(original_error) => {
                 input.reset(&initial_state);
@@ -167,7 +313,7 @@ impl<'a, 'i> cssparser::QualifiedRuleParser<'i> for CssRuleParser<'a> {
                 // the nested pseudos from the whole list would leave empty
                 // selector entries and make the fallback fail.
                 // https://drafts.csswg.org/css-lists-3/#marker-properties
-                let routing_selector = split_selector_list(&selector_text)
+                let routing_selector = super::pseudo_elements::split_selector_list(&selector_text)
                     .into_iter()
                     .map(|selector| {
                         let selector = selector
@@ -188,7 +334,13 @@ impl<'a, 'i> cssparser::QualifiedRuleParser<'i> for CssRuleParser<'a> {
                 let selector =
                     SelectorList::parse(&selector_parser, &mut routing_parser, parse_relative)
                         .map_err(|_| original_error)?;
-                Ok((selector_text, selector))
+                if let Some(nesting) = &self.nesting {
+                    nesting
+                        .resolve(selector)
+                        .ok_or_else(|| input.new_custom_error(SelectorParseErrorKind::InvalidState))
+                } else {
+                    Ok((selector_text, selector))
+                }
             }
         }
     }
@@ -199,36 +351,177 @@ impl<'a, 'i> cssparser::QualifiedRuleParser<'i> for CssRuleParser<'a> {
         _start: &ParserState,
         input: &mut Parser<'i, 't>,
     ) -> Result<Self::QualifiedRule, cssparser::ParseError<'i, Self::Error>> {
-        let specificity = selector
-            .slice()
-            .iter()
-            .map(|branch| branch.specificity())
-            .max()
-            .unwrap_or(0);
-        let declarations = parse_declarations_from_parser(input, self.base_url, self.root_url);
-        let routed_rules = split_pseudo_element_rule(
-            &selector_text,
-            &self.namespaces.borrow().selector_parser(),
-            &declarations,
-            self.current_layer.clone(),
-            self.current_scopes.clone(),
-        );
-        if !routed_rules.is_empty() {
-            return if routed_rules.len() == 1 {
-                Ok(routed_rules.into_iter().next().expect("one routed rule"))
-            } else {
-                Ok(ParsedCssRule::Nested(routed_rules))
-            };
+        let nesting = NestingContext::new(selector_text, selector);
+        let mut parser = self.with_nesting(nesting);
+        let nested = parse_nested_style_block(input, &mut parser);
+        Ok(ParsedCssRule::Nested(nested))
+    }
+}
+
+enum NestedStyleItem {
+    Declaration((String, String)),
+    Rule(Box<ParsedCssRule>),
+}
+
+/// Parses the block contents allowed by CSS Nesting.  `RuleBodyParser` keeps
+/// declarations, qualified rules, and at-rules at CSS component-value
+/// boundaries, so braces or delimiters inside values cannot become rules.
+/// <https://drafts.csswg.org/css-nesting-1/#style-rules>
+struct NestedStyleBodyParser<'a, 'p> {
+    parser: &'p mut CssRuleParser<'a>,
+}
+
+impl<'a, 'p, 'i> AtRuleParser<'i> for NestedStyleBodyParser<'a, 'p> {
+    type Prelude = AtRulePrelude;
+    type AtRule = NestedStyleItem;
+    type Error = SelectorParseErrorKind<'i>;
+
+    fn parse_prelude<'t>(
+        &mut self,
+        name: CowRcStr<'i>,
+        input: &mut Parser<'i, 't>,
+    ) -> Result<Self::Prelude, cssparser::ParseError<'i, Self::Error>> {
+        // CSS Nesting permits only group rules in a style rule.  Consume the
+        // remaining prelude before ignoring another at-rule, so recovery is
+        // confined to that rule.
+        if !name.eq_ignore_ascii_case("media")
+            && !name.eq_ignore_ascii_case("supports")
+            && !name.eq_ignore_ascii_case("container")
+            && !name.eq_ignore_ascii_case("layer")
+            && !name.eq_ignore_ascii_case("scope")
+        {
+            consume_remaining_input(input);
+            return Ok(AtRulePrelude::Ignored);
         }
-        Ok(ParsedCssRule::Style(StyleRule {
-            selector_text,
-            selector,
-            declarations,
-            specificity,
-            order: 0,
-            layer_name: self.current_layer.clone(),
-            scopes: self.current_scopes.clone(),
-        }))
+        <CssRuleParser<'a> as AtRuleParser<'i>>::parse_prelude(self.parser, name, input)
+    }
+
+    fn rule_without_block(
+        &mut self,
+        prelude: Self::Prelude,
+        start: &ParserState,
+    ) -> Result<Self::AtRule, ()> {
+        <CssRuleParser<'a> as AtRuleParser<'i>>::rule_without_block(self.parser, prelude, start)
+            .map(|rule| NestedStyleItem::Rule(Box::new(rule)))
+    }
+
+    fn parse_block<'t>(
+        &mut self,
+        prelude: Self::Prelude,
+        start: &ParserState,
+        input: &mut Parser<'i, 't>,
+    ) -> Result<Self::AtRule, cssparser::ParseError<'i, Self::Error>> {
+        <CssRuleParser<'a> as AtRuleParser<'i>>::parse_block(self.parser, prelude, start, input)
+            .map(|rule| NestedStyleItem::Rule(Box::new(rule)))
+    }
+}
+
+impl<'a, 'p, 'i> cssparser::QualifiedRuleParser<'i> for NestedStyleBodyParser<'a, 'p> {
+    type Prelude = (String, SelectorList<QuireSelectorImpl>);
+    type QualifiedRule = NestedStyleItem;
+    type Error = SelectorParseErrorKind<'i>;
+
+    fn parse_prelude<'t>(
+        &mut self,
+        input: &mut Parser<'i, 't>,
+    ) -> Result<Self::Prelude, cssparser::ParseError<'i, Self::Error>> {
+        <CssRuleParser<'a> as cssparser::QualifiedRuleParser<'i>>::parse_prelude(self.parser, input)
+    }
+
+    fn parse_block<'t>(
+        &mut self,
+        prelude: Self::Prelude,
+        start: &ParserState,
+        input: &mut Parser<'i, 't>,
+    ) -> Result<Self::QualifiedRule, cssparser::ParseError<'i, Self::Error>> {
+        <CssRuleParser<'a> as cssparser::QualifiedRuleParser<'i>>::parse_block(
+            self.parser,
+            prelude,
+            start,
+            input,
+        )
+        .map(|rule| NestedStyleItem::Rule(Box::new(rule)))
+    }
+}
+
+impl<'a, 'p, 'i> DeclarationParser<'i> for NestedStyleBodyParser<'a, 'p> {
+    type Declaration = NestedStyleItem;
+    type Error = SelectorParseErrorKind<'i>;
+
+    fn parse_value<'t>(
+        &mut self,
+        name: CowRcStr<'i>,
+        input: &mut Parser<'i, 't>,
+        _declaration_start: &ParserState,
+    ) -> Result<Self::Declaration, cssparser::ParseError<'i, Self::Error>> {
+        crate::css::parse::parse_nested_declaration_value(name, input)
+            .map(NestedStyleItem::Declaration)
+            .ok_or_else(|| input.new_custom_error(SelectorParseErrorKind::InvalidState))
+    }
+}
+
+impl<'a, 'p, 'i> RuleBodyItemParser<'i, NestedStyleItem, SelectorParseErrorKind<'i>>
+    for NestedStyleBodyParser<'a, 'p>
+{
+    fn parse_declarations(&self) -> bool {
+        true
+    }
+
+    fn parse_qualified(&self) -> bool {
+        true
+    }
+}
+
+fn parse_nested_style_block<'a, 'i, 't>(
+    input: &mut Parser<'i, 't>,
+    parser: &mut CssRuleParser<'a>,
+) -> Vec<ParsedCssRule> {
+    let context = parser
+        .nesting
+        .clone()
+        .expect("nested style parser has a parent selector");
+    let mut declarations = Declarations::new().with_urls(parser.base_url, parser.root_url);
+    let mut rules = Vec::new();
+    let items = {
+        let mut body_parser = NestedStyleBodyParser { parser };
+        RuleBodyParser::new(input, &mut body_parser)
+            .flatten()
+            .collect::<Vec<_>>()
+    };
+    for item in items {
+        match item {
+            NestedStyleItem::Declaration(declaration) => {
+                declarations.extend(std::iter::once(declaration).collect());
+            }
+            NestedStyleItem::Rule(rule) => {
+                if !declarations.is_empty() {
+                    rules.extend(parser.style_rules(
+                        context.selector_text.clone(),
+                        context.selector.clone(),
+                        std::mem::replace(
+                            &mut declarations,
+                            Declarations::new().with_urls(parser.base_url, parser.root_url),
+                        ),
+                    ));
+                }
+                rules.push(*rule);
+            }
+        }
+    }
+    if !declarations.is_empty() {
+        rules.extend(parser.style_rules(context.selector_text, context.selector, declarations));
+    }
+    rules
+}
+
+fn parse_style_rule_list<'a, 'i, 't>(
+    input: &mut Parser<'i, 't>,
+    parser: &mut CssRuleParser<'a>,
+) -> Vec<ParsedCssRule> {
+    if parser.nesting.is_some() {
+        parse_nested_style_block(input, parser)
+    } else {
+        StyleSheetParser::new(input, parser).flatten().collect()
     }
 }
 
@@ -242,6 +535,50 @@ impl<'a, 'i> cssparser::AtRuleParser<'i> for CssRuleParser<'a> {
         name: CowRcStr<'i>,
         input: &mut Parser<'i, 't>,
     ) -> Result<Self::Prelude, cssparser::ParseError<'i, Self::Error>> {
+        if name.eq_ignore_ascii_case("page") {
+            self.namespace_prelude_open = false;
+            return parse_page_selector_list(input)
+                .map(AtRulePrelude::Page)
+                .map_err(|_| input.new_custom_error(SelectorParseErrorKind::InvalidState));
+        }
+        if name.eq_ignore_ascii_case("keyframes") {
+            self.namespace_prelude_open = false;
+            return KeyframesName::parse(input)
+                .map(AtRulePrelude::Keyframes)
+                .map_err(|_| input.new_custom_error(SelectorParseErrorKind::InvalidState));
+        }
+        if name.eq_ignore_ascii_case("property") {
+            self.namespace_prelude_open = false;
+            return parse_property_names(input)
+                .map(AtRulePrelude::Property)
+                .map_err(|_| input.new_custom_error(SelectorParseErrorKind::InvalidState));
+        }
+        if name.eq_ignore_ascii_case("layer") {
+            self.namespace_prelude_open = false;
+            let names = if input.is_exhausted() {
+                Vec::new()
+            } else {
+                parse_layer_name_list(input)
+                    .map_err(|_| input.new_custom_error(SelectorParseErrorKind::InvalidState))?
+            };
+            return Ok(AtRulePrelude::Layer(names));
+        }
+        if name.eq_ignore_ascii_case("scope") {
+            self.namespace_prelude_open = false;
+            let selector_parser = self.namespaces.borrow().selector_parser();
+            let nesting_parent = self
+                .nesting
+                .as_ref()
+                .and_then(|context| context.nesting_parent.as_ref());
+            let selector_parser = if nesting_parent.is_some() {
+                selector_parser.with_parent_selector()
+            } else {
+                selector_parser
+            };
+            return parse_scope_prelude(input, &selector_parser, self.scope_anchor, nesting_parent)
+                .map(AtRulePrelude::Scope)
+                .map_err(|_| input.new_custom_error(SelectorParseErrorKind::InvalidState));
+        }
         // A custom-property declaration in a feature query can consist only
         // of whitespace. Preserve that whitespace for `@supports` instead of
         // applying the normal at-rule prelude trimming.
@@ -266,24 +603,12 @@ impl<'a, 'i> cssparser::AtRuleParser<'i> for CssRuleParser<'a> {
             Ok(AtRulePrelude::Supports(
                 supports_condition_applies_with_selector_parser(&prelude, &selector_parser),
             ))
-        } else if name.eq_ignore_ascii_case("layer") {
-            Ok(AtRulePrelude::Layer(prelude))
         } else if name.eq_ignore_ascii_case("namespace") {
             Ok(AtRulePrelude::Namespace(
                 self.namespace_prelude_open
                     .then(|| parse_namespace_prelude(&prelude))
                     .flatten(),
             ))
-        } else if name.eq_ignore_ascii_case("scope") {
-            let selector_parser = self.namespaces.borrow().selector_parser();
-            Ok(AtRulePrelude::Scope(parse_scope_prelude(
-                &prelude,
-                &selector_parser,
-            )))
-        } else if name.eq_ignore_ascii_case("page") {
-            Ok(AtRulePrelude::Page(prelude))
-        } else if name.eq_ignore_ascii_case("keyframes") {
-            Ok(AtRulePrelude::Keyframes(prelude))
         } else if name.eq_ignore_ascii_case("font-face") {
             Ok(AtRulePrelude::FontFace)
         } else if name.eq_ignore_ascii_case("counter-style") {
@@ -294,8 +619,6 @@ impl<'a, 'i> cssparser::AtRuleParser<'i> for CssRuleParser<'a> {
             Ok(AtRulePrelude::FontPaletteValues(prelude))
         } else if name.eq_ignore_ascii_case("container") {
             Ok(AtRulePrelude::Container(prelude))
-        } else if name.eq_ignore_ascii_case("property") {
-            Ok(AtRulePrelude::Property(prelude))
         } else {
             Ok(AtRulePrelude::Ignored)
         }
@@ -307,8 +630,12 @@ impl<'a, 'i> cssparser::AtRuleParser<'i> for CssRuleParser<'a> {
         _start: &ParserState,
     ) -> Result<Self::AtRule, ()> {
         match prelude {
-            AtRulePrelude::Layer(prelude) => {
-                for name in parse_layer_name_list(self.current_layer.as_deref(), &prelude) {
+            AtRulePrelude::Layer(names) => {
+                if names.is_empty() {
+                    return Ok(ParsedCssRule::Ignored);
+                }
+                for name in names {
+                    let name = qualify_layer_name(self.current_layer.as_ref(), name);
                     self.layers.borrow_mut().register(&name);
                 }
                 Ok(ParsedCssRule::Ignored)
@@ -348,12 +675,12 @@ impl<'a, 'i> cssparser::AtRuleParser<'i> for CssRuleParser<'a> {
                     namespaces: Rc::clone(&self.namespaces),
                     current_layer: self.current_layer.clone(),
                     current_scopes: self.current_scopes.clone(),
+                    scope_anchor: self.scope_anchor,
                     media_environment: self.media_environment,
+                    nesting: self.nesting.clone(),
                     namespace_prelude_open: false,
                 };
-                let nested = StyleSheetParser::new(input, &mut parser)
-                    .flatten()
-                    .collect::<Vec<_>>();
+                let nested = parse_style_rule_list(input, &mut parser);
                 Ok(ParsedCssRule::Nested(nested))
             }
             AtRulePrelude::Supports(true) => {
@@ -364,26 +691,25 @@ impl<'a, 'i> cssparser::AtRuleParser<'i> for CssRuleParser<'a> {
                     namespaces: Rc::clone(&self.namespaces),
                     current_layer: self.current_layer.clone(),
                     current_scopes: self.current_scopes.clone(),
+                    scope_anchor: self.scope_anchor,
                     media_environment: self.media_environment,
+                    nesting: self.nesting.clone(),
                     namespace_prelude_open: false,
                 };
-                let nested = StyleSheetParser::new(input, &mut parser)
-                    .flatten()
-                    .collect::<Vec<_>>();
+                let nested = parse_style_rule_list(input, &mut parser);
                 Ok(ParsedCssRule::Nested(nested))
             }
-            AtRulePrelude::Layer(prelude) => {
-                let layer_name = if prelude.trim().is_empty() {
+            AtRulePrelude::Layer(names) => {
+                let layer_name = if names.is_empty() {
                     self.layers.borrow_mut().anonymous_name()
-                } else if prelude.contains(',') {
+                } else if names.len() != 1 {
                     consume_remaining_input(input);
                     return Ok(ParsedCssRule::Ignored);
                 } else {
-                    let Some(name) = qualify_layer_name(self.current_layer.as_deref(), &prelude)
-                    else {
-                        consume_remaining_input(input);
-                        return Ok(ParsedCssRule::Ignored);
-                    };
+                    let name = qualify_layer_name(
+                        self.current_layer.as_ref(),
+                        names.into_iter().next().expect("one layer name"),
+                    );
                     self.layers.borrow_mut().register(&name);
                     name
                 };
@@ -394,15 +720,15 @@ impl<'a, 'i> cssparser::AtRuleParser<'i> for CssRuleParser<'a> {
                     namespaces: Rc::clone(&self.namespaces),
                     current_layer: Some(layer_name),
                     current_scopes: self.current_scopes.clone(),
+                    scope_anchor: self.scope_anchor,
                     media_environment: self.media_environment,
+                    nesting: self.nesting.clone(),
                     namespace_prelude_open: false,
                 };
-                let nested = StyleSheetParser::new(input, &mut parser)
-                    .flatten()
-                    .collect::<Vec<_>>();
+                let nested = parse_style_rule_list(input, &mut parser);
                 Ok(ParsedCssRule::Nested(nested))
             }
-            AtRulePrelude::Scope(Some(scope)) => {
+            AtRulePrelude::Scope(scope) => {
                 let mut current_scopes = self.current_scopes.clone();
                 current_scopes.push(scope);
                 let mut parser = CssRuleParser {
@@ -412,24 +738,27 @@ impl<'a, 'i> cssparser::AtRuleParser<'i> for CssRuleParser<'a> {
                     namespaces: Rc::clone(&self.namespaces),
                     current_layer: self.current_layer.clone(),
                     current_scopes,
+                    scope_anchor: self.scope_anchor,
                     media_environment: self.media_environment,
+                    nesting: self.nesting.clone(),
                     namespace_prelude_open: false,
                 };
-                let nested = StyleSheetParser::new(input, &mut parser)
-                    .flatten()
-                    .collect::<Vec<_>>();
+                let nested = parse_style_rule_list(input, &mut parser);
                 Ok(ParsedCssRule::Nested(nested))
             }
             AtRulePrelude::Page(prelude) => {
-                let _ = prelude;
-                consume_remaining_input(input);
-                Ok(ParsedCssRule::Ignored)
+                let mut parser = PageRuleBodyParser::new(self.base_url, self.root_url);
+                for _ in RuleBodyParser::new(input, &mut parser) {}
+                Ok(ParsedCssRule::Page(
+                    parser.finish(prelude, self.current_layer.clone()),
+                ))
             }
             AtRulePrelude::Keyframes(name) => {
-                let body = consume_remaining_input(input);
-                Ok(parse_keyframes_rule(&name, &body)
-                    .map(ParsedCssRule::Keyframes)
-                    .unwrap_or(ParsedCssRule::Ignored))
+                Ok(
+                    parse_keyframes_rule(name, input, self.base_url, self.root_url)
+                        .map(ParsedCssRule::Keyframes)
+                        .unwrap_or(ParsedCssRule::Ignored),
+                )
             }
             AtRulePrelude::FontFace => {
                 let body = consume_remaining_input(input);
@@ -466,27 +795,28 @@ impl<'a, 'i> cssparser::AtRuleParser<'i> for CssRuleParser<'a> {
                     namespaces: Rc::clone(&self.namespaces),
                     current_layer: self.current_layer.clone(),
                     current_scopes: self.current_scopes.clone(),
+                    scope_anchor: self.scope_anchor,
                     media_environment: self.media_environment,
+                    nesting: self.nesting.clone(),
                     namespace_prelude_open: false,
                 };
-                let nested = StyleSheetParser::new(input, &mut parser)
-                    .flatten()
-                    .collect::<Vec<_>>();
+                let nested = parse_style_rule_list(input, &mut parser);
                 let mut rules = Vec::new();
+                let mut nested_containers = Vec::new();
                 for rule in nested {
-                    collect_container_style_rules(rule, &mut rules);
+                    collect_container_style_rules(rule, &mut rules, &mut nested_containers);
                 }
-                Ok(ParsedCssRule::Container(ContainerRule { prelude, rules }))
+                Ok(ParsedCssRule::Container(ContainerRule {
+                    prelude,
+                    rules,
+                    nested: nested_containers,
+                }))
             }
-            AtRulePrelude::Property(prelude) => {
-                let block = consume_remaining_input(input);
-                Ok(parse_property_rule(&prelude, &block)
-                    .map(ParsedCssRule::Property)
-                    .unwrap_or(ParsedCssRule::Ignored))
-            }
+            AtRulePrelude::Property(names) => Ok(parse_property_rule(names, input)
+                .map(ParsedCssRule::Property)
+                .unwrap_or(ParsedCssRule::Ignored)),
             AtRulePrelude::Media(false)
             | AtRulePrelude::Supports(false)
-            | AtRulePrelude::Scope(None)
             | AtRulePrelude::Namespace(_)
             | AtRulePrelude::Ignored => {
                 consume_remaining_input(input);
@@ -499,16 +829,16 @@ impl<'a, 'i> cssparser::AtRuleParser<'i> for CssRuleParser<'a> {
 pub(in crate::css) enum AtRulePrelude {
     Media(bool),
     Supports(bool),
-    Layer(String),
+    Layer(Vec<LayerName>),
     Namespace(Option<(Option<String>, String)>),
-    Scope(Option<ScopeRule>),
-    Page(String),
-    Keyframes(String),
+    Scope(ScopeRule),
+    Page(Vec<PageSelector>),
+    Keyframes(KeyframesName),
     FontFace,
     CounterStyle(String),
     FontFeatureValues(String),
     FontPaletteValues(String),
     Container(String),
-    Property(String),
+    Property(Vec<String>),
     Ignored,
 }

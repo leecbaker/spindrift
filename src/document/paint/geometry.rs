@@ -240,6 +240,284 @@ impl PaintTransform {
         let inverse = self.0.inverse()?;
         Some(Self::from_transform(inverse).apply_clip_to_aabb(clip))
     }
+
+    pub(crate) fn inverse_apply_point(self, point: PaintPoint) -> Option<PaintPoint> {
+        Some(Self::from_transform(self.0.inverse()?).apply_point(point))
+    }
+}
+
+/// A non-projective homogeneous transform in page-local paint coordinates.
+///
+/// CSS Transforms Level 2 uses a 4×4 matrix while CSS 3D rendering contexts
+/// are accumulated. PDF content streams accept only an affine 2D CTM, so this
+/// wrapper is the explicit boundary between those two representations. Its
+/// constructor rejects perspective terms instead of silently approximating a
+/// projective scene.
+/// <https://drafts.csswg.org/css-transforms-2/#ctm>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Affine3dPaintTransform(euclid::Transform3D<f32, PaintSpace, PaintSpace>);
+
+/// A full CSS 3D matrix retained until a paint backend chooses an output
+/// representation. Unlike PDF's CTM, this can carry perspective terms.
+/// <https://drafts.csswg.org/css-transforms-2/#processing-of-perspective-transformed-boxes>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Projective3dPaintTransform(euclid::Transform3D<f32, PaintSpace, PaintSpace>);
+
+/// The projection state of one point on a CSS plane. Keeping the homogeneous
+/// coordinate explicit prevents renderer code from accidentally drawing
+/// behind-viewer geometry after a perspective divide.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum ProjectedPaintPoint {
+    Visible {
+        point: PaintPoint,
+        depth: f32,
+    },
+    AtViewer {
+        direction: euclid::Vector3D<f32, PaintSpace>,
+    },
+    BehindViewer,
+}
+
+/// A visible source plane after homogeneous clipping and perspective divide.
+/// `source_transform` stays attached so ordering and backend lowering do not
+/// accidentally reinterpret the projected polygon as an affine PDF CTM.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ProjectedScenePlane {
+    pub(crate) polygon: Vec<PaintPoint>,
+    pub(crate) depth: f32,
+    pub(crate) source_transform: Projective3dPaintTransform,
+}
+
+/// The explicitly modeled outcome of projecting a source-plane polygon.
+/// <https://drafts.csswg.org/css-transforms-2/#processing-of-perspective-transformed-boxes>
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ProjectedPlane {
+    Visible(ProjectedScenePlane),
+    ClippedAtViewer(ProjectedScenePlane),
+    BehindViewer,
+}
+
+impl Projective3dPaintTransform {
+    const EPSILON: f32 = 1e-6;
+
+    pub(crate) fn identity() -> Self {
+        Self(euclid::Transform3D::identity())
+    }
+
+    pub(crate) fn from_transform(
+        transform: euclid::Transform3D<f32, PaintSpace, PaintSpace>,
+    ) -> Self {
+        Self(transform)
+    }
+
+    /// Promote a PDF-affine paint matrix into the retained CSS 3D scene.
+    /// This is used only while lowering a projective ancestor, before any
+    /// PDF CTM has been emitted.
+    pub(crate) fn from_paint_transform(transform: PaintTransform) -> Self {
+        Self(euclid::Transform3D::new(
+            transform.a(),
+            transform.b(),
+            0.0,
+            0.0,
+            transform.c(),
+            transform.d(),
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            transform.e(),
+            transform.f(),
+            0.0,
+            1.0,
+        ))
+    }
+
+    /// Compose `self` after `right`, matching CSS matrix multiplication.
+    pub(crate) fn multiply(self, right: Self) -> Self {
+        Self(right.0.then(&self.0))
+    }
+
+    pub(crate) fn is_invertible(self) -> bool {
+        self.0.inverse().is_some()
+    }
+
+    pub(crate) fn try_into_affine_pdf_ctm(self) -> Option<Affine3dPaintTransform> {
+        Affine3dPaintTransform::try_from_transform(self.0)
+    }
+
+    pub(crate) fn faces_away_from_viewer(self) -> bool {
+        self.0.m33 < 0.0
+    }
+
+    pub(crate) fn project_plane_point(self, point: PaintPoint) -> ProjectedPaintPoint {
+        let (x, y, z, w) = self.homogeneous_plane_point(point);
+        if w > Self::EPSILON {
+            ProjectedPaintPoint::Visible {
+                point: PaintPoint::new(x / w, y / w),
+                depth: z / w,
+            }
+        } else if w < -Self::EPSILON {
+            ProjectedPaintPoint::BehindViewer
+        } else {
+            ProjectedPaintPoint::AtViewer {
+                direction: euclid::Vector3D::new(x, y, z),
+            }
+        }
+    }
+
+    /// Clip a convex source-plane polygon to the visible side of the viewer
+    /// and perform its perspective divide. The `w = 0` intersections are
+    /// retained at a small positive epsilon so the result is finite, as CSS
+    /// Transforms permits an implementation-defined far distance there.
+    pub(crate) fn project_visible_polygon(self, points: &[PaintPoint]) -> Vec<PaintPoint> {
+        if points.len() < 3 {
+            return Vec::new();
+        }
+        let mut visible = Vec::with_capacity(points.len() + 2);
+        let mut previous = *points.last().expect("nonempty polygon");
+        let mut previous_w = self.homogeneous_plane_point(previous).3;
+        for current in points.iter().copied() {
+            let current_w = self.homogeneous_plane_point(current).3;
+            let previous_inside = previous_w > Self::EPSILON;
+            let current_inside = current_w > Self::EPSILON;
+            if previous_inside != current_inside {
+                let t = (Self::EPSILON - previous_w) / (current_w - previous_w);
+                visible.push(PaintPoint::new(
+                    previous.x + (current.x - previous.x) * t,
+                    previous.y + (current.y - previous.y) * t,
+                ));
+            }
+            if current_inside {
+                visible.push(current);
+            }
+            previous = current;
+            previous_w = current_w;
+        }
+        visible
+            .into_iter()
+            .map(|point| {
+                let (x, y, _, w) = self.homogeneous_plane_point(point);
+                PaintPoint::new(x / w, y / w)
+            })
+            .collect()
+    }
+
+    pub(crate) fn project_plane(self, points: &[PaintPoint]) -> ProjectedPlane {
+        if points.len() < 3 {
+            return ProjectedPlane::BehindViewer;
+        }
+        let viewer_clipped = points
+            .iter()
+            .any(|point| self.homogeneous_plane_point(*point).3 <= Self::EPSILON);
+        let polygon = self.project_visible_polygon(points);
+        if polygon.len() < 3 {
+            return ProjectedPlane::BehindViewer;
+        }
+        let depth = points
+            .iter()
+            .filter_map(|point| match self.project_plane_point(*point) {
+                ProjectedPaintPoint::Visible { depth, .. } => Some(depth),
+                ProjectedPaintPoint::AtViewer { .. } | ProjectedPaintPoint::BehindViewer => None,
+            })
+            .next()
+            .unwrap_or(0.0);
+        let plane = ProjectedScenePlane {
+            polygon,
+            depth,
+            source_transform: self,
+        };
+        if viewer_clipped {
+            ProjectedPlane::ClippedAtViewer(plane)
+        } else {
+            ProjectedPlane::Visible(plane)
+        }
+    }
+
+    fn homogeneous_plane_point(self, point: PaintPoint) -> (f32, f32, f32, f32) {
+        (
+            point.x * self.0.m11 + point.y * self.0.m21 + self.0.m41,
+            point.x * self.0.m12 + point.y * self.0.m22 + self.0.m42,
+            point.x * self.0.m13 + point.y * self.0.m23 + self.0.m43,
+            point.x * self.0.m14 + point.y * self.0.m24 + self.0.m44,
+        )
+    }
+}
+
+impl Affine3dPaintTransform {
+    const EPSILON: f32 = 1e-6;
+
+    /// The initial shared coordinate system of an affine CSS 3D rendering
+    /// context. A `preserve-3d` element establishes this context even when
+    /// its own `transform` is `none`.
+    /// <https://drafts.csswg.org/css-transforms-2/#3d-rendering-contexts>
+    pub(crate) fn identity() -> Self {
+        Self(euclid::Transform3D::identity())
+    }
+
+    pub(crate) fn try_from_transform(
+        transform: euclid::Transform3D<f32, PaintSpace, PaintSpace>,
+    ) -> Option<Self> {
+        (transform.m14.abs() <= Self::EPSILON
+            && transform.m24.abs() <= Self::EPSILON
+            && transform.m34.abs() <= Self::EPSILON
+            && transform.m44.abs() > Self::EPSILON)
+            .then_some(Self(transform))
+    }
+
+    /// Compose `self` after `right`, matching CSS matrix multiplication.
+    pub(crate) fn multiply(self, right: Self) -> Self {
+        Self(right.0.then(&self.0))
+    }
+
+    pub(crate) fn is_invertible(self) -> bool {
+        self.0.inverse().is_some()
+    }
+
+    /// Promote an affine 3D plane matrix into the homogeneous representation
+    /// used when an ancestor supplies perspective. This is lossless: affine
+    /// CSS 3D transforms may carry Z translation/rotation even though PDF's
+    /// 2D CTM cannot represent them.
+    /// <https://drafts.csswg.org/css-transforms-2/#3d-rendering-contexts>
+    pub(crate) fn into_projective(self) -> Projective3dPaintTransform {
+        Projective3dPaintTransform::from_transform(self.0)
+    }
+
+    /// The page-plane CTM after all 3D context participants have composed.
+    pub(crate) fn flatten_to_paint_transform(self) -> PaintTransform {
+        let inverse_w = self.0.m44.recip();
+        PaintTransform::from_transform(euclid::Transform2D::new(
+            self.0.m11 * inverse_w,
+            self.0.m12 * inverse_w,
+            self.0.m21 * inverse_w,
+            self.0.m22 * inverse_w,
+            self.0.m41 * inverse_w,
+            self.0.m42 * inverse_w,
+        ))
+    }
+
+    /// The sign of the transformed plane normal relative to the viewer.
+    pub(crate) fn faces_away_from_viewer(self) -> bool {
+        self.0.m33 < 0.0
+    }
+
+    /// Depth of a page-local point on this plane after its homogeneous affine
+    /// transform. Positive Z faces the viewer in CSS Transforms' initial
+    /// coordinate system.
+    pub(crate) fn depth_at(self, point: PaintPoint) -> f32 {
+        self.0.m13 * point.x + self.0.m23 * point.y + self.0.m43
+    }
+
+    /// Return this plane's Z coordinate at a point in the flattened shared
+    /// rendering-context plane.  The inverse 2D projection identifies the
+    /// corresponding point on the retained local plane.
+    pub(crate) fn depth_at_projected(self, point: PaintPoint) -> Option<f32> {
+        let local = self
+            .flatten_to_paint_transform()
+            .inverse_apply_point(point)?;
+        Some(self.depth_at(local))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -332,7 +610,7 @@ impl PaintClip {
         PaintPoint::new(self.x() + self.width(), self.y() + self.height())
     }
 
-    pub(in crate::document) fn translated(self, offset: PaintTranslation) -> Self {
+    pub(crate) fn translated(self, offset: PaintTranslation) -> Self {
         Self::from_paint_rect(offset.transform_rect(&self.rect))
     }
 
@@ -485,8 +763,8 @@ impl PaintBounds {
 mod tests {
     use super::{
         AxisSelectivePaintClip, PaintBounds, PaintClip, PaintPoint, PaintRect, PaintSize,
-        PaintTransform, PaintTranslation, PdfPoint, PdfRect, PdfSize, paint_point_to_pdf,
-        paint_rect_to_pdf,
+        PaintTransform, PaintTranslation, PdfPoint, PdfRect, PdfSize, ProjectedPaintPoint,
+        Projective3dPaintTransform, paint_point_to_pdf, paint_rect_to_pdf,
     };
 
     fn paint_rect(x: f32, y: f32, width: f32, height: f32) -> PaintRect {
@@ -501,6 +779,29 @@ mod tests {
         assert_eq!(
             transform.apply_point(PaintPoint::new(1.0, 2.0)),
             PaintPoint::new(12.0, 26.0)
+        );
+    }
+
+    #[test]
+    fn projective_plane_clips_edges_at_the_viewer_instead_of_dropping_it() {
+        let transform = Projective3dPaintTransform::from_transform(euclid::Transform3D::new(
+            1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ));
+        assert!(matches!(
+            transform.project_plane_point(PaintPoint::new(0.0, 0.0)),
+            ProjectedPaintPoint::Visible { .. }
+        ));
+        let polygon = transform.project_visible_polygon(&[
+            PaintPoint::new(-2.0, -1.0),
+            PaintPoint::new(0.0, -1.0),
+            PaintPoint::new(0.0, 1.0),
+            PaintPoint::new(-2.0, 1.0),
+        ]);
+        assert!(polygon.len() >= 3);
+        assert!(
+            polygon
+                .iter()
+                .all(|point| point.x.is_finite() && point.y.is_finite())
         );
     }
 

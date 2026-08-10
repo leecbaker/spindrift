@@ -6,7 +6,7 @@ pub(in crate::css) fn expand_flex_flow_shorthand(
     let mut wrap = "nowrap";
     let mut saw_direction = false;
     let mut saw_wrap = false;
-    for token in trim_css_value(value).split_whitespace() {
+    for token in try_split_css_component_values(trim_css_value(value))? {
         match token.to_ascii_lowercase().as_str() {
             "row" | "row-reverse" | "column" | "column-reverse" if !saw_direction => {
                 direction = token;
@@ -108,7 +108,7 @@ pub(in crate::css) fn parse_flex_flow(value: &str) -> Option<(FlexDirection, Fle
     let mut balance = false;
     let mut saw_direction = false;
     let mut saw_wrap = false;
-    for token in trim_css_value(value).split_whitespace() {
+    for token in try_split_css_component_values(trim_css_value(value))? {
         match token.to_ascii_lowercase().as_str() {
             "row" if !saw_direction => {
                 direction = FlexDirection::Row;

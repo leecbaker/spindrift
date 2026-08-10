@@ -7,6 +7,35 @@
 ///
 /// The table is ported from checked-out WeasyPrint's CLDR-derived
 /// `weasyprint.text.constants.LANG_QUOTES`.
+/// A static quotation-mark system selected for a computed `quotes: auto`
+/// value.
+///
+/// The system holds only references into the CLDR-derived table, so resolving
+/// the parent language does not retain or allocate an owned language string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResolvedAutoQuotes {
+    open: &'static [&'static str],
+    close: &'static [&'static str],
+}
+
+impl ResolvedAutoQuotes {
+    pub(crate) fn pair_at_depth(self, depth: usize) -> (&'static str, &'static str) {
+        let open = self
+            .open
+            .get(depth)
+            .or_else(|| self.open.last())
+            .copied()
+            .unwrap_or(DEFAULT_QUOTES.open[0]);
+        let close = self
+            .close
+            .get(depth)
+            .or_else(|| self.close.last())
+            .copied()
+            .unwrap_or(DEFAULT_QUOTES.close[0]);
+        (open, close)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct LangQuotes {
     language: &'static str,
@@ -628,56 +657,65 @@ const LANG_QUOTES: &[LangQuotes] = &[
     },
 ];
 
-pub(super) fn language_quote_pair(
-    language: Option<&str>,
-    depth: usize,
-) -> (&'static str, &'static str) {
+pub(crate) fn resolved_auto_quotes_for_language(language: Option<&str>) -> ResolvedAutoQuotes {
     let quotes = language
         .and_then(lang_quotes_for_language)
         .unwrap_or(DEFAULT_QUOTES);
-    quote_pair_at_depth(quotes, depth)
+    ResolvedAutoQuotes {
+        open: quotes.open,
+        close: quotes.close,
+    }
 }
 
 fn lang_quotes_for_language(language: &str) -> Option<LangQuotes> {
-    let normalized = language.replace('-', "_");
     if let Some(quotes) = LANG_QUOTES
         .iter()
-        .find(|quotes| normalized.eq_ignore_ascii_case(quotes.language))
+        .find(|quotes| language_tag_eq(language, quotes.language))
     {
         return Some(*quotes);
     }
     LANG_QUOTES
         .iter()
-        .filter(|quotes| language_matches_parent(&normalized, quotes.language))
+        .filter(|quotes| language_matches_parent(language, quotes.language))
         .max_by_key(|quotes| quotes.language.len())
-        .cloned()
+        .copied()
 }
 
-fn language_matches_parent(normalized: &str, candidate: &str) -> bool {
-    normalized.len() > candidate.len()
-        && normalized[..candidate.len()].eq_ignore_ascii_case(candidate)
-        && normalized.as_bytes()[candidate.len()] == b'_'
+fn language_tag_eq(language: &str, candidate: &str) -> bool {
+    language.len() == candidate.len()
+        && language
+            .bytes()
+            .zip(candidate.bytes())
+            .all(|(actual, expected)| language_tag_byte_eq(actual, expected))
 }
 
-fn quote_pair_at_depth(quotes: LangQuotes, depth: usize) -> (&'static str, &'static str) {
-    let open = quotes
-        .open
-        .get(depth)
-        .or_else(|| quotes.open.last())
-        .cloned()
-        .unwrap_or(DEFAULT_QUOTES.open[0]);
-    let close = quotes
-        .close
-        .get(depth)
-        .or_else(|| quotes.close.last())
-        .cloned()
-        .unwrap_or(DEFAULT_QUOTES.close[0]);
-    (open, close)
+fn language_matches_parent(language: &str, candidate: &str) -> bool {
+    language.len() > candidate.len()
+        && language
+            .as_bytes()
+            .get(..candidate.len())
+            .is_some_and(|prefix| {
+                prefix
+                    .iter()
+                    .copied()
+                    .zip(candidate.bytes())
+                    .all(|(actual, expected)| language_tag_byte_eq(actual, expected))
+            })
+        && matches!(language.as_bytes().get(candidate.len()), Some(b'-' | b'_'))
+}
+
+fn language_tag_byte_eq(actual: u8, expected: u8) -> bool {
+    actual.eq_ignore_ascii_case(&expected)
+        || matches!((actual, expected), (b'-', b'_') | (b'_', b'-'))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::language_quote_pair;
+    use super::resolved_auto_quotes_for_language;
+
+    fn language_quote_pair(language: Option<&str>, depth: usize) -> (&'static str, &'static str) {
+        resolved_auto_quotes_for_language(language).pair_at_depth(depth)
+    }
 
     #[test]
     fn unknown_language_uses_default_curly_quotes() {
@@ -707,5 +745,11 @@ mod tests {
     fn depth_past_available_pairs_reuses_deepest_pair() {
         assert_eq!(language_quote_pair(Some("fr"), 8), ("«", "»"));
         assert_eq!(language_quote_pair(Some("fr-CH"), 8), ("‹", "›"));
+    }
+
+    #[test]
+    fn malformed_or_non_ascii_language_uses_default_quotes_without_panicking() {
+        assert_eq!(language_quote_pair(Some("é-fr"), 0), ("“", "”"));
+        assert_eq!(language_quote_pair(Some("\u{e3}"), 1), ("‘", "’"));
     }
 }

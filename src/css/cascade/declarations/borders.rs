@@ -74,7 +74,7 @@ pub(in crate::css) fn border_shorthand_components(
             style = Some(part.to_string());
             recognized = true;
         }
-        if color.is_none() && parse_border_color(part, CssColor::BLACK).is_some() {
+        if color.is_none() && parse_border_color(part).is_some() {
             color = Some(part.to_string());
             recognized = true;
         }

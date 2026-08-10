@@ -5,6 +5,9 @@ CSS Containment Level 1, and their shared CSS Fragmentation behavior.
 
 ## Current support
 
+- CSS-wide `initial`, `inherit`, `unset`, and `all` apply to `column-height`
+  and `column-wrap` through the same canonical longhand registry as ordinary
+  declarations, so `all` resets both non-inherited multicol properties.
 - `column-count`, `column-width`, `columns`, `column-gap`, column rules,
   `column-fill` (`auto`, `balance`, and `balance-all`), and `column-span`
   (`none` and `all`) have computed-value models and cascade support.
@@ -18,7 +21,9 @@ CSS Containment Level 1, and their shared CSS Fragmentation behavior.
   than index-based round-robin placement. Column transitions share the page
   fragmentation machinery, including forced breaks, target-specific avoid
   values, `break-inside`, widows/orphans, and rollback to an earlier class A
-  boundary.
+  boundary. A definite block that no longer fits the remaining column but fits
+  an empty column takes that class-A break, while an oversized block remains
+  fragmentable rather than looping through empty columns.
 - Inline-only multicolumn rows commit their class-B line fragments and one
   shared column block extent before painting. This keeps fixed-height
   sequential columns and their column rules consistent when `widows` or
@@ -27,8 +32,22 @@ CSS Containment Level 1, and their shared CSS Fragmentation behavior.
 - One-column multicol containers and overflow columns progress in the inline
   direction. Column boxes use isolated float contexts and column-local
   containing widths. Auto-height sequential overflow column rows continue on
-  later pages. Direct out-of-flow children are positioned against the multicol
-  container after speculative column layout.
+  later pages. Direct and nested positioned descendants resolve in their
+  continuous source containing block after speculative column layout, then
+  replay through every committed source-to-destination column slice that
+  intersects their paint; temporary column pages never become a single
+  positioned-owner coordinate system. Exact later-slice static-position and
+  stacking behavior remains incomplete for several positioned WPT matrices.
+- Positioned continuation bookkeeping distinguishes its full conceptual
+  fragmentainer span from the destination pages that own paint. A resolved
+  non-scrollable `overflow: clip` ancestor remains in the positioned clip
+  chain even when its containing block straddles the clip edge, and its
+  reachable prefix bounds scratch continuation materialization before pages
+  or paint payload are created. Balance probes retain only a deferred
+  positioned-principal descriptor and do not emit speculative payload. Clip
+  owners whose final used geometry is unavailable at this boundary still need
+  deferred replay; `hidden`, `auto`, and `scroll` intentionally retain their
+  conservative potentially-visible behavior.
 - Float block extents constrain balancing independently of normal-flow block
   extents, so a float can fragment and repaint through anonymous columns
   without being double-counted beside in-flow content. The structural estimate
@@ -206,10 +225,11 @@ failures are classified below rather than excluded.
   orthogonal replay, and column-rule geometry still use a physically
   horizontal block-child canvas.
 - Positioned descendants nested below fragmented relative/effect containers
-  retain future fragmentainer assignments, and positioned principal decoration
-  continues through its recorded span. Remaining fixed-position, static-
-  position, transformed-containing-block, and spanner interactions still need
-  one durable multicol containing-block model across every nested case.
+  retain the same committed source-slice candidates as direct multicolumn
+  descendants, and positioned principal decoration continues through the
+  resulting clipped paint slices. Later-slice static-position, paint-order,
+  fixed-position, transformed-containing-block, and spanner interactions
+  still need broader nested interoperability coverage.
 - Tables, grids, flex containers, floats, and replaced content now consume an
   active column fragmentainer, but their column-local paint and side-effect
   replay needs more interoperability coverage. Repeated table chrome and

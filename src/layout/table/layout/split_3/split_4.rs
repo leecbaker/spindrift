@@ -1,5 +1,6 @@
 use super::*;
 use crate::layout::block::child_available_space_for_formatting_context;
+use crate::layout::block::suppress_fragmented_box_edges;
 use crate::layout::inline_collect::{InlinePlacement, TextDecorationPropagationContext};
 
 /// Resolve a table part's relative offset against its immediate table parent.
@@ -236,8 +237,11 @@ impl<'a> LayoutBuilder<'a> {
         .with_bounds(bounds);
         self.positioned_layers.push(PositionedPaintLayer {
             page_index: paint_page_index,
+            transaction_depth: self.positioned_paint_transaction_depth,
             source_element: None,
             source_style: style.clone(),
+            source_style_identity: style as *const ComputedStyle as usize,
+            multicol_fragment_index: None,
             source_is_target: false,
             stack_level: policy.stack_level,
             context,
@@ -352,7 +356,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         fragment: &mut Option<TableBodyPaintFragment>,
         fragmentainer_kind: FragmentainerKind,
-        fragment_top: f32,
+        placement: TableFragmentainerPlacement,
         start: TableFragmentStartDecision,
         repeating_header_rows: &[usize],
     ) -> bool {
@@ -362,7 +366,7 @@ impl<'a> LayoutBuilder<'a> {
                 self.current_page.paint_checkpoint(),
                 self.pages.len(),
                 self.positioned_layers.len(),
-                fragment_top,
+                placement,
                 start,
             );
             new_fragment.mark_repeated_headers(start.repeated_header_rows(repeating_header_rows));
@@ -413,7 +417,7 @@ impl<'a> LayoutBuilder<'a> {
         columns: &[TableColumn<'_>],
         table_style: &ComputedStyle,
         stylesheets: &Stylesheets<'_>,
-        table_x: f32,
+        _table_x: f32,
         used_table_width: f32,
         _table_cellpadding: Option<f32>,
         column_plan: &TableColumnPlan,
@@ -425,6 +429,11 @@ impl<'a> LayoutBuilder<'a> {
         let Some(fragment_state) = fragment.take() else {
             return;
         };
+        // Fragmentainer transitions rebase the table's inline origin. The
+        // commit context is intentionally shared across fragments, so only
+        // the fragment plan can identify this fragment's physical wrapper
+        // origin without reconstructing it from a later cursor.
+        let table_x = fragment_state.plan.placement.table_x().points();
         debug_assert!(
             self.fragmentainer_materializes_cursor(fragment_state.plan.fragmentainer_kind)
         );
@@ -473,17 +482,37 @@ impl<'a> LayoutBuilder<'a> {
                 column_plan,
                 &fragment_state,
             );
-        self.current_page.prepend_recorded_primitives_to_fragment(
-            &mut fragment,
-            PaintBand::BackgroundBorder,
-            structural_backgrounds,
-        );
-        self.current_page.append_recorded_primitives_to_fragment(
-            &mut fragment,
-            PaintBand::Outline,
-            structural_outlines,
-        );
+        // A document-canvas table root is committed directly to its final
+        // page. Record its structural primitives now so they remain visible
+        // through the page's public paint-resource projection; ordinary and
+        // speculative table fragments must stay as primitives because an
+        // enclosing fragmentation replay can still translate them.
+        // <https://html.spec.whatwg.org/multipage/rendering.html#the-page>
+        if table_is_document_canvas && self.positioned_paint_transaction_depth == 0 {
+            self.current_page.prepend_recorded_primitives_to_fragment(
+                &mut fragment,
+                PaintBand::BackgroundBorder,
+                structural_backgrounds,
+            );
+            self.current_page.append_recorded_primitives_to_fragment(
+                &mut fragment,
+                PaintBand::Outline,
+                structural_outlines,
+            );
+        } else {
+            self.current_page.prepend_primitives_to_fragment(
+                &mut fragment,
+                PaintBand::BackgroundBorder,
+                structural_backgrounds,
+            );
+            self.current_page.append_primitives_to_fragment(
+                &mut fragment,
+                PaintBand::Outline,
+                structural_outlines,
+            );
+        }
         for relative_paint in relative_structural_paints {
+            let source_style_identity = &relative_paint.style as *const ComputedStyle as usize;
             let policy = StackingContextPolicy::for_non_positioned_style_effect(
                 &relative_paint.style,
                 relative_paint.bounds,
@@ -500,8 +529,11 @@ impl<'a> LayoutBuilder<'a> {
             .with_bounds(relative_paint.bounds);
             self.positioned_layers.push(PositionedPaintLayer {
                 page_index: fragment_state.plan.page_index,
+                transaction_depth: self.positioned_paint_transaction_depth,
                 source_element: None,
                 source_style: relative_paint.style,
+                source_style_identity,
+                multicol_fragment_index: None,
                 source_is_target: false,
                 stack_level: policy.stack_level,
                 context,
@@ -515,7 +547,7 @@ impl<'a> LayoutBuilder<'a> {
         }
 
         if table_metrics.border_collapse != css::BorderCollapse::Collapse {
-            let border_box_top = fragment_state.plan.fragment_top
+            let border_box_top = fragment_state.plan.placement.paint_top().points()
                 + vertical_edge_spacing
                 + table_width.padding.top
                 + table_width.border_widths.top;
@@ -544,40 +576,42 @@ impl<'a> LayoutBuilder<'a> {
                             row.row_index == index
                                 && row.fragment_mode == TableRowFragmentMode::Whole
                         });
-                let border_box = if unfragmented_grid {
-                    fragment_state.grid_viewport.as_ref().map(|viewport| {
-                        let placement = viewport.destination_placement();
-                        let grid = placement.page_top_rect_with_block_edge_spacing(
-                            TableGridLength::new(table_vertical_edge_spacing(
-                                &[fragment_has_occupied_row],
-                                table_metrics.clone(),
-                            )),
-                        );
-                        let padding = PageTopRect::new(
-                            grid.x() - table_width.padding.left,
-                            grid.top_y() + table_width.padding.top,
-                            grid.width() + table_width.padding.left + table_width.padding.right,
-                            grid.height() + table_width.padding.top + table_width.padding.bottom,
-                        );
-                        PageTopRect::new(
-                            padding.x() - table_width.border_widths.left,
-                            padding.top_y() + table_width.border_widths.top,
-                            padding.width()
-                                + table_width.border_widths.left
-                                + table_width.border_widths.right,
-                            padding.height()
-                                + table_width.border_widths.top
-                                + table_width.border_widths.bottom,
-                        )
-                    })
-                } else {
-                    Some(PageTopRect::new(
-                        border_box_x,
-                        border_box_top,
-                        border_box_width,
-                        border_box_height,
-                    ))
-                };
+                let projected_border_box = fragment_state.grid_viewport.as_ref().map(|viewport| {
+                    let placement = viewport.destination_placement();
+                    let grid = placement.page_top_rect_with_block_edge_spacing(
+                        TableGridLength::new(table_vertical_edge_spacing(
+                            &[fragment_has_occupied_row],
+                            table_metrics.clone(),
+                        )),
+                    );
+                    let padding = PageTopRect::new(
+                        grid.x() - table_width.padding.left,
+                        grid.top_y() + table_width.padding.top,
+                        grid.width() + table_width.padding.left + table_width.padding.right,
+                        grid.height() + table_width.padding.top + table_width.padding.bottom,
+                    );
+                    PageTopRect::new(
+                        padding.x() - table_width.border_widths.left,
+                        padding.top_y() + table_width.border_widths.top,
+                        padding.width()
+                            + table_width.border_widths.left
+                            + table_width.border_widths.right,
+                        padding.height()
+                            + table_width.border_widths.top
+                            + table_width.border_widths.bottom,
+                    )
+                });
+                let border_box =
+                    if table_style.writing_mode.has_vertical_lines() || unfragmented_grid {
+                        projected_border_box
+                    } else {
+                        Some(PageTopRect::new(
+                            border_box_x,
+                            border_box_top,
+                            border_box_width,
+                            border_box_height,
+                        ))
+                    };
                 if let Some(border_box) = border_box {
                     // `slice` keeps the wrapper's source outer block edges;
                     // an internal column/page boundary is only a destination
@@ -600,32 +634,15 @@ impl<'a> LayoutBuilder<'a> {
                             slice.block_start.length().get() + slice.block_size.get()
                                 >= source_extent - epsilon
                         });
-                        match table_style.writing_mode {
-                            WritingMode::HorizontalTb => {
-                                if !exposes_block_start {
-                                    border_style.border_widths.top = 0.0;
-                                }
-                                if !exposes_block_end {
-                                    border_style.border_widths.bottom = 0.0;
-                                }
-                            }
-                            WritingMode::VerticalLr | WritingMode::SidewaysLr => {
-                                if !exposes_block_start {
-                                    border_style.border_widths.left = 0.0;
-                                }
-                                if !exposes_block_end {
-                                    border_style.border_widths.right = 0.0;
-                                }
-                            }
-                            WritingMode::VerticalRl | WritingMode::SidewaysRl => {
-                                if !exposes_block_start {
-                                    border_style.border_widths.right = 0.0;
-                                }
-                                if !exposes_block_end {
-                                    border_style.border_widths.left = 0.0;
-                                }
-                            }
-                        }
+                        // Use the same source-edge ownership contract as a
+                        // fragmented block. The viewport supplies logical
+                        // table source slices; this helper performs the one
+                        // writing-mode-aware physical-edge projection.
+                        suppress_fragmented_box_edges(
+                            &mut border_style,
+                            exposes_block_start,
+                            exposes_block_end,
+                        );
                     }
                     paint_table_border_edges(
                         &mut border_rects,
@@ -636,11 +653,19 @@ impl<'a> LayoutBuilder<'a> {
                     let mut border_primitives = Vec::new();
                     border_primitives.extend(border_rects.into_iter().map(PaintPrimitive::Rect));
                     border_primitives.extend(border_paths.into_iter().map(PaintPrimitive::Path));
-                    self.current_page.append_recorded_primitives_to_fragment(
-                        &mut fragment,
-                        PaintBand::BackgroundBorder,
-                        border_primitives,
-                    );
+                    if table_is_document_canvas && self.positioned_paint_transaction_depth == 0 {
+                        self.current_page.append_recorded_primitives_to_fragment(
+                            &mut fragment,
+                            PaintBand::BackgroundBorder,
+                            border_primitives,
+                        );
+                    } else {
+                        self.current_page.append_primitives_to_fragment(
+                            &mut fragment,
+                            PaintBand::BackgroundBorder,
+                            border_primitives,
+                        );
+                    }
                 }
             }
         }
@@ -661,38 +686,100 @@ impl<'a> LayoutBuilder<'a> {
             // CSS 2.2 Appendix E paints collapsed table borders in the table's
             // background/border phase, before foreground cell contents:
             // <https://www.w3.org/TR/CSS22/zindex.html>.
-            self.current_page.prepend_recorded_primitives_to_fragment(
+            self.current_page.prepend_primitives_to_fragment(
                 &mut fragment,
                 PaintBand::TableCollapsedBorder,
                 borders,
             );
         }
 
-        let bounds_x = table_x - table_width.padding.left - table_width.border_widths.left;
-        let bounds_top = fragment_state.plan.fragment_top
-            + vertical_edge_spacing
-            + table_width.padding.top
-            + table_width.border_widths.top;
-        let bounds_bottom = bottom
-            - vertical_edge_spacing
-            - table_width.padding.bottom
-            - table_width.border_widths.bottom;
-        let bounds = PageTopRect::new(
-            bounds_x,
-            bounds_top,
-            used_table_width
-                + table_width.padding.left
-                + table_width.padding.right
-                + table_width.border_widths.left
-                + table_width.border_widths.right,
-            bounds_top - bounds_bottom,
-        )
-        .paint_clip();
+        let bounds = if table_style.writing_mode.has_vertical_lines() {
+            fragment_state.grid_viewport.as_ref().map(|viewport| {
+                let placement = viewport.destination_placement();
+                let grid = placement.page_top_rect_with_block_edge_spacing(TableGridLength::new(
+                    table_vertical_edge_spacing(
+                        &[fragment_has_occupied_row],
+                        table_metrics.clone(),
+                    ),
+                ));
+                let padding = PageTopRect::new(
+                    grid.x() - table_width.padding.left,
+                    grid.top_y() + table_width.padding.top,
+                    grid.width() + table_width.padding.left + table_width.padding.right,
+                    grid.height() + table_width.padding.top + table_width.padding.bottom,
+                );
+                PageTopRect::new(
+                    padding.x() - table_width.border_widths.left,
+                    padding.top_y() + table_width.border_widths.top,
+                    padding.width()
+                        + table_width.border_widths.left
+                        + table_width.border_widths.right,
+                    padding.height()
+                        + table_width.border_widths.top
+                        + table_width.border_widths.bottom,
+                )
+                .paint_clip()
+            })
+        } else {
+            let bounds_x = table_x - table_width.padding.left - table_width.border_widths.left;
+            let bounds_top = fragment_state.plan.placement.paint_top().points()
+                + vertical_edge_spacing
+                + table_width.padding.top
+                + table_width.border_widths.top;
+            let bounds_bottom = bottom
+                - vertical_edge_spacing
+                - table_width.padding.bottom
+                - table_width.border_widths.bottom;
+            Some(
+                PageTopRect::new(
+                    bounds_x,
+                    bounds_top,
+                    used_table_width
+                        + table_width.padding.left
+                        + table_width.padding.right
+                        + table_width.border_widths.left
+                        + table_width.border_widths.right,
+                    bounds_top - bounds_bottom,
+                )
+                .paint_clip(),
+            )
+        }
+        .unwrap_or_else(|| {
+            PageTopRect::new(
+                table_x,
+                fragment_state.plan.placement.paint_top().points(),
+                0.0,
+                0.0,
+            )
+            .paint_clip()
+        });
         let overflow_clip = table_box_overflow_clip(
             table_style,
             table_padding_box_clip_from_border_box(bounds, table_width),
             table_is_document_canvas,
         );
+        let contoured_overflow_clip = overflow_clip
+            .filter(|_| box_content_contour_is_non_rectangular(table_style))
+            .and_then(|overflow_bounds| {
+                resolve_box_content_contour(
+                    bounds.paint_rect(),
+                    table_style,
+                    table_width.border_widths,
+                    BoxContentContourRequest::Overflow {
+                        reference_box: css::BackgroundBox::Padding,
+                        outset: 0.0,
+                    },
+                )
+                .map(|mut contour| {
+                    contour.bounds = overflow_bounds;
+                    contour
+                })
+            });
+        // A table nested in a table cell is foreground cell content. Keep it
+        // in the cell's inline paint phase so the enclosing table's
+        // collapsed-border phase is emitted first; its own collapsed borders
+        // then remain above that parent decoration.
+        // <https://www.w3.org/TR/CSS22/zindex.html>
         let parent_band = if self
             .ancestors
             .iter()
@@ -702,16 +789,31 @@ impl<'a> LayoutBuilder<'a> {
         {
             PaintBand::Inline
         } else {
-            PaintBand::InFlowBlock
+            table_parent_paint_band(table_style)
         };
-        let mut policy =
-            table_atomic_stacking_policy(table_style, parent_band, bounds, overflow_clip);
+        let mut policy = table_atomic_stacking_policy(
+            table_style,
+            parent_band,
+            bounds,
+            contoured_overflow_clip
+                .is_none()
+                .then_some(overflow_clip)
+                .flatten(),
+        );
         let mut child_contexts = self.positioned_child_contexts_since(
             fragment_state.positioned_layer_start,
             fragment_state.plan.page_index,
             &policy,
         );
-        let fragment = if let Some(overflow_clip) = policy.effects.overflow_clip.take() {
+        let fragment = if let Some(contour) = contoured_overflow_clip {
+            fragment.with_contents_effect_scoped_to_box_content_contour_and_child_contexts(
+                contour,
+                std::mem::take(&mut child_contexts),
+            )
+        } else if let Some(crate::document::paint::contours::OverflowClipEffect::Rect(
+            overflow_clip,
+        )) = policy.effects.overflow_clip_effect.take()
+        {
             // CSS table overflow clips the grid and its descendants, but not
             // the table's own background, border, collapsed-border phase, or
             // outline. Keep decoration bands outside an in-band clip scope so
@@ -725,10 +827,11 @@ impl<'a> LayoutBuilder<'a> {
         } else {
             fragment
         };
-        // A table nested in a cell is emitted as the cell's foreground
-        // content, after the enclosing table's collapsed-border phase. Other
-        // non-positioned tables remain in the ordinary block band, so their
-        // own collapsed border remains after earlier in-flow block backgrounds.
+        // The table's outer display role selects its in-flow block or inline
+        // band. Relative and positioned tables are promoted by the stacking
+        // policy above; the collapsed-border phase remains a separate global
+        // table band.
+        // <https://drafts.csswg.org/css-display/#outer-role>
         // <https://www.w3.org/TR/CSS22/zindex.html>
         self.scope_current_page_fragment_with_policy(
             &fragment_state.checkpoint,
@@ -759,11 +862,13 @@ impl<'a> LayoutBuilder<'a> {
         table_height_is_definite: bool,
         table_metrics: TableMetrics,
         grid_placement: Option<TableGridPlacement>,
+        destination_row_block_start: Option<TableGridBlockOffset>,
         row_top: f32,
         row_height: f32,
         piece_height: f32,
         piece_offset: f32,
         row_fragment_mode: TableRowFragmentMode,
+        follows_repeated_header: bool,
         collapsed_geometry: Option<&CollapsedTableGeometry>,
         row_baseline_offset: Option<f32>,
     ) {
@@ -782,7 +887,10 @@ impl<'a> LayoutBuilder<'a> {
         } else {
             false
         };
-        let content_row_top = row_top + piece_offset;
+        // `row_top` is already in the destination fragmentainer. Source
+        // continuation progress belongs only to child-slice selection, not
+        // to positioned containing blocks in this page fragment.
+        let content_row_top = row_top;
         // CSS Containment does not apply to table row tracks or row groups:
         // they have no containment principal box. Their positioned and
         // transformed principal boxes still establish containing blocks for
@@ -934,9 +1042,16 @@ impl<'a> LayoutBuilder<'a> {
                     ),
                 )
             });
+            let destination_row_block_start = destination_row_block_start
+                .map(|offset| offset.length().get())
+                .unwrap_or(row_block_start);
             let cell_border_box = column_plan.cell_border_box(
                 prepared.area,
-                TableRowBounds::new(row_block_start + piece_offset, cell_height),
+                // The fragment viewport owns the destination grid origin.
+                // Rebase the source row into that viewport before projecting
+                // the cell; using its unfragmented track offset places later
+                // rows at the bottom of every continuation page.
+                TableRowBounds::new(destination_row_block_start, cell_height),
             );
             let cell_width = cell_border_box.width();
             let text = prepared.text;
@@ -1267,8 +1382,6 @@ impl<'a> LayoutBuilder<'a> {
             // own border or background; otherwise an overflowing scrollport
             // clips the border it is painted inside.
             // <https://www.w3.org/TR/CSS22/zindex.html>
-            let cell_content_paint_checkpoint = self.current_page.paint_checkpoint();
-
             // Retain ordinary overflow as a paint effect so descendants keep
             // their unmodified layout geometry.  The PDF clip is installed
             // below when the cell's retained paint subtree is scoped.  Row
@@ -1300,6 +1413,17 @@ impl<'a> LayoutBuilder<'a> {
                     self.table_cell_child_ancestors(cell, row),
                     percentage_height_basis,
                 );
+                // A repeated header is paint-only table chrome, yet its
+                // physical cursor consumption precedes this committed body
+                // row. Keep the first body row's direct inline replay inside
+                // the already selected row fragment instead of making a
+                // second page-relative pre-break from that chrome cursor.
+                // <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+                let suppress_inline_prebreak =
+                    follows_repeated_header && row_fragment_mode == TableRowFragmentMode::Whole;
+                if suppress_inline_prebreak {
+                    self.out_of_flow_prebreak_suppression_depth += 1;
+                }
                 self.push_float_context();
                 if let Some(sequence) = &cell_fragment_plan.content.inline_sequence {
                     if row_fragment_mode.clips_to_row_piece() {
@@ -1358,6 +1482,9 @@ impl<'a> LayoutBuilder<'a> {
                     self.layout_text_block(&text, cell_style, 0.0, 0.0, table_cell_href(cell));
                 }
                 self.pop_float_context();
+                if suppress_inline_prebreak {
+                    self.out_of_flow_prebreak_suppression_depth -= 1;
+                }
                 self.restore_table_cell_content_scope(content_scope);
             }
             if cell_has_paintable_area && !inline_sequence_paints_cell_children {
@@ -1417,7 +1544,7 @@ impl<'a> LayoutBuilder<'a> {
             // output.
             // <https://www.w3.org/TR/css-contain-1/#containment-paint>
             if cell.element.is_some()
-                && (cell_style.has_transform()
+                && (cell_style.has_transform_or_preserve_3d()
                     || cell.element.is_some_and(|element| {
                         property_containment_establishes_independent_formatting_context(
                             element, cell_style,
@@ -1441,7 +1568,8 @@ impl<'a> LayoutBuilder<'a> {
                     StackingContextPolicy::for_atomic(cell_style, PaintBand::InFlowBlock, bounds);
                 if let Some(content_clip) = &cell_fragment_plan.content_clip {
                     let clips = content_clip.paint_clips();
-                    policy.effects.overflow_clip_union = PaintClipUnion::from_clips(&clips);
+                    policy.effects.overflow_clip_effect = PaintClipUnion::from_clips(&clips)
+                        .map(crate::document::paint::contours::OverflowClipEffect::Union);
                 }
                 let child_contexts = self.positioned_child_contexts_since(
                     cell_positioned_layer_start,
@@ -1449,7 +1577,11 @@ impl<'a> LayoutBuilder<'a> {
                     &policy,
                 );
                 self.scope_current_page_paint_since_with_policy(
-                    &cell_content_paint_checkpoint,
+                    // Transforms apply to the cell border box, including its
+                    // own decorations.  Start at the cell checkpoint rather
+                    // than its descendant-only overflow checkpoint so a
+                    // `preserve-3d` cell is a genuine participant.
+                    &cell_paint_checkpoint,
                     policy,
                     bounds,
                     child_contexts,
@@ -1732,13 +1864,17 @@ impl<'a> LayoutBuilder<'a> {
                     percentage_height_basis,
                     |layout| {
                         layout.with_text_box_line_trim_scope(cell_text_box_line_trim, |layout| {
-                            layout.inline_line_sequence_for_text(
-                                text,
-                                cell_style,
-                                available_width,
-                                0.0,
-                                table_cell_href(cell),
-                            )
+                            layout
+                                .inline_line_sequence_for_text(
+                                    text,
+                                    cell_style,
+                                    available_width,
+                                    0.0,
+                                    table_cell_href(cell),
+                                )
+                                .with_replay_float_scope(
+                                    ReplayFloatScope::IsolatedFormattingContext,
+                                )
                         })
                     },
                 ));
@@ -1748,13 +1884,16 @@ impl<'a> LayoutBuilder<'a> {
         if row_fragment_mode.replays_flow_children_from_plan()
             && let Some(children) = cell.children.as_deref()
         {
-            let child_top = content_geometry.content_box().top_y();
             plan.child_fragments = self.table_cell_child_fragment_plans(
                 children,
                 stylesheets,
                 available_width,
                 percentage_height_basis,
-                child_top,
+                // Child selection belongs to the source cell's local block
+                // coordinate system. A continuation restarts at a different
+                // physical page position, so using `content_geometry` here
+                // would recreate the first child at every row slice.
+                0.0,
                 // Block coordinates decrease in the direction of flow. A
                 // continuation therefore advances *away* from the source
                 // row start even though its destination page-local `row_top`
@@ -1762,8 +1901,8 @@ impl<'a> LayoutBuilder<'a> {
                 // interval explicitly; adding the offset instead selects an
                 // empty interval above every continuation and drops later
                 // in-flow children before a following `clear`.
-                row_top - piece_offset,
-                row_top - piece_offset - piece_height,
+                -piece_offset,
+                -piece_offset - piece_height,
                 // Paint remains in the destination fragmentainer's physical
                 // coordinate system. Its clip starts at this piece's local
                 // row edge, not at the source interval above.
@@ -1948,6 +2087,7 @@ impl<'a> LayoutBuilder<'a> {
             0.0,
             0.0,
         )
+        .with_replay_float_scope(ReplayFloatScope::IsolatedFormattingContext)
     }
 
     /// Run table-cell inline planning with the cell content box as containing block.
@@ -1994,11 +2134,7 @@ impl<'a> LayoutBuilder<'a> {
                 PhysicalContentHeight::new(content_box_pt(self.page_area_height())),
             ));
         self.definite_block_size_stack.push(percentage_height_basis);
-        self.push_float_context();
-
-        let result = f(self);
-
-        self.pop_float_context();
+        let result = self.with_replay_float_scope(ReplayFloatScope::IsolatedFormattingContext, f);
         self.content_left = content_left;
         self.content_right = content_right;
         self.content_logical_inline_size_stack = content_logical_inline_size_stack;
@@ -2060,11 +2196,7 @@ impl<'a> LayoutBuilder<'a> {
                 PhysicalContentHeight::new(content_box_pt(content_box.height())),
             ));
         self.definite_block_size_stack.push(percentage_height_basis);
-        self.push_float_context();
-
-        let result = f(self);
-
-        self.pop_float_context();
+        let result = self.with_replay_float_scope(ReplayFloatScope::IsolatedFormattingContext, f);
         self.content_left = content_left;
         self.content_right = content_right;
         self.cursor_y = cursor_y;

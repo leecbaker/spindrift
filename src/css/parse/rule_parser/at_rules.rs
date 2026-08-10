@@ -1,15 +1,26 @@
 use super::*;
-use crate::css::component_values::find_matching_brace;
-use crate::css::{PropertyRegistrationRule, RegisteredCustomProperty};
+use crate::css::{
+    LayerName, LayerSegment, PropertyRegistrationRule, RegisteredCustomProperty, ScopeRoot,
+    StylesheetScopeAnchor,
+};
+use cssparser::{
+    AtRuleParser, BasicParseErrorKind, DeclarationParser, Parser, ParserState, RuleBodyItemParser,
+    RuleBodyParser, Token,
+};
 
-pub(super) fn collect_container_style_rules(rule: ParsedCssRule, rules: &mut Vec<StyleRule>) {
+pub(super) fn collect_container_style_rules(
+    rule: ParsedCssRule,
+    rules: &mut Vec<StyleRule>,
+    nested_containers: &mut Vec<ContainerRule>,
+) {
     match rule {
         ParsedCssRule::Style(rule) => rules.push(rule),
-        ParsedCssRule::Nested(nested) => {
-            for rule in nested {
-                collect_container_style_rules(rule, rules);
+        ParsedCssRule::Nested(nested_rules) => {
+            for rule in nested_rules {
+                collect_container_style_rules(rule, rules, nested_containers);
             }
         }
+        ParsedCssRule::Container(rule) => nested_containers.push(rule),
         ParsedCssRule::Marker(_)
         | ParsedCssRule::BeforeMarker(_)
         | ParsedCssRule::AfterMarker(_)
@@ -19,94 +30,187 @@ pub(super) fn collect_container_style_rules(rule: ParsedCssRule, rules: &mut Vec
         | ParsedCssRule::FootnoteMarker(_)
         | ParsedCssRule::FirstLine(_)
         | ParsedCssRule::FirstLetter(_)
-        | ParsedCssRule::Container(_)
         | ParsedCssRule::Keyframes(_)
         | ParsedCssRule::FontFace(_)
         | ParsedCssRule::CounterStyle(_)
         | ParsedCssRule::FontFeatureValues(_)
         | ParsedCssRule::FontPaletteValues(_, _)
         | ParsedCssRule::Property(_)
+        | ParsedCssRule::Page(_)
         | ParsedCssRule::Ignored => {}
     }
 }
 
-/// Parses the `<color>` subset of CSS Properties and Values registrations.
-/// Unknown descriptors are intentionally ignored, whereas missing required
-/// descriptors invalidate the whole rule.
-pub(in crate::css) fn parse_property_rule(
-    prelude: &str,
-    block: &str,
-) -> Option<PropertyRegistrationRule> {
-    let names = crate::css::component_values::split_css_top_level_delimiter(prelude, ',')
-        .into_iter()
-        .map(str::trim)
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    if names.is_empty()
-        || names
-            .iter()
-            .any(|name| !crate::css::is_custom_property_name(name))
-    {
-        return None;
-    }
-    let declarations = crate::css::parse::parse_declarations(block);
-    let mut syntax = None;
-    let mut inherits = None;
-    let mut initial_value = None;
-    for (name, value) in declarations.iter() {
-        match name.as_str() {
-            "syntax" => {
-                syntax = crate::css::component_values::parse_css_string_token(value)
-                    .filter(|(_, remainder)| remainder.trim().is_empty())
-                    .map(|(value, _)| value)
-            }
-            "inherits" => {
-                inherits = match value.trim().to_ascii_lowercase().as_str() {
-                    "true" => Some(true),
-                    "false" => Some(false),
-                    _ => return None,
-                }
-            }
-            "initial-value" => initial_value = Some(value.trim()),
-            _ => {}
+/// Parses the comma-separated `<custom-property-name>#` prelude of an
+/// `@property` rule. Names are decoded by CSS Syntax before registration.
+/// <https://drafts.css-houdini.org/css-properties-values-api/#at-property-rule>
+pub(in crate::css) fn parse_property_names<'i, 't>(
+    input: &mut Parser<'i, 't>,
+) -> Result<Vec<String>, cssparser::ParseError<'i, BasicParseErrorKind<'i>>> {
+    input.parse_comma_separated(|input| {
+        let name = input.expect_ident_cloned()?;
+        input.expect_exhausted()?;
+        if !crate::css::is_custom_property_name(&name) {
+            return Err(input.new_custom_error(BasicParseErrorKind::QualifiedRuleInvalid));
         }
-    }
-    if syntax.as_deref()? != "<color>" {
-        return None;
-    }
-    let initial_value = initial_value?;
-    // `currentColor` and light-dark() are not computationally independent.
-    if initial_value.to_ascii_lowercase().contains("currentcolor")
-        || initial_value.to_ascii_lowercase().contains("light-dark(")
-    {
-        return None;
-    }
-    Some(PropertyRegistrationRule {
-        names,
-        registration: RegisteredCustomProperty {
-            inherits: inherits?,
-            initial_color: crate::css::values::parse_color(initial_value)?,
-        },
+        Ok(name.to_string())
     })
 }
 
-pub(in crate::css) fn parse_layer_name_list(parent: Option<&str>, prelude: &str) -> Vec<String> {
-    prelude
-        .split(',')
-        .filter_map(|name| qualify_layer_name(parent, name))
-        .collect()
+/// Parses Quire's supported `<color>` subset of an `@property` rule.
+///
+/// Descriptor boundaries and names are validated by CSS Syntax. Unknown or
+/// malformed descriptors recover locally; the completed rule is emitted only
+/// when its final modeled descriptors form a usable `<color>` registration.
+pub(in crate::css) fn parse_property_rule<'i, 't>(
+    names: Vec<String>,
+    input: &mut Parser<'i, 't>,
+) -> Option<PropertyRegistrationRule> {
+    let mut parser = PropertyRuleBodyParser::default();
+    for _ in RuleBodyParser::new(input, &mut parser) {}
+    parser.finish(names)
 }
 
-pub(in crate::css) fn qualify_layer_name(parent: Option<&str>, name: &str) -> Option<String> {
-    let name = name.trim();
-    if name.is_empty() {
-        return None;
+#[derive(Default)]
+struct PropertyRuleBodyParser {
+    syntax: Option<String>,
+    inherits: Option<bool>,
+    initial_value: Option<String>,
+}
+
+impl PropertyRuleBodyParser {
+    fn finish(self, names: Vec<String>) -> Option<PropertyRegistrationRule> {
+        if self.syntax.as_deref()? != "<color>" {
+            return None;
+        }
+        let initial_value = self.initial_value?;
+        // `currentColor` and light-dark() are not computationally independent.
+        if initial_value.to_ascii_lowercase().contains("currentcolor")
+            || initial_value.to_ascii_lowercase().contains("light-dark(")
+        {
+            return None;
+        }
+        Some(PropertyRegistrationRule {
+            names,
+            registration: RegisteredCustomProperty {
+                inherits: self.inherits?,
+                initial_color: crate::css::values::parse_color(&initial_value)?,
+            },
+        })
     }
-    let name = match parent {
-        Some(parent) if !parent.is_empty() => format!("{parent}.{name}"),
-        _ => name.to_string(),
-    };
-    Some(name)
+}
+
+impl<'i> DeclarationParser<'i> for PropertyRuleBodyParser {
+    type Declaration = ();
+    type Error = BasicParseErrorKind<'i>;
+
+    fn parse_value<'t>(
+        &mut self,
+        name: CowRcStr<'i>,
+        input: &mut Parser<'i, 't>,
+        _declaration_start: &ParserState,
+    ) -> Result<Self::Declaration, cssparser::ParseError<'i, Self::Error>> {
+        if name.eq_ignore_ascii_case("syntax") {
+            let syntax = input.expect_string_cloned()?;
+            input.expect_exhausted()?;
+            self.syntax = Some(syntax.to_string());
+            return Ok(());
+        }
+        if name.eq_ignore_ascii_case("inherits") {
+            let inherits = input.expect_ident_cloned()?;
+            input.expect_exhausted()?;
+            self.inherits = match inherits.to_ascii_lowercase().as_ref() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => return Err(input.new_custom_error(BasicParseErrorKind::QualifiedRuleInvalid)),
+            };
+            return Ok(());
+        }
+        if name.eq_ignore_ascii_case("initial-value") {
+            let start = input.position();
+            let mut has_tokenizer_error = false;
+            while let Ok(token) = input.next_including_whitespace_and_comments() {
+                has_tokenizer_error |= token.is_parse_error();
+            }
+            let value = input.slice_from(start).trim();
+            if has_tokenizer_error
+                || crate::css::component_values::CssComponentValueList::parse(value).is_none()
+            {
+                return Err(input.new_custom_error(BasicParseErrorKind::QualifiedRuleInvalid));
+            }
+            self.initial_value = Some(value.to_string());
+            return Ok(());
+        }
+        Err(input.new_custom_error(BasicParseErrorKind::AtRuleInvalid(name)))
+    }
+}
+
+impl<'i> AtRuleParser<'i> for PropertyRuleBodyParser {
+    type Prelude = ();
+    type AtRule = ();
+    type Error = BasicParseErrorKind<'i>;
+}
+
+impl<'i> cssparser::QualifiedRuleParser<'i> for PropertyRuleBodyParser {
+    type Prelude = ();
+    type QualifiedRule = ();
+    type Error = BasicParseErrorKind<'i>;
+}
+
+impl<'i> RuleBodyItemParser<'i, (), BasicParseErrorKind<'i>> for PropertyRuleBodyParser {
+    fn parse_declarations(&self) -> bool {
+        true
+    }
+
+    fn parse_qualified(&self) -> bool {
+        false
+    }
+}
+
+/// Parses one complete CSS Cascade `<layer-name>` from decoded tokens.
+///
+/// Delimiter dots are structural tokens: whitespace and comments around one
+/// are invalid rather than silently becoming part of a byte-scanned name.
+/// <https://www.w3.org/TR/css-cascade-5/#typedef-layer-name>
+pub(in crate::css) fn parse_layer_name<'i, 't>(
+    input: &mut Parser<'i, 't>,
+) -> Result<LayerName, cssparser::ParseError<'i, BasicParseErrorKind<'i>>> {
+    let first = input.expect_ident_cloned()?;
+    if is_css_wide_keyword(&first) {
+        return Err(input.new_custom_error(BasicParseErrorKind::QualifiedRuleInvalid));
+    }
+    let mut segments = vec![LayerSegment::Named(first.to_string())];
+    while !input.is_exhausted() {
+        let token = input.next_including_whitespace_and_comments()?.clone();
+        if !matches!(token, Token::Delim('.')) {
+            return Err(input.new_custom_error(BasicParseErrorKind::QualifiedRuleInvalid));
+        }
+        let Token::Ident(next) = input.next_including_whitespace_and_comments()?.clone() else {
+            return Err(input.new_custom_error(BasicParseErrorKind::QualifiedRuleInvalid));
+        };
+        if is_css_wide_keyword(&next) {
+            return Err(input.new_custom_error(BasicParseErrorKind::QualifiedRuleInvalid));
+        }
+        segments.push(LayerSegment::Named(next.to_string()));
+    }
+    Ok(LayerName(segments))
+}
+
+pub(in crate::css) fn parse_layer_name_list<'i, 't>(
+    input: &mut Parser<'i, 't>,
+) -> Result<Vec<LayerName>, cssparser::ParseError<'i, BasicParseErrorKind<'i>>> {
+    input.parse_comma_separated(parse_layer_name)
+}
+
+pub(in crate::css) fn qualify_layer_name(parent: Option<&LayerName>, name: LayerName) -> LayerName {
+    parent.map_or(name.clone(), |parent| parent.nested(name))
+}
+
+fn is_css_wide_keyword(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "initial" | "inherit" | "unset" | "revert" | "revert-layer"
+    )
 }
 
 pub(in crate::css) fn parse_namespace_prelude(prelude: &str) -> Option<(Option<String>, String)> {
@@ -134,26 +238,81 @@ pub(in crate::css) fn parse_namespace_prelude(prelude: &str) -> Option<(Option<S
 /// or unsupported preludes are ignored so their declarations do not enter the
 /// cascade:
 /// <https://www.w3.org/TR/css-cascade-5/#scope-atrule>.
-pub(in crate::css) fn parse_scope_prelude(
-    prelude: &str,
+pub(in crate::css) fn parse_scope_prelude<'i, 't>(
+    input: &mut Parser<'i, 't>,
     selector_parser: &QuireSelectorParser,
-) -> Option<ScopeRule> {
-    let prelude = prelude.trim();
-    let (root_text, after_root) = parse_parenthesized_selector(prelude)?;
-    let root = parse_scope_selector(root_text, selector_parser)?;
-    let after_root = after_root.trim();
-    if after_root.is_empty() {
-        return Some(ScopeRule { root, limit: None });
+    owner: StylesheetScopeAnchor,
+    nesting_parent: Option<&SelectorList<QuireSelectorImpl>>,
+) -> Result<ScopeRule, cssparser::ParseError<'i, SelectorParseErrorKind<'i>>> {
+    let root = if input
+        .try_parse(|input| input.expect_parenthesis_block())
+        .is_ok()
+    {
+        ScopeRoot::Explicit(input.parse_nested_block(|input| {
+            parse_scope_selector_from_parser(input, selector_parser, nesting_parent)
+        })?)
+    } else {
+        ScopeRoot::Owner(owner)
+    };
+    let limit = if input.is_exhausted() {
+        None
+    } else {
+        let to = input.expect_ident_cloned()?;
+        if !to.eq_ignore_ascii_case("to") {
+            return Err(input.new_custom_error(SelectorParseErrorKind::InvalidState));
+        }
+        input.expect_parenthesis_block()?;
+        Some(input.parse_nested_block(|input| {
+            let scope_parent = nesting_scope_limit_parent(selector_parser)?;
+            parse_scope_selector_from_parser(input, selector_parser, Some(&scope_parent))
+        })?)
+    };
+    input.expect_exhausted()?;
+    Ok(ScopeRule { root, limit })
+}
+
+fn parse_scope_selector_from_parser<'i, 't>(
+    input: &mut Parser<'i, 't>,
+    selector_parser: &QuireSelectorParser,
+    nesting_parent: Option<&SelectorList<QuireSelectorImpl>>,
+) -> Result<SelectorList<QuireSelectorImpl>, cssparser::ParseError<'i, SelectorParseErrorKind<'i>>>
+{
+    let selector = SelectorList::parse(selector_parser, input, ParseRelative::No)?;
+    input.expect_exhausted()?;
+    let selector = if selector
+        .slice()
+        .iter()
+        .any(|branch| branch.has_parent_selector())
+    {
+        selector.replace_parent_selector(
+            nesting_parent
+                .ok_or_else(|| input.new_custom_error(SelectorParseErrorKind::InvalidState))?,
+        )
+    } else {
+        selector
+    };
+    if selector
+        .slice()
+        .iter()
+        .any(|branch| branch.has_pseudo_element())
+    {
+        return Err(input.new_custom_error(SelectorParseErrorKind::InvalidState));
     }
-    let after_to = strip_ascii_word_prefix(after_root, "to")?.trim();
-    let (limit_text, after_limit) = parse_parenthesized_selector(after_to)?;
-    if !after_limit.trim().is_empty() {
-        return None;
-    }
-    Some(ScopeRule {
-        root,
-        limit: Some(parse_scope_selector(limit_text, selector_parser)?),
-    })
+    Ok(selector)
+}
+
+/// In a nested `@scope` limit, `&` is a zero-specificity `:where(:scope)`.
+/// Parsing that replacement as selectors keeps it in the same selector model
+/// as ordinary scope boundaries.
+fn nesting_scope_limit_parent<'i>(
+    selector_parser: &QuireSelectorParser,
+) -> Result<SelectorList<QuireSelectorImpl>, cssparser::ParseError<'i, SelectorParseErrorKind<'i>>>
+{
+    let mut input = ParserInput::new(":where(:scope)");
+    let mut parser = Parser::new(&mut input);
+    let selector = SelectorList::parse(selector_parser, &mut parser, ParseRelative::No)?;
+    parser.expect_exhausted()?;
+    Ok(selector)
 }
 
 pub(in crate::css) fn parse_parenthesized_selector(value: &str) -> Option<(&str, &str)> {
@@ -228,47 +387,96 @@ fn word_boundary_after(bytes: &[u8], index: usize) -> bool {
         .is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'-' && *byte != b'_')
 }
 
-/// Parses the contents of a CSS `@keyframes` rule.
+/// Parses a tokenized `@keyframes` rule body.
 ///
-/// Keyframe selectors accept `from`, `to`, and percentages. A selector list
-/// creates one step for each valid offset, while invalid selectors are simply
-/// ignored as required by CSS Animations error handling:
+/// A malformed selector list invalidates its complete keyframe block, but CSS
+/// Syntax recovery continues with later blocks in the same rule:
 /// <https://www.w3.org/TR/css-animations-1/#keyframes>
-pub(in crate::css) fn parse_keyframes_rule(name: &str, body: &str) -> Option<KeyframesRule> {
-    let name = name.trim();
-    if name.is_empty() || name.contains(char::is_whitespace) {
-        return None;
-    }
-    let mut steps = Vec::new();
-    let mut rest = body;
-    while let Some(open) = crate::css::component_values::find_next_top_level_open_brace(rest, 0) {
-        let selectors = rest[..open].trim();
-        let Some(close) = find_matching_brace(rest, open, false) else {
-            break;
-        };
-        let declarations = parse_declarations(&rest[open + 1..close]);
-        for selector in crate::css::component_values::split_css_top_level_delimiter(selectors, ',')
-        {
-            let offset = match selector.trim().to_ascii_lowercase().as_str() {
-                "from" => Some(0.0),
-                "to" => Some(1.0),
-                percentage => percentage
-                    .strip_suffix('%')
-                    .and_then(|value| value.trim().parse::<f32>().ok())
-                    .map(|value| value / 100.0)
-                    .filter(|value| (0.0..=1.0).contains(value)),
-            };
-            if let Some(offset) = offset {
-                steps.push(KeyframeStep {
-                    offset,
-                    declarations: declarations.clone(),
-                });
-            }
-        }
-        rest = &rest[close + 1..];
-    }
-    (!steps.is_empty()).then_some(KeyframesRule {
-        name: name.to_string(),
-        steps,
+pub(in crate::css) fn parse_keyframes_rule<'i, 't>(
+    name: KeyframesName,
+    input: &mut Parser<'i, 't>,
+    base_url: Option<&url::Url>,
+    root_url: Option<&url::Url>,
+) -> Option<KeyframesRule> {
+    let mut parser = KeyframesRuleBodyParser {
+        steps: Vec::new(),
+        base_url,
+        root_url,
+    };
+    for _ in RuleBodyParser::new(input, &mut parser) {}
+    (!parser.steps.is_empty()).then_some(KeyframesRule {
+        name,
+        steps: parser.steps,
     })
+}
+
+struct KeyframesRuleBodyParser<'a> {
+    steps: Vec<KeyframeStep>,
+    base_url: Option<&'a url::Url>,
+    root_url: Option<&'a url::Url>,
+}
+
+impl<'i> AtRuleParser<'i> for KeyframesRuleBodyParser<'_> {
+    type Prelude = ();
+    type AtRule = ();
+    type Error = BasicParseErrorKind<'i>;
+}
+
+impl<'i> DeclarationParser<'i> for KeyframesRuleBodyParser<'_> {
+    type Declaration = ();
+    type Error = BasicParseErrorKind<'i>;
+}
+
+impl<'i> cssparser::QualifiedRuleParser<'i> for KeyframesRuleBodyParser<'_> {
+    type Prelude = Vec<f32>;
+    type QualifiedRule = ();
+    type Error = BasicParseErrorKind<'i>;
+
+    fn parse_prelude<'t>(
+        &mut self,
+        input: &mut Parser<'i, 't>,
+    ) -> Result<Self::Prelude, cssparser::ParseError<'i, Self::Error>> {
+        input.parse_comma_separated(parse_keyframe_selector)
+    }
+
+    fn parse_block<'t>(
+        &mut self,
+        selectors: Self::Prelude,
+        _start: &ParserState,
+        input: &mut Parser<'i, 't>,
+    ) -> Result<Self::QualifiedRule, cssparser::ParseError<'i, Self::Error>> {
+        let declarations = parse_declarations_from_parser(input, self.base_url, self.root_url);
+        self.steps
+            .extend(selectors.into_iter().map(|offset| KeyframeStep {
+                offset,
+                declarations: declarations.clone(),
+            }));
+        Ok(())
+    }
+}
+
+impl<'i> RuleBodyItemParser<'i, (), BasicParseErrorKind<'i>> for KeyframesRuleBodyParser<'_> {
+    fn parse_declarations(&self) -> bool {
+        false
+    }
+
+    fn parse_qualified(&self) -> bool {
+        true
+    }
+}
+
+fn parse_keyframe_selector<'i, 't>(
+    input: &mut Parser<'i, 't>,
+) -> Result<f32, cssparser::ParseError<'i, BasicParseErrorKind<'i>>> {
+    let offset = match input.next()?.clone() {
+        Token::Ident(name) if name.eq_ignore_ascii_case("from") => 0.0,
+        Token::Ident(name) if name.eq_ignore_ascii_case("to") => 1.0,
+        Token::Percentage { unit_value, .. } => unit_value,
+        _ => return Err(input.new_custom_error(BasicParseErrorKind::QualifiedRuleInvalid)),
+    };
+    input.expect_exhausted()?;
+    if !offset.is_finite() || !(0.0..=1.0).contains(&offset) {
+        return Err(input.new_custom_error(BasicParseErrorKind::QualifiedRuleInvalid));
+    }
+    Ok(offset)
 }

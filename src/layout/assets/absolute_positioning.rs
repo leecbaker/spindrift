@@ -120,7 +120,7 @@ pub(in crate::layout) fn resolve_absolute_horizontal(
     style: &ComputedStyle,
     containing_block: ContainingBlock,
     auto_or_intrinsic_width: f32,
-    static_position: StaticHorizontalPosition,
+    static_position: PhysicalStaticAxisFallback,
     containing_direction: Direction,
 ) -> PositionedAxis {
     resolve_absolute_horizontal_with_non_content(
@@ -153,7 +153,7 @@ pub(in crate::layout) fn resolve_absolute_horizontal_with_non_content(
     containing_block: ContainingBlock,
     auto_or_intrinsic_width: f32,
     automatic_minimum_width: Option<f32>,
-    static_position: StaticHorizontalPosition,
+    static_position: PhysicalStaticAxisFallback,
     containing_direction: Direction,
     horizontal_non_content: f32,
 ) -> PositionedAxis {

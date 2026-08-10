@@ -13,7 +13,8 @@ use super::values::{
 };
 use crate::units::{PercentageBasis, layout_points};
 use crate::{
-    PageMargins, PageSize, RenderOptions,
+    RenderOptions,
+    layout::{PageMargins, PageSize},
     units::{LayoutLength, layout_pt},
 };
 

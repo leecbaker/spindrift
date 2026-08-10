@@ -30,7 +30,7 @@ pub(in crate::css) fn parse_contain(value: &str) -> Option<Contain> {
     }
 
     let mut contain = Contain::NONE;
-    for token in value.split_whitespace() {
+    for token in try_split_css_component_values(&value)? {
         match token {
             "size" if !contain.size => contain.size = true,
             "layout" if !contain.layout => contain.layout = true,
@@ -73,15 +73,62 @@ pub(in crate::css) fn parse_clip_path(value: &str, font_size: f32) -> Option<Cli
     }
 }
 
+/// Parse the CSS 2 legacy `clip` property used by absolutely positioned
+/// elements. CSS 2 requires comma separation, but permits user agents to
+/// accept the historical whitespace-only form; accept either complete form
+/// while rejecting mixed separators.
+/// <https://drafts.csswg.org/css2/#propdef-clip>
+pub(in crate::css) fn parse_legacy_clip(value: &str, font_size: f32) -> Option<LegacyClip> {
+    let value = trim_css_value(value);
+    if value.eq_ignore_ascii_case("auto") {
+        return Some(LegacyClip::Auto);
+    }
+    let calls = css_function_list(value)?;
+    let [(name, body)] = calls.as_slice() else {
+        return None;
+    };
+    if !name.eq_ignore_ascii_case("rect") {
+        return None;
+    }
+    let comma_components = split_css_function_arguments(body)?;
+    let components = if comma_components.len() == 1 {
+        try_split_css_component_values(body)?
+    } else if comma_components
+        .iter()
+        .all(|component| !component.is_empty())
+    {
+        comma_components
+    } else {
+        return None;
+    };
+    let [top, right, bottom, left] = components.as_slice() else {
+        return None;
+    };
+    Some(LegacyClip::Rect([
+        parse_legacy_clip_edge(top, font_size)?,
+        parse_legacy_clip_edge(right, font_size)?,
+        parse_legacy_clip_edge(bottom, font_size)?,
+        parse_legacy_clip_edge(left, font_size)?,
+    ]))
+}
+
+fn parse_legacy_clip_edge(value: &str, font_size: f32) -> Option<LegacyClipEdge> {
+    if value.eq_ignore_ascii_case("auto") {
+        return Some(LegacyClipEdge::Auto);
+    }
+    let length = parse_computed_length_percentage(value, font_size)?;
+    (!length.contains_percentage()).then_some(LegacyClipEdge::Length(length))
+}
+
 fn parse_clip_path_inset(value: &str, font_size: f32) -> Option<[ComputedLengthPercentage; 4]> {
-    let calls = parse_transform_function_calls(value)?;
+    let calls = css_function_list(value)?;
     let [(name, body)] = calls.as_slice() else {
         return None;
     };
     if !name.eq_ignore_ascii_case("inset") {
         return None;
     }
-    let components = split_css_component_values(body);
+    let components = try_split_css_component_values(body)?;
     let values = components
         .iter()
         .take_while(|component| !component.eq_ignore_ascii_case("round"))
@@ -863,5 +910,30 @@ fn parse_border_shape_position_component(
         "top" if !horizontal => Some(ComputedLengthPercentage::ZERO),
         "bottom" if !horizontal => Some(ComputedLengthPercentage::from_percent(1.0)),
         _ => parse_computed_length_percentage(value, font_size),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_clip_accepts_complete_comma_or_whitespace_rects() {
+        assert!(matches!(
+            parse_legacy_clip("rect(1px, auto, 3px, 4px)", 12.0),
+            Some(LegacyClip::Rect(_))
+        ));
+        assert!(matches!(
+            parse_legacy_clip("rect(1px auto 3px 4px)", 12.0),
+            Some(LegacyClip::Rect(_))
+        ));
+        assert_eq!(parse_legacy_clip("auto", 12.0), Some(LegacyClip::Auto));
+    }
+
+    #[test]
+    fn legacy_clip_rejects_percentages_and_malformed_rects() {
+        assert!(parse_legacy_clip("rect(1%, 2px, 3px, 4px)", 12.0).is_none());
+        assert!(parse_legacy_clip("rect(1px, 2px 3px, 4px)", 12.0).is_none());
+        assert!(parse_legacy_clip("rect(1px, 2px, 3px)", 12.0).is_none());
     }
 }

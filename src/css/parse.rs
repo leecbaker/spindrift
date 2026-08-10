@@ -3,9 +3,9 @@ use super::selector::{QuireSelectorImpl, QuireSelectorParser};
 use super::types::{
     ContainerRule, CounterStyleRange, CounterStyleRangeInterval, CounterStyleRule,
     CounterStyleSystem, Css, CssFontFace, Declarations, Direction, Display, FontFaceSource,
-    FontPaletteValues, FontStyle, FontWeight, FontWidth, KeyframeStep, KeyframesRule,
-    MediaEnvironment, PagePseudo, PageRule, PageSelector, PageSpecificity, ScopeRule, StyleRule,
-    Stylesheet, StylesheetOrigin, UnicodeRange,
+    FontPaletteValues, FontStyle, FontWeight, FontWidth, KeyframeStep, KeyframesName,
+    KeyframesRule, MediaEnvironment, PagePseudo, PageRule, PageSelector, PageSpecificity,
+    ScopeRule, StyleRule, Stylesheet, StylesheetOrigin, UnicodeRange,
 };
 use super::values::{
     parse_color, parse_display, parse_font_family_names, parse_font_style, parse_font_weight,
@@ -27,9 +27,7 @@ pub(crate) fn parse_stylesheet_with_media_environment(
     css: &Css,
     media_environment: &MediaEnvironment,
 ) -> Stylesheet {
-    let expanded_source = recover_eof_component_blocks(&expand_nested_rules(
-        &expand_custom_media_rules(css.source()),
-    ));
+    let expanded_source = recover_eof_component_blocks(&expand_custom_media_rules(css.source()));
     let mut input = ParserInput::new(&expanded_source);
     let mut parser = Parser::new(&mut input);
     let layers = LayerRegistry::new_shared();
@@ -48,9 +46,11 @@ pub(crate) fn parse_stylesheet_with_media_environment(
         root_url: css.root_url(),
         layers: Rc::clone(&layers),
         namespaces,
-        current_layer: css.import_layer_name().map(ToOwned::to_owned),
+        current_layer: css.import_layer_name().cloned(),
         current_scopes: Vec::new(),
+        scope_anchor: css.scope_anchor(),
         media_environment: *media_environment,
+        nesting: None,
         namespace_prelude_open: true,
     };
     let mut parsed_rules = Vec::new();
@@ -70,6 +70,7 @@ pub(crate) fn parse_stylesheet_with_media_environment(
     let mut parsed_font_feature_values = Vec::new();
     let mut parsed_font_palette_values = Vec::new();
     let mut parsed_property_registrations = Vec::new();
+    let mut parsed_page_rules = Vec::new();
 
     for item in StyleSheetParser::new(&mut parser, &mut rule_parser).flatten() {
         flatten_rule(
@@ -91,6 +92,7 @@ pub(crate) fn parse_stylesheet_with_media_environment(
             &mut parsed_font_feature_values,
             &mut parsed_font_palette_values,
             &mut parsed_property_registrations,
+            &mut parsed_page_rules,
         );
     }
 
@@ -176,15 +178,22 @@ pub(crate) fn parse_stylesheet_with_media_environment(
         .collect();
     let layer_names = layers.borrow().names();
     let namespace_prefixes = rule_parser.namespaces.borrow().prefixes.clone();
-    let page_rules = parse_page_rules(
-        css.source(),
-        css.base_url(),
-        css.root_url(),
-        css.origin(),
-        &layer_names,
-        css.import_layer_name(),
-        media_environment,
-    );
+    let page_rules = parsed_page_rules
+        .into_iter()
+        .enumerate()
+        .map(|(order, rule)| PageRule {
+            origin: css.origin(),
+            selectors: rule.selectors,
+            declarations: rule.declarations,
+            margin_boxes: rule.margin_boxes,
+            footnote_area: rule.footnote_area,
+            order,
+            layer_order: rule
+                .layer
+                .as_ref()
+                .and_then(|name| layers.borrow().order_for(name)),
+        })
+        .collect::<Vec<_>>();
     let page_declarations = page_rules
         .iter()
         .filter(|rule| rule.selectors.is_empty())
@@ -194,7 +203,7 @@ pub(crate) fn parse_stylesheet_with_media_environment(
         });
     let first_page_declarations = cascade_page_declarations(&page_rules, 1);
     let font_feature_values =
-        parse_font_feature_values_rules(parsed_font_feature_values, &layer_names);
+        parse_font_feature_values_rules(parsed_font_feature_values, &layers.borrow());
 
     Stylesheet {
         origin: css.origin(),
@@ -255,6 +264,11 @@ fn recover_eof_component_blocks(source: &str) -> String {
             } else if byte == b'\\' {
                 escaped = true;
             } else if byte == quote_byte {
+                quote = None;
+            } else if matches!(byte, b'\n' | b'\r' | 0x0C) {
+                // A newline terminates an unterminated string as a CSS Syntax
+                // BadString token. Do not turn that tokenizer error into a
+                // valid EOF-closed string while recovering outer blocks.
                 quote = None;
             }
             continue;
@@ -331,11 +345,13 @@ use font_face::*;
 use nesting::*;
 pub(crate) use page_margin::cascade_page_declarations;
 use page_margin::*;
+pub(in crate::css) use rule_parser::LayerRegistry;
 use rule_parser::*;
 pub(crate) use rule_parser::{
     custom_property_value_is_valid, is_custom_property_name, media_rule_applies,
     media_rule_applies_in_environment, supports_condition_applies,
 };
+pub(in crate::css) use rule_parser::{parse_layer_name, parse_layer_name_list};
 
 /// Parses a declaration at specified-value time and returns the canonical
 /// property/value operation the cascade should apply.

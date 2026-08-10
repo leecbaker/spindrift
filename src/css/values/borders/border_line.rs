@@ -16,7 +16,7 @@ pub(crate) fn apply_border(value: &str, style: &mut ComputedStyle, side: Option<
             recognized |= border_style.is_some();
         }
         if color.is_none() {
-            color = parse_border_color(part, style.color);
+            color = parse_border_color(part);
             recognized |= color.is_some();
         }
         if !recognized {
@@ -26,7 +26,7 @@ pub(crate) fn apply_border(value: &str, style: &mut ComputedStyle, side: Option<
 
     let width = width.unwrap_or(ComputedLengthPercentage::from_points(3.0 * CSS_PX_TO_PT));
     let border_style = border_style.unwrap_or(BorderStyle::None);
-    let color = color.unwrap_or(style.color);
+    let color = color.unwrap_or(CssColorOrCurrentColor::CurrentColor);
 
     if let Some(side) = side {
         set_border_side_width(style, side, width);
@@ -166,13 +166,10 @@ pub(crate) fn parse_logical_border_styles(value: &str) -> Option<[BorderStyle; 2
 /// CSS Logical Properties defines `border-block-color` and
 /// `border-inline-color` as two-value shorthands for start/end colors:
 /// <https://www.w3.org/TR/css-logical-1/#border-shorthands>.
-pub(crate) fn parse_logical_border_colors(
-    value: &str,
-    current_color: CssColor,
-) -> Option<[CssColor; 2]> {
+pub(crate) fn parse_logical_border_colors(value: &str) -> Option<[CssColorOrCurrentColor; 2]> {
     let values = split_css_component_values(value)
         .into_iter()
-        .map(|part| parse_border_color(part, current_color))
+        .map(parse_border_color)
         .collect::<Option<Vec<_>>>()?;
     match values.as_slice() {
         [all] => Some([*all, *all]),
@@ -204,11 +201,11 @@ pub(crate) fn parse_border_style(value: &str) -> Option<BorderStyle> {
 /// `color` value:
 /// <https://www.w3.org/TR/css-backgrounds-3/#border-color> and
 /// <https://www.w3.org/TR/css-color-4/#currentcolor-color>.
-pub(crate) fn parse_border_color(value: &str, current_color: CssColor) -> Option<CssColor> {
+pub(crate) fn parse_border_color(value: &str) -> Option<CssColorOrCurrentColor> {
     if trim_css_value(value).eq_ignore_ascii_case("currentcolor") {
-        Some(current_color)
+        Some(CssColorOrCurrentColor::CurrentColor)
     } else {
-        parse_color(value)
+        parse_color(value).map(CssColorOrCurrentColor::Color)
     }
 }
 
@@ -218,10 +215,10 @@ pub(crate) fn parse_border_color(value: &str, current_color: CssColor) -> Option
 /// one-to-four-value box-edge shorthand for the physical border color
 /// longhands:
 /// <https://www.w3.org/TR/css-backgrounds-3/#border-color>.
-pub(crate) fn parse_border_colors(value: &str, current_color: CssColor) -> Option<BorderColors> {
+pub(crate) fn parse_border_colors(value: &str) -> Option<BorderColors> {
     let colors = split_css_component_values(value)
         .into_iter()
-        .map(|part| parse_border_color(part, current_color))
+        .map(parse_border_color)
         .collect::<Option<Vec<_>>>()?;
     match colors.as_slice() {
         [all] => Some(border_colors_all(*all)),

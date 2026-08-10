@@ -37,7 +37,9 @@ pub(crate) fn parse_gap_rule_color_list(
     value: &str,
     current_color: CssColor,
 ) -> Option<GapRuleList<CssColor>> {
-    parse_gap_rule_list(value, |token| parse_border_color(token, current_color))
+    parse_gap_rule_list(value, |token| {
+        parse_border_color(token).map(|color| color.resolve(current_color))
+    })
 }
 
 pub(crate) fn parse_gap_rule_break(value: &str) -> Option<GapRuleBreak> {
@@ -132,7 +134,7 @@ fn parse_single_gap_rule(
             continue;
         }
         if color.is_none()
-            && let Some(parsed) = parse_border_color(part, current_color)
+            && let Some(parsed) = parse_border_color(part).map(|color| color.resolve(current_color))
         {
             color = Some(parsed);
             saw_component = true;

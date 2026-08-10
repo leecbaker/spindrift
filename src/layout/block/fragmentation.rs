@@ -152,8 +152,7 @@ impl<'a> LayoutBuilder<'a> {
             self.replay_fragment_continuation_on_page(&continuation, context);
         }
         let mut retry_style = style.clone();
-        retry_style.break_inside_avoid = false;
-        retry_style.break_inside_avoid_column = false;
+        retry_style.break_inside = css::BreakInsideAvoidance::Auto;
         // CSS Fragmentation treats `break-inside: avoid` as a constraint to
         // keep a box unfragmented when possible. Once an ancestor avoid box has
         // been moved to a fresh fragmentainer for a retry, nested avoid boxes

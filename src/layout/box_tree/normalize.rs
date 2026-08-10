@@ -489,7 +489,7 @@ fn split_inline_block_context_or_part<'a>(
 fn split_inline_style_needs_block_context(element: &Element, style: &ComputedStyle) -> bool {
     matches!(style.position, Position::Relative | Position::Sticky)
         || style.z_index.establishes_stacking_context()
-        || style.opacity < 1.0
+        || style.opacity.value() < 1.0
         || style.has_transform()
         || style.isolation == Isolation::Isolate
         || style.mix_blend_mode != MixBlendMode::Normal
@@ -821,6 +821,17 @@ pub(crate) fn anonymous_table_style(parent_style: &ComputedStyle) -> ComputedSty
     style.caption_side = parent_style.caption_side;
     style.empty_cells = parent_style.empty_cells;
     style.border_spacing = parent_style.border_spacing.clone();
+    // CSS Display generates this wrapper without a source element. In a
+    // surrounding preserving context it transports the layout offset but is
+    // not itself a CSS `transform-style` box, so retain that distinction for
+    // the paint-tree bridge.
+    // Table fixup can generate a chain of anonymous table, row-group, and
+    // row boxes.  Each link must remain transparent: letting a later
+    // synthetic wrapper fall back to `flat` would terminate the ancestor's
+    // CSS 3D rendering context even though there is no intervening element.
+    // <https://drafts.csswg.org/css-transforms-2/#3d-rendering-contexts>
+    style.anonymous_3d_layout_bridge = parent_style.anonymous_3d_layout_bridge
+        || parent_style.transform_style == css::TransformStyle::Preserve3d;
     style
 }
 
@@ -877,6 +888,21 @@ where
     matches!(box_, FormattingBoxWith::Text(text) if crate::text::text_is_css_collapsible_whitespace(&text.text))
 }
 
+/// Return whether a formatting box participates in an anonymous inline run.
+///
+/// An `inline-table` is stored as an [`AtomicInline`] because its table
+/// formatting context is atomic to its parent, but its outer display role is
+/// still inline-level. Keep that outer-role classification visible here so
+/// mixed block containers generate the CSS 2.2 anonymous block boxes in tree
+/// order instead of collecting the table as an out-of-order direct inline
+/// descendant. The table wrapper and table-root distinction comes from CSS
+/// Display and CSS Tables; CSS Positioned Layout then paints the wrapper as a
+/// line-box item while retaining the table's local structural paint order.
+///
+/// <https://drafts.csswg.org/css-display-3/#outer-role>
+/// <https://drafts.csswg.org/css-tables-3/#anonymous-boxes>
+/// <https://www.w3.org/TR/CSS22/visuren.html#anonymous-block-level>
+/// <https://drafts.csswg.org/css-position-4/#painting-order>
 pub(crate) fn is_inline_level_box<S>(box_: &FormattingBoxWith<'_, S>) -> bool
 where
     S: AsRef<ComputedStyle>,
@@ -884,8 +910,10 @@ where
     match box_ {
         FormattingBoxWith::Inline(_) | FormattingBoxWith::Text(_) => true,
         FormattingBoxWith::AtomicInline(box_) => {
-            box_.core.style.as_ref().display.is_atomic_inline()
-                || box_.core.style.as_ref().display.is_replaced()
+            let display = box_.core.style.as_ref().display;
+            display.is_atomic_inline()
+                || display.is_replaced()
+                || (display.is_table() && display.is_inline_level())
         }
         FormattingBoxWith::Block(_)
         | FormattingBoxWith::InlineSplitBlockContext(_)

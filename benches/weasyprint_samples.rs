@@ -92,10 +92,12 @@ fn benchmark_weasyprint_samples(c: &mut Criterion) {
 }
 
 async fn render_empty_pdf(options: &RenderOptions, pdf_options: &PdfOptions) -> Vec<u8> {
+    let mut bytes = Vec::new();
     Html::from_string("<!doctype html><meta charset=\"utf-8\"><title>empty</title>")
-        .write_pdf_bytes(options, pdf_options)
+        .write_pdf(&mut bytes, options, pdf_options)
         .await
-        .expect("render empty document to PDF")
+        .expect("render empty document to PDF");
+    bytes
 }
 
 async fn render_inline_break_all_pdf(
@@ -103,10 +105,12 @@ async fn render_inline_break_all_pdf(
     options: &RenderOptions,
     pdf_options: &PdfOptions,
 ) -> Vec<u8> {
+    let mut bytes = Vec::new();
     Html::from_string(source)
-        .write_pdf_bytes(options, pdf_options)
+        .write_pdf(&mut bytes, options, pdf_options)
         .await
-        .expect("render long break-all benchmark document to PDF")
+        .expect("render long break-all benchmark document to PDF");
+    bytes
 }
 
 async fn render_sample_pdf(
@@ -123,9 +127,11 @@ async fn render_sample_pdf(
             .unwrap_or_else(|error| panic!("load stylesheet {stylesheet}: {error}"));
         html = html.with_stylesheet(stylesheet);
     }
-    html.write_pdf_bytes(options, pdf_options)
+    let mut bytes = Vec::new();
+    html.write_pdf(&mut bytes, options, pdf_options)
         .await
-        .unwrap_or_else(|error| panic!("render sample {} to PDF: {error}", sample.path))
+        .unwrap_or_else(|error| panic!("render sample {} to PDF: {error}", sample.path));
+    bytes
 }
 
 criterion_group!(benches, benchmark_weasyprint_samples);

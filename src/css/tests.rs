@@ -2,7 +2,9 @@ use super::values::{edge_all, parse_computed_length_percentage};
 use super::*;
 use crate::css::page::page_style_for_declarations;
 use crate::{
-    LayoutSize, PageMargins, PageSize, RenderOptions,
+    LayoutSize, RenderOptions,
+    layout::PageMargins,
+    layout::PageSize,
     units::{LayoutLength, layout_pt},
 };
 use std::{
@@ -46,7 +48,6 @@ async fn stylesheet_options_do_not_eagerly_apply_page_rules() {
     let css = Css::from_string("@page { size: 200px 100px; margin: 10px } p { font-size: 20px }");
     let mut options = RenderOptions::default();
     let initial_page_size = options.page_size;
-    let initial_page_margins = options.page_margins;
     apply_stylesheet_options(&css, &mut options);
 
     // Page rules are page-context inputs, not global render options. Keeping
@@ -54,7 +55,6 @@ async fn stylesheet_options_do_not_eagerly_apply_page_rules() {
     // immutable fallback geometry, regardless of whether its declarations
     // use viewport units.
     assert_eq!(options.page_size, initial_page_size);
-    assert_eq!(options.page_margins, initial_page_margins);
     assert_eq!(options.font_size(), 15.0);
 }
 
@@ -574,6 +574,63 @@ async fn page_margin_at_rules_match_exact_names() {
 }
 
 #[tokio::test]
+async fn page_rules_tokenize_escaped_names_and_nested_component_values() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        r#"@p\61 ge rep\6f rt:first {
+             color: red;
+             @unknown { content: "ignored; } @top-left {" }
+             @top-left invalid { content: "also ignored" }
+             @top-\6c eft {
+               content: "}; @top-left {";
+               background-image: url("data:text/plain,;@top-left{}");
+             }
+             @footnote { max-height: 30% }
+           }"#,
+    ));
+
+    assert_eq!(stylesheet.page_rules.len(), 1);
+    let rule = &stylesheet.page_rules[0];
+    assert_eq!(rule.selectors[0].page_type.as_deref(), Some("report"));
+    assert_eq!(
+        rule.declarations.get("color").map(String::as_str),
+        Some("red")
+    );
+    let top_left = rule.margin_boxes.get("top-left").unwrap();
+    assert_eq!(
+        top_left.get("content").map(String::as_str),
+        Some("\"}; @top-left {\"")
+    );
+    assert_eq!(
+        top_left.get("background-image").map(String::as_str),
+        Some("url(\"data:text/plain,;@top-left{}\")")
+    );
+    assert_eq!(
+        rule.footnote_area
+            .as_ref()
+            .and_then(|declarations| declarations.get("max-height"))
+            .map(String::as_str),
+        Some("30%")
+    );
+}
+
+#[tokio::test]
+async fn invalid_page_selector_lists_are_not_partially_accepted() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "@page :first, :unknown { margin: 4in } \
+         @page report :first { margin: 3in } \
+         @page :nth(2n+) { margin: 2in } \
+         @page { margin: 1in }",
+    ));
+
+    assert_eq!(stylesheet.page_rules.len(), 1);
+    assert!(stylesheet.page_rules[0].selectors.is_empty());
+    assert_eq!(
+        page_margins_from(&stylesheet.page_declarations, PageMargins::all_points(0.0)),
+        PageMargins::all_points(72.0)
+    );
+}
+
+#[tokio::test]
 async fn parses_invoice_page_margin_boxes_through_main_at_rule_parser() {
     let stylesheet = parse_stylesheet(
         &Css::from_file("weasyprint-samples/invoice/invoice.css")
@@ -798,8 +855,14 @@ async fn parses_page_margin_box_layers() {
     ));
 
     assert_eq!(stylesheet.page_rules.len(), 2);
-    assert_eq!(stylesheet.page_rules[0].layer_order, Some(1));
-    assert_eq!(stylesheet.page_rules[1].layer_order, Some(0));
+    assert_eq!(
+        stylesheet.page_rules[0].layer_order.as_ref().unwrap().0,
+        vec![1, 0]
+    );
+    assert_eq!(
+        stylesheet.page_rules[1].layer_order.as_ref().unwrap().0,
+        vec![0, 0]
+    );
 }
 
 #[tokio::test]
@@ -936,6 +999,31 @@ fn forced_colors_media_feature_tracks_the_rendering_environment() {
 }
 
 #[test]
+fn prefers_color_scheme_media_feature_uses_light_default_and_explicit_preference() {
+    let default_environment =
+        MediaEnvironment::new(MediaType::Print, CssViewportSize::new(800.0, 600.0));
+    let dark_environment =
+        default_environment.with_color_scheme_preference(ColorSchemePreference::Dark);
+
+    assert!(crate::css::media_rule_applies_in_environment(
+        "(prefers-color-scheme: light)",
+        &default_environment,
+    ));
+    assert!(!crate::css::media_rule_applies_in_environment(
+        "(prefers-color-scheme: dark)",
+        &default_environment,
+    ));
+    assert!(crate::css::media_rule_applies_in_environment(
+        "(prefers-color-scheme: dark)",
+        &dark_environment,
+    ));
+    assert!(!crate::css::media_rule_applies_in_environment(
+        "(prefers-color-scheme: light)",
+        &dark_environment,
+    ));
+}
+
+#[test]
 fn print_media_dimensions_match_the_renderer_viewport() {
     let environment = MediaEnvironment::new(MediaType::Print, CssViewportSize::new(480.0, 288.0));
 
@@ -968,7 +1056,7 @@ async fn matching_print_media_rule_overrides_earlier_background_shorthand() {
     );
 
     assert_eq!(
-        style.background_color.color(),
+        style.background.background_color.color(),
         Some(CssColor::new(0, 128, 0))
     );
 }
@@ -995,14 +1083,14 @@ fn inherited_relative_currentcolor_background_resolves_against_child_color() {
     );
 
     assert_eq!(
-        parent.background_color,
+        parent.background.background_color,
         BackgroundColor::RelativeCurrentColor {
             expression: "rgb(from currentcolor r g b)".to_string(),
             used_color_scheme: parent.used_color_scheme,
         }
     );
     assert_eq!(
-        parent.background_color,
+        parent.background.background_color,
         BackgroundColor::RelativeCurrentColor {
             expression: "rgb(from currentcolor r g b)".to_string(),
             used_color_scheme: parent.used_color_scheme,
@@ -1014,14 +1102,14 @@ fn inherited_relative_currentcolor_background_resolves_against_child_color() {
         Some(CssColor::new(0, 128, 0))
     );
     assert_eq!(
-        child.background_color,
+        child.background.background_color,
         BackgroundColor::RelativeCurrentColor {
             expression: "rgb(from currentcolor r g b)".to_string(),
             used_color_scheme: child.used_color_scheme,
         }
     );
     assert_eq!(
-        child.background_color.visible_color(child.color),
+        child.background.background_color.visible_color(child.color),
         Some(CssColor::new(0, 128, 0))
     );
 }
@@ -1094,10 +1182,13 @@ async fn inherited_background_origin_preserves_the_child_image_layers() {
         &[parent_signature],
     );
 
-    assert_eq!(child.background_origin, BackgroundBox::Content);
-    assert!(child.background_image.is_image());
-    assert!(child.background_layers[0].image.is_image());
-    assert_eq!(child.background_layers[0].origin, BackgroundBox::Content);
+    assert_eq!(child.background.background_origin, BackgroundBox::Content);
+    assert!(child.background.background_image.is_image());
+    assert!(child.background.background_layers[0].image.is_image());
+    assert_eq!(
+        child.background.background_layers[0].origin,
+        BackgroundBox::Content
+    );
 }
 
 #[tokio::test]
@@ -1123,8 +1214,8 @@ async fn inherited_background_clip_applies_to_a_color_only_child() {
         &[parent_signature],
     );
 
-    assert_eq!(parent.background_clip, BackgroundBox::Content);
-    assert_eq!(child.background_clip, BackgroundBox::Content);
+    assert_eq!(parent.background.background_clip, BackgroundBox::Content);
+    assert_eq!(child.background.background_clip, BackgroundBox::Content);
     assert_eq!(child.background_color_clip(), BackgroundBox::Content);
 }
 
@@ -1289,23 +1380,23 @@ async fn has_pseudo_class_matches_descendant_dir_inherited_from_document_directi
         );
 
     assert_eq!(
-        implicit_ltr.background_color.color(),
+        implicit_ltr.background.background_color.color(),
         Some(CssColor::new(0, 255, 0))
     );
     assert_eq!(
-        explicit_ltr.background_color.color(),
+        explicit_ltr.background.background_color.color(),
         Some(CssColor::new(0, 255, 0))
     );
     assert_eq!(
-        ancestor_ltr.background_color.color(),
+        ancestor_ltr.background.background_color.color(),
         Some(CssColor::new(0, 255, 0))
     );
     assert_eq!(
-        explicit_rtl.background_color.color(),
+        explicit_rtl.background.background_color.color(),
         Some(CssColor::new(0, 255, 0))
     );
     assert_eq!(
-        ancestor_rtl.background_color.color(),
+        ancestor_rtl.background.background_color.color(),
         Some(CssColor::new(0, 255, 0))
     );
 }
@@ -1346,7 +1437,7 @@ async fn lang_pseudo_class_matches_basic_and_inherited_languages() {
         &[],
     );
     let parent = ComputedStyle {
-        language: Some("fr".to_string()),
+        language: ContentLanguage::from_html_attribute("fr"),
         ..ComputedStyle::initial()
     };
     let inherited = style_for_element_with_signature(
@@ -1365,6 +1456,30 @@ async fn lang_pseudo_class_matches_basic_and_inherited_languages() {
 
     assert_eq!(english.color, CssColor::new(0, 0, 255));
     assert_eq!(inherited.color, CssColor::new(255, 0, 0));
+}
+
+#[tokio::test]
+async fn malformed_html_language_tags_do_not_match_lang_or_drive_typography() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "p { color: black } p:lang(ja) { color: red }",
+    ));
+    let style = style_for_element_with_signature(
+        ElementSignature::new(
+            "p",
+            HashMap::from([("lang".to_string(), "ja_Hang".to_string())]),
+        ),
+        None,
+        std::slice::from_ref(&stylesheet),
+        None,
+        &[],
+    );
+
+    assert_eq!(style.color, CssColor::BLACK);
+    assert_eq!(style.language.as_deref(), None);
+    let ContentLanguage::Tagged(tag) = style.language else {
+        panic!("a malformed but present HTML lang value remains tagged")
+    };
+    assert_eq!(tag.as_str(), "ja_Hang");
 }
 
 #[tokio::test]
@@ -1427,7 +1542,7 @@ async fn lang_pseudo_class_matches_selectors_four_ranges() {
     assert_eq!(regional.color, CssColor::new(255, 0, 0));
     assert_eq!(regional.border_colors.top, CssColor::new(0, 128, 0));
     assert_eq!(
-        italian.background_color.color(),
+        italian.background.background_color.color(),
         Some(CssColor::new(0, 0, 255))
     );
     assert_eq!(unknown.border_colors.right, CssColor::new(128, 0, 128));
@@ -1435,7 +1550,13 @@ async fn lang_pseudo_class_matches_selectors_four_ranges() {
         wildcard_subtag.border_colors.bottom,
         CssColor::new(0, 128, 0)
     );
-    assert_eq!(singleton_extension.border_colors.bottom, CssColor::BLACK);
+    assert_eq!(
+        singleton_extension
+            .border_colors
+            .bottom
+            .resolve(singleton_extension.color),
+        CssColor::BLACK
+    );
 }
 
 #[tokio::test]
@@ -1527,15 +1648,15 @@ async fn nth_last_child_of_selector_list_counts_filtered_siblings_from_end() {
     );
 
     assert_eq!(
-        first_filtered.background_color.color(),
+        first_filtered.background.background_color.color(),
         Some(CssColor::new(0, 255, 0))
     );
     assert_eq!(
-        second_filtered.background_color.color(),
+        second_filtered.background.background_color.color(),
         Some(CssColor::new(255, 0, 0))
     );
     assert_eq!(
-        third_filtered.background_color.color(),
+        third_filtered.background.background_color.color(),
         Some(CssColor::new(0, 255, 0))
     );
 }
@@ -1702,7 +1823,10 @@ async fn invalid_nth_child_of_selector_list_rejects_rule_and_supports_selector()
     );
 
     assert_eq!(style.color, CssColor::BLACK);
-    assert_eq!(style.background_color.color(), Some(CssColor::TRANSPARENT));
+    assert_eq!(
+        style.background.background_color.color(),
+        Some(CssColor::TRANSPARENT)
+    );
 }
 
 #[tokio::test]
@@ -1780,12 +1904,75 @@ async fn empty_and_has_pseudo_classes_use_child_and_sibling_snapshots() {
     assert_eq!(empty.color, CssColor::new(0, 255, 0));
     assert_eq!(text_only.color, CssColor::BLACK);
     assert_eq!(
-        with_child_and_next.background_color.color(),
+        with_child_and_next.background.background_color.color(),
         Some(CssColor::new(0, 0, 255))
     );
     assert_eq!(
         with_child_and_next.border_colors.top,
         CssColor::new(255, 0, 0)
+    );
+}
+
+#[tokio::test]
+async fn static_link_history_pseudo_classes_keep_links_unvisited() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "a { color: black } \
+         a:link { color: lime } \
+         a:visited { color: red } \
+         a:any-link { border-top-color: blue } \
+         .link-parent:has(:link) { color: lime } \
+         .visited-parent:has(:visited) { color: red } \
+         .any-link-parent:has(:any-link) { color: blue }",
+    ));
+    let hyperlink = ElementSignature::new(
+        "a",
+        HashMap::from([("href".to_string(), "destination".to_string())]),
+    );
+    let non_hyperlink = ElementSignature::new("a", HashMap::new());
+
+    let link_style = style_for_element_with_signature(
+        hyperlink,
+        None,
+        std::slice::from_ref(&stylesheet),
+        None,
+        &[],
+    );
+    let non_link_style = style_for_element_with_signature(
+        non_hyperlink,
+        None,
+        std::slice::from_ref(&stylesheet),
+        None,
+        &[],
+    );
+    let link_parent = |class: &str| {
+        style_for_element_with_signature(
+            ElementSignature::new(
+                "div",
+                HashMap::from([("class".to_string(), class.to_string())]),
+            )
+            .with_children(
+                vec![ElementSiblingSignature::new(
+                    "a",
+                    HashMap::from([("href".to_string(), "destination".to_string())]),
+                )],
+                false,
+            ),
+            None,
+            std::slice::from_ref(&stylesheet),
+            None,
+            &[],
+        )
+    };
+
+    assert_eq!(link_style.color, CssColor::new(0, 255, 0));
+    assert_eq!(link_style.border_colors.top, CssColor::new(0, 0, 255));
+    assert_eq!(non_link_style.color, CssColor::BLACK);
+    assert_ne!(non_link_style.border_colors.top, CssColor::new(0, 0, 255));
+    assert_eq!(link_parent("link-parent").color, CssColor::new(0, 255, 0));
+    assert_eq!(link_parent("visited-parent").color, CssColor::BLACK);
+    assert_eq!(
+        link_parent("any-link-parent").color,
+        CssColor::new(0, 0, 255)
     );
 }
 
@@ -1868,7 +2055,7 @@ async fn sibling_signatures_keep_child_snapshots_for_ancestor_has_rules() {
             &[container, b_signature],
         );
         assert_eq!(
-            c_style.background_color.color(),
+            c_style.background.background_color.color(),
             Some(CssColor::new(0, 0, 255))
         );
     }
@@ -1935,7 +2122,7 @@ async fn static_and_html_state_pseudo_classes_parse_and_match_deterministically(
 
     assert_eq!(checked_required.color, CssColor::new(0, 255, 0));
     assert_eq!(
-        checked_required.background_color.color(),
+        checked_required.background.background_color.color(),
         Some(CssColor::new(0, 0, 255))
     );
     assert_eq!(
@@ -1948,7 +2135,10 @@ async fn static_and_html_state_pseudo_classes_parse_and_match_deterministically(
     );
     assert_eq!(checked_required.outline_color, CssColor::new(255, 0, 0));
     assert_eq!(disabled.border_colors.top, CssColor::new(255, 0, 0));
-    assert_eq!(disabled.border_colors.right, CssColor::BLACK);
+    assert_eq!(
+        disabled.border_colors.right.resolve(disabled.color),
+        CssColor::BLACK
+    );
     assert_eq!(readonly.outline_color, CssColor::new(255, 0, 0));
     assert_eq!(writable.outline_color, CssColor::new(0, 0, 255));
 }
@@ -1998,9 +2188,12 @@ async fn open_pseudo_class_matches_static_html_open_state() {
     assert_eq!(open_details.margin.left, 60.0);
     assert_eq!(closed_details.color, CssColor::new(255, 0, 0));
     assert_eq!(closed_details.margin.left, 0.0);
-    assert_eq!(open_div.border_colors.top, CssColor::BLACK);
     assert_eq!(
-        section.background_color.color(),
+        open_div.border_colors.top.resolve(open_div.color),
+        CssColor::BLACK
+    );
+    assert_eq!(
+        section.background.background_color.color(),
         Some(CssColor::new(0, 0, 255))
     );
 }
@@ -2037,13 +2230,13 @@ async fn target_pseudo_classes_match_signature_target_state() {
     );
 
     assert_eq!(
-        container.background_color.color(),
+        container.background.background_color.color(),
         Some(CssColor::new(0, 0, 255))
     );
     assert_eq!(container.color, CssColor::BLACK);
     assert_eq!(target.color, CssColor::new(0, 255, 0));
     assert_eq!(
-        target.background_color.color(),
+        target.background.background_color.color(),
         Some(CssColor::new(0, 0, 255))
     );
 }
@@ -2092,7 +2285,7 @@ async fn namespace_selectors_match_namespaced_type_and_attribute_signatures() {
     assert_eq!(html_style.color, CssColor::new(0, 255, 0));
     assert_eq!(use_style.color, CssColor::new(0, 0, 255));
     assert_eq!(
-        wrong_namespace_style.background_color.color(),
+        wrong_namespace_style.background.background_color.color(),
         Some(CssColor::TRANSPARENT)
     );
 }
@@ -2149,7 +2342,10 @@ async fn namespace_selectors_work_in_supports_conditions() {
     );
 
     assert_eq!(style.color, CssColor::new(0, 255, 0));
-    assert_eq!(style.background_color.color(), Some(CssColor::TRANSPARENT));
+    assert_eq!(
+        style.background.background_color.color(),
+        Some(CssColor::TRANSPARENT)
+    );
 }
 
 #[tokio::test]
@@ -2358,7 +2554,7 @@ async fn form_state_pseudo_classes_use_html_disabled_and_local_constraint_state(
     );
     assert_eq!(valid_in_range.outline_color, CssColor::new(0, 255, 0));
     assert_eq!(
-        valid_in_range.background_color.color(),
+        valid_in_range.background.background_color.color(),
         Some(CssColor::new(0, 255, 0))
     );
     assert!(checked_default.text_decoration.underline);
@@ -2445,8 +2641,65 @@ async fn generated_pseudo_style_inherits_without_cloning_non_inherited_propertie
         Some("blue".to_string())
     );
     assert_eq!(before.margin.left, 0.0);
-    assert_eq!(before.background_color.color(), Some(CssColor::TRANSPARENT));
+    assert_eq!(
+        before.background.background_color.color(),
+        Some(CssColor::TRANSPARENT)
+    );
     assert_eq!(before.position, Position::Static);
+}
+
+#[tokio::test]
+async fn transform_style_and_backface_visibility_cascade_without_inheriting() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "body { transform-style: preserve-3d; backface-visibility: hidden }",
+    ));
+    let parent = style_for_element_with_signature(
+        ElementSignature::new("body", HashMap::new()),
+        None,
+        std::slice::from_ref(&stylesheet),
+        None,
+        &[],
+    );
+    let child = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        &[stylesheet],
+        Some(&parent),
+        &[ElementSignature::new("body", HashMap::new())],
+    );
+    assert_eq!(parent.transform_style, TransformStyle::Preserve3d);
+    assert_eq!(parent.backface_visibility, BackfaceVisibility::Hidden);
+    assert_eq!(child.transform_style, TransformStyle::Flat);
+    assert_eq!(child.backface_visibility, BackfaceVisibility::Visible);
+
+    let important_author = parse_stylesheet(&Css::from_string(
+        "div { transform-style: flat !important; backface-visibility: visible !important }",
+    ));
+    let normal_inline = style_for_element_with_signature(
+        ElementSignature::new("div", HashMap::new()),
+        Some("transform-style: preserve-3d; backface-visibility: hidden"),
+        std::slice::from_ref(&important_author),
+        None,
+        &[],
+    );
+    assert_eq!(normal_inline.transform_style, TransformStyle::Flat);
+    assert_eq!(
+        normal_inline.backface_visibility,
+        BackfaceVisibility::Visible
+    );
+
+    let important_inline = style_for_element_with_signature(
+        ElementSignature::new("div", HashMap::new()),
+        Some("transform-style: preserve-3d !important; backface-visibility: hidden !important"),
+        &[important_author],
+        None,
+        &[],
+    );
+    assert_eq!(important_inline.transform_style, TransformStyle::Preserve3d);
+    assert_eq!(
+        important_inline.backface_visibility,
+        BackfaceVisibility::Hidden
+    );
 }
 
 #[tokio::test]
@@ -2574,8 +2827,29 @@ async fn marker_style_inherits_without_cloning_non_inherited_properties() {
     assert_eq!(marker.color, CssColor::new(255, 0, 0));
     assert_eq!(marker.font_size, 18.0);
     assert_eq!(marker.margin.left, 0.0);
-    assert_eq!(marker.background_color.color(), Some(CssColor::TRANSPARENT));
+    assert_eq!(
+        marker.background.background_color.color(),
+        Some(CssColor::TRANSPARENT)
+    );
     assert_eq!(marker.position, Position::Static);
+}
+
+#[tokio::test]
+async fn marker_all_property_expands_before_color_and_font_size_prepasses() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        r#"li::marker { all: initial; color: green; font-size: 18pt; content: "x" }"#,
+    ));
+    let style = style_for_element_with_signature(
+        ElementSignature::new("li", HashMap::new()),
+        None,
+        &[stylesheet],
+        None,
+        &[],
+    );
+    let marker = style.marker_style.as_ref().expect("marker style");
+
+    assert_eq!(marker.color, CssColor::new(0, 128, 0));
+    assert_eq!(marker.font_size, 18.0);
 }
 
 #[test]
@@ -2634,7 +2908,7 @@ fn anonymous_block_style_inherits_only_inherited_properties() {
     assert_eq!(anonymous.padding, Edges::ZERO);
     assert_eq!(anonymous.border_widths, Edges::ZERO);
     assert_eq!(
-        anonymous.background_color.color(),
+        anonymous.background.background_color.color(),
         Some(CssColor::TRANSPARENT)
     );
     assert!(anonymous.box_values.width.is_auto());
@@ -2716,8 +2990,7 @@ async fn parses_column_break_values_without_page_forcing() {
     assert!(!style.break_before.is_forced());
     assert!(!style.break_after.avoids_page());
     assert!(style.break_after.avoids_column());
-    assert!(!style.break_inside_avoid);
-    assert!(style.break_inside_avoid_column);
+    assert_eq!(style.break_inside, BreakInsideAvoidance::AvoidColumn);
 }
 
 #[tokio::test]
@@ -2731,8 +3004,7 @@ async fn legacy_page_break_properties_reject_column_values() {
 
     assert_eq!(style.break_before, PageBreak::Auto);
     assert_eq!(style.break_after, PageBreak::Auto);
-    assert!(!style.break_inside_avoid);
-    assert!(!style.break_inside_avoid_column);
+    assert_eq!(style.break_inside, BreakInsideAvoidance::Auto);
 }
 
 #[tokio::test]
@@ -2766,7 +3038,7 @@ async fn css_url_tokens_handle_quoted_parentheses() {
     apply_declarations(&mut style, &declarations);
 
     assert!(matches!(
-        style.background_image.as_image(),
+        style.background.background_image.as_image(),
         Some(BackgroundImage::Url { src, .. }) if src == "images/report ) cover.png"
     ));
     assert_eq!(list_style_image_url(&style), Some("markers/a)b.png"));
@@ -2793,7 +3065,9 @@ async fn parses_axis_aligned_linear_gradient_background_image() {
 
     apply_declarations(&mut style, &declarations);
 
-    let Some(BackgroundImage::LinearGradient(gradient)) = style.background_image.as_image() else {
+    let Some(BackgroundImage::LinearGradient(gradient)) =
+        style.background.background_image.as_image()
+    else {
         panic!("expected linear gradient background image");
     };
     assert_eq!(gradient.direction, LinearGradientDirection::Angle(180.0));
@@ -2831,7 +3105,7 @@ async fn parses_color_image_background_image() {
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
     assert!(
-        matches!(style.background_image.as_image(), Some(BackgroundImage::CssColor(ColorImageColor::CssColor(color))) if *color == CssColor::new(0, 128, 0))
+        matches!(style.background.background_image.as_image(), Some(BackgroundImage::CssColor(ColorImageColor::CssColor(color))) if *color == CssColor::new(0, 128, 0))
     );
 }
 
@@ -2842,7 +3116,7 @@ async fn image_set_keeps_the_selected_candidate_resolution() {
     apply_declarations(&mut style, &declarations);
 
     assert!(matches!(
-        style.background_image.as_image(),
+        style.background.background_image.as_image(),
         Some(BackgroundImage::ImageSet(set))
             if set.options.len() == 1
                 && set.options[0].resolution_dppx == 0.5
@@ -2859,7 +3133,7 @@ async fn invalid_image_set_does_not_replace_the_cascaded_background_image() {
     apply_declarations(&mut style, &declarations);
 
     assert!(matches!(
-        style.background_image.as_image(),
+        style.background.background_image.as_image(),
         Some(BackgroundImage::Url { src, .. }) if src == "green.png"
     ));
 }
@@ -2871,9 +3145,9 @@ async fn calculated_invalid_image_set_candidate_computes_to_no_image() {
     );
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
-    style.background_image.select_image_set(1.0);
+    style.background.background_image.select_image_set(1.0);
 
-    assert_eq!(style.background_image, ComputedImage::Invalid);
+    assert_eq!(style.background.background_image, ComputedImage::Invalid);
 }
 
 #[tokio::test]
@@ -2883,9 +3157,9 @@ async fn zero_resolution_image_set_candidate_computes_to_no_image() {
     );
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
-    style.background_image.select_image_set(1.0);
+    style.background.background_image.select_image_set(1.0);
 
-    assert_eq!(style.background_image, ComputedImage::Invalid);
+    assert_eq!(style.background.background_image, ComputedImage::Invalid);
 }
 
 #[tokio::test]
@@ -2895,9 +3169,9 @@ async fn unknown_image_set_type_computes_to_an_invalid_image() {
     );
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
-    style.background_image.select_image_set(1.0);
+    style.background.background_image.select_image_set(1.0);
 
-    assert_eq!(style.background_image, ComputedImage::Invalid);
+    assert_eq!(style.background.background_image, ComputedImage::Invalid);
 }
 
 #[tokio::test]
@@ -2909,7 +3183,7 @@ async fn malformed_image_set_type_does_not_replace_the_cascaded_image() {
     apply_declarations(&mut style, &declarations);
 
     assert!(matches!(
-        style.background_image.as_image(),
+        style.background.background_image.as_image(),
         Some(BackgroundImage::Url { src, .. }) if src == "green.png"
     ));
 }
@@ -2922,7 +3196,7 @@ async fn supported_image_set_type_selects_its_candidate() {
     apply_declarations(&mut style, &declarations);
 
     assert!(matches!(
-        style.background_image.as_image(),
+        style.background.background_image.as_image(),
         Some(BackgroundImage::ImageSet(set))
             if set.options.len() == 1
                 && set.options[0].resolution_dppx == 1.0
@@ -2947,7 +3221,7 @@ async fn image_set_selection_uses_the_rendering_density_after_mime_filtering() {
         &[],
     );
     assert!(matches!(
-        style.background_image.as_image(),
+        style.background.background_image.as_image(),
         Some(BackgroundImage::SelectedImageSet { image, resolution })
             if *resolution == 2.0
                 && matches!(**image, BackgroundImage::Url { ref src, .. } if src == "two.png")
@@ -2962,7 +3236,7 @@ async fn image_set_calc_accepts_dimension_aware_sum_and_product() {
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
     assert!(matches!(
-        style.background_image.as_image(),
+        style.background.background_image.as_image(),
         Some(BackgroundImage::ImageSet(set))
             if set.options[0].resolution_dppx == 1.0
     ));
@@ -2977,7 +3251,7 @@ async fn image_set_uses_component_value_aliases_and_escaped_string_sources() {
     apply_declarations(&mut style, &declarations);
 
     assert!(matches!(
-        style.background_image.as_image(),
+        style.background.background_image.as_image(),
         Some(BackgroundImage::ImageSet(set))
             if matches!(*set.options[0].image, BackgroundImage::Url { ref src, .. } if src == "green.png")
                 && set.options[0].mime_type.as_deref() == Some("image/png")
@@ -2996,7 +3270,7 @@ async fn image_set_resolution_uses_shared_math_and_calculated_range_clamping() {
     apply_declarations(&mut style, &declarations);
 
     assert!(matches!(
-        style.background_image.as_image(),
+        style.background.background_image.as_image(),
         Some(BackgroundImage::ImageSet(set))
             if set.options.iter().map(|option| option.resolution_dppx).collect::<Vec<_>>() == [2.0, 0.0, 1.0]
     ));
@@ -3009,10 +3283,10 @@ async fn malformed_image_set_mime_parameters_are_filtered_not_syntax_errors() {
     );
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
-    style.background_image.select_image_set(1.0);
+    style.background.background_image.select_image_set(1.0);
 
     assert!(matches!(
-        style.background_image.as_image(),
+        style.background.background_image.as_image(),
         Some(BackgroundImage::SelectedImageSet { image, .. })
             if matches!(**image, BackgroundImage::Url { ref src, .. } if src == "good.png")
     ));
@@ -3030,7 +3304,8 @@ async fn css_color_4_gradient_stops_retain_their_computed_color_spaces() {
 
     apply_declarations(&mut style, &declarations);
 
-    let Some(BackgroundImage::LinearGradient(linear)) = style.background_layers[0].image.as_image()
+    let Some(BackgroundImage::LinearGradient(linear)) =
+        style.background.background_layers[0].image.as_image()
     else {
         panic!("expected linear gradient");
     };
@@ -3046,7 +3321,8 @@ async fn css_color_4_gradient_stops_retain_their_computed_color_spaces() {
     assert!(first.components()[0] > 1.0);
     assert_eq!(second.space(), CssColorSpace::Rec2020);
 
-    let Some(BackgroundImage::RadialGradient(radial)) = style.background_layers[1].image.as_image()
+    let Some(BackgroundImage::RadialGradient(radial)) =
+        style.background.background_layers[1].image.as_image()
     else {
         panic!("expected radial gradient");
     };
@@ -3056,7 +3332,8 @@ async fn css_color_4_gradient_stops_retain_their_computed_color_spaces() {
             .is_some_and(|color| color.space() == CssColorSpace::XyzD50)
     }));
 
-    let Some(BackgroundImage::ConicGradient(conic)) = style.background_layers[2].image.as_image()
+    let Some(BackgroundImage::ConicGradient(conic)) =
+        style.background.background_layers[2].image.as_image()
     else {
         panic!("expected conic gradient");
     };
@@ -3076,7 +3353,8 @@ async fn parses_angle_and_corner_linear_gradient_directions() {
 
     apply_declarations(&mut style, &declarations);
 
-    let Some(BackgroundImage::LinearGradient(first)) = style.background_layers[0].image.as_image()
+    let Some(BackgroundImage::LinearGradient(first)) =
+        style.background.background_layers[0].image.as_image()
     else {
         panic!("expected first linear gradient background image");
     };
@@ -3084,7 +3362,8 @@ async fn parses_angle_and_corner_linear_gradient_directions() {
     assert_eq!(first.stops[0].position, None);
     assert_eq!(first.stops[1].position, None);
 
-    let Some(BackgroundImage::LinearGradient(second)) = style.background_layers[1].image.as_image()
+    let Some(BackgroundImage::LinearGradient(second)) =
+        style.background.background_layers[1].image.as_image()
     else {
         panic!("expected second linear gradient background image");
     };
@@ -3108,13 +3387,15 @@ async fn parses_css_images_4_gradient_interpolation_preludes() {
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
 
-    let Some(BackgroundImage::LinearGradient(linear)) = style.background_layers[0].image.as_image()
+    let Some(BackgroundImage::LinearGradient(linear)) =
+        style.background.background_layers[0].image.as_image()
     else {
         panic!("expected linear gradient");
     };
     assert_eq!(linear.interpolation.space, GradientInterpolationSpace::Srgb);
 
-    let Some(BackgroundImage::RadialGradient(radial)) = style.background_layers[1].image.as_image()
+    let Some(BackgroundImage::RadialGradient(radial)) =
+        style.background.background_layers[1].image.as_image()
     else {
         panic!("expected radial gradient");
     };
@@ -3123,7 +3404,8 @@ async fn parses_css_images_4_gradient_interpolation_preludes() {
         GradientInterpolationSpace::DisplayP3
     );
 
-    let Some(BackgroundImage::ConicGradient(conic)) = style.background_layers[2].image.as_image()
+    let Some(BackgroundImage::ConicGradient(conic)) =
+        style.background.background_layers[2].image.as_image()
     else {
         panic!("expected conic gradient");
     };
@@ -3139,7 +3421,12 @@ async fn unqualified_gradients_use_css_images_3_srgb_interpolation() {
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
 
-    for image in style.background_layers.iter().map(|layer| &layer.image) {
+    for image in style
+        .background
+        .background_layers
+        .iter()
+        .map(|layer| &layer.image)
+    {
         let interpolation = match image.as_image() {
             Some(BackgroundImage::LinearGradient(gradient)) => gradient.interpolation,
             Some(BackgroundImage::RadialGradient(gradient)) => gradient.interpolation,
@@ -3161,7 +3448,7 @@ async fn rejects_invalid_gradient_interpolation_preludes() {
         let declarations = parse_declarations(&format!("background-image: {value}"));
         let mut style = default_style_for_tag("div");
         apply_declarations(&mut style, &declarations);
-        assert!(style.background_image.is_none(), "{value}");
+        assert!(style.background.background_image.is_none(), "{value}");
     }
 }
 
@@ -3173,7 +3460,9 @@ async fn gradient_stops_retain_missing_components_and_currentcolor() {
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
 
-    let Some(BackgroundImage::LinearGradient(gradient)) = style.background_image.as_image() else {
+    let Some(BackgroundImage::LinearGradient(gradient)) =
+        style.background.background_image.as_image()
+    else {
         panic!("expected linear gradient");
     };
     assert_eq!(
@@ -3202,7 +3491,9 @@ async fn background_shorthand_preserves_modern_hsl_missing_components() {
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
 
-    let Some(BackgroundImage::LinearGradient(gradient)) = style.background_image.as_image() else {
+    let Some(BackgroundImage::LinearGradient(gradient)) =
+        style.background.background_image.as_image()
+    else {
         panic!("expected linear gradient");
     };
     assert_eq!(
@@ -3235,7 +3526,9 @@ async fn rgb_missing_components_do_not_become_oklab_components() {
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
 
-    let Some(BackgroundImage::LinearGradient(gradient)) = style.background_image.as_image() else {
+    let Some(BackgroundImage::LinearGradient(gradient)) =
+        style.background.background_image.as_image()
+    else {
         panic!("expected linear gradient");
     };
     assert!(
@@ -3259,7 +3552,8 @@ async fn parses_all_polar_hue_directions() {
         ));
         let mut style = default_style_for_tag("div");
         apply_declarations(&mut style, &declarations);
-        let Some(BackgroundImage::LinearGradient(gradient)) = style.background_image.as_image()
+        let Some(BackgroundImage::LinearGradient(gradient)) =
+            style.background.background_image.as_image()
         else {
             panic!("expected linear gradient for {keyword}");
         };
@@ -3283,7 +3577,9 @@ async fn class_rule_retains_a_decreasing_hsl_gradient_method() {
         None,
         &[],
     );
-    let Some(BackgroundImage::LinearGradient(gradient)) = style.background_image.as_image() else {
+    let Some(BackgroundImage::LinearGradient(gradient)) =
+        style.background.background_image.as_image()
+    else {
         panic!("expected class background gradient");
     };
     assert_eq!(
@@ -3300,7 +3596,9 @@ async fn parses_repeating_linear_gradient_stops_and_hints() {
 
     apply_declarations(&mut style, &declarations);
 
-    let Some(BackgroundImage::LinearGradient(gradient)) = style.background_image.as_image() else {
+    let Some(BackgroundImage::LinearGradient(gradient)) =
+        style.background.background_image.as_image()
+    else {
         panic!("expected linear gradient background image");
     };
     assert_eq!(gradient.direction, LinearGradientDirection::Angle(0.0));
@@ -3340,7 +3638,9 @@ async fn parses_radial_gradient_shape_size_position_and_stops() {
 
     apply_declarations(&mut style, &declarations);
 
-    let Some(BackgroundImage::RadialGradient(gradient)) = style.background_image.as_image() else {
+    let Some(BackgroundImage::RadialGradient(gradient)) =
+        style.background.background_image.as_image()
+    else {
         panic!("expected radial gradient background image");
     };
     assert_eq!(gradient.shape, RadialGradientShape::Circle);
@@ -3391,7 +3691,9 @@ async fn parses_repeating_radial_gradient_explicit_radii() {
 
     apply_declarations(&mut style, &declarations);
 
-    let Some(BackgroundImage::RadialGradient(gradient)) = style.background_image.as_image() else {
+    let Some(BackgroundImage::RadialGradient(gradient)) =
+        style.background.background_image.as_image()
+    else {
         panic!("expected radial gradient background image");
     };
     assert_eq!(gradient.shape, RadialGradientShape::Ellipse);
@@ -3416,13 +3718,15 @@ async fn parses_linear_gradient_angle_units() {
 
     apply_declarations(&mut style, &declarations);
 
-    let Some(BackgroundImage::LinearGradient(first)) = style.background_layers[0].image.as_image()
+    let Some(BackgroundImage::LinearGradient(first)) =
+        style.background.background_layers[0].image.as_image()
     else {
         panic!("expected first gradient");
     };
     assert!((gradient_angle(first) - 90.0).abs() < 0.001);
 
-    let Some(BackgroundImage::LinearGradient(second)) = style.background_layers[1].image.as_image()
+    let Some(BackgroundImage::LinearGradient(second)) =
+        style.background.background_layers[1].image.as_image()
     else {
         panic!("expected second gradient");
     };
@@ -3444,7 +3748,9 @@ async fn parses_linear_gradient_percentage_color_stops() {
 
     apply_declarations(&mut style, &declarations);
 
-    let Some(BackgroundImage::LinearGradient(gradient)) = style.background_image.as_image() else {
+    let Some(BackgroundImage::LinearGradient(gradient)) =
+        style.background.background_image.as_image()
+    else {
         panic!("expected linear gradient background image");
     };
     assert_eq!(gradient.stops.len(), 2);
@@ -3482,7 +3788,9 @@ async fn ch_linear_gradient_color_stops_resolve_before_paint() {
 
     apply_declarations(&mut style, &declarations);
 
-    let Some(BackgroundImage::LinearGradient(gradient)) = style.background_image.as_image() else {
+    let Some(BackgroundImage::LinearGradient(gradient)) =
+        style.background.background_image.as_image()
+    else {
         panic!("expected linear gradient background image");
     };
     assert_eq!(
@@ -3492,7 +3800,9 @@ async fn ch_linear_gradient_color_stops_resolve_before_paint() {
 
     style.resolve_font_metric_lengths(layout_pt(6.0));
 
-    let Some(BackgroundImage::LinearGradient(gradient)) = style.background_image.as_image() else {
+    let Some(BackgroundImage::LinearGradient(gradient)) =
+        style.background.background_image.as_image()
+    else {
         panic!("expected linear gradient background image");
     };
     assert_eq!(
@@ -3500,7 +3810,7 @@ async fn ch_linear_gradient_color_stops_resolve_before_paint() {
         Some(ComputedLengthPercentage::from_points(12.0))
     );
     let Some(BackgroundImage::LinearGradient(layer_gradient)) =
-        style.background_layers[0].image.as_image()
+        style.background.background_layers[0].image.as_image()
     else {
         panic!("expected linear gradient background layer");
     };
@@ -3511,7 +3821,9 @@ async fn ch_linear_gradient_color_stops_resolve_before_paint() {
 
     style.resolve_viewport_lengths_for_viewport(LayoutSize::new(200.0, 100.0));
 
-    let Some(BackgroundImage::LinearGradient(gradient)) = style.background_image.as_image() else {
+    let Some(BackgroundImage::LinearGradient(gradient)) =
+        style.background.background_image.as_image()
+    else {
         panic!("expected linear gradient background image");
     };
     assert_eq!(
@@ -3531,7 +3843,9 @@ async fn gradient_stops_resolve_em_against_the_element_font_size() {
     apply_declarations(&mut style, &declarations);
     style.finalize_computed_font_relative_lengths();
 
-    let Some(BackgroundImage::LinearGradient(gradient)) = style.background_image.as_image() else {
+    let Some(BackgroundImage::LinearGradient(gradient)) =
+        style.background.background_image.as_image()
+    else {
         panic!("expected linear gradient background image");
     };
     assert_eq!(
@@ -3544,7 +3858,7 @@ async fn gradient_stops_resolve_em_against_the_element_font_size() {
     );
 
     let Some(BackgroundImage::LinearGradient(gradient)) =
-        style.background_layers[0].image.as_image()
+        style.background.background_layers[0].image.as_image()
     else {
         panic!("expected linear gradient background layer");
     };
@@ -3584,8 +3898,8 @@ async fn parses_background_origin_and_clip_boxes() {
 
     apply_declarations(&mut style, &declarations);
 
-    assert_eq!(style.background_origin, BackgroundBox::Content);
-    assert_eq!(style.background_clip, BackgroundBox::Padding);
+    assert_eq!(style.background.background_origin, BackgroundBox::Content);
+    assert_eq!(style.background.background_clip, BackgroundBox::Padding);
 }
 
 #[tokio::test]
@@ -3602,24 +3916,39 @@ async fn parses_comma_separated_background_layers() {
 
     apply_declarations(&mut style, &declarations);
 
-    assert_eq!(style.background_layers.len(), 2);
+    assert_eq!(style.background.background_layers.len(), 2);
     assert!(matches!(
-        style.background_layers[0].image.as_image(),
+        style.background.background_layers[0].image.as_image(),
         Some(BackgroundImage::Url { src, .. }) if src == "top.png"
     ));
     assert!(matches!(
-        style.background_layers[1].image.as_image(),
+        style.background.background_layers[1].image.as_image(),
         Some(BackgroundImage::Url { src, .. }) if src == "bottom.png"
     ));
     assert_eq!(
-        style.background_layers[0].repeat,
+        style.background.background_layers[0].repeat,
         BackgroundRepeat::NoRepeat
     );
-    assert_eq!(style.background_layers[1].repeat, BackgroundRepeat::RepeatY);
-    assert_eq!(style.background_layers[0].origin, BackgroundBox::Content);
-    assert_eq!(style.background_layers[0].clip, BackgroundBox::Padding);
-    assert_eq!(style.background_layers[1].origin, BackgroundBox::Border);
-    assert_eq!(style.background_layers[1].clip, BackgroundBox::Content);
+    assert_eq!(
+        style.background.background_layers[1].repeat,
+        BackgroundRepeat::RepeatY
+    );
+    assert_eq!(
+        style.background.background_layers[0].origin,
+        BackgroundBox::Content
+    );
+    assert_eq!(
+        style.background.background_layers[0].clip,
+        BackgroundBox::Padding
+    );
+    assert_eq!(
+        style.background.background_layers[1].origin,
+        BackgroundBox::Border
+    );
+    assert_eq!(
+        style.background.background_layers[1].clip,
+        BackgroundBox::Content
+    );
 }
 
 #[tokio::test]
@@ -3631,7 +3960,7 @@ async fn background_color_uses_the_bottom_most_layer_clip() {
 
     apply_declarations(&mut style, &declarations);
 
-    assert_eq!(style.background_layers.len(), 2);
+    assert_eq!(style.background.background_layers.len(), 2);
     assert_eq!(style.background_color_clip(), BackgroundBox::Content);
 }
 
@@ -3643,11 +3972,11 @@ async fn background_shorthand_sets_origin_then_clip_boxes() {
     apply_declarations(&mut style, &declarations);
 
     assert_eq!(
-        style.background_color.color(),
+        style.background.background_color.color(),
         Some(CssColor::new(255, 0, 0))
     );
-    assert_eq!(style.background_origin, BackgroundBox::Content);
-    assert_eq!(style.background_clip, BackgroundBox::Border);
+    assert_eq!(style.background.background_origin, BackgroundBox::Content);
+    assert_eq!(style.background.background_clip, BackgroundBox::Border);
 }
 
 #[tokio::test]
@@ -3657,29 +3986,41 @@ async fn parses_background_repeat_aliases_and_two_axis_values() {
         &mut style,
         &parse_declarations("background-repeat: repeat-x"),
     );
-    assert_eq!(style.background_repeat, BackgroundRepeat::RepeatX);
+    assert_eq!(
+        style.background.background_repeat,
+        BackgroundRepeat::RepeatX
+    );
 
     apply_declarations(
         &mut style,
         &parse_declarations("background-repeat: repeat-y"),
     );
-    assert_eq!(style.background_repeat, BackgroundRepeat::RepeatY);
+    assert_eq!(
+        style.background.background_repeat,
+        BackgroundRepeat::RepeatY
+    );
 
     apply_declarations(
         &mut style,
         &parse_declarations("background-repeat: no-repeat repeat"),
     );
-    assert_eq!(style.background_repeat, BackgroundRepeat::RepeatY);
+    assert_eq!(
+        style.background.background_repeat,
+        BackgroundRepeat::RepeatY
+    );
 
     apply_declarations(
         &mut style,
         &parse_declarations("background: url(bg.png) repeat no-repeat"),
     );
-    assert_eq!(style.background_repeat, BackgroundRepeat::RepeatX);
+    assert_eq!(
+        style.background.background_repeat,
+        BackgroundRepeat::RepeatX
+    );
 
     apply_declarations(&mut style, &parse_declarations("background-repeat: space"));
     assert_eq!(
-        style.background_repeat,
+        style.background.background_repeat,
         BackgroundRepeat::new(BackgroundRepeatAxis::Space, BackgroundRepeatAxis::Space)
     );
 
@@ -3688,7 +4029,7 @@ async fn parses_background_repeat_aliases_and_two_axis_values() {
         &parse_declarations("background-repeat: round no-repeat"),
     );
     assert_eq!(
-        style.background_repeat,
+        style.background.background_repeat,
         BackgroundRepeat::new(BackgroundRepeatAxis::Round, BackgroundRepeatAxis::NoRepeat)
     );
 }
@@ -3720,6 +4061,22 @@ async fn decodes_css_string_escapes_in_generated_content() {
         style.content,
         Content::List {
             parts: vec![GeneratedContentPart::Text("\u{0099}".to_string())],
+            alt: None,
+        }
+    );
+}
+
+#[tokio::test]
+async fn decodes_a_zero_css_escape_to_the_replacement_character() {
+    let declarations = parse_declarations(r#"content: "\0000""#);
+    let mut style = ComputedStyle::initial();
+
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(
+        style.content,
+        Content::List {
+            parts: vec![GeneratedContentPart::Text("\u{fffd}".to_string())],
             alt: None,
         }
     );
@@ -3761,6 +4118,25 @@ async fn parses_mixed_generated_content_parts() {
                     }),
                 },
             ],
+            alt: None,
+        }
+    );
+}
+
+#[tokio::test]
+async fn generated_content_attr_names_preserve_authored_case() {
+    let declarations = parse_declarations("content: attr(definitionURL)");
+    let mut style = ComputedStyle::initial();
+
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(
+        style.content,
+        Content::List {
+            parts: vec![GeneratedContentPart::Attr {
+                name: "definitionURL".to_string(),
+                fallback: None,
+            }],
             alt: None,
         }
     );
@@ -3993,7 +4369,7 @@ async fn auto_quotes_resolve_from_parent_language() {
     );
 
     assert_eq!(child.language.as_deref(), Some("ja"));
-    assert_eq!(child.quotes.auto_language(), Some("en"));
+    assert_eq!(child.quotes.auto_quote_pair(0), ("“", "”"));
 }
 
 #[tokio::test]
@@ -4037,9 +4413,9 @@ async fn match_parent_preserves_resolved_auto_quote_language() {
     );
 
     assert_eq!(quoted.language.as_deref(), Some("ja"));
-    assert_eq!(quoted.quotes.auto_language(), Some("en"));
-    assert_eq!(match_parent.quotes.auto_language(), Some("en"));
-    assert_eq!(auto.quotes.auto_language(), Some("ja"));
+    assert_eq!(quoted.quotes.auto_quote_pair(0), ("“", "”"));
+    assert_eq!(match_parent.quotes.auto_quote_pair(0), ("“", "”"));
+    assert_eq!(auto.quotes.auto_quote_pair(0), ("「", "」"));
 }
 
 #[tokio::test]
@@ -4370,6 +4746,23 @@ async fn font_shorthand_accepts_small_caps_and_resets_variant_subproperties() {
     assert_eq!(style.font_style, FontStyle::Italic);
     assert_eq!(style.font_weight, FontWeight::BOLD);
     assert_eq!(style.font_width, FontWidth::CONDENSED);
+}
+
+#[tokio::test]
+async fn font_shorthand_resets_modeled_reset_only_longhands_and_allows_later_overrides() {
+    let declarations = parse_declarations(
+        "font-feature-settings: \"liga\" off; font-variation-settings: \"wght\" 700; \
+         font-kerning: none; font: italic 12px Ahem; font-weight: 900",
+    );
+    let mut style = default_style_for_tag("p");
+
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(style.font_feature_settings, FontFeatureSettings::NORMAL);
+    assert_eq!(style.font_variation_settings, FontVariationSettings::NORMAL);
+    assert_eq!(style.font_kerning, FontKerning::Auto);
+    assert_eq!(style.font_style, FontStyle::Italic);
+    assert_eq!(style.font_weight, FontWeight(900));
 }
 
 #[tokio::test]
@@ -5200,7 +5593,7 @@ async fn parses_box_declarations() {
     assert_eq!(style.border_colors.top, CssColor::new(255, 0, 0));
     assert_eq!(style.border_styles.top, BorderStyle::Solid);
     assert_eq!(
-        style.background_color.color(),
+        style.background.background_color.color(),
         Some(CssColor::new(0, 0, 255))
     );
 }
@@ -5533,7 +5926,7 @@ async fn parses_background_size_and_position_as_computed_values() {
     apply_declarations(&mut style, &declarations);
 
     assert_eq!(
-        style.background_size,
+        style.background.background_size,
         BackgroundSize::Explicit {
             width: BackgroundSizeAxis::LengthPercentage(ComputedLengthPercentage::from_percent(
                 0.5
@@ -5542,20 +5935,44 @@ async fn parses_background_size_and_position_as_computed_values() {
         }
     );
     assert_eq!(
-        style.background_position.x.origin,
+        style.background.background_position.x.origin,
         BackgroundPositionOrigin::End
     );
     assert_eq!(
-        style.background_position.x.offset,
+        style.background.background_position.x.offset,
         ComputedLengthPercentage::from_points(3.0)
     );
     assert_eq!(
-        style.background_position.y.origin,
+        style.background.background_position.y.origin,
         BackgroundPositionOrigin::End
     );
     assert_eq!(
-        style.background_position.y.offset,
+        style.background.background_position.y.offset,
         ComputedLengthPercentage::from_percent(0.25)
+    );
+}
+
+#[tokio::test]
+async fn background_shorthand_applies_position_without_a_size_clause() {
+    let declarations = parse_declarations("background: url(tile.svg) bottom right");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(
+        style.background.background_position.x.origin,
+        BackgroundPositionOrigin::End
+    );
+    assert_eq!(
+        style.background.background_position.y.origin,
+        BackgroundPositionOrigin::End
+    );
+    assert_eq!(
+        style.background.background_position.x.offset,
+        ComputedLengthPercentage::ZERO
+    );
+    assert_eq!(
+        style.background.background_position.y.offset,
+        ComputedLengthPercentage::ZERO
     );
 }
 
@@ -5566,19 +5983,19 @@ async fn parses_numeric_background_position_axes() {
     apply_declarations(&mut style, &declarations);
 
     assert_eq!(
-        style.background_position.x.origin,
+        style.background.background_position.x.origin,
         BackgroundPositionOrigin::Start
     );
     assert_eq!(
-        style.background_position.x.offset,
+        style.background.background_position.x.offset,
         ComputedLengthPercentage::from_points(-27.0 * CSS_PX_TO_PT)
     );
     assert_eq!(
-        style.background_position.y.origin,
+        style.background.background_position.y.origin,
         BackgroundPositionOrigin::Start
     );
     assert_eq!(
-        style.background_position.y.offset,
+        style.background.background_position.y.offset,
         ComputedLengthPercentage::ZERO
     );
 }
@@ -5592,6 +6009,7 @@ async fn background_position_defers_min_max_percentages_until_the_free_space_is_
 
     assert_eq!(
         style
+            .background
             .background_position
             .x
             .offset
@@ -5601,6 +6019,7 @@ async fn background_position_defers_min_max_percentages_until_the_free_space_is_
     );
     assert_eq!(
         style
+            .background
             .background_position
             .y
             .offset
@@ -5621,15 +6040,16 @@ async fn background_position_axis_longhands_replace_only_their_axis() {
     apply_declarations(&mut style, &declarations);
 
     assert_eq!(
-        style.background_position.x.origin,
+        style.background.background_position.x.origin,
         BackgroundPositionOrigin::Start
     );
     assert_eq!(
-        style.background_position.y.origin,
+        style.background.background_position.y.origin,
         BackgroundPositionOrigin::Start
     );
     assert_eq!(
         style
+            .background
             .background_position
             .x
             .offset
@@ -5639,6 +6059,7 @@ async fn background_position_axis_longhands_replace_only_their_axis() {
     );
     assert_eq!(
         style
+            .background
             .background_position
             .y
             .offset
@@ -5657,7 +6078,7 @@ async fn rejects_invalid_background_size_values_without_discarding_the_cascade()
     apply_declarations(&mut style, &declarations);
 
     assert_eq!(
-        style.background_size,
+        style.background.background_size,
         BackgroundSize::Explicit {
             width: BackgroundSizeAxis::LengthPercentage(ComputedLengthPercentage::from_points(
                 50.0 * CSS_PX_TO_PT
@@ -5674,7 +6095,7 @@ async fn background_shorthand_comments_and_invalid_values_preserve_the_cascade()
         let mut style = default_style_for_tag("div");
         apply_declarations(&mut style, &declarations);
         assert_eq!(
-            style.background_color.color(),
+            style.background.background_color.color(),
             Some(CssColor::new(50, 205, 50)),
             "{value}"
         );
@@ -5684,9 +6105,49 @@ async fn background_shorthand_comments_and_invalid_values_preserve_the_cascade()
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
     assert_eq!(
-        style.background_color.color(),
+        style.background.background_color.color(),
         Some(CssColor::new(50, 205, 50))
     );
+}
+
+#[tokio::test]
+async fn background_tokenization_decodes_escaped_keywords_and_gradient_functions() {
+    let declarations = parse_declarations(
+        r"background: linear\2d gradient(red, blue) no\2d repeat left top / cover",
+    );
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(
+        style.background.background_repeat,
+        BackgroundRepeat::NoRepeat
+    );
+    assert_eq!(style.background.background_size, BackgroundSize::Cover);
+    assert!(matches!(
+        style.background.background_image.as_image(),
+        Some(BackgroundImage::LinearGradient(_))
+    ));
+}
+
+#[tokio::test]
+async fn malformed_background_layer_lists_do_not_apply_a_valid_prefix() {
+    let declarations = parse_declarations(
+        "background-repeat: no-repeat; \
+         background-repeat: repeat, invalid; \
+         background-image: linear-gradient(red, blue); \
+         background-image: linear-gradient(red, blue),",
+    );
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(
+        style.background.background_repeat,
+        BackgroundRepeat::NoRepeat
+    );
+    assert!(matches!(
+        style.background.background_image.as_image(),
+        Some(BackgroundImage::LinearGradient(_))
+    ));
 }
 
 #[tokio::test]
@@ -5697,17 +6158,17 @@ async fn background_shorthand_size_split_ignores_url_slashes() {
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
 
-    assert_eq!(style.background_layers.len(), 2);
+    assert_eq!(style.background.background_layers.len(), 2);
     assert_eq!(
-        style.background_color.color(),
+        style.background.background_color.color(),
         Some(CssColor::new(255, 0, 0))
     );
     assert_eq!(
-        style.background_layers[0].repeat,
+        style.background.background_layers[0].repeat,
         BackgroundRepeat::NoRepeat
     );
     assert_eq!(
-        style.background_layers[0].size,
+        style.background.background_layers[0].size,
         BackgroundSize::Explicit {
             width: BackgroundSizeAxis::LengthPercentage(ComputedLengthPercentage::from_points(
                 50.0 * CSS_PX_TO_PT
@@ -5717,7 +6178,10 @@ async fn background_shorthand_size_split_ignores_url_slashes() {
             )),
         }
     );
-    assert_eq!(style.background_layers[1].image, ComputedImage::None);
+    assert_eq!(
+        style.background.background_layers[1].image,
+        ComputedImage::None
+    );
 }
 
 #[tokio::test]
@@ -5729,15 +6193,15 @@ async fn background_shorthand_extracts_position_after_a_spaced_gradient_function
     apply_declarations(&mut style, &declarations);
 
     assert_eq!(
-        style.background_position.x.offset,
+        style.background.background_position.x.offset,
         ComputedLengthPercentage::from_ch(1.0)
     );
     assert_eq!(
-        style.background_position.y.offset,
+        style.background.background_position.y.offset,
         ComputedLengthPercentage::ZERO
     );
     assert_eq!(
-        style.background_size,
+        style.background.background_size,
         BackgroundSize::Explicit {
             width: BackgroundSizeAxis::LengthPercentage(ComputedLengthPercentage::from_ch(4.0)),
             height: BackgroundSizeAxis::LengthPercentage(ComputedLengthPercentage::from_ch(1.0)),
@@ -5753,7 +6217,7 @@ async fn background_shorthand_size_split_ignores_data_url_slashes() {
     apply_declarations(&mut style, &declarations);
 
     assert_eq!(
-        style.background_size,
+        style.background.background_size,
         BackgroundSize::Explicit {
             width: BackgroundSizeAxis::LengthPercentage(ComputedLengthPercentage::from_points(
                 40.0
@@ -5763,7 +6227,10 @@ async fn background_shorthand_size_split_ignores_data_url_slashes() {
             )),
         }
     );
-    assert_eq!(style.background_repeat, BackgroundRepeat::NoRepeat);
+    assert_eq!(
+        style.background.background_repeat,
+        BackgroundRepeat::NoRepeat
+    );
 }
 
 #[tokio::test]
@@ -5775,7 +6242,7 @@ async fn background_shorthand_size_split_ignores_quoted_url_parentheses() {
     apply_declarations(&mut style, &declarations);
 
     assert_eq!(
-        style.background_size,
+        style.background.background_size,
         BackgroundSize::Explicit {
             width: BackgroundSizeAxis::LengthPercentage(ComputedLengthPercentage::from_points(
                 40.0
@@ -5814,12 +6281,126 @@ async fn custom_properties_resolve_or_invalidate_declarations() {
     );
     assert_eq!(fallback.color, CssColor::new(255, 0, 0));
 
+    let mut defined_primary = default_style_for_tag("div");
+    apply_declarations(
+        &mut defined_primary,
+        &parse_declarations("--accent: green; color: var(--accent, var(--missing))"),
+    );
+    assert_eq!(defined_primary.color, CssColor::new(0, 128, 0));
+
+    let mut cyclic_primary = default_style_for_tag("div");
+    apply_declarations(
+        &mut cyclic_primary,
+        &parse_declarations(
+            "--first: var(--second); --second: var(--first); \
+             color: var(--first, var(--missing, green))",
+        ),
+    );
+    assert_eq!(cyclic_primary.color, CssColor::new(0, 128, 0));
+
+    let mut malformed_fallback = default_style_for_tag("div");
+    apply_declarations(
+        &mut malformed_fallback,
+        &parse_declarations("color: red; --accent: green; color: var(--accent, var(, blue))"),
+    );
+    assert_eq!(malformed_fallback.color, CssColor::new(255, 0, 0));
+
     let mut nested = default_style_for_tag("div");
     apply_declarations(
         &mut nested,
         &parse_declarations("--accent: #00ff00; color: var(--accent)"),
     );
     assert_eq!(nested.color, CssColor::new(0, 255, 0));
+}
+
+#[tokio::test]
+async fn custom_property_component_errors_are_invalid_at_parse_time() {
+    let mut unmatched_closer = default_style_for_tag("div");
+    apply_declarations(
+        &mut unmatched_closer,
+        &parse_declarations("--tone: green; --tone: red); color: var(--tone)"),
+    );
+    assert_eq!(unmatched_closer.color, CssColor::new(0, 128, 0));
+
+    for invalid_fallback in ["var(--tone, \"\n", "var(--tone, url(\"\n"] {
+        let mut style = default_style_for_tag("div");
+        apply_declarations(
+            &mut style,
+            &parse_declarations(&format!(
+                "color: green; --tone: red; color: {invalid_fallback}"
+            )),
+        );
+        // The malformed declaration is ignored before the cascade, so the
+        // preceding specified value—not the variable's primary value—wins.
+        assert_eq!(style.color, CssColor::new(0, 128, 0), "{invalid_fallback}");
+    }
+
+    // Stylesheet recovery may close an EOF-terminated simple block, but it
+    // must retain a newline-terminated BadString token within that block.
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "p { color: green; --tone: red; color: var(--tone, \"\n",
+    ));
+    let style = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        &[stylesheet],
+        None,
+        &[],
+    );
+    assert_eq!(style.color, CssColor::new(0, 128, 0));
+
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "body { color: orange } p { color: green; --tone: red; color: var(--tone, \"\n",
+    ));
+    let body = style_for_element_with_signature(
+        ElementSignature::new("body", HashMap::new()),
+        None,
+        std::slice::from_ref(&stylesheet),
+        None,
+        &[],
+    );
+    let paragraph = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        &[stylesheet],
+        Some(&body),
+        &[ElementSignature::new("body", HashMap::new())],
+    );
+    assert_eq!(paragraph.color, CssColor::new(0, 128, 0));
+}
+
+#[tokio::test]
+async fn valid_component_blocks_with_variables_invalidate_at_computed_value_time() {
+    let mut style = default_style_for_tag("div");
+    style.color = CssColor::new(0, 128, 0);
+    apply_declarations(
+        &mut style,
+        &parse_declarations("color: red; color: { [ var(--missing) ] }"),
+    );
+
+    // The declaration is valid at specified-value time because it contains a
+    // syntactically valid var(), but its unresolved reference invalidates its
+    // consuming property at computed-value time.
+    assert_eq!(style.color, CssColor::new(0, 128, 0));
+
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "body { color: green } p { color: red; color: { [ var(--missing) ] } }",
+    ));
+    let body = style_for_element_with_signature(
+        ElementSignature::new("body", HashMap::new()),
+        None,
+        std::slice::from_ref(&stylesheet),
+        None,
+        &[],
+    );
+    let paragraph = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        &[stylesheet],
+        Some(&body),
+        &[ElementSignature::new("body", HashMap::new())],
+    );
+    assert_eq!(paragraph.color, CssColor::new(0, 128, 0));
 }
 
 #[test]
@@ -5927,7 +6508,10 @@ async fn registered_color_property_resolves_light_dark_in_its_own_scheme() {
 
     assert_eq!(style.used_color_scheme, UsedColorScheme::Dark);
     assert_eq!(
-        style.background_color.resolved_color(style.color),
+        style
+            .background
+            .background_color
+            .resolved_color(style.color),
         CssColor::new(0, 128, 0)
     );
     assert_eq!(
@@ -5967,7 +6551,10 @@ async fn registered_color_property_preserves_its_defining_scheme_when_inherited(
     assert_eq!(parent.used_color_scheme, UsedColorScheme::Dark);
     assert_eq!(child.used_color_scheme, UsedColorScheme::Light);
     assert_eq!(
-        child.background_color.resolved_color(child.color),
+        child
+            .background
+            .background_color
+            .resolved_color(child.color),
         CssColor::new(0, 128, 0)
     );
 }
@@ -5990,7 +6577,10 @@ async fn registered_color_property_resets_invalid_and_noninherited_values_to_ini
         &[],
     );
     assert_eq!(
-        style.background_color.resolved_color(style.color),
+        style
+            .background
+            .background_color
+            .resolved_color(style.color),
         CssColor::new(0, 0, 255)
     );
 }
@@ -6026,7 +6616,10 @@ async fn registered_color_property_uses_initial_for_unset_and_noninheritance() {
         &[ElementSignature::new("div", HashMap::new())],
     );
     assert_eq!(
-        child.background_color.resolved_color(child.color),
+        child
+            .background
+            .background_color
+            .resolved_color(child.color),
         CssColor::new(0, 128, 0)
     );
     assert_eq!(
@@ -6034,6 +6627,99 @@ async fn registered_color_property_uses_initial_for_unset_and_noninheritance() {
         Some(&ComputedCustomPropertyValue::Color(CssColor::new(
             0, 0, 255
         )))
+    );
+}
+
+#[test]
+fn property_rules_use_css_tokens_for_names_and_descriptors() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        r#"
+            @pr\6f perty --t\6f ne/**/,/**/--other {
+                s\79 ntax: "<color>";
+                inh\65 rits: /**/ false;
+                initial-value: rgb(0 128 0);
+            }
+            @property --recovered {
+                syntax: "<color>" trailing;
+                syntax: "<color>";
+                inherits: invalid;
+                inherits: false;
+                unknown-descriptor: "};,@property";
+                @unknown { color: red }
+                initial-value: blue;
+            }
+        "#,
+    ));
+
+    assert_eq!(stylesheet.property_registrations.len(), 2);
+    assert_eq!(
+        stylesheet.property_registrations[0].names,
+        vec!["--tone", "--other"]
+    );
+    assert!(!stylesheet.property_registrations[0].registration.inherits);
+    assert_eq!(
+        stylesheet.property_registrations[0]
+            .registration
+            .initial_color,
+        CssColor::new(0, 128, 0)
+    );
+    assert_eq!(
+        stylesheet.property_registrations[1].names,
+        vec!["--recovered"]
+    );
+    assert!(!stylesheet.property_registrations[1].registration.inherits);
+    assert_eq!(
+        stylesheet.property_registrations[1]
+            .registration
+            .initial_color,
+        CssColor::new(0, 0, 255)
+    );
+}
+
+#[test]
+fn invalid_property_preludes_and_descriptors_do_not_accept_prefixes() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        r#"
+            @property --valid { syntax: "<color>"; inherits: true; initial-value: red }
+            @property --invalid, "not-a-name" {
+                syntax: "<color>"; inherits: false; initial-value: blue
+            }
+            @property --bad-syntax {
+                syntax: "<color>" trailing; inherits: false; initial-value: blue
+            }
+            @property --bad-string {
+                syntax: "<color>
+                inherits: false; initial-value: blue
+            }
+            @property --later { syntax: "<color>"; inherits: false; initial-value: green }
+        "#,
+    ));
+
+    assert_eq!(
+        stylesheet
+            .property_registrations
+            .iter()
+            .flat_map(|rule| rule.names.iter())
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["--valid", "--later"]
+    );
+}
+
+#[test]
+fn eof_closed_property_rule_keeps_its_complete_descriptors() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "@property --eof { syntax: \"<color>\"; inherits: true; initial-value: green",
+    ));
+
+    assert_eq!(stylesheet.property_registrations.len(), 1);
+    assert_eq!(stylesheet.property_registrations[0].names, vec!["--eof"]);
+    assert!(stylesheet.property_registrations[0].registration.inherits);
+    assert_eq!(
+        stylesheet.property_registrations[0]
+            .registration
+            .initial_color,
+        CssColor::new(0, 128, 0)
     );
 }
 
@@ -6067,6 +6753,18 @@ async fn custom_property_resolution_uses_css_token_boundaries_and_eof_recovery()
         &parse_declarations("--accent: green; color: var(--accent /* unclosed comment"),
     );
     assert_eq!(eof_closed.color, CssColor::new(0, 128, 0));
+
+    let eof_nested_fallback = parse_stylesheet(&Css::from_string(
+        "p { color: red; --accent: green; color: var(--accent, var(--missing)",
+    ));
+    let eof_nested_fallback = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        &[eof_nested_fallback],
+        None,
+        &[],
+    );
+    assert_eq!(eof_nested_fallback.color, CssColor::new(0, 128, 0));
 
     let mut quoted_text = default_style_for_tag("div");
     apply_declarations(
@@ -6105,6 +6803,84 @@ async fn variable_substitution_expands_shorthands_at_computed_value_time() {
 }
 
 #[tokio::test]
+async fn custom_properties_preserve_font_family_token_boundaries() {
+    let cases = [
+        (
+            "--a: Ahem, sans-serif; font-family: var(--a)",
+            FontFamily::List(vec![
+                FontFamily::Names(vec!["Ahem".to_string()]),
+                FontFamily::SansSerif,
+            ]),
+        ),
+        (
+            "--a: var(--b), sans-serif; --b: Ahem; font-family: var(--a)",
+            FontFamily::List(vec![
+                FontFamily::Names(vec!["Ahem".to_string()]),
+                FontFamily::SansSerif,
+            ]),
+        ),
+        (
+            "--a: SomeUnknownFont, var(--b); --b: Ahem; font-family: var(--a)",
+            FontFamily::List(vec![
+                FontFamily::Names(vec!["SomeUnknownFont".to_string()]),
+                FontFamily::Names(vec!["Ahem".to_string()]),
+            ]),
+        ),
+        (
+            "--a: Ahem var(--b) sans-serif; --b: ,; font-family: var(--a)",
+            FontFamily::List(vec![
+                FontFamily::Names(vec!["Ahem".to_string()]),
+                FontFamily::SansSerif,
+            ]),
+        ),
+    ];
+
+    for (declarations, expected) in cases {
+        let mut style = default_style_for_tag("p");
+        apply_declarations(&mut style, &parse_declarations(declarations));
+        assert_eq!(style.font_family, expected, "{declarations}");
+    }
+}
+
+#[tokio::test]
+async fn custom_properties_preserve_generated_content_string_tokens() {
+    let mut style = default_style_for_tag("p");
+    apply_declarations(
+        &mut style,
+        &parse_declarations(r#"--a: "hello"; --b: "there"; content: var(--a) " " var(--b)"#),
+    );
+
+    assert_eq!(
+        style.content,
+        Content::List {
+            parts: vec![
+                GeneratedContentPart::Text("hello".to_string()),
+                GeneratedContentPart::Text(" ".to_string()),
+                GeneratedContentPart::Text("there".to_string()),
+            ],
+            alt: None,
+        }
+    );
+}
+
+#[tokio::test]
+async fn custom_properties_preserve_scalar_token_boundaries() {
+    let mut style = default_style_for_tag("div");
+    apply_declarations(
+        &mut style,
+        &parse_declarations(
+            "--length: 10px; --opacity: .5; width: var(--length); opacity: var(--opacity)",
+        ),
+    );
+
+    let ComputedLengthPercentageOrAuto::LengthPercentage(width) = style.box_values.width else {
+        panic!("width should resolve to a length");
+    };
+    assert!((width.length_points() - 10.0 * CSS_PX_TO_PT).abs() < 0.001);
+    assert_eq!(style.opacity, 0.5);
+}
+
+#[tokio::test]
 async fn invalid_variable_shorthand_resets_every_affected_longhand() {
     let mut style = default_style_for_tag("div");
     apply_declarations(
@@ -6115,9 +6891,12 @@ async fn invalid_variable_shorthand_resets_every_affected_longhand() {
         ),
     );
     assert_eq!(style.outline_style, BorderStyle::None);
-    assert_eq!(style.outline_color, CssColor::BLACK);
+    assert_eq!(style.outline_color.resolve(style.color), CssColor::BLACK);
     assert_eq!(style.border_styles.left, BorderStyle::None);
-    assert_eq!(style.border_colors.left, CssColor::BLACK);
+    assert_eq!(
+        style.border_colors.left.resolve(style.color),
+        CssColor::BLACK
+    );
 }
 
 #[tokio::test]
@@ -6422,7 +7201,10 @@ async fn supports_rule_recognizes_initial_letter_properties() {
     assert_eq!(style.color, CssColor::new(0, 0, 255));
     assert_eq!(style.border_colors.top, CssColor::new(0, 128, 0));
     assert_eq!(style.border_colors.bottom, CssColor::new(0, 0, 255));
-    assert_eq!(style.background_color.color(), Some(CssColor::TRANSPARENT));
+    assert_eq!(
+        style.background.background_color.color(),
+        Some(CssColor::TRANSPARENT)
+    );
 }
 
 #[tokio::test]
@@ -7828,6 +8610,49 @@ async fn parses_grid_auto_repeat_track_lists() {
         panic!("expected auto-fill repeat");
     };
     assert_eq!(repeat.count, GridRepeatCount::AutoFill);
+}
+
+#[tokio::test]
+async fn parses_intrinsic_grid_lanes_auto_repeat_track_lists() {
+    let declarations = parse_declarations(
+        "grid-template-columns: repeat(auto-fit, max-content);\
+         grid-template-rows: repeat(auto-fill, min-content);",
+    );
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    let GridTrackList::Tracks {
+        components: columns,
+        ..
+    } = &style.grid_template_columns
+    else {
+        panic!("intrinsic auto-fit columns should parse");
+    };
+    let GridTrackListComponent::Repeat(_, columns_repeat) = &columns[0] else {
+        panic!("expected intrinsic auto-fit repeat");
+    };
+    assert_eq!(columns_repeat.count, GridRepeatCount::AutoFit);
+    assert!(matches!(
+        columns_repeat.tracks[0],
+        GridTrackListComponent::Track(
+            _,
+            GridTrackSize {
+                min: GridMinTrackBreadth::MaxContent,
+                max: GridMaxTrackBreadth::MaxContent,
+            }
+        )
+    ));
+
+    let GridTrackList::Tracks {
+        components: rows, ..
+    } = &style.grid_template_rows
+    else {
+        panic!("intrinsic auto-fill rows should parse");
+    };
+    let GridTrackListComponent::Repeat(_, rows_repeat) = &rows[0] else {
+        panic!("expected intrinsic auto-fill repeat");
+    };
+    assert_eq!(rows_repeat.count, GridRepeatCount::AutoFill);
 }
 
 #[tokio::test]
@@ -9314,6 +10139,48 @@ async fn parses_flex_baseline_alignment_keywords() {
 }
 
 #[tokio::test]
+async fn parses_anchor_center_only_for_self_alignment() {
+    let declarations = parse_declarations("place-self: anchor-center");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(style.align_self.keyword, SelfAlignmentKeyword::Center);
+    assert_eq!(style.align_self.safety, AlignmentSafety::Default);
+    assert_eq!(
+        style.justify_self,
+        JustifySelf::new(SelfAlignmentKeyword::Center)
+    );
+
+    let declarations =
+        parse_declarations("align-self: safe anchor-center; justify-self: anchor-center");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(style.align_self.keyword, SelfAlignmentKeyword::Center);
+    assert_eq!(style.align_self.safety, AlignmentSafety::Safe);
+    assert_eq!(
+        style.justify_self,
+        JustifySelf::new(SelfAlignmentKeyword::Center)
+    );
+
+    let declarations = parse_declarations(
+        "align-self: end; justify-self: start; align-items: end; justify-items: start; \
+         align-items: anchor-center; justify-items: anchor-center; place-items: anchor-center",
+    );
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(
+        style.align_items,
+        AlignItems::new(SelfAlignmentKeyword::End)
+    );
+    assert_eq!(
+        style.justify_items,
+        JustifyItems::new(SelfAlignmentKeyword::Start)
+    );
+}
+
+#[tokio::test]
 async fn parses_box_alignment_place_shorthands() {
     let declarations = parse_declarations(
         "place-content: space-between center; place-items: last baseline right; place-self: safe center left",
@@ -9427,6 +10294,13 @@ async fn parses_balanced_flex_wrap_with_cross_axis_direction() {
     apply_declarations(&mut style, &declarations);
     assert_eq!(style.flex_direction, FlexDirection::Column);
     assert_eq!(style.flex_wrap, FlexWrap::Balance);
+
+    let declarations = parse_declarations("flex-line-count: 4");
+    apply_declarations(&mut style, &declarations);
+    assert_eq!(
+        style.flex_line_count,
+        FlexLineCount::Count(NonZeroUsize::new(4).expect("positive line count"))
+    );
 }
 
 #[tokio::test]
@@ -10079,37 +10953,6 @@ async fn invalid_body_margin_source_uses_ua_default_without_frame_fallback() {
 }
 
 #[tokio::test]
-async fn disabled_presentational_hints_ignore_body_and_container_margin_attributes() {
-    let ua = html5_user_agent_stylesheet();
-    let stylesheets = Stylesheets::for_document(ua, None, &[])
-        .with_html_container_frame_body_margins(Some(HtmlContainerFrameBodyMargins {
-            horizontal: Some(100),
-            vertical: Some(60),
-        }));
-    let mut attrs = HashMap::new();
-    attrs.insert("marginwidth".to_string(), "80".to_string());
-    attrs.insert("marginheight".to_string(), "40".to_string());
-
-    let style = style_for_element_with_signature(
-        ElementSignature::new("body", attrs),
-        None,
-        &stylesheets,
-        None,
-        &[],
-    );
-
-    assert_eq!(
-        style.margin,
-        Edges {
-            top: 6.0,
-            right: 6.0,
-            bottom: 6.0,
-            left: 6.0,
-        }
-    );
-}
-
-#[tokio::test]
 async fn author_and_inline_css_override_body_margin_presentational_hints() {
     let ua = html5_user_agent_stylesheet();
     let hints = html5_presentational_hints_stylesheet();
@@ -10169,28 +11012,6 @@ async fn table_rules_groups_presentational_hint_sets_group_border_color() {
     assert_eq!(hinted.border_styles.bottom, BorderStyle::Solid);
     assert_eq!(hinted.border_widths.bottom, 0.75);
     assert_eq!(overridden.border_colors.bottom, CssColor::new(0, 0, 255));
-}
-
-#[tokio::test]
-async fn hr_dynamic_presentational_hints_are_optional() {
-    let ua = html5_user_agent_stylesheet();
-    let mut attrs = HashMap::new();
-    attrs.insert("width".to_string(), "100".to_string());
-    attrs.insert("size".to_string(), "8".to_string());
-    attrs.insert("color".to_string(), "red".to_string());
-
-    let style = style_for_element_with_signature(
-        ElementSignature::new("hr", attrs),
-        None,
-        &Stylesheets::borrowed(&[ua]),
-        None,
-        &[],
-    );
-
-    assert!(style.box_values.width.is_auto());
-    assert!(style.box_values.height.is_auto());
-    assert_eq!(style.color, CssColor::new(128, 128, 128));
-    assert_eq!(style.border_widths.top, CSS_PX_TO_PT);
 }
 
 #[tokio::test]
@@ -10454,8 +11275,18 @@ async fn table_default_border_color_tracks_the_cascaded_current_color() {
         &[],
     );
 
-    assert_eq!(style.border_colors.top, CssColor::new(0, 128, 128));
-    assert_eq!(style.border_colors.right, CssColor::new(0, 128, 128));
+    assert_eq!(
+        style.border_colors.top,
+        CssColorOrCurrentColor::CurrentColor
+    );
+    assert_eq!(
+        style.border_colors.right,
+        CssColorOrCurrentColor::CurrentColor
+    );
+    assert_eq!(
+        style.border_colors.resolve(style.color).top,
+        CssColor::new(0, 128, 128)
+    );
 }
 
 #[tokio::test]
@@ -10515,12 +11346,11 @@ fn text_wrap_longhands_override_the_legacy_white_space_wrap_component() {
     let declarations = parse_declarations("line-clamp: 2");
     apply_declarations(&mut style, &declarations);
     assert_eq!(
-        style.line_clamp,
-        Some(ComputedLineClamp::new(
-            std::num::NonZeroUsize::new(2).unwrap(),
-            ComputedClampContinuation::Collapse,
-        ))
+        style.max_lines,
+        MaxLines::Lines(std::num::NonZeroUsize::new(2).unwrap())
     );
+    assert_eq!(style.block_ellipsis, BlockEllipsis::Auto);
+    assert_eq!(style.continue_, Continue::Collapse);
 }
 
 #[test]
@@ -10536,12 +11366,11 @@ fn legacy_webkit_line_clamp_resolves_after_display_and_orientation_cascade() {
     assert_eq!(active.webkit_box_orient, WebkitBoxOrient::Vertical);
     assert_eq!(active.display, Display::INLINE_BLOCK);
     assert_eq!(
-        active.line_clamp,
-        Some(ComputedLineClamp::new(
-            std::num::NonZeroUsize::new(3).unwrap(),
-            ComputedClampContinuation::WebkitLegacy,
-        ))
+        active.max_lines,
+        MaxLines::Lines(std::num::NonZeroUsize::new(3).unwrap())
     );
+    assert_eq!(active.block_ellipsis, BlockEllipsis::Auto);
+    assert_eq!(active.continue_, Continue::WebkitLegacy);
 
     let mut missing_orientation = default_style_for_tag("div");
     apply_declarations(
@@ -10549,14 +11378,32 @@ fn legacy_webkit_line_clamp_resolves_after_display_and_orientation_cascade() {
         &parse_declarations("-webkit-line-clamp: 3; display: -webkit-box"),
     );
     assert_eq!(missing_orientation.display, Display::FLEX);
-    assert!(missing_orientation.line_clamp.is_none());
+    assert_eq!(
+        missing_orientation.max_lines,
+        MaxLines::Lines(std::num::NonZeroUsize::new(3).unwrap())
+    );
+    // Inactive legacy compatibility is a used-value decision.  The
+    // independently cascaded longhand remains observable as authored.
+    assert_eq!(missing_orientation.continue_, Continue::WebkitLegacy);
+    assert!(matches!(
+        missing_orientation.used_continuation(),
+        UsedContinuation::Ordinary
+    ));
 
     let mut missing_legacy_display = default_style_for_tag("div");
     apply_declarations(
         &mut missing_legacy_display,
         &parse_declarations("-webkit-box-orient: vertical; -webkit-line-clamp: 3"),
     );
-    assert!(missing_legacy_display.line_clamp.is_none());
+    assert_eq!(
+        missing_legacy_display.max_lines,
+        MaxLines::Lines(std::num::NonZeroUsize::new(3).unwrap())
+    );
+    assert_eq!(missing_legacy_display.continue_, Continue::WebkitLegacy);
+    assert!(matches!(
+        missing_legacy_display.used_continuation(),
+        UsedContinuation::Ordinary
+    ));
 
     let mut reset_to_none = default_style_for_tag("div");
     apply_declarations(
@@ -10567,21 +11414,171 @@ fn legacy_webkit_line_clamp_resolves_after_display_and_orientation_cascade() {
         ),
     );
     assert_eq!(reset_to_none.display, Display::FLEX);
-    assert_eq!(reset_to_none.line_clamp, None);
+    assert_eq!(reset_to_none.max_lines, MaxLines::None);
+    assert_eq!(reset_to_none.block_ellipsis, BlockEllipsis::Auto);
+    assert_eq!(reset_to_none.continue_, Continue::Auto);
 
     let mut unprefixed = default_style_for_tag("div");
     apply_declarations(
         &mut unprefixed,
         &parse_declarations("display: -webkit-box; -webkit-box-orient: vertical; line-clamp: 2"),
     );
-    assert_eq!(unprefixed.display, Display::FLEX);
     assert_eq!(
-        unprefixed.line_clamp,
-        Some(ComputedLineClamp::new(
-            std::num::NonZeroUsize::new(2).unwrap(),
-            ComputedClampContinuation::Collapse,
-        ))
+        unprefixed.display,
+        Display::new(DisplayOuter::Block, DisplayInner::FlowRoot)
     );
+    assert_eq!(
+        unprefixed.max_lines,
+        MaxLines::Lines(std::num::NonZeroUsize::new(2).unwrap())
+    );
+    assert_eq!(unprefixed.continue_, Continue::Collapse);
+}
+
+#[test]
+fn line_clamp_longhands_cascade_independently_and_preserve_marker_inheritance() {
+    let mut parent = default_style_for_tag("div");
+    apply_declarations(
+        &mut parent,
+        &parse_declarations("line-clamp: 3 \"continued\\A page\"; max-lines: 2; continue: discard"),
+    );
+    assert_eq!(
+        parent.max_lines,
+        MaxLines::Lines(std::num::NonZeroUsize::new(2).unwrap())
+    );
+    assert_eq!(parent.continue_, Continue::Discard);
+    assert_eq!(
+        parent.block_ellipsis,
+        BlockEllipsis::String(std::sync::Arc::from("continued page"))
+    );
+
+    let child = style_for_element_with_signature(
+        ElementSignature::new("span", HashMap::new()),
+        None,
+        &[],
+        Some(&parent),
+        &[],
+    );
+    assert_eq!(child.block_ellipsis, parent.block_ellipsis);
+    assert_eq!(child.max_lines, MaxLines::None);
+    assert_eq!(child.continue_, Continue::Auto);
+
+    let mut reset = default_style_for_tag("div");
+    apply_declarations(
+        &mut reset,
+        &parse_declarations("line-clamp: 2 \"more\"; line-clamp: none"),
+    );
+    assert_eq!(reset.max_lines, MaxLines::None);
+    assert_eq!(reset.block_ellipsis, BlockEllipsis::NoEllipsis);
+    assert_eq!(reset.continue_, Continue::Auto);
+}
+
+#[test]
+fn positive_line_budget_cannot_represent_zero_available_slots() {
+    let available = PositiveLineCount::from_rendered_slots(2).unwrap();
+    assert!(PositiveLineCount::from_rendered_slots(0).is_none());
+    assert_eq!(
+        RemainingLineSlots::Available(available)
+            .debit(PositiveLineCount::from_rendered_slots(2).unwrap()),
+        RemainingLineSlots::Exhausted
+    );
+}
+
+#[test]
+fn discard_region_traversal_captures_only_its_first_typed_break() {
+    assert!(DiscardRegionTraversal::default().first_break().is_none());
+
+    let mut forced = DiscardRegionTraversal::default();
+    forced.capture_forced_after_lines(ClampPoint::AtContainerStart);
+    forced.capture_overflow(RegionOverflowPoint::after_direct_children(
+        std::num::NonZeroUsize::new(2).unwrap(),
+    ));
+    assert!(matches!(
+        forced.first_break(),
+        Some(CapturedRegionBreak::ForcedAfterLines(
+            ClampPoint::AtContainerStart
+        ))
+    ));
+
+    let mut overflow = DiscardRegionTraversal::default();
+    overflow.capture_overflow(RegionOverflowPoint::after_direct_children(
+        std::num::NonZeroUsize::new(3).unwrap(),
+    ));
+    overflow.capture_forced_after_lines(ClampPoint::AtContainerStart);
+    assert!(matches!(
+        overflow.first_break(),
+        Some(CapturedRegionBreak::Overflow(point)) if point.retained_direct_children().get() == 3
+    ));
+}
+
+#[test]
+fn only_renderable_block_ellipsis_values_can_create_a_marker() {
+    assert!(BlockEllipsis::NoEllipsis.renderable().is_none());
+    assert!(
+        BlockEllipsis::String(std::sync::Arc::from(""))
+            .renderable()
+            .is_none()
+    );
+    assert_eq!(BlockEllipsis::Auto.renderable().unwrap().text(), "…");
+    assert_eq!(
+        BlockEllipsis::String(std::sync::Arc::from("more"))
+            .renderable()
+            .unwrap()
+            .text(),
+        "more"
+    );
+
+    let eligible_line = EligibleMarkerLine::terminal_inline_line(4);
+    assert!(
+        BlockEllipsisPlacement::at_terminal_inline_line(eligible_line, &BlockEllipsis::NoEllipsis,)
+            .is_none()
+    );
+    assert!(
+        BlockEllipsisPlacement::at_terminal_inline_line(
+            eligible_line,
+            &BlockEllipsis::String(std::sync::Arc::from("")),
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn automatic_line_clamp_keeps_a_graph_source_endpoint_across_reflow() {
+    let marker = BlockEllipsis::Auto;
+    let endpoint = InlineSourceEndpoint::at_graph_boundary(7, 13);
+    let clamp = InlineLineClamp::Automatic(AutomaticLineClamp::after_measured_source_line(
+        2, endpoint, &marker,
+    ));
+
+    // A balanced reflow may redistribute the source into different visual
+    // lines, so the graph boundary—not this ordinal—is the stable cutoff.
+    assert_eq!(clamp.inline_source_end(), Some(endpoint));
+    assert!(clamp.is_terminal_line(2));
+    assert!(clamp.excludes_line(3));
+}
+
+#[test]
+fn font_relative_max_height_is_a_finite_automatic_clamp_constraint() {
+    let mut style = default_style_for_tag("div");
+    apply_declarations(
+        &mut style,
+        &parse_declarations("font: 16px / 32px serif; max-height: 4lh; line-clamp: auto"),
+    );
+    assert!(matches!(
+        style.box_values.max_height,
+        ComputedLengthPercentageOrAuto::LengthPercentage(_)
+    ));
+    style.resolve_line_height_relative_lengths();
+    assert_eq!(
+        style.box_values.max_height.length_if_no_percent(),
+        Some(96.0)
+    );
+    assert!(matches!(
+        style.used_continuation(),
+        UsedContinuation::LineClamp(LineClampContainer {
+            cutoff: ClampPointRule::AutomaticBlockSize,
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -10705,6 +11702,45 @@ async fn supported_replaced_elements_default_to_content_box_clipping() {
 }
 
 #[tokio::test]
+async fn embedded_svg_uses_the_svg_viewport_overflow_default() {
+    let ua = html5_user_agent_stylesheet();
+    let html = ElementSignature::new("html", HashMap::new());
+
+    let embedded = style_for_element_with_signature(
+        ElementSignature::new("svg", HashMap::new()),
+        None,
+        &Stylesheets::borrowed(&[ua]),
+        None,
+        std::slice::from_ref(&html),
+    );
+    assert_eq!(embedded.overflow_x, Overflow::Hidden);
+    assert_eq!(embedded.overflow_y, Overflow::Hidden);
+
+    let author = parse_stylesheet(&Css::from_string("svg { overflow: visible }"));
+    let visible = style_for_element_with_signature(
+        ElementSignature::new("svg", HashMap::new()),
+        None,
+        &Stylesheets::borrowed(&[ua, &author]),
+        None,
+        std::slice::from_ref(&html),
+    );
+    assert_eq!(visible.overflow_x, Overflow::Visible);
+    assert_eq!(visible.overflow_y, Overflow::Visible);
+
+    // The element of a standalone SVG/XML document is the document root, so
+    // SVG 2 leaves its initial `overflow: visible` value intact.
+    let standalone = style_for_element_with_signature(
+        ElementSignature::new("svg", HashMap::new()),
+        None,
+        &Stylesheets::borrowed(&[ua]),
+        None,
+        &[],
+    );
+    assert_eq!(standalone.overflow_x, Overflow::Visible);
+    assert_eq!(standalone.overflow_y, Overflow::Visible);
+}
+
+#[tokio::test]
 async fn parses_auto_margins() {
     let declarations = parse_declarations("margin: 1pt auto 2pt 3pt; margin-left: auto");
     let mut style = default_style_for_tag("div");
@@ -10807,7 +11843,10 @@ async fn parses_border_styles_and_side_colors() {
     assert_eq!(style.border_colors.top, CssColor::new(255, 0, 0));
     assert_eq!(style.border_colors.right, CssColor::new(0, 128, 0));
     assert_eq!(style.border_colors.bottom, CssColor::new(0, 0, 255));
-    assert_eq!(style.border_colors.left, CssColor::BLACK);
+    assert_eq!(
+        style.border_colors.left.resolve(style.color),
+        CssColor::BLACK
+    );
 }
 
 #[tokio::test]
@@ -10829,10 +11868,23 @@ async fn parses_border_current_color_against_computed_color() {
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
 
-    assert_eq!(style.border_colors.top, CssColor::new(0, 128, 0));
-    assert_eq!(style.border_colors.right, CssColor::new(0, 128, 0));
-    assert_eq!(style.border_colors.bottom, CssColor::new(0, 128, 0));
+    assert_eq!(
+        style.border_colors.top,
+        CssColorOrCurrentColor::CurrentColor
+    );
+    assert_eq!(
+        style.border_colors.right,
+        CssColorOrCurrentColor::CurrentColor
+    );
+    assert_eq!(
+        style.border_colors.bottom,
+        CssColorOrCurrentColor::CurrentColor
+    );
     assert_eq!(style.border_colors.left, CssColor::new(0, 0, 255));
+    let resolved = style.border_colors.resolve(style.color);
+    assert_eq!(resolved.top, CssColor::new(0, 128, 0));
+    assert_eq!(resolved.right, CssColor::new(0, 128, 0));
+    assert_eq!(resolved.bottom, CssColor::new(0, 128, 0));
 }
 
 #[tokio::test]
@@ -10873,7 +11925,10 @@ async fn parses_border_color_shorthand_with_rgb_functions() {
     assert_eq!(style.border_colors.top, CssColor::new(255, 0, 0));
     assert_eq!(style.border_colors.right, CssColor::new(0, 128, 0));
     assert_eq!(style.border_colors.bottom, CssColor::new(0, 0, 255));
-    assert_eq!(style.border_colors.left, CssColor::BLACK);
+    assert_eq!(
+        style.border_colors.left.resolve(style.color),
+        CssColor::BLACK
+    );
 }
 
 #[tokio::test]
@@ -11349,7 +12404,10 @@ async fn rejects_invalid_border_color_and_style_component_lists() {
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
 
-    assert_eq!(style.border_colors.top, CssColor::BLACK);
+    assert_eq!(
+        style.border_colors.top.resolve(style.color),
+        CssColor::BLACK
+    );
     assert_eq!(style.border_styles.top, BorderStyle::None);
 }
 
@@ -12448,6 +13506,7 @@ async fn parses_cssparser_colors() {
     apply_declarations(&mut style, &declarations);
     assert_eq!(style.color, CssColor::new(102, 51, 153));
     let background = style
+        .background
         .background_color
         .color()
         .expect("explicit background color");
@@ -12466,7 +13525,7 @@ async fn parses_alpha_and_transparent_colors() {
 
     assert_eq!(style.color, CssColor::rgba(255, 0, 0, 0.5));
     assert_eq!(
-        style.background_color.color(),
+        style.background.background_color.color(),
         Some(CssColor::rgba(0, 0, 255, 0.25))
     );
     assert_eq!(style.border_color, CssColor::TRANSPARENT);
@@ -13846,7 +14905,13 @@ async fn layer_statement_sets_order_before_layer_blocks() {
          @layer base { p { color: red } }\
          @layer theme { #hero { color: blue } }",
     ));
-    assert_eq!(stylesheet.layer_names, vec!["theme", "base"]);
+    assert_eq!(
+        stylesheet.layer_names,
+        vec![
+            LayerName(vec![LayerSegment::Named("theme".to_string())]),
+            LayerName(vec![LayerSegment::Named("base".to_string())]),
+        ]
+    );
 
     let style = style_for_element_with_signature(
         ElementSignature::new("p", HashMap::from([("id".to_string(), "hero".to_string())])),
@@ -13857,6 +14922,147 @@ async fn layer_statement_sets_order_before_layer_blocks() {
     );
 
     assert_eq!(style.color, CssColor::new(255, 0, 0));
+}
+
+#[tokio::test]
+async fn nested_layer_direct_declarations_follow_the_implicit_final_sublayer() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "@layer framework {\
+           @layer components { p { color: blue } }\
+           p { color: red }\
+         }",
+    ));
+
+    let style = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        &[stylesheet],
+        None,
+        &[],
+    );
+    assert_eq!(style.color, CssColor::new(255, 0, 0));
+}
+
+#[tokio::test]
+async fn layer_names_keep_escaped_dots_distinct_from_hierarchy_separators() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "@layer a\\.b { p { color: blue } } @layer a.b { p { color: red } }",
+    ));
+    assert_ne!(stylesheet.layer_names[0], stylesheet.layer_names[1]);
+    assert_eq!(stylesheet.layer_names.len(), 2);
+}
+
+#[tokio::test]
+async fn malformed_layer_delimiters_do_not_create_a_valid_prefix_layer() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "@layer theme /**/ . colors { p { color: red } } p { color: blue }",
+    ));
+    let style = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        &[stylesheet],
+        None,
+        &[],
+    );
+    assert_eq!(style.color, CssColor::new(0, 0, 255));
+}
+
+#[tokio::test]
+async fn empty_and_limit_only_scopes_use_the_document_root() {
+    let empty = parse_stylesheet(&Css::from_string("@scope { p { color: red } }"));
+    let limited = parse_stylesheet(&Css::from_string(
+        "@scope to (.stop) { p { color: red } } p { color: blue }",
+    ));
+    let ancestors = [
+        ElementSignature::new("html", HashMap::new()),
+        ElementSignature::new("body", HashMap::new()),
+    ];
+    let empty_style = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        &[empty],
+        None,
+        &ancestors,
+    );
+    let limited_style = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        &[limited],
+        None,
+        &ancestors,
+    );
+    assert_eq!(empty_style.color, CssColor::new(255, 0, 0));
+    assert_eq!(limited_style.color, CssColor::new(255, 0, 0));
+}
+
+#[tokio::test]
+async fn empty_scope_uses_the_embedded_stylesheet_owner_anchor() {
+    let owner = crate::dom::Node::element("section");
+    let owner_id = owner.as_element().expect("owner element").id;
+    let stylesheet = parse_stylesheet(
+        &Css::from_string("@scope { p { color: red } }")
+            .with_scope_anchor(StylesheetScopeAnchor::Element(owner_id)),
+    );
+    let mut matching_owner = ElementSignature::new("section", HashMap::new());
+    matching_owner.source_element_id = Some(owner_id);
+    let inside = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        std::slice::from_ref(&stylesheet),
+        None,
+        &[
+            ElementSignature::new("html", HashMap::new()),
+            matching_owner,
+        ],
+    );
+    let outside = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        &[stylesheet],
+        None,
+        &[ElementSignature::new("html", HashMap::new())],
+    );
+    assert_eq!(inside.color, CssColor::new(255, 0, 0));
+    assert_ne!(outside.color, CssColor::new(255, 0, 0));
+}
+
+#[tokio::test]
+async fn scope_boundaries_reject_pseudo_elements() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "@scope (.card::before) { p { color: red } } p { color: blue }",
+    ));
+    let style = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        &[stylesheet],
+        None,
+        &[ElementSignature::new(
+            "section",
+            HashMap::from([("class".to_string(), "card".to_string())]),
+        )],
+    );
+    assert_eq!(style.color, CssColor::new(0, 0, 255));
+}
+
+#[tokio::test]
+async fn nested_scope_roots_are_constrained_by_the_outer_scope() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "@scope (.outer) { @scope (html) { p { color: red } } } p { color: blue }",
+    ));
+    let style = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        &[stylesheet],
+        None,
+        &[
+            ElementSignature::new("html", HashMap::new()),
+            ElementSignature::new(
+                "section",
+                HashMap::from([("class".to_string(), "outer".to_string())]),
+            ),
+        ],
+    );
+    assert_eq!(style.color, CssColor::new(0, 0, 255));
 }
 
 #[tokio::test]
@@ -14047,7 +15253,7 @@ async fn supports_rule_applies_supported_declaration_conditions() {
 
     assert_eq!(style.color, CssColor::new(0, 0, 255));
     assert_eq!(
-        style.background_color.color(),
+        style.background.background_color.color(),
         Some(CssColor::new(255, 0, 0))
     );
     assert_eq!(style.border_colors.top, CssColor::new(0, 128, 0));
@@ -14088,7 +15294,10 @@ async fn supports_rule_recognizes_wrap_inside_avoid() {
     );
 
     assert_eq!(style.color, CssColor::new(0, 0, 255));
-    assert_eq!(style.background_color.color(), Some(CssColor::TRANSPARENT));
+    assert_eq!(
+        style.background.background_color.color(),
+        Some(CssColor::TRANSPARENT)
+    );
 }
 
 #[tokio::test]
@@ -14114,7 +15323,7 @@ async fn supports_rule_recognizes_stacking_context_trigger_properties() {
 
     assert_eq!(style.color, CssColor::new(0, 0, 255));
     assert_eq!(
-        style.background_color.color(),
+        style.background.background_color.color(),
         Some(CssColor::new(255, 0, 0))
     );
     assert_eq!(style.border_colors.top, CssColor::new(0, 128, 0));
@@ -14141,7 +15350,10 @@ async fn supports_rule_recognizes_font_size_adjust_values() {
     );
 
     assert_eq!(style.color, CssColor::new(0, 0, 255));
-    assert_eq!(style.background_color.color(), Some(CssColor::TRANSPARENT));
+    assert_eq!(
+        style.background.background_color.color(),
+        Some(CssColor::TRANSPARENT)
+    );
 }
 
 #[tokio::test]
@@ -14161,7 +15373,10 @@ async fn supports_rule_recognizes_text_orientation_values() {
 
     assert_eq!(style.color, CssColor::new(0, 0, 255));
     assert_eq!(style.border_colors.top, CssColor::new(0, 128, 0));
-    assert_eq!(style.background_color.color(), Some(CssColor::TRANSPARENT));
+    assert_eq!(
+        style.background.background_color.color(),
+        Some(CssColor::TRANSPARENT)
+    );
 }
 
 #[tokio::test]
@@ -14194,14 +15409,17 @@ async fn supports_rule_recognizes_text_align_justify_all_only_on_text_align() {
     assert_eq!(style.border_colors.top, CssColor::new(0, 128, 0));
     assert_eq!(style.border_colors.bottom, CssColor::new(0, 0, 255));
     assert_eq!(style.border_colors.left, CssColor::new(0, 128, 0));
-    assert_eq!(style.border_colors.right, CssColor::BLACK);
+    assert_eq!(style.border_colors.right.resolve(style.color), style.color);
     assert_eq!(style.border_widths.top, 3.0);
     assert_eq!(style.border_widths.right, 3.0);
     assert_eq!(style.border_widths.bottom, 3.0);
     assert_eq!(style.border_widths.left, 3.0);
     assert_eq!(style.outline_color, CssColor::new(0, 128, 0));
     assert_eq!(style.outline_style, BorderStyle::None);
-    assert_eq!(style.background_color.color(), Some(CssColor::TRANSPARENT));
+    assert_eq!(
+        style.background.background_color.color(),
+        Some(CssColor::TRANSPARENT)
+    );
 }
 
 #[tokio::test]
@@ -14222,7 +15440,7 @@ async fn supports_rule_recognizes_text_transform_full_width() {
     assert_eq!(style.color, CssColor::new(0, 0, 255));
     assert_eq!(style.border_colors.top, CssColor::new(0, 128, 0));
     assert_eq!(
-        style.background_color.color(),
+        style.background.background_color.color(),
         Some(CssColor::new(255, 0, 0))
     );
 }
@@ -14250,7 +15468,7 @@ async fn supports_rule_recognizes_css_text_decoration_level_three_values() {
 
     assert_eq!(style.color, CssColor::new(0, 0, 255));
     assert_eq!(
-        style.background_color.color(),
+        style.background.background_color.color(),
         Some(CssColor::new(255, 0, 0))
     );
     assert_eq!(style.border_colors.top, CssColor::new(0, 128, 0));
@@ -14258,7 +15476,7 @@ async fn supports_rule_recognizes_css_text_decoration_level_three_values() {
     assert_ne!(style.border_colors.left, CssColor::new(255, 0, 0));
     assert_eq!(style.border_colors.right, CssColor::new(0, 0, 255));
     assert_eq!(style.outline_color, CssColor::new(0, 128, 0));
-    assert_eq!(style.border_colors.left, CssColor::BLACK);
+    assert_eq!(style.border_colors.left.resolve(style.color), style.color);
 }
 
 #[tokio::test]
@@ -14293,7 +15511,7 @@ async fn supports_rule_evaluates_not_and_or_conditions() {
 
     assert_eq!(style.color, CssColor::new(0, 0, 255));
     assert_eq!(
-        style.background_color.color(),
+        style.background.background_color.color(),
         Some(CssColor::new(255, 0, 0))
     );
 }
@@ -14484,7 +15702,10 @@ async fn supports_rule_evaluates_selector_conditions_with_selector_parser() {
     assert_eq!(style.border_colors.top, CssColor::new(0, 255, 0));
     assert_eq!(style.border_colors.right, CssColor::new(0, 0, 255));
     assert_eq!(style.border_colors.bottom, CssColor::new(255, 0, 0));
-    assert_eq!(style.background_color.color(), Some(CssColor::TRANSPARENT));
+    assert_eq!(
+        style.background.background_color.color(),
+        Some(CssColor::TRANSPARENT)
+    );
 }
 
 #[tokio::test]
@@ -14506,10 +15727,13 @@ async fn supports_rule_rejects_shadow_and_unmodeled_ui_pseudo_selectors() {
     );
 
     assert_eq!(style.color, CssColor::new(0, 0, 255));
-    assert_eq!(style.background_color.color(), Some(CssColor::TRANSPARENT));
-    assert_eq!(style.border_colors.top, CssColor::new(0, 0, 0));
-    assert_eq!(style.border_colors.right, CssColor::new(0, 0, 0));
-    assert_eq!(style.border_colors.bottom, CssColor::new(0, 0, 0));
+    assert_eq!(
+        style.background.background_color.color(),
+        Some(CssColor::TRANSPARENT)
+    );
+    assert_eq!(style.border_colors.top.resolve(style.color), style.color);
+    assert_eq!(style.border_colors.right.resolve(style.color), style.color);
+    assert_eq!(style.border_colors.bottom.resolve(style.color), style.color);
 }
 
 #[tokio::test]
@@ -14528,6 +15752,120 @@ async fn supports_rule_preserves_nested_layer_order() {
     );
 
     assert_eq!(style.color, CssColor::new(0, 0, 255));
+}
+
+#[tokio::test]
+async fn import_supports_declaration_condition_loads_the_import() {
+    let dir = std::env::temp_dir().join(format!(
+        "quire-import-supports-declaration-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let imported_path = dir.join("imported.css");
+    let main_path = dir.join("main.css");
+    std::fs::write(&imported_path, "p { color: green }").unwrap();
+    std::fs::write(
+        &main_path,
+        "@import \"imported.css\" supports(display: block);",
+    )
+    .unwrap();
+
+    let parsed_stylesheets = Css::from_file(&main_path)
+        .await
+        .unwrap()
+        .with_imports()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|css| parse_stylesheet(&css))
+        .collect::<Vec<_>>();
+    let style = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        &parsed_stylesheets,
+        None,
+        &[],
+    );
+
+    assert_eq!(parsed_stylesheets.len(), 2);
+    assert_eq!(style.color, CssColor::new(0, 128, 0));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn import_supports_unknown_declaration_condition_skips_the_import() {
+    let dir = std::env::temp_dir().join(format!(
+        "quire-import-supports-unknown-declaration-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let imported_path = dir.join("imported.css");
+    let main_path = dir.join("main.css");
+    std::fs::write(&imported_path, "p { color: red }").unwrap();
+    std::fs::write(
+        &main_path,
+        "@import \"imported.css\" supports(foo: bar); p { color: blue }",
+    )
+    .unwrap();
+
+    let parsed_stylesheets = Css::from_file(&main_path)
+        .await
+        .unwrap()
+        .with_imports()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|css| parse_stylesheet(&css))
+        .collect::<Vec<_>>();
+    let style = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        &parsed_stylesheets,
+        None,
+        &[],
+    );
+
+    assert_eq!(parsed_stylesheets.len(), 1);
+    assert_eq!(style.color, CssColor::new(0, 0, 255));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn import_supports_logical_condition_uses_the_shared_evaluator() {
+    let dir = std::env::temp_dir().join(format!(
+        "quire-import-supports-logical-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let imported_path = dir.join("imported.css");
+    let main_path = dir.join("main.css");
+    std::fs::write(&imported_path, "p { color: green }").unwrap();
+    std::fs::write(
+        &main_path,
+        "@import \"imported.css\" supports(not (unsupported: yes));",
+    )
+    .unwrap();
+
+    let parsed_stylesheets = Css::from_file(&main_path)
+        .await
+        .unwrap()
+        .with_imports()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|css| parse_stylesheet(&css))
+        .collect::<Vec<_>>();
+    let style = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        &parsed_stylesheets,
+        None,
+        &[],
+    );
+
+    assert_eq!(parsed_stylesheets.len(), 2);
+    assert_eq!(style.color, CssColor::new(0, 128, 0));
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -15016,6 +16354,94 @@ async fn all_property_applies_css_wide_keyword_to_modeled_longhands() {
 }
 
 #[tokio::test]
+async fn all_property_expands_before_property_prepasses() {
+    for keyword in ["initial", "inherit", "unset"] {
+        let stylesheet = parse_stylesheet(&Css::from_string(format!(
+            "p {{ all: {keyword}; color: green; font-size: 18pt; color-scheme: dark }}"
+        )));
+        let style = style_for_element_with_signature(
+            ElementSignature::new("p", HashMap::new()),
+            None,
+            &[stylesheet],
+            None,
+            &[],
+        );
+
+        assert_eq!(style.color, CssColor::new(0, 128, 0), "{keyword}");
+        assert_eq!(style.font_size, 18.0, "{keyword}");
+        assert_eq!(style.used_color_scheme, UsedColorScheme::Dark, "{keyword}");
+    }
+}
+
+#[tokio::test]
+async fn all_property_excludes_direction_and_unicode_bidi() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "p { direction: rtl; unicode-bidi: bidi-override; all: initial }",
+    ));
+    let style = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        &[stylesheet],
+        None,
+        &[],
+    );
+
+    assert_eq!(style.direction, Direction::Rtl);
+    assert_eq!(style.unicode_bidi, UnicodeBidi::BidiOverride);
+}
+
+#[tokio::test]
+async fn all_revert_rolls_back_each_longhand_to_the_previous_origin() {
+    let ua = parse_stylesheet(&Css::from_string("p { color: green }").with_user_agent_origin());
+    let author = parse_stylesheet(&Css::from_string("p { color: red; all: revert }"));
+    let style = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        &Stylesheets::borrowed(&[&ua, &author]),
+        None,
+        &[],
+    );
+
+    assert_eq!(style.color, CssColor::new(0, 128, 0));
+}
+
+#[tokio::test]
+async fn all_revert_layer_rolls_back_each_longhand_to_the_previous_layer() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "@layer base, theme; \
+         @layer base { p { color: green } } \
+         @layer theme { p { color: red; all: revert-layer } }",
+    ));
+    let style = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        &[stylesheet],
+        None,
+        &[],
+    );
+
+    assert_eq!(style.color, CssColor::new(0, 128, 0));
+}
+
+#[tokio::test]
+async fn all_property_variable_expands_before_property_prepasses() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "p { --reset: initial; all: var(--reset); color: green; font-size: 18pt; color-scheme: dark }",
+    ));
+    let style = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        &[stylesheet],
+        None,
+        &[],
+    );
+
+    assert_eq!(style.color, CssColor::new(0, 128, 0));
+    assert_eq!(style.font_size, 18.0);
+    assert_eq!(style.used_color_scheme, UsedColorScheme::Dark);
+}
+
+#[tokio::test]
 async fn revert_layer_applies_to_generated_pseudo_rules() {
     let stylesheet = parse_stylesheet(&Css::from_string(
         "@layer base, theme;\
@@ -15174,8 +16600,197 @@ async fn expands_nested_style_rules() {
         .collect::<Vec<_>>();
 
     assert!(selectors.contains(&".outer"));
-    assert!(selectors.contains(&".outer .inner"));
-    assert!(selectors.contains(&".outer:last-child"));
+    assert!(
+        selectors
+            .iter()
+            .any(|selector| selector.contains(":is(.outer) .inner"))
+    );
+    assert!(
+        selectors
+            .iter()
+            .any(|selector| selector.contains(":is(.outer):last-child"))
+    );
+}
+
+#[tokio::test]
+async fn nested_rules_use_css_nesting_selector_semantics() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "#high, .low { & p { color: red } } .container p { color: blue }",
+    ));
+    let parent = default_style_for_tag("body");
+    let style = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        &[stylesheet],
+        Some(&parent),
+        &[ElementSignature::new(
+            "div",
+            HashMap::from([("class".to_string(), "low container".to_string())]),
+        )],
+    );
+    // `&` has the maximum specificity of its parent selector list, like
+    // `:is(#high, .low)`, rather than the matched branch's specificity.
+    assert_eq!(style.color, CssColor::new(255, 0, 0));
+}
+
+#[tokio::test]
+async fn declarations_interleaved_with_nested_rules_keep_source_order() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "article { color: green; & { color: blue } color: red }",
+    ));
+    let style = style_for_element_with_signature(
+        ElementSignature::new("article", HashMap::new()),
+        None,
+        &[stylesheet],
+        None,
+        &[],
+    );
+    assert_eq!(style.color, CssColor::new(255, 0, 0));
+}
+
+#[tokio::test]
+async fn nested_group_rules_keep_the_style_rule_context() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        ".outer { @media print { color: red; > p { color: blue } } @supports (display: block) { background-color: green } @layer nested { border-top-color: black } }",
+    ));
+    assert!(
+        stylesheet
+            .rules
+            .iter()
+            .any(|rule| rule.declarations.get("background-color").is_some())
+    );
+    assert!(
+        stylesheet
+            .rules
+            .iter()
+            .any(|rule| rule.declarations.get("border-top-color").is_some())
+    );
+    let outer = style_for_element_with_signature(
+        ElementSignature::new(
+            "section",
+            HashMap::from([("class".to_string(), "outer".to_string())]),
+        ),
+        None,
+        std::slice::from_ref(&stylesheet),
+        Some(&default_style_for_tag("body")),
+        &[],
+    );
+    let child = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        &[stylesheet],
+        Some(&outer),
+        &[ElementSignature::new(
+            "section",
+            HashMap::from([("class".to_string(), "outer".to_string())]),
+        )],
+    );
+    assert_eq!(outer.color, CssColor::new(255, 0, 0));
+    assert_eq!(child.color, CssColor::new(0, 0, 255));
+}
+
+#[tokio::test]
+async fn nested_container_rules_retain_their_query_hierarchy() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "@container outer (width > 1px) { .host { @container inner (height > 1px) { color: red } } }",
+    ));
+    assert_eq!(stylesheet.container_rules.len(), 1);
+    assert_eq!(stylesheet.container_rules[0].nested().len(), 1);
+    assert_eq!(stylesheet.container_rules[0].nested()[0].rules().len(), 1);
+}
+
+#[tokio::test]
+async fn nested_scope_parent_selector_is_tokenized() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        ".outer { @scope (&) { & > p { color: red } } } p { color: blue }",
+    ));
+    let style = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        &[stylesheet],
+        None,
+        &[ElementSignature::new(
+            "section",
+            HashMap::from([("class".to_string(), "outer".to_string())]),
+        )],
+    );
+    assert_eq!(style.color, CssColor::new(255, 0, 0));
+}
+
+#[tokio::test]
+async fn nested_scope_limit_parent_selector_has_scope_specificity_behavior() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        ".outer { @scope (&) to (& .limit) { p { color: red } } } p { color: blue }",
+    ));
+    let style = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        &[stylesheet],
+        None,
+        &[ElementSignature::new(
+            "section",
+            HashMap::from([("class".to_string(), "outer".to_string())]),
+        )],
+    );
+    assert_eq!(style.color, CssColor::new(255, 0, 0));
+}
+
+#[tokio::test]
+async fn sass_style_parent_suffix_is_not_a_css_nesting_selector() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        ".card { &Header { color: red } } .card { color: blue }",
+    ));
+    let style = style_for_element_with_signature(
+        ElementSignature::new(
+            "section",
+            HashMap::from([("class".to_string(), "card".to_string())]),
+        ),
+        None,
+        &[stylesheet],
+        None,
+        &[],
+    );
+    assert_eq!(style.color, CssColor::new(0, 0, 255));
+}
+
+#[tokio::test]
+async fn malformed_nested_rules_recover_without_rewriting_component_values() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        ".outer { --value: { braces: ';'; text: \"& }\" }; &Header { color: red } .valid { color: green } }",
+    ));
+    let style = style_for_element_with_signature(
+        ElementSignature::new(
+            "p",
+            HashMap::from([("class".to_string(), "valid".to_string())]),
+        ),
+        None,
+        &[stylesheet],
+        None,
+        &[ElementSignature::new(
+            "section",
+            HashMap::from([("class".to_string(), "outer".to_string())]),
+        )],
+    );
+    assert_eq!(style.color, CssColor::new(0, 128, 0));
+}
+
+#[tokio::test]
+async fn eof_closed_nested_blocks_follow_css_syntax_recovery() {
+    let stylesheet = parse_stylesheet(&Css::from_string(".outer { .valid { color: green"));
+    let style = style_for_element_with_signature(
+        ElementSignature::new(
+            "p",
+            HashMap::from([("class".to_string(), "valid".to_string())]),
+        ),
+        None,
+        &[stylesheet],
+        None,
+        &[ElementSignature::new(
+            "section",
+            HashMap::from([("class".to_string(), "outer".to_string())]),
+        )],
+    );
+    assert_eq!(style.color, CssColor::new(0, 128, 0));
 }
 
 #[tokio::test]
@@ -15217,10 +16832,8 @@ async fn expands_nested_of_type_table_cell_selectors() {
         .map(|rule| rule.selector_text.as_str())
         .collect::<Vec<_>>();
 
-    assert!(selectors.contains(&"th:first-of-type"));
-    assert!(selectors.contains(&"td:first-of-type"));
-    assert!(selectors.contains(&"th:last-of-type"));
-    assert!(selectors.contains(&"td:last-of-type"));
+    assert!(selectors.contains(&":is(th, td):first-of-type"));
+    assert!(selectors.contains(&":is(th, td):last-of-type"));
 
     let parent = default_style_for_tag("tr");
     let first = style_for_element_with_signature(
@@ -15253,6 +16866,36 @@ async fn expands_nested_of_type_table_cell_selectors() {
 }
 
 #[tokio::test]
+async fn nth_of_type_applies_full_size_kana_to_only_the_second_table_cell() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "td:nth-of-type(2) { text-transform: full-size-kana }",
+    ));
+    let parent = default_style_for_tag("tr");
+    let sibling_tags = vec!["td".to_string(), "td".to_string(), "td".to_string()];
+
+    let cell_styles = (0..3)
+        .map(|sibling_index| {
+            style_for_element_with_signature(
+                ElementSignature::with_siblings(
+                    "td",
+                    HashMap::new(),
+                    sibling_index,
+                    sibling_tags.clone(),
+                ),
+                None,
+                std::slice::from_ref(&stylesheet),
+                Some(&parent),
+                &[],
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert!(!cell_styles[0].text_transform.applies_full_size_kana());
+    assert!(cell_styles[1].text_transform.applies_full_size_kana());
+    assert!(!cell_styles[2].text_transform.applies_full_size_kana());
+}
+
+#[tokio::test]
 async fn expands_nested_id_descendant_heading_rules() {
     let stylesheet = parse_stylesheet(&Css::from_string(
         "#ticket { h2 { font-weight: 300; margin: 0; text-transform: uppercase } }",
@@ -15262,7 +16905,7 @@ async fn expands_nested_id_descendant_heading_rules() {
         .iter()
         .map(|rule| rule.selector_text.as_str());
 
-    assert!(selectors.any(|s| s == "#ticket h2"));
+    assert!(selectors.any(|s| s == ":is(#ticket) h2"));
 
     let parent = style_for_element_with_signature(
         ElementSignature::new(
@@ -15306,9 +16949,9 @@ async fn expands_nested_information_heading_rules() {
         .map(|rule| rule.selector_text.as_str())
         .collect::<Vec<_>>();
 
-    assert!(selectors.contains(&"#informations h1"));
-    assert!(selectors.contains(&"#informations #name"));
-    assert!(selectors.contains(&"#informations #destination"));
+    assert!(selectors.contains(&":is(#informations) h1"));
+    assert!(selectors.contains(&":is(#informations) #name"));
+    assert!(selectors.contains(&":is(#informations) #destination"));
 
     let ua = html5_user_agent_stylesheet();
     let stylesheet_references = [ua, &stylesheet];
@@ -15370,9 +17013,9 @@ async fn expands_deep_nested_invoice_table_cell_selectors() {
         .map(|rule| rule.selector_text.as_str())
         .collect::<Vec<_>>();
 
-    assert!(selectors.contains(&"table td:last-of-type"));
-    assert!(selectors.contains(&"table th:last-of-type"));
-    assert!(selectors.contains(&"table td:first-of-type"));
+    assert!(selectors.contains(&":is(:is(table) td):last-of-type"));
+    assert!(selectors.contains(&":is(:is(table) th, :is(table) td):last-of-type"));
+    assert!(selectors.contains(&":is(:is(table) th, :is(table) td):first-of-type"));
 
     let parent = default_style_for_tag("tr");
     let table = ElementSignature::new("table", HashMap::new());
@@ -15435,8 +17078,7 @@ async fn parses_break_inside_avoid() {
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
 
-    assert!(style.break_inside_avoid);
-    assert!(!style.break_inside_avoid_column);
+    assert_eq!(style.break_inside, BreakInsideAvoidance::AvoidPage);
 }
 
 #[tokio::test]
@@ -15445,8 +17087,7 @@ async fn parses_modern_break_inside_avoid_for_all_fragmentainers() {
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
 
-    assert!(style.break_inside_avoid);
-    assert!(style.break_inside_avoid_column);
+    assert_eq!(style.break_inside, BreakInsideAvoidance::Avoid);
 }
 
 #[tokio::test]
@@ -15556,6 +17197,7 @@ async fn parses_transform_functions_and_origin() {
             x: ComputedLengthPercentage::from_percent(1.0),
             y: ComputedLengthPercentage::from_points(20.0),
             z: ComputedLengthPercentage::ZERO,
+            is_initial: false,
         }
     );
 }
@@ -15712,6 +17354,7 @@ async fn ch_transform_lengths_preserve_font_metric_component_until_used_resoluti
             x: ComputedLengthPercentage::from_ch(3.0),
             y: ComputedLengthPercentage::from_ch(4.0),
             z: ComputedLengthPercentage::ZERO,
+            is_initial: false,
         }
     );
 
@@ -15730,6 +17373,7 @@ async fn ch_transform_lengths_preserve_font_metric_component_until_used_resoluti
             x: ComputedLengthPercentage::from_points(15.0),
             y: ComputedLengthPercentage::from_points(20.0),
             z: ComputedLengthPercentage::ZERO,
+            is_initial: false,
         }
     );
 }
@@ -15744,7 +17388,10 @@ async fn parses_outline_properties() {
 
     assert_eq!(style.outline_width, 5.0 * CSS_PX_TO_PT);
     assert_eq!(style.outline_style, BorderStyle::Dashed);
-    assert_eq!(style.outline_color, CssColor::new(0x12, 0x34, 0x56));
+    assert_eq!(
+        style.outline_color.resolve(style.color),
+        CssColor::new(0x12, 0x34, 0x56)
+    );
     assert_eq!(
         style.outline_offset,
         ComputedLengthPercentage::from_points(2.0)
@@ -16005,7 +17652,12 @@ fn computed_style_ch_advance_query_matches_font_metric_projection() {
 
 #[test]
 fn computed_style_selected_font_metrics_include_ic_ex_and_cap() {
-    for declaration in ["width: 2ic", "width: 2ex", "width: 2cap"] {
+    for declaration in [
+        "width: 2ic",
+        "width: calc(100px + 2ic)",
+        "width: 2ex",
+        "width: 2cap",
+    ] {
         let mut style = ComputedStyle::initial();
         apply_declarations(&mut style, &parse_declarations(declaration));
 
@@ -16014,4 +17666,281 @@ fn computed_style_selected_font_metrics_include_ic_ex_and_cap() {
 
     let style = ComputedStyle::initial();
     assert!(!style.requires_selected_font_metrics());
+}
+
+#[test]
+fn ruby_alignment_and_overhang_values_cascade_and_inherit() {
+    let mut style = ComputedStyle::initial();
+    apply_declarations(
+        &mut style,
+        &parse_declarations(
+            "ruby-align: start; ruby-overhang: none; ruby-align: center; ruby-overhang: spaces",
+        ),
+    );
+    assert_eq!(style.ruby_align, RubyAlign::Center);
+    assert_eq!(style.ruby_overhang, RubyOverhang::Spaces);
+
+    for (declaration, align) in [
+        ("ruby-align: start", RubyAlign::Start),
+        ("ruby-align: center", RubyAlign::Center),
+        ("ruby-align: space-between", RubyAlign::SpaceBetween),
+        ("ruby-align: space-around", RubyAlign::SpaceAround),
+    ] {
+        let mut style = ComputedStyle::initial();
+        apply_declarations(&mut style, &parse_declarations(declaration));
+        assert_eq!(style.ruby_align, align, "{declaration}");
+    }
+
+    assert_eq!(ComputedStyle::initial().ruby_align, RubyAlign::SpaceAround);
+    assert_eq!(ComputedStyle::initial().ruby_overhang, RubyOverhang::Auto);
+}
+
+#[tokio::test]
+async fn ruby_alignment_and_overhang_honor_css_wide_keywords() {
+    let parent = style_for_element_with_signature(
+        ElementSignature::new("section", HashMap::new()),
+        Some("ruby-align: start; ruby-overhang: spaces"),
+        &[],
+        None,
+        &[],
+    );
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "p { ruby-align: initial; ruby-overhang: initial } \
+         q { ruby-align: inherit; ruby-overhang: inherit } \
+         em { ruby-align: unset; ruby-overhang: unset }",
+    ));
+
+    let initial = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        std::slice::from_ref(&stylesheet),
+        Some(&parent),
+        &[],
+    );
+    assert_eq!(initial.ruby_align, RubyAlign::SpaceAround);
+    assert_eq!(initial.ruby_overhang, RubyOverhang::Auto);
+
+    for tag in ["q", "em"] {
+        let inherited = style_for_element_with_signature(
+            ElementSignature::new(tag, HashMap::new()),
+            None,
+            std::slice::from_ref(&stylesheet),
+            Some(&parent),
+            &[],
+        );
+        assert_eq!(inherited.ruby_align, RubyAlign::Start);
+        assert_eq!(inherited.ruby_overhang, RubyOverhang::Spaces);
+    }
+
+    let ua = parse_stylesheet(
+        &Css::from_string("p { ruby-align: center; ruby-overhang: auto }").with_user_agent_origin(),
+    );
+    let author = parse_stylesheet(&Css::from_string(
+        "p { ruby-align: start; ruby-overhang: spaces; ruby-align: revert; ruby-overhang: revert }",
+    ));
+    let reverted = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        &Stylesheets::borrowed(&[&ua, &author]),
+        None,
+        &[],
+    );
+    assert_eq!(reverted.ruby_align, RubyAlign::Center);
+    assert_eq!(reverted.ruby_overhang, RubyOverhang::Auto);
+
+    let layered = parse_stylesheet(&Css::from_string(
+        "@layer base, theme; \
+         @layer base { p { ruby-align: start; ruby-overhang: spaces } } \
+         @layer theme { p { ruby-align: center; ruby-overhang: auto; ruby-align: revert-layer; ruby-overhang: revert-layer } }",
+    ));
+    let reverted_layer = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        &[layered],
+        None,
+        &[],
+    );
+    assert_eq!(reverted_layer.ruby_align, RubyAlign::Start);
+    assert_eq!(reverted_layer.ruby_overhang, RubyOverhang::Spaces);
+}
+
+#[test]
+fn keyframes_blocks_follow_css_tokens_and_recover_locally() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        r#"
+            @key\66 rames sl\69 de {
+                fr\6f m, 50%, to {
+                    opacity: 0;
+                    content: "};,@top-left";
+                    background-image: url("data:text/plain,};,@top-left");
+                }
+                125%, from { opacity: .9 }
+                @unknown { color: red }
+                25% { opacity: .25 }
+            }
+            @keyframes later { from { opacity: 0 } to { opacity: 1 } }
+        "#,
+    ));
+
+    assert_eq!(stylesheet.keyframes.len(), 2);
+    let slide = &stylesheet.keyframes[0];
+    assert_eq!(slide.name.as_str(), "slide");
+    assert_eq!(
+        slide
+            .steps
+            .iter()
+            .map(|step| step.offset)
+            .collect::<Vec<_>>(),
+        vec![0.0, 0.5, 1.0, 0.25]
+    );
+    assert_eq!(
+        slide.steps[0]
+            .declarations
+            .get("content")
+            .map(String::as_str),
+        Some("\"};,@top-left\"")
+    );
+}
+
+#[test]
+fn keyframes_eof_blocks_recover_without_accepting_invalid_selector_lists() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "@keyframes invalid { from, 101% { opacity: .9 } 25% { opacity: .25 } } \
+         @keyframes recovered { from { opacity: 0 } to { opacity: 1 }",
+    ));
+
+    assert_eq!(stylesheet.keyframes.len(), 2);
+    assert_eq!(
+        stylesheet.keyframes[0]
+            .steps
+            .iter()
+            .map(|step| step.offset)
+            .collect::<Vec<_>>(),
+        vec![0.25]
+    );
+    assert_eq!(
+        stylesheet.keyframes[1]
+            .steps
+            .iter()
+            .map(|step| step.offset)
+            .collect::<Vec<_>>(),
+        vec![0.0, 1.0]
+    );
+}
+
+#[test]
+fn keyframes_names_are_decoded_case_sensitive_css_values() {
+    let names = parse_stylesheet(&Css::from_string(
+        "@keyframes none { from { opacity: 0 } } \
+         @keyframes initial { from { opacity: 0 } } \
+         @keyframes \"none\" { from { opacity: 0 } } \
+         @keyframes FADE { from { opacity: 0 } } \
+         @keyframes f\\61 de { from { opacity: 0 } }",
+    ));
+    assert_eq!(
+        names
+            .keyframes
+            .iter()
+            .map(|rule| rule.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["none", "FADE", "fade"]
+    );
+
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "@keyframes fade { from { opacity: 0 } to { opacity: .2 } } \
+         @keyframes FADE { from { opacity: 0 } to { opacity: 1 } } \
+         p { animation: fade 1s -0.5s }",
+    ));
+    assert_eq!(
+        stylesheet
+            .keyframes
+            .iter()
+            .map(|rule| rule.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["fade", "FADE"]
+    );
+    let fade = KeyframesName::parse_css("fade").expect("valid unquoted keyframes name");
+    assert_eq!(stylesheet.keyframes[0].name, fade);
+    assert_ne!(stylesheet.keyframes[1].name, fade);
+
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "@keyframes \"quoted name\" { from { opacity: 0 } to { opacity: 1 } }",
+    ));
+    assert_eq!(
+        stylesheet.keyframes[0].name,
+        KeyframesName::parse_css("\"quoted name\"").expect("valid quoted keyframes name")
+    );
+}
+
+#[test]
+fn typed_animation_snapshot_longhands_follow_shorthand_defaulting_and_inheritance() {
+    let mut parent = ComputedStyle::initial();
+    apply_declarations(
+        &mut parent,
+        &parse_declarations("animation: parent-fade 2s -0.5s"),
+    );
+
+    let stylesheet = parse_stylesheet(&Css::from_string("p { animation: inherit }"));
+    let mut child = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        std::slice::from_ref(&stylesheet),
+        Some(&parent),
+        &[],
+    );
+    assert_eq!(child.animation_snapshot, parent.animation_snapshot);
+
+    apply_declarations(
+        &mut child,
+        &parse_declarations("animation-duration: 3s; all: initial"),
+    );
+    assert_eq!(
+        child.animation_snapshot,
+        ComputedAnimationSnapshot::INITIAL,
+        "all must reset the modeled animation longhands"
+    );
+
+    apply_declarations(
+        &mut child,
+        &parse_declarations("--snapshot: fade 4s -1s; animation: var(--snapshot)"),
+    );
+    assert_eq!(child.animation_snapshot.duration_seconds, 4.0);
+    assert_eq!(child.animation_snapshot.delay_seconds, -1.0);
+    assert_eq!(
+        child
+            .animation_snapshot
+            .name
+            .as_ref()
+            .map(KeyframesName::as_str),
+        Some("fade")
+    );
+
+    apply_declarations(&mut child, &parse_declarations("animation: var(--missing)"));
+    assert_eq!(child.animation_snapshot, ComputedAnimationSnapshot::INITIAL);
+}
+
+#[tokio::test]
+async fn animation_revert_layer_rolls_back_each_typed_snapshot_component() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "@layer base { p { animation: fade 2s -0.5s } } \
+         @layer theme { p { animation: replacement 4s -1s; animation: revert-layer } }",
+    ));
+    let style = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        std::slice::from_ref(&stylesheet),
+        None,
+        &[],
+    );
+
+    assert_eq!(style.animation_snapshot.duration_seconds, 2.0);
+    assert_eq!(style.animation_snapshot.delay_seconds, -0.5);
+    assert_eq!(
+        style
+            .animation_snapshot
+            .name
+            .as_ref()
+            .map(KeyframesName::as_str),
+        Some("fade")
+    );
 }

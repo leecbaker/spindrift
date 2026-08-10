@@ -3,7 +3,40 @@
 use base64::Engine as _;
 use image::{ExtendedColorType, ImageEncoder};
 use moxcms::{ColorProfile, ToneReprCurve};
-use quire::{Html, PdfCompression, PdfOptions, PdfProfile, RenderOptions};
+use quire::{Document, Html, PdfCompression, PdfOptions, PdfProfile, RenderOptions};
+
+trait PdfBytesForTest {
+    fn write_pdf_bytes(&self, options: &PdfOptions) -> quire::Result<Vec<u8>>;
+}
+
+impl PdfBytesForTest for Document {
+    fn write_pdf_bytes(&self, options: &PdfOptions) -> quire::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        self.write_pdf(&mut bytes, options)?;
+        Ok(bytes)
+    }
+}
+
+trait HtmlPdfBytesForTest {
+    async fn write_pdf_bytes(
+        &self,
+        render_options: &RenderOptions,
+        pdf_options: &PdfOptions,
+    ) -> quire::Result<Vec<u8>>;
+}
+
+impl HtmlPdfBytesForTest for Html {
+    async fn write_pdf_bytes(
+        &self,
+        render_options: &RenderOptions,
+        pdf_options: &PdfOptions,
+    ) -> quire::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        self.write_pdf(&mut bytes, render_options, pdf_options)
+            .await?;
+        Ok(bytes)
+    }
+}
 
 fn wide_gamut_profile() -> Vec<u8> {
     let mut profile = ColorProfile::new_display_p3();

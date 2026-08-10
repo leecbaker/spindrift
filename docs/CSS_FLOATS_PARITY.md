@@ -1,6 +1,6 @@
 # CSS Floats Parity
 
-Last updated: 2026-07-28
+Last updated: 2026-08-04
 
 CSS 2.2 is the conformance target for float placement, exclusion, and
 clearance. WeasyPrint is used as a compatibility reference for paged-output
@@ -67,6 +67,11 @@ behavior where the specs leave implementation details ambiguous.
   not their own margin box, for float-adjacent collision. Auto-width roots can
   narrow to the float-free band while horizontal margins remain outside the
   collision box.
+- Final BFC placement preserves the original CSS containing span and
+  percentage bases for width and margin resolution. The residual float band is
+  used only for collision testing and auto-width measurement; the resolved
+  border-box origin is then applied once, including RTL, negative margins,
+  nested BFCs, and auto-width retries.
 - Negative physical margins retain their normal-flow border-box origin during
   BFC fixed-point avoidance. A root that is disjoint from a float may extend
   beyond its containing inline span through that margin instead of being

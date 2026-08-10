@@ -363,27 +363,23 @@ pub(in crate::css) fn parse_grid_repeat(token: &str, font_size: f32) -> Option<G
 
 /// Validate the CSS Grid `repeat()` grammar after parsing its track fragment.
 ///
-/// CSS Grid forbids nested `repeat()` fragments, and `auto-fill`/`auto-fit`
-/// use the stricter `<fixed-size>` grammar because auto-repeat counts are
-/// derived from definite track breadths:
-/// <https://www.w3.org/TR/css-grid-1/#repeat-notation>.
+/// Nested `repeat()` fragments remain invalid. Grid Lanes extends an
+/// auto-repeat fragment to arbitrary track sizing functions, whose used count
+/// is resolved by its hypothetical track-sizing pass.
+/// <https://drafts.csswg.org/css-grid-3/#track-sizing>.
 pub(in crate::css) fn grid_repeat_tracks_are_valid(
     count: GridRepeatCount,
     tracks: &[GridTrackListComponent],
 ) -> bool {
     tracks.iter().all(|component| match component {
+        // Grid Lanes extends auto-repeat to intrinsic track sizing functions.
+        // The computed value must retain this syntax until its required
+        // hypothetical layout can resolve the repetition count.
+        // <https://drafts.csswg.org/css-grid-3/#track-sizing>.
         GridTrackListComponent::Track(_, size) => {
             !matches!(count, GridRepeatCount::AutoFill | GridRepeatCount::AutoFit)
                 || grid_track_size_is_fixed_for_auto_repeat(size.clone())
-                // Grid Lanes extends auto-repeat to intrinsic track breadths:
-                // <https://drafts.csswg.org/css-grid-3/#track-sizing>.
-                || matches!(
-                    size,
-                    GridTrackSize {
-                        min: GridMinTrackBreadth::Auto,
-                        max: GridMaxTrackBreadth::Auto,
-                    }
-                )
+                || grid_track_size_is_intrinsic_for_auto_repeat(size.clone())
         }
         GridTrackListComponent::Repeat(_, _) => false,
     })
@@ -393,6 +389,21 @@ pub(in crate::css) fn grid_track_size_is_fixed_for_auto_repeat(size: GridTrackSi
     grid_min_track_breadth_is_fixed(size.min.clone())
         || (grid_min_track_breadth_is_inflexible(size.min)
             && grid_max_track_breadth_is_fixed(size.max))
+}
+
+fn grid_track_size_is_intrinsic_for_auto_repeat(size: GridTrackSize) -> bool {
+    matches!(
+        (size.min, size.max),
+        (
+            GridMinTrackBreadth::Auto
+                | GridMinTrackBreadth::MinContent
+                | GridMinTrackBreadth::MaxContent,
+            GridMaxTrackBreadth::Auto
+                | GridMaxTrackBreadth::MinContent
+                | GridMaxTrackBreadth::MaxContent
+                | GridMaxTrackBreadth::FitContent(_)
+        )
+    )
 }
 
 pub(in crate::css) fn grid_min_track_breadth_is_fixed(value: GridMinTrackBreadth) -> bool {

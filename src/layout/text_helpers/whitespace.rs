@@ -1,21 +1,5 @@
 use super::*;
 
-/// Applies CSS min/max size constraints, with minimums overriding maximums.
-///
-/// CSS 2.2 applies max constraints first and min constraints second, so a
-/// larger minimum size wins over a smaller maximum size:
-/// <https://www.w3.org/TR/CSS22/visudet.html#min-max-widths> and
-/// <https://www.w3.org/TR/CSS22/visudet.html#min-max-heights>.
-pub(in crate::layout) fn constrain(mut value: f32, min: Option<f32>, max: Option<f32>) -> f32 {
-    if let Some(max) = max {
-        value = value.min(max);
-    }
-    if let Some(min) = min {
-        value = value.max(min);
-    }
-    value
-}
-
 pub(in crate::layout) fn inline_text(element: &Element) -> String {
     if element_suppresses_direct_text_children(element) {
         return String::new();
@@ -28,14 +12,14 @@ pub(in crate::layout) fn inline_text(element: &Element) -> String {
 }
 
 pub(in crate::layout) fn normalized_text_for_style(text: &str, style: &ComputedStyle) -> String {
-    let text = match style.white_space {
-        WhiteSpace::Normal | WhiteSpace::NoWrap => normalize_inline_text(text),
-        WhiteSpace::PreLine => normalize_pre_line_text_for_style(text, style),
+    let text = css_text_rendering_text(text);
+    match style.white_space {
+        WhiteSpace::Normal | WhiteSpace::NoWrap => normalize_inline_text(&text),
+        WhiteSpace::PreLine => normalize_pre_line_text_for_style(&text, style),
         WhiteSpace::Pre | WhiteSpace::PreWrap | WhiteSpace::BreakSpaces => {
-            normalize_pre_wrap_text_for_style(text, style)
+            normalize_pre_wrap_text_for_style(&text, style)
         }
-    };
-    text_with_visible_control_characters(&text)
+    }
 }
 
 pub(in crate::layout) fn inline_text_for_style(element: &Element, style: &ComputedStyle) -> String {
@@ -56,7 +40,7 @@ pub(in crate::layout) fn inline_text_for_style(element: &Element, style: &Comput
             pre_wrap_inline_text_for_style(element, style)
         }
     };
-    text_with_visible_control_characters(&text)
+    css_text_rendering_text(&text)
 }
 
 pub(in crate::layout) fn own_inline_text_for_style(
@@ -100,7 +84,7 @@ pub(in crate::layout) fn own_inline_text_for_style(
             normalize_pre_wrap_text_for_style(&output, style)
         }
     };
-    text_with_visible_control_characters(&text)
+    css_text_rendering_text(&text)
 }
 
 /// Collapse normal white space while preserving CSS Text's context-sensitive
@@ -108,7 +92,7 @@ pub(in crate::layout) fn own_inline_text_for_style(
 /// inline-item whitespace processor used when a block selects the direct DOM
 /// text path before building line items.
 fn normalize_inline_text_for_style(text: &str, style: &ComputedStyle) -> String {
-    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    let text = css_text_rendering_text(text);
     let characters = text.chars().collect::<Vec<_>>();
     let mut output = String::new();
     let mut index = 0;
@@ -152,35 +136,6 @@ fn normalize_inline_text_for_style(text: &str, style: &ComputedStyle) -> String 
         }
     }
     crate::text::trim_css_collapsible_whitespace(&output).to_string()
-}
-
-/// Replaces non-whitespace Unicode control characters with a visible glyph.
-///
-/// CSS Text white-space processing keeps control characters other than
-/// document white space visible instead of silently discarding them. Use U+FFFD
-/// so PDF output has a font-fallback-visible glyph even when no font maps the
-/// original C0/C1 control code:
-/// <https://www.w3.org/TR/css-text-3/#white-space-processing>.
-pub(in crate::layout) fn text_with_visible_control_characters(text: &str) -> String {
-    text.chars()
-        .map(|character| {
-            if is_visible_control_character(character) {
-                '\u{fffd}'
-            } else {
-                character
-            }
-        })
-        .collect()
-}
-
-pub(in crate::layout) fn is_visible_control_character(character: char) -> bool {
-    character_is_unicode_control(character)
-        // CSS Text treats TAB, LF, and CR as document white space. Form feed
-        // is a visible Cc character in the white-space processing tests and
-        // must not be discarded merely because generic CSS token whitespace
-        // handling recognizes it.
-        && !matches!(character, '\t' | '\n' | '\r')
-        && character != INLINE_BREAK
 }
 
 pub(in crate::layout) fn pre_wrap_inline_text_for_style(
@@ -250,6 +205,7 @@ pub(in crate::layout) fn collect_pre_wrap_inline_text(node: &Node, output: &mut 
 pub(in crate::layout) const INLINE_BREAK: char = '\u{FDD0}';
 
 pub(in crate::layout) fn normalize_inline_text(text: &str) -> String {
+    let text = css_text_rendering_text(text);
     let mut output = String::new();
     let mut last_was_space = true;
     for character in text.chars() {
@@ -276,7 +232,7 @@ pub(in crate::layout) fn normalize_pre_wrap_text_for_style(
     text: &str,
     _style: &ComputedStyle,
 ) -> String {
-    text.replace("\r\n", "\n").replace('\r', "\n")
+    css_text_rendering_text(text)
 }
 
 pub(in crate::layout) fn normalize_pre_line_text_for_style(

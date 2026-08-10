@@ -28,7 +28,7 @@ but spec conformance takes priority when behavior differs.
   layout grids: leading ASCII digits are parsed, trailing junk is ignored,
   invalid values default to 1, `rowspan=0` spans to the row-group end, and
   column/row spans are clamped to the HTML table-model bounds.
-- HTML presentational hints are enabled by default and map table dimensions, border color,
+- HTML presentational hints are always applied for HTML documents and map table dimensions, border color,
   cell spacing, cell padding, and legacy structural `background` URLs through
   the ordinary author-origin cascade. Author CSS therefore overrides the hints,
   and resource URLs retain the document URL context.

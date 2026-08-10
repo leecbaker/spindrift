@@ -1,6 +1,55 @@
 use super::*;
 use crate::units::{LayoutLength, LayoutSize, layout_pt};
+use cssparser::{BasicParseErrorKind, Parser, ParserInput};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// A decoded cascade-layer path.
+///
+/// CSS layer names are a sequence of identifiers, not a serialized dot
+/// string. Keeping the segments separate prevents an escaped literal dot in
+/// an identifier from becoming indistinguishable from the layer separator.
+/// <https://www.w3.org/TR/css-cascade-5/#typedef-layer-name>
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct LayerName(pub(in crate::css) Vec<LayerSegment>);
+
+impl LayerName {
+    pub(in crate::css) fn nested(&self, child: Self) -> Self {
+        let mut segments = self.0.clone();
+        segments.extend(child.0);
+        Self(segments)
+    }
+
+    pub(in crate::css) fn anonymous() -> Self {
+        Self(vec![LayerSegment::Anonymous(AnonymousLayerId::next())])
+    }
+
+    pub(in crate::css) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// One segment in a [`LayerName`]. Anonymous layers are deliberately not
+/// representable by any CSS identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(in crate::css) enum LayerSegment {
+    Named(String),
+    Anonymous(AnonymousLayerId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(in crate::css) struct AnonymousLayerId(u64);
+
+impl AnonymousLayerId {
+    fn next() -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+/// A lexicographic position in the cascade-layer tree.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct LayerOrder(pub(in crate::css) Vec<usize>);
 
 /// The output medium used when evaluating CSS Media Queries.
 ///
@@ -8,9 +57,20 @@ use std::collections::HashMap;
 /// defaults to `print`, while callers that render a screen snapshot can select
 /// `screen`: <https://www.w3.org/TR/mediaqueries-4/#media-types>.
 ///
-/// ```
-/// let medium = quire::MediaType::Print;
-/// assert_eq!(medium, quire::MediaType::Print);
+/// ```no_run
+/// use quire::{Html, MediaType, PdfOptions, RenderOptions};
+/// use std::fs::File;
+///
+/// # async fn render() -> quire::Result<()> {
+/// let mut render_options = RenderOptions::default();
+/// render_options.media_type = MediaType::Screen;
+/// let mut output = File::create("document.pdf")?;
+/// Html::from_file("document.html")
+///     .await?
+///     .write_pdf(&mut output, &render_options, &PdfOptions::default())
+///     .await?;
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MediaType {
@@ -26,6 +86,24 @@ pub enum MediaType {
 /// CSS CssColor Adjustment requires an active forced-colors environment to make
 /// its limited palette available through CSS system color keywords:
 /// <https://www.w3.org/TR/css-color-adjust-1/#forced-colors-mode>.
+///
+/// ```no_run
+/// use quire::{
+///     ForcedColorPalette, ForcedColorsMode, Html, PdfOptions, RenderOptions,
+/// };
+/// use std::fs::File;
+///
+/// # async fn render() -> quire::Result<()> {
+/// let mut render_options = RenderOptions::default();
+/// render_options.forced_colors = ForcedColorsMode::Active(ForcedColorPalette::DARK);
+/// let mut output = File::create("document.pdf")?;
+/// Html::from_file("document.html")
+///     .await?
+///     .write_pdf(&mut output, &render_options, &PdfOptions::default())
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ForcedColorPalette {
     /// `Canvas`.
@@ -118,6 +196,24 @@ impl ForcedColorPalette {
 }
 
 /// Whether CSS forced-colors mode is active for this render.
+///
+/// ```no_run
+/// use quire::{
+///     ForcedColorPalette, ForcedColorsMode, Html, PdfOptions, RenderOptions,
+/// };
+/// use std::fs::File;
+///
+/// # async fn render() -> quire::Result<()> {
+/// let mut render_options = RenderOptions::default();
+/// render_options.forced_colors = ForcedColorsMode::Active(ForcedColorPalette::LIGHT);
+/// let mut output = File::create("document.pdf")?;
+/// Html::from_file("document.html")
+///     .await?
+///     .write_pdf(&mut output, &render_options, &PdfOptions::default())
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 #[allow(clippy::large_enum_variant)] // Public Copy render option avoids per-style indirection.
 pub enum ForcedColorsMode {
@@ -213,6 +309,15 @@ pub(crate) enum ForcedColorAdjust {
 pub enum CssViewportSpace {}
 
 /// A viewport size expressed in CSS pixels.
+///
+/// This type is used to construct a [`MediaEnvironment`]. PDF rendering derives
+/// its viewport from the initial page box, which author CSS may replace through
+/// the `@page` `size` descriptor.
+///
+/// ```
+/// let viewport = quire::CssViewportSize::new(800.0, 600.0);
+/// assert_eq!(viewport.width, 800.0);
+/// ```
 pub type CssViewportSize = euclid::Size2D<f32, CssViewportSpace>;
 
 /// Physical and logical viewport bases for resolving CSS viewport units.
@@ -222,6 +327,9 @@ pub type CssViewportSize = euclid::Size2D<f32, CssViewportSpace>;
 pub(crate) struct ViewportLengthBasis {
     physical: LayoutSize,
     writing_mode: WritingMode,
+    /// Layout-time container-unit basis. When absent, container-relative
+    /// lengths use the required small-viewport fallback.
+    container_physical: Option<LayoutSize>,
 }
 
 impl ViewportLengthBasis {
@@ -229,7 +337,19 @@ impl ViewportLengthBasis {
         Self {
             physical,
             writing_mode,
+            container_physical: None,
         }
+    }
+
+    /// Supply the physical query-container axes selected during layout.
+    ///
+    /// The current element's writing mode remains the projection context for
+    /// `cqi`/`cqb`; only the independently selected physical width and height
+    /// bases come from ancestor query containers.
+    /// <https://drafts.csswg.org/css-conditional-5/#container-lengths>
+    pub(crate) fn with_container_physical(mut self, physical: LayoutSize) -> Self {
+        self.container_physical = Some(physical);
+        self
     }
 
     pub(crate) fn vw(self, percentage: f32) -> LayoutLength {
@@ -272,7 +392,10 @@ impl ViewportLengthBasis {
     /// viewport. Quire's fixed paged viewport makes that the active page area.
     /// <https://www.w3.org/TR/css-contain-3/#container-lengths>
     pub(crate) fn container_fallback(self) -> ContainerLengthBasis {
-        ContainerLengthBasis::for_writing_mode(self.physical, self.writing_mode)
+        ContainerLengthBasis::for_writing_mode(
+            self.container_physical.unwrap_or(self.physical),
+            self.writing_mode,
+        )
     }
 }
 
@@ -415,6 +538,19 @@ pub(crate) struct RootFontMetricLengthBasis {
 /// computed style values, because media conditions must be evaluated before
 /// their declarations enter the cascade:
 /// <https://www.w3.org/TR/mediaqueries-4/#media-features>.
+///
+/// `Html::render` derives this environment from [`crate::RenderOptions`], so
+/// applications normally configure the public render options directly.
+///
+/// ```
+/// use quire::{CssViewportSize, MediaEnvironment, MediaType};
+///
+/// let environment = MediaEnvironment::new(
+///     MediaType::Screen,
+///     CssViewportSize::new(1280.0, 720.0),
+/// );
+/// assert_eq!(environment.media_type, MediaType::Screen);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MediaEnvironment {
     /// Rendering target selected for media queries.
@@ -434,6 +570,22 @@ pub struct MediaEnvironment {
 /// scheme. `None` is intentionally the default: in that case the first
 /// author-supported scheme wins.
 /// <https://www.w3.org/TR/css-color-adjust-1/#color-scheme-preference>
+///
+/// ```no_run
+/// use quire::{ColorSchemePreference, Html, PdfOptions, RenderOptions};
+/// use std::fs::File;
+///
+/// # async fn render() -> quire::Result<()> {
+/// let mut render_options = RenderOptions::default();
+/// render_options.color_scheme_preference = ColorSchemePreference::Dark;
+/// let mut output = File::create("document.pdf")?;
+/// Html::from_file("document.html")
+///     .await?
+///     .write_pdf(&mut output, &render_options, &PdfOptions::default())
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ColorSchemePreference {
     /// The user has not expressed a preference; the first supported scheme wins.
@@ -450,7 +602,7 @@ pub enum ColorSchemePreference {
 }
 
 /// One of the color schemes whose rendering behavior Quire implements.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum UsedColorScheme {
     Light,
     Dark,
@@ -467,6 +619,19 @@ impl ColorSchemePreference {
 
     pub(crate) const fn is_override(self) -> bool {
         matches!(self, Self::OverrideLight | Self::OverrideDark)
+    }
+
+    /// The value exposed by the `prefers-color-scheme` media feature.
+    ///
+    /// Media Queries intentionally exposes the ordinary default as `light`,
+    /// while `None` remains distinct for CSS Color Adjustment's used-scheme
+    /// selection, where the first author-supported scheme wins.
+    /// <https://www.w3.org/TR/mediaqueries-5/#prefers-color-scheme>
+    pub(crate) const fn media_query_scheme(self) -> UsedColorScheme {
+        match self {
+            Self::Dark | Self::OverrideDark => UsedColorScheme::Dark,
+            Self::None | Self::Light | Self::OverrideLight => UsedColorScheme::Light,
+        }
     }
 }
 
@@ -973,7 +1138,7 @@ pub(crate) struct Stylesheet {
     /// CSS Cascade Level 5 defines layer ordering by first declaration, with
     /// unlayered normal declarations ordered after all layered declarations:
     /// <https://www.w3.org/TR/css-cascade-5/#layer-order>.
-    pub layer_names: Vec<String>,
+    pub layer_names: Vec<LayerName>,
     /// Prefix bindings declared by CSS `@namespace` rules.
     ///
     /// Selector parsing consumes these bindings immediately, but declaration
@@ -1247,7 +1412,7 @@ impl<'a> Stylesheets<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum StylesheetOrigin {
     UserAgent,
     User,
@@ -1272,7 +1437,7 @@ pub(crate) struct PageRule {
     /// cascade layers to that ordering:
     /// <https://www.w3.org/TR/css-page-3/#cascading-and-page-context> and
     /// <https://www.w3.org/TR/css-cascade-5/#layering>.
-    pub layer_order: Option<usize>,
+    pub layer_order: Option<LayerOrder>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1518,7 +1683,7 @@ pub(crate) struct StyleRule {
     #[allow(dead_code)]
     pub specificity: u32,
     pub order: usize,
-    pub layer_name: Option<String>,
+    pub layer_name: Option<LayerName>,
     pub scopes: Vec<ScopeRule>,
 }
 
@@ -1533,6 +1698,9 @@ pub(crate) struct ContainerRule {
     /// axes and computed style for threshold resolution.
     pub prelude: String,
     pub rules: Vec<StyleRule>,
+    /// Nested container queries retain their own condition instead of being
+    /// flattened into the outer query before layout-time evaluation.
+    pub nested: Vec<ContainerRule>,
 }
 
 #[allow(
@@ -1558,6 +1726,10 @@ impl ContainerRule {
     pub(crate) fn rules(&self) -> &[StyleRule] {
         &self.rules
     }
+
+    pub(crate) fn nested(&self) -> &[ContainerRule] {
+        &self.nested
+    }
 }
 
 impl Stylesheet {
@@ -1570,6 +1742,81 @@ impl Stylesheet {
     }
 }
 
+/// A CSS Animations `<keyframes-name>`.
+///
+/// The name has already been decoded from an identifier or string token. Its
+/// equality is intentionally case-sensitive, as required when matching an
+/// `animation-name` against an `@keyframes` rule:
+/// <https://www.w3.org/TR/css-animations-1/#keyframes>
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KeyframesName(String);
+
+impl KeyframesName {
+    /// Parses one complete `<keyframes-name>` from CSS tokens.
+    ///
+    /// CSS Animations permits either a `<custom-ident>` or a `<string>`. The
+    /// unquoted form excludes CSS-wide keywords, `default`, and `none`; a
+    /// quoted string remains valid for every decoded value.
+    /// <https://www.w3.org/TR/css-animations-1/#typedef-keyframes-name>
+    pub(in crate::css) fn parse<'i, 't>(
+        input: &mut Parser<'i, 't>,
+    ) -> Result<Self, cssparser::ParseError<'i, BasicParseErrorKind<'i>>> {
+        if let Ok(ident) = input.try_parse(|input| input.expect_ident_cloned()) {
+            if Self::unquoted_identifier_is_reserved(&ident) {
+                return Err(input.new_custom_error(BasicParseErrorKind::QualifiedRuleInvalid));
+            }
+            input.expect_exhausted()?;
+            return Ok(Self(ident.to_string()));
+        }
+
+        let string = input.expect_string_cloned()?;
+        input.expect_exhausted()?;
+        Ok(Self(string.to_string()))
+    }
+
+    /// Parses a complete keyframes name retained as a declaration-value slice.
+    pub(in crate::css) fn parse_css(value: &str) -> Option<Self> {
+        let mut input = ParserInput::new(value);
+        let mut parser = Parser::new(&mut input);
+        Self::parse(&mut parser).ok()
+    }
+
+    /// Serializes the decoded keyframes name as a CSS string token. Keeping
+    /// the snapshot state decoded makes keyframe-name comparison correct;
+    /// quoting here provides an unambiguous declaration value when a
+    /// shorthand is expanded into `animation-name`.
+    pub(in crate::css) fn to_css_string(&self) -> String {
+        let mut output = String::with_capacity(self.0.len() + 2);
+        output.push('"');
+        for character in self.0.chars() {
+            match character {
+                '"' | '\\' => {
+                    output.push('\\');
+                    output.push(character);
+                }
+                '\n' => output.push_str("\\a "),
+                '\r' => output.push_str("\\d "),
+                '\u{000C}' => output.push_str("\\c "),
+                character => output.push(character),
+            }
+        }
+        output.push('"');
+        output
+    }
+
+    #[cfg(test)]
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn unquoted_identifier_is_reserved(value: &str) -> bool {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "initial" | "inherit" | "unset" | "revert" | "revert-layer" | "default" | "none"
+        )
+    }
+}
+
 /// One named CSS keyframes rule.
 ///
 /// CSS Animations stores keyframes separately from ordinary style rules: a
@@ -1578,7 +1825,7 @@ impl Stylesheet {
 /// <https://www.w3.org/TR/css-animations-1/#keyframes>
 #[derive(Debug, Clone)]
 pub(crate) struct KeyframesRule {
-    pub(crate) name: String,
+    pub(crate) name: KeyframesName,
     pub(crate) steps: Vec<KeyframeStep>,
 }
 
@@ -1599,8 +1846,26 @@ pub(crate) struct KeyframeStep {
 /// <https://www.w3.org/TR/css-cascade-5/#scoped-styles>.
 #[derive(Debug, Clone)]
 pub(crate) struct ScopeRule {
-    pub root: SelectorList<QuireSelectorImpl>,
+    pub root: ScopeRoot,
     pub limit: Option<SelectorList<QuireSelectorImpl>>,
+}
+
+/// The upper boundary of a CSS `@scope` rule.
+#[derive(Debug, Clone)]
+pub(crate) enum ScopeRoot {
+    Explicit(SelectorList<QuireSelectorImpl>),
+    Owner(StylesheetScopeAnchor),
+}
+
+/// The DOM context used by an empty `@scope` prelude.
+///
+/// CSS scopes an empty-prelude rule to the parent of the owning stylesheet
+/// node, or to the containing tree root when it has no parent element:
+/// <https://drafts.csswg.org/css-cascade-6/#scope-atrule>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum StylesheetScopeAnchor {
+    DocumentRoot,
+    Element(crate::dom::ElementId),
 }
 
 #[derive(Debug, Clone, Default)]

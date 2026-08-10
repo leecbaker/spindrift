@@ -1,13 +1,14 @@
 use crate::document::Page;
 
 use super::annotations::RenderedLink;
+use super::contours::{OverflowClipEffect, ResolvedBoxContentClip};
 use super::display_list::PaintDisplayItem;
 use super::geometry::{
-    AxisSelectivePaintClip, PaintClip, PaintClipUnion, PaintPoint, PaintTransform, PaintTranslation,
+    Affine3dPaintTransform, AxisSelectivePaintClip, PaintClip, PaintClipUnion, PaintPoint,
+    PaintTransform, PaintTranslation, Projective3dPaintTransform,
 };
 use super::page::{PaintOperation, PaintPrimitive};
 use super::paths::RenderedPathClip;
-use super::shapes::RenderedRoundedRect;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PaintEffectScope {
@@ -46,7 +47,13 @@ impl PaintEffectScope {
 
     pub(crate) fn monolithic(bounds: PaintClip, items: Vec<PaintDisplayItem>) -> Self {
         Self {
-            effects: PaintEffects::default(),
+            // This scope is introduced by anonymous fragmentation machinery,
+            // not by a CSS box, so it must never introduce a `flat` boundary
+            // inside a 3D rendering context.
+            effects: PaintEffects {
+                three_d_participation: ThreeDParticipation::TransparentLayoutBridge,
+                ..PaintEffects::default()
+            },
             bounds: Some(bounds),
             fragmentation: PaintFragmentation::Monolithic,
             items,
@@ -166,6 +173,7 @@ impl PaintEffectScope {
     pub(in crate::document) fn push_transformed_links(
         &self,
         transform: PaintTransform,
+        clip: Option<PaintClip>,
         links: &mut Vec<RenderedLink>,
     ) {
         if self.effects.suppresses_paint() {
@@ -176,9 +184,23 @@ impl PaintEffectScope {
         } else {
             transform
         };
+        let clip = intersect_link_clip(
+            clip,
+            self.effects
+                .scene_plane_clip
+                .map(|clip| transform.apply_clip_to_aabb(clip.bounds())),
+        );
         for item in &self.items {
-            item.push_transformed_links(transform, links);
+            item.push_transformed_links(transform, clip, links);
         }
+    }
+}
+
+fn intersect_link_clip(left: Option<PaintClip>, right: Option<PaintClip>) -> Option<PaintClip> {
+    match (left, right) {
+        (Some(left), Some(right)) => left.intersect(right),
+        (Some(clip), None) | (None, Some(clip)) => Some(clip),
+        (None, None) => None,
     }
 }
 
@@ -191,19 +213,36 @@ impl PaintEffectScope {
 pub(crate) struct PaintEffects {
     pub(crate) opacity: f32,
     pub(crate) transform: Option<PaintTransform>,
+    /// The local affine 3D matrix retained until a `preserve-3d` rendering
+    /// context chooses its final page-plane transform.
+    pub(crate) affine_3d_transform: Option<Affine3dPaintTransform>,
+    /// A non-affine 3D projection retained until projective primitive lowering.
+    /// This is intentionally separate from the affine fast path because PDF
+    /// content streams cannot express it as a graphics-state CTM.
+    pub(crate) projective_3d_transform: Option<Projective3dPaintTransform>,
+    /// A `perspective` property applies to children, rather than to the
+    /// perspective element's own plane.
+    pub(crate) descendant_projective_3d_transform: Option<Projective3dPaintTransform>,
+    pub(crate) three_d_participation: ThreeDParticipation,
+    /// The computed `backface-visibility` choice. Its final visibility is
+    /// resolved against the accumulated 3D matrix, not this local matrix.
+    pub(crate) hide_backface: bool,
     /// A non-invertible CSS transform suppresses the entire transformed
     /// element, including its descendants and links.
     /// <https://www.w3.org/TR/css-transforms-1/#transform-rendering>
     pub(crate) suppress_paint: bool,
-    pub(crate) overflow_clip: Option<PaintClip>,
-    /// Overflow clip retained without collapsing a visible physical axis into
-    /// a finite rectangle. Generic clips continue to use `overflow_clip`.
-    pub(crate) axis_selective_overflow_clip: Option<AxisSelectivePaintClip>,
-    /// A disjoint union of rectangular overflow clips. This keeps table-cell
-    /// rowspan holes intact through retained paint and PDF serialization.
-    pub(crate) overflow_clip_union: Option<PaintClipUnion>,
-    pub(crate) rounded_overflow_clip: Option<RenderedRoundedRect>,
+    /// CSS Overflow clipping, retained independently from CSS `clip-path`.
+    ///
+    /// This is deliberately a single logical effect: a contoured edge carries
+    /// its conservative bounds with the exact path, while rectangular,
+    /// axis-selective, and fragmented-table-union cases preserve their own
+    /// geometry without formatter-specific side channels.
+    pub(crate) overflow_clip_effect: Option<OverflowClipEffect>,
     pub(crate) absolute_clip: Option<PaintClip>,
+    /// Internal convex fragment clip emitted when Newell ordering splits a
+    /// 3D scene plane. It composes with authored clips rather than replacing
+    /// them.
+    pub(crate) scene_plane_clip: Option<RenderedClipPathPolygon>,
     pub(crate) clip_path: PaintClipPathEffect,
     pub(crate) mask: PaintMaskEffect,
     pub(crate) filter: PaintFilterEffect,
@@ -216,12 +255,15 @@ impl Default for PaintEffects {
         Self {
             opacity: 1.0,
             transform: None,
+            affine_3d_transform: None,
+            projective_3d_transform: None,
+            descendant_projective_3d_transform: None,
+            three_d_participation: ThreeDParticipation::Flat,
+            hide_backface: false,
             suppress_paint: false,
-            overflow_clip: None,
-            axis_selective_overflow_clip: None,
-            overflow_clip_union: None,
-            rounded_overflow_clip: None,
+            overflow_clip_effect: None,
             absolute_clip: None,
+            scene_plane_clip: None,
             clip_path: PaintClipPathEffect::None,
             mask: PaintMaskEffect::None,
             filter: PaintFilterEffect::None,
@@ -231,23 +273,124 @@ impl Default for PaintEffects {
     }
 }
 
+/// An element's role while paint records are assembled into a CSS 3D scene.
+///
+/// Anonymous layout boxes use `TransparentLayoutBridge` so table fixup and
+/// block-in-inline wrappers cannot accidentally create an element-level
+/// `flat` boundary.
+/// <https://drafts.csswg.org/css-transforms-2/#3d-rendering-contexts>
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ThreeDParticipation {
+    #[default]
+    Flat,
+    Preserve3d,
+    TransparentLayoutBridge,
+}
+
 impl PaintEffects {
+    /// An internally introduced overflow scope carries an authored clip but
+    /// is not itself a CSS box. It must not introduce an extra used-`flat`
+    /// boundary into an enclosing 3D rendering context.
+    /// <https://drafts.csswg.org/css-transforms-2/#grouping-property-values>
+    pub(crate) fn transparent_overflow_scope(effect: OverflowClipEffect) -> Self {
+        Self {
+            overflow_clip_effect: Some(effect),
+            three_d_participation: ThreeDParticipation::TransparentLayoutBridge,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn is_effect_free_transparent_layout_bridge(&self) -> bool {
+        self.three_d_participation == ThreeDParticipation::TransparentLayoutBridge
+            && self.opacity >= 1.0
+            && self.transform.is_none()
+            && self.affine_3d_transform.is_none()
+            && self.projective_3d_transform.is_none()
+            && self.descendant_projective_3d_transform.is_none()
+            && !self.hide_backface
+            && !self.suppress_paint
+            && self.overflow_clip_effect.is_none()
+            && self.absolute_clip.is_none()
+            && self.scene_plane_clip.is_none()
+            && !self.clip_path.is_active()
+            && !self.mask.is_active()
+            && !self.filter.is_active()
+            && self.blend_mode == PaintBlendMode::Normal
+            && !self.isolation
+    }
+    /// Conservative bounds for one non-union overflow effect.  This is for
+    /// culling and fragmentation only; painting must retain the exact enum.
+    pub(crate) fn overflow_clip_bounds(&self) -> Option<PaintClip> {
+        match self.overflow_clip_effect.as_ref()? {
+            OverflowClipEffect::Rect(clip) => Some(*clip),
+            OverflowClipEffect::AxisSelective(clip) => Some(clip.bounds()),
+            OverflowClipEffect::Union(_) => None,
+            OverflowClipEffect::Contoured(clip) => Some(clip.bounds),
+        }
+    }
+
+    pub(crate) fn set_rectangular_overflow_clip(&mut self, clip: Option<PaintClip>) {
+        self.overflow_clip_effect = clip.map(OverflowClipEffect::Rect);
+    }
+
+    /// Restrict an already-retained non-union overflow edge to a replay or
+    /// fragmentainer rectangle while preserving its semantic edge kind.
+    pub(crate) fn intersect_overflow_clip_bounds(&mut self, clip: PaintClip) {
+        self.overflow_clip_effect = match self.overflow_clip_effect.take() {
+            Some(OverflowClipEffect::Rect(existing)) => {
+                existing.intersect(clip).map(OverflowClipEffect::Rect)
+            }
+            Some(OverflowClipEffect::AxisSelective(existing)) => {
+                existing.bounds().intersect(clip).map(|bounds| {
+                    OverflowClipEffect::AxisSelective(AxisSelectivePaintClip::new(
+                        bounds,
+                        existing.clips_x(),
+                        existing.clips_y(),
+                    ))
+                })
+            }
+            Some(OverflowClipEffect::Contoured(mut existing)) => {
+                existing.bounds = existing.bounds.intersect(clip).unwrap_or(PaintClip::new(
+                    clip.x(),
+                    clip.y(),
+                    0.0,
+                    0.0,
+                ));
+                Some(OverflowClipEffect::Contoured(existing))
+            }
+            // A fragmented table union cannot be compressed to one
+            // rectangle. Its owning replay keeps the union scope; callers
+            // that need an additional outer fragmentainer clip must wrap it.
+            Some(OverflowClipEffect::Union(existing)) => Some(OverflowClipEffect::Union(existing)),
+            None => Some(OverflowClipEffect::Rect(clip)),
+        };
+    }
+
+    /// Remove only CSS Overflow effects while preserving independent absolute
+    /// clipping, CSS `clip-path`, masks, filters, and transforms. Atomic
+    /// replaced-element scopes use this when their content primitive owns the
+    /// exact content edge and the enclosing scope also contains decoration.
+    pub(crate) fn clear_overflow_clip_effects(&mut self) {
+        self.overflow_clip_effect = None;
+    }
+
     pub(crate) const fn suppresses_paint(&self) -> bool {
         self.suppress_paint
     }
 
     pub(crate) fn translated(mut self, offset: PaintTranslation) -> Self {
-        self.overflow_clip = self.overflow_clip.map(|clip| clip.translated(offset));
-        self.axis_selective_overflow_clip = self
-            .axis_selective_overflow_clip
-            .map(|clip| clip.translated(offset));
-        self.overflow_clip_union = self
-            .overflow_clip_union
-            .map(|clips| clips.translated(offset));
-        self.rounded_overflow_clip = self
-            .rounded_overflow_clip
-            .map(|clip| clip.translated(offset));
+        self.overflow_clip_effect = self.overflow_clip_effect.map(|effect| match effect {
+            OverflowClipEffect::Rect(clip) => OverflowClipEffect::Rect(clip.translated(offset)),
+            OverflowClipEffect::AxisSelective(clip) => {
+                OverflowClipEffect::AxisSelective(clip.translated(offset))
+            }
+            OverflowClipEffect::Union(clips) => OverflowClipEffect::Union(clips.translated(offset)),
+            OverflowClipEffect::Contoured(clip) => {
+                OverflowClipEffect::Contoured(clip.translated(offset))
+            }
+        });
         self.absolute_clip = self.absolute_clip.map(|clip| clip.translated(offset));
+        self.scene_plane_clip = self.scene_plane_clip.map(|clip| clip.translated(offset));
         self.clip_path = match self.clip_path {
             PaintClipPathEffect::Polygon(polygon) => {
                 PaintClipPathEffect::Polygon(Box::new((*polygon).translated(offset)))
@@ -288,17 +431,20 @@ impl PaintEffects {
         if let Some(clip) = self.absolute_clip {
             steps.push(PaintEffectStep::Clip(clip));
         }
-        if let Some(clip) = self.overflow_clip {
-            steps.push(PaintEffectStep::Clip(clip));
+        if let Some(effect) = &self.overflow_clip_effect {
+            match effect {
+                OverflowClipEffect::Rect(clip) => steps.push(PaintEffectStep::Clip(*clip)),
+                OverflowClipEffect::AxisSelective(clip) => {
+                    steps.push(PaintEffectStep::AxisSelectiveClip(*clip))
+                }
+                OverflowClipEffect::Union(clips) => steps.push(PaintEffectStep::ClipUnion(*clips)),
+                OverflowClipEffect::Contoured(clip) => {
+                    steps.push(PaintEffectStep::ContouredOverflowClip(clip.clone()))
+                }
+            }
         }
-        if let Some(clip) = self.axis_selective_overflow_clip {
-            steps.push(PaintEffectStep::AxisSelectiveClip(clip));
-        }
-        if let Some(clips) = &self.overflow_clip_union {
-            steps.push(PaintEffectStep::ClipUnion(*clips));
-        }
-        if let Some(clip) = self.rounded_overflow_clip {
-            steps.push(PaintEffectStep::RoundedClip(clip));
+        if let Some(clip) = self.scene_plane_clip {
+            steps.push(PaintEffectStep::ScenePlaneClip(Box::new(clip)));
         }
         if self.clip_path.is_active() {
             steps.push(PaintEffectStep::ClipPath(self.clip_path.clone()));
@@ -331,6 +477,10 @@ impl PaintEffects {
 pub(crate) enum PaintClipPathEffect {
     None,
     Polygon(Box<RenderedClipPathPolygon>),
+    #[expect(
+        dead_code,
+        reason = "CSS path() parsing is retained separately from box contour clipping"
+    )]
     Path(RenderedPathClip),
     Shape,
     Url,
@@ -364,13 +514,16 @@ impl PaintMaskEffect {
 
 /// Filter source recorded for context-level PDF grouping.
 ///
-/// Filter function rendering is not complete yet; this type distinguishes real
-/// authored filters from `will-change` pre-isolation.
+/// [`Exact`](Self::Exact) is the narrow set of sRGB color transforms that can
+/// be distributed across ordinary source-over paint without a raster surface.
+/// All other valid filter values intentionally retain their grouping behavior
+/// as [`RequiresRasterBackend`](Self::RequiresRasterBackend).
 /// <https://www.w3.org/TR/filter-effects-1/#FilterProperty>.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum PaintFilterEffect {
     None,
-    FilterList,
+    Exact(crate::css::ExactFilterLowering),
+    RequiresRasterBackend,
     WillChange,
 }
 
@@ -436,7 +589,8 @@ pub(crate) enum PaintEffectStep {
     Clip(PaintClip),
     AxisSelectiveClip(AxisSelectivePaintClip),
     ClipUnion(PaintClipUnion),
-    RoundedClip(RenderedRoundedRect),
+    ContouredOverflowClip(ResolvedBoxContentClip),
+    ScenePlaneClip(Box<RenderedClipPathPolygon>),
     ClipPath(PaintClipPathEffect),
     Transform(PaintTransform),
     Filter(PaintFilterEffect),
@@ -481,6 +635,30 @@ impl RenderedClipPathPolygon {
         &self.points[..usize::from(self.len)]
     }
 
+    /// Conservative axis-aligned bounds of a retained local scene fragment.
+    /// PDF annotations are rectangles, so clipping a split link annotation to
+    /// this box is the most precise representation available at that boundary.
+    pub(in crate::document) fn bounds(&self) -> PaintClip {
+        let points = self.points();
+        let min_x = points
+            .iter()
+            .map(|point| point.x)
+            .fold(f32::INFINITY, f32::min);
+        let max_x = points
+            .iter()
+            .map(|point| point.x)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let min_y = points
+            .iter()
+            .map(|point| point.y)
+            .fold(f32::INFINITY, f32::min);
+        let max_y = points
+            .iter()
+            .map(|point| point.y)
+            .fold(f32::NEG_INFINITY, f32::max);
+        PaintClip::new(min_x, min_y, max_x - min_x, max_y - min_y)
+    }
+
     pub(in crate::document) fn translated(mut self, offset: PaintTranslation) -> Self {
         for point in &mut self.points[..usize::from(self.len)] {
             *point = offset.transform_point(*point);
@@ -491,14 +669,16 @@ impl RenderedClipPathPolygon {
 
 #[cfg(test)]
 mod tests {
-    use super::{PaintEffectStep, PaintEffects};
-    use crate::document::paint::geometry::{PaintClip, PaintTransform};
+    use super::{PaintEffectStep, PaintEffects, RenderedClipPathPolygon};
+    use crate::document::paint::geometry::{PaintClip, PaintPoint, PaintTransform};
 
     #[test]
     fn transform_establishes_the_coordinate_system_before_overflow_clip() {
         let effects = PaintEffects {
             transform: Some(PaintTransform::scale(2.0, 2.0)),
-            overflow_clip: Some(PaintClip::new(10.0, 20.0, 30.0, 40.0)),
+            overflow_clip_effect: Some(super::OverflowClipEffect::Rect(PaintClip::new(
+                10.0, 20.0, 30.0, 40.0,
+            ))),
             ..PaintEffects::default()
         };
 
@@ -506,5 +686,17 @@ mod tests {
             effects.ordered_steps().as_slice(),
             [PaintEffectStep::Transform(_), PaintEffectStep::Clip(_)]
         ));
+    }
+
+    #[test]
+    fn scene_plane_polygon_bounds_cover_every_vertex() {
+        let polygon = RenderedClipPathPolygon::new(&[
+            PaintPoint::new(-5.0, 7.0),
+            PaintPoint::new(3.0, -2.0),
+            PaintPoint::new(11.0, 4.0),
+        ])
+        .expect("three points form a polygon");
+
+        assert_eq!(polygon.bounds(), PaintClip::new(-5.0, -2.0, 16.0, 9.0));
     }
 }

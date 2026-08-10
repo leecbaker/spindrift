@@ -50,6 +50,23 @@ impl<'a> LayoutBuilder<'a> {
                     available_width,
                 ))
             }
+            box_tree::FormattingBox::Replaced(box_)
+                if replaced_element_kind(box_.core.element) == Some(ReplacedElementKind::Image)
+                    && box_
+                        .core
+                        .element
+                        .attrs
+                        .get("src")
+                        .is_none_or(|source| source.is_empty()) =>
+            {
+                // An `img` with no image source has no intrinsic replaced
+                // object. Its percentage height is ignored for table-row
+                // minimum sizing, and its final percentage layout may not
+                // feed back into the distributed row plan.
+                // <https://drafts.csswg.org/css-tables-3/#row-layout>
+                // <https://html.spec.whatwg.org/multipage/images.html#the-img-element>
+                Some(0.0)
+            }
             box_tree::FormattingBox::AtomicInline(box_) => {
                 Some(self.table_cell_row_minimum_atomic_inline_outer_height(
                     &box_.core.style,
@@ -670,6 +687,7 @@ impl<'a> LayoutBuilder<'a> {
             table_metrics: table_metrics.clone(),
             collapsed_geometry: collapsed_geometry.as_ref(),
             wrapper_border_box_block_size: None,
+            positioned_table_block_content_size: None,
             wrapper_non_grid_block_size: layout_pt(0.0),
         };
 
@@ -1034,9 +1052,16 @@ impl<'a> LayoutBuilder<'a> {
         table_style: &ComputedStyle,
         stylesheets: &Stylesheets<'_>,
         table_x: f32,
-        table_width: f32,
+        table_width: TableCaptionOuterWidth,
         side: CaptionSide,
     ) {
+        let table_width = table_width.points();
+        if std::env::var_os("QUIRE_TRACE_TABLE_CAPTION").is_some() {
+            eprintln!(
+                "table caption container: side={side:?} input_x={table_x} input_width={table_width} parent=({}, {}) cursor={}",
+                self.content_left, self.content_right, self.cursor_y,
+            );
+        }
         for caption in captions {
             let mut caption_style = self.style_for_table_caption(caption, table_style, stylesheets);
             if caption_style.caption_side != side || caption_style.display.is_none() {
@@ -1110,6 +1135,12 @@ impl<'a> LayoutBuilder<'a> {
             };
             let previous_left = self.content_left;
             let previous_right = self.content_right;
+            if std::env::var_os("QUIRE_TRACE_TABLE_CAPTION").is_some() {
+                eprintln!(
+                    " caption: style={:?}/{:?} available_width={caption_available_width}",
+                    caption_style.writing_mode, caption_style.caption_side,
+                );
+            }
             self.content_left = table_x;
             self.content_right = table_x + caption_available_width;
             self.push_float_context();

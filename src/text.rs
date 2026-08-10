@@ -752,15 +752,87 @@ impl ShapedInlineGlyph {
 /// <https://www.w3.org/TR/css-text-3/#line-break-details>.
 pub(crate) const OBJECT_REPLACEMENT_CHARACTER: char = '\u{fffc}';
 
+/// One scalar after CSS Text's control-character classification.
+///
+/// CSS Text gives Unicode `Cc` scalars a meaning before white-space
+/// processing and shaping. Keeping that classification typed makes it
+/// impossible for a visible control to accidentally enter a whitespace-only
+/// path merely because it is represented as a Rust `char`.
+/// <https://www.w3.org/TR/css-text-3/#white-space-processing>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CssTextScalar {
+    DocumentSpace,
+    Tab,
+    SegmentBreak,
+    CarriageReturn,
+    VisibleControl(VisibleControlCharacter),
+    Text(char),
+}
+
+/// A Unicode control character CSS Text requires the UA to render visibly.
+///
+/// Construction is private to [`classify_css_text_scalar`], which excludes
+/// tab, line feed, and carriage return. Those characters retain their
+/// separate CSS white-space semantics.
+/// <https://www.w3.org/TR/css-text-3/#white-space-processing>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VisibleControlCharacter(char);
+
+impl VisibleControlCharacter {
+    /// The portable visible symbol Quire shapes for a control character.
+    ///
+    /// U+25A0 BLACK SQUARE is an `So` / Common character, matching CSS Text's
+    /// required text-processing class without relying on a font-specific
+    /// `.notdef` glyph for a C0 or C1 code point. The original scalar remains
+    /// in the DOM/computed generated-content value; this is rendering text.
+    const fn synthesized_glyph(self) -> char {
+        '\u{25a0}'
+    }
+}
+
+/// Classify one scalar according to CSS Text control and white-space rules.
+pub(crate) fn classify_css_text_scalar(character: char) -> CssTextScalar {
+    match character {
+        ' ' => CssTextScalar::DocumentSpace,
+        '\t' => CssTextScalar::Tab,
+        '\n' => CssTextScalar::SegmentBreak,
+        '\r' => CssTextScalar::CarriageReturn,
+        character if character_is_unicode_control(character) => {
+            CssTextScalar::VisibleControl(VisibleControlCharacter(character))
+        }
+        character => CssTextScalar::Text(character),
+    }
+}
+
+/// Materialize text for CSS whitespace processing and shaping.
+///
+/// Carriage return becomes an ordinary space. Every other Cc character apart
+/// from tab and line feed becomes a visible `So` / Common symbol. This is the
+/// one rendering boundary shared by DOM and generated text.
+/// <https://www.w3.org/TR/css-text-3/#white-space-processing>
+pub(crate) fn css_text_rendering_text(text: &str) -> String {
+    text.chars()
+        .map(|character| match classify_css_text_scalar(character) {
+            CssTextScalar::CarriageReturn => ' ',
+            CssTextScalar::VisibleControl(control) => control.synthesized_glyph(),
+            CssTextScalar::DocumentSpace => ' ',
+            CssTextScalar::Tab => '\t',
+            CssTextScalar::SegmentBreak => '\n',
+            CssTextScalar::Text(character) => character,
+        })
+        .collect()
+}
+
 /// Return whether a character is CSS document white space that can collapse.
 ///
-/// CSS Text white-space processing operates on document white-space
-/// characters: spaces, tabs, segment breaks, and form feeds. Other Unicode
-/// space separators, including U+3000 IDEOGRAPHIC SPACE, remain normal
-/// visible characters and are handled by Unicode line breaking:
+/// CSS Text white-space processing operates only on spaces, tabs, and
+/// segment breaks; a carriage return is first converted to a space. Other
+/// Unicode space separators, including U+3000 IDEOGRAPHIC SPACE, and form
+/// feed U+000C remain visible text and are handled through Unicode line
+/// breaking:
 /// <https://www.w3.org/TR/css-text-3/#white-space-processing>.
 pub(crate) fn is_css_collapsible_whitespace(character: char) -> bool {
-    matches!(character, ' ' | '\t' | '\n' | '\r' | '\u{000C}')
+    matches!(character, ' ' | '\t' | '\n' | '\r')
 }
 
 /// Return whether a character is a CSS document space preserved by `pre-wrap`.
@@ -964,7 +1036,6 @@ pub(crate) struct FontRequest {
 enum FontRequestFamily {
     Generic(GenericFontRequest),
     Named(String),
-    Names(Vec<String>),
     List(Vec<FontRequestFamily>),
 }
 
@@ -1036,7 +1107,7 @@ mod typographic_units;
 mod unicode_properties;
 
 pub(crate) use bidi::{
-    bidi_control_scope_for_style, text_with_css_bidi_controls, text_without_bidi_format_controls,
+    bidi_control_scope_for_style, resolve_bidi_visual_ranges, text_without_bidi_format_controls,
 };
 pub(crate) use breaking::contains_bidi_text;
 pub(crate) use breaking::{
@@ -1069,13 +1140,13 @@ pub(crate) use typographic_units::{
     character_is_inter_character_control, inter_character_gap_allowed_between_text,
     keep_all_suppresses_break_between, text_allows_inter_character_gap_after,
     text_allows_inter_character_gap_before, text_is_inter_character_control_only,
-    typographic_unit_count, typographic_unit_ranges,
+    typographic_unit_ranges,
 };
 use unicode_properties::*;
 pub(crate) use unicode_properties::{
-    SegmentBreakContext, TextSpacingPunctuationClass, character_blocks_atomic_inline_break,
-    character_has_joining_behavior, character_is_arabic_tatweel, character_is_autospace_alpha,
-    character_is_autospace_ideograph, character_is_autospace_numeric,
+    SegmentBreakContext, TextSpacingPunctuationClass, Uax14BoundaryProtection,
+    bidi_mirroring_glyph, character_has_joining_behavior, character_is_arabic_tatweel,
+    character_is_autospace_alpha, character_is_autospace_ideograph, character_is_autospace_numeric,
     character_is_bidi_format_control, character_is_css_other_space_separator,
     character_is_css_word_separator, character_is_currency_symbol,
     character_is_default_ignorable_code_point, character_is_first_hangable_punctuation,
@@ -1090,7 +1161,7 @@ pub(crate) use unicode_properties::{
     character_preserves_word_boundary_context, character_receives_text_emphasis_mark,
     plaintext_direction_for_text, segment_break_is_removable, text_spacing_punctuation_class,
     typographic_unit_is_upright_in_mixed_orientation,
-    typographic_unit_uses_vertical_forms_in_mixed_orientation,
+    typographic_unit_uses_vertical_forms_in_mixed_orientation, uax14_atomic_boundary_protection,
 };
 
 #[cfg(test)]

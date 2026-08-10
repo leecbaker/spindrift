@@ -1,7 +1,9 @@
 use super::*;
 use crate::document::paint::geometry::AxisSelectivePaintClip;
+use crate::layout::assets::DocumentPageIndex;
 use crate::layout::block::float::FLOAT_EPSILON;
 use crate::layout::block::formatting_boxes_have_eligible_multicol_spanner;
+use crate::layout::paint_ops::FragmentedDecorationSlice;
 
 impl<'a> LayoutBuilder<'a> {
     /// Measure a block formatting context root in one candidate float band.
@@ -30,13 +32,17 @@ impl<'a> LayoutBuilder<'a> {
                 style.margin.left,
                 style.margin.right,
             ));
-        let candidate_geometry = self.block_layout_geometry_in_inline_span(
+        let constrained_auto_width = auto_border_box_width.is_some();
+        let mut candidate_geometry = self.block_layout_geometry_in_inline_span(
             element,
             style,
             stylesheets,
             child_boxes,
             BlockLayoutInlineConstraint {
-                containing_inline_span: PageInlineSpan::new(band_left, band_width),
+                // Width and margin resolution still use the CSS containing
+                // span. Only an auto-width root gets the residual band as a
+                // selected border-box placement below.
+                containing_inline_span,
                 percentage_basis: PercentageBasis::definite(LogicalInlineContentSize::new(
                     content_box_pt(containing_inline_size),
                 )),
@@ -46,6 +52,24 @@ impl<'a> LayoutBuilder<'a> {
                 auto_border_box_width,
             },
         );
+        // A BFC root's border box may meet the float at the band edge while
+        // its margin overlaps the exclusion. The ordinary block-width
+        // resolver intentionally places a margin box from the containing
+        // span, so normalize the candidate back to the edge selected by float
+        // avoidance before testing collision:
+        // <https://www.w3.org/TR/CSS22/visuren.html#floats>.
+        if constrained_auto_width {
+            let border_box_width = candidate_geometry.outer_inline().width().points();
+            let border_box_left = if style.direction == Direction::Rtl {
+                band_left + (band_width - border_box_width).max(0.0)
+            } else {
+                band_left
+            };
+            candidate_geometry.reanchor_float_avoiding_border_box(PageInlineSpan::new(
+                border_box_left,
+                border_box_width,
+            ));
+        }
         let candidate_style = &candidate_geometry.style;
         let estimated_outer_height = self
             .estimate_element_height(
@@ -321,7 +345,11 @@ impl<'a> LayoutBuilder<'a> {
             );
             let empty_destination_fragmentainer = match fragmentainer_kind {
                 FragmentainerKind::Page => {
-                    let next_context = self.resolved_page_context(self.pages.len() + 2, false);
+                    let next_context = self
+                        .fragmentainer_override
+                        .filter(|override_| override_.kind == FragmentainerKind::Page)
+                        .map(|override_| override_.context_for_fragmentainer(self.pages.len() + 1))
+                        .unwrap_or_else(|| self.resolved_page_context(self.pages.len() + 2, false));
                     Fragmentainer::new(
                         layout_pt(next_context.area_height()),
                         layout_pt(next_context.area_height()),
@@ -501,6 +529,15 @@ impl<'a> LayoutBuilder<'a> {
             };
         let applied_start_margin =
             page_start_margin(layout_pt(hypothetical_start_margin), starts_at_page_top);
+        // A transparent parent may have received only its local placement
+        // delta after an ancestor consumed part of a larger adjoining start
+        // margin set. Its own first child must compare against that complete
+        // set, or the descendant contribution is applied a second time.
+        let descendant_applied_start_margin = self
+            .inherited_adjoining_start_margins
+            .last()
+            .copied()
+            .unwrap_or(applied_start_margin);
         let margin_edge_top = self.cursor_y;
         self.cursor_y -= applied_start_margin.points();
         let clearance_count_at_block_entry = self.applied_clearance_count;
@@ -514,7 +551,6 @@ impl<'a> LayoutBuilder<'a> {
             || block_align_content_establishes_independent_formatting_context(
                 geometry.style.align_content,
             );
-        let mut paint_bfc_decoration_after_preceding_floats = false;
         if !establishes_independent_bfc {
             let before_clear_page_index = self.pages.len();
             let before_clear_top = self.cursor_y;
@@ -555,91 +591,103 @@ impl<'a> LayoutBuilder<'a> {
                     .expect("root float context exists")
                     .clone();
                 let page_index = self.current_float_page_index();
-                paint_bfc_decoration_after_preceding_floats = context
-                    .shapes
-                    .iter()
-                    .any(|shape| shape.is_css_float() && shape.page_index == page_index);
-                let clear = if bfc_clearance_applied {
-                    Clear::None
-                } else {
-                    geometry.style.clear
-                };
-                let writing_mode = geometry.style.writing_mode;
-                let direction = geometry.style.used_direction();
-                let containing_inline_span =
-                    PageInlineSpan::from_edges(containing_left, containing_right);
-                let normal_border_top = self.cursor_y;
-                let mut solve_placement = |top| {
-                    context.avoiding_bfc_root_position(
-                        page_index,
-                        top,
-                        clear,
-                        writing_mode,
-                        direction,
-                        containing_left,
-                        containing_right,
-                        |band, _candidate_top| {
-                            self.measure_float_avoiding_bfc(
-                                element,
-                                style,
-                                stylesheets,
-                                child_boxes,
-                                containing_inline_size,
-                                containing_inline_span,
-                                band,
-                            )
+                if context.has_css_float_on_page(page_index) {
+                    let clear = if bfc_clearance_applied {
+                        Clear::None
+                    } else {
+                        geometry.style.clear
+                    };
+                    let writing_mode = geometry.style.writing_mode;
+                    let direction = geometry.style.used_direction();
+                    let containing_inline_span =
+                        PageInlineSpan::from_edges(containing_left, containing_right);
+                    let normal_border_top = self.cursor_y;
+                    let mut solve_placement = |top| {
+                        context.avoiding_bfc_root_position(
+                            page_index,
+                            top,
+                            clear,
+                            writing_mode,
+                            direction,
+                            containing_left,
+                            containing_right,
+                            |band, _candidate_top| {
+                                self.measure_float_avoiding_bfc(
+                                    element,
+                                    style,
+                                    stylesheets,
+                                    child_boxes,
+                                    containing_inline_size,
+                                    containing_inline_span,
+                                    band,
+                                )
+                            },
+                        )
+                    };
+                    // A positive adjoining start margin can cross an active float
+                    // before it puts the BFC root's border box below that float.
+                    // Test the margin edge first.  When the root cannot occupy
+                    // that band, retain only the portion of the margin needed to
+                    // reach the float's block-end edge, just as clearance does.
+                    // If it fits beside the float, the normal margin placement is
+                    // retained and solved at the border edge below.
+                    // <https://www.w3.org/TR/CSS22/visuren.html#floats>
+                    let margin_edge_placement = (applied_start_margin.points() > FLOAT_EPSILON
+                        && !bfc_clearance_applied)
+                        .then(|| solve_placement(PageTopBlockPosition::new(margin_edge_top)));
+                    let placement = match margin_edge_placement {
+                        Some(placement)
+                            if placement.placement.origin.top_y()
+                                < margin_edge_top - FLOAT_EPSILON
+                                && placement.placement.origin.top_y()
+                                    > normal_border_top + FLOAT_EPSILON =>
+                        {
+                            placement
+                        }
+                        _ => solve_placement(PageTopBlockPosition::new(normal_border_top)),
+                    };
+                    self.cursor_y = placement.placement.origin.top_y();
+                    let available_span = placement.placement.available_span;
+                    let containing_inline_span =
+                        PageInlineSpan::from_edges(containing_left, containing_right);
+                    let auto_border_box_width = (available_span.width()
+                        < containing_inline_size - FLOAT_EPSILON)
+                        .then_some(float_avoiding_auto_border_box_width(
+                            available_span,
+                            containing_inline_span,
+                            style.margin.left,
+                            style.margin.right,
+                        ));
+                    let constrained_auto_width = auto_border_box_width.is_some();
+                    geometry = self.block_layout_geometry_in_inline_span(
+                        element,
+                        style,
+                        stylesheets,
+                        child_boxes,
+                        BlockLayoutInlineConstraint {
+                            // The residual band controls auto-width sizing, but it
+                            // is not the block's CSS containing span. Resolve the
+                            // final width and percentage-dependent geometry from
+                            // the original containing block, then apply the
+                            // measured candidate's border-box origin below.
+                            containing_inline_span,
+                            percentage_basis: PercentageBasis::definite(
+                                LogicalInlineContentSize::new(content_box_pt(
+                                    containing_inline_size,
+                                )),
+                            ),
+                            physical_width_percentage_basis: PhysicalContentWidth::new(
+                                content_box_pt(containing_inline_size),
+                            ),
+                            auto_border_box_width,
                         },
-                    )
-                };
-                // A positive adjoining start margin can cross an active float
-                // before it puts the BFC root's border box below that float.
-                // Test the margin edge first.  When the root cannot occupy
-                // that band, retain only the portion of the margin needed to
-                // reach the float's block-end edge, just as clearance does.
-                // If it fits beside the float, the normal margin placement is
-                // retained and solved at the border edge below.
-                // <https://www.w3.org/TR/CSS22/visuren.html#floats>
-                let margin_edge_placement = (applied_start_margin.points() > FLOAT_EPSILON
-                    && !bfc_clearance_applied)
-                    .then(|| solve_placement(PageTopBlockPosition::new(margin_edge_top)));
-                let placement = match margin_edge_placement {
-                    Some(placement)
-                        if placement.placement.origin.top_y() < margin_edge_top - FLOAT_EPSILON
-                            && placement.placement.origin.top_y()
-                                > normal_border_top + FLOAT_EPSILON =>
-                    {
-                        placement
+                    );
+                    if constrained_auto_width {
+                        geometry.reanchor_float_avoiding_border_box(
+                            placement.candidate.normal_flow_border_box_inline_span,
+                        );
                     }
-                    _ => solve_placement(PageTopBlockPosition::new(normal_border_top)),
-                };
-                self.cursor_y = placement.placement.origin.top_y();
-                let available_span = placement.placement.available_span;
-                let containing_inline_span =
-                    PageInlineSpan::from_edges(containing_left, containing_right);
-                let auto_border_box_width = (available_span.width()
-                    < containing_inline_size - FLOAT_EPSILON)
-                    .then_some(float_avoiding_auto_border_box_width(
-                        available_span,
-                        containing_inline_span,
-                        style.margin.left,
-                        style.margin.right,
-                    ));
-                geometry = self.block_layout_geometry_in_inline_span(
-                    element,
-                    style,
-                    stylesheets,
-                    child_boxes,
-                    BlockLayoutInlineConstraint {
-                        containing_inline_span: available_span,
-                        percentage_basis: PercentageBasis::definite(LogicalInlineContentSize::new(
-                            content_box_pt(containing_inline_size),
-                        )),
-                        physical_width_percentage_basis: PhysicalContentWidth::new(content_box_pt(
-                            containing_inline_size,
-                        )),
-                        auto_border_box_width,
-                    },
-                );
+                }
             } else {
                 let style = &geometry.style;
                 // In a vertical BFC, an inline-start float can meet the
@@ -735,8 +783,14 @@ impl<'a> LayoutBuilder<'a> {
         let definite_content_height_for_children = geometry.definite_content_height;
         let definite_content_height =
             definite_content_height_for_children.map(PhysicalContentHeight::points);
+        // Multicolumn sizing consumes the used block constraint before it
+        // chooses a local column set. Resolve `lh` here, at the block's used
+        // line-height boundary, so a finite `height: 2lh` does not degrade
+        // into an auto-height balanced row.
+        let mut multicol_used_height = style.box_values.height.clone();
+        multicol_used_height.resolve_line_height_relative_lengths(layout_pt(style.line_height));
         let multicol_content_height =
-            definite_content_height.or_else(|| style.box_values.height.length_if_no_percent());
+            definite_content_height.or_else(|| multicol_used_height.length_if_no_percent());
         let outer_inline = geometry.outer_inline();
         let content_inline = geometry.content_inline();
         let content_width = content_inline.width().points();
@@ -789,6 +843,30 @@ impl<'a> LayoutBuilder<'a> {
         // to the opposite edge.
         // <https://www.w3.org/TR/css-writing-modes-4/#logical-to-physical>
         let block_top = self.cursor_y;
+        let propagated_vertical_body_canvas = self.principal_flow.is_source_body(element)
+            && WritingModeAxes::new(style.writing_mode, style.used_direction())
+                .swaps_physical_axes();
+        if propagated_vertical_body_canvas
+            && self.root_principal_flow_context.active_canvas.is_none()
+        {
+            self.root_principal_flow_context.active_canvas = Some(ActiveDocumentCanvas {
+                body: Some(element.id),
+                inline_end_inset: layout_pt(
+                    match inline_start_side(style.writing_mode, style.used_direction()) {
+                        PhysicalSide::Top => style.margin.bottom,
+                        PhysicalSide::Bottom => style.margin.top,
+                        PhysicalSide::Left | PhysicalSide::Right => {
+                            unreachable!("a vertical writing mode must have a vertical inline axis")
+                        }
+                    },
+                ),
+                inline_origin: PageTopBlockPosition::new(block_top),
+                block_track_occupancy: layout_pt(
+                    (self.current_page_context.right() - self.page_left()).max(0.0),
+                ),
+                trailing_child_block_margin: layout_pt(0.0),
+            });
+        }
         let mut fragmented_definite_block = false;
         let positioning_containing_block_mode =
             PositionedContainingBlockMode::for_element(element, style);
@@ -796,7 +874,9 @@ impl<'a> LayoutBuilder<'a> {
         let paint_page_index = self.pages.len();
         let positioned_layer_start = self.positioned_layers.len();
         let pending_paint_fragment_start = self.pending_paint_fragments.len();
-        let pending_positioned_page_span_target_at_start = self.pending_positioned_page_span_target;
+        let pending_positioned_page_span_target_at_start = self
+            .pending_positioned_fragmentation
+            .materialized_destination_end();
         let static_scroll_snap_scope =
             self.begin_static_scroll_snap_scope(style, element.tag.eq_ignore_ascii_case("html"));
         let block_start_page_context = self.current_page_context;
@@ -875,6 +955,11 @@ impl<'a> LayoutBuilder<'a> {
                 );
         }
         self.child_available_space_stack.push(child_available_space);
+        let container_unit_scope = self.push_container_unit_context(
+            style,
+            PhysicalContentWidth::new(content_inline.width()),
+            PhysicalContentHeight::new(content_box_pt(definite_content_height.unwrap_or(0.0))),
+        );
         if establishes_independent_bfc {
             self.push_float_context();
         }
@@ -930,10 +1015,9 @@ impl<'a> LayoutBuilder<'a> {
         // A deferred effect is required when the used height is intrinsic,
         // when paint containment supplies the clip, or when a longhand axis
         // creates the scroll container independently of the legacy shorthand
-        // field. In the latter two cases primitive clipping would mutate the
-        // alignment subject's recorded geometry. Definite shorthand overflow
-        // can keep the existing primitive clip, which leaves descendant paint
-        // bands public for CSS Appendix E ordering.
+        // field. The retained effect owns all visual-overflow clipping: a
+        // primitive clip would mutate descendant source geometry before a
+        // later CSS transform is applied.
         // <https://www.w3.org/TR/css-overflow-3/#overflow-clip-edge>
         // <https://www.w3.org/TR/css-contain-1/#containment-paint>
         let paint_containment_applies = paint_containment_applies_to_element(element, style);
@@ -958,10 +1042,21 @@ impl<'a> LayoutBuilder<'a> {
                 || definite_content_height.is_some()
                 || paint_containment_applies
                 || needs_contoured_overflow_clip);
+        // The normal deferred path preserves an element-level PDF scope until
+        // its used block size is known. When one padding-box dimension is
+        // already known to be empty, though, no descendant can survive that
+        // scope. Keep the active layout clip as well so the public paint
+        // projection culls descendants immediately (and so no inherited
+        // overflow clip is accidentally popped).
+        // <https://www.w3.org/TR/css-overflow-3/#overflow-clipping>
+        let has_empty_known_overflow_clip =
+            content_width + style.padding.left + style.padding.right <= 0.0
+                || overflow_clip_content_height
+                    .is_some_and(|height| height + style.padding.top + style.padding.bottom <= 0.0);
         let overflow_clip_active = if used_overflow_clips
             && style_clips_overflow(style)
             && !paint_containment_applies
-            && !needs_deferred_overflow_clip
+            && (!needs_deferred_overflow_clip || has_empty_known_overflow_clip)
         // The deferred effect scopes one element-level clip around the
         // completed paint fragment. Keeping an eager clip as well turns
         // it into a synthetic clip for each text line, which can cut ink
@@ -975,6 +1070,7 @@ impl<'a> LayoutBuilder<'a> {
                     - self.page_bottom())
                 .max(0.0)
             });
+            let used_overflow = UsedOverflowAxes::from_style(style);
             let (clip_edge_x, clip_edge_y) = overflow_clip_edge_axes(style);
             let (clip_x, clip_y) = overflow_clipping_axes(style);
             let margin = if clip_edge_x || clip_edge_y {
@@ -983,7 +1079,7 @@ impl<'a> LayoutBuilder<'a> {
                 0.0
             };
             let clip_height = clip_content_height + style.padding.top + style.padding.bottom;
-            self.push_overflow_clip(OverflowClip::from_paint_rect_with_axes(
+            self.push_overflow_clip(OverflowClip::from_paint_rect_with_axes_and_non_scrollable(
                 PageTopRect::new(
                     outer_x + border_widths.left - margin,
                     block_top - border_widths.top + margin,
@@ -993,6 +1089,8 @@ impl<'a> LayoutBuilder<'a> {
                 .paint_rect(),
                 clip_x,
                 clip_y,
+                used_overflow.non_scrollable_clip_x(),
+                used_overflow.non_scrollable_clip_y(),
             ));
             true
         } else {
@@ -1052,7 +1150,14 @@ impl<'a> LayoutBuilder<'a> {
         let has_explicit_line_break = !has_generated_content
             && child_boxes.is_none()
             && element_has_direct_line_break(element);
+        let root_has_inline_generated_content = element.tag.eq_ignore_ascii_case("html")
+            && style
+                .before_style
+                .iter()
+                .chain(style.after_style.iter())
+                .any(|pseudo| !pseudo.display.is_block_level() && pseudo.content.is_generated());
         let use_ordered_mixed_flow = !has_generated_content
+            && !root_has_inline_generated_content
             && !requires_block_in_inline_normalization
             && !requires_run_in_normalization
             && (((child_boxes.is_none() || child_boxes.is_some_and(has_non_inline_formatting_box))
@@ -1201,6 +1306,7 @@ impl<'a> LayoutBuilder<'a> {
         // post-layout cursor.
         // <https://www.w3.org/TR/css-multicol-1/#the-multi-column-model>
         let mut laid_out_inline_multicol = false;
+        let mut preceding_inline_local_cutoff = false;
         // Retain the committed list-item sequence when the direct inline path
         // can select one. Vertical auto-size geometry must consume this same
         // line sequence rather than reconstructing marker content and text.
@@ -1254,6 +1360,9 @@ impl<'a> LayoutBuilder<'a> {
                         element.attrs.get("href").map(String::as_str),
                         list_marker.as_ref(),
                     );
+                    preceding_inline_local_cutoff = committed_vertical_list_item_sequence
+                        .as_ref()
+                        .is_some_and(|sequence| sequence.has_local_continuation_cutoff);
                 }
             } else if style.display.is_list_item() {
                 self.layout_list_text_block(
@@ -1275,13 +1384,14 @@ impl<'a> LayoutBuilder<'a> {
                 );
                 laid_out_inline_multicol = laid_out_multicol_text;
                 if !laid_out_multicol_text {
-                    self.layout_text_block(
+                    let outcome = self.layout_text_block(
                         &text,
                         style,
                         0.0,
                         0.0,
                         element.attrs.get("href").map(String::as_str),
                     );
+                    preceding_inline_local_cutoff = outcome.has_local_continuation_cutoff;
                 }
             }
             self.pop_text_box_line_trim_scope(pushed_text_box_trim);
@@ -1451,13 +1561,26 @@ impl<'a> LayoutBuilder<'a> {
                     })
                     .unwrap_or(0.0)
             } else if !text.is_empty() {
-                self.estimate_text_physical_height(
-                    &text,
+                // This fallback still has styled inline descendants in the
+                // DOM-backed collector.  Measuring its flattened text under
+                // the block style would discard an inner atomic inline's
+                // effective layout footprint: in particular a horizontal
+                // text-combine-upright composition must contribute its one-em
+                // square, not its uncompressed horizontal advance.
+                //
+                // Use the same styled item collection and intrinsic graph as
+                // line layout, which forms TCY before measuring its atomic
+                // parent participant.
+                // <https://drafts.csswg.org/css-writing-modes-4/#text-combine-layout>
+                // <https://drafts.csswg.org/css-sizing-3/#intrinsic>
+                self.intrinsic_inline_measurement_for_element(
+                    element,
                     style,
+                    stylesheets,
+                    child_boxes,
                     content_logical_inline_size,
-                    0.0,
-                    0.0,
                 )
+                .physical_height(style)
             } else {
                 0.0
             };
@@ -1549,21 +1672,33 @@ impl<'a> LayoutBuilder<'a> {
         // children so a blockified positioned descendant can form the CSS
         // static-position rectangle in this block's writing mode.
         // <https://www.w3.org/TR/css-position-3/#static-position>
-        let static_content_height = definite_content_height.unwrap_or_else(|| {
-            containing_block_content_height
-                .points()
-                .map(|height| (height - vertical_extras).max(0.0))
-                .unwrap_or(0.0)
-        });
+        let static_content_height = if style.writing_mode.has_vertical_lines() {
+            // `height` is the logical inline size of a vertical block. The
+            // static-position rectangle for a block child must span that
+            // physical vertical inline axis, even though the legacy
+            // `definite_content_height` path is a block-axis sizing input.
+            // <https://drafts.csswg.org/css-position-3/#staticpos-rect>
+            // <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+            content_logical_inline_size
+        } else {
+            definite_content_height.unwrap_or_else(|| {
+                containing_block_content_height
+                    .points()
+                    .map(|height| (height - vertical_extras).max(0.0))
+                    .unwrap_or(0.0)
+            })
+        };
         self.block_static_position_contexts
             .push(BlockStaticPositionContext {
-                writing_mode: style.writing_mode,
-                direction: style.used_direction(),
-                content_left: self.content_left,
-                content_right: self.content_right,
-                content_top_y: content_top,
-                content_height: static_content_height,
-                physical_block_size_is_auto: style.box_values.width.is_auto(),
+                axes: WritingModeAxes::new(style.writing_mode, style.used_direction()),
+                content_rect: PageTopRect::new(
+                    self.content_left,
+                    content_top,
+                    (self.content_right - self.content_left).max(0.0),
+                    static_content_height,
+                ),
+                justify_items: style.justify_items,
+                align_items: style.align_items,
             });
         let children_outcome =
             self.layout_block_flow_children_phase(Box::new(BlockFlowChildrenPhaseInput {
@@ -1574,7 +1709,7 @@ impl<'a> LayoutBuilder<'a> {
                 child_boxes,
                 can_collapse_start_margin,
                 can_collapse_end_margin,
-                applied_start_margin,
+                applied_start_margin: descendant_applied_start_margin,
                 clearance_consumed_adjoining_start_margin,
                 starts_at_page_top,
                 laid_out_column_children,
@@ -1583,6 +1718,10 @@ impl<'a> LayoutBuilder<'a> {
                 use_ordered_mixed_flow,
                 has_preceding_inline_flow_content: has_collectable_inline_content
                     && !use_ordered_mixed_flow,
+                preceding_inline_local_cutoff,
+                discard_region_limit: None,
+                direct_automatic_block_size_constraint:
+                    super::children::state::direct_automatic_block_size_constraint(style),
                 definite_content_height,
                 descendant_percentage_height_basis,
             }));
@@ -1599,8 +1738,11 @@ impl<'a> LayoutBuilder<'a> {
         // exclude only the fieldset border, never descendant backgrounds.
         // <https://html.spec.whatwg.org/multipage/rendering.html#the-fieldset-and-legend-elements>
         let rendered_legend = children_outcome.rendered_legend;
+        let inline_capture = self.finish_clamp_line_slot_capture();
         let clamp_line_slots =
-            self.finish_clamp_line_slot_capture() + children_outcome.descendant_clamp_line_slots;
+            inline_capture.line_slots + children_outcome.descendant_clamp_line_slots;
+        let has_local_continuation_cutoff = inline_capture.has_local_continuation_cutoff
+            || children_outcome.has_local_continuation_cutoff;
         let in_flow_child_fragment_end =
             (self.pages.len() > paint_page_index).then_some(InFlowFragmentEnd {
                 page_index: self.pages.len(),
@@ -1640,8 +1782,39 @@ impl<'a> LayoutBuilder<'a> {
             self.pop_positioned_containing_block(scope);
         }
         self.pop_overflow_clip(overflow_clip_active);
+        self.pop_container_unit_context(container_unit_scope);
         self.child_available_space_stack.pop();
         self.content_logical_inline_size_stack.pop();
+        if propagated_vertical_body_canvas {
+            let block_end_inset = match block_start_side(style.writing_mode) {
+                PhysicalSide::Left => style.margin.right,
+                PhysicalSide::Right => style.margin.left,
+                PhysicalSide::Top | PhysicalSide::Bottom => {
+                    unreachable!("a vertical document canvas has a horizontal block axis")
+                }
+            };
+            if let Some(active_canvas) = self.root_principal_flow_context.active_canvas.take() {
+                debug_assert_eq!(active_canvas.body, Some(element.id));
+                self.root_principal_flow_context.completed_canvas = Some(CompletedDocumentCanvas {
+                    body: active_canvas.body,
+                    // A fragmented body completes on its final fragmentainer,
+                    // not necessarily the page on which its canvas began.
+                    // Root content following the canvas must therefore make
+                    // its placement decision against this committed source
+                    // fragment.
+                    source_page: DocumentPageIndex::new(self.pages.len()),
+                    source_block_track: PageInlineSpan::from_edges(
+                        self.content_left,
+                        self.content_right,
+                    ),
+                    inline_origin: active_canvas.inline_origin,
+                    inline_end_inset: active_canvas.inline_end_inset,
+                    block_end_inset: layout_pt(block_end_inset),
+                    block_track_occupancy: active_canvas.block_track_occupancy,
+                    trailing_child_block_margin: active_canvas.trailing_child_block_margin,
+                });
+            }
+        }
         self.restore_page_area_parent_context_after_page_transition(
             previous_left,
             previous_right,
@@ -1658,6 +1831,12 @@ impl<'a> LayoutBuilder<'a> {
             && !independent_bfc_had_float_content
             && self.pages.len() == paint_page_index
             && self.applied_clearance_count == clearance_count_at_block_entry
+            // Adjoining block margins require no block-axis border or
+            // padding.  Retaining a nonzero vertical edge is essential even
+            // for an otherwise empty positioned body: that edge is the
+            // principal decoration of its stacking context.
+            // <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
+            && vertical_extras == 0.0
         {
             self.cursor_y = content_top;
         }
@@ -1944,9 +2123,14 @@ impl<'a> LayoutBuilder<'a> {
                     .iter()
                     .map(|layer| layer.page_index),
             )
-            .chain(self.pending_positioned_page_span_target.filter(|target| {
-                pending_positioned_page_span_target_at_start.is_none_or(|initial| *target > initial)
-            }))
+            .chain(
+                self.pending_positioned_fragmentation
+                    .materialized_destination_end()
+                    .filter(|target| {
+                        pending_positioned_page_span_target_at_start
+                            .is_none_or(|initial| *target > initial)
+                    }),
+            )
             .max();
         // A deferred out-of-flow placement can discover a static position
         // beyond the current column set while its in-flow containing block is
@@ -2093,9 +2277,9 @@ impl<'a> LayoutBuilder<'a> {
                 used_overflow_axes.clips_y(),
             ))
         });
-        let deferred_rounded_overflow_clip = deferred_overflow_clip
+        let deferred_box_content_contour = deferred_overflow_clip
             .filter(|_| deferred_overflow_is_fully_bounded)
-            .and_then(|_| {
+            .and_then(|overflow_bounds| {
                 let reference_box = match style.overflow_clip_margin.reference_box {
                     css::OverflowClipMarginBox::Border => css::BackgroundBox::Border,
                     css::OverflowClipMarginBox::Padding => css::BackgroundBox::Padding,
@@ -2108,19 +2292,26 @@ impl<'a> LayoutBuilder<'a> {
                 } else {
                     0.0
                 };
-                rounded_clip_rect_for_box_with_outset(
+                resolve_box_content_contour(
                     border_paint_rect,
                     style,
                     border_widths,
-                    reference_box,
-                    outset,
+                    BoxContentContourRequest::Overflow {
+                        reference_box,
+                        outset,
+                    },
                 )
+                .map(|mut contour| {
+                    // Fragmentation owns the used overflow extent. The
+                    // contour resolver owns only its exact border edge;
+                    // replacing this bound with an independently-derived
+                    // box would lose a definite/fragment-local clip size.
+                    contour.bounds = overflow_bounds;
+                    contour
+                })
             });
-        let deferred_border_shape_overflow_clip = deferred_overflow_clip
-            .filter(|_| deferred_overflow_is_fully_bounded)
-            .and_then(|_| {
-                single_border_shape_overflow_clip(border_paint_rect, style, border_widths)
-            });
+        let deferred_box_content_contour = deferred_box_content_contour
+            .filter(|clip| !matches!(&clip.contour, BoxContentContour::Rect));
         if block_height > 0.0 {
             self.mark_current_page_flow_content();
         }
@@ -2139,12 +2330,25 @@ impl<'a> LayoutBuilder<'a> {
         };
         let propagates_document_canvas_properties =
             self.element_propagates_document_canvas_properties(element, style);
+        // The root element's border is part of the root stacking context's
+        // background/border phase.  It must not be promoted with ordinary
+        // block descendants, because negative positioned descendants paint
+        // only after that root phase.
+        // <https://www.w3.org/TR/CSS22/zindex.html>
+        let is_root_element = element.tag.eq_ignore_ascii_case("html");
         let mut own_background_primitives = Vec::new();
         let mut own_outline_primitives = Vec::new();
-        if propagates_document_canvas_properties {
-            if style.visibility == Visibility::Visible {
-                self.capture_document_canvas_background(element, style);
-            }
+        if propagates_document_canvas_properties && style.visibility == Visibility::Visible {
+            self.capture_document_canvas_background(element, style);
+        }
+        // Only the source selected by CSS Backgrounds paints the document
+        // canvas. A body whose background does not propagate remains ordinary
+        // descendant paint and must be captured by an ancestor root transform.
+        // <https://drafts.csswg.org/css-backgrounds-3/#special-backgrounds>
+        // <https://drafts.csswg.org/css-transforms-1/#transform-rendering>
+        let propagates_document_canvas_background = propagates_document_canvas_properties
+            && self.element_paints_document_canvas_background(element);
+        if propagates_document_canvas_background {
             // Capturing the root background creates the canvas-background
             // record. Preserve the used root box after that creation: a
             // position-fixed root can have a much smaller positioning area
@@ -2159,7 +2363,6 @@ impl<'a> LayoutBuilder<'a> {
                 );
             }
             if !suppress_own_principal_box_decoration
-                && block_height > 0.0
                 && (used_border_width(style) > layout_pt(0.0)
                     || style.border_image.source.is_image())
                 && style.visibility == Visibility::Visible
@@ -2169,19 +2372,20 @@ impl<'a> LayoutBuilder<'a> {
                 // ordinary element border painting behind descendants:
                 // <https://www.w3.org/TR/css-backgrounds-3/#special-backgrounds>.
                 let mut border_style = style.clone();
-                border_style.background_color = css::BackgroundColor::TRANSPARENT;
-                border_style.background_image = css::ComputedImage::None;
-                border_style.background_layers.clear();
+                border_style.background.background_color = css::BackgroundColor::TRANSPARENT;
+                border_style.background.background_image = css::ComputedImage::None;
+                border_style.background.background_layers.clear();
                 own_background_primitives =
                     self.box_background_primitives(border_paint_rect, &border_style);
             }
         } else if !suppress_own_principal_box_decoration
             && fragmented_spanner_slices.is_empty()
             && fragmented_block_slices.is_empty()
-            && border_paint_rect.size.width > 0.0
-            && border_paint_rect.size.height > 0.0
-            && (style.background_color.is_potentially_visible()
-                || style.background_image.is_image()
+            && ((border_paint_rect.size.width > 0.0 && border_paint_rect.size.height > 0.0)
+                || used_border_width(style) > layout_pt(0.0)
+                || style.border_image.source.is_image())
+            && (style.background.background_color.is_potentially_visible()
+                || style.background.background_image.is_image()
                 || style.border_image.source.is_image()
                 || used_border_width(style) > layout_pt(0.0))
             && style.visibility == Visibility::Visible
@@ -2192,13 +2396,14 @@ impl<'a> LayoutBuilder<'a> {
             // source can paint the page canvas.
             // <https://drafts.csswg.org/css-backgrounds-3/#special-backgrounds>
             if let Some(exclusion) = rendered_legend_border_exclusion.as_ref()
-                && let Some((backgrounds, borders)) =
+                && let Some((backgrounds, borders, deferred_images)) =
                     self.split_background_and_normal_border_primitives(border_paint_rect, style)
             {
                 own_background_primitives = backgrounds;
                 own_background_primitives.extend(
                     self.clip_rectangular_border_primitives(borders, &exclusion.visible_regions),
                 );
+                own_background_primitives.extend(deferred_images);
             } else {
                 own_background_primitives =
                     self.box_background_primitives(border_paint_rect, style);
@@ -2246,11 +2451,12 @@ impl<'a> LayoutBuilder<'a> {
             }
         }
         if let Some(overflow_clip) = deferred_overflow_clip {
-            let content_overflow_clip = match deferred_border_shape_overflow_clip {
-                Some(BorderShapeOverflowClip::Empty) => {
-                    PaintClip::new(overflow_clip.x(), overflow_clip.y(), 0.0, 0.0)
-                }
-                Some(BorderShapeOverflowClip::Path(_)) | None => overflow_clip,
+            let content_overflow_clip = match deferred_box_content_contour.as_ref() {
+                Some(ResolvedBoxContentClip {
+                    contour: BoxContentContour::Empty,
+                    ..
+                }) => PaintClip::new(overflow_clip.x(), overflow_clip.y(), 0.0, 0.0),
+                _ => overflow_clip,
             };
             for layer in self
                 .positioned_layers
@@ -2267,7 +2473,7 @@ impl<'a> LayoutBuilder<'a> {
                 // layer fits a curved `border-shape` contour.  Keep the
                 // scope so positioned descendants are clipped at the shape,
                 // even when they lie wholly inside its rectangular bounds.
-                let layer_is_wholly_inside_clip = deferred_border_shape_overflow_clip.is_none()
+                let layer_is_wholly_inside_clip = deferred_box_content_contour.is_none()
                     && layer
                         .context
                         .bounds
@@ -2275,27 +2481,27 @@ impl<'a> LayoutBuilder<'a> {
                 if layer_is_wholly_inside_clip {
                     continue;
                 }
-                layer.context.effects.overflow_clip = Some(
-                    layer
-                        .context
-                        .effects
-                        .overflow_clip
-                        .and_then(|existing| existing.intersect(content_overflow_clip))
-                        .unwrap_or(content_overflow_clip),
-                );
+                let effective_bounds = layer
+                    .context
+                    .effects
+                    .overflow_clip_bounds()
+                    .and_then(|existing| existing.intersect(content_overflow_clip))
+                    .unwrap_or(content_overflow_clip);
+                layer
+                    .context
+                    .effects
+                    .intersect_overflow_clip_bounds(content_overflow_clip);
                 // Out-of-flow positioned descendants escape the ordinary
                 // fragment capture, so carry the enclosing contour onto the
                 // layer that will later be replayed into the ancestor stack.
                 // The rectangular clip above remains the conservative bounds
                 // for links and raster culling; this typed contour supplies
                 // the visible inner edge.
-                if let Some(BorderShapeOverflowClip::Path(shape_clip)) =
-                    deferred_border_shape_overflow_clip.clone()
-                {
-                    layer.context.effects.clip_path = PaintClipPathEffect::Path(shape_clip);
-                    layer.context.effects.rounded_overflow_clip = None;
-                } else if let Some(rounded_clip) = deferred_rounded_overflow_clip {
-                    layer.context.effects.rounded_overflow_clip = Some(rounded_clip);
+                if let Some(mut contour) = deferred_box_content_contour.clone() {
+                    contour.bounds = effective_bounds;
+                    layer.context.effects.overflow_clip_effect = Some(
+                        crate::document::paint::contours::OverflowClipEffect::Contoured(contour),
+                    );
                 }
             }
         }
@@ -2322,27 +2528,10 @@ impl<'a> LayoutBuilder<'a> {
                 fragment = fragment.translated(static_scroll_translation);
             }
             if let Some(overflow_clip) = deferred_overflow_clip {
-                fragment = if let Some(BorderShapeOverflowClip::Path(shape_clip)) =
-                    deferred_border_shape_overflow_clip.clone()
-                {
-                    fragment.with_contents_effect_scoped_to_path(overflow_clip, shape_clip)
-                } else if matches!(
-                    deferred_border_shape_overflow_clip,
-                    Some(BorderShapeOverflowClip::Empty)
-                ) {
-                    fragment.with_contents_effect_scoped_to_rect(PaintClip::new(
-                        overflow_clip.x(),
-                        overflow_clip.y(),
-                        0.0,
-                        0.0,
-                    ))
-                } else if let Some(rounded_clip) = deferred_rounded_overflow_clip {
-                    fragment
-                        .with_contents_effect_scoped_to_rounded_rect(overflow_clip, rounded_clip)
+                fragment = if let Some(contour) = deferred_box_content_contour {
+                    fragment.with_contents_effect_scoped_to_box_content_contour(contour)
                 } else if paint_containment_applies {
-                    fragment
-                        .with_primitives_clipped_to_rect_preserving_structure(overflow_clip)
-                        .with_paint_containment_contents_effect_scoped_to_rect(overflow_clip)
+                    fragment.with_paint_containment_contents_effect_scoped_to_rect(overflow_clip)
                 } else if let Some(axis_selective_clip) = deferred_axis_selective_overflow_clip {
                     fragment.with_contents_effect_scoped_to_axis_selective_rect(axis_selective_clip)
                 } else {
@@ -2350,13 +2539,14 @@ impl<'a> LayoutBuilder<'a> {
                     // its untrimmed ink bounds.  Clipping primitives first
                     // makes overflowing paint appear contained and erases
                     // the PDF clip scope that must remain authoritative.
-                    fragment
-                        .with_contents_effect_scoped_to_rect_preserving_contained_ink(
-                            &self.current_page,
-                            overflow_clip,
-                        )
-                        .with_primitives_clipped_to_rect_preserving_structure(overflow_clip)
+                    fragment.with_contents_effect_scoped_to_rect_preserving_contained_ink(
+                        &self.current_page,
+                        overflow_clip,
+                    )
                 };
+            }
+            if is_root_element {
+                fragment.promote_background_border_to_in_flow_block();
             }
             if background_page_index == paint_page_index {
                 self.current_page.prepend_recorded_primitives_to_fragment(
@@ -2374,9 +2564,7 @@ impl<'a> LayoutBuilder<'a> {
             // could promote this principal-box decoration later. Its
             // background therefore needs its resolved parent-level phase
             // immediately.
-            if paint_bfc_decoration_after_preceding_floats {
-                fragment.promote_background_border_after_floats();
-            } else {
+            if !is_root_element {
                 fragment.promote_background_border_to_in_flow_block();
             }
             if retain_size_contained_monolithic_paint {
@@ -2397,6 +2585,7 @@ impl<'a> LayoutBuilder<'a> {
                 physical_border_box_inline_span: outer_inline.width(),
                 static_border_box: Some(border_paint_rect),
                 clamp_line_slots,
+                has_local_continuation_cutoff,
                 in_flow_child_fragment_end,
             };
             if matches!(style.position, Position::Relative | Position::Sticky) {
@@ -2512,39 +2701,20 @@ impl<'a> LayoutBuilder<'a> {
                 }
             });
             if let Some(overflow_clip) = fragment_overflow_clip {
-                fragment = if let Some(BorderShapeOverflowClip::Path(shape_clip)) =
-                    deferred_border_shape_overflow_clip.clone()
-                {
-                    fragment.with_contents_effect_scoped_to_path(overflow_clip, shape_clip)
-                } else if matches!(
-                    deferred_border_shape_overflow_clip,
-                    Some(BorderShapeOverflowClip::Empty)
-                ) {
-                    fragment.with_contents_effect_scoped_to_rect(PaintClip::new(
-                        overflow_clip.x(),
-                        overflow_clip.y(),
-                        0.0,
-                        0.0,
-                    ))
-                } else if let Some(rounded_clip) = deferred_rounded_overflow_clip {
-                    fragment
-                        .with_contents_effect_scoped_to_rounded_rect(overflow_clip, rounded_clip)
+                fragment = if let Some(contour) = deferred_box_content_contour.clone() {
+                    fragment.with_contents_effect_scoped_to_box_content_contour(contour)
                 } else if paint_containment_applies {
-                    fragment
-                        .with_primitives_clipped_to_rect_preserving_structure(overflow_clip)
-                        .with_paint_containment_contents_effect_scoped_to_rect(overflow_clip)
+                    fragment.with_paint_containment_contents_effect_scoped_to_rect(overflow_clip)
                 } else if let Some(axis_selective_clip) = deferred_axis_selective_overflow_clip {
                     fragment.with_contents_effect_scoped_to_axis_selective_rect(axis_selective_clip)
                 } else {
                     // See the non-fragmented path above: scope based on the
                     // original descendant ink before updating public
                     // primitive geometry to the visible clip rectangle.
-                    fragment
-                        .with_contents_effect_scoped_to_rect_preserving_contained_ink(
-                            &self.current_page,
-                            overflow_clip,
-                        )
-                        .with_primitives_clipped_to_rect_preserving_structure(overflow_clip)
+                    fragment.with_contents_effect_scoped_to_rect_preserving_contained_ink(
+                        &self.current_page,
+                        overflow_clip,
+                    )
                 };
             }
             if let Some(slice) = fragmented_block_slices
@@ -2552,7 +2722,7 @@ impl<'a> LayoutBuilder<'a> {
                 .find(|slice| slice.page_index == page_index)
             {
                 let mut fragment_style = style.clone();
-                if propagates_document_canvas_properties {
+                if propagates_document_canvas_background {
                     suppress_document_canvas_background(&mut fragment_style);
                 }
                 suppress_fragmented_box_edges(
@@ -2627,6 +2797,12 @@ impl<'a> LayoutBuilder<'a> {
                 }
                 decorated_block_pages.push(page_index);
             } else if page_index == background_page_index {
+                if is_root_element {
+                    // Descendant block backgrounds recorded by the root
+                    // still belong to normal flow, while the root's own
+                    // border remains in Appendix E's earlier root phase.
+                    fragment.promote_background_border_to_in_flow_block();
+                }
                 fragment.prepend_primitives_in_band(
                     PaintBand::BackgroundBorder,
                     own_background_primitives.clone(),
@@ -2634,12 +2810,8 @@ impl<'a> LayoutBuilder<'a> {
                 fragment
                     .append_primitives_in_band(PaintBand::Outline, own_outline_primitives.clone());
             }
-            if !defer_own_decoration_promotion {
-                if paint_bfc_decoration_after_preceding_floats {
-                    fragment.promote_background_border_after_floats();
-                } else {
-                    fragment.promote_background_border_to_in_flow_block();
-                }
+            if !defer_own_decoration_promotion && !is_root_element {
+                fragment.promote_background_border_to_in_flow_block();
             }
             if retain_size_contained_monolithic_paint {
                 fragment = fragment.with_monolithic_fragmentation_scope(
@@ -2674,7 +2846,7 @@ impl<'a> LayoutBuilder<'a> {
                 continue;
             }
             let mut fragment_style = style.clone();
-            if propagates_document_canvas_properties {
+            if propagates_document_canvas_background {
                 suppress_document_canvas_background(&mut fragment_style);
             }
             suppress_fragmented_box_edges(
@@ -2746,11 +2918,7 @@ impl<'a> LayoutBuilder<'a> {
                 fragment.append_primitives_in_band(PaintBand::Outline, outlines);
             }
             if !defer_own_decoration_promotion {
-                if paint_bfc_decoration_after_preceding_floats {
-                    fragment.promote_background_border_after_floats();
-                } else {
-                    fragment.promote_background_border_to_in_flow_block();
-                }
+                fragment.promote_background_border_to_in_flow_block();
             }
             if fragment.is_empty() {
                 continue;
@@ -2771,7 +2939,7 @@ impl<'a> LayoutBuilder<'a> {
         if style.visibility == Visibility::Visible {
             for slice in &fragmented_spanner_slices {
                 let mut fragment_style = style.clone();
-                if propagates_document_canvas_properties {
+                if propagates_document_canvas_background {
                     suppress_document_canvas_background(&mut fragment_style);
                 }
                 suppress_fragmented_box_edges(
@@ -2844,11 +3012,7 @@ impl<'a> LayoutBuilder<'a> {
                 }
                 // See the equivalent ordinary-fragment loop above: this is
                 // the sole paint owner for a synthesized definite span.
-                if paint_bfc_decoration_after_preceding_floats {
-                    fragment.promote_background_border_after_floats();
-                } else {
-                    fragment.promote_background_border_to_in_flow_block();
-                }
+                fragment.promote_background_border_to_in_flow_block();
                 if slice.page_index < self.pages.len() {
                     self.pages[slice.page_index]
                         .append_paint_fragment_owned(fragment, PaintTranslation::identity());
@@ -2864,6 +3028,7 @@ impl<'a> LayoutBuilder<'a> {
             physical_border_box_inline_span: outer_inline.width(),
             static_border_box: Some(border_paint_rect),
             clamp_line_slots,
+            has_local_continuation_cutoff,
             in_flow_child_fragment_end,
         };
         if matches!(style.position, Position::Relative | Position::Sticky) {
@@ -2912,10 +3077,14 @@ impl<'a> LayoutBuilder<'a> {
                 .fragmentainer_override
                 .map(|override_| override_.context.area_height())
                 .unwrap_or_else(|| self.current_page_context.area_height());
-            let plan = column_continuation_materialization(
+            let materialization_limit = self
+                .positioned_scratch_page_limit()
+                .unwrap_or(MAX_MATERIALIZED_COLUMN_FRAGMENTAINERS);
+            let plan = column_continuation_materialization_with_limit(
                 layout_pt(remaining),
                 layout_pt(continuation_block_size),
                 self.pages.len() + 1,
+                materialization_limit,
             );
             for page_index in 0..plan.pages_to_push {
                 self.push_page();
@@ -2952,11 +3121,14 @@ impl<'a> LayoutBuilder<'a> {
             self.mark_current_page_flow_content();
         }
         let continuation_block_size = self.current_page_context.area_height();
+        let materialization_limit = self
+            .positioned_scratch_page_limit()
+            .unwrap_or(MAX_MATERIALIZED_PAGE_FRAGMENTAINERS);
         let plan = continuation_materialization(
             layout_pt(remaining),
             layout_pt(continuation_block_size),
             self.pages.len() + 1,
-            MAX_MATERIALIZED_PAGE_FRAGMENTAINERS,
+            materialization_limit,
         );
         for page_index in 0..plan.pages_to_push {
             self.push_page();
@@ -3098,6 +3270,7 @@ impl<'a> LayoutBuilder<'a> {
             physical_border_box_inline_span: border_box_pt(0.0),
             static_border_box: None,
             clamp_line_slots: 0,
+            has_local_continuation_cutoff: false,
             in_flow_child_fragment_end: None,
         };
         self.apply_forced_break_after_box_in(fragmentainer_kind, style);
@@ -3178,15 +3351,19 @@ fn fragmented_slice_background_positioning_border_rect(
     fragment_border_rect: PaintRect,
     decoration_break: css::BoxDecorationBreak,
 ) -> PaintRect {
-    if decoration_break == css::BoxDecorationBreak::Clone {
-        return fragment_border_rect;
-    }
     let preceding_block_span = slices
         .iter()
         .take_while(|candidate| candidate.page_index < slice.page_index)
         .map(|candidate| (candidate.top - candidate.bottom).max(0.0))
         .sum::<f32>();
-    PaintTranslation::new(0.0, preceding_block_span).transform_rect(&source_border_rect)
+    FragmentedDecorationSlice::new(
+        source_border_rect,
+        fragment_border_rect,
+        PaintTranslation::new(0.0, preceding_block_span),
+        slice.owns_block_start,
+        slice.owns_block_end,
+    )
+    .positioning_border_rect(decoration_break)
 }
 
 /// Slice continuous paint from one source coordinate space into its outer
@@ -3324,9 +3501,9 @@ pub(in crate::layout) fn suppress_fragmented_box_edges(
 /// system; cloning it into every page fragment would re-anchor image layers:
 /// <https://www.w3.org/TR/css-backgrounds-3/#special-backgrounds>.
 fn suppress_document_canvas_background(style: &mut ComputedStyle) {
-    style.background_color = css::BackgroundColor::TRANSPARENT;
-    style.background_image = css::ComputedImage::None;
-    style.background_layers.clear();
+    style.background.background_color = css::BackgroundColor::TRANSPARENT;
+    style.background.background_image = css::ComputedImage::None;
+    style.background.background_layers.clear();
 }
 
 fn suppress_promoted_spanner_physical_edge(style: &mut ComputedStyle, side: PhysicalSide) {

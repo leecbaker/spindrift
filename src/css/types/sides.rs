@@ -95,6 +95,10 @@ impl WritingModeAxes {
         self.writing_mode
     }
 
+    pub(crate) const fn direction(self) -> Direction {
+        self.direction
+    }
+
     /// Resolve a logical box side into its physical page edge.
     pub(crate) const fn physical_side(self, side: LogicalSide) -> PhysicalSide {
         match side {

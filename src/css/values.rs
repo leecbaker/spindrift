@@ -1,7 +1,4 @@
-use super::component_values::{
-    decode_css_escapes, is_css_ident_continue, parse_css_string_token, split_function_argument,
-    strip_ascii_function, trim_css_value,
-};
+use super::component_values::{parse_css_string_token, trim_css_value};
 use super::types::*;
 use cssparser::{Parser, ParserInput};
 

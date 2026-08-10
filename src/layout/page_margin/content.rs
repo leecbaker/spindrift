@@ -356,9 +356,9 @@ pub(in crate::layout) fn page_margin_inline_content_style(style: &ComputedStyle)
     inline_style.outline_width_value = css::ComputedLengthPercentage::ZERO;
     inline_style.outline_style = css::BorderStyle::None;
     inline_style.outline_offset = css::ComputedLengthPercentage::ZERO;
-    inline_style.background_color = css::BackgroundColor::TRANSPARENT;
-    inline_style.background_image = css::ComputedImage::None;
-    inline_style.background_layers.clear();
+    inline_style.background.background_color = css::BackgroundColor::TRANSPARENT;
+    inline_style.background.background_image = css::ComputedImage::None;
+    inline_style.background.background_layers.clear();
     inline_style
 }
 
@@ -480,8 +480,8 @@ pub(in crate::layout) fn page_margin_quote_pair(
             .or_else(|| pairs.last())
             .cloned()
             .unwrap_or_else(|| ("“".to_string(), "”".to_string())),
-        Quotes::Auto { .. } => {
-            let (open, close) = quotes::language_quote_pair(style.quotes.auto_language(), depth);
+        Quotes::Auto(_) => {
+            let (open, close) = style.quotes.auto_quote_pair(depth);
             (open.to_string(), close.to_string())
         }
     }

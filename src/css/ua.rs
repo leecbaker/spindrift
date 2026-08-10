@@ -39,10 +39,10 @@ pub(crate) fn html5_presentational_hints_stylesheet() -> Stylesheet {
     static STYLESHEET: OnceLock<Stylesheet> = OnceLock::new();
     STYLESHEET
         .get_or_init(|| {
-            // HTML presentational hints are optional in WeasyPrint and map to
-            // author-origin declarations with zero specificity. Keeping them
-            // as a stylesheet lets the normal Cascade 5 sort handle author CSS
-            // overrides instead of adding attribute checks to layout code.
+            // HTML presentational hints map to author-origin declarations with
+            // zero specificity. Keeping them as a stylesheet lets the normal
+            // Cascade 5 sort handle author CSS overrides instead of adding
+            // attribute checks to layout code.
             // https://html.spec.whatwg.org/multipage/rendering.html#presentational-hints
             // https://www.w3.org/TR/css-cascade-5/#cascade-sort
             let mut stylesheet = parse_stylesheet(

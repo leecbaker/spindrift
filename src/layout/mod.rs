@@ -1,10 +1,10 @@
 use crate::css::{
     self, AlignContent, AlignItems, AlignSelf, AlignmentBaseline, AlignmentSafety, BackgroundImage,
     BaselineMetric, BaselineShift, BookmarkLabelPart, BorderStyle, BoxSizing, CaptionSide, Clear,
-    ClipPath, ComputedStyle, Content, ContentAlignmentKeyword, ContentVisibility, CounterReset,
-    CounterResetKind, CounterStyleRange, CounterStyleRule, CounterStyleSystem, CounterValue,
-    CssBookmarkState, CssColor, Declarations, Direction, Display, DisplayInner, DisplayOuter,
-    DominantBaseline, ElementAttributeSignature, ElementSiblingSignature,
+    ClipPath, ComputedStyle, ContainerType, Content, ContentAlignmentKeyword, ContentVisibility,
+    CounterReset, CounterResetKind, CounterStyleRange, CounterStyleRule, CounterStyleSystem,
+    CounterValue, CssBookmarkState, CssColor, Declarations, Direction, Display, DisplayInner,
+    DisplayOuter, DominantBaseline, ElementAttributeSignature, ElementSiblingSignature,
     ElementSiblingSignatureList, ElementSignature, EmptyCells, FilterValue, FlexDirection,
     FlexWrap, Float, GeneratedAltTextPart, GeneratedContentPart, GeneratedQuote, Isolation,
     JustifyContent, JustifyItems, JustifySelf, LinearGradientDirection, ListStylePosition,
@@ -18,6 +18,7 @@ use crate::css::{
     WritingModeAxes, block_end_side, block_start_side, inline_end_side, inline_start_side,
 };
 use crate::document::paint::annotations::RenderedLink;
+use crate::document::paint::contours::{BoxContentContour, ResolvedBoxContentClip};
 use crate::document::paint::display_list::PaintBand;
 use crate::document::paint::effects::{
     PaintBlendMode, PaintClipPathEffect, PaintEffects, PaintFilterEffect, PaintMaskEffect,
@@ -61,12 +62,12 @@ use crate::text::{
     character_is_first_hangable_punctuation, character_is_first_letter_associated_space,
     character_is_first_letter_suffix_punctuation, character_is_hangable_stop_or_comma,
     character_is_join_control, character_is_last_hangable_punctuation,
-    character_is_unicode_alphanumeric, character_is_unicode_control,
-    character_is_unicode_first_letter_base, character_is_unicode_mark,
-    character_is_unicode_punctuation, character_is_unicode_symbol,
+    character_is_unicode_alphanumeric, character_is_unicode_first_letter_base,
+    character_is_unicode_mark, character_is_unicode_punctuation, character_is_unicode_symbol,
     character_preserves_word_boundary_context, character_receives_text_emphasis_mark,
-    contains_bidi_text, is_css_collapsible_whitespace, plaintext_direction_for_text,
-    text_with_hyphenation_controls, text_without_bidi_format_controls,
+    contains_bidi_text, css_text_rendering_text, is_css_collapsible_whitespace,
+    plaintext_direction_for_text, text_with_hyphenation_controls,
+    text_without_bidi_format_controls,
 };
 use crate::timing::DebugTimer;
 use crate::units::{
@@ -82,14 +83,15 @@ use taffy::prelude as taffy_layout;
 
 use self::assets::{
     DocumentCanvasBackgroundArea, PaintBackgroundArea,
-    fragmented_table_root_background_image_primitives,
     background_image_primitives_for_style_with_paint_areas,
     background_image_primitives_for_style_with_paint_areas_and_fixed_positioning_area,
+    fragmented_table_root_background_image_primitives,
     structural_table_background_image_primitives,
 };
 
 mod asset_helpers;
 mod assets;
+mod baseline;
 pub(crate) fn generated_linear_gradient_raster_color_space(
     gradient: &crate::css::LinearGradient,
     size: crate::document::paint::geometry::PaintSize,
@@ -150,7 +152,6 @@ mod paint_helpers;
 pub(crate) use paint_helpers::block::shaped_rect_path_commands;
 mod paint_ops;
 mod positioned_child;
-mod quotes;
 mod ruby;
 mod scroll_snap;
 mod table;
@@ -205,7 +206,10 @@ use text_helpers::*;
 use used_values::*;
 
 mod split_1;
-pub use self::split_1::*;
+pub use self::split_1::RenderOptions;
+pub(in crate::layout) use self::split_1::*;
+pub(crate) use self::split_1::{PageMargins, PageSize};
+pub(crate) use self::split_1::{PreparedDomLayout, layout_prepared_dom, start_font_system_load};
 mod split_2;
 pub(in crate::layout) use self::split_2::*;
 mod split_3;

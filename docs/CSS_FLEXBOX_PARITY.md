@@ -1,6 +1,6 @@
 # CSS Flexbox Parity
 
-Last updated: 2026-08-03
+Last updated: 2026-08-09
 
 This document tracks Quire's implementation status for CSS Flexible Box
 Layout. The normative references are CSS Flexible Box Layout Level 1, CSS Box
@@ -10,13 +10,22 @@ references, but spec conformance is the priority when the two disagree.
 
 ## Current Implementation
 
+- `margin-trim` is applied as a container-owned used-margin plan. It covers
+  every logical edge across row/column and reverse directions, uses the
+  container writing mode for orthogonal items, and derives wrapped-line edge
+  items from the order-modified non-collapsed flex line topology before final
+  sizing and replay. Adjacent opaque item backgrounds can still expose a
+  one-pixel PDF raster stitching seam because their independent paint scopes
+  are not yet coalesced. Fragmentation-specific trimming remains deferred.
+
 - The local renderable `css/css-flexbox/` WPT run currently passes 647 of 935
   tests (69.20%). This raw reftest baseline includes reference-side rendering
   gaps (notably CSS-versus-image color precision), so it
   is a triage input rather than a direct count of flex-algorithm defects. The
   largest material layout clusters are baseline/writing-mode layout, intrinsic
   sizing and automatic minimums, tables as flex items, absolute static
-  positioning, and the unfinished `flex-wrap: balance` Level 2 cases.
+  positioning, and the remaining intrinsic/available-size `flex-wrap: balance`
+  Level 2 cases.
 
 - Flex layout is implemented under `src/layout/flex/`.
 - The raster members of the non-script `flex-aspect-ratio-img` reftest family
@@ -61,10 +70,12 @@ references, but spec conformance is the priority when the two disagree.
 - Absolutely positioned flex children are collected out of flow. Their
   static-position probe uses fixed sole-item sizing and ignores authored
   flexing, including `flex-basis`, while normal absolute positioning computes
-  the final used size. The probe exports both physical static-position starts
-  to positioned layout, so `auto` inset pairs use the flex static-position
-  rectangle, including both `justify-content` main-axis alignment and
-  `align-items` cross-axis alignment in horizontal and vertical writing modes.
+  the final used size. A typed static-geometry record keeps the hypothetical
+  margin-box main-axis interval distinct from the flex content-box cross-axis
+  edges, and does not override the real absolute-position containing block.
+  Thus `auto` inset pairs use the flex static-position rectangle while final
+  inset equations and safe overflow use the positioned-layout containing
+  block, including horizontal and vertical writing modes.
   Distributed main-axis values are resolved for the hypothetical sole item:
   `space-between`/`stretch` use start fallback and
   `space-around`/`space-evenly` use center fallback.
@@ -98,6 +109,15 @@ references, but spec conformance is the priority when the two disagree.
   with an indefinite percentage basis while retaining their definite preferred
   flex base size. This prevents a percentage table wrapper from becoming an
   artificial automatic minimum for its flex-item ancestor.
+- Table flex items consume a table-owned wrapper-sizing contract. It keeps
+  grid min/max-content contributions distinct from wrapper preferred inline
+  and caption-inclusive intrinsic block contributions, while wrapper borders,
+  padding, and margins remain in their own box-model spaces. The intrinsic
+  block probe clears authored `height` and `min-height`, so a specified table
+  height is a flex preferred-size suggestion rather than a second automatic
+  minimum. Speculative table-height caching includes resolved block
+  constraints, preventing a stretched or specified wrapper measurement from
+  leaking into an intrinsic flex probe.
 - The flex/Taffy margin and padding adapters resolve percentage and mixed
   `calc()` values against the containing block's logical inline percentage
   basis before converting to physical Taffy edges. Replay uses the same used
@@ -118,6 +138,19 @@ references, but spec conformance is the priority when the two disagree.
   cross metrics and baselines while preserving replay-only fragmentable
   overflow. Stretch remeasurement therefore cannot overwrite the hypothetical
   contribution that establishes the content-based line.
+- Flex intrinsic line measurement distinguishes a container content-box
+  constraint from an item content-box constraint. A definite preferred cross
+  size or post-flex main size is already the item's content box, so its
+  padding is not removed a second time before selecting inline lines. This
+  keeps the item’s hypothetical main extent, final line slot, and measured
+  baseline aligned with the text that replay actually paints.
+- A single final cross-axis placement phase runs after main-size and cross-size
+  remeasurement, automatic-minimum correction, and line-slot refresh. Taffy
+  continues to construct lines, size stretch items, and resolve auto cross
+  margins; Quire resolves the final CSS Align side, center, safe-overflow, and
+  first/last baseline placement from those final margin-box slots. Baseline
+  metadata is then refreshed before `align-content`, RTL mirroring, and other
+  whole-line translations move items and their exported baselines together.
 - Flex item replay materializes each principal background and border from its
   frozen final physical border box before replaying the independent formatting
   context. The resulting decoration and descendant paint are retained as one
@@ -130,6 +163,13 @@ references, but spec conformance is the priority when the two disagree.
   padding and border a second time.
   split-item decoration remains subject to the fragmentation limitations
   listed below.
+- A wrapped physical-column flex container that remains in one fragmentainer
+  replays one complete order-modified item sequence rather than synthetic
+  physical-Y source slices. This preserves `column-reverse` and
+  `wrap-reverse` item contents, while actual page/column continuations retain
+  their separate interval planner. `justify-content: normal` and `stretch`
+  also resolve as `flex-start` in reverse main axes, preserving the free-space
+  offset before final replay.
 - A size-contained flex item keeps its definite used main size while its
   intrinsic contribution is sized as empty. When that monolithic item spans
   pages, each continuation clips the corresponding block interval of one
@@ -159,10 +199,11 @@ references, but spec conformance is the priority when the two disagree.
   order-modified fallback selection for reversed main axes. Remaining
   Baseline participant eligibility, synthesized-baseline selection, and CSS
   Align fallback are resolved together after final flex-item remeasurement,
-  rather than in separate physical row/column correction passes. Remaining
-  multi-line precision issues are in final line-content/inline placement;
-  broader mixed-writing-mode baseline-set transport into parent inline layout
-  remains incomplete.
+  rather than in separate physical row/column correction passes. Inline-flex
+  atoms convert final content-box baseline sets to physical border-box
+  coordinates once, then the parent inline context projects the compatible
+  physical axis through its logical block-start side. This covers horizontal,
+  `vertical-lr`, and `vertical-rl` inline-flex baseline transport.
 - Replayed flex and grid item formatting contexts now retain an explicit
   physical normal-flow containing-block scope for relative/sticky descendants.
   Block, nested flex/grid/table, and inline formatting contexts consume that
@@ -450,6 +491,18 @@ references, but spec conformance is the priority when the two disagree.
   `width:max-content` row flex containers include main-axis gap lengths and
   definite flex-basis contributions in their intrinsic main size, so parent
   baseline alignment observes the same line breaks as the nested flex layout.
+  Wrapped flex lines resolve their cross-axis percentage gutter once from the
+  definite flex content box before `align-content: normal`/`stretch` sizes
+  and places line slots. This covers `gap-009-ltr.html` without turning a
+  genuinely cyclic percentage gap into a definite length.
+  An automatic physical-column `inline-flex` preserves the resolved main-axis
+  gap between every adjacent final line member while retaining normal-flow
+  line-box leading. This covers the fixed-gap `gap-004-{lr,rl}` and
+  `gap-005-{ltr,rtl}` WPT cases without treating visual item overflow as the
+  used line span. Final flex-item baseline coordinates use their placed
+  border-box origins, so fixed item margins do not shift equivalent
+  `vertical-rl` inline-flex gap layouts; this covers `gap-005-rl.html` and
+  wrapped `gap-006-rl.html`.
   Vertical-writing nested row flex containers export physical x-axis
   first/last baselines for parent row flex baseline-sharing groups, including
   `wrap-reverse` line packing, when their wrapped line estimates have either a

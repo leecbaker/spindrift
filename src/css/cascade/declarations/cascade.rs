@@ -1,4 +1,6 @@
 use super::*;
+use crate::css::LayerOrder;
+use crate::css::is_custom_property_name;
 
 /// A declaration after selector matching and cascade ordering, with its origin
 /// and URL base preserved for computed-value application.
@@ -9,18 +11,72 @@ use super::*;
 /// <https://www.w3.org/TR/css-cascade-5/#cascade-sort>.
 #[derive(Debug, Clone)]
 pub(crate) struct CascadedDeclaration<'a> {
-    pub name: Cow<'a, str>,
+    /// Typed property identity for cascade mechanics. Only custom properties
+    /// retain an authored name; modeled properties serialize from their
+    /// canonical enum identity at legacy parser boundaries.
+    pub(in crate::css) property: CascadedProperty<'a>,
     pub value: Cow<'a, str>,
     pub origin: StylesheetOrigin,
     pub base_url: Option<&'a url::Url>,
     pub root_url: Option<&'a url::Url>,
     pub important: bool,
-    pub layer_order: Option<usize>,
+    pub layer_order: Option<LayerOrder>,
     pub specificity: u32,
     pub scope_proximity: usize,
     pub stylesheet_index: usize,
     pub rule_order: usize,
     pub declaration_order: usize,
+}
+
+/// The property kind carried by an ordinary cascade declaration.
+///
+/// Custom properties keep their original case-sensitive spelling in the
+/// `Custom` variant, while all supported ordinary properties are classified
+/// once into the typed syntax model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::css) enum CascadedProperty<'a> {
+    Modeled(ModeledProperty),
+    Custom(Cow<'a, str>),
+}
+
+impl<'a> CascadedProperty<'a> {
+    /// Classify a declaration that has survived CSS parsing for the typed
+    /// cascade. Unknown non-custom properties are ignored at this boundary,
+    /// as required by CSS Syntax's declaration error handling.
+    /// <https://www.w3.org/TR/css-syntax-3/#declaration>
+    pub(in crate::css) fn try_from_name(name: Cow<'a, str>) -> Option<Self> {
+        if is_custom_property_name(&name) {
+            Some(Self::Custom(name))
+        } else {
+            ModeledProperty::parse(&name).map(Self::Modeled)
+        }
+    }
+
+    pub(in crate::css) fn from_name(name: Cow<'a, str>) -> Self {
+        Self::try_from_name(name)
+            .expect("internal cascade construction must use a modeled or custom property")
+    }
+
+    pub(in crate::css) fn modeled(&self) -> Option<&ModeledProperty> {
+        match self {
+            Self::Modeled(property) => Some(property),
+            Self::Custom(_) => None,
+        }
+    }
+
+    pub(in crate::css) fn css_name(&self) -> &str {
+        match self {
+            Self::Modeled(property) => property.css_name(),
+            Self::Custom(name) => name,
+        }
+    }
+
+    pub(in crate::css) fn custom_name(&self) -> Option<&str> {
+        match self {
+            Self::Modeled(_) => None,
+            Self::Custom(name) => Some(name),
+        }
+    }
 }
 
 pub(in crate::css) fn cascaded_declarations_from(
@@ -30,19 +86,21 @@ pub(in crate::css) fn cascaded_declarations_from(
     declarations
         .iter()
         .enumerate()
-        .map(|(declaration_order, (name, value))| CascadedDeclaration {
-            name: Cow::Borrowed(name.as_str()),
-            value: Cow::Borrowed(value.as_str()),
-            origin,
-            base_url: declarations.base_url(),
-            root_url: declarations.root_url(),
-            important: declaration_is_important(value),
-            layer_order: None,
-            specificity: 0,
-            scope_proximity: usize::MAX,
-            stylesheet_index: 0,
-            rule_order: 0,
-            declaration_order,
+        .filter_map(|(declaration_order, (name, value))| {
+            Some(CascadedDeclaration {
+                property: CascadedProperty::try_from_name(Cow::Borrowed(name.as_str()))?,
+                value: Cow::Borrowed(value.as_str()),
+                origin,
+                base_url: declarations.base_url(),
+                root_url: declarations.root_url(),
+                important: declaration_is_important(value),
+                layer_order: None,
+                specificity: 0,
+                scope_proximity: usize::MAX,
+                stylesheet_index: 0,
+                rule_order: 0,
+                declaration_order,
+            })
         })
         .collect()
 }
@@ -54,16 +112,24 @@ pub(in crate::css) fn cascaded_declarations_from(
 /// and author origins:
 /// <https://www.w3.org/TR/css-cascade-5/#cascade-sort>.
 pub(crate) fn sort_cascaded_declarations(declarations: &mut [CascadedDeclaration<'_>]) {
-    declarations.sort_by_key(|declaration| {
-        (
-            origin_importance_rank(declaration.origin, declaration.important),
-            layer_precedence_rank(declaration.layer_order, declaration.important),
-            declaration.specificity,
-            scope_proximity_rank(declaration.scope_proximity),
-            declaration.stylesheet_index,
-            declaration.rule_order,
-            declaration.declaration_order,
-        )
+    declarations.sort_by(|left, right| {
+        origin_importance_rank(left.origin, left.important)
+            .cmp(&origin_importance_rank(right.origin, right.important))
+            .then_with(|| {
+                compare_layer_order(
+                    left.layer_order.as_ref(),
+                    right.layer_order.as_ref(),
+                    left.important,
+                )
+            })
+            .then_with(|| left.specificity.cmp(&right.specificity))
+            .then_with(|| {
+                scope_proximity_rank(left.scope_proximity)
+                    .cmp(&scope_proximity_rank(right.scope_proximity))
+            })
+            .then_with(|| left.stylesheet_index.cmp(&right.stylesheet_index))
+            .then_with(|| left.rule_order.cmp(&right.rule_order))
+            .then_with(|| left.declaration_order.cmp(&right.declaration_order))
     });
 }
 
@@ -73,12 +139,20 @@ pub(crate) fn sort_cascaded_declarations(declarations: &mut [CascadedDeclaration
 /// normal declarations, while important declarations reverse layer order and
 /// place unlayered important declarations before layered important declarations:
 /// <https://www.w3.org/TR/css-cascade-5/#layering>.
-pub(in crate::css) fn layer_precedence_rank(layer_order: Option<usize>, important: bool) -> usize {
-    match (important, layer_order) {
-        (false, Some(order)) => order,
-        (false, None) => usize::MAX,
-        (true, None) => 0,
-        (true, Some(order)) => usize::MAX.saturating_sub(1).saturating_sub(order),
+pub(in crate::css) fn compare_layer_order(
+    left: Option<&LayerOrder>,
+    right: Option<&LayerOrder>,
+    important: bool,
+) -> std::cmp::Ordering {
+    match (important, left, right) {
+        (false, Some(left), Some(right)) => left.cmp(right),
+        (false, Some(_), None) => std::cmp::Ordering::Less,
+        (false, None, Some(_)) => std::cmp::Ordering::Greater,
+        (false, None, None) => std::cmp::Ordering::Equal,
+        (true, Some(left), Some(right)) => right.cmp(left),
+        (true, Some(_), None) => std::cmp::Ordering::Greater,
+        (true, None, Some(_)) => std::cmp::Ordering::Less,
+        (true, None, None) => std::cmp::Ordering::Equal,
     }
 }
 
@@ -130,10 +204,20 @@ pub(crate) fn origin_importance_rank(origin: StylesheetOrigin, important: bool) 
 pub(in crate::css) fn is_shadowed_by_later_var_declaration(
     declarations: &[CascadedDeclaration<'_>],
     index: usize,
-    name: &str,
+    property: &CascadedProperty,
 ) -> bool {
     declarations[index + 1..].iter().any(|declaration| {
-        declaration.name.as_ref() == name
+        (declaration.property == *property
+            || matches!(
+                (declaration.property.modeled(), property.modeled()),
+                (
+                    Some(ModeledProperty::Longhand(left)),
+                    Some(ModeledProperty::FontComponent(right))
+                ) | (
+                    Some(ModeledProperty::FontComponent(left)),
+                    Some(ModeledProperty::Longhand(right))
+                ) if left == right
+            ))
             && contains_css_variable_reference(trim_css_value(&declaration.value))
     })
 }
@@ -158,8 +242,8 @@ pub(in crate::css) fn declarations_after_css_wide_rollbacks<'a>(
         if declaration_is_revert(&declaration.value) {
             output.retain(|candidate: &CascadedDeclaration<'_>| {
                 !declarations_affect_same_property_in_context(
-                    &candidate.name,
-                    &declaration.name,
+                    &candidate.property,
+                    &declaration.property,
                     direction,
                     writing_mode,
                 ) || !same_or_stronger_reverted_origin(candidate, declaration)
@@ -167,8 +251,8 @@ pub(in crate::css) fn declarations_after_css_wide_rollbacks<'a>(
         } else if declaration_is_revert_layer(&declaration.value) {
             output.retain(|candidate: &CascadedDeclaration<'_>| {
                 !declarations_affect_same_property_in_context(
-                    &candidate.name,
-                    &declaration.name,
+                    &candidate.property,
+                    &declaration.property,
                     direction,
                     writing_mode,
                 ) || !same_cascade_layer(candidate, declaration)
@@ -188,30 +272,53 @@ pub(in crate::css) fn declarations_after_css_wide_rollbacks<'a>(
 /// <https://www.w3.org/TR/css-cascade-5/#shorthand> and
 /// <https://www.w3.org/TR/css-cascade-5/#revert-layer>.
 pub(crate) fn declarations_affect_same_property(left: &str, right: &str) -> bool {
+    let Some(left) = ModeledProperty::parse(left) else {
+        return false;
+    };
+    let Some(right) = ModeledProperty::parse(right) else {
+        return false;
+    };
     declarations_affect_same_property_in_context(
-        left,
-        right,
+        &CascadedProperty::Modeled(left),
+        &CascadedProperty::Modeled(right),
         Direction::Ltr,
         WritingMode::HorizontalTb,
     )
 }
 
 pub(in crate::css) fn declarations_affect_same_property_in_context(
-    left: &str,
-    right: &str,
+    left: &CascadedProperty,
+    right: &CascadedProperty,
     direction: Direction,
     writing_mode: WritingMode,
 ) -> bool {
-    if left.eq_ignore_ascii_case(right) {
-        return true;
-    }
-    let Some(left_longhands) = affected_longhands(left, direction, writing_mode) else {
+    let (Some(left), Some(right)) = (left.modeled(), right.modeled()) else {
         return false;
     };
-    let Some(right_longhands) = affected_longhands(right, direction, writing_mode) else {
-        return false;
-    };
+    let left_longhands = affected_longhands(left, direction, writing_mode);
+    let right_longhands = affected_longhands(right, direction, writing_mode);
     left_longhands
-        .iter()
-        .any(|left| right_longhands.iter().any(|right| left == right))
+        .into_iter()
+        .any(|left| right_longhands.into_iter().any(|right| left == right))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_non_custom_declarations_are_ignored_at_the_cascade_boundary() {
+        let declarations = crate::css::parse_declarations(
+            "-weasy-anchor: attr(id); color: green; --preserved-custom: value",
+        );
+
+        let cascaded = cascaded_declarations_from(&declarations, StylesheetOrigin::Author);
+
+        assert_eq!(cascaded.len(), 2);
+        assert_eq!(cascaded[0].property.css_name(), "color");
+        assert_eq!(
+            cascaded[1].property.custom_name(),
+            Some("--preserved-custom")
+        );
+    }
 }

@@ -42,8 +42,21 @@ decorations, plus complex intersection and writing-mode cases.
   visibility metadata or by the crossing rule's own width/style/color.
   Definition-list and collected inline-sequence multicolumn paths emit column
   rules between resolved columns.
+- A subgridded grid axis retains the parent’s final physical track spans,
+  inter-track gutters, and terminal edge through replay. Its final item areas,
+  line offsets, used extent, and gap-decoration input therefore remain
+  parent-owned rather than being reconstructed from Taffy’s uniform-gap
+  placement adapter. This covers the basic inherited-column, inherited-row,
+  and two-axis subgrid decoration cases.
 - Flex gap-decoration painting does not apply the grid/multicolumn-only
   `*-rule-visibility-items` filter to resolved flex gutters.
+- Wrapped flex lines reserve a percentage cross-axis gap from a definite
+  content-box basis before `align-content: normal`/`stretch` distributes line
+  slots; cyclic intrinsic-size percentage gaps remain zero.
+- Inline-flex baseline export uses each finalized flex item's border-box
+  origin. Equivalent fixed item margins therefore do not perturb placement of
+  vertical-writing gap layouts; this covers `gap-005-rl.html` and
+  `gap-006-rl.html`.
 - Normal-flow fragmented flex containers project gap decorations into
   page-local fragments, clipping physical row-axis rule extent to the visible
   fragment block range. Block grid containers also replay gap decorations into

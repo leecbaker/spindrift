@@ -911,12 +911,167 @@ pub(crate) fn build_table_fragment<'a>(
             cells: Vec::new(),
         });
     }
+    apply_table_fragment_missing_cells_fixup(&mut rows, &columns);
     let grid = table_fragment_grid(&rows);
     MutableTableFragment {
         rows,
         captions,
         columns,
         grid,
+    }
+}
+
+/// Complete the row/column grid with anonymous cells after its column count is
+/// known.
+///
+/// CSS Tables derives the grid from the HTML table algorithm before requiring
+/// every slot to be occupied.  Explicit `col` and `colgroup` tracks therefore
+/// participate even when a source row supplies fewer cells; missing cells are
+/// appended as anonymous table-cell boxes rather than represented as empty
+/// geometry.
+/// <https://drafts.csswg.org/css-tables-3/#dimensioning-the-row-column-grid>
+/// <https://drafts.csswg.org/css-tables-3/#missing-cells-fixup>
+fn apply_table_fragment_missing_cells_fixup(
+    rows: &mut [MutableTableFragmentRow<'_>],
+    columns: &[MutableTableFragmentColumn<'_>],
+) {
+    let declared_column_count = table_fragment_definite_column_count(columns);
+    let required_column_count = table_fragment_grid(rows)
+        .column_count
+        .max(declared_column_count);
+    if required_column_count == 0 {
+        return;
+    }
+
+    let row_group_ends = table_fragment_row_group_end_indices(rows);
+    let mut active_rowspans = Vec::new();
+    for (row_index, row) in rows.iter_mut().enumerate() {
+        let mut column = 0usize;
+        for cell in &row.cells {
+            while active_rowspans.get(column).copied().unwrap_or(0) > 0 {
+                column += 1;
+            }
+            let colspan = cell.element.map(html_table_colspan).unwrap_or(1);
+            let rowspan = cell
+                .element
+                .map(|element| html_table_rowspan(element, row_index, row_group_ends[row_index]))
+                .unwrap_or(1);
+            let end = column + colspan;
+            if active_rowspans.len() < end {
+                active_rowspans.resize(end, 0);
+            }
+            for active in &mut active_rowspans[column..end] {
+                *active = (*active).max(rowspan);
+            }
+            column = end;
+        }
+
+        while (0..required_column_count)
+            .any(|index| active_rowspans.get(index).copied().unwrap_or(0) == 0)
+        {
+            while active_rowspans.get(column).copied().unwrap_or(0) > 0 {
+                column += 1;
+            }
+            if column >= required_column_count {
+                break;
+            }
+            row.cells.push(MutableTableFragmentCell {
+                element: None,
+                signature: ElementSignature::new("td", HashMap::new()),
+                style: None,
+                children: Vec::new(),
+                anonymous: true,
+            });
+            if active_rowspans.len() <= column {
+                active_rowspans.resize(column + 1, 0);
+            }
+            active_rowspans[column] = 1;
+            column += 1;
+        }
+
+        for active in &mut active_rowspans {
+            *active = active.saturating_sub(1);
+        }
+        while active_rowspans.last().copied() == Some(0) {
+            active_rowspans.pop();
+        }
+    }
+}
+
+/// Return the grid extent still required by non-zero definite column tracks.
+///
+/// The HTML formatting algorithm may expose more column tracks than a table
+/// needs. In auto layout those unneeded tracks are merged before missing-cell
+/// fixup unless their outer measure is definite and non-zero. In particular,
+/// percentage and mixed length-percentage declarations remain cyclic while
+/// the intrinsic grid is being constructed, and a zero `width`/`min-width`/
+/// `max-width` does not keep an otherwise absent trailing track alive.
+/// <https://drafts.csswg.org/css-tables-3/#track-merging>
+/// <https://drafts.csswg.org/css-tables-3/#computing-column-measures>
+fn table_fragment_definite_column_count(columns: &[MutableTableFragmentColumn<'_>]) -> usize {
+    let mut column_end = 0;
+    let mut required_end = 0;
+    for column in columns {
+        let span = column.span.max(1);
+        column_end += span;
+        let group_measure = column
+            .group
+            .as_ref()
+            .and_then(|group| group.style.as_deref())
+            .map(table_fragment_column_definite_outer_measure)
+            .unwrap_or(0.0);
+        let column_measure = column
+            .style
+            .as_deref()
+            .map(table_fragment_column_definite_outer_measure)
+            .unwrap_or(0.0);
+        if group_measure.max(column_measure) > 0.0 {
+            required_end = column_end;
+        }
+    }
+    required_end
+}
+
+/// Return a column's non-cyclic outer measure before the table width exists.
+///
+/// This is the fixed-value portion of CSS Tables' column outer min/max
+/// measures. A value involving a percentage is deliberately not partially
+/// reduced to its length component: it needs the eventual table width and is
+/// not definite at grid-construction time.
+fn table_fragment_column_definite_outer_measure(style: &ComputedStyle) -> f32 {
+    let (min_width, width, max_width) = if style.writing_mode.has_vertical_lines() {
+        (
+            &style.box_values.min_height,
+            style.box_values.height.value(),
+            &style.box_values.max_height,
+        )
+    } else {
+        (
+            &style.box_values.min_width,
+            &style.box_values.width,
+            &style.box_values.max_width,
+        )
+    };
+    let min = table_fragment_definite_length(min_width).unwrap_or(0.0);
+    let preferred = table_fragment_definite_length(width).unwrap_or(0.0);
+    let maximum = table_fragment_definite_length(max_width).unwrap_or(f32::INFINITY);
+    min.max(preferred.min(maximum)).max(0.0)
+}
+
+fn table_fragment_definite_length(value: &css::ComputedLengthPercentageOrAuto) -> Option<f32> {
+    match value {
+        css::ComputedLengthPercentageOrAuto::LengthPercentage(value)
+            if !value.needs_percentage_basis() =>
+        {
+            Some(value.length_points())
+        }
+        css::ComputedLengthPercentageOrAuto::Auto
+        | css::ComputedLengthPercentageOrAuto::LengthPercentage(_)
+        | css::ComputedLengthPercentageOrAuto::MinContent
+        | css::ComputedLengthPercentageOrAuto::MaxContent
+        | css::ComputedLengthPercentageOrAuto::FitContent(_)
+        | css::ComputedLengthPercentageOrAuto::Stretch
+        | css::ComputedLengthPercentageOrAuto::CalcSize(_) => None,
     }
 }
 

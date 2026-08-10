@@ -29,14 +29,16 @@ preserves the ruby formatting context instead of converting it into unrelated
 anonymous block runs.
 
 The inline collector materializes normalized base columns with annotation
-sidecars. They are painted separately from the parent text stream, so
+sidecars. The normalization preserves the computed style of each `rbc` and
+`rtc` independently from its `rb` and `rt` segments, so container-level
+`ruby-overhang` policy is not guessed from annotation text. They are painted separately from the parent text stream, so
 annotations cannot become parent text, justification opportunities, or
 first-letter candidates. An empty annotation container whose only descendants
 are floats or positioned boxes is ignored for normal annotation content
 collection. `::first-letter` can style the first base-side word collected from
 a ruby container rather than selecting an annotation word. The materializer
-measures paired base and annotation levels, centers the shorter level in its
-column, applies the default CJK `ruby-align: space-around` distribution, and
+measures paired base and annotation levels with distinct typed column and ink
+spans, applies `ruby-align: start | center | space-between | space-around`, and
 stacks annotations on a typed logical over/under side. `ruby-position:
 alternate | over | under` is inherited and the originating block's selected
 `::first-line` overlay is replayed into captured ruby base and annotation
@@ -45,6 +47,18 @@ create a second scope. Ruby role styles carry a used transform-applicability
 decision, preventing transform paint and geometry from being established for
 Ruby's non-transformable structure. Relative ruby and ruby-base-container
 scopes retain their positioned descendants' containing-block ownership.
+
+After CSS Text has selected a parent line, the materializer resolves ruby
+overhang against its immediate *visual* neighbors. The resulting placement is
+attached only to the selected inline atom, never to the reusable normalized
+ruby source. `ruby-overhang: spaces` (and legacy `none`, which aliases it)
+borrows preserved spaces or tabs, U+00A0 and Unicode `Zs` separators, plus the
+applicable untrimmed fullwidth punctuation share. `auto` uses Quire's
+documented deterministic UA policy: it may borrow at most `0.5ic` on each
+logical side from an immediately adjacent non-atomic visual text item. Any
+unborrowed annotation excess remains in the ruby's normal-flow advance. Paint
+uses the line-local logical placement for horizontal interlinear ruby. The
+remaining vertical ruby paint projection is tracked below as unfinished work.
 
 Relevant specifications:
 
@@ -64,6 +78,7 @@ anonymous wrappers, multi-level span sizing, and vertical-writing-mode
 placement also need dedicated conformance work.
 
 Deliberately deferred after this foundation: `ruby-position: inter-character`,
-`ruby-merge`, non-default `ruby-align`, auto-hide/collapse, overhang, detailed
-bidi isolation/reordering refinements, and breaks within a base/annotation
-pair.
+`ruby-merge`, auto-hide/collapse, a glyph-ink collision analysis richer than
+the deterministic `0.5ic` `auto` policy, full ruby-specific bidi isolation and
+reordering, complete vertical ruby paint projection, and breaks within a
+base/annotation pair.

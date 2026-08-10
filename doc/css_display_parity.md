@@ -27,3 +27,15 @@ Fresh `quire-wpt evaluate-test` runs pass these ten screenshot paths:
 The outstanding semantic limits are tracked in `SPEC_DIVERGENCES.md`; the flex
 references additionally expose the renderer's ordinary blockified-inline flex
 reference path, rather than a flattened-content loss.
+
+`inline-table` is an inline-level atomic table wrapper. Mixed block containers
+now classify that outer display role during direct-DOM traversal and anonymous
+inline-run normalization, so its table paint remains in source order with
+surrounding blocks; `display: table` remains block flow. This follows CSS
+Display outer roles, CSS Tables wrapper generation, CSS 2.2 anonymous block
+boxes, and CSS Positioned Layout painting order:
+
+- <https://drafts.csswg.org/css-display-3/#outer-role>
+- <https://drafts.csswg.org/css-tables-3/#anonymous-boxes>
+- <https://www.w3.org/TR/CSS22/visuren.html#anonymous-block-level>
+- <https://drafts.csswg.org/css-position-4/#painting-order>

@@ -26,13 +26,6 @@ Convert an HTML file to a PDF file:
 quire document.html document.pdf
 ```
 
-Set the initial page size while converting a file. Values use CSS absolute
-length units; an `@page` rule in the document can override this size:
-
-```sh
-quire --page-size 8.5in 11in document.html document.pdf
-```
-
 Implemented now:
 
 - crate API and CLI
@@ -87,6 +80,17 @@ Without a logging flag, Quire shows warnings and errors by default. Set
 `RUST_LOG` to customize `env_logger` filtering; `--verbose`, `--debug`, and
 `--quiet` override `RUST_LOG` for WeasyPrint-compatible CLI behavior.
 
+Print host information useful in bug reports without rendering a document:
+
+```sh
+quire --info
+```
+
+The report includes Quire's version plus the host operating system, version,
+and architecture. Unlike WeasyPrint, it does not list Rust dependency versions:
+Quire's rendering stack is compiled into the binary rather than dynamically
+loaded from system libraries.
+
 Use `--full-fonts` to embed complete font programs when PDF embedding permits
 it, matching WeasyPrint's opt-out of font subsetting:
 
@@ -117,14 +121,16 @@ failure as fatal. Use `--no-http-redirects` to reject HTTP redirects, or
 cargo run -- --no-http-redirects --allow-fetch-errors input.html /tmp/output.pdf
 ```
 
-Use `--input-syntax xml` to force XML/XHTML parsing. The default
-`--input-syntax auto` keeps HTML parsing unless the source begins with an XML
-declaration such as `<?xml version="1.0"?>`.
-
 External stylesheets are supported:
 
 ```sh
 cargo run -- -s style.css input.html /tmp/hello.pdf
+```
+
+Set document page geometry in CSS rather than command-line or crate options:
+
+```css
+@page { size: A4; margin: 18mm }
 ```
 
 Generate shell completions with:
@@ -138,8 +144,10 @@ cargo run -- --generate-completion bash > quire.bash
 ```rust
 use quire::{Html, PdfOptions, RenderOptions};
 
-let pdf = Html::from_string("<p>Hello, world</p>")
-    .write_pdf_bytes(&RenderOptions::default(), &PdfOptions::default())?;
+let mut pdf = Vec::new();
+Html::from_string("<p>Hello, world</p>")
+    .write_pdf(&mut pdf, &RenderOptions::default(), &PdfOptions::default())
+    .await?;
 # Ok::<(), quire::Error>(())
 ```
 
@@ -147,13 +155,17 @@ Rendering the KinSNP fixture from Rust uses the same library path:
 
 ```rust
 use quire::{Html, PdfOptions, RenderOptions};
+use std::fs::File;
 
-Html::from_file("KinSNP_example.html")?
+let mut output = File::create("/tmp/kinsnp.pdf")?;
+Html::from_file("KinSNP_example.html")
+    .await?
     .write_pdf(
-        "/tmp/kinsnp.pdf",
+        &mut output,
         &RenderOptions::default(),
         &PdfOptions::default(),
-    )?;
+    )
+    .await?;
 # Ok::<(), quire::Error>(())
 ```
 

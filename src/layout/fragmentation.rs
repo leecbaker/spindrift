@@ -32,23 +32,22 @@ pub(in crate::layout) struct ColumnContinuationMaterialization {
     pub(in crate::layout) has_unmaterialized_tail: bool,
 }
 
-/// Plan equal-size anonymous column continuations without work proportional
-/// to an authored CSS length.
+/// Plan column continuations with a caller-proven materialized prefix.
 ///
-/// The returned final block offset is based on the full conceptual run, even
-/// when only its paint-relevant prefix is retained. This keeps following
-/// off-canvas flow ordered while bounding temporary memory and runtime.
-/// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
-pub(in crate::layout) fn column_continuation_materialization(
+/// The caller may lower this limit only for a positioned subtree whose
+/// non-scrollable overflow clip makes the remaining logical tail unreachable
+/// in static output. All other callers retain the normal multicol limit.
+pub(in crate::layout) fn column_continuation_materialization_with_limit(
     remaining_block_size: LayoutLength,
     continuation_block_size: LayoutLength,
     already_materialized: usize,
+    materialization_limit: usize,
 ) -> ColumnContinuationMaterialization {
     continuation_materialization(
         remaining_block_size,
         continuation_block_size,
         already_materialized,
-        MAX_MATERIALIZED_COLUMN_FRAGMENTAINERS,
+        materialization_limit,
     )
 }
 
@@ -322,6 +321,7 @@ pub(in crate::layout) struct FragmentSourceSliceInput {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::layout) struct FragmentainerProjection {
     source_clip: PaintClip,
+    destination_clip: PaintClip,
     destination_translation: PaintTranslation,
     destination_page_clip_in_source_space: PaintClip,
 }
@@ -364,6 +364,7 @@ impl FragmentainerProjection {
         );
         Self {
             source_clip: source.paint_clip(),
+            destination_clip: destination.paint_clip(),
             destination_translation,
             destination_page_clip_in_source_space: PageTopRect::new(
                 input.destination_page_area.x() - destination_translation.x,
@@ -377,6 +378,16 @@ impl FragmentainerProjection {
 
     pub(in crate::layout) fn source_clip(self) -> PaintClip {
         self.source_clip
+    }
+
+    /// Exact destination-local paint clip for this logical fragment slice.
+    ///
+    /// The destination rectangle is retained independently from the source
+    /// clip because a positioned principal first maps continuous source paint
+    /// into the temporary source fragmentainer before it is translated to the
+    /// committed destination.
+    pub(in crate::layout) fn destination_clip(self) -> PaintClip {
+        self.destination_clip
     }
 
     pub(in crate::layout) fn destination_translation(self) -> PaintTranslation {
@@ -556,14 +567,14 @@ impl FragmentainerKind {
     ///
     /// CSS Break lets `break-inside: avoid` apply to every fragmentation
     /// context, while `avoid-page` and `avoid-column` are target-specific.
-    /// Computed style stores those target constraints separately; layout code
-    /// should consume them through the active fragmentainer kind so page and
-    /// column fragmentation share the same call shape:
+    /// Layout consumes the canonical computed value through the active
+    /// fragmentainer kind so page and column fragmentation share one call
+    /// shape:
     /// <https://www.w3.org/TR/css-break-3/#propdef-break-inside>.
     pub(in crate::layout) fn avoids_break_inside(self, style: &ComputedStyle) -> bool {
         match self {
-            Self::Page => style.break_inside_avoid,
-            Self::Column => style.break_inside_avoid_column,
+            Self::Page => style.break_inside.avoids_page(),
+            Self::Column => style.break_inside.avoids_column(),
         }
     }
 }
@@ -977,6 +988,10 @@ impl ForcedBreakCarryState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::block::{
+        AvoidRunPrebreakInput, AvoidRunRetryContext, AvoidRunSourceFragmentainerOccupancy,
+        should_move_avoid_break_run_to_next_fragmentainer,
+    };
 
     fn fragmentainer(block_size: f32, available_size: f32) -> Fragmentainer {
         Fragmentainer::new(layout_pt(block_size), layout_pt(available_size))
@@ -1234,6 +1249,66 @@ mod tests {
         });
 
         assert!(!decision.should_break);
+    }
+
+    #[test]
+    fn avoid_run_prebreak_rejects_equal_capacity_empty_fragmentainer_retry() {
+        assert!(!should_move_avoid_break_run_to_next_fragmentainer(
+            AvoidRunPrebreakInput {
+                run_height: 20.0,
+                next_height: 60.0,
+                retry_context: AvoidRunRetryContext {
+                    current_fragmentainer: fragmentainer(100.0, 40.0),
+                    empty_destination_fragmentainer: fragmentainer(100.0, 100.0),
+                    source_occupancy: AvoidRunSourceFragmentainerOccupancy::Empty,
+                },
+            }
+        ));
+    }
+
+    #[test]
+    fn avoid_run_prebreak_uses_strictly_larger_empty_destination() {
+        assert!(should_move_avoid_break_run_to_next_fragmentainer(
+            AvoidRunPrebreakInput {
+                run_height: 20.0,
+                next_height: 60.0,
+                retry_context: AvoidRunRetryContext {
+                    current_fragmentainer: fragmentainer(100.0, 40.0),
+                    empty_destination_fragmentainer: fragmentainer(120.0, 120.0),
+                    source_occupancy: AvoidRunSourceFragmentainerOccupancy::Empty,
+                },
+            }
+        ));
+    }
+
+    #[test]
+    fn avoid_run_prebreak_keeps_oversized_run_in_ordinary_fragmentation() {
+        assert!(!should_move_avoid_break_run_to_next_fragmentainer(
+            AvoidRunPrebreakInput {
+                run_height: 80.0,
+                next_height: 60.0,
+                retry_context: AvoidRunRetryContext {
+                    current_fragmentainer: fragmentainer(100.0, 40.0),
+                    empty_destination_fragmentainer: fragmentainer(120.0, 120.0),
+                    source_occupancy: AvoidRunSourceFragmentainerOccupancy::Empty,
+                },
+            }
+        ));
+    }
+
+    #[test]
+    fn avoid_run_prebreak_keeps_occupied_source_behavior() {
+        assert!(should_move_avoid_break_run_to_next_fragmentainer(
+            AvoidRunPrebreakInput {
+                run_height: 20.0,
+                next_height: 60.0,
+                retry_context: AvoidRunRetryContext {
+                    current_fragmentainer: fragmentainer(100.0, 40.0),
+                    empty_destination_fragmentainer: fragmentainer(100.0, 100.0),
+                    source_occupancy: AvoidRunSourceFragmentainerOccupancy::Occupied,
+                },
+            }
+        ));
     }
 
     #[test]
@@ -1718,18 +1793,17 @@ mod tests {
     #[test]
     fn break_inside_avoid_is_target_specific() {
         let mut style = ComputedStyle::initial();
-        style.break_inside_avoid = true;
+        style.break_inside = css::BreakInsideAvoidance::AvoidPage;
 
         assert!(FragmentainerKind::Page.avoids_break_inside(&style));
         assert!(!FragmentainerKind::Column.avoids_break_inside(&style));
 
-        style.break_inside_avoid = false;
-        style.break_inside_avoid_column = true;
+        style.break_inside = css::BreakInsideAvoidance::AvoidColumn;
 
         assert!(!FragmentainerKind::Page.avoids_break_inside(&style));
         assert!(FragmentainerKind::Column.avoids_break_inside(&style));
 
-        style.break_inside_avoid = true;
+        style.break_inside = css::BreakInsideAvoidance::Avoid;
 
         assert!(FragmentainerKind::Page.avoids_break_inside(&style));
         assert!(FragmentainerKind::Column.avoids_break_inside(&style));
@@ -1768,7 +1842,12 @@ mod tests {
 
     #[test]
     fn column_continuation_plan_materializes_normal_runs_exactly() {
-        let plan = column_continuation_materialization(layout_pt(250.0), layout_pt(100.0), 1);
+        let plan = column_continuation_materialization_with_limit(
+            layout_pt(250.0),
+            layout_pt(100.0),
+            1,
+            MAX_MATERIALIZED_COLUMN_FRAGMENTAINERS,
+        );
 
         assert_eq!(plan.pages_to_push, 3);
         assert_eq!(plan.last_fragment_used_block_size, layout_pt(50.0));
@@ -1777,7 +1856,12 @@ mod tests {
 
     #[test]
     fn column_continuation_plan_keeps_empty_runs_empty() {
-        let plan = column_continuation_materialization(layout_pt(0.0), layout_pt(100.0), 1);
+        let plan = column_continuation_materialization_with_limit(
+            layout_pt(0.0),
+            layout_pt(100.0),
+            1,
+            MAX_MATERIALIZED_COLUMN_FRAGMENTAINERS,
+        );
 
         assert_eq!(plan.pages_to_push, 0);
         assert_eq!(plan.last_fragment_used_block_size, layout_pt(0.0));
@@ -1786,8 +1870,12 @@ mod tests {
 
     #[test]
     fn column_continuation_plan_bounds_extreme_authored_lengths() {
-        let plan =
-            column_continuation_materialization(layout_pt(1_000_000_000.0), layout_pt(100.0), 1);
+        let plan = column_continuation_materialization_with_limit(
+            layout_pt(1_000_000_000.0),
+            layout_pt(100.0),
+            1,
+            MAX_MATERIALIZED_COLUMN_FRAGMENTAINERS,
+        );
 
         assert_eq!(
             plan.pages_to_push,
@@ -1842,6 +1930,11 @@ mod tests {
         assert_eq!(
             projection.destination_translation(),
             PaintTranslation::new(100.0, 100.0)
+        );
+        assert_eq!(
+            projection.destination_clip(),
+            PageTopRect::new(110.0, 200.0, 100.0, 100.0).paint_clip(),
+            "destination clipping remains authoritative instead of being reconstructed from source geometry",
         );
     }
 

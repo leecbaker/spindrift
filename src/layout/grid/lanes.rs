@@ -1,6 +1,6 @@
 use super::*;
 
-/// Which physical axis contains the fixed grid lanes.
+/// Which physical axis contains the fixed Grid Lanes tracks.
 ///
 /// Grid Lanes Layout keeps Grid's track model in one axis and packs items in
 /// the perpendicular stacking axis. The orientation follows the Level 3
@@ -13,7 +13,85 @@ enum GridLanesAxis {
     Rows,
 }
 
+/// Placement provenance retained after Grid Lanes has converted an item's
+/// authored grid-axis placement into a final numeric area. Automatic subgrids
+/// keep the parent tracks but deliberately do not inherit parent line names.
+/// <https://drafts.csswg.org/css-grid-3/#subgrids>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GridLanesItemPlacement {
+    Definite { grid_axis: GridAxis },
+    Automatic { grid_axis: GridAxis, span: usize },
+}
+
+impl GridLanesItemPlacement {
+    pub(super) fn grid_axis(self) -> GridAxis {
+        match self {
+            Self::Definite { grid_axis } | Self::Automatic { grid_axis, .. } => grid_axis,
+        }
+    }
+
+    pub(super) fn is_automatic(self) -> bool {
+        matches!(self, Self::Automatic { .. })
+    }
+}
+
+/// Whether Grid Lanes packs its items along the physical block axis.
+///
+/// This is used by the atomic-inline overflow adapter; baseline export stays
+/// in the ordinary physical-baseline pipeline.
+/// <https://drafts.csswg.org/css-grid-3/#grid-lanes-baseline-alignment>
+pub(super) fn grid_lanes_stacking_axis_is_block(style: &ComputedStyle) -> bool {
+    matches!(GridLanesAxis::from_style(style), GridLanesAxis::Columns)
+}
+
+pub(super) fn grid_lanes_item_placement(
+    parent_style: &ComputedStyle,
+    child: &GridChild<'_>,
+) -> Option<GridLanesItemPlacement> {
+    parent_style.display.is_grid_lanes().then(|| {
+        let axis = GridLanesAxis::from_style(parent_style);
+        let (start, end) = axis.placements(child);
+        let grid_axis = match axis {
+            GridLanesAxis::Columns => GridAxis::Column,
+            GridLanesAxis::Rows => GridAxis::Row,
+        };
+        if matches!(start, css::GridPlacement::Line(_))
+            || matches!(end, css::GridPlacement::Line(_))
+        {
+            GridLanesItemPlacement::Definite { grid_axis }
+        } else {
+            GridLanesItemPlacement::Automatic {
+                grid_axis,
+                span: grid_lanes_span(axis, child, usize::MAX),
+            }
+        }
+    })
+}
+
 type GridLanesPercentageBasis = PercentageBasis<LayoutLength>;
+
+/// Container geometry shared by the Grid Lanes placement and its intrinsic
+/// auto-repeat probe. Keeping these inputs together prevents the grid-axis
+/// percentage basis from being separated from the physical width and resolved
+/// subgrid axis that establish it.
+pub(super) struct GridLanesLayoutContext<'a> {
+    pub(super) width: PhysicalContentWidth,
+    pub(super) block_percentage_basis: GridLanesPercentageBasis,
+    pub(super) subgrid_context: Option<&'a ResolvedSubgridContext>,
+}
+
+/// Inputs that bind a packed item's intrinsic measurement to the final parent
+/// Grid Lanes topology. Keeping them together prevents probe-only subgrid
+/// geometry from diverging from replay.
+struct GridLanesItemMeasurementContext<'a> {
+    stylesheets: &'a Stylesheets<'a>,
+    parent_style: &'a ComputedStyle,
+    parent_layout: &'a GridLayout,
+    area: GridItemArea,
+    placement: GridLanesItemPlacement,
+    inline_percentage_basis: GridLanesPercentageBasis,
+    axis: GridLanesAxis,
+}
 
 fn grid_lanes_basis_points(basis: GridLanesPercentageBasis) -> f32 {
     basis.points().unwrap_or(0.0)
@@ -23,12 +101,186 @@ fn grid_lanes_basis_points(basis: GridLanesPercentageBasis) -> f32 {
 /// size. The full Grid sizing algorithm continues to own mixed repeat lists;
 /// this is the single-track subset needed before an intrinsic auto-repeat has
 /// a concrete repetition count.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 enum GridLanesIntrinsicAutoRepeatTrack {
     Auto,
     MinContent,
     MaxContent,
     FitContent(css::ComputedLengthPercentage),
+}
+
+/// Provenance of a final Grid Lanes track after an intrinsic auto-repeat has
+/// been materialized. Keeping this separate from its used size ensures that
+/// `auto-fit` can collapse only repeated tracks while explicit line placement
+/// and implicit-grid formation retain their normal Grid semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GridLanesAutoRepeatTrackSource {
+    FixedPrefix,
+    Repeated { repetition: usize, slot: usize },
+    FixedSuffix,
+    ImplicitEnd,
+}
+
+#[derive(Debug, Clone)]
+struct GridLanesResolvedAutoRepeatTrack {
+    source: GridLanesAutoRepeatTrackSource,
+    used_size: f32,
+    auto_sized: bool,
+    collapsed: bool,
+}
+
+/// Final grid-axis topology for a Grid Lanes intrinsic auto-repeat.
+///
+/// The hypothetical pass determines the repeated slots; this record then
+/// materializes the actual explicit and implicit grid before Grid Lanes
+/// placement. It is deliberately the sole source of both line resolution and
+/// packing availability.
+/// <https://drafts.csswg.org/css-grid-3/#track-sizing>
+#[derive(Clone)]
+struct GridLanesAutoRepeatResolution {
+    tracks: Vec<GridLanesResolvedAutoRepeatTrack>,
+    explicit_line_count: usize,
+    line_names: Vec<Vec<String>>,
+    repeat_range: std::ops::Range<usize>,
+    gap: f32,
+    materialized_geometry: Option<GridLanesTrackGeometry>,
+}
+
+impl GridLanesAutoRepeatResolution {
+    fn geometry(&self, alignment: css::ContentAlignment, available: f32) -> GridLanesTrackGeometry {
+        if let Some(geometry) = &self.materialized_geometry {
+            return geometry.clone();
+        }
+        debug_assert!(self.repeat_range.clone().all(|index| matches!(
+            self.tracks[index].source,
+            GridLanesAutoRepeatTrackSource::Repeated { .. }
+        )));
+        let sizes = self
+            .tracks
+            .iter()
+            .map(|track| track.used_size)
+            .collect::<Vec<_>>();
+        let active = self
+            .tracks
+            .iter()
+            .map(|track| !track.collapsed)
+            .collect::<Vec<_>>();
+        let auto_sized = self
+            .tracks
+            .iter()
+            .map(|track| track.auto_sized && !track.collapsed)
+            .collect::<Vec<_>>();
+        GridLanesTrackGeometry::from_track_sizes_with_active(&sizes, self.gap, &active)
+            .expect("an intrinsic auto-repeat resolution always has tracks")
+            .with_auto_track_stretch(&auto_sized, alignment, available)
+    }
+
+    fn resolved_range(
+        &self,
+        axis: GridLanesAxis,
+        child: &GridChild<'_>,
+    ) -> Option<std::ops::Range<usize>> {
+        let span = grid_lanes_span(axis, child, self.tracks.len());
+        let (start, end) = axis.placements(child);
+        let start_line = self.line_index(start)?;
+        let end_line = self.line_index(end)?;
+        let start = match (start_line, end_line) {
+            (Some(start), Some(end)) if end > start => start,
+            (Some(start), _) => start,
+            (_, Some(end)) => end.checked_sub(span)?,
+            _ => return None,
+        };
+        (start.checked_add(span)? <= self.tracks.len()).then_some(start..start + span)
+    }
+
+    fn line_index(&self, placement: &css::GridPlacement) -> Option<Option<usize>> {
+        let css::GridPlacement::Line(line) = placement else {
+            return Some(None);
+        };
+        let index = if let Some(name) = line.name() {
+            named_grid_line_index(&self.line_names, name, line.index().unwrap_or(1))?
+        } else {
+            let index = line.index()?;
+            if index > 0 {
+                index
+            } else {
+                i32::try_from(self.explicit_line_count)
+                    .ok()?
+                    .checked_add(index)?
+                    .checked_add(1)?
+            }
+        };
+        usize::try_from(index.checked_sub(1)?).ok().map(Some)
+    }
+
+    fn append_end_implicit_tracks(&mut self, count: usize, size: f32, auto_sized: bool) {
+        self.tracks
+            .extend((0..count).map(|_| GridLanesResolvedAutoRepeatTrack {
+                source: GridLanesAutoRepeatTrackSource::ImplicitEnd,
+                used_size: size,
+                auto_sized,
+                collapsed: false,
+            }));
+        self.line_names.resize_with(self.tracks.len() + 1, Vec::new);
+    }
+
+    fn apply_auto_fit(
+        &mut self,
+        axis: GridLanesAxis,
+        children: &[GridChild<'_>],
+        items: &[GridItemLayout],
+        flow_tolerance: f32,
+    ) {
+        let mut occupied = vec![false; self.tracks.len()];
+        let active = vec![true; self.tracks.len()];
+        let mut lane_ends = vec![0.0; self.tracks.len()];
+        let mut cursor = 0;
+        for (child, item) in children.iter().zip(items) {
+            let span = grid_lanes_span(axis, child, self.tracks.len());
+            let (range, automatic) = self
+                .resolved_range(axis, child)
+                .map(|range| (range, false))
+                .unwrap_or_else(|| {
+                    (
+                        grid_lanes_shortest_range(
+                            &lane_ends,
+                            &active,
+                            span,
+                            cursor,
+                            flow_tolerance,
+                        ),
+                        true,
+                    )
+                });
+            if automatic {
+                cursor = range.end;
+            }
+            // A one-track automatic item is replayed after `auto-fit` has
+            // removed empty repeated tracks. A spanning automatic item has a
+            // concrete candidate area during the occupancy pass and keeps
+            // every repeated track it spans occupied.
+            if !automatic || span > 1 {
+                for index in range.clone() {
+                    occupied[index] = true;
+                }
+            }
+            let stacking_size = match axis {
+                GridLanesAxis::Columns => item.height(),
+                GridLanesAxis::Rows => item.width(),
+            }
+            .max(0.0);
+            let end = lane_ends[range.clone()].iter().copied().fold(0.0, f32::max) + stacking_size;
+            for lane_end in &mut lane_ends[range] {
+                *lane_end = end;
+            }
+        }
+        for index in self.repeat_range.clone() {
+            if !occupied[index] {
+                self.tracks[index].collapsed = true;
+            }
+        }
+    }
 }
 
 /// Physical start/end geometry for the fixed grid axis of a Grid Lanes box.
@@ -41,6 +293,9 @@ enum GridLanesIntrinsicAutoRepeatTrack {
 struct GridLanesTrackGeometry {
     starts: Vec<f32>,
     ends: Vec<f32>,
+    /// A collapsed `repeat(auto-fit, ...)` track keeps its grid lines but
+    /// cannot receive automatic Grid Lanes placement.
+    active: Vec<bool>,
 }
 
 impl GridLanesTrackGeometry {
@@ -53,6 +308,7 @@ impl GridLanesTrackGeometry {
         (!axis.track_starts().is_empty()).then(|| Self {
             starts: axis.track_starts().to_vec(),
             ends: axis.track_ends().to_vec(),
+            active: vec![true; axis.track_count()],
         })
     }
 
@@ -78,10 +334,26 @@ impl GridLanesTrackGeometry {
             starts.push(start);
             ends.push(line_offsets[index + 1].max(start));
         }
-        Some(Self { starts, ends })
+        Some(Self {
+            active: vec![true; track_count],
+            starts,
+            ends,
+        })
     }
 
     fn from_track_sizes(sizes: &[f32], gap: f32) -> Option<Self> {
+        Self::from_track_sizes_with_active(sizes, gap, &vec![true; sizes.len()])
+    }
+
+    /// Construct final line geometry after `auto-fit` has collapsed its empty
+    /// tracks. Collapsed tracks and the gutters on either side of them have
+    /// zero used size, but their lines remain addressable by explicit
+    /// placement.
+    /// <https://drafts.csswg.org/css-grid-3/#auto-repeat>
+    fn from_track_sizes_with_active(sizes: &[f32], gap: f32, active: &[bool]) -> Option<Self> {
+        if sizes.len() != active.len() {
+            return None;
+        }
         if sizes.is_empty() {
             return None;
         }
@@ -90,13 +362,23 @@ impl GridLanesTrackGeometry {
         let mut offset = 0.0;
         for (index, size) in sizes.iter().enumerate() {
             starts.push(offset);
-            offset += size.max(0.0);
+            if active[index] {
+                offset += size.max(0.0);
+            }
             ends.push(offset);
-            if index + 1 < sizes.len() {
+            // A run of collapsed auto-fit tracks has no breadth, but the
+            // active tracks on either side remain separate grid tracks and
+            // therefore retain their single intervening gutter. This avoids
+            // turning an empty repeated slot into an extra visual gap.
+            if active[index] && active[index + 1..].iter().any(|&track| track) {
                 offset += gap;
             }
         }
-        Some(Self { starts, ends })
+        Some(Self {
+            starts,
+            ends,
+            active: active.to_vec(),
+        })
     }
 
     fn track_count(&self) -> usize {
@@ -116,6 +398,14 @@ impl GridLanesTrackGeometry {
         offsets.push(self.starts[0]);
         offsets.extend(self.ends.iter().cloned());
         offsets
+    }
+
+    fn track_sizes(&self) -> Vec<f32> {
+        self.starts
+            .iter()
+            .zip(&self.ends)
+            .map(|(start, end)| (end - start).max(0.0))
+            .collect()
     }
 
     /// Distribute a definite grid-axis container's remaining free space
@@ -263,10 +553,14 @@ impl<'a> LayoutBuilder<'a> {
         style: &ComputedStyle,
         children: &[GridChild<'_>],
         stylesheets: &Stylesheets<'_>,
-        width: PhysicalContentWidth,
+        context: GridLanesLayoutContext<'_>,
         mut layout: GridLayout,
-        subgrid_context: Option<&ResolvedSubgridContext>,
     ) -> GridLayout {
+        let GridLanesLayoutContext {
+            width,
+            block_percentage_basis,
+            subgrid_context,
+        } = context;
         let inline_percentage_basis = PercentageBasis::definite(layout_pt(width.points()));
         let axis = GridLanesAxis::from_style(style);
         let swaps_physical_grid_axes =
@@ -293,11 +587,16 @@ impl<'a> LayoutBuilder<'a> {
         // populated by ordinary row/column auto-placement, so preserve the
         // authored geometry for the common fully-definite track case instead
         // of inheriting those unrelated implicit-track offsets.
-        let grid_axis_size = match axis {
-            GridLanesAxis::Columns => width.points(),
-            GridLanesAxis::Rows => layout.height.points(),
+        // The post-layout height of an auto-sized grid is not a percentage
+        // basis for its row axis. In particular, treating it as definite
+        // makes a cyclic percentage child create an intrinsic row that CSS
+        // must instead size as `auto`.
+        // <https://www.w3.org/TR/css-grid/#track-sizing>
+        let grid_axis_percentage_basis = match axis {
+            GridLanesAxis::Columns => PercentageBasis::definite(layout_pt(width.points())),
+            GridLanesAxis::Rows => block_percentage_basis,
         };
-        let grid_axis_percentage_basis = PercentageBasis::definite(layout_pt(grid_axis_size));
+        let grid_axis_size = grid_lanes_basis_points(grid_axis_percentage_basis);
         let grid_axis_gap = resolved_grid_axis.map_or_else(
             || {
                 used_grid_lanes_gap(
@@ -310,18 +609,31 @@ impl<'a> LayoutBuilder<'a> {
             },
             ResolvedSubgridAxis::taffy_gap,
         );
+        let grid_axis_content_alignment = match axis {
+            GridLanesAxis::Columns => style.justify_content,
+            GridLanesAxis::Rows => style.align_content,
+        };
         let fixed_track_sizes =
             grid_lanes_definite_track_sizes(grid_axis_tracks, grid_axis_percentage_basis);
-        let auto_repeat_geometry = self.grid_lanes_auto_repeat_auto_geometry(
+        let auto_repeat_resolution = self.grid_lanes_resolve_intrinsic_auto_repeat(
+            style,
             axis,
             grid_axis_tracks,
             children,
             &layout.items,
             stylesheets,
+            width,
+            grid_axis_percentage_basis
+                .value()
+                .map(|basis| PhysicalContentHeight::new(content_box_pt(basis.points()))),
             inline_percentage_basis,
             grid_axis_percentage_basis,
             grid_axis_gap,
+            grid_axis_content_alignment,
         );
+        let auto_repeat_geometry = auto_repeat_resolution
+            .as_ref()
+            .map(|resolution| resolution.geometry(grid_axis_content_alignment, grid_axis_size));
         let auto_repeat_geometry_resolves_item_percentages = auto_repeat_geometry.is_some();
         let auto_row_geometry = (axis == GridLanesAxis::Rows)
             .then(|| {
@@ -350,10 +662,6 @@ impl<'a> LayoutBuilder<'a> {
         let taffy_gutters = match axis {
             GridLanesAxis::Columns => &layout.gap_gutters.columns,
             GridLanesAxis::Rows => &layout.gap_gutters.rows,
-        };
-        let grid_axis_content_alignment = match axis {
-            GridLanesAxis::Columns => style.justify_content,
-            GridLanesAxis::Rows => style.align_content,
         };
         let geometry = resolved_grid_axis
             .and_then(GridLanesTrackGeometry::from_resolved_subgrid_axis)
@@ -393,6 +701,28 @@ impl<'a> LayoutBuilder<'a> {
                 used_grid_lanes_gap(style.column_gap.clone(), inline_percentage_basis)
             }
         };
+        // The Grid probe intentionally treats cyclic item percentages as
+        // automatic while sizing intrinsic tracks.  Grid Lanes needs those
+        // same values again before it packs the perpendicular axis: the
+        // packed extent is a final item-size input, not an intrinsic track
+        // contribution.  Keep the estimate and the correction in the shared
+        // Grid sizing layer, then consume its result below for both axes.
+        // <https://www.w3.org/TR/css-grid-1/#percentage-sizing>
+        let final_estimates = children
+            .iter()
+            .map(|child| {
+                self.estimate_grid_item_size(
+                    child,
+                    stylesheets,
+                    width.points(),
+                    grid_percentage_basis(
+                        Some(content_box_pt(width.points())),
+                        GridAvailableSizeSource::ContainerInlineSize,
+                    ),
+                    grid_percentage_basis(None, GridAvailableSizeSource::ContainerBlockSize),
+                )
+            })
+            .collect::<Vec<_>>();
         let mut lane_ends = vec![0.0_f32; lane_count];
         let mut placed = layout.items.clone();
         let mut order = (0..children.len()).collect::<Vec<_>>();
@@ -408,21 +738,47 @@ impl<'a> LayoutBuilder<'a> {
         let mut occupied = vec![Vec::<GridLanesOccupiedInterval>::new(); lane_count];
         let grid_axis_line_names = resolved_grid_axis
             .map(|axis| axis.line_names().to_vec())
+            .or_else(|| {
+                auto_repeat_resolution
+                    .as_ref()
+                    .map(|resolution| resolution.line_names.clone())
+            })
             .or_else(|| grid_lanes_explicit_line_names(grid_axis_tracks));
+        let mut final_grid_axis_line_names =
+            grid_axis_line_names.clone().unwrap_or_else(|| match axis {
+                GridLanesAxis::Columns => layout.column_line_names.clone(),
+                GridLanesAxis::Rows => layout.row_line_names.clone(),
+            });
+        let final_grid_axis_offsets = geometry.line_offsets();
+        final_grid_axis_line_names.resize_with(final_grid_axis_offsets.len(), Vec::new);
+        final_grid_axis_line_names.truncate(final_grid_axis_offsets.len());
+        layout.set_physical_grid_axis_topology(
+            match axis {
+                GridLanesAxis::Columns => GridAxis::Column,
+                GridLanesAxis::Rows => GridAxis::Row,
+            },
+            final_grid_axis_offsets,
+            geometry.track_sizes(),
+            final_grid_axis_line_names,
+        );
 
         for index in order {
             let child = &children[index];
+            let placement_provenance = grid_lanes_item_placement(style, child)
+                .expect("Grid Lanes placement is only queried for a Grid Lanes container");
             // The ordinary Grid probe has already measured this item using
             // the shared intrinsic-sizing pipeline.  Grid Lanes changes its
             // placement, not its grid-axis intrinsic size, so retain that
             // measurement for non-stretch self-alignment.
-            let measured_item = &layout.items[index];
+            let measured_item = &placed[index];
             let span = grid_lanes_span(axis, child, lane_count);
             let (mut range, auto_placed) = match resolved_grid_axis
                 .and_then(|resolved_axis| {
                     let (start, end) = axis.placements(child);
-                    (!matches!(start, css::GridPlacement::Auto)
-                        || !matches!(end, css::GridPlacement::Auto))
+                    matches!(
+                        placement_provenance,
+                        GridLanesItemPlacement::Definite { .. }
+                    )
                     .then(|| resolved_axis.resolved_range(start, end, 1))
                     .and_then(|range| {
                         let range = range.track_range();
@@ -430,6 +786,11 @@ impl<'a> LayoutBuilder<'a> {
                         let end = range.end;
                         (start < end && end <= lane_count).then_some(start..end)
                     })
+                })
+                .or_else(|| {
+                    auto_repeat_resolution
+                        .as_ref()
+                        .and_then(|resolution| resolution.resolved_range(axis, child))
                 })
                 .or_else(|| {
                     grid_lanes_fixed_range(
@@ -444,6 +805,7 @@ impl<'a> LayoutBuilder<'a> {
                 None => (
                     grid_lanes_shortest_range(
                         &lane_ends,
+                        &geometry.active,
                         span,
                         auto_placement_cursor,
                         flow_tolerance,
@@ -464,25 +826,58 @@ impl<'a> LayoutBuilder<'a> {
                 }
             }
             let normal_range = range.clone();
+            let normal_area = grid_lanes_item_area(axis, &normal_range);
+            let measurement_context = GridLanesItemMeasurementContext {
+                stylesheets,
+                parent_style: style,
+                parent_layout: &layout,
+                area: normal_area,
+                placement: placement_provenance,
+                inline_percentage_basis,
+                axis,
+            };
             let stacking_start = lane_ends[normal_range.clone()]
                 .iter()
                 .cloned()
                 .fold(0.0_f32, f32::max);
             let margins = grid_lanes_margins(&child.style, inline_percentage_basis);
+            let final_percentage_size = match axis {
+                GridLanesAxis::Columns => resolve_grid_item_final_percentage_size(
+                    child,
+                    &final_estimates[index],
+                    measured_item,
+                    geometry.area_size(&range),
+                    layout.height.points(),
+                    width,
+                ),
+                GridLanesAxis::Rows => resolve_grid_item_final_percentage_size(
+                    child,
+                    &final_estimates[index],
+                    measured_item,
+                    width.points(),
+                    geometry.area_size(&range),
+                    width,
+                ),
+            };
             let (item_width, item_height, grid_axis_offset) = match axis {
                 GridLanesAxis::Columns => {
                     let area_width = geometry.area_size(&range);
-                    let measured_width = if auto_repeat_geometry_resolves_item_percentages {
-                        grid_lanes_grid_axis_specified_border_size(
-                            axis,
-                            &child.style,
-                            layout_pt(area_width),
-                        )
-                        .map(|size| size.points())
-                        .unwrap_or(measured_item.width())
-                    } else {
-                        measured_item.width()
-                    };
+                    let measured_width = final_percentage_size.width.map_or_else(
+                        || {
+                            if auto_repeat_geometry_resolves_item_percentages {
+                                grid_lanes_grid_axis_specified_border_size(
+                                    axis,
+                                    &child.style,
+                                    layout_pt(area_width),
+                                )
+                                .map(|size| size.points())
+                                .unwrap_or(measured_item.width())
+                            } else {
+                                measured_item.width()
+                            }
+                        },
+                        SemanticLengthExt::points,
+                    );
                     let (item_width, grid_axis_offset) = grid_lanes_grid_axis_alignment(
                         axis,
                         style,
@@ -492,31 +887,40 @@ impl<'a> LayoutBuilder<'a> {
                         margins.right.points(),
                         measured_width,
                     );
-                    let item_height = self
-                        .grid_lanes_item_border_block_size(
-                            child,
-                            stylesheets,
-                            item_width,
-                            inline_percentage_basis,
-                            axis,
+                    let item_height = final_percentage_size
+                        .height
+                        .map_or_else(
+                            || {
+                                self.grid_lanes_item_border_block_size(
+                                    child,
+                                    item_width,
+                                    measurement_context,
+                                )
+                                .points()
+                            },
+                            SemanticLengthExt::points,
                         )
-                        .points()
                         .max(0.0);
                     (item_width, item_height, grid_axis_offset)
                 }
                 GridLanesAxis::Rows => {
                     let area_height = geometry.area_size(&range);
-                    let measured_height = if auto_repeat_geometry_resolves_item_percentages {
-                        grid_lanes_grid_axis_specified_border_size(
-                            axis,
-                            &child.style,
-                            layout_pt(area_height),
-                        )
-                        .map(|size| size.points())
-                        .unwrap_or(measured_item.height())
-                    } else {
-                        measured_item.height()
-                    };
+                    let measured_height = final_percentage_size.height.map_or_else(
+                        || {
+                            if auto_repeat_geometry_resolves_item_percentages {
+                                grid_lanes_grid_axis_specified_border_size(
+                                    axis,
+                                    &child.style,
+                                    layout_pt(area_height),
+                                )
+                                .map(|size| size.points())
+                                .unwrap_or(measured_item.height())
+                            } else {
+                                measured_item.height()
+                            }
+                        },
+                        SemanticLengthExt::points,
+                    );
                     let (item_height, grid_axis_offset) = grid_lanes_grid_axis_alignment(
                         axis,
                         style,
@@ -526,15 +930,19 @@ impl<'a> LayoutBuilder<'a> {
                         margins.bottom.points(),
                         measured_height,
                     );
-                    let item_width = self
-                        .grid_lanes_item_border_block_size(
-                            child,
-                            stylesheets,
-                            item_height,
-                            inline_percentage_basis,
-                            axis,
+                    let item_width = final_percentage_size
+                        .width
+                        .map_or_else(
+                            || {
+                                self.grid_lanes_item_border_block_size(
+                                    child,
+                                    item_height,
+                                    measurement_context,
+                                )
+                                .points()
+                            },
+                            SemanticLengthExt::points,
                         )
-                        .points()
                         .max(0.0);
                     (item_width, item_height, grid_axis_offset)
                 }
@@ -566,6 +974,13 @@ impl<'a> LayoutBuilder<'a> {
                 .map(|(_, start)| *start)
                 .unwrap_or(stacking_start);
             let item = &mut placed[index];
+            item.set_grid_lanes_placement(placement_provenance);
+            if final_percentage_size.width.is_some() {
+                item.mark_final_percentage_axis(GridAxis::Column);
+            }
+            if final_percentage_size.height.is_some() {
+                item.mark_final_percentage_axis(GridAxis::Row);
+            }
             match axis {
                 GridLanesAxis::Columns => {
                     let area_x = geometry.area_start(&range);
@@ -716,12 +1131,41 @@ impl<'a> LayoutBuilder<'a> {
             }
         }
         match axis {
-            GridLanesAxis::Columns => layout.column_line_offsets = geometry.line_offsets(),
+            GridLanesAxis::Columns => {
+                layout.column_line_offsets = geometry.line_offsets();
+                let mut names = resolved_grid_axis
+                    .map(|axis| axis.physical_line_names().to_vec())
+                    .or_else(|| {
+                        auto_repeat_resolution
+                            .as_ref()
+                            .map(|resolution| resolution.line_names.clone())
+                    })
+                    .unwrap_or_else(|| layout.column_line_names.clone());
+                names.resize_with(layout.column_line_offsets.len(), Vec::new);
+                names.truncate(layout.column_line_offsets.len());
+                layout.column_line_names = names;
+            }
             GridLanesAxis::Rows if !has_auto_row_geometry => {
                 layout.row_line_offsets = geometry.line_offsets();
+                let mut names = resolved_grid_axis
+                    .map(|axis| axis.physical_line_names().to_vec())
+                    .or_else(|| {
+                        auto_repeat_resolution
+                            .as_ref()
+                            .map(|resolution| resolution.line_names.clone())
+                    })
+                    .unwrap_or_else(|| layout.row_line_names.clone());
+                names.resize_with(layout.row_line_offsets.len(), Vec::new);
+                names.truncate(layout.row_line_offsets.len());
+                layout.row_line_names = names;
             }
             GridLanesAxis::Rows => {}
         }
+        // Replaced items with an automatic size retain an intrinsic used size
+        // independently of their track contribution. Apply that geometry
+        // after Lanes has established the final origin; doing so earlier can
+        // make an intrinsic image incorrectly participate in lane packing.
+        apply_grid_replaced_item_size_corrections(style, children, &final_estimates, &mut placed);
         layout.items = placed;
         layout
     }
@@ -738,44 +1182,68 @@ impl<'a> LayoutBuilder<'a> {
     fn grid_lanes_item_border_block_size(
         &mut self,
         child: &GridChild<'_>,
-        stylesheets: &Stylesheets<'_>,
         grid_axis_border_size: f32,
-        inline_percentage_basis: GridLanesPercentageBasis,
-        axis: GridLanesAxis,
+        context: GridLanesItemMeasurementContext<'_>,
     ) -> BorderBoxLength {
         // Column lanes use their grid area as the item's physical inline
         // size. Row lanes stack along the physical inline axis instead, so
         // their width must be measured against the container's inline
         // percentage basis rather than the row-track (block-axis) size.
         // <https://drafts.csswg.org/css-grid-3/#grid-lanes-layout-and-placement-algorithm>
-        let available_width = match axis {
+        let available_width = match context.axis {
             GridLanesAxis::Columns => grid_lanes_content_inline_size(
                 child,
                 border_box_pt(grid_axis_border_size),
-                inline_percentage_basis,
+                context.inline_percentage_basis,
             ),
-            GridLanesAxis::Rows => content_box_pt(grid_lanes_basis_points(inline_percentage_basis)),
+            GridLanesAxis::Rows => {
+                content_box_pt(grid_lanes_basis_points(context.inline_percentage_basis))
+            }
         };
-        let estimate = self.estimate_grid_item_size(
-            child,
-            stylesheets,
-            available_width.points(),
-            grid_percentage_basis(
-                Some(available_width),
-                GridAvailableSizeSource::ContainerInlineSize,
-            ),
-            PercentageBasis::indefinite(),
-        );
-        border_box_pt(match axis {
+        let estimate = if let Some(subgrid_context) = ResolvedSubgridContext::from_parent(
+            context.parent_style,
+            context.parent_layout,
+            &child.style,
+            context.area,
+            Some(context.placement),
+        ) {
+            self.with_resolved_subgrid_context(subgrid_context, |layout| {
+                layout.estimate_grid_item_size(
+                    child,
+                    context.stylesheets,
+                    available_width.points(),
+                    grid_percentage_basis(
+                        Some(available_width),
+                        GridAvailableSizeSource::ContainerInlineSize,
+                    ),
+                    PercentageBasis::indefinite(),
+                )
+            })
+        } else {
+            self.estimate_grid_item_size(
+                child,
+                context.stylesheets,
+                available_width.points(),
+                grid_percentage_basis(
+                    Some(available_width),
+                    GridAvailableSizeSource::ContainerInlineSize,
+                ),
+                PercentageBasis::indefinite(),
+            )
+        };
+        border_box_pt(match context.axis {
             GridLanesAxis::Columns => {
                 estimate.height.points()
-                    + grid_lanes_vertical_non_content(&child.style, inline_percentage_basis)
+                    + grid_lanes_vertical_non_content(&child.style, context.inline_percentage_basis)
                         .points()
             }
             GridLanesAxis::Rows => {
                 estimate.width.points()
-                    + grid_lanes_horizontal_non_content(&child.style, inline_percentage_basis)
-                        .points()
+                    + grid_lanes_horizontal_non_content(
+                        &child.style,
+                        context.inline_percentage_basis,
+                    )
+                    .points()
             }
         })
     }
@@ -788,7 +1256,7 @@ impl<'a> LayoutBuilder<'a> {
     /// each item a conventional grid column, so reusing its final widths would
     /// incorrectly make sibling lanes depend on that unrelated placement.
     /// <https://drafts.csswg.org/css-grid-3/#track-sizing>
-    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code, clippy::too_many_arguments)]
     fn grid_lanes_auto_column_offsets(
         &mut self,
         tracks: &css::GridTrackList,
@@ -872,18 +1340,40 @@ impl<'a> LayoutBuilder<'a> {
     /// against the selected track area during replay.
     /// <https://drafts.csswg.org/css-grid-1/#algo-content> and
     /// <https://drafts.csswg.org/css-grid-3/#track-sizing>
-    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code, clippy::too_many_arguments)]
     fn grid_lanes_auto_repeat_auto_geometry(
         &mut self,
+        style: &ComputedStyle,
         axis: GridLanesAxis,
         tracks: &css::GridTrackList,
         children: &[GridChild<'_>],
         items: &[GridItemLayout],
         stylesheets: &Stylesheets<'_>,
+        width: PhysicalContentWidth,
+        root_height: Option<PhysicalContentHeight>,
         inline_percentage_basis: GridLanesPercentageBasis,
         available_size: GridLanesPercentageBasis,
         gap: f32,
+        content_alignment: css::ContentAlignment,
     ) -> Option<GridLanesTrackGeometry> {
+        if let Some(resolution) = self.grid_lanes_resolve_intrinsic_auto_repeat(
+            style,
+            axis,
+            tracks,
+            children,
+            items,
+            stylesheets,
+            width,
+            root_height,
+            inline_percentage_basis,
+            available_size,
+            gap,
+            content_alignment,
+        ) {
+            return Some(
+                resolution.geometry(content_alignment, grid_lanes_basis_points(available_size)),
+            );
+        }
         let css::GridTrackList::Tracks { components, .. } = tracks else {
             return None;
         };
@@ -989,6 +1479,563 @@ impl<'a> LayoutBuilder<'a> {
             .max(1.0) as usize;
         GridLanesTrackGeometry::from_track_sizes(&vec![contribution; count], gap)
     }
+
+    /// Resolve the Level 3 intrinsic auto-repeat as a complete grid-axis
+    /// geometry. This deliberately runs before ordinary Grid Lanes placement:
+    /// the hypothetical sizing pass ignores explicit line positions, while
+    /// the final geometry retains enough implicit tracks for them.
+    #[allow(clippy::too_many_arguments)]
+    fn grid_lanes_resolve_intrinsic_auto_repeat(
+        &mut self,
+        style: &ComputedStyle,
+        axis: GridLanesAxis,
+        tracks: &css::GridTrackList,
+        children: &[GridChild<'_>],
+        items: &[GridItemLayout],
+        stylesheets: &Stylesheets<'_>,
+        width: PhysicalContentWidth,
+        root_height: Option<PhysicalContentHeight>,
+        _inline_percentage_basis: GridLanesPercentageBasis,
+        available_size: GridLanesPercentageBasis,
+        gap: f32,
+        content_alignment: css::ContentAlignment,
+    ) -> Option<GridLanesAutoRepeatResolution> {
+        let css::GridTrackList::Tracks { components, .. } = tracks else {
+            return None;
+        };
+        if children.len() != items.len() {
+            return None;
+        }
+
+        let mut fixed_sizes = Vec::new();
+        let mut repeat_start = None;
+        let mut repeated_tracks = None;
+        let mut auto_fit = false;
+        for component in components {
+            match component {
+                css::GridTrackListComponent::Track(_, track) => {
+                    fixed_sizes.push(grid_lanes_definite_track_size(
+                        track.clone(),
+                        available_size,
+                    )?);
+                }
+                css::GridTrackListComponent::Repeat(_, repeat) => match repeat.count {
+                    css::GridRepeatCount::Number(count) => {
+                        for _ in 0..count {
+                            for component in &repeat.tracks {
+                                let css::GridTrackListComponent::Track(_, track) = component else {
+                                    return None;
+                                };
+                                fixed_sizes.push(grid_lanes_definite_track_size(
+                                    track.clone(),
+                                    available_size,
+                                )?);
+                            }
+                        }
+                    }
+                    css::GridRepeatCount::AutoFill | css::GridRepeatCount::AutoFit => {
+                        if repeated_tracks.is_some() {
+                            return None;
+                        }
+                        let tracks = repeat
+                            .tracks
+                            .iter()
+                            .map(|component| match component {
+                                css::GridTrackListComponent::Track(_, track) => Some(track.clone()),
+                                css::GridTrackListComponent::Repeat(_, _) => None,
+                            })
+                            .collect::<Option<Vec<_>>>()?;
+                        repeat_start = Some(fixed_sizes.len());
+                        auto_fit = matches!(repeat.count, css::GridRepeatCount::AutoFit);
+                        repeated_tracks = Some(tracks);
+                    }
+                },
+            }
+        }
+        let repeat_start = repeat_start?;
+        let repeated_tracks = repeated_tracks?;
+        if repeated_tracks.is_empty() {
+            return None;
+        }
+
+        // CSS Grid Level 3 requires enough virtual repetitions to expose all
+        // automatic starts for the largest span. The positions themselves are
+        // intentionally ignored in this sizing phase.
+        let largest_span = children
+            .iter()
+            .map(|child| grid_lanes_span(axis, child, usize::MAX))
+            .max()
+            .unwrap_or(1);
+        let hypothetical_repetitions = 2 + largest_span.saturating_sub(2) / repeated_tracks.len();
+        debug_assert!(hypothetical_repetitions >= 2);
+
+        let repeated_sizes = grid_lanes_virtual_mixed_auto_repeat_sizes(
+            axis,
+            children,
+            items,
+            &repeated_tracks,
+            hypothetical_repetitions,
+        )
+        .or_else(|| {
+            self.grid_lanes_virtual_intrinsic_auto_repeat_sizes(
+                style,
+                axis,
+                children,
+                stylesheets,
+                width,
+                root_height,
+                hypothetical_repetitions,
+                repeat_start,
+                repeated_tracks.len(),
+            )
+        })?;
+        let repeated_auto_sized = repeated_tracks
+            .iter()
+            .map(|track| {
+                matches!(
+                    grid_lanes_intrinsic_auto_repeat_track(track.clone()),
+                    Some(GridLanesIntrinsicAutoRepeatTrack::Auto)
+                )
+            })
+            .collect::<Vec<_>>();
+        let fixed_size = fixed_sizes.iter().sum::<f32>();
+        let fixed_track_count = fixed_sizes.len();
+        let repeat_size = repeated_sizes.iter().sum::<f32>();
+        let repeat_track_count = repeated_sizes.len();
+        let first_repetition_size = fixed_size
+            + repeat_size
+            + gap * (fixed_track_count + repeat_track_count).saturating_sub(1) as f32;
+        let available = grid_lanes_basis_points(available_size);
+        let repetitions = if available_size.is_definite() && first_repetition_size <= available {
+            ((available - first_repetition_size) / (repeat_size + gap * repeat_track_count as f32))
+                .floor()
+                .max(0.0) as usize
+                + 1
+        } else {
+            1
+        };
+        let mut suffix_sizes = fixed_sizes.split_off(repeat_start);
+        let prefix_sizes = fixed_sizes;
+        let mut resolved_tracks = prefix_sizes
+            .into_iter()
+            .map(|used_size| GridLanesResolvedAutoRepeatTrack {
+                source: GridLanesAutoRepeatTrackSource::FixedPrefix,
+                used_size,
+                auto_sized: false,
+                collapsed: false,
+            })
+            .collect::<Vec<_>>();
+        for repetition in 0..repetitions {
+            resolved_tracks.extend(repeated_sizes.iter().enumerate().map(|(slot, &used_size)| {
+                GridLanesResolvedAutoRepeatTrack {
+                    source: GridLanesAutoRepeatTrackSource::Repeated { repetition, slot },
+                    used_size,
+                    auto_sized: repeated_auto_sized[slot],
+                    collapsed: false,
+                }
+            }));
+        }
+        resolved_tracks.extend(suffix_sizes.drain(..).map(|used_size| {
+            GridLanesResolvedAutoRepeatTrack {
+                source: GridLanesAutoRepeatTrackSource::FixedSuffix,
+                used_size,
+                auto_sized: false,
+                collapsed: false,
+            }
+        }));
+        let repeat_range = repeat_start..repeat_start + repetitions * repeat_track_count;
+        let line_names = grid_lanes_expanded_auto_repeat_line_names(tracks, repetitions)?;
+        let explicit_line_count = resolved_tracks.len() + 1;
+        let mut resolution = GridLanesAutoRepeatResolution {
+            tracks: resolved_tracks,
+            explicit_line_count,
+            line_names,
+            repeat_range,
+            gap,
+            materialized_geometry: None,
+        };
+
+        // Explicit placement can extend the final grid, but it must not have
+        // influenced the hypothetical repeat-size pass above.
+        let required_track_count =
+            grid_lanes_required_track_count(axis, children, resolution.tracks.len());
+        resolution.append_end_implicit_tracks(
+            required_track_count.saturating_sub(resolution.tracks.len()),
+            grid_lanes_auto_implicit_track_size(axis, style, children, items),
+            grid_lanes_implicit_track_is_auto(axis, style),
+        );
+        // Once the intrinsic repeat count is known, ordinary Grid owns the
+        // used breadth of the resulting explicit and implicit track list.
+        // Replaying that *materialized* template is intentionally distinct
+        // from the preceding hypothetical pass: it observes authored line
+        // placement and lets `grid-auto-*` size the implicit tracks.  In
+        // particular, an implicit auto track must not inherit the largest
+        // repeated-track breadth merely because it is adjacent to the
+        // repeat.
+        // <https://drafts.csswg.org/css-grid-3/#grid-axis-track-sizing>
+        if !auto_fit {
+            resolution.materialized_geometry = self
+                .grid_lanes_materialized_auto_repeat_geometry(
+                    style,
+                    axis,
+                    children,
+                    stylesheets,
+                    width,
+                    root_height,
+                    repetitions,
+                )
+                .filter(|geometry| geometry.track_count() == resolution.tracks.len());
+        }
+        if auto_fit {
+            resolution.apply_auto_fit(
+                axis,
+                children,
+                items,
+                grid_lanes_flow_tolerance(style, _inline_percentage_basis),
+            );
+        }
+        let _ = content_alignment;
+        let _ = available;
+        Some(resolution)
+    }
+
+    /// Replay an intrinsic auto-repeat after its count has become definite.
+    ///
+    /// This is the final, placement-aware sizing pass. Unlike the virtual
+    /// pass, it leaves item placement intact and therefore creates the
+    /// normal implicit tracks required by spans extending past the explicit
+    /// grid. The returned sizes are already used sizes in the container's
+    /// coordinate space, including Grid's `normal`/stretch distribution.
+    #[allow(clippy::too_many_arguments)]
+    fn grid_lanes_materialized_auto_repeat_geometry(
+        &mut self,
+        style: &ComputedStyle,
+        axis: GridLanesAxis,
+        children: &[GridChild<'_>],
+        stylesheets: &Stylesheets<'_>,
+        width: PhysicalContentWidth,
+        root_height: Option<PhysicalContentHeight>,
+        repetitions: usize,
+    ) -> Option<GridLanesTrackGeometry> {
+        let mut materialized_style = style.clone();
+        let template = match axis {
+            GridLanesAxis::Columns => &mut materialized_style.grid_template_columns,
+            GridLanesAxis::Rows => &mut materialized_style.grid_template_rows,
+        };
+        let css::GridTrackList::Tracks { components, .. } = template else {
+            return None;
+        };
+        let repetitions = u16::try_from(repetitions).ok()?;
+        let mut materialized = false;
+        for component in components {
+            let css::GridTrackListComponent::Repeat(_, repeat) = component else {
+                continue;
+            };
+            if matches!(
+                repeat.count,
+                css::GridRepeatCount::AutoFill | css::GridRepeatCount::AutoFit
+            ) {
+                repeat.count = css::GridRepeatCount::Number(repetitions);
+                materialized = true;
+            }
+        }
+        materialized.then_some(())?;
+        let layout = self.compute_grid_layout_pass(
+            &materialized_style,
+            children,
+            stylesheets,
+            None,
+            &[],
+            GridLayoutPassConfig {
+                width,
+                root_height,
+                item_height_basis: grid_percentage_basis(
+                    root_height.map(PhysicalContentHeight::content_box_length),
+                    GridAvailableSizeSource::ContainerBlockSize,
+                ),
+                row_gap_basis: grid_percentage_basis(
+                    root_height.map(PhysicalContentHeight::content_box_length),
+                    GridAvailableSizeSource::ContainerBlockSize,
+                ),
+                reported_height: None,
+                item_placement_overrides: Vec::new(),
+                baseline_plan: None,
+            },
+        )?;
+        match axis {
+            GridLanesAxis::Columns => GridLanesTrackGeometry::from_grid_layout_offsets(
+                &layout.column_line_offsets,
+                &layout.gap_gutters.columns,
+            ),
+            GridLanesAxis::Rows => GridLanesTrackGeometry::from_grid_layout_offsets(
+                &layout.row_line_offsets,
+                &layout.gap_gutters.rows,
+            ),
+        }
+    }
+
+    /// Size the hypothetical repeat list with the ordinary Grid track-sizing
+    /// adapter. Every item is copied to every start at which its span fits;
+    /// its authored line placement is deliberately discarded for this pass.
+    ///
+    /// CSS Grid Level 3 defines these copies as theoretical automatic
+    /// positions, whose corresponding repeat slots contribute their maximum
+    /// resolved size: <https://drafts.csswg.org/css-grid-3/#grid-axis-track-sizing>.
+    #[allow(clippy::too_many_arguments)]
+    fn grid_lanes_virtual_intrinsic_auto_repeat_sizes(
+        &mut self,
+        style: &ComputedStyle,
+        axis: GridLanesAxis,
+        children: &[GridChild<'_>],
+        stylesheets: &Stylesheets<'_>,
+        width: PhysicalContentWidth,
+        root_height: Option<PhysicalContentHeight>,
+        repetitions: usize,
+        repeat_start: usize,
+        repeat_track_count: usize,
+    ) -> Option<Vec<f32>> {
+        let mut virtual_style = style.clone();
+        let template = match axis {
+            GridLanesAxis::Columns => &mut virtual_style.grid_template_columns,
+            GridLanesAxis::Rows => &mut virtual_style.grid_template_rows,
+        };
+        let css::GridTrackList::Tracks { components, .. } = template else {
+            return None;
+        };
+        let repetitions = u16::try_from(repetitions).ok()?;
+        for component in components {
+            let css::GridTrackListComponent::Repeat(_, repeat) = component else {
+                continue;
+            };
+            if matches!(
+                repeat.count,
+                css::GridRepeatCount::AutoFill | css::GridRepeatCount::AutoFit
+            ) {
+                repeat.count = css::GridRepeatCount::Number(repetitions);
+            }
+        }
+        match axis {
+            GridLanesAxis::Columns => {
+                virtual_style.justify_content =
+                    css::ContentAlignment::new(css::ContentAlignmentKeyword::Start);
+            }
+            GridLanesAxis::Rows => {
+                virtual_style.align_content =
+                    css::ContentAlignment::new(css::ContentAlignmentKeyword::Start);
+            }
+        }
+
+        let total_track_count = grid_lanes_template_track_count(template)?;
+        let mut virtual_children = Vec::new();
+        for child in children {
+            let span = grid_lanes_span(axis, child, total_track_count);
+            for start in 0..=total_track_count.saturating_sub(span) {
+                let mut copy = child.clone();
+                grid_lanes_set_virtual_axis_placement(&mut copy.style, axis, start, span)?;
+                grid_lanes_set_virtual_cross_axis_placement(&mut copy.style, axis)?;
+                virtual_children.push(copy);
+            }
+        }
+        let layout = self.compute_grid_layout_pass(
+            &virtual_style,
+            &virtual_children,
+            stylesheets,
+            None,
+            &[],
+            GridLayoutPassConfig {
+                width,
+                root_height,
+                item_height_basis: grid_percentage_basis(
+                    root_height.map(PhysicalContentHeight::content_box_length),
+                    GridAvailableSizeSource::ContainerBlockSize,
+                ),
+                row_gap_basis: grid_percentage_basis(
+                    root_height.map(PhysicalContentHeight::content_box_length),
+                    GridAvailableSizeSource::ContainerBlockSize,
+                ),
+                reported_height: None,
+                item_placement_overrides: Vec::new(),
+                baseline_plan: None,
+            },
+        )?;
+        let track_sizes = layout.physical_track_sizes(match axis {
+            GridLanesAxis::Columns => GridAxis::Column,
+            GridLanesAxis::Rows => GridAxis::Row,
+        });
+        (track_sizes.len() >= repeat_start + usize::from(repetitions) * repeat_track_count)
+            .then_some(())?;
+        Some(
+            (0..repeat_track_count)
+                .map(|slot| {
+                    (0..usize::from(repetitions))
+                        .filter_map(|repetition| {
+                            track_sizes.get(repeat_start + repetition * repeat_track_count + slot)
+                        })
+                        .copied()
+                        .fold(0.0_f32, f32::max)
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+}
+
+/// A virtual track used only while resolving an intrinsic Grid Lanes
+/// auto-repeat. Definite tracks reserve their complete breadth before a
+/// spanning item's contribution is distributed to the intrinsic tracks.
+/// <https://www.w3.org/TR/css-grid-3/#grid-axis-track-sizing>
+#[derive(Clone, Copy)]
+enum GridLanesVirtualMixedTrack {
+    Fixed(f32),
+    Intrinsic,
+}
+
+/// Resolve the simple mixed intrinsic/definite repeated list that the shared
+/// Grid adapter cannot model: Grid Lanes must place every virtual copy of a
+/// spanning item, but definite tracks cannot absorb its intrinsic growth.
+///
+/// This intentionally handles only an unadorned repeated list. More complex
+/// templates continue through the shared adapter until their complete track
+/// sizing protocol is represented here.
+fn grid_lanes_virtual_mixed_auto_repeat_sizes(
+    axis: GridLanesAxis,
+    children: &[GridChild<'_>],
+    items: &[GridItemLayout],
+    repeated_tracks: &[css::GridTrackSize],
+    repetitions: usize,
+) -> Option<Vec<f32>> {
+    if children.len() != items.len() || repeated_tracks.len() < 2 || repetitions == 0 {
+        return None;
+    }
+    let slots = repeated_tracks
+        .iter()
+        .cloned()
+        .map(grid_lanes_virtual_mixed_track)
+        .collect::<Option<Vec<_>>>()?;
+    if !slots
+        .iter()
+        .any(|slot| matches!(slot, GridLanesVirtualMixedTrack::Fixed(_)))
+        || !slots
+            .iter()
+            .any(|slot| matches!(slot, GridLanesVirtualMixedTrack::Intrinsic))
+    {
+        return None;
+    }
+
+    let mut track_sizes = (0..repetitions)
+        .flat_map(|_| slots.iter().copied())
+        .map(|slot| match slot {
+            GridLanesVirtualMixedTrack::Fixed(size) => size,
+            GridLanesVirtualMixedTrack::Intrinsic => 0.0,
+        })
+        .collect::<Vec<_>>();
+    let mut virtual_items = Vec::new();
+    for (child, item) in children.iter().zip(items) {
+        let span = grid_lanes_span(axis, child, track_sizes.len());
+        let contribution = match axis {
+            GridLanesAxis::Columns => item.width(),
+            GridLanesAxis::Rows => item.height(),
+        }
+        .max(0.0);
+        for start in 0..=track_sizes.len().saturating_sub(span) {
+            virtual_items.push((span, start, contribution));
+        }
+    }
+    virtual_items.sort_by_key(|(span, start, _)| (*span, *start));
+    for (span, start, contribution) in virtual_items {
+        let range = start..start + span;
+        let growable = range
+            .clone()
+            .filter(|&index| {
+                matches!(
+                    slots[index % slots.len()],
+                    GridLanesVirtualMixedTrack::Intrinsic
+                )
+            })
+            .collect::<Vec<_>>();
+        if growable.is_empty() {
+            continue;
+        }
+        let fixed_size = range
+            .filter_map(|index| match slots[index % slots.len()] {
+                GridLanesVirtualMixedTrack::Fixed(size) => Some(size),
+                GridLanesVirtualMixedTrack::Intrinsic => None,
+            })
+            .sum::<f32>();
+        let growth = ((contribution - fixed_size).max(0.0) / growable.len() as f32).max(0.0);
+        for index in growable {
+            track_sizes[index] = track_sizes[index].max(growth);
+        }
+    }
+    Some(
+        (0..slots.len())
+            .map(|slot| {
+                (0..repetitions)
+                    .map(|repetition| track_sizes[repetition * slots.len() + slot])
+                    .fold(0.0_f32, f32::max)
+            })
+            .collect(),
+    )
+}
+
+fn grid_lanes_virtual_mixed_track(track: css::GridTrackSize) -> Option<GridLanesVirtualMixedTrack> {
+    if let Some(intrinsic) = grid_lanes_intrinsic_auto_repeat_track(track.clone()) {
+        let _ = intrinsic;
+        return Some(GridLanesVirtualMixedTrack::Intrinsic);
+    }
+    let (
+        css::GridMinTrackBreadth::LengthPercentage(min),
+        css::GridMaxTrackBreadth::LengthPercentage(max),
+    ) = (track.min, track.max)
+    else {
+        return None;
+    };
+    if min.contains_percentage() || max.contains_percentage() {
+        return None;
+    }
+    let min = min.length_max_zero().points();
+    let max = max.length_max_zero().points();
+    ((min - max).abs() < 0.01).then_some(GridLanesVirtualMixedTrack::Fixed(min.max(0.0)))
+}
+
+/// Resolve the simple default `grid-auto-* : auto` track used after an
+/// intrinsic repeat has formed an end implicit grid. This is a contribution
+/// of the implicit track's own sizing function, not a borrowed repeated
+/// track size: a spanning item contributes evenly to every track in its
+/// candidate area.
+fn grid_lanes_auto_implicit_track_size(
+    axis: GridLanesAxis,
+    style: &ComputedStyle,
+    children: &[GridChild<'_>],
+    items: &[GridItemLayout],
+) -> f32 {
+    if !grid_lanes_implicit_track_is_auto(axis, style) {
+        return 0.0;
+    }
+    children
+        .iter()
+        .zip(items)
+        .map(|(child, item)| {
+            let span = grid_lanes_span(axis, child, usize::MAX).max(1) as f32;
+            let contribution = match axis {
+                GridLanesAxis::Columns => item.width(),
+                GridLanesAxis::Rows => item.height(),
+            };
+            (contribution / span).max(0.0)
+        })
+        .fold(0.0, f32::max)
+}
+
+fn grid_lanes_implicit_track_is_auto(axis: GridLanesAxis, style: &ComputedStyle) -> bool {
+    let auto_tracks = match axis {
+        GridLanesAxis::Columns => &style.grid_auto_columns,
+        GridLanesAxis::Rows => &style.grid_auto_rows,
+    };
+    auto_tracks.as_slice().iter().all(|track| {
+        matches!(
+            grid_lanes_intrinsic_auto_repeat_track(track.clone()),
+            Some(GridLanesIntrinsicAutoRepeatTrack::Auto)
+        )
+    })
 }
 
 /// Return the intrinsic track sizing function supported by the auto-repeat
@@ -1013,6 +2060,148 @@ fn grid_lanes_intrinsic_auto_repeat_track(
         }
         _ => None,
     }
+}
+
+fn grid_lanes_expanded_auto_repeat_line_names(
+    tracks: &css::GridTrackList,
+    repetitions: usize,
+) -> Option<Vec<Vec<String>>> {
+    let mut tracks = tracks.clone();
+    let css::GridTrackList::Tracks { components, .. } = &mut tracks else {
+        return None;
+    };
+    let repetitions = u16::try_from(repetitions).ok()?;
+    for component in components {
+        let css::GridTrackListComponent::Repeat(_, repeat) = component else {
+            continue;
+        };
+        if matches!(
+            repeat.count,
+            css::GridRepeatCount::AutoFill | css::GridRepeatCount::AutoFit
+        ) {
+            repeat.count = css::GridRepeatCount::Number(repetitions);
+        }
+    }
+    let css::GridTrackList::Tracks {
+        components,
+        trailing_names,
+    } = tracks
+    else {
+        unreachable!();
+    };
+    explicit_grid_line_names(&components, &trailing_names)
+}
+
+fn grid_lanes_template_track_count(tracks: &css::GridTrackList) -> Option<usize> {
+    let css::GridTrackList::Tracks { components, .. } = tracks else {
+        return None;
+    };
+    components.iter().try_fold(0_usize, |count, component| {
+        let added = match component {
+            css::GridTrackListComponent::Track(_, _) => 1,
+            css::GridTrackListComponent::Repeat(_, repeat) => {
+                let css::GridRepeatCount::Number(repetitions) = repeat.count else {
+                    return None;
+                };
+                let slots =
+                    repeat
+                        .tracks
+                        .iter()
+                        .try_fold(0_usize, |slots, component| match component {
+                            css::GridTrackListComponent::Track(_, _) => slots.checked_add(1),
+                            css::GridTrackListComponent::Repeat(_, _) => None,
+                        })?;
+                usize::from(repetitions).checked_mul(slots)?
+            }
+        };
+        count.checked_add(added)
+    })
+}
+
+fn grid_lanes_set_virtual_axis_placement(
+    style: &mut GridUsedStyle,
+    axis: GridLanesAxis,
+    start: usize,
+    span: usize,
+) -> Option<()> {
+    let start = i32::try_from(start.checked_add(1)?).ok()?;
+    let end = start.checked_add(i32::try_from(span).ok()?)?;
+    let start = css::GridPlacement::Line(css::GridLinePlacement::Number(
+        std::num::NonZeroI32::new(start)?,
+    ));
+    let end = css::GridPlacement::Line(css::GridLinePlacement::Number(std::num::NonZeroI32::new(
+        end,
+    )?));
+    match axis {
+        GridLanesAxis::Columns => {
+            style.grid_column_start = start;
+            style.grid_column_end = end;
+        }
+        GridLanesAxis::Rows => {
+            style.grid_row_start = start;
+            style.grid_row_end = end;
+        }
+    }
+    Some(())
+}
+
+fn grid_lanes_set_virtual_cross_axis_placement(
+    style: &mut GridUsedStyle,
+    axis: GridLanesAxis,
+) -> Option<()> {
+    let start = css::GridPlacement::Line(css::GridLinePlacement::Number(
+        std::num::NonZeroI32::new(1)?,
+    ));
+    let end = css::GridPlacement::Line(css::GridLinePlacement::Number(std::num::NonZeroI32::new(
+        2,
+    )?));
+    match axis {
+        GridLanesAxis::Columns => {
+            style.grid_row_start = start;
+            style.grid_row_end = end;
+        }
+        GridLanesAxis::Rows => {
+            style.grid_column_start = start;
+            style.grid_column_end = end;
+        }
+    }
+    Some(())
+}
+
+/// Return the physical number of tracks required by final explicit placement.
+/// Positive line references beyond the resolved explicit repeat establish
+/// ordinary implicit tracks; they must never be clamped into the repeat.
+fn grid_lanes_required_track_count(
+    axis: GridLanesAxis,
+    children: &[GridChild<'_>],
+    explicit_track_count: usize,
+) -> usize {
+    children
+        .iter()
+        .fold(explicit_track_count, |required, child| {
+            let (start, end) = axis.placements(child);
+            let span = grid_lanes_span(axis, child, usize::MAX);
+            let start_line = grid_lanes_positive_line(start);
+            let end_line = grid_lanes_positive_line(end);
+            let item_required = match (start_line, end_line) {
+                (Some(start), Some(end)) => start.max(end).saturating_sub(1),
+                (Some(start), None) => start.saturating_sub(1).saturating_add(span),
+                (None, Some(end)) => end.saturating_sub(1),
+                // An automatically placed span expands the implicit grid
+                // when the explicit repeat has fewer tracks than the span.
+                // Its final position is chosen later by the Grid Lanes
+                // placement algorithm, but it must fit before then.
+                (None, None) => span,
+            };
+            required.max(item_required)
+        })
+}
+
+fn grid_lanes_positive_line(placement: &css::GridPlacement) -> Option<usize> {
+    let css::GridPlacement::Line(line) = placement else {
+        return None;
+    };
+    usize::try_from(line.index()?).ok().filter(|&line| line > 0)
 }
 
 fn grid_lanes_reverse_range(
@@ -1520,6 +2709,28 @@ fn grid_lanes_span(axis: GridLanesAxis, child: &GridChild<'_>, lane_count: usize
     .clamp(1, lane_count)
 }
 
+/// The parent-grid area corresponding to a resolved Grid Lanes range. The
+/// stacking axis is the container content box; only the grid axis is a grid
+/// area. This is the same topology used for final replay of a subgrid item.
+fn grid_lanes_item_area(axis: GridLanesAxis, range: &std::ops::Range<usize>) -> GridItemArea {
+    let start = u16::try_from(range.start.saturating_add(1)).unwrap_or(u16::MAX);
+    let end = u16::try_from(range.end.saturating_add(1)).unwrap_or(u16::MAX);
+    match axis {
+        GridLanesAxis::Columns => GridItemArea {
+            row_start: 1,
+            row_end: 2,
+            column_start: start,
+            column_end: end,
+        },
+        GridLanesAxis::Rows => GridItemArea {
+            row_start: start,
+            row_end: end,
+            column_start: 1,
+            column_end: 2,
+        },
+    }
+}
+
 fn grid_lanes_fixed_range(
     axis: GridLanesAxis,
     child: &GridChild<'_>,
@@ -1542,12 +2753,20 @@ fn grid_lanes_fixed_range(
 
 fn grid_lanes_shortest_range(
     lane_ends: &[f32],
+    active_tracks: &[bool],
     span: usize,
     cursor: usize,
     tolerance: f32,
 ) -> std::ops::Range<usize> {
+    debug_assert_eq!(lane_ends.len(), active_tracks.len());
     let mut best_end = f32::INFINITY;
     for start in 0..=lane_ends.len().saturating_sub(span) {
+        if !active_tracks[start..start + span]
+            .iter()
+            .all(|&active| active)
+        {
+            continue;
+        }
         let end = lane_ends[start..start + span]
             .iter()
             .cloned()
@@ -1556,6 +2775,12 @@ fn grid_lanes_shortest_range(
     }
     let mut first = None;
     for start in 0..=lane_ends.len().saturating_sub(span) {
+        if !active_tracks[start..start + span]
+            .iter()
+            .all(|&active| active)
+        {
+            continue;
+        }
         let end = lane_ends[start..start + span]
             .iter()
             .cloned()
@@ -1567,7 +2792,8 @@ fn grid_lanes_shortest_range(
             }
         }
     }
-    let start = first.unwrap_or(0);
+    let start =
+        first.unwrap_or_else(|| active_tracks.iter().position(|&active| active).unwrap_or(0));
     start..start + span
 }
 
@@ -1612,5 +2838,23 @@ fn used_grid_lanes_gap(gap: css::ComputedGap, basis: GridLanesPercentageBasis) -
     match gap {
         css::ComputedGap::Normal => 0.0,
         css::ComputedGap::LengthPercentage(value) => used_length_percentage(value, basis).points(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collapsed_auto_fit_track_preserves_one_gutter_between_active_neighbors() {
+        let geometry = GridLanesTrackGeometry::from_track_sizes_with_active(
+            &[37.5, 37.5, 0.0, 37.5],
+            7.5,
+            &[true, true, false, true],
+        )
+        .expect("non-empty track list has geometry");
+
+        assert_eq!(geometry.starts, vec![0.0, 45.0, 90.0, 90.0]);
+        assert_eq!(geometry.ends, vec![37.5, 82.5, 90.0, 127.5]);
     }
 }

@@ -23,10 +23,13 @@ spec divergences. Actual CSS/PDF conformance gaps should still be recorded in
   handle. It cannot carry Quire's owned CSS math representation or its
   percentage-definiteness semantics. Quire resolves mixed values at the
   adapter boundary when the relevant percentage basis is definite.
-- `self-start` and `self-end` alignment: CSS Box Alignment maps these keywords
-  through the alignment subject's own writing mode. Taffy's flex alignment
-  model only carries the container-axis keyword, so Quire lets Taffy perform
-  sizing and line construction, then corrects final cross-axis offsets.
+- CSS Align cross-axis placement and baseline sharing: CSS Box Alignment maps
+  `self-start`/`self-end` through the alignment subject's own writing mode and
+  defines safe overflow and first/last baseline-sharing behavior. Taffy's flex
+  alignment model only carries container-axis placeholders and no baseline
+  callback, so Quire preserves its sizing, line construction, stretch, and
+  auto-margin results, then resolves final side, center, and baseline placement
+  from the completed flex-line slots.
 - `align-content: baseline`: Taffy's public `AlignContentKeyword` has no
   baseline keywords, so Quire maps them to start packing, records flex line
   metadata, and applies baseline packing in post-processing.

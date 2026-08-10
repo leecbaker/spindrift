@@ -1,8 +1,14 @@
 /// Quire's standard result type.
 ///
-/// ```
-/// fn render() -> quire::Result<()> {
-///     Ok(())
+/// ```no_run
+/// use quire::{Html, PdfOptions, RenderOptions, Result};
+/// use std::fs::File;
+///
+/// async fn render() -> Result<()> {
+///     let html = Html::from_file("document.html").await?;
+///     let mut output = File::create("document.pdf")?;
+///     html.write_pdf(&mut output, &RenderOptions::default(), &PdfOptions::default())
+///         .await
 /// }
 /// ```
 pub type Result<T> = std::result::Result<T, Error>;
@@ -10,9 +16,22 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, thiserror::Error)]
 /// An error returned while loading, rendering, or serializing a document.
 ///
-/// ```
-/// let error = quire::Error::InvalidInput("missing source".to_string());
-/// assert!(error.to_string().contains("missing source"));
+/// ```no_run
+/// use quire::{Error, Html, PdfOptions, RenderOptions};
+/// use std::fs::File;
+///
+/// # async fn render() -> Result<(), Error> {
+/// let html = Html::from_file("document.html").await?;
+/// let mut output = File::create("document.pdf")?;
+/// if let Err(error) = html
+///     .write_pdf(&mut output, &RenderOptions::default(), &PdfOptions::default())
+///     .await
+/// {
+///     eprintln!("could not create PDF: {error}");
+///     return Err(error);
+/// }
+/// # Ok(())
+/// # }
 /// ```
 pub enum Error {
     #[error(transparent)]

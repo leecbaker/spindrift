@@ -1052,6 +1052,12 @@ async fn inline_block_intrinsic_width_uses_own_definite_height_for_percentage_ca
         .expect("canvas background should paint behind green");
     assert!((red.width() - 75.0).abs() < 0.01, "red={red:?}");
     assert!((red.height() - 75.0).abs() < 0.01, "red={red:?}");
+    assert!(
+        first_rect_paint_operation_index(page, CssColor::new(255, 0, 0))
+            < first_rect_paint_operation_index(page, CssColor::new(0, 128, 0)),
+        "the negative-z canvas must paint before the inline-block's in-flow background: {:?}",
+        page.paint_operations()
+    );
 }
 
 #[tokio::test]
@@ -1763,6 +1769,77 @@ async fn supports_authored_vertical_align_super_and_sub() {
     assert!(up.y() > base.y());
     assert!(down.y() < base.y());
     assert!(flat.y() < up.y());
+}
+
+#[tokio::test]
+async fn regular_inline_top_and_bottom_align_descendant_text_to_line_edges() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 240pt 160pt; margin: 20pt }\
+         body, p { margin: 0 }\
+         .small { font: 10pt/10pt sans-serif }\
+         .big { font: 20pt/20pt sans-serif }\
+         </style>\
+         <p class=\"small\">small<span class=\"big\" style=\"vertical-align:top\">top</span></p>\
+         <p class=\"big\">big<span class=\"small\" style=\"vertical-align:bottom\">bottom</span></p>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let lines = &document.pages[0].lines();
+    let line = |text: &str| {
+        lines
+            .iter()
+            .find(|line| line.text == text)
+            .unwrap_or_else(|| panic!("expected rendered line {text:?}: {lines:?}"))
+    };
+    let small = line("small");
+    let top = line("top");
+    let big = line("big");
+    let bottom = line("bottom");
+
+    assert!(
+        top.y() < small.y() - 4.0,
+        "top-aligned descendant should sit above the small baseline sibling: top={top:?}, small={small:?}"
+    );
+    assert!(
+        bottom.y() < big.y() - 2.0,
+        "bottom-aligned descendant should sit below the big baseline sibling: bottom={bottom:?}, big={big:?}"
+    );
+}
+
+#[tokio::test]
+async fn nested_regular_inline_top_and_bottom_scopes_are_independent() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 240pt 120pt; margin: 20pt }\
+         body, p { margin: 0 }\
+         .small { font: 10pt/10pt sans-serif }\
+         .big { font: 20pt/20pt sans-serif }\
+         </style>\
+         <p class=\"small\">peer<span class=\"big\" style=\"vertical-align:top\">outer<span class=\"small\" style=\"vertical-align:bottom\">inner</span></span></p>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let lines = &document.pages[0].lines();
+    let line = |text: &str| {
+        lines
+            .iter()
+            .find(|line| line.text == text)
+            .unwrap_or_else(|| panic!("expected rendered line {text:?}: {lines:?}"))
+    };
+    let peer = line("peer");
+    let outer = line("outer");
+    let inner = line("inner");
+
+    assert!(outer.y() < peer.y() - 4.0);
+    assert!(
+        inner.y() < outer.y() - 2.0,
+        "nested bottom scope must not inherit the outer top placement: inner={inner:?}, outer={outer:?}"
+    );
 }
 
 #[tokio::test]

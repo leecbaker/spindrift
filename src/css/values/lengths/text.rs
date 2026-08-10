@@ -14,7 +14,7 @@ pub(crate) fn parse_hanging_punctuation(value: &str) -> Option<HangingPunctuatio
 
     let mut output = HangingPunctuation::NONE;
     let mut saw_keyword = false;
-    for keyword in value.split_whitespace() {
+    for keyword in crate::css::component_values::try_split_css_component_values(value)? {
         match keyword.to_ascii_lowercase().as_str() {
             "first" if !output.first => output.first = true,
             "last" if !output.last => output.last = true,
@@ -31,7 +31,9 @@ pub(in crate::css) fn remove_unordered_text_indent_keyword(
     value: &str,
     keyword: &str,
 ) -> (String, bool) {
-    let Some(range) = find_top_level_keyword(value, keyword) else {
+    let Some(range) =
+        crate::css::component_values::find_css_top_level_keyword_range(value, keyword)
+    else {
         return (value.trim().to_string(), false);
     };
     let mut output = String::with_capacity(value.len().saturating_sub(range.len()));
@@ -41,47 +43,6 @@ pub(in crate::css) fn remove_unordered_text_indent_keyword(
     }
     output.push_str(value[range.end..].trim_start());
     (output.trim().to_string(), true)
-}
-
-pub(in crate::css) fn find_top_level_keyword(
-    value: &str,
-    keyword: &str,
-) -> Option<std::ops::Range<usize>> {
-    let first = keyword.chars().next()?;
-    let mut depth = 0usize;
-    for (start, character) in value.char_indices() {
-        match character {
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
-            _ if depth == 0 && character.eq_ignore_ascii_case(&first) => {
-                let end = start + keyword.len();
-                if value
-                    .get(start..end)
-                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(keyword))
-                    && keyword_boundary(value, start, end)
-                {
-                    return Some(start..end);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-pub(in crate::css) fn keyword_boundary(value: &str, start: usize, end: usize) -> bool {
-    !value[..start]
-        .chars()
-        .next_back()
-        .is_some_and(is_css_identifier_character)
-        && !value[end..]
-            .chars()
-            .next()
-            .is_some_and(is_css_identifier_character)
-}
-
-pub(in crate::css) fn is_css_identifier_character(character: char) -> bool {
-    character.is_ascii_alphanumeric() || character == '_' || character == '-'
 }
 
 /// Parses `letter-spacing` into a computed length projection.

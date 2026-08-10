@@ -1,5 +1,6 @@
 use super::*;
 use crate::text::character_is_css_other_space_separator;
+use crate::text::{Uax14BoundaryProtection, uax14_atomic_boundary_protection};
 #[cfg(test)]
 use crate::text::{keep_all_suppresses_break_between, manual_suppresses_break_between};
 use std::rc::Rc;
@@ -190,8 +191,7 @@ pub(in crate::layout) fn inline_break_opportunities_for_runs(
             position: InlineGraphPosition::at_run_start(runs.len()),
             kind: InlineBreakKind::Forced,
             availability: BreakAvailability::Ordinary,
-            trims: false,
-            hangs: false,
+            whitespace_edge: SelectedWhitespaceEdge::None,
             discretionary: None,
         });
     }
@@ -375,8 +375,11 @@ pub(in crate::layout) fn inline_text_break_opportunity(
             InlineBreakKind::SoftWrap
         },
         availability,
-        trims: false,
-        hangs,
+        whitespace_edge: if hangs {
+            SelectedWhitespaceEdge::PreWrapHang
+        } else {
+            SelectedWhitespaceEdge::None
+        },
         discretionary: soft_hyphen.then_some(DiscretionaryBreakEffect {
             source_boundary: InlineGraphPosition {
                 run_index,
@@ -419,8 +422,7 @@ fn inline_break_opportunity_at_boundary(
             position: InlineGraphPosition::at_run_start(boundary),
             kind: InlineBreakKind::ExplicitVirtual,
             availability: BreakAvailability::Ordinary,
-            trims: false,
-            hangs: false,
+            whitespace_edge: SelectedWhitespaceEdge::None,
             discretionary: None,
         });
     }
@@ -438,8 +440,7 @@ fn inline_break_opportunity_at_boundary(
             position: InlineGraphPosition::at_run_start(boundary),
             kind: InlineBreakKind::FloatPlacement,
             availability: BreakAvailability::Ordinary,
-            trims: false,
-            hangs: false,
+            whitespace_edge: SelectedWhitespaceEdge::None,
             discretionary: None,
         });
     }
@@ -448,8 +449,7 @@ fn inline_break_opportunity_at_boundary(
             position: InlineGraphPosition::at_run_start(boundary),
             kind: InlineBreakKind::PreservedSpace,
             availability: BreakAvailability::Ordinary,
-            trims: true,
-            hangs: false,
+            whitespace_edge: SelectedWhitespaceEdge::CollapseAtNextLineStart,
             discretionary: None,
         });
     }
@@ -461,8 +461,7 @@ fn inline_break_opportunity_at_boundary(
             position: InlineGraphPosition::at_run_start(boundary),
             kind: InlineBreakKind::PreservedSpace,
             availability: BreakAvailability::Ordinary,
-            trims: true,
-            hangs: false,
+            whitespace_edge: SelectedWhitespaceEdge::CollapseAtNextLineStart,
             discretionary: None,
         });
     }
@@ -480,8 +479,7 @@ fn inline_break_opportunity_at_boundary(
             position: InlineGraphPosition::at_run_start(boundary),
             kind: InlineBreakKind::PreservedSpace,
             availability: BreakAvailability::Ordinary,
-            trims: true,
-            hangs: false,
+            whitespace_edge: SelectedWhitespaceEdge::CollapseAtNextLineStart,
             discretionary: None,
         });
     }
@@ -506,8 +504,7 @@ fn inline_break_opportunity_at_boundary(
             position: InlineGraphPosition::at_run_start(boundary),
             kind: InlineBreakKind::PreservedSpace,
             availability: BreakAvailability::Ordinary,
-            trims: false,
-            hangs: true,
+            whitespace_edge: SelectedWhitespaceEdge::PreWrapHang,
             discretionary: None,
         });
     }
@@ -521,8 +518,7 @@ fn inline_break_opportunity_at_boundary(
             position: InlineGraphPosition::at_run_start(boundary),
             kind: InlineBreakKind::BreakSpaces,
             availability: BreakAvailability::Ordinary,
-            trims: false,
-            hangs: false,
+            whitespace_edge: SelectedWhitespaceEdge::BreakSpacesRetained,
             discretionary: None,
         });
     }
@@ -562,8 +558,7 @@ fn inline_break_opportunity_at_boundary(
                     unreachable!("break-spaces fallback must have text")
                 }
             },
-            trims: false,
-            hangs: false,
+            whitespace_edge: SelectedWhitespaceEdge::None,
             discretionary: None,
         });
     }
@@ -580,8 +575,7 @@ fn inline_break_opportunity_at_boundary(
             position: InlineGraphPosition::at_run_start(boundary),
             kind: InlineBreakKind::Hyphenation,
             availability: BreakAvailability::Ordinary,
-            trims: false,
-            hangs: false,
+            whitespace_edge: SelectedWhitespaceEdge::None,
             discretionary: Some(DiscretionaryBreakEffect {
                 source_boundary: InlineGraphPosition::at_run_start(boundary),
                 marker_owner: DiscretionaryMarkerOwner {
@@ -686,8 +680,7 @@ fn inline_atomic_boundary_opportunity(
             position: InlineGraphPosition::at_run_start(boundary),
             kind: InlineBreakKind::AtomicBoundary,
             availability: BreakAvailability::Ordinary,
-            trims: false,
-            hangs: false,
+            whitespace_edge: SelectedWhitespaceEdge::None,
             discretionary: None,
         },
     )
@@ -833,8 +826,9 @@ fn inline_line_item_is_transparent_to_text_continuity(item: &InlineLineItem) -> 
 fn inline_line_item_is_transparent_text_edge(atom: &InlineAtom) -> bool {
     matches!(
         atom.content(),
-        InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(_) | InlineEdgeRole::TextAutospace)
-            | InlineAtomContent::StaticPositionPlaceholder
+        InlineAtomContent::InlineEdge(
+            InlineEdgeRole::BoxEdge(_) | InlineEdgeRole::TextAutospace(_)
+        ) | InlineAtomContent::StaticPositionPlaceholder
     )
 }
 
@@ -971,13 +965,19 @@ fn inline_atomic_boundary_allows_soft_wrap(
 ) -> bool {
     inline_boundary_owner_allows_soft_wrap(before.scope(), after.scope(), fallback_boundary_style)
         && !((before.is_atomic()
-            && after
-                .leading_character()
-                .is_some_and(character_blocks_atomic_inline_break))
+            && after.leading_character().is_some_and(|character| {
+                !matches!(
+                    uax14_atomic_boundary_protection(character),
+                    Uax14BoundaryProtection::None
+                )
+            }))
             || (after.is_atomic()
-                && before
-                    .trailing_character()
-                    .is_some_and(character_blocks_atomic_inline_break)))
+                && before.trailing_character().is_some_and(|character| {
+                    !matches!(
+                        uax14_atomic_boundary_protection(character),
+                        Uax14BoundaryProtection::None
+                    )
+                })))
 }
 
 fn inline_fragment_boundary_opportunity(
@@ -1007,8 +1007,7 @@ fn inline_fragment_boundary_opportunity(
             InlineBreakKind::SoftWrap
         },
         availability,
-        trims: false,
-        hangs: false,
+        whitespace_edge: SelectedWhitespaceEdge::None,
         discretionary: None,
     })
 }
@@ -1129,6 +1128,7 @@ fn text_break_is_min_content_eligible_at_fragment_boundary(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::css::ContentLanguage;
 
     #[test]
     fn selected_soft_hyphen_preserves_trailing_joining_context() {
@@ -1198,7 +1198,9 @@ mod tests {
 
     fn text_autospace_edge(style: &ComputedStyle) -> InlineAtom {
         InlineAtom::new(
-            InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace),
+            InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace(
+                InlineTextBoundarySpacing::new(layout_pt(0.0), false),
+            )),
             style.clone(),
             None,
             InlineSize::new(0.0, style.line_height),
@@ -1387,7 +1389,7 @@ mod tests {
     #[test]
     fn explicit_virtual_separator_owns_one_ordinary_graph_boundary() {
         let mut style = ComputedStyle::initial();
-        style.language = Some("th".to_string());
+        style.language = ContentLanguage::from_html_attribute("th");
         let runs = vec![
             InlineParagraphRun {
                 item: InlineLineItem::Fragment(fragment("กรุงเทพ", style.clone())),
@@ -1437,7 +1439,7 @@ mod tests {
     fn auto_phrase_uses_icu_boundaries_across_transparent_text_edges() {
         let mut style = ComputedStyle::initial();
         style.word_break = css::WordBreak::AutoPhrase;
-        style.language = Some("ja".to_string());
+        style.language = ContentLanguage::from_html_attribute("ja");
         let runs = vec![
             InlineParagraphRun {
                 item: InlineLineItem::Fragment(fragment("東京へ", style.clone())),
@@ -1496,7 +1498,35 @@ mod tests {
         assert!(opportunities.iter().any(|opportunity| {
             opportunity.position == InlineGraphPosition::at_run_start(2)
                 && matches!(opportunity.kind, InlineBreakKind::PreservedSpace)
-                && opportunity.hangs
+                && opportunity.whitespace_edge == SelectedWhitespaceEdge::PreWrapHang
+        }));
+    }
+
+    #[test]
+    fn collapsible_space_break_marks_the_next_line_start_for_collapse() {
+        let style = ComputedStyle::initial();
+        let runs = vec![
+            InlineParagraphRun {
+                item: InlineLineItem::Fragment(fragment("one", style.clone())),
+                width: 0.0,
+                shaped: None,
+            },
+            InlineParagraphRun {
+                item: InlineLineItem::Fragment(fragment(" ", style.clone())),
+                width: 0.0,
+                shaped: None,
+            },
+            InlineParagraphRun {
+                item: InlineLineItem::Fragment(fragment("two", style.clone())),
+                width: 0.0,
+                shaped: None,
+            },
+        ];
+
+        let opportunities = inline_break_opportunities_for_runs(&runs, &style);
+        assert!(opportunities.iter().any(|opportunity| {
+            opportunity.position == InlineGraphPosition::at_run_start(1)
+                && opportunity.trims_next_line_start()
         }));
     }
 
@@ -1532,7 +1562,7 @@ mod tests {
         assert!(opportunities.iter().any(|opportunity| {
             opportunity.position == InlineGraphPosition::at_run_start(2)
                 && matches!(opportunity.kind, InlineBreakKind::BreakSpaces)
-                && !opportunity.hangs
+                && opportunity.whitespace_edge == SelectedWhitespaceEdge::BreakSpacesRetained
         }));
 
         let combined_runs = vec![InlineParagraphRun {
@@ -1558,7 +1588,36 @@ mod tests {
                     byte_offset: "xx\u{1680}".len(),
                 }
                 && matches!(opportunity.kind, InlineBreakKind::SoftWrap)
-                && !opportunity.hangs
+                && opportunity.whitespace_edge == SelectedWhitespaceEdge::None
+        }));
+
+        let narrow_no_break_space_runs = vec![InlineParagraphRun {
+            item: InlineLineItem::Fragment(fragment("xx\u{202f}あ", style)),
+            width: 0.0,
+            shaped: None,
+        }];
+        let opportunities = inline_break_opportunities_for_runs(
+            &narrow_no_break_space_runs,
+            &ComputedStyle::initial(),
+        );
+        assert!(
+            !opportunities.iter().any(|opportunity| {
+                opportunity.position
+                    == InlineGraphPosition {
+                        run_index: 0,
+                        byte_offset: "xx".len(),
+                    }
+            }),
+            "U+202F retains its ordinary UAX #14 GL protection before itself"
+        );
+        assert!(opportunities.iter().any(|opportunity| {
+            opportunity.position
+                == InlineGraphPosition {
+                    run_index: 0,
+                    byte_offset: "xx\u{202f}".len(),
+                }
+                && matches!(opportunity.kind, InlineBreakKind::SoftWrap)
+                && opportunity.whitespace_edge == SelectedWhitespaceEdge::None
         }));
     }
 
@@ -1749,6 +1808,14 @@ mod tests {
                 "{text:?} must suppress an atomic-inline boundary break"
             );
         }
+        assert!(!inline_atomic_boundary_allows_soft_wrap(
+            InlineBreakBoundaryContext::Text {
+                text: "word\u{202f}",
+                scope: None,
+            },
+            InlineBreakBoundaryContext::Atomic { scope: None },
+            &style,
+        ));
     }
 
     #[test]

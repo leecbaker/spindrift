@@ -22,6 +22,39 @@ use crate::{
 };
 use fontique::Blob as FontiqueBlob;
 
+trait PdfBytesForTest {
+    fn write_pdf_bytes(&self, options: &PdfOptions) -> crate::Result<Vec<u8>>;
+}
+
+impl PdfBytesForTest for Document {
+    fn write_pdf_bytes(&self, options: &PdfOptions) -> crate::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        self.write_pdf(&mut bytes, options)?;
+        Ok(bytes)
+    }
+}
+
+trait HtmlPdfBytesForTest {
+    async fn write_pdf_bytes(
+        &self,
+        render_options: &RenderOptions,
+        pdf_options: &PdfOptions,
+    ) -> crate::Result<Vec<u8>>;
+}
+
+impl HtmlPdfBytesForTest for Html {
+    async fn write_pdf_bytes(
+        &self,
+        render_options: &RenderOptions,
+        pdf_options: &PdfOptions,
+    ) -> crate::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        self.write_pdf(&mut bytes, render_options, pdf_options)
+            .await?;
+        Ok(bytes)
+    }
+}
+
 struct CountingFontData {
     bytes: Vec<u8>,
     reads: Arc<AtomicUsize>,
@@ -884,6 +917,11 @@ fn pdf_metadata_stream_mirrors_document_info_dictionary() {
         title: Some("Spec Title".to_string()),
         author: Some("Ada Lovelace".to_string()),
         creator: Some("Quire Test Suite".to_string()),
+        language: Some("en-US".to_string()),
+        description: Some("Specification summary".to_string()),
+        keywords: vec!["PDF".to_string(), "metadata".to_string()],
+        created: crate::DocumentDate::parse("1997-07-16T19:20+01:00".to_string()),
+        modified: crate::DocumentDate::parse("1998-12-23".to_string()),
     });
 
     let pdf_options = PdfOptions {
@@ -900,10 +938,22 @@ fn pdf_metadata_stream_mirrors_document_info_dictionary() {
     assert!(rendered.contains("/Author (Ada Lovelace)"));
     assert!(rendered.contains("/Creator (Quire Test Suite)"));
     assert!(rendered.contains("/Producer (quire-test producer)"));
+    assert!(rendered.contains("/Lang (en-US)"));
+    assert!(rendered.contains("/Subject (Specification summary)"));
+    assert!(rendered.contains("/Keywords (PDF, metadata)"));
+    assert!(rendered.contains("/CreationDate (D:19970716192000+01'00)"));
+    assert!(rendered.contains("/ModDate (D:19981223)"));
     assert!(xmp.contains("<pdf:Producer>quire-test producer</pdf:Producer>"));
     assert!(!xmp.contains("pdfaid"));
     assert!(xmp.contains("<xmp:CreatorTool>Quire Test Suite</xmp:CreatorTool>"));
     assert!(xmp.contains("<dc:creator><rdf:Seq><rdf:li>Ada Lovelace</rdf:li>"));
+    assert!(xmp.contains("<dc:language><rdf:Bag><rdf:li>en-US</rdf:li>"));
+    assert!(xmp.contains(
+        "<dc:description><rdf:Alt><rdf:li xml:lang=\"x-default\">Specification summary</rdf:li>"
+    ));
+    assert!(xmp.contains("<pdf:Keywords>PDF, metadata</pdf:Keywords>"));
+    assert!(xmp.contains("<xmp:CreateDate>1997-07-16T19:20+01:00</xmp:CreateDate>"));
+    assert!(xmp.contains("<xmp:ModifyDate>1998-12-23</xmp:ModifyDate>"));
     assert!(xmp.contains("<dc:title><rdf:Alt><rdf:li xml:lang=\"x-default\">Spec Title</rdf:li>"));
     assert_eq!(
         first_xmp_lang_alt_text(&xmp, "dc:title"),
@@ -964,6 +1014,10 @@ fn pdf_xmp_metadata_escapes_text_values() {
         title: Some("AT&T <PDF> \"Title\" 'Test' Café".to_string()),
         author: Some("Ada & Bob <Team> \"A\" 'B' Ł".to_string()),
         creator: Some("Tool & Chain <1>".to_string()),
+        language: Some("en&<US>\"'".to_string()),
+        description: Some("A & B <C>".to_string()),
+        keywords: vec!["A&B".to_string()],
+        ..DocumentMetadata::default()
     });
 
     let options = PdfOptions {
@@ -978,6 +1032,9 @@ fn pdf_xmp_metadata_escapes_text_values() {
     assert!(xmp.contains("Ada &amp; Bob &lt;Team&gt; &quot;A&quot; &#39;B&#39; Ł"));
     assert!(xmp.contains("Tool &amp; Chain &lt;1&gt;"));
     assert!(xmp.contains("Quire &amp; Producer &lt;PDF&gt;"));
+    assert!(xmp.contains("en&amp;&lt;US&gt;&quot;&#39;"));
+    assert!(xmp.contains("A &amp; B &lt;C&gt;"));
+    assert!(xmp.contains("<pdf:Keywords>A&amp;B</pdf:Keywords>"));
 }
 
 #[tokio::test]
@@ -1654,6 +1711,38 @@ async fn block_svg_opacity_emits_transparency_group_form_xobject() {
     assert!(rendered.contains("/Subtype /Form"));
     assert_transparency_group(&rendered);
     assert!(rendered.contains("/GSalpha500 gs"));
+}
+
+#[tokio::test]
+async fn inline_svg_root_emits_an_isolated_transparency_group() {
+    let pdf = Html::from_string(
+        "<style>@page { size: 100pt 100pt; margin: 0 } body, svg { margin: 0 } \\
+         svg { background: green; }</style>\\
+         <svg width=\"20pt\" height=\"20pt\"><rect width=\"20pt\" height=\"20pt\" fill=\"red\"/></svg>",
+    )
+    .write_pdf_bytes(&RenderOptions::default(), &crate::PdfOptions::default())
+    .await
+    .unwrap();
+    let rendered = pdf_searchable_text(&pdf);
+
+    assert!(rendered.contains("/Subtype /Form"));
+    assert_transparency_group(&rendered);
+}
+
+#[tokio::test]
+async fn block_svg_root_emits_an_isolated_transparency_group() {
+    let pdf = Html::from_string(
+        "<style>@page { size: 100pt 100pt; margin: 0 } body, svg { margin: 0 } \\
+         svg { display: block; background: green; }</style>\\
+         <svg width=\"20pt\" height=\"20pt\"><rect width=\"20pt\" height=\"20pt\" fill=\"red\"/></svg>",
+    )
+    .write_pdf_bytes(&RenderOptions::default(), &crate::PdfOptions::default())
+    .await
+    .unwrap();
+    let rendered = pdf_searchable_text(&pdf);
+
+    assert!(rendered.contains("/Subtype /Form"));
+    assert_transparency_group(&rendered);
 }
 
 #[tokio::test]

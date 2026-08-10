@@ -1,5 +1,6 @@
 use super::generated_content::annotate_line_break_element_breaks;
 use super::*;
+use crate::layout::inline_layout::InlineLineStackCursor;
 use std::rc::Rc;
 
 impl<'a> LayoutBuilder<'a> {
@@ -377,52 +378,39 @@ impl<'a> LayoutBuilder<'a> {
         )
     }
 
-    pub(in crate::layout) fn inline_static_baseline_y_from_buffer(
-        &mut self,
-        output: &[InlineItem],
-        fallback_style: &ComputedStyle,
-    ) -> f32 {
-        if let Some(atom) = output.iter().rev().find_map(|item| match item {
-            InlineItem::Atom(atom) if !atom.content().is_inline_edge() => Some(atom),
-            _ => None,
-        }) {
-            let borders = used_border_widths(atom.style());
-            let atom_baseline_offset =
-                inline_atom_logical_margin_box_baseline_offset(atom, fallback_style)
-                    - atom.baseline_shift;
-            let parent_baseline_offset = self
-                .font_system
-                .rendered_first_line_baseline_offset(atom.style())
-                .points();
-            let line_baseline_offset = atom_baseline_offset.max(parent_baseline_offset);
-            return self.cursor_y - line_baseline_offset
-                + atom.baseline_offset_from_border_box_block_start(
-                    inline_atom_logical_border_block_size(atom, fallback_style),
-                )
-                + atom.baseline_shift
-                - borders.top
-                - atom.style().padding.top
-                - atom.style().font_size;
-        }
-
-        self.cursor_y
-            - self
-                .font_system
-                .rendered_first_line_baseline_offset(fallback_style)
-                .points()
-    }
-
-    pub(in crate::layout) fn block_static_position_y_offset_from_buffer(
+    pub(in crate::layout) fn block_static_position_placeholder_box_from_buffer(
         &mut self,
         output: &[InlineItem],
         block_style: &ComputedStyle,
-    ) -> f32 {
+        static_position_index: Option<usize>,
+    ) -> Option<PageTopRect> {
         // Zero-sized split inline edge atoms preserve decoration boundaries,
         // but do not themselves occupy the line that selects the static
         // position. Nonzero edge atoms, such as an inline-start border before
         // a block-in-inline split, still create the hypothetical line that
         // precedes the block-level positioned box.
-        let has_buffered_content = output.iter().any(|item| match item {
+        let static_position_index = static_position_index
+            .unwrap_or(output.len())
+            .min(output.len());
+        let preceding_items = &output[..static_position_index];
+        // An inline edge with zero advance is omitted from ordinary line
+        // selection, but its own line-height still separates the split
+        // inline's start fragment from a following block box. Preserve that
+        // replacement extent while selecting the hypothetical block start.
+        // <https://www.w3.org/TR/CSS22/visuren.html#anonymous-block-level>
+        let zero_advance_edge_line_height = preceding_items
+            .iter()
+            .map(|item| match item {
+                InlineItem::Atom(atom)
+                    if atom.content().is_inline_edge() && atom.size.width.abs() <= f32::EPSILON =>
+                {
+                    Some(atom.size.height)
+                }
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+            .and_then(|heights| heights.into_iter().reduce(f32::max));
+        let has_buffered_content = preceding_items.iter().any(|item| match item {
             InlineItem::Word(_) => !inline_item_is_collapsible_space(item),
             InlineItem::Atom(atom) => {
                 !atom.content().is_inline_edge() || atom.size.width > 0.0 || atom.size.height > 0.0
@@ -438,7 +426,7 @@ impl<'a> LayoutBuilder<'a> {
             InlineItem::Break(_) => true,
         });
         if !has_buffered_content {
-            return 0.0;
+            return Some(PageTopRect::new(self.content_left, self.cursor_y, 0.0, 0.0));
         }
         let available_width = self.current_content_logical_inline_size().max(1.0);
         // CSS Positioned Layout removes the abspos from flow, but CSS 2.2
@@ -449,13 +437,19 @@ impl<'a> LayoutBuilder<'a> {
         // machinery as real content:
         // https://www.w3.org/TR/css-position-3/#absolute-positioning
         // https://www.w3.org/TR/CSS22/visudet.html#abs-non-replaced-height
-        let mut hypothetical_items = output.to_vec();
+        let mut hypothetical_items = Vec::with_capacity(output.len() + 2);
+        hypothetical_items.extend_from_slice(preceding_items);
         if !matches!(hypothetical_items.last(), Some(InlineItem::Break(_))) {
             hypothetical_items.push(InlineItem::Break(InlineBreak::default()));
         }
+        // This atom chooses the preceding inline line only. It is not the
+        // hypothetical block box itself: block-in-inline splitting creates
+        // that box in block layout, not as an inline atomic participant.
+        // <https://www.w3.org/TR/CSS22/visuren.html#anonymous-block-level>
         hypothetical_items.push(InlineItem::Atom(Box::new(
             self.block_static_position_placeholder_atom(block_style),
         )));
+        hypothetical_items.extend_from_slice(&output[static_position_index..]);
         // The placeholder sequence is measurement only. In particular,
         // buffered source floats must not be registered a second time while
         // determining an absolute box's block static position.
@@ -469,10 +463,18 @@ impl<'a> LayoutBuilder<'a> {
             0.0,
         );
         self.restore(snapshot);
+        let context = sequence.context(block_style);
         let records = sequence.fragment_records_for_paint(0, sequence.records.len());
-        let mut offset = 0.0;
+        let replay_snapshot = self.snapshot();
+        let mut plaintext_direction_state = None;
+        let mut stack = InlineLineStackCursor::new(
+            block_style,
+            self.content_left,
+            self.content_right,
+            self.cursor_y,
+        );
         for record in &records {
-            if record.fragment.as_ref().is_some_and(|fragment| {
+            let contains_placeholder = record.fragment.as_ref().is_some_and(|fragment| {
                 fragment.items().iter().any(|item| {
                     matches!(
                         &item.item,
@@ -480,22 +482,87 @@ impl<'a> LayoutBuilder<'a> {
                             if matches!(atom.content(), InlineAtomContent::StaticPositionPlaceholder)
                     )
                 })
-            }) {
-                return offset;
+            });
+            if contains_placeholder {
+                stack.apply(self);
+                self.apply_line_block_start_trim_for_paint(record, block_style.writing_mode);
+                let split_boundary_cursor = self.cursor_y;
+                let placeholder_box = self
+                    .prepare_inline_line_record(record, context, &mut plaintext_direction_state)
+                    .and_then(|prepared| {
+                        prepared.paint_items.iter().find_map(|item| {
+                            let PreparedInlinePaintItem::Atom(atom) = item else {
+                                return None;
+                            };
+                            matches!(
+                                atom.atom.content(),
+                                InlineAtomContent::StaticPositionPlaceholder
+                            )
+                            .then_some(
+                                match block_style.writing_mode {
+                                    WritingMode::HorizontalTb => {
+                                        // A block in an inline sequence splits
+                                        // the preceding inline run into an
+                                        // anonymous block. Its hypothetical
+                                        // block-start is the next line's
+                                        // block-start, not the inline atom's
+                                        // baseline-aligned content rectangle.
+                                        // <https://www.w3.org/TR/CSS22/visuren.html#anonymous-block-level>
+                                        // <https://www.w3.org/TR/CSS22/visudet.html#abs-non-replaced-height>
+                                        PageTopRect::new(
+                                            self.content_left,
+                                            split_boundary_cursor
+                                                - zero_advance_edge_line_height
+                                                    .map(|height| {
+                                                        (height - block_style.line_height).max(0.0)
+                                                    })
+                                                    .unwrap_or(0.0),
+                                            0.0,
+                                            0.0,
+                                        )
+                                    }
+                                    WritingMode::VerticalRl
+                                    | WritingMode::VerticalLr
+                                    | WritingMode::SidewaysRl
+                                    | WritingMode::SidewaysLr => {
+                                        // In vertical flow the block axis is
+                                        // physical horizontal. The prepared
+                                        // zero-footprint marker supplies the
+                                        // logical boundary between the preceding
+                                        // anonymous block and the hypothetical
+                                        // block; its inline content extent must
+                                        // not become the latter's block size.
+                                        PageTopRect::new(
+                                            atom.border_box.x(),
+                                            split_boundary_cursor,
+                                            // Diagnostic: the block-start edge
+                                            // of a vertical-rl hypothetical block
+                                            // is its physical right margin edge.
+                                            // Keep this extent out of the line
+                                            // marker itself while proving that the
+                                            // capture needs the block box edge,
+                                            // rather than the marker's left edge.
+                                            block_style.line_height,
+                                            0.0,
+                                        )
+                                    }
+                                },
+                            )
+                        })
+                    });
+                self.restore(replay_snapshot);
+                return placeholder_box;
             }
-            offset += record.height();
+            stack.advance(record.height());
         }
-        offset
+        self.restore(replay_snapshot);
+        None
     }
 
-    /// Builds a non-painting line-selection atom for the block-level static
-    /// position of an absolutely positioned box.
-    ///
-    /// CSS Positioned Layout resolves auto insets from the hypothetical
-    /// normal-flow static-position rectangle; for block-level sources inside
-    /// inline collection, that rectangle starts after the preceding line boxes:
-    /// <https://www.w3.org/TR/css-position-3/#staticpos-rect> and
-    /// <https://www.w3.org/TR/CSS22/visudet.html#abs-non-replaced-height>.
+    /// Builds a non-painting line-selection atom for a block-level static
+    /// source. The real hypothetical block box is laid out separately after
+    /// block-in-inline splitting; this atom must not impersonate that box.
+    /// <https://www.w3.org/TR/css-position-3/#staticpos-rect>
     pub(in crate::layout) fn block_static_position_placeholder_atom(
         &mut self,
         block_style: &ComputedStyle,
@@ -631,12 +698,18 @@ impl<'a> LayoutBuilder<'a> {
     ) {
         match part {
             GeneratedContentPart::Text(text) => {
-                push_generated_inline_words_for_style(
+                let source = if element.tag.eq_ignore_ascii_case("wbr") {
+                    InlineTextSource::GeneratedWbr
+                } else {
+                    InlineTextSource::Generated
+                };
+                push_generated_inline_words_for_style_with_source(
                     text,
                     style,
                     link_target,
                     baseline_shift,
                     visual_offset,
+                    source,
                     output,
                 );
             }

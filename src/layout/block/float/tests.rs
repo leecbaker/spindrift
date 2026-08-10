@@ -787,6 +787,36 @@ fn bfc_root_placement_ignores_own_margins_for_float_collision() {
 }
 
 #[test]
+fn bfc_root_placement_keeps_rtl_border_box_at_band_end() {
+    let context = FloatContext {
+        shapes: vec![shape(Float::Left, 0, 0.0, 50.0, 100.0, 0.0)],
+    };
+
+    let placement = context.avoiding_bfc_root_position(
+        0,
+        top(100.0),
+        Clear::None,
+        WritingMode::HorizontalTb,
+        Direction::Rtl,
+        0.0,
+        100.0,
+        |band, _top| bfc_measurement(band.right() - 40.0, 40.0, 20.0),
+    );
+
+    // The residual band is the available-space result; the resolved RTL
+    // border box is anchored at its physical end and remains the collision
+    // geometry used by the BFC fixed point.
+    assert_eq!(
+        placement.placement.available_span,
+        PageInlineSpan::new(50.0, 50.0)
+    );
+    assert_eq!(
+        placement.candidate.normal_flow_border_box_inline_span,
+        PageInlineSpan::new(60.0, 40.0)
+    );
+}
+
+#[test]
 fn bfc_root_placement_uses_resolved_border_box_start() {
     let context = FloatContext {
         shapes: vec![shape(Float::Right, 0, 50.0, 100.0, 100.0, 50.0)],

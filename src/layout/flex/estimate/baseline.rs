@@ -47,7 +47,7 @@ mod tests {
                 layout_pt(0.0),
                 layout_pt(50.0),
             ),
-            Some(FlexHorizontalBaselineOffset::new(50.0))
+            Some(flex_horizontal_baseline_from_points(50.0))
         );
     }
 
@@ -73,7 +73,7 @@ mod tests {
                 layout_pt(0.0),
                 layout_pt(10.0),
             ),
-            Some(FlexHorizontalBaselineOffset::new(95.0))
+            Some(flex_horizontal_baseline_from_points(95.0))
         );
     }
 
@@ -95,7 +95,7 @@ mod tests {
                 layout_pt(0.0),
                 layout_pt(12.0),
             ),
-            Some(FlexHorizontalBaselineOffset::new(12.0))
+            Some(flex_horizontal_baseline_from_points(12.0))
         );
     }
 }
@@ -139,10 +139,10 @@ pub(in crate::layout::flex) fn horizontal_text_baseline_offset(
         .physical_side(LogicalSide::BlockStart)
     {
         PhysicalSide::Top | PhysicalSide::Bottom => None,
-        PhysicalSide::Left => Some(FlexHorizontalBaselineOffset::new(
+        PhysicalSide::Left => Some(flex_horizontal_baseline_from_points(
             borders.left + style.padding.left + content_baseline_offset,
         )),
-        PhysicalSide::Right => Some(FlexHorizontalBaselineOffset::new(
+        PhysicalSide::Right => Some(flex_horizontal_baseline_from_points(
             border_box_width.points()
                 - borders.right
                 - style.padding.right
@@ -407,8 +407,8 @@ impl<'a> LayoutBuilder<'a> {
                 let baseline = self.inline_box_text_line_layout_baseline_offset(&box_.style);
                 FlexItemBaselineEstimate {
                     vertical: FlexItemBaselinePair {
-                        first: Some(FlexVerticalBaselineOffset::new(baseline)),
-                        last: Some(FlexVerticalBaselineOffset::new(baseline)),
+                        first: Some(flex_vertical_baseline_from_points(baseline)),
+                        last: Some(flex_vertical_baseline_from_points(baseline)),
                     },
                     ..Default::default()
                 }
@@ -686,8 +686,8 @@ impl<'a> LayoutBuilder<'a> {
 
         FlexItemBaselineEstimate {
             vertical: FlexItemBaselinePair {
-                first: Some(FlexVerticalBaselineOffset::new(first_baseline)),
-                last: Some(FlexVerticalBaselineOffset::new(last_baseline)),
+                first: Some(flex_vertical_baseline_from_points(first_baseline)),
+                last: Some(flex_vertical_baseline_from_points(last_baseline)),
             },
             horizontal: FlexItemBaselinePair {
                 first: first_horizontal_text_baseline_offset(

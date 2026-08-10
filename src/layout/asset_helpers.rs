@@ -1,6 +1,7 @@
 use super::*;
 use crate::LayoutSize;
 use crate::layout::assets::rasterize_generated_css_image;
+use crate::svg::SvgImageContext;
 use crate::units::{IntoLayoutLength, LayoutLength, layout_px};
 use std::rc::Rc;
 
@@ -33,6 +34,7 @@ pub(super) fn load_resolved_image_source(
     root_url: Option<&url::Url>,
     resource_cache: &ResourceCache,
     apply_orientation: bool,
+    image_context: SvgImageContext,
 ) -> Option<ResolvedImageAsset> {
     load_resolved_image_source_with_request(
         src,
@@ -40,6 +42,7 @@ pub(super) fn load_resolved_image_source(
         root_url,
         resource_cache,
         apply_orientation,
+        image_context,
         &css::RequestUrlModifiers::default(),
     )
 }
@@ -52,11 +55,16 @@ pub(super) fn load_resolved_image_source_with_request(
     root_url: Option<&url::Url>,
     resource_cache: &ResourceCache,
     apply_orientation: bool,
+    image_context: SvgImageContext,
     request_modifiers: &css::RequestUrlModifiers,
 ) -> Option<ResolvedImageAsset> {
     let (asset, svg_fragment) = if src.starts_with("data:") {
         (
-            resource_cache.data_image_asset_with_orientation(src, apply_orientation)?,
+            resource_cache.data_image_asset_with_orientation(
+                src,
+                apply_orientation,
+                image_context,
+            )?,
             None,
         )
     } else {
@@ -67,7 +75,11 @@ pub(super) fn load_resolved_image_source_with_request(
         }
         let svg_fragment = url.fragment().map(str::to_owned);
         (
-            resource_cache.image_asset_url_with_orientation(&url, apply_orientation)?,
+            resource_cache.image_asset_url_with_orientation(
+                &url,
+                apply_orientation,
+                image_context,
+            )?,
             svg_fragment,
         )
     };
@@ -120,6 +132,7 @@ pub(super) fn load_image_source_with_request(
         root_url,
         resource_cache,
         apply_orientation,
+        SvgImageContext::default(),
         request_modifiers,
     )? {
         ResolvedImageAsset::Raster(image) => Some(image),
@@ -525,6 +538,7 @@ pub(super) fn intrinsic_image_size(
         root_url,
         resource_cache,
         style.image_orientation == css::ImageOrientation::FromImage,
+        SvgImageContext::from_used_color_scheme(style.used_color_scheme),
     )?;
     let intrinsic_size = match &asset {
         ResolvedImageAsset::Raster(image) => image.natural_layout_size(),
@@ -983,6 +997,7 @@ pub(super) fn used_generated_image(
         root_url,
         resource_cache,
         style.image_orientation == css::ImageOrientation::FromImage,
+        SvgImageContext::from_used_color_scheme(style.used_color_scheme),
     )?;
     // CSS Images applies an image-set resolution descriptor to the natural
     // resolution of raster candidates only. Vector SVG candidates retain
@@ -2095,7 +2110,15 @@ mod tests {
     fn percent_encoded_svg_data_url_resolves_as_a_vector_asset() {
         let cache = ResourceCache::default();
         let source = "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%2220%22%20height%3D%2210%22%3E%3Cpath%20d%3D%22M0%200H20V10H0Z%22%20fill%3D%22red%22%2F%3E%3C%2Fsvg%3E";
-        let asset = load_resolved_image_source(source, None, None, &cache, true).unwrap();
+        let asset = load_resolved_image_source(
+            source,
+            None,
+            None,
+            &cache,
+            true,
+            SvgImageContext::default(),
+        )
+        .unwrap();
         let ResolvedImageAsset::Svg(asset) = asset else {
             panic!("expected SVG asset");
         };
@@ -2115,7 +2138,15 @@ mod tests {
     fn base64_svg_data_url_resolves_as_a_vector_asset() {
         let cache = ResourceCache::default();
         let source = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIxMCI+PHBhdGggZD0iTTAgMEgyMFYxMEgwWiIgZmlsbD0icmVkIi8+PC9zdmc+";
-        let asset = load_resolved_image_source(source, None, None, &cache, true).unwrap();
+        let asset = load_resolved_image_source(
+            source,
+            None,
+            None,
+            &cache,
+            true,
+            SvgImageContext::default(),
+        )
+        .unwrap();
 
         assert!(matches!(asset, ResolvedImageAsset::Svg(_)));
     }
@@ -2131,7 +2162,7 @@ mod tests {
             .await
             .expect("local image fixture must preload");
         assert!(matches!(
-            cache.image_asset_url_with_orientation(&url, true),
+            cache.image_asset_url_with_orientation(&url, true, SvgImageContext::default()),
             Some(crate::resource::ResourceImageAsset::Svg(_))
         ));
     }
@@ -2543,5 +2574,47 @@ mod tests {
             resolved.source_rect().size,
             NormalizedObjectSourceSize::new(1.0, 1.0)
         );
+    }
+
+    #[test]
+    fn border_image_percentage_slices_use_the_concrete_svg_viewport() {
+        // A 150pt square border-image area establishes a 200 by 200 CSS-pixel
+        // SVG viewport. Percentage slices must remain proportions of that
+        // viewport, independently of the SVG's viewBox coordinates.
+        // <https://www.w3.org/TR/css-backgrounds-3/#border-image-slice>
+        let slices = used_border_image_slices(
+            css::BorderImageSliceOffsets {
+                top: css::BorderImageSliceValue::Percent(0.40),
+                right: css::BorderImageSliceValue::Percent(0.30),
+                bottom: css::BorderImageSliceValue::Percent(0.20),
+                left: css::BorderImageSliceValue::Percent(0.10),
+            },
+            200,
+            200,
+        );
+
+        assert_eq!(slices.top, 80);
+        assert_eq!(slices.right, 60);
+        assert_eq!(slices.bottom, 40);
+        assert_eq!(slices.left, 20);
+    }
+
+    #[test]
+    fn border_image_numeric_slices_keep_concrete_svg_coordinates() {
+        let slices = used_border_image_slices(
+            css::BorderImageSliceOffsets {
+                top: css::BorderImageSliceValue::Number(40.0),
+                right: css::BorderImageSliceValue::Number(30.0),
+                bottom: css::BorderImageSliceValue::Number(20.0),
+                left: css::BorderImageSliceValue::Number(10.0),
+            },
+            200,
+            200,
+        );
+
+        assert_eq!(slices.top, 40);
+        assert_eq!(slices.right, 30);
+        assert_eq!(slices.bottom, 20);
+        assert_eq!(slices.left, 10);
     }
 }

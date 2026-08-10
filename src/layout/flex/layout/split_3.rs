@@ -376,6 +376,7 @@ pub(in crate::layout::flex) fn flex_break_units(
                     }
                 }
                 (!item_indices.is_empty()).then(|| FlexBreakUnit {
+                    topology: FlexReplayTopology::Fragmented,
                     line_start: line_index,
                     line_end: line_index + 1,
                     block_start,
@@ -434,6 +435,7 @@ pub(in crate::layout::flex) fn flex_break_units(
                     continue;
                 }
                 partitions.push(FlexBreakUnit {
+                    topology: FlexReplayTopology::Fragmented,
                     line_start: active.iter().map(|unit| unit.line_start).min().unwrap_or(0),
                     line_end: active.iter().map(|unit| unit.line_end).max().unwrap_or(0),
                     block_start,
@@ -517,6 +519,7 @@ pub(in crate::layout::flex) fn flex_break_units(
             .iter()
             .any(|&index| fragmentainer_kind.avoids_break_inside(&children[index].style));
         units.push(FlexBreakUnit {
+            topology: FlexReplayTopology::Fragmented,
             item_indices,
             line_start,
             line_end,
@@ -528,6 +531,53 @@ pub(in crate::layout::flex) fn flex_break_units(
         });
     }
     units
+}
+
+/// Builds the sole replay unit for a flex container that remains in one
+/// fragmentainer.
+///
+/// Flex lines can overlap on the physical block axis (notably wrapped
+/// physical columns), but that is ordinary two-dimensional flex placement,
+/// not fragmentation. Replaying them through physical block intervals would
+/// turn a `column-reverse` container into an incorrectly ordered source
+/// sequence. The line membership is already order-modified, so flatten it
+/// without sorting by physical geometry.
+/// <https://www.w3.org/TR/css-flexbox-1/#layout-algorithm>
+/// <https://www.w3.org/TR/css-flexbox-1/#pagination>
+pub(in crate::layout::flex) fn unfragmented_flex_container_break_unit(
+    flex_layout: &FlexLayout,
+    children: &[StyledChild<'_>],
+    total_content_height: LayoutLength,
+) -> FlexBreakUnit {
+    let mut item_indices = Vec::with_capacity(flex_layout.items.len());
+    let mut included = vec![false; flex_layout.items.len()];
+    for line in &flex_layout.lines {
+        for &item_index in &line.item_indices {
+            if !included[item_index] && !flex_item_is_collapsed(&children[item_index].style) {
+                included[item_index] = true;
+                item_indices.push(item_index);
+            }
+        }
+    }
+    // A zero-sized or otherwise exceptional item can have final geometry
+    // without appearing in a line record. It remains an in-flow flex item and
+    // must have exactly one replay opportunity.
+    for (item_index, child) in children.iter().enumerate() {
+        if !included[item_index] && !flex_item_is_collapsed(&child.style) {
+            item_indices.push(item_index);
+        }
+    }
+    FlexBreakUnit {
+        topology: FlexReplayTopology::Unfragmented,
+        item_indices,
+        line_start: 0,
+        line_end: flex_layout.lines.len(),
+        block_start: FlexFragmentBlockOffset::new(0.0),
+        block_end: FlexFragmentBlockOffset::new(total_content_height.points()),
+        break_before: PageBreak::Auto,
+        break_after: PageBreak::Auto,
+        break_inside_avoid: false,
+    }
 }
 
 /// Builds the fragmentation units for a flex container, including its own
@@ -564,6 +614,7 @@ pub(in crate::layout::flex) fn flex_container_break_units(
     units.retain(|unit| unit.block_end.points() > unit.block_start.points() + 0.01);
     if units.is_empty() && total_content_height > layout_pt(0.01) {
         units.push(FlexBreakUnit {
+            topology: FlexReplayTopology::Fragmented,
             item_indices: Vec::new(),
             line_start: 0,
             line_end: 0,
@@ -610,6 +661,7 @@ pub(in crate::layout::flex) fn flex_zero_capacity_column_item_break_units(
             let bounds = flex_item_block_bounds(item, true);
             let (line_start, line_end) = flex_item_line_range(flex_layout, item_index);
             FlexBreakUnit {
+                topology: FlexReplayTopology::Fragmented,
                 item_indices: vec![item_index],
                 line_start,
                 line_end,
@@ -682,14 +734,6 @@ pub(in crate::layout::flex) fn flex_fragment_from_break_unit(
                 .iter()
                 .position(|line| line.item_indices.contains(&item_index))
                 .unwrap_or(unit.line_start);
-            let item_block_bounds = flex_item_block_bounds(item, use_fragmentation_height);
-            let item_block_start = item_block_bounds.start().points();
-            let item_block_end = item_block_bounds.end().points();
-            let slice_start = item_block_start.max(unit.block_start.points());
-            let slice_end = item_block_end.min(unit.block_end.points());
-            if slice_end <= slice_start + 0.01 {
-                return None;
-            }
             let used_bounds = item.clone();
             let mut source_bounds = used_bounds.clone();
             if use_fragmentation_height {
@@ -697,35 +741,51 @@ pub(in crate::layout::flex) fn flex_fragment_from_break_unit(
                     item.fragmentation_height().points(),
                 ));
             }
-            let mut bounds = source_bounds.clone();
-            bounds.set_y(FlexPhysicalVerticalOffset::new(slice_start));
-            bounds.set_height(FlexPhysicalVerticalSize::new(
-                (slice_end - slice_start).max(0.0),
-            ));
-            let content_slice = FlexFragmentSlice {
-                block_start: FlexFragmentBlockOffset::new(
-                    (slice_start - item_block_start).max(0.0),
+            let (bounds, content_slice, replay_origin) = match unit.topology {
+                FlexReplayTopology::Unfragmented => (
+                    used_bounds.clone(),
+                    FlexFragmentSlice {
+                        block_start: FlexFragmentBlockOffset::new(0.0),
+                        block_end: FlexFragmentBlockOffset::new(used_bounds.height().points()),
+                    },
+                    FlexItemReplayOrigin::ChildFragment,
                 ),
-                block_end: FlexFragmentBlockOffset::new(
-                    (slice_end - item_block_start).min(source_bounds.height().points()),
-                ),
+                FlexReplayTopology::Fragmented => {
+                    let item_block_bounds = flex_item_block_bounds(item, use_fragmentation_height);
+                    let item_block_start = item_block_bounds.start().points();
+                    let item_block_end = item_block_bounds.end().points();
+                    let slice_start = item_block_start.max(unit.block_start.points());
+                    let slice_end = item_block_end.min(unit.block_end.points());
+                    if slice_end <= slice_start + 0.01 {
+                        return None;
+                    }
+                    let mut bounds = source_bounds.clone();
+                    bounds.set_y(FlexPhysicalVerticalOffset::new(slice_start));
+                    bounds.set_height(FlexPhysicalVerticalSize::new(
+                        (slice_end - slice_start).max(0.0),
+                    ));
+                    let content_slice = FlexFragmentSlice {
+                        block_start: FlexFragmentBlockOffset::new(
+                            (slice_start - item_block_start).max(0.0),
+                        ),
+                        block_end: FlexFragmentBlockOffset::new(
+                            (slice_end - item_block_start).min(source_bounds.height().points()),
+                        ),
+                    };
+                    // The selected interval, rather than the source box's
+                    // current height, identifies descendant-overflow replay.
+                    // <https://www.w3.org/TR/css-flexbox-1/#pagination>
+                    // <https://www.w3.org/TR/css-break-3/#box-splitting>
+                    let replay_origin = if content_slice.block_end.points()
+                        > used_bounds.height().points() + 0.01
+                    {
+                        FlexItemReplayOrigin::SourceSlice
+                    } else {
+                        FlexItemReplayOrigin::ChildFragment
+                    };
+                    (bounds, content_slice, replay_origin)
+                }
             };
-            // The selected interval, rather than the source box's current
-            // height, identifies descendant-overflow replay. Column
-            // fragmentation can materialize a continuation after the flex
-            // item has already had its source extent projected into the
-            // enclosing break unit, making the two heights equal. A slice
-            // that reaches beyond the frozen used border box is nevertheless
-            // still part of the one descendant source canvas and must replay
-            // from its committed source offset.
-            // <https://www.w3.org/TR/css-flexbox-1/#pagination>
-            // <https://www.w3.org/TR/css-break-3/#box-splitting>
-            let replay_origin =
-                if content_slice.block_end.points() > used_bounds.height().points() + 0.01 {
-                    FlexItemReplayOrigin::SourceSlice
-                } else {
-                    FlexItemReplayOrigin::ChildFragment
-                };
             // Descendant overflow can outlive the flex item's used border
             // box. Preserve its source content range, but project box
             // decoration independently onto the used border box so a
@@ -772,7 +832,7 @@ pub(in crate::layout::flex) fn flex_fragment_from_break_unit(
                         context.continuation_fragmentainer_capacity.points(),
                     ),
                     fragmentainer_index: context.page_index,
-                    continuation_ordinal: 0,
+                    fragment_start: FlexItemFragmentStart::ItemStart,
                     child_fragment_ordinal: None,
                 },
                 metadata: FragmentPageMetadata::empty(context.page_index),
@@ -1618,7 +1678,8 @@ mod tests {
         ));
         let flex_layout = FlexLayout {
             height: PhysicalContentHeight::new(content_box_pt(100.0)),
-            baselines: FlexContainerBaselineEstimate::default(),
+            main_gap: FlexMainSize::new(0.0),
+            baselines: FlexContainerBaselineSets::default(),
             items: vec![first, second],
             lines: vec![
                 test_flex_line(
@@ -1640,6 +1701,7 @@ mod tests {
         };
         let fragment = flex_fragment_from_break_unit(
             &FlexBreakUnit {
+                topology: FlexReplayTopology::Fragmented,
                 item_indices: vec![0, 1],
                 line_start: 0,
                 line_end: 2,
@@ -1681,6 +1743,56 @@ mod tests {
                 FlexFragmentBlockOffset::new(50.0),
             )
         );
+
+        let unfragmented = flex_fragment_from_break_unit(
+            &FlexBreakUnit {
+                topology: FlexReplayTopology::Unfragmented,
+                // The physical-Y order of these wrapped column lines is not
+                // the replay order for `column-reverse`.
+                item_indices: vec![1, 0],
+                line_start: 0,
+                line_end: 2,
+                block_start: FlexFragmentBlockOffset::new(0.0),
+                block_end: FlexFragmentBlockOffset::new(100.0),
+                break_before: PageBreak::Auto,
+                break_after: PageBreak::Auto,
+                break_inside_avoid: false,
+            },
+            &flex_layout,
+            FlexFragmentBuildContext {
+                page_index: 0,
+                outer_inline_span: PageInlineSpan::new(0.0, 40.0),
+                content_top: PageTopBlockPosition::new(100.0),
+                block_offset: FlexFragmentBlockOffset::new(0.0),
+                first_fragmentainer_capacity: layout_pt(100.0),
+                continuation_fragmentainer_capacity: layout_pt(100.0),
+                starts_page_fragment: true,
+            },
+            false,
+        );
+        assert_eq!(
+            unfragmented
+                .items
+                .iter()
+                .map(|item| item.item_index)
+                .collect::<Vec<_>>(),
+            vec![1, 0]
+        );
+        assert_eq!(
+            unfragmented.items[0].bounds.height(),
+            FlexPhysicalVerticalSize::new(50.0)
+        );
+        assert_eq!(
+            unfragmented.items[1].bounds.height(),
+            FlexPhysicalVerticalSize::new(100.0)
+        );
+        assert!(unfragmented.items.iter().all(|item| {
+            !item.continuation.continues_from_previous_fragment()
+                && (item.continuation.source_content_slice.block_end.points()
+                    - item.source_bounds.height().points())
+                .abs()
+                    <= 0.01
+        }));
     }
 
     #[test]
@@ -1880,9 +1992,10 @@ mod tests {
             css::ComputedGap::LengthPercentage(css::ComputedLengthPercentage::from_points(10.0));
         let flex_layout = FlexLayout {
             height: PhysicalContentHeight::new(content_box_pt(50.0)),
-            baselines: FlexContainerBaselineEstimate {
+            main_gap: FlexMainSize::new(10.0),
+            baselines: FlexContainerBaselineSets {
                 vertical: FlexItemBaselinePair {
-                    first: Some(FlexVerticalBaselineOffset::new(0.0)),
+                    first: Some(flex_vertical_baseline_from_points(0.0)),
                     last: None,
                 },
                 horizontal: FlexItemBaselinePair::default(),
@@ -1974,9 +2087,10 @@ mod tests {
         ));
         let flex_layout = FlexLayout {
             height: PhysicalContentHeight::new(content_box_pt(70.0)),
-            baselines: FlexContainerBaselineEstimate {
+            main_gap: FlexMainSize::new(10.0),
+            baselines: FlexContainerBaselineSets {
                 vertical: FlexItemBaselinePair {
-                    first: Some(FlexVerticalBaselineOffset::new(0.0)),
+                    first: Some(flex_vertical_baseline_from_points(0.0)),
                     last: None,
                 },
                 horizontal: FlexItemBaselinePair::default(),
@@ -2292,6 +2406,7 @@ mod tests {
         cross_end: FlexCrossOffset,
     ) -> FlexLineLayout {
         FlexLineLayout {
+            logical_cross_start_rank: 0,
             source_start: item_indices.iter().cloned().min().unwrap_or(0),
             source_end: item_indices
                 .iter()

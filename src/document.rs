@@ -1,6 +1,6 @@
 pub(crate) mod paint;
 
-pub use paint::annotations::LinkAnnotation;
+pub(crate) use paint::annotations::LinkAnnotation;
 pub(crate) use paint::geometry::PaintStrokeWidth;
 
 use paint::annotations::RenderedLink;
@@ -15,20 +15,28 @@ use paint::text::RenderedLine;
 
 use crate::{CssColor, Error, Result, image_store::DocumentImageStore, pdf, timing::DebugTimer};
 use fontique::Blob as FontiqueBlob;
+use jiff::{civil::Date, fmt::strtime::BrokenDownTime};
 use std::borrow::Cow;
 use std::fmt;
+use std::io::Write;
 use std::ops::Deref;
-#[cfg(not(target_arch = "wasm32"))]
-use std::path::Path;
 use std::str::FromStr;
 
 #[derive(Debug, Clone, PartialEq)]
 /// The fully rendered, inspectable document before PDF serialization.
 ///
 /// ```no_run
-/// # fn inspect(document: &quire::Document) {
-/// let page_count = document.pages().len();
-/// # let _ = page_count;
+/// use quire::{Html, PdfOptions, RenderOptions};
+/// use std::fs::File;
+///
+/// # async fn render() -> quire::Result<()> {
+/// let document = Html::from_file("document.html")
+///     .await?
+///     .render(&RenderOptions::default())
+///     .await?;
+/// let mut output = File::create("document.pdf")?;
+/// document.write_pdf(&mut output, &PdfOptions::default())?;
+/// # Ok(())
 /// # }
 /// ```
 pub struct Document {
@@ -53,18 +61,6 @@ impl Document {
                 image.materialize_store_backing(&self.image_store);
             }
         }
-    }
-
-    /// Returns the rendered pages in document order.
-    ///
-    /// ```no_run
-    /// # fn inspect(document: &quire::Document) {
-    /// let pages = document.pages();
-    /// # let _ = pages;
-    /// # }
-    /// ```
-    pub fn pages(&self) -> &[Page] {
-        &self.pages
     }
 
     /// Returns document-wide PDF metadata extracted during rendering.
@@ -92,18 +88,17 @@ impl Document {
         &self.bookmarks
     }
 
-    /// Serializes this document as PDF bytes using the supplied PDF options.
+    /// Serializes this document as a PDF into `writer` using the supplied PDF
+    /// options.
     ///
     /// ```no_run
-    /// # fn write(document: &quire::Document) -> quire::Result<()> {
-    /// let pdf = document.write_pdf_bytes(&quire::PdfOptions::default())?;
-    /// # let _ = pdf;
+    /// # fn write(document: &quire::Document, output: &mut Vec<u8>) -> quire::Result<()> {
+    /// document.write_pdf(output, &quire::PdfOptions::default())?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn write_pdf_bytes(&self, options: &PdfOptions) -> Result<Vec<u8>> {
-        let _timer =
-            DebugTimer::start(format!("writing {} page(s) to PDF bytes", self.pages.len()));
+    pub fn write_pdf<W: Write>(&self, writer: &mut W, options: &PdfOptions) -> Result<()> {
+        let _timer = DebugTimer::start(format!("writing {} page(s) to PDF", self.pages.len()));
         if self.pages.is_empty() {
             return Err(Error::InvalidInput("document has no pages".to_string()));
         }
@@ -111,23 +106,7 @@ impl Document {
             let _timer = DebugTimer::start("validating paint operations");
             self.validate_paint_operations()?;
         }
-        pdf::write_document(self, options)
-    }
-
-    /// Serializes this document to a PDF file using the supplied PDF options.
-    ///
-    /// ```no_run
-    /// # fn write(document: &quire::Document) -> quire::Result<()> {
-    /// document.write_pdf("document.pdf", &quire::PdfOptions::default())?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn write_pdf<P: AsRef<Path>>(&self, target: P, options: &PdfOptions) -> Result<()> {
-        let target = target.as_ref();
-        log::debug!("writing PDF file {}", target.display());
-        std::fs::write(target, self.write_pdf_bytes(options)?)?;
-        Ok(())
+        pdf::write_document(self, options, writer)
     }
 
     pub(crate) fn validate_paint_operations(&self) -> Result<()> {
@@ -144,9 +123,23 @@ impl Document {
 /// compression is useful when inspecting generated PDF syntax, but increases
 /// output size substantially for images and embedded font programs.
 ///
-/// ```
-/// let compression = quire::PdfCompression::Uncompressed;
-/// assert_eq!(compression, quire::PdfCompression::Uncompressed);
+/// ```no_run
+/// use quire::{Html, PdfCompression, PdfOptions, RenderOptions};
+/// use std::fs::File;
+///
+/// # async fn render() -> quire::Result<()> {
+/// let pdf_options = PdfOptions {
+///     compression: PdfCompression::Uncompressed,
+///     ..PdfOptions::default()
+/// };
+/// let document = Html::from_file("document.html")
+///     .await?
+///     .render(&RenderOptions::default())
+///     .await?;
+/// let mut output = File::create("document.pdf")?;
+/// document.write_pdf(&mut output, &pdf_options)?;
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum PdfCompression {
@@ -164,6 +157,25 @@ pub enum PdfCompression {
 ///
 /// ISO 32000-2:2020, 9.7 and 9.9 define Type 0/CIDFont and embedded font
 /// program requirements.
+///
+/// ```no_run
+/// use quire::{FontEmbeddingMode, Html, PdfOptions, RenderOptions};
+/// use std::fs::File;
+///
+/// # async fn render() -> quire::Result<()> {
+/// let pdf_options = PdfOptions {
+///     font_embedding: FontEmbeddingMode::Full,
+///     ..PdfOptions::default()
+/// };
+/// let document = Html::from_file("document.html")
+///     .await?
+///     .render(&RenderOptions::default())
+///     .await?;
+/// let mut output = File::create("document.pdf")?;
+/// document.write_pdf(&mut output, &pdf_options)?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FontEmbeddingMode {
     /// Embed only the glyphs used by the document.
@@ -180,9 +192,23 @@ pub enum FontEmbeddingMode {
 /// version, XMP identification fields, and stricter font-planning hooks; it is
 /// not by itself a guarantee that every PDF/A requirement has been satisfied.
 ///
-/// ```
-/// let profile = quire::PdfProfile::PdfA2B;
-/// assert!(profile.is_pdfa());
+/// ```no_run
+/// use quire::{Html, PdfOptions, PdfProfile, RenderOptions};
+/// use std::fs::File;
+///
+/// # async fn render() -> quire::Result<()> {
+/// let pdf_options = PdfOptions {
+///     profile: PdfProfile::PdfA2B,
+///     ..PdfOptions::default()
+/// };
+/// let document = Html::from_file("document.html")
+///     .await?
+///     .render(&RenderOptions::default())
+///     .await?;
+/// let mut output = File::create("document.pdf")?;
+/// document.write_pdf(&mut output, &pdf_options)?;
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum PdfProfile {
@@ -292,6 +318,26 @@ pub(crate) struct PdfAIdentification {
 /// These settings do not affect CSS parsing, cascade, layout, or paint. The
 /// same [`Document`] can therefore be serialized repeatedly with distinct PDF
 /// profiles, compression, font embedding, or producer values.
+///
+/// ```no_run
+/// use quire::{Html, PdfOptions, PdfProfile, RenderOptions};
+/// use std::fs::File;
+///
+/// # async fn render() -> quire::Result<()> {
+/// let pdf_options = PdfOptions {
+///     profile: PdfProfile::Pdf,
+///     producer: "Example report service".to_string(),
+///     ..PdfOptions::default()
+/// };
+/// let document = Html::from_file("document.html")
+///     .await?
+///     .render(&RenderOptions::default())
+///     .await?;
+/// let mut output = File::create("document.pdf")?;
+/// document.write_pdf(&mut output, &pdf_options)?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PdfOptions {
     /// PDF profile and conformance-identification metadata to emit.
@@ -317,10 +363,34 @@ impl Default for PdfOptions {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 /// Source metadata associated with a rendered document.
+///
+/// ```no_run
+/// use quire::{Html, PdfOptions, RenderOptions};
+/// use std::fs::File;
+///
+/// # async fn render() -> quire::Result<()> {
+/// let document = Html::from_string(
+///     "<title>Quarterly report</title><meta name=author content=Quire>",
+/// )
+/// .render(&RenderOptions::default())
+/// .await?;
+/// if let Some(title) = document.metadata().title() {
+///     println!("Rendering {title}");
+/// }
+/// let mut output = File::create("document.pdf")?;
+/// document.write_pdf(&mut output, &PdfOptions::default())?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct DocumentMetadata {
     pub(crate) title: Option<String>,
     pub(crate) author: Option<String>,
     pub(crate) creator: Option<String>,
+    pub(crate) language: Option<String>,
+    pub(crate) description: Option<String>,
+    pub(crate) keywords: Vec<String>,
+    pub(crate) created: Option<DocumentDate>,
+    pub(crate) modified: Option<DocumentDate>,
 }
 
 impl DocumentMetadata {
@@ -358,14 +428,420 @@ impl DocumentMetadata {
     pub fn creator(&self) -> Option<&str> {
         self.creator.as_deref()
     }
+
+    /// Returns the document language from the root HTML element, if specified.
+    ///
+    /// ```no_run
+    /// # fn inspect(metadata: &quire::DocumentMetadata) {
+    /// let language = metadata.language();
+    /// # let _ = language;
+    /// # }
+    /// ```
+    pub fn language(&self) -> Option<&str> {
+        self.language.as_deref()
+    }
+
+    /// Returns the document description, if one was present in the source.
+    ///
+    /// ```no_run
+    /// # fn inspect(metadata: &quire::DocumentMetadata) {
+    /// let description = metadata.description();
+    /// # let _ = description;
+    /// # }
+    /// ```
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    /// Returns the document keywords in source order.
+    ///
+    /// ```no_run
+    /// # fn inspect(metadata: &quire::DocumentMetadata) {
+    /// for keyword in metadata.keywords() {
+    ///     println!("{keyword}");
+    /// }
+    /// # }
+    /// ```
+    pub fn keywords(&self) -> &[String] {
+        &self.keywords
+    }
+
+    /// Returns the document creation date, if one was present in the source.
+    ///
+    /// ```no_run
+    /// # fn inspect(metadata: &quire::DocumentMetadata) {
+    /// let created = metadata.created();
+    /// # let _ = created;
+    /// # }
+    /// ```
+    pub fn created(&self) -> Option<&DocumentDate> {
+        self.created.as_ref()
+    }
+
+    /// Returns the document modification date, if one was present in the source.
+    ///
+    /// ```no_run
+    /// # fn inspect(metadata: &quire::DocumentMetadata) {
+    /// let modified = metadata.modified();
+    /// # let _ = modified;
+    /// # }
+    /// ```
+    pub fn modified(&self) -> Option<&DocumentDate> {
+        self.modified.as_ref()
+    }
+}
+
+/// A date in [W3C's ISO 8601 profile] extracted from document metadata.
+///
+/// It retains the source representation while storing validated date
+/// components for PDF serialization.
+///
+/// [W3C's ISO 8601 profile]: <https://www.w3.org/TR/NOTE-datetime>
+///
+/// ```no_run
+/// use quire::{Html, PdfOptions, RenderOptions};
+/// use std::fs::File;
+///
+/// # async fn render() -> quire::Result<()> {
+/// let document = Html::from_string(
+///     r#"<meta name="dcterms.created" content="2026-08-08">"#,
+/// )
+/// .render(&RenderOptions::default())
+/// .await?;
+/// if let Some(created) = document.metadata().created() {
+///     println!("Created on {created}");
+/// }
+/// let mut output = File::create("document.pdf")?;
+/// document.write_pdf(&mut output, &PdfOptions::default())?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentDate {
+    source: String,
+    components: DocumentDateComponents,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DocumentDateComponents {
+    Year {
+        year: u16,
+    },
+    YearMonth {
+        year: u16,
+        month: u8,
+    },
+    Date {
+        year: u16,
+        month: u8,
+        day: u8,
+    },
+    DateTime {
+        year: u16,
+        month: u8,
+        day: u8,
+        hour: u8,
+        minute: u8,
+        second: u8,
+        offset_seconds: i32,
+        offset_is_negative: bool,
+    },
+}
+
+impl DocumentDate {
+    /// Returns the validated source date in W3C ISO 8601 profile form.
+    ///
+    /// ```no_run
+    /// # fn inspect(date: &quire::DocumentDate) {
+    /// println!("{}", date.as_str());
+    /// # }
+    /// ```
+    pub fn as_str(&self) -> &str {
+        &self.source
+    }
+
+    pub(crate) fn parse(source: String) -> Option<Self> {
+        let value = source.trim_matches(is_html_space);
+        is_w3c_iso_8601_profile_form(value)?;
+        let datetime_value = value
+            .strip_suffix('Z')
+            .map(|prefix| format!("{prefix}+00:00"))
+            .unwrap_or_else(|| value.to_string());
+        let offset_is_negative = datetime_value
+            .as_bytes()
+            .get(datetime_value.len().saturating_sub(6))
+            .is_some_and(|sign| *sign == b'-');
+
+        if let Some(components) = Self::parse_datetime(
+            &datetime_value,
+            "%Y-%m-%dT%H:%M:%S%.f%:z",
+            offset_is_negative,
+        ) {
+            return Some(Self { source, components });
+        }
+        if let Some(components) =
+            Self::parse_datetime(&datetime_value, "%Y-%m-%dT%H:%M%:z", offset_is_negative)
+        {
+            return Some(Self { source, components });
+        }
+        if let Some(components) = Self::parse_date(value, "%F") {
+            return Some(Self { source, components });
+        }
+        if let Some(components) = Self::parse_year_month(value) {
+            return Some(Self { source, components });
+        }
+        Self::parse_year(value).map(|components| Self { source, components })
+    }
+
+    pub(crate) fn pdf_info_value(&self) -> String {
+        match self.components {
+            DocumentDateComponents::Year { year } => format!("D:{year:04}"),
+            DocumentDateComponents::YearMonth { year, month } => {
+                format!("D:{year:04}{month:02}")
+            }
+            DocumentDateComponents::Date { year, month, day } => {
+                format!("D:{year:04}{month:02}{day:02}")
+            }
+            DocumentDateComponents::DateTime {
+                year,
+                month,
+                day,
+                hour,
+                minute,
+                second,
+                offset_seconds,
+                offset_is_negative,
+            } => {
+                let offset = if offset_seconds == 0 && !offset_is_negative {
+                    "Z".to_string()
+                } else {
+                    let sign = if offset_seconds < 0 || offset_is_negative {
+                        '-'
+                    } else {
+                        '+'
+                    };
+                    let offset_minutes = offset_seconds.unsigned_abs() / 60;
+                    format!(
+                        "{sign}{:02}'{:02}",
+                        offset_minutes / 60,
+                        offset_minutes % 60
+                    )
+                };
+                format!("D:{year:04}{month:02}{day:02}{hour:02}{minute:02}{second:02}{offset}")
+            }
+        }
+    }
+
+    fn parse_datetime(
+        value: &str,
+        format: &str,
+        offset_is_negative: bool,
+    ) -> Option<DocumentDateComponents> {
+        let parsed = BrokenDownTime::parse(format, value).ok()?;
+        let (year, month, day) = parsed_date_parts(&parsed)?;
+        Date::new(
+            i16::try_from(year).ok()?,
+            i8::try_from(month).ok()?,
+            i8::try_from(day).ok()?,
+        )
+        .ok()?;
+        Some(DocumentDateComponents::DateTime {
+            year,
+            month,
+            day,
+            hour: u8::try_from(parsed.hour()?).ok()?,
+            minute: u8::try_from(parsed.minute()?).ok()?,
+            second: u8::try_from(parsed.second().unwrap_or(0)).ok()?,
+            offset_seconds: parsed.offset()?.seconds(),
+            offset_is_negative,
+        })
+    }
+
+    fn parse_date(value: &str, format: &str) -> Option<DocumentDateComponents> {
+        let parsed = BrokenDownTime::parse(format, value).ok()?;
+        let (year, month, day) = parsed_date_parts(&parsed)?;
+        Date::new(
+            i16::try_from(year).ok()?,
+            i8::try_from(month).ok()?,
+            i8::try_from(day).ok()?,
+        )
+        .ok()?;
+        Some(DocumentDateComponents::Date { year, month, day })
+    }
+
+    fn parse_year_month(value: &str) -> Option<DocumentDateComponents> {
+        let parsed = BrokenDownTime::parse("%Y-%m", value).ok()?;
+        Some(DocumentDateComponents::YearMonth {
+            year: u16::try_from(parsed.year()?).ok()?,
+            month: u8::try_from(parsed.month()?).ok()?,
+        })
+    }
+
+    fn parse_year(value: &str) -> Option<DocumentDateComponents> {
+        let parsed = BrokenDownTime::parse("%Y", value).ok()?;
+        Some(DocumentDateComponents::Year {
+            year: u16::try_from(parsed.year()?).ok()?,
+        })
+    }
+}
+
+impl fmt::Display for DocumentDate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+fn parsed_date_parts(parsed: &BrokenDownTime) -> Option<(u16, u8, u8)> {
+    Some((
+        u16::try_from(parsed.year()?).ok()?,
+        u8::try_from(parsed.month()?).ok()?,
+        u8::try_from(parsed.day()?).ok()?,
+    ))
+}
+
+fn is_html_space(character: char) -> bool {
+    matches!(character, ' ' | '\t' | '\n' | '\u{000C}' | '\r')
+}
+
+/// Checks the lexical forms admitted by the W3C ISO 8601 profile before the
+/// time parser validates their calendar values.
+/// <https://www.w3.org/TR/NOTE-datetime>
+fn is_w3c_iso_8601_profile_form(value: &str) -> Option<()> {
+    fn digits(value: &[u8]) -> bool {
+        value.iter().all(u8::is_ascii_digit)
+    }
+
+    let bytes = value.as_bytes();
+    match bytes.len() {
+        4 if digits(bytes) => Some(()),
+        7 if digits(&bytes[..4]) && bytes[4] == b'-' && digits(&bytes[5..]) => Some(()),
+        10 if digits(&bytes[..4])
+            && bytes[4] == b'-'
+            && digits(&bytes[5..7])
+            && bytes[7] == b'-'
+            && digits(&bytes[8..]) =>
+        {
+            Some(())
+        }
+        _ => is_w3c_iso_8601_profile_datetime_form(bytes),
+    }
+}
+
+fn is_w3c_iso_8601_profile_datetime_form(bytes: &[u8]) -> Option<()> {
+    // The profile requires a full calendar date, a minute-precision time, and
+    // a timezone. Seconds and a fractional seconds component are optional.
+    if bytes.len() < 17
+        || !bytes[..4].iter().all(u8::is_ascii_digit)
+        || bytes.get(4) != Some(&b'-')
+        || !bytes[5..7].iter().all(u8::is_ascii_digit)
+        || bytes.get(7) != Some(&b'-')
+        || !bytes[8..10].iter().all(u8::is_ascii_digit)
+        || bytes.get(10) != Some(&b'T')
+        || !bytes[11..13].iter().all(u8::is_ascii_digit)
+        || bytes.get(13) != Some(&b':')
+        || !bytes[14..16].iter().all(u8::is_ascii_digit)
+    {
+        return None;
+    }
+
+    let time_end = match bytes.get(16) {
+        Some(b'Z') if bytes.len() == 17 => return Some(()),
+        Some(b'+') | Some(b'-') => 16,
+        Some(b':') if bytes.len() >= 19 && bytes[17..19].iter().all(u8::is_ascii_digit) => {
+            let mut end = 19;
+            if bytes.get(end) == Some(&b'.') {
+                end += 1;
+                let fraction_start = end;
+                while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+                    end += 1;
+                }
+                if end == fraction_start {
+                    return None;
+                }
+            }
+            end
+        }
+        _ => return None,
+    };
+
+    match bytes.get(time_end..) {
+        Some([b'Z']) => Some(()),
+        Some(
+            [
+                sign @ (b'+' | b'-'),
+                hour_tens,
+                hour_ones,
+                b':',
+                minute_tens,
+                minute_ones,
+            ],
+        ) if sign.is_ascii()
+            && hour_tens.is_ascii_digit()
+            && hour_ones.is_ascii_digit()
+            && minute_tens.is_ascii_digit()
+            && minute_ones.is_ascii_digit() =>
+        {
+            Some(())
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DocumentDate;
+
+    #[test]
+    fn metadata_dates_accept_w3c_iso_8601_profile_forms() {
+        let cases = [
+            ("1997", "D:1997"),
+            ("1997-07", "D:199707"),
+            ("1997-07-16", "D:19970716"),
+            ("1997-07-16T19:20+01:00", "D:19970716192000+01'00"),
+            ("1997-07-16T19:20:30Z", "D:19970716192030Z"),
+            ("1997-07-16T19:20:30.45-00:30", "D:19970716192030-00'30"),
+        ];
+
+        for (source, expected_pdf_date) in cases {
+            let date = DocumentDate::parse(source.to_string()).expect("valid W3C profile date");
+            assert_eq!(date.as_str(), source);
+            assert_eq!(date.pdf_info_value(), expected_pdf_date);
+        }
+    }
+
+    #[test]
+    fn metadata_dates_reject_non_profile_values() {
+        for source in [
+            "1997-7-16",
+            "1997-07-16T19:20",
+            "1997-07-16T19:20:30+0100",
+            "1997-02-30",
+        ] {
+            assert!(
+                DocumentDate::parse(source.to_string()).is_none(),
+                "{source:?} must not be accepted"
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 /// A document bookmark derived from the rendered source.
 ///
 /// ```no_run
-/// # fn inspect(bookmark: &quire::Bookmark) {
-/// println!("{}", bookmark.label());
+/// use quire::{Html, PdfOptions, RenderOptions};
+/// use std::fs::File;
+///
+/// # async fn render() -> quire::Result<()> {
+/// let document = Html::from_string("<h1>Introduction</h1>")
+///     .render(&RenderOptions::default())
+///     .await?;
+/// for bookmark in document.bookmarks() {
+///     println!("{} on page {}", bookmark.label(), bookmark.page_index() + 1);
+/// }
+/// let mut output = File::create("document.pdf")?;
+/// document.write_pdf(&mut output, &PdfOptions::default())?;
+/// # Ok(())
 /// # }
 /// ```
 pub struct Bookmark {
@@ -478,9 +954,21 @@ impl Bookmark {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// The initial expansion state of a bookmark in a PDF viewer.
 ///
-/// ```
-/// let state = quire::BookmarkState::Open;
-/// assert_eq!(state, quire::BookmarkState::Open);
+/// ```no_run
+/// use quire::{BookmarkState, Html, PdfOptions, RenderOptions};
+/// use std::fs::File;
+///
+/// # async fn render() -> quire::Result<()> {
+/// let document = Html::from_string(
+///     "<style>h1 { bookmark-state: closed }</style><h1>Introduction</h1>",
+/// )
+/// .render(&RenderOptions::default())
+/// .await?;
+/// assert_eq!(document.bookmarks()[0].state(), BookmarkState::Closed);
+/// let mut output = File::create("document.pdf")?;
+/// document.write_pdf(&mut output, &PdfOptions::default())?;
+/// # Ok(())
+/// # }
 /// ```
 pub enum BookmarkState {
     /// Display the bookmark's children initially.
@@ -490,15 +978,8 @@ pub enum BookmarkState {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-/// A rendered page in document order.
-///
-/// ```no_run
-/// # fn inspect(page: &quire::Page) {
-/// let area = page.width() * page.height();
-/// # let _ = area;
-/// # }
-/// ```
-pub struct Page {
+/// A renderer-owned page in document order.
+pub(crate) struct Page {
     size: PaintSize,
     pub(crate) rotation: i32,
     pub(crate) rects: Vec<RenderedRect>,
@@ -542,26 +1023,12 @@ impl Page {
     }
 
     /// Returns the page width in PDF points.
-    ///
-    /// ```no_run
-    /// # fn inspect(page: &quire::Page) {
-    /// let width = page.width();
-    /// # let _ = width;
-    /// # }
-    /// ```
-    pub fn width(&self) -> f32 {
+    pub(crate) fn width(&self) -> f32 {
         self.size.width
     }
 
     /// Returns the page height in PDF points.
-    ///
-    /// ```no_run
-    /// # fn inspect(page: &quire::Page) {
-    /// let height = page.height();
-    /// # let _ = height;
-    /// # }
-    /// ```
-    pub fn height(&self) -> f32 {
+    pub(crate) fn height(&self) -> f32 {
         self.size.height
     }
 
@@ -593,16 +1060,7 @@ impl Page {
         &self.lines
     }
 
-    /// Returns link annotations in page-local PDF-point coordinates.
-    ///
-    /// ```no_run
-    /// # fn inspect(page: &quire::Page) {
-    /// for link in page.links() {
-    ///     println!("{}", link.target());
-    /// }
-    /// # }
-    /// ```
-    pub fn links(&self) -> &[LinkAnnotation] {
+    pub(crate) fn links(&self) -> &[LinkAnnotation] {
         &self.links
     }
 
@@ -623,13 +1081,7 @@ impl Page {
     }
 
     /// Returns the clockwise page rotation in degrees.
-    ///
-    /// ```no_run
-    /// # fn inspect(page: &quire::Page) {
-    /// assert_eq!(page.rotation() % 90, 0);
-    /// # }
-    /// ```
-    pub fn rotation(&self) -> i32 {
+    pub(crate) fn rotation(&self) -> i32 {
         self.rotation
     }
 

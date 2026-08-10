@@ -16,7 +16,9 @@ pub(in crate::css) fn logical_mapping_context(
     let mut direction = base_style.direction;
     let mut writing_mode = base_style.writing_mode;
     for declaration in declarations {
-        let name = declaration.name.as_ref();
+        let Some(property) = declaration.property.modeled() else {
+            continue;
+        };
         let value = trim_css_value(&declaration.value);
         if contains_css_variable_reference(value)
             || declaration_is_revert(value)
@@ -24,29 +26,31 @@ pub(in crate::css) fn logical_mapping_context(
         {
             continue;
         }
-        if name.eq_ignore_ascii_case("all") {
+        if matches!(property, ModeledProperty::All) {
             if let Some(keyword) = CssWideDefaultKeyword::parse(value) {
                 writing_mode = defaulted_writing_mode(keyword, inheritance_source);
             }
             continue;
         }
         if let Some(keyword) = CssWideDefaultKeyword::parse(value) {
-            match name {
-                "direction" => direction = defaulted_direction(keyword, inheritance_source),
-                "writing-mode" => {
+            match property {
+                ModeledProperty::Longhand(ModeledLonghand::Direction) => {
+                    direction = defaulted_direction(keyword, inheritance_source)
+                }
+                ModeledProperty::Longhand(ModeledLonghand::WritingMode) => {
                     writing_mode = defaulted_writing_mode(keyword, inheritance_source);
                 }
                 _ => {}
             }
             continue;
         }
-        match name {
-            "direction" => {
+        match property {
+            ModeledProperty::Longhand(ModeledLonghand::Direction) => {
                 if let Some(parsed) = parse_direction(value) {
                     direction = parsed;
                 }
             }
-            "writing-mode" => {
+            ModeledProperty::Longhand(ModeledLonghand::WritingMode) => {
                 if let Some(parsed) = parse_writing_mode(value) {
                     writing_mode = parsed;
                 }

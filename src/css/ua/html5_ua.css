@@ -24,6 +24,11 @@ address, article, aside, blockquote, body, center, dd, details, dir, div, dl, dt
 button, input, keygen, select, textarea { display: inline-block }
 li { display: list-item }
 table { display: table }
+/* SVG 2 gives non-document-root SVG viewports a UA `overflow: hidden`
+   rule. An author declaration, including `overflow: visible`, still wins in
+   the normal cascade. The standalone SVG document element remains visible.
+   https://www.w3.org/TR/SVG2/render.html#OverflowAndClipProperties */
+svg:not(:root) { overflow: hidden }
 caption { display: table-caption }
 colgroup, colgroup[hidden] { display: table-column-group }
 col, col[hidden] { display: table-column }
@@ -181,7 +186,7 @@ iframe:not([seamless]) { border: 2px inset }
 /* CSS Overflow Level 4 extends overflow to replaced elements.  Keep this in
    the UA cascade, rather than special-casing layout, so authors can opt out.
    The content-box default retains the historical clipping behavior. */
-img, iframe, video, embed, object, canvas, svg {
+img, iframe, video, embed, object, canvas {
   overflow: clip;
   overflow-clip-margin: content-box;
 }

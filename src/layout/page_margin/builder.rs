@@ -44,7 +44,7 @@ impl<'a> LayoutBuilder<'a> {
                     (
                         rule.origin,
                         specificity,
-                        rule.layer_order,
+                        rule.layer_order.clone(),
                         rule.order,
                         &rule.declarations,
                     )
@@ -436,9 +436,9 @@ impl<'a> LayoutBuilder<'a> {
         // The embedded replay fragment is an ordinary generated-content atom;
         // only the source element has `position: running()` semantics.
         atom_style.position = css::Position::Static;
-        atom_style.background_color = css::BackgroundColor::TRANSPARENT;
-        atom_style.background_image = css::ComputedImage::None;
-        atom_style.background_layers.clear();
+        atom_style.background.background_color = css::BackgroundColor::TRANSPARENT;
+        atom_style.background.background_image = css::ComputedImage::None;
+        atom_style.background.background_layers.clear();
         atom_style.border_width = 0.0;
         atom_style.border_widths = css::Edges::ZERO;
         atom_style.border_styles = css::BorderStyles::NONE;
@@ -446,7 +446,9 @@ impl<'a> LayoutBuilder<'a> {
         Some(InlineItem::Atom(Box::new(InlineAtom::new(
             InlineAtomContent::InlineFragment {
                 fragment: Box::new(fragment),
+                replay_coordinates: AtomicInlineFragmentReplayCoordinates::border_box_local(),
                 table_cell_context: None,
+                contents_overflow_clip_applied: false,
             },
             atom_style,
             None,

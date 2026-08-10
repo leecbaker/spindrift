@@ -1,5 +1,4 @@
 use super::*;
-use crate::css::is_custom_property_name;
 
 pub(crate) fn apply_cascaded_marker_declarations_with_inheritance_source_and_parent_ch_advance(
     style: &mut ComputedStyle,
@@ -22,7 +21,15 @@ pub(crate) fn apply_cascaded_marker_declarations_with_inheritance_source_and_par
         inheritance_source,
         color_scheme_preference,
     );
+    // See the element cascade: registered colors depend on the owning
+    // marker's used color scheme, so compute them after that prepass.
     compute_registered_custom_property_values(style);
+    let declarations = declarations_after_variable_substitution_and_shorthand_expansion(
+        &declarations,
+        &style.custom_properties,
+        direction,
+        writing_mode,
+    );
     apply_cascaded_font_size_declarations_with_parent_ch_advance(
         style,
         &declarations,
@@ -30,19 +37,22 @@ pub(crate) fn apply_cascaded_marker_declarations_with_inheritance_source_and_par
         parent_ch_advance,
     );
     apply_cascaded_color_declarations(style, &declarations, inheritance_source);
-    let declarations = declarations_after_variable_substitution_and_shorthand_expansion(
-        &declarations,
-        &style.custom_properties,
-        direction,
-        writing_mode,
-    );
 
+    let mut parsed_font_component = None;
     for (index, declaration) in declarations.iter().enumerate() {
-        let name = declaration.name.as_ref();
-        if is_custom_property_name(name) || name == "font-size" {
+        let Some(property) = declaration.property.modeled() else {
+            continue;
+        };
+        let name = property.css_name();
+        if matches!(
+            property,
+            ModeledProperty::Longhand(
+                ModeledLonghand::ColorScheme | ModeledLonghand::FontSize | ModeledLonghand::Color
+            ) | ModeledProperty::FontComponent(ModeledLonghand::FontSize)
+        ) {
             continue;
         }
-        if is_shadowed_by_later_var_declaration(&declarations, index, name) {
+        if is_shadowed_by_later_var_declaration(&declarations, index, &declaration.property) {
             continue;
         }
         let resolved_value;
@@ -57,14 +67,35 @@ pub(crate) fn apply_cascaded_marker_declarations_with_inheritance_source_and_par
             value
         };
         if let Some(keyword) = CssWideDefaultKeyword::parse(value) {
-            apply_css_wide_default_keyword(style, name, keyword, inheritance_source);
+            apply_css_wide_default_keyword(style, property, keyword, inheritance_source);
             continue;
         }
-        match name {
-            "color" => {
-                // The shared color prepass has already selected and resolved
-                // the winning `color` declaration for this marker style.
+        if let Some(component) = property.font_component() {
+            let source = (
+                declaration.stylesheet_index,
+                declaration.rule_order,
+                declaration.declaration_order,
+            );
+            if parsed_font_component
+                .as_ref()
+                .is_none_or(|(cached_source, _)| *cached_source != source)
+            {
+                parsed_font_component = parse_font_shorthand_with_line_height_font_size(
+                    value,
+                    inheritance_source.font_size,
+                    parent_ch_advance,
+                    style.font_weight,
+                    Some(style.font_size),
+                )
+                .map(|font| (source, font));
             }
+            if let Some((_, font)) = &parsed_font_component {
+                apply_font_shorthand_component(style, component, font);
+            }
+            continue;
+        }
+        parsed_font_component = None;
+        match name {
             "-webkit-text-fill-color" => {
                 if value.eq_ignore_ascii_case("currentcolor") {
                     style.text_fill_color = CssColorOrCurrentColor::CurrentColor;
@@ -259,24 +290,29 @@ pub(crate) fn apply_cascaded_marker_declarations_with_inheritance_source_and_par
                 "avoid" => style.wrap_inside = WrapInside::Avoid,
                 _ => {}
             },
-            "line-clamp" | "-webkit-line-clamp" => {
-                let value = value.trim().to_ascii_lowercase();
-                if value == "none" {
-                    style.line_clamp = None;
+            "max-lines" => {
+                let value = value.trim();
+                if value.eq_ignore_ascii_case("none") {
+                    style.max_lines = MaxLines::None;
                 } else if let Ok(value) = value.parse::<usize>()
                     && let Some(value) = std::num::NonZeroUsize::new(value)
                 {
-                    style.line_clamp = Some(ComputedLineClamp::new(
-                        value,
-                        if name == "-webkit-line-clamp" {
-                            ComputedClampContinuation::WebkitLegacy
-                        } else {
-                            ComputedClampContinuation::Collapse
-                        },
-                    ));
-                    style.used_line_clamp = None;
+                    style.max_lines = MaxLines::Lines(value);
                 }
+                style.line_limit_traversal = None;
             }
+            "block-ellipsis" => match value.trim().to_ascii_lowercase().as_str() {
+                "auto" => style.block_ellipsis = BlockEllipsis::Auto,
+                "no-ellipsis" => style.block_ellipsis = BlockEllipsis::NoEllipsis,
+                _ => {}
+            },
+            "continue" => match value.trim().to_ascii_lowercase().as_str() {
+                "auto" => style.continue_ = Continue::Auto,
+                "collapse" => style.continue_ = Continue::Collapse,
+                "discard" => style.continue_ = Continue::Discard,
+                "-webkit-legacy" => style.continue_ = Continue::WebkitLegacy,
+                _ => {}
+            },
             "text-transform" => {
                 if let Some(transform) = parse_text_transform(value) {
                     style.text_transform = transform;

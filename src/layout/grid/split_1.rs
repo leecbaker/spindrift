@@ -1,5 +1,56 @@
+use super::lanes::grid_lanes_stacking_axis_is_block;
+use super::lanes::{GridLanesItemPlacement, GridLanesLayoutContext};
+use super::resolved::physical_grid_line_names;
 use super::*;
+use crate::layout::baseline::{BaselinePair, PhysicalBaselineSets, PhysicalTopBaselineOffset};
 use crate::layout::block::{DefiniteBlockBreakContext, should_prebreak_definite_block};
+
+/// Resolve the pre-layout scrollport reservation shared by Grid's intrinsic,
+/// final sizing, and overflow-clip phases. Quire's static PDF UA uses overlay
+/// scrollbars, so no native scrollbar chrome consumes Grid track space.
+/// <https://drafts.csswg.org/css-overflow-3/#scrollbars-layout>
+fn grid_scrollbar_reservation(_: &ComputedStyle) -> ScrollbarGutterReservation {
+    ScrollbarGutterReservation::static_pdf_overlay()
+}
+
+/// Return the physical space available to Grid tracks after a reserved
+/// vertical scrollbar has consumed horizontal content space.
+fn grid_scrollport_content_width(
+    content_width: PhysicalContentWidth,
+    reservation: ScrollbarGutterReservation,
+) -> PhysicalContentWidth {
+    PhysicalContentWidth::new(content_box_pt(
+        (content_width.points() - reservation.horizontal_extent().points()).max(0.0),
+    ))
+}
+
+/// A definite physical height keeps its outer content box; a horizontal
+/// scrollbar consumes only the Grid track-sizing space inside it.
+fn grid_scrollport_content_height_basis(
+    content_height: Option<PhysicalContentHeight>,
+    reservation: ScrollbarGutterReservation,
+) -> Option<PhysicalContentHeight> {
+    content_height.map(|height| {
+        PhysicalContentHeight::new(content_box_pt(
+            (height.points() - reservation.vertical_extent().points()).max(0.0),
+        ))
+    })
+}
+
+/// An automatic Grid block size grows around a reserved horizontal scrollbar,
+/// whereas a definite size has already allocated that scrollbar inside itself.
+fn grid_total_content_height(
+    track_height: PhysicalContentHeight,
+    definite_content_height: Option<PhysicalContentHeight>,
+    reservation: ScrollbarGutterReservation,
+) -> PhysicalContentHeight {
+    if let Some(height) = definite_content_height {
+        return height;
+    }
+    PhysicalContentHeight::new(content_box_pt(
+        track_height.points() + reservation.vertical_extent().points(),
+    ))
+}
 
 impl<'a> LayoutBuilder<'a> {
     /// Lay out a CSS grid container, preserving a flex item's post-flexing
@@ -82,18 +133,35 @@ impl<'a> LayoutBuilder<'a> {
                     PercentageBasis::definite(layout_pt(available_outer_height)),
                 ))
             });
-        let requested_content_width = self.used_block_physical_content_width(
-            element,
-            &used_style,
-            stylesheets,
-            child_boxes,
-            BlockContentWidthInputs {
-                available_outer_width,
-                percentage_basis: PercentageBasis::definite(layout_pt(containing_inline_size)),
-                horizontal_non_content: non_content_pt(horizontal_extras),
-                definite_content_height: explicit_content_height,
-            },
-        );
+        // A normal-flow block-level Grid retains the usual block-width
+        // fill-available behavior even when its writing mode makes physical
+        // width the logical block axis. Its track-derived intrinsic block
+        // contribution is for intrinsic sizing keywords and floated/atomic
+        // participation, not a replacement for `width: auto` here.
+        // <https://drafts.csswg.org/css-grid-2/#grid-container-size>
+        let requested_content_width = if used_style.writing_mode.has_vertical_lines()
+            && used_style.box_values.width.is_auto()
+            && used_style.float == Float::None
+        {
+            PhysicalContentWidth::new(used_normal_flow_block_content_box_width(
+                &used_style,
+                layout_pt(containing_inline_size),
+                non_content_pt(horizontal_extras),
+            ))
+        } else {
+            self.used_block_physical_content_width(
+                element,
+                &used_style,
+                stylesheets,
+                child_boxes,
+                BlockContentWidthInputs {
+                    available_outer_width,
+                    percentage_basis: PercentageBasis::definite(layout_pt(containing_inline_size)),
+                    horizontal_non_content: non_content_pt(horizontal_extras),
+                    definite_content_height: explicit_content_height,
+                },
+            )
+        };
         // A grid container participates in normal block sizing before its
         // track-sizing algorithm runs.  Thus an automatic physical width can
         // be transferred from a definite physical height through the
@@ -125,10 +193,15 @@ impl<'a> LayoutBuilder<'a> {
         let content_width = width.content_width.points();
         let outer_width = width.border_box_width().points();
         let style = &used_style;
+        let scrollbar_reservation = grid_scrollbar_reservation(style);
         let containment = used_property_containment(element, style);
         let mut outer_x = width.border_box_inline_span.left_x() + relative_offset.x();
         let mut inner_x = outer_x + border_widths.left + style.padding.left;
-        let inner_width = content_width.max(0.0);
+        let inner_width = grid_scrollport_content_width(
+            PhysicalContentWidth::new(content_box_pt(content_width)),
+            scrollbar_reservation,
+        )
+        .points();
         let definite_content_height = explicit_content_height
             .or_else(|| {
                 non_replaced_aspect_ratio_content_height(
@@ -222,18 +295,27 @@ impl<'a> LayoutBuilder<'a> {
                     &[],
                     stylesheets,
                     PhysicalContentWidth::new(content_box_pt(inner_width)),
-                    definite_content_height,
+                    grid_scrollport_content_height_basis(
+                        definite_content_height,
+                        scrollbar_reservation,
+                    ),
                     GridLayoutPurpose::IntrinsicProbe,
                 )
                 .map(|layout| layout.height)
                 .unwrap_or_else(|| PhysicalContentHeight::new(content_box_pt(0.0)));
-            Some(definite_content_height.unwrap_or_else(|| {
-                PhysicalContentHeight::new(constrain_content_height(
-                    style,
-                    empty_grid_height.content_box_length(),
-                    PercentageBasis::definite(layout_pt(available_outer_height)),
-                ))
-            }))
+            Some(
+                grid_scrollport_content_height_basis(
+                    definite_content_height,
+                    scrollbar_reservation,
+                )
+                .unwrap_or_else(|| {
+                    PhysicalContentHeight::new(constrain_content_height(
+                        style,
+                        empty_grid_height.content_box_length(),
+                        PercentageBasis::definite(layout_pt(available_outer_height)),
+                    ))
+                }),
+            )
         } else {
             None
         };
@@ -246,7 +328,8 @@ impl<'a> LayoutBuilder<'a> {
         // sizing constraint.
         //
         // <https://www.w3.org/TR/css-contain-1/#containment-size>
-        let grid_item_layout_height_basis = definite_content_height;
+        let grid_item_layout_height_basis =
+            grid_scrollport_content_height_basis(definite_content_height, scrollbar_reservation);
 
         self.cursor_y -= style.margin.top;
         if style.float == Float::None {
@@ -300,28 +383,38 @@ impl<'a> LayoutBuilder<'a> {
             return;
         };
         let total_content_height = size_contained_content_height
-            .map(PhysicalContentHeight::points)
-            .unwrap_or_else(|| {
-                constrain_content_height(
+            .or_else(|| {
+                Some(PhysicalContentHeight::new(constrain_content_height(
                     style,
                     grid_layout.height.content_box_length(),
                     PercentageBasis::definite(layout_pt(available_outer_height)),
+                )))
+            })
+            .map(|height| {
+                grid_total_content_height(height, definite_content_height, scrollbar_reservation)
+                    .points()
+            })
+            .expect("the Grid layout always supplies a content height");
+        // Keep curved overflow contours until descendant paint has been
+        // captured. An eager padding-box rectangle would irreversibly erase
+        // the CSS Borders contour before the shared resolver can retain it.
+        let needs_contoured_overflow_clip = self.element_used_overflow_clips(element, style)
+            && box_content_contour_is_non_rectangular(style);
+        let overflow_clip_active =
+            if self.element_used_overflow_clips(element, style) && !needs_contoured_overflow_clip {
+                self.push_padding_box_overflow_clip(
+                    element,
+                    style,
+                    Some(scrollbar_reservation),
+                    outer_x,
+                    block_top,
+                    border_widths,
+                    content_width,
+                    total_content_height,
                 )
-                .points()
-            });
-        let overflow_clip_active = if self.element_used_overflow_clips(element, style) {
-            self.push_padding_box_overflow_clip(
-                element,
-                style,
-                outer_x,
-                block_top,
-                border_widths,
-                content_width,
-                total_content_height,
-            )
-        } else {
-            false
-        };
+            } else {
+                false
+            };
         let suppresses_descendant_fragmentation = used_property_containment(element, style).size
             || (overflow_clip_active && definite_content_height.is_some());
         let grid_fragment_plan = if suppresses_descendant_fragmentation {
@@ -558,15 +651,35 @@ impl<'a> LayoutBuilder<'a> {
         self.cursor_y -= style.padding.bottom + border_widths.bottom;
         let block_bottom = self.cursor_y;
         let block_height = (block_top - block_bottom).max(total_height);
-        let contents_overflow_clip = overflow_clip_active.then(|| {
-            PageTopRect::new(
-                outer_x + border_widths.left,
-                block_top - border_widths.top,
-                content_width + style.padding.left + style.padding.right,
-                total_content_height + style.padding.top + style.padding.bottom,
-            )
-            .paint_clip()
-        });
+        let contents_overflow_clip =
+            (overflow_clip_active || needs_contoured_overflow_clip).then(|| {
+                PageTopRect::new(
+                    outer_x + border_widths.left,
+                    block_top - border_widths.top,
+                    content_width + style.padding.left + style.padding.right,
+                    total_content_height + style.padding.top + style.padding.bottom,
+                )
+                .paint_clip()
+            });
+        let contoured_contents_overflow_clip = contents_overflow_clip
+            .filter(|_| needs_contoured_overflow_clip)
+            .and_then(|bounds| {
+                resolve_box_content_contour(
+                    paint_space_rect(outer_x, block_bottom, outer_width, block_height),
+                    style,
+                    border_widths,
+                    BoxContentContourRequest::Overflow {
+                        reference_box: css::BackgroundBox::Padding,
+                        outset: 0.0,
+                    },
+                )
+                .map(|mut contour| {
+                    // Grid fragmentation owns the used padding-box span;
+                    // contour resolution owns only its precise edge.
+                    contour.bounds = bounds;
+                    contour
+                })
+            });
         if block_height > 0.0 {
             self.mark_current_page_flow_content();
         }
@@ -598,13 +711,12 @@ impl<'a> LayoutBuilder<'a> {
             // <https://www.w3.org/TR/css-grid-1/#grid-items> and
             // <https://www.w3.org/TR/css-overflow-3/#overflow-clipping>.
             fragment.promote_background_border_to_in_flow_block();
-            if page_index == paint_page_index
-                && let Some(clip) = contents_overflow_clip
-            {
-                if overflow_clip_active {
-                    fragment = fragment.with_primitives_clipped_to_rect_preserving_structure(clip);
+            if page_index == paint_page_index {
+                if let Some(contour) = contoured_contents_overflow_clip.clone() {
+                    fragment = fragment.with_contents_effect_scoped_to_box_content_contour(contour);
+                } else if let Some(clip) = contents_overflow_clip {
+                    fragment = fragment.with_contents_effect_scoped_to_rect(clip);
                 }
-                fragment = fragment.with_contents_effect_scoped_to_rect(clip);
             }
             if grid_spanned_pages {
                 let planned_fragment_record = grid_fragment_plan
@@ -638,8 +750,8 @@ impl<'a> LayoutBuilder<'a> {
                             )
                         });
                     if style.visibility == Visibility::Visible
-                        && (style.background_color.is_potentially_visible()
-                            || style.background_image.is_image()
+                        && (style.background.background_color.is_potentially_visible()
+                            || style.background.background_image.is_image()
                             || style.border_image.source.is_image()
                             || used_border_width(style) > layout_pt(0.0))
                     {
@@ -823,6 +935,7 @@ impl<'a> LayoutBuilder<'a> {
             - box_metrics.margin.right.points())
         .max(used_style.font_size);
         let style = &used_style;
+        let scrollbar_reservation = grid_scrollbar_reservation(style);
         let containment = used_property_containment(element, style);
         let horizontal_extras = box_metrics.horizontal_non_content_length().points();
         let vertical_extras = box_metrics.vertical_non_content_length().points();
@@ -854,6 +967,10 @@ impl<'a> LayoutBuilder<'a> {
             PercentageBasis::definite(layout_pt(available_width.max(0.0))),
         )
         .points();
+        let grid_content_width = grid_scrollport_content_width(
+            PhysicalContentWidth::new(content_box_pt(content_width)),
+            scrollbar_reservation,
+        );
         let definite_content_height = used_content_box_height_or_auto(
             style,
             layout_pt(style.line_height.max(1.0)),
@@ -873,19 +990,28 @@ impl<'a> LayoutBuilder<'a> {
                     style,
                     &[],
                     stylesheets,
-                    PhysicalContentWidth::new(content_box_pt(content_width)),
-                    definite_content_height,
+                    grid_content_width,
+                    grid_scrollport_content_height_basis(
+                        definite_content_height,
+                        scrollbar_reservation,
+                    ),
                     GridLayoutPurpose::IntrinsicProbe,
                 )
                 .map(|layout| layout.height)
                 .unwrap_or_else(|| PhysicalContentHeight::new(content_box_pt(0.0)));
-            Some(definite_content_height.unwrap_or_else(|| {
-                PhysicalContentHeight::new(constrain_content_height(
-                    style,
-                    empty_grid_height.content_box_length(),
-                    PercentageBasis::definite(layout_pt(available_width)),
-                ))
-            }))
+            Some(
+                grid_scrollport_content_height_basis(
+                    definite_content_height,
+                    scrollbar_reservation,
+                )
+                .unwrap_or_else(|| {
+                    PhysicalContentHeight::new(constrain_content_height(
+                        style,
+                        empty_grid_height.content_box_length(),
+                        PercentageBasis::definite(layout_pt(available_width)),
+                    ))
+                }),
+            )
         } else {
             None
         };
@@ -893,29 +1019,35 @@ impl<'a> LayoutBuilder<'a> {
             style,
             &children,
             stylesheets,
-            PhysicalContentWidth::new(content_box_pt(content_width)),
-            size_contained_content_height.or(definite_content_height),
+            grid_content_width,
+            size_contained_content_height.or_else(|| {
+                grid_scrollport_content_height_basis(definite_content_height, scrollbar_reservation)
+            }),
             GridLayoutPurpose::IntrinsicProbe,
         );
-        let content_height = size_contained_content_height
-            .map(PhysicalContentHeight::points)
-            .unwrap_or_else(|| {
-                let measured = grid_layout
-                    .as_ref()
-                    .map(|layout| layout.height.points())
-                    .unwrap_or(style.line_height)
-                    .max(style.line_height);
-                constrain_content_height(
-                    style,
-                    content_box_pt(measured),
-                    PercentageBasis::definite(layout_pt(available_width)),
-                )
-                .points()
-            });
+        let content_height = size_contained_content_height.unwrap_or_else(|| {
+            let measured = grid_layout
+                .as_ref()
+                .map(|layout| layout.height.points())
+                .unwrap_or(style.line_height)
+                .max(style.line_height);
+            PhysicalContentHeight::new(constrain_content_height(
+                style,
+                content_box_pt(measured),
+                PercentageBasis::definite(layout_pt(available_width)),
+            ))
+        });
+        let content_height = grid_total_content_height(
+            content_height,
+            definite_content_height,
+            scrollbar_reservation,
+        )
+        .points();
         let border_box_height = content_height + vertical_extras;
         let baseline_offset = grid_layout
             .as_ref()
-            .and_then(|layout| layout.first_baseline)
+            .and_then(|layout| layout.baselines.vertical.first)
+            .map(PhysicalTopBaselineOffset::points)
             .map(|baseline| box_metrics.border.top.points() + style.padding.top + baseline)
             .unwrap_or(border_box_height);
 
@@ -968,6 +1100,7 @@ impl<'a> LayoutBuilder<'a> {
             PercentageBasis::definite(layout_pt(available_width)),
         );
         let style = &used_style;
+        let scrollbar_reservation = grid_scrollbar_reservation(style);
         let containment = used_property_containment(element, style);
         let border_widths = box_metrics.border.to_css_edges();
         let horizontal_extras = box_metrics.horizontal_non_content_length().points();
@@ -1001,6 +1134,10 @@ impl<'a> LayoutBuilder<'a> {
             PercentageBasis::definite(layout_pt(available_width.max(0.0))),
         )
         .points();
+        let grid_content_width = grid_scrollport_content_width(
+            PhysicalContentWidth::new(content_box_pt(content_width)),
+            scrollbar_reservation,
+        );
         let definite_content_height = used_content_box_height_or_auto(
             style,
             layout_pt(style.line_height.max(1.0)),
@@ -1020,28 +1157,39 @@ impl<'a> LayoutBuilder<'a> {
                     style,
                     &[],
                     stylesheets,
-                    PhysicalContentWidth::new(content_box_pt(content_width)),
-                    definite_content_height,
+                    grid_content_width,
+                    grid_scrollport_content_height_basis(
+                        definite_content_height,
+                        scrollbar_reservation,
+                    ),
                     GridLayoutPurpose::IntrinsicProbe,
                 )
                 .map(|layout| layout.height)
                 .unwrap_or_else(|| PhysicalContentHeight::new(content_box_pt(0.0)));
-            Some(definite_content_height.unwrap_or_else(|| {
-                PhysicalContentHeight::new(constrain_content_height(
-                    style,
-                    empty_grid_height.content_box_length(),
-                    PercentageBasis::definite(layout_pt(available_width)),
-                ))
-            }))
+            Some(
+                grid_scrollport_content_height_basis(
+                    definite_content_height,
+                    scrollbar_reservation,
+                )
+                .unwrap_or_else(|| {
+                    PhysicalContentHeight::new(constrain_content_height(
+                        style,
+                        empty_grid_height.content_box_length(),
+                        PercentageBasis::definite(layout_pt(available_width)),
+                    ))
+                }),
+            )
         } else {
             None
         };
-        let grid_content_height_basis = size_contained_content_height.or(definite_content_height);
+        let grid_content_height_basis = size_contained_content_height.or_else(|| {
+            grid_scrollport_content_height_basis(definite_content_height, scrollbar_reservation)
+        });
         let Some(grid_layout) = self.compute_grid_layout(
             style,
             &children,
             stylesheets,
-            PhysicalContentWidth::new(content_box_pt(content_width)),
+            grid_content_width,
             grid_content_height_basis,
             GridLayoutPurpose::FinalLayout,
         ) else {
@@ -1055,16 +1203,19 @@ impl<'a> LayoutBuilder<'a> {
             );
         };
 
-        let total_content_height = size_contained_content_height
-            .map(PhysicalContentHeight::points)
-            .unwrap_or_else(|| {
-                constrain_content_height(
-                    style,
-                    grid_layout.height.content_box_length(),
-                    PercentageBasis::definite(layout_pt(available_width)),
-                )
-                .points()
-            });
+        let total_content_height = size_contained_content_height.unwrap_or_else(|| {
+            PhysicalContentHeight::new(constrain_content_height(
+                style,
+                grid_layout.height.content_box_length(),
+                PercentageBasis::definite(layout_pt(available_width)),
+            ))
+        });
+        let total_content_height = grid_total_content_height(
+            total_content_height,
+            definite_content_height,
+            scrollbar_reservation,
+        )
+        .points();
         let border_box_height = total_content_height + vertical_extras;
         let snapshot = self.snapshot();
         let positioned_layer_start = self.positioned_layers.len();
@@ -1076,7 +1227,7 @@ impl<'a> LayoutBuilder<'a> {
         let top = 10_000.0;
         let content_top = top - border_widths.top - style.padding.top;
         let inner_x = border_widths.left + style.padding.left;
-        let inner_width = content_width.max(0.0);
+        let inner_width = grid_content_width.points();
         self.current_page = Page::new(content_width + horizontal_extras, top);
         self.content_left = inner_x;
         self.content_right = inner_x + inner_width;
@@ -1210,30 +1361,60 @@ impl<'a> LayoutBuilder<'a> {
             );
         }
         let fragment = fragment.translated(PaintTranslation::new(0.0, -border_bottom));
-        let baseline_offset = (!containment.layout)
-            .then_some(grid_layout.first_baseline)
+        // Layout containment suppresses every descendant-provided baseline,
+        // including the fallback recovered from captured fragment paint. Do
+        // not let `first_line_y()` re-export the grid item's internal line
+        // after the Grid baseline has been correctly suppressed.
+        // <https://www.w3.org/TR/css-contain-1/#containment-layout>
+        let descendant_baseline = (!containment.layout)
+            .then_some(grid_layout.baselines.vertical.first)
             .flatten()
+            .map(PhysicalTopBaselineOffset::points)
             .map(|baseline| border_widths.top + style.padding.top + baseline)
             .or_else(|| {
-                fragment
-                    .first_line_y()
+                (!containment.layout)
+                    .then(|| fragment.first_line_y())
+                    .flatten()
                     .map(|line_y| (border_box_height - line_y).max(0.0))
-            })
-            .unwrap_or(border_box_height);
+            });
+        let baseline_offset = LayoutBuilder::inline_block_baseline_offset_with_containment(
+            style.as_computed(),
+            containment.layout,
+            border_box_height,
+            descendant_baseline,
+        );
+        let inline_lanes_overflow_clearance =
+            grid_lanes_inline_overflow_clearance(style.as_computed(), &grid_layout);
         let fixed_layers = self.fixed_layers.split_off(fixed_layer_start);
         self.restore(snapshot);
         self.fixed_layers.extend(fixed_layers);
+        // Grid Lanes exports its packed baseline through `grid_layout` just
+        // like an ordinary grid container.  Do not rewrite an authored
+        // baseline alignment here: doing so changes the line box that owns an
+        // inline-grid-lanes atom rather than its exported baseline.
+        // <https://drafts.csswg.org/css-grid-3/#grid-lanes-baseline-alignment>
+        let mut atom_style = style.as_computed().clone();
+        // The clearance is a margin-box contribution, not a larger border
+        // box. Keeping those spaces distinct preserves the captured grid
+        // fragment's top edge while reserving endward line space for its
+        // visible stacking overflow.
+        atom_style.margin.bottom += inline_lanes_overflow_clearance;
 
         InlineAtom::new(
             InlineAtomContent::InlineFragment {
                 fragment: Box::new(fragment),
+                replay_coordinates: AtomicInlineFragmentReplayCoordinates::border_box_local(),
                 table_cell_context: None,
+                contents_overflow_clip_applied: false,
             },
-            style.as_computed().clone(),
+            atom_style,
             None,
             InlineSize::new(
                 content_width + horizontal_extras + style.margin.left + style.margin.right,
-                border_box_height + style.margin.top + style.margin.bottom,
+                border_box_height
+                    + inline_lanes_overflow_clearance
+                    + style.margin.top
+                    + style.margin.bottom,
             ),
             baseline_offset,
             baseline_shift,
@@ -1241,6 +1422,38 @@ impl<'a> LayoutBuilder<'a> {
             None,
         )
     }
+}
+
+/// Reserve the leading grid-axis quantum below an inline column-lanes box
+/// when a final percentage-sized item visibly overflows its fixed stacking
+/// size. This keeps following line boxes out of that overflow while leaving
+/// the container's specified border box unchanged.
+///
+/// Grid Lanes' stacking range may exceed the content box, while its inline
+/// formatting participation remains atomic. The clearance is the lead-in to
+/// the first overflowing final item, preserving the grid-axis placement
+/// quantum without making the principal border box taller.
+/// <https://drafts.csswg.org/css-grid-3/#sizing-grid-containers>
+fn grid_lanes_inline_overflow_clearance(style: &ComputedStyle, layout: &GridLayout) -> f32 {
+    if !style.display.is_grid_lanes()
+        || !grid_lanes_stacking_axis_is_block(style)
+        || style.vertical_align != VerticalAlign::BASELINE
+        || !layout.items.iter().any(|item| {
+            item.final_percentage_axes().height && item.height() > layout.height.points() + 0.01
+        })
+    {
+        return 0.0;
+    }
+    layout
+        .items
+        .iter()
+        .filter(|item| {
+            item.final_percentage_axes().height && item.height() > layout.height.points() + 0.01
+        })
+        .map(GridItemLayout::x)
+        .filter(|offset| *offset > 0.01)
+        .min_by(|left, right| left.total_cmp(right))
+        .unwrap_or(0.0)
 }
 
 pub(in crate::layout::grid) struct GridGapFragmentProjection<'a> {
@@ -1423,6 +1636,10 @@ fn grid_fragment_source_range_from_bounds(
 #[derive(Debug, Clone)]
 pub(in crate::layout) struct GridLayout {
     pub(in crate::layout) height: PhysicalContentHeight,
+    /// Grid's exported baselines in physical content-box coordinates.  The
+    /// legacy scalar pair below remains a temporary adapter for callers that
+    /// are known to consume only horizontal writing-mode baselines.
+    pub(in crate::layout) baselines: PhysicalBaselineSets,
     pub(in crate::layout) first_baseline: Option<f32>,
     pub(in crate::layout) last_baseline: Option<f32>,
     pub(in crate::layout) items: Vec<GridItemLayout>,
@@ -1430,6 +1647,53 @@ pub(in crate::layout) struct GridLayout {
     pub(in crate::layout) gap_gutters: GapDecorationGridGutters,
     pub(in crate::layout) column_line_offsets: Vec<f32>,
     pub(in crate::layout) row_line_offsets: Vec<f32>,
+    /// Final Grid line names in physical Taffy order. This carries inherited
+    /// and locally-added subgrid names through nested replay.
+    pub(in crate::layout) column_line_names: Vec<css::GridLineNames>,
+    pub(in crate::layout) row_line_names: Vec<css::GridLineNames>,
+    /// Used physical track sizes retained for edge-track consumers such as
+    /// `margin-trim`; zero-sized auto-fit tracks are collapsed tracks.
+    column_track_sizes: Vec<f32>,
+    row_track_sizes: Vec<f32>,
+}
+
+impl GridLayout {
+    /// Used physical track sizes reported by the shared Grid sizing pass.
+    ///
+    /// Grid Lanes uses these only while resolving its Level 3 intrinsic
+    /// auto-repeat hypothesis, before it performs its distinct packing pass.
+    pub(super) fn physical_track_sizes(&self, axis: GridAxis) -> &[f32] {
+        match axis {
+            GridAxis::Column => &self.column_track_sizes,
+            GridAxis::Row => &self.row_track_sizes,
+        }
+    }
+
+    /// Replace one physical axis with the final Grid Lanes topology before
+    /// measuring packed children. This keeps subgrid probes and final replay
+    /// on the same used tracks and line-name map.
+    pub(super) fn set_physical_grid_axis_topology(
+        &mut self,
+        axis: GridAxis,
+        line_offsets: Vec<f32>,
+        track_sizes: Vec<f32>,
+        line_names: Vec<css::GridLineNames>,
+    ) {
+        debug_assert_eq!(line_offsets.len(), track_sizes.len().saturating_add(1));
+        debug_assert_eq!(line_offsets.len(), line_names.len());
+        match axis {
+            GridAxis::Column => {
+                self.column_line_offsets = line_offsets;
+                self.column_track_sizes = track_sizes;
+                self.column_line_names = line_names;
+            }
+            GridAxis::Row => {
+                self.row_line_offsets = line_offsets;
+                self.row_track_sizes = track_sizes;
+                self.row_line_names = line_names;
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1453,7 +1717,29 @@ enum GridTaffyLeaf {
 pub(in crate::layout) struct GridItemLayout {
     rect: GridRect,
     pub(in crate::layout::grid) area: Option<GridItemArea>,
+    /// Whether a Grid Lanes item was placed from a definite grid-axis line or
+    /// by the lanes cursor.  A final numeric area alone cannot preserve this:
+    /// automatic subgrids remain track-aligned, but do not inherit parent line
+    /// names. <https://drafts.csswg.org/css-grid-3/#subgrids>
+    grid_lanes_placement: Option<GridLanesItemPlacement>,
     used_box_metrics: Option<UsedBoxMetrics>,
+    final_percentage_axes: GridItemFinalPercentageAxes,
+    /// A stretched vertical grid item retains a cyclic physical-height
+    /// percentage during replay when the container's corresponding grid axis
+    /// was indefinite. Its final grid area is still used for placement and
+    /// painting; only its own content sizing must not be re-resolved against
+    /// that area as a newly definite authored height.
+    /// <https://drafts.csswg.org/css-grid-2/#grid-item-sizing>
+    replay_cyclic_physical_height: bool,
+}
+
+/// Physical axes whose used size came from the post-track percentage phase.
+/// Replay must retain those bounds instead of resolving the authored value
+/// again against its temporary item formatting context.
+#[derive(Debug, Clone, Copy, Default)]
+pub(in crate::layout::grid) struct GridItemFinalPercentageAxes {
+    pub(in crate::layout::grid) width: bool,
+    pub(in crate::layout::grid) height: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1490,12 +1776,42 @@ fn grid_used_track_extent(
     line_extent.max(item_extent).min(fallback).max(0.0)
 }
 
+/// Replace Taffy's emulated subgrid area with the selected parent track area.
+///
+/// Taffy supplies placement order only: it cannot represent a borrowed Grid
+/// axis, so final geometry must remain tied to the parent’s used tracks.
+/// <https://www.w3.org/TR/css-grid-2/#subgrids>
+fn apply_resolved_subgrid_axis_item_geometry(
+    axis: Option<&ResolvedSubgridAxis>,
+    physical_axis: GridAxis,
+    items: &mut [GridItemLayout],
+) {
+    let Some(axis) = axis else {
+        return;
+    };
+    for item in items {
+        let Some(area) = item.area else {
+            continue;
+        };
+        let (start_line, end_line) = match physical_axis {
+            GridAxis::Column => (area.column_start, area.column_end),
+            GridAxis::Row => (area.row_start, area.row_end),
+        };
+        if let Some((start, end)) = axis.track_area_span(start_line, end_line) {
+            item.set_axis_geometry(physical_axis, start, (end - start).max(0.0));
+        }
+    }
+}
+
 impl GridItemLayout {
     pub(in crate::layout::grid) fn new(rect: GridRect, area: Option<GridItemArea>) -> Self {
         Self {
             rect,
             area,
+            grid_lanes_placement: None,
             used_box_metrics: None,
+            final_percentage_axes: GridItemFinalPercentageAxes::default(),
+            replay_cyclic_physical_height: false,
         }
     }
 
@@ -1509,6 +1825,36 @@ impl GridItemLayout {
 
     pub(in crate::layout::grid) fn used_box_metrics(&self) -> Option<UsedBoxMetrics> {
         self.used_box_metrics
+    }
+
+    pub(in crate::layout::grid) fn final_percentage_axes(&self) -> GridItemFinalPercentageAxes {
+        self.final_percentage_axes
+    }
+
+    pub(in crate::layout::grid) fn preserves_cyclic_physical_height_on_replay(&self) -> bool {
+        self.replay_cyclic_physical_height
+    }
+
+    pub(in crate::layout::grid) fn preserve_cyclic_physical_height_on_replay(&mut self) {
+        self.replay_cyclic_physical_height = true;
+    }
+
+    pub(in crate::layout::grid) fn mark_final_percentage_axis(&mut self, axis: GridAxis) {
+        match axis {
+            GridAxis::Column => self.final_percentage_axes.width = true,
+            GridAxis::Row => self.final_percentage_axes.height = true,
+        }
+    }
+
+    pub(in crate::layout::grid) fn grid_lanes_placement(&self) -> Option<GridLanesItemPlacement> {
+        self.grid_lanes_placement
+    }
+
+    pub(in crate::layout::grid) fn set_grid_lanes_placement(
+        &mut self,
+        placement: GridLanesItemPlacement,
+    ) {
+        self.grid_lanes_placement = Some(placement);
     }
 
     pub(in crate::layout::grid) fn x(&self) -> f32 {
@@ -1627,10 +1973,75 @@ impl<'a> LayoutBuilder<'a> {
         height: Option<PhysicalContentHeight>,
         purpose: GridLayoutPurpose,
     ) -> Option<GridLayout> {
-        // A direct subgrid replay installs this one-shot context immediately
-        // before entering its formatting context. Consume it here rather than
-        // leaving it visible to unrelated nested grids.
-        let subgrid_context = self.take_resolved_subgrid_context();
+        // A direct subgrid replay installs this context immediately before
+        // entering its formatting context. Intrinsic probes may run first,
+        // but they must only borrow that resolved topology: consuming it
+        // there would make the subsequent final replay fall back to an
+        // unresolved standalone grid. The final layout owns the one-shot
+        // consumption.
+        // <https://drafts.csswg.org/css-grid-2/#subgrids>
+        let subgrid_context = match purpose {
+            GridLayoutPurpose::IntrinsicProbe => self.resolved_subgrid_context_for_probe(),
+            GridLayoutPurpose::FinalLayout => self.take_resolved_subgrid_context(),
+        };
+        self.compute_grid_layout_with_margin_trim(
+            style,
+            children,
+            stylesheets,
+            width,
+            height,
+            purpose,
+            subgrid_context,
+            true,
+        )
+    }
+
+    /// Run Grid sizing after deriving any container-owned `margin-trim` used
+    /// margins from a placement probe.  Placement is independent of an item's
+    /// margins, while track sizing is not, so the probe must not become the
+    /// final sizing pass.
+    /// <https://drafts.csswg.org/css-box-4/#margin-trim-grid>.
+    #[allow(clippy::too_many_arguments)]
+    fn compute_grid_layout_with_margin_trim(
+        &mut self,
+        style: &ComputedStyle,
+        children: &[GridChild<'_>],
+        stylesheets: &Stylesheets<'_>,
+        width: PhysicalContentWidth,
+        height: Option<PhysicalContentHeight>,
+        purpose: GridLayoutPurpose,
+        subgrid_context: Option<ResolvedSubgridContext>,
+        derive_margin_trim: bool,
+    ) -> Option<GridLayout> {
+        if derive_margin_trim && grid_has_margin_trim(style) && !children.is_empty() {
+            let placement_probe = self.compute_grid_layout_with_margin_trim(
+                style,
+                children,
+                stylesheets,
+                width,
+                height,
+                purpose,
+                subgrid_context.clone(),
+                false,
+            )?;
+            let plan = grid_margin_trim_plan(style, &placement_probe);
+            if !plan.is_empty() {
+                let mut trimmed_children = children.to_vec();
+                for (index, child) in trimmed_children.iter_mut().enumerate() {
+                    plan.apply_to_style(index, &mut child.style);
+                }
+                return self.compute_grid_layout_with_margin_trim(
+                    style,
+                    &trimmed_children,
+                    stylesheets,
+                    width,
+                    height,
+                    purpose,
+                    subgrid_context,
+                    false,
+                );
+            }
+        }
         let preliminary_layout = self.compute_grid_layout_pass(
             style,
             children,
@@ -1649,8 +2060,52 @@ impl<'a> LayoutBuilder<'a> {
                     GridAvailableSizeSource::ContainerBlockSize,
                 ),
                 reported_height: None,
+                item_placement_overrides: Vec::new(),
+                baseline_plan: None,
             },
         )?;
+        // Grid baseline alignment affects intrinsic track sizes before the
+        // ordinary track-sizing algorithm runs.  Taffy does not expose an
+        // item-baseline measurement channel, so first obtain its placement
+        // topology, derive the spec's sizing-only baseline shims from that
+        // topology, and run the real sizing pass with those shims installed.
+        // The probe's placement is independent of track sizes; only the
+        // resulting track contributions change in the second pass.
+        // <https://drafts.csswg.org/css-grid-2/#algo-track-sizing>
+        let baseline_plan = self.grid_baseline_sizing_plan(
+            style,
+            children,
+            stylesheets,
+            width,
+            height,
+            &preliminary_layout,
+        );
+        let preliminary_layout = if baseline_plan.is_empty() {
+            preliminary_layout
+        } else {
+            self.compute_grid_layout_pass(
+                style,
+                children,
+                stylesheets,
+                subgrid_context.as_ref(),
+                &[],
+                GridLayoutPassConfig {
+                    width,
+                    root_height: height,
+                    item_height_basis: grid_percentage_basis(
+                        height.map(PhysicalContentHeight::content_box_length),
+                        GridAvailableSizeSource::ContainerBlockSize,
+                    ),
+                    row_gap_basis: grid_percentage_basis(
+                        height.map(PhysicalContentHeight::content_box_length),
+                        GridAvailableSizeSource::ContainerBlockSize,
+                    ),
+                    reported_height: None,
+                    item_placement_overrides: Vec::new(),
+                    baseline_plan: Some(baseline_plan.clone()),
+                },
+            )?
+        };
         let contributions = if purpose == GridLayoutPurpose::FinalLayout
             && subgrid_context.is_none()
         {
@@ -1658,6 +2113,18 @@ impl<'a> LayoutBuilder<'a> {
         } else {
             Vec::new()
         };
+        // Descendant contribution proxies take part in parent track sizing,
+        // but they are not Grid items and must not displace automatic items
+        // during the proxy pass. Preserve the preliminary placement while
+        // resolving the shared inherited tracks.
+        // <https://drafts.csswg.org/css-grid-2/#subgrid-contributions>
+        let contribution_item_placement_overrides = (!contributions.is_empty()).then(|| {
+            preliminary_layout
+                .items
+                .iter()
+                .map(|item| item.area)
+                .collect::<Vec<_>>()
+        });
         let intrinsic_layout = if contributions.is_empty() {
             preliminary_layout
         } else {
@@ -1679,6 +2146,10 @@ impl<'a> LayoutBuilder<'a> {
                         GridAvailableSizeSource::ContainerBlockSize,
                     ),
                     reported_height: None,
+                    item_placement_overrides: contribution_item_placement_overrides
+                        .clone()
+                        .unwrap_or_default(),
+                    baseline_plan: Some(baseline_plan.clone()),
                 },
             )?
         };
@@ -1712,6 +2183,9 @@ impl<'a> LayoutBuilder<'a> {
                         GridAvailableSizeSource::ContainerBlockSize,
                     ),
                     reported_height: Some(intrinsic_layout.height),
+                    item_placement_overrides: contribution_item_placement_overrides
+                        .unwrap_or_default(),
+                    baseline_plan: Some(baseline_plan),
                 },
             );
         }
@@ -1737,6 +2211,9 @@ impl<'a> LayoutBuilder<'a> {
                         GridAvailableSizeSource::ContainerBlockSize,
                     ),
                     reported_height: Some(intrinsic_layout.height),
+                    item_placement_overrides: contribution_item_placement_overrides
+                        .unwrap_or_default(),
+                    baseline_plan: Some(baseline_plan),
                 },
             );
         }
@@ -1745,12 +2222,66 @@ impl<'a> LayoutBuilder<'a> {
                 style,
                 children,
                 stylesheets,
-                width,
+                GridLanesLayoutContext {
+                    width,
+                    block_percentage_basis:
+                        height.map_or_else(PercentageBasis::indefinite, |height| {
+                            PercentageBasis::definite(layout_pt(height.points()))
+                        }),
+                    subgrid_context: subgrid_context.as_ref(),
+                },
                 intrinsic_layout,
-                subgrid_context.as_ref(),
             ));
         }
         Some(intrinsic_layout)
+    }
+
+    /// Resolve the baseline sizing data from an already-placed Grid topology.
+    ///
+    /// Grid placement does not depend on the used track sizes, so the
+    /// preliminary pass supplies stable row/column membership while this pass
+    /// supplies the measured item baselines used to construct intrinsic-size
+    /// shims.  The shims are installed only in the following Taffy sizing
+    /// pass, never in the replay style.
+    /// <https://drafts.csswg.org/css-grid-2/#algo-track-sizing>
+    fn grid_baseline_sizing_plan(
+        &mut self,
+        style: &ComputedStyle,
+        children: &[GridChild<'_>],
+        stylesheets: &Stylesheets<'_>,
+        width: PhysicalContentWidth,
+        height: Option<PhysicalContentHeight>,
+        topology: &GridLayout,
+    ) -> GridBaselinePlan {
+        let available_space = GridPhysicalAvailableSpace {
+            width_basis: grid_percentage_basis(
+                Some(width.content_box_length()),
+                GridAvailableSizeSource::ContainerInlineSize,
+            ),
+            height_basis: grid_percentage_basis(
+                height.map(PhysicalContentHeight::content_box_length),
+                GridAvailableSizeSource::ContainerBlockSize,
+            ),
+        };
+        let estimates = children
+            .iter()
+            .map(|child| {
+                self.estimate_grid_item_size(
+                    child,
+                    stylesheets,
+                    width.points(),
+                    available_space.width_basis,
+                    available_space.height_basis,
+                )
+            })
+            .collect::<Vec<_>>();
+        grid_baseline_plan(
+            style,
+            children,
+            &estimates,
+            &topology.baseline_resolutions,
+            &topology.items,
+        )
     }
 
     /// Run the existing subgrid contribution probe with a placed item's
@@ -1770,13 +2301,20 @@ impl<'a> LayoutBuilder<'a> {
         height: Option<f32>,
         purpose: GridLayoutPurpose,
     ) -> Option<GridLayout> {
-        self.compute_grid_layout(
+        // This temporary probe owns the context installed by the contribution
+        // collector. Unlike an intrinsic probe encountered while replaying a
+        // real subgrid item, it has no later formatting pass that must retain
+        // the context.
+        let subgrid_context = self.take_resolved_subgrid_context();
+        self.compute_grid_layout_with_margin_trim(
             style,
             children,
             stylesheets,
             PhysicalContentWidth::new(content_box_pt(placed_item_border_box_width)),
             height.map(|height| PhysicalContentHeight::new(content_box_pt(height))),
             purpose,
+            subgrid_context,
+            true,
         )
     }
 
@@ -1789,7 +2327,7 @@ impl<'a> LayoutBuilder<'a> {
     /// indefinite for grid item percentage block sizes:
     /// <https://www.w3.org/TR/css-align-3/#gap-percent> and
     /// <https://www.w3.org/TR/css-grid-1/#grid-sizing>.
-    fn compute_grid_layout_pass(
+    pub(super) fn compute_grid_layout_pass(
         &mut self,
         style: &ComputedStyle,
         children: &[GridChild<'_>],
@@ -1856,6 +2394,31 @@ impl<'a> LayoutBuilder<'a> {
         let mut estimates = Vec::with_capacity(children.len());
         let mut item_box_metrics = Vec::with_capacity(children.len());
         for (index, child) in children.iter().enumerate() {
+            let placement_override = config
+                .item_placement_overrides
+                .get(index)
+                .copied()
+                .flatten();
+            let overridden_row = placement_override.and_then(|area| {
+                taffy_grid_area_line(
+                    area,
+                    if swaps_physical_grid_axes {
+                        GridAxis::Column
+                    } else {
+                        GridAxis::Row
+                    },
+                )
+            });
+            let overridden_column = placement_override.and_then(|area| {
+                taffy_grid_area_line(
+                    area,
+                    if swaps_physical_grid_axes {
+                        GridAxis::Row
+                    } else {
+                        GridAxis::Column
+                    },
+                )
+            });
             let resolved_placement = resolved_item_placements
                 .as_ref()
                 .map(|placements| placements[index]);
@@ -1915,15 +2478,19 @@ impl<'a> LayoutBuilder<'a> {
                             .aspect_ratio
                             .preferred_ratio_for_non_replaced(false),
                         min_size: taffy_layout::Size {
-                            width: taffy_grid_item_min_dimension(
+                            width: grid_item_taffy_min_dimension(
                                 child.style.box_values.min_width.clone(),
-                                item_width_basis,
+                                GridAxis::Column,
+                                style,
+                                &child.style,
                                 physical_estimate.min_width,
                                 physical_estimate.content_width,
                             ),
-                            height: taffy_grid_item_min_dimension(
+                            height: grid_item_taffy_min_dimension(
                                 child.style.box_values.min_height.clone(),
-                                item_height_basis,
+                                GridAxis::Row,
+                                style,
+                                &child.style,
                                 physical_estimate.min_height,
                                 physical_estimate.content_height,
                             ),
@@ -1931,21 +2498,24 @@ impl<'a> LayoutBuilder<'a> {
                         max_size: taffy_layout::Size {
                             width: taffy_grid_item_constraint_dimension(
                                 child.style.box_values.max_width.clone(),
-                                item_width_basis,
+                                GridPercentageBasis::indefinite(),
                                 physical_estimate.min_width,
                                 physical_estimate.content_width,
                             ),
                             height: taffy_grid_item_constraint_dimension(
                                 child.style.box_values.max_height.clone(),
-                                item_height_basis,
+                                GridPercentageBasis::indefinite(),
                                 physical_estimate.min_height,
                                 physical_estimate.content_height,
                             ),
                         },
-                        margin: taffy_bridge::margin(
+                        margin: grid_taffy_margin_with_baseline_shim(
                             &child.style,
                             item_inline_basis,
-                            taffy_bridge::TaffyCyclicPercentage::ResolveToLengthComponent,
+                            config
+                                .baseline_plan
+                                .as_ref()
+                                .and_then(|plan| plan.shim(index)),
                         ),
                         padding: taffy_bridge::padding(&child.style, item_inline_basis),
                         border: taffy_bridge::border_edges(used_border_widths(&child.style)),
@@ -1959,92 +2529,96 @@ impl<'a> LayoutBuilder<'a> {
                         } else {
                             taffy_effective_grid_justify_self(&child.style, style)
                         },
-                        grid_row: if swaps_physical_grid_axes {
-                            resolved_placement
-                                .and_then(|placement| placement.columns)
-                                .map(ResolvedSubgridPlacement::taffy_line)
-                                .unwrap_or_else(|| {
-                                    physical_row_subgrid.map_or_else(
-                                        || {
-                                            taffy_grid_line_with_startward_adjustment(
-                                                &child.style.grid_column_start,
-                                                &child.style.grid_column_end,
-                                                &column_adjustment,
-                                            )
-                                        },
-                                        |axis| {
-                                            axis.clamped_taffy_line(
-                                                &child.style.grid_column_start,
-                                                &child.style.grid_column_end,
-                                            )
-                                        },
-                                    )
-                                })
-                        } else {
-                            resolved_placement
-                                .and_then(|placement| placement.rows)
-                                .map(ResolvedSubgridPlacement::taffy_line)
-                                .unwrap_or_else(|| {
-                                    physical_row_subgrid.map_or_else(
-                                        || {
-                                            taffy_grid_line_with_startward_adjustment(
-                                                &child.style.grid_row_start,
-                                                &child.style.grid_row_end,
-                                                &row_adjustment,
-                                            )
-                                        },
-                                        |axis| {
-                                            axis.clamped_taffy_line(
-                                                &child.style.grid_row_start,
-                                                &child.style.grid_row_end,
-                                            )
-                                        },
-                                    )
-                                })
-                        },
-                        grid_column: if swaps_physical_grid_axes {
-                            resolved_placement
-                                .and_then(|placement| placement.rows)
-                                .map(ResolvedSubgridPlacement::taffy_line)
-                                .unwrap_or_else(|| {
-                                    physical_column_subgrid.map_or_else(
-                                        || {
-                                            taffy_grid_line_with_startward_adjustment(
-                                                &child.style.grid_row_start,
-                                                &child.style.grid_row_end,
-                                                &row_adjustment,
-                                            )
-                                        },
-                                        |axis| {
-                                            axis.clamped_taffy_line(
-                                                &child.style.grid_row_start,
-                                                &child.style.grid_row_end,
-                                            )
-                                        },
-                                    )
-                                })
-                        } else {
-                            resolved_placement
-                                .and_then(|placement| placement.columns)
-                                .map(ResolvedSubgridPlacement::taffy_line)
-                                .unwrap_or_else(|| {
-                                    physical_column_subgrid.map_or_else(
-                                        || {
-                                            taffy_grid_line_with_startward_adjustment(
-                                                &child.style.grid_column_start,
-                                                &child.style.grid_column_end,
-                                                &column_adjustment,
-                                            )
-                                        },
-                                        |axis| {
-                                            axis.clamped_taffy_line(
-                                                &child.style.grid_column_start,
-                                                &child.style.grid_column_end,
-                                            )
-                                        },
-                                    )
-                                })
-                        },
+                        grid_row: overridden_row.unwrap_or_else(|| {
+                            if swaps_physical_grid_axes {
+                                resolved_placement
+                                    .and_then(|placement| placement.columns)
+                                    .map(ResolvedSubgridPlacement::taffy_line)
+                                    .unwrap_or_else(|| {
+                                        physical_row_subgrid.map_or_else(
+                                            || {
+                                                taffy_grid_line_with_startward_adjustment(
+                                                    &child.style.grid_column_start,
+                                                    &child.style.grid_column_end,
+                                                    &column_adjustment,
+                                                )
+                                            },
+                                            |axis| {
+                                                axis.clamped_taffy_line(
+                                                    &child.style.grid_column_start,
+                                                    &child.style.grid_column_end,
+                                                )
+                                            },
+                                        )
+                                    })
+                            } else {
+                                resolved_placement
+                                    .and_then(|placement| placement.rows)
+                                    .map(ResolvedSubgridPlacement::taffy_line)
+                                    .unwrap_or_else(|| {
+                                        physical_row_subgrid.map_or_else(
+                                            || {
+                                                taffy_grid_line_with_startward_adjustment(
+                                                    &child.style.grid_row_start,
+                                                    &child.style.grid_row_end,
+                                                    &row_adjustment,
+                                                )
+                                            },
+                                            |axis| {
+                                                axis.clamped_taffy_line(
+                                                    &child.style.grid_row_start,
+                                                    &child.style.grid_row_end,
+                                                )
+                                            },
+                                        )
+                                    })
+                            }
+                        }),
+                        grid_column: overridden_column.unwrap_or_else(|| {
+                            if swaps_physical_grid_axes {
+                                resolved_placement
+                                    .and_then(|placement| placement.rows)
+                                    .map(ResolvedSubgridPlacement::taffy_line)
+                                    .unwrap_or_else(|| {
+                                        physical_column_subgrid.map_or_else(
+                                            || {
+                                                taffy_grid_line_with_startward_adjustment(
+                                                    &child.style.grid_row_start,
+                                                    &child.style.grid_row_end,
+                                                    &row_adjustment,
+                                                )
+                                            },
+                                            |axis| {
+                                                axis.clamped_taffy_line(
+                                                    &child.style.grid_row_start,
+                                                    &child.style.grid_row_end,
+                                                )
+                                            },
+                                        )
+                                    })
+                            } else {
+                                resolved_placement
+                                    .and_then(|placement| placement.columns)
+                                    .map(ResolvedSubgridPlacement::taffy_line)
+                                    .unwrap_or_else(|| {
+                                        physical_column_subgrid.map_or_else(
+                                            || {
+                                                taffy_grid_line_with_startward_adjustment(
+                                                    &child.style.grid_column_start,
+                                                    &child.style.grid_column_end,
+                                                    &column_adjustment,
+                                                )
+                                            },
+                                            |axis| {
+                                                axis.clamped_taffy_line(
+                                                    &child.style.grid_column_start,
+                                                    &child.style.grid_column_end,
+                                                )
+                                            },
+                                        )
+                                    })
+                            }
+                        }),
                         ..Default::default()
                     },
                     GridTaffyLeaf::Item(sizing_estimate),
@@ -2289,8 +2863,10 @@ impl<'a> LayoutBuilder<'a> {
         let mut grid_item_areas = Vec::new();
         let mut column_line_offsets = Vec::new();
         let mut row_line_offsets = Vec::new();
+        let mut column_track_sizes = Vec::new();
+        let mut row_track_sizes = Vec::new();
         let mut track_corrections = GridTrackLayoutCorrections::default();
-        let gap_gutters = match tree.detailed_layout_info(root) {
+        let mut gap_gutters = match tree.detailed_layout_info(root) {
             taffy::tree::DetailedLayoutInfo::Grid(info) => {
                 grid_item_areas = info
                     .items
@@ -2334,6 +2910,8 @@ impl<'a> LayoutBuilder<'a> {
                     .as_ref()
                     .map(|correction| correction.gutters.as_slice())
                     .unwrap_or(&info.rows.gutters);
+                column_track_sizes = column_sizes.to_vec();
+                row_track_sizes = row_sizes.to_vec();
                 column_line_offsets = column_correction
                     .as_ref()
                     .map(|correction| correction.offsets.clone())
@@ -2366,6 +2944,38 @@ impl<'a> LayoutBuilder<'a> {
             }
             taffy::tree::DetailedLayoutInfo::None => GapDecorationGridGutters::default(),
         };
+        // Taffy is used to resolve placement topology, but it has no subgrid
+        // model. Once placement is known, inherited axes must retain the
+        // parent-owned track and gutter geometry exactly.
+        // <https://www.w3.org/TR/css-grid-2/#subgrids>
+        if let Some(axis) = physical_column_subgrid {
+            column_line_offsets = axis.line_offsets().to_vec();
+            column_track_sizes = axis
+                .track_starts()
+                .iter()
+                .zip(axis.track_ends())
+                .map(|(start, end)| (end - start).max(0.0))
+                .collect();
+            gap_gutters.columns = axis.gap_gutters();
+        }
+        if let Some(axis) = physical_row_subgrid {
+            row_line_offsets = axis.line_offsets().to_vec();
+            row_track_sizes = axis
+                .track_starts()
+                .iter()
+                .zip(axis.track_ends())
+                .map(|(start, end)| (end - start).max(0.0))
+                .collect();
+            gap_gutters.rows = axis.gap_gutters();
+        }
+        let column_line_names = physical_column_subgrid.map_or_else(
+            || physical_grid_line_names(style, GridAxis::Column, column_line_offsets.len()),
+            |axis| axis.physical_line_names().to_vec(),
+        );
+        let row_line_names = physical_row_subgrid.map_or_else(
+            || physical_grid_line_names(style, GridAxis::Row, row_line_offsets.len()),
+            |axis| axis.physical_line_names().to_vec(),
+        );
         // Proxy nodes are appended after real child nodes and intentionally
         // have no corresponding `GridItemLayout`: they influence only Taffy's
         // track sizing, never replay, baselines, gap decoration, or fragment
@@ -2389,10 +2999,38 @@ impl<'a> LayoutBuilder<'a> {
             })
             .collect::<Option<Vec<_>>>()?;
         debug_assert_eq!(items.len(), children.len());
+        apply_resolved_subgrid_axis_item_geometry(
+            physical_column_subgrid,
+            GridAxis::Column,
+            &mut items,
+        );
+        apply_resolved_subgrid_axis_item_geometry(physical_row_subgrid, GridAxis::Row, &mut items);
+        let final_grid_height = physical_row_subgrid
+            .map(ResolvedSubgridAxis::outer_extent)
+            .unwrap_or(root_layout.size.height);
+        // Stretch computes a final grid-area rectangle without converting an
+        // automatic item inline size into an authored definite size. When a
+        // vertical grid's physical height was indefinite during track sizing,
+        // preserve that cycle at replay so the item's content uses the same
+        // percentage behavior that participated in intrinsic sizing.
+        // <https://drafts.csswg.org/css-grid-2/#grid-item-sizing>
+        if swaps_physical_grid_axes && !item_height_basis.is_definite() {
+            for (item, child) in items.iter_mut().zip(children) {
+                let inline_self = effective_grid_justify_self(&child.style, style).keyword;
+                if child.style.box_values.height.is_auto()
+                    && matches!(
+                        inline_self,
+                        SelfAlignmentKeyword::Normal | SelfAlignmentKeyword::Stretch
+                    )
+                {
+                    item.preserve_cyclic_physical_height_on_replay();
+                }
+            }
+        }
         apply_startward_auto_fit_track_corrections(
             style,
             content_width,
-            root_layout.size.height,
+            final_grid_height,
             &track_corrections,
             &mut items,
         );
@@ -2400,7 +3038,7 @@ impl<'a> LayoutBuilder<'a> {
             style,
             children,
             content_width,
-            root_layout.size.height,
+            final_grid_height,
             &column_line_offsets,
             &row_line_offsets,
             &mut items,
@@ -2409,22 +3047,24 @@ impl<'a> LayoutBuilder<'a> {
             style,
             children,
             content_width,
-            root_layout.size.height,
+            final_grid_height,
             &column_line_offsets,
             &row_line_offsets,
             &mut items,
         );
-        if contained_subgrid_columns || contained_subgrid_rows {
-            apply_grid_deferred_percentage_item_size_corrections(
-                style,
-                children,
-                content_width,
-                root_layout.size.height,
-                &column_line_offsets,
-                &row_line_offsets,
-                &mut items,
-            );
-        }
+        apply_grid_replaced_item_size_corrections(style, children, &estimates, &mut items);
+        apply_grid_deferred_percentage_item_size_corrections(
+            GridFinalItemPercentagePlacement {
+                container_style: style,
+                container_width: content_width,
+                container_height: final_grid_height,
+                column_line_offsets: &column_line_offsets,
+                row_line_offsets: &row_line_offsets,
+            },
+            children,
+            &estimates,
+            &mut items,
+        );
         let baseline_resolutions =
             resolve_grid_baseline_participation(style, children, &items, item_available_space);
         // Taffy reports each item's border-box location after resolving its
@@ -2453,10 +3093,20 @@ impl<'a> LayoutBuilder<'a> {
             &items,
             GridBaselineSet::Last,
         );
+        let baselines = PhysicalBaselineSets {
+            vertical: BaselinePair {
+                first: first_baseline
+                    .map(|baseline| PhysicalTopBaselineOffset::new(layout_pt(baseline))),
+                last: last_baseline
+                    .map(|baseline| PhysicalTopBaselineOffset::new(layout_pt(baseline))),
+            },
+            ..PhysicalBaselineSets::default()
+        };
         Some(GridLayout {
-            height: config.reported_height.unwrap_or_else(|| {
-                PhysicalContentHeight::new(content_box_pt(root_layout.size.height))
-            }),
+            height: config
+                .reported_height
+                .unwrap_or_else(|| PhysicalContentHeight::new(content_box_pt(final_grid_height))),
+            baselines,
             first_baseline,
             last_baseline,
             items,
@@ -2464,8 +3114,137 @@ impl<'a> LayoutBuilder<'a> {
             gap_gutters,
             column_line_offsets,
             row_line_offsets,
+            column_line_names,
+            row_line_names,
+            column_track_sizes,
+            row_track_sizes,
         })
     }
+}
+
+fn grid_has_margin_trim(style: &ComputedStyle) -> bool {
+    let trim = style.margin_trim;
+    trim.block_start || trim.block_end || trim.inline_start || trim.inline_end
+}
+
+/// Derive a Grid item's trimmed physical margins from its placed logical area.
+///
+/// CSS Grid trims every item in the edge track.  Taffy reports one-indexed
+/// physical row/column line numbers, so translate those back through the
+/// container writing mode before comparing the outer tracks. Empty tracks are
+/// retained, while only zero-sized unoccupied `auto-fit` tracks are ignored.
+/// <https://drafts.csswg.org/css-box-4/#margin-trim-grid>.
+fn grid_margin_trim_plan(style: &ComputedStyle, layout: &GridLayout) -> MarginTrimPlan {
+    let mut plan = MarginTrimPlan::for_item_count(layout.items.len());
+    let axes = WritingModeAxes::new(style.writing_mode, style.used_direction());
+    let swaps_axes = axes.swaps_physical_axes();
+    let physical_spans = layout
+        .items
+        .iter()
+        .filter_map(|item| item.area)
+        .collect::<Vec<_>>();
+    let (inline_spans, block_spans, inline_sizes, block_sizes) = if swaps_axes {
+        (
+            physical_spans
+                .iter()
+                .map(|area| (area.row_start, area.row_end))
+                .collect::<Vec<_>>(),
+            physical_spans
+                .iter()
+                .map(|area| (area.column_start, area.column_end))
+                .collect::<Vec<_>>(),
+            layout.row_track_sizes.as_slice(),
+            layout.column_track_sizes.as_slice(),
+        )
+    } else {
+        (
+            physical_spans
+                .iter()
+                .map(|area| (area.column_start, area.column_end))
+                .collect::<Vec<_>>(),
+            physical_spans
+                .iter()
+                .map(|area| (area.row_start, area.row_end))
+                .collect::<Vec<_>>(),
+            layout.column_track_sizes.as_slice(),
+            layout.row_track_sizes.as_slice(),
+        )
+    };
+    let (inline_first, inline_last) =
+        grid_margin_trim_edge_lines(&style.grid_template_columns, inline_sizes, &inline_spans);
+    let (block_first, block_last) =
+        grid_margin_trim_edge_lines(&style.grid_template_rows, block_sizes, &block_spans);
+
+    for (index, item) in layout.items.iter().enumerate() {
+        let Some(area) = item.area else {
+            continue;
+        };
+        let (inline_start, inline_end, block_start, block_end) = if swaps_axes {
+            (
+                area.row_start,
+                area.row_end,
+                area.column_start,
+                area.column_end,
+            )
+        } else {
+            (
+                area.column_start,
+                area.column_end,
+                area.row_start,
+                area.row_end,
+            )
+        };
+        if style.margin_trim.inline_start && inline_start == inline_first {
+            plan.trim(index, axes.physical_side(LogicalSide::InlineStart));
+        }
+        if style.margin_trim.inline_end && inline_end == inline_last {
+            plan.trim(index, axes.physical_side(LogicalSide::InlineEnd));
+        }
+        if style.margin_trim.block_start && block_start == block_first {
+            plan.trim(index, axes.physical_side(LogicalSide::BlockStart));
+        }
+        if style.margin_trim.block_end && block_end == block_last {
+            plan.trim(index, axes.physical_side(LogicalSide::BlockEnd));
+        }
+    }
+    plan
+}
+
+/// Return the first and last non-collapsed grid lines for one logical axis.
+///
+/// Outside `auto-fit`, even a zero-sized or empty track remains relevant to
+/// margin adjacency. In an `auto-fit` repetition, CSS Grid collapses only
+/// empty repeated tracks; an occupied zero-sized track must still be kept.
+/// <https://www.w3.org/TR/css-grid-1/#auto-repeat>.
+fn grid_margin_trim_edge_lines(
+    tracks: &css::GridTrackList,
+    sizes: &[f32],
+    areas: &[(u16, u16)],
+) -> (u16, u16) {
+    let last_line = u16::try_from(sizes.len().saturating_add(1)).unwrap_or(u16::MAX);
+    if !grid_track_list_has_auto_fit(tracks) {
+        return (1, last_line);
+    }
+    let occupied = |track_index: usize| {
+        let line = u16::try_from(track_index.saturating_add(1)).unwrap_or(u16::MAX);
+        areas
+            .iter()
+            .any(|(start, end)| *start <= line && line < *end)
+    };
+    let first = sizes
+        .iter()
+        .enumerate()
+        .find(|(index, size)| size.abs() > 0.01 || occupied(*index))
+        .and_then(|(index, _)| u16::try_from(index.saturating_add(1)).ok())
+        .unwrap_or(1);
+    let last = sizes
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(index, size)| size.abs() > 0.01 || occupied(*index))
+        .and_then(|(index, _)| u16::try_from(index.saturating_add(2)).ok())
+        .unwrap_or(last_line);
+    (first, last)
 }
 
 /// The direct grid item representing a subgrid is empty in an inherited axis;
@@ -2490,6 +3269,108 @@ fn grid_item_parent_sizing_estimate(
         estimate.metrics.content_height = content_box_pt(0.0);
     }
     estimate
+}
+
+/// Convert a Grid item's automatic minimum for Taffy after applying Grid's
+/// eligibility conditions. Taffy's generic `auto` minimum is content based,
+/// but Grid explicitly zeroes that minimum for a multi-track span containing
+/// a flexible track.
+/// <https://www.w3.org/TR/css-grid-1/#min-size-auto>
+fn grid_item_taffy_min_dimension(
+    value: css::ComputedLengthPercentageOrAuto,
+    physical_axis: GridAxis,
+    container_style: &ComputedStyle,
+    item_style: &ComputedStyle,
+    min_content: ContentBoxLength,
+    max_content: ContentBoxLength,
+) -> taffy_layout::Dimension {
+    if value.is_auto()
+        && grid_item_spans_flexible_track_on_physical_axis(
+            container_style,
+            item_style,
+            physical_axis,
+        )
+    {
+        return taffy_layout::Dimension::length(0.0);
+    }
+    taffy_grid_item_min_dimension(
+        value,
+        GridPercentageBasis::indefinite(),
+        min_content,
+        max_content,
+    )
+}
+
+/// Whether an explicitly counted multi-track span crosses a flexible track.
+///
+/// The Grid automatic-minimum rule is deliberately based on track sizing
+/// functions, not the final numeric track sizes. The full placement engine
+/// remains Taffy's responsibility; this early decision is only needed for a
+/// span encoded directly in the item style, before Taffy consumes the leaf's
+/// minimum contribution.
+fn grid_item_spans_flexible_track_on_physical_axis(
+    container_style: &ComputedStyle,
+    item_style: &ComputedStyle,
+    physical_axis: GridAxis,
+) -> bool {
+    let swaps_axes = WritingModeAxes::new(container_style.writing_mode, container_style.direction)
+        .swaps_physical_axes();
+    let (start, end, tracks) = match (physical_axis, swaps_axes) {
+        (GridAxis::Column, false) => (
+            &item_style.grid_column_start,
+            &item_style.grid_column_end,
+            &container_style.grid_template_columns,
+        ),
+        (GridAxis::Row, false) => (
+            &item_style.grid_row_start,
+            &item_style.grid_row_end,
+            &container_style.grid_template_rows,
+        ),
+        (GridAxis::Column, true) => (
+            &item_style.grid_row_start,
+            &item_style.grid_row_end,
+            &container_style.grid_template_rows,
+        ),
+        (GridAxis::Row, true) => (
+            &item_style.grid_column_start,
+            &item_style.grid_column_end,
+            &container_style.grid_template_columns,
+        ),
+    };
+    grid_placement_explicit_span(start, end).is_some_and(|span| span > 1)
+        && grid_track_list_has_flexible_track(tracks)
+}
+
+fn grid_placement_explicit_span(
+    start: &css::GridPlacement,
+    end: &css::GridPlacement,
+) -> Option<u16> {
+    match (start, end) {
+        (css::GridPlacement::Line(_), css::GridPlacement::Span(span))
+        | (css::GridPlacement::Span(span), css::GridPlacement::Line(_)) => span.count(),
+        _ => None,
+    }
+}
+
+fn grid_track_list_has_flexible_track(tracks: &css::GridTrackList) -> bool {
+    let css::GridTrackList::Tracks { components, .. } = tracks else {
+        return false;
+    };
+    components
+        .iter()
+        .any(grid_track_component_has_flexible_track)
+}
+
+fn grid_track_component_has_flexible_track(component: &css::GridTrackListComponent) -> bool {
+    match component {
+        css::GridTrackListComponent::Track(_, track) => {
+            matches!(track.max, css::GridMaxTrackBreadth::Flex(_))
+        }
+        css::GridTrackListComponent::Repeat(_, repeat) => repeat
+            .tracks
+            .iter()
+            .any(grid_track_component_has_flexible_track),
+    }
 }
 
 /// Whether an auto-sized grid's physical rows have fully fixed explicit sizes.
@@ -2565,12 +3446,35 @@ fn grid_gap_resolves_differently_with_basis(
     (used - intrinsic).abs() > 0.01
 }
 
-struct GridLayoutPassConfig {
-    width: PhysicalContentWidth,
-    root_height: Option<PhysicalContentHeight>,
-    item_height_basis: GridPercentageBasis,
-    row_gap_basis: GridPercentageBasis,
-    reported_height: Option<PhysicalContentHeight>,
+pub(super) struct GridLayoutPassConfig {
+    pub(super) width: PhysicalContentWidth,
+    pub(super) root_height: Option<PhysicalContentHeight>,
+    pub(super) item_height_basis: GridPercentageBasis,
+    pub(super) row_gap_basis: GridPercentageBasis,
+    pub(super) reported_height: Option<PhysicalContentHeight>,
+    /// Resolved real-item areas retained while sizing-only descendant proxy
+    /// leaves are included in a second parent track-sizing pass.
+    pub(super) item_placement_overrides: Vec<Option<GridItemArea>>,
+    /// Baseline shims derived from the placement topology. These affect only
+    /// Taffy's intrinsic Grid sizing margins, never the replayed item style.
+    pub(super) baseline_plan: Option<GridBaselinePlan>,
+}
+
+/// Convert a preliminary physical Grid area into a fixed Taffy placement for
+/// the proxy sizing pass. The area was produced by the preceding placement
+/// pass, so its lines are valid Taffy grid lines.
+fn taffy_grid_area_line(
+    area: GridItemArea,
+    axis: GridAxis,
+) -> Option<taffy_layout::Line<taffy_layout::GridPlacement<String>>> {
+    let (start, end) = match axis {
+        GridAxis::Column => (area.column_start, area.column_end),
+        GridAxis::Row => (area.row_start, area.row_end),
+    };
+    Some(taffy_layout::Line {
+        start: taffy_layout::line(i16::try_from(start).ok()?),
+        end: taffy_layout::line(i16::try_from(end).ok()?),
+    })
 }
 
 #[derive(Default)]
@@ -2800,6 +3704,150 @@ pub(super) struct GridBaselineResolution {
     column_self: GridBaselineParticipation,
     row_content: GridBaselineParticipation,
     column_content: GridBaselineParticipation,
+}
+
+/// A virtual margin used only while Grid sizes intrinsic tracks for a
+/// baseline-sharing group.  CSS Grid calls this a baseline "shim"; keeping it
+/// distinct from used margins prevents the sizing contribution from leaking
+/// into item replay.
+/// <https://drafts.csswg.org/css-grid-2/#algo-track-sizing>
+#[derive(Debug, Clone, Copy, Default)]
+struct GridBaselineSizingShim {
+    top: f32,
+    bottom: f32,
+    left: f32,
+    right: f32,
+}
+
+/// Baseline decisions shared by the Grid sizing and final-alignment phases.
+///
+/// The vector is indexed by the real Grid item index, so sizing-only subgrid
+/// contribution leaves cannot accidentally acquire an item's baseline shim.
+#[derive(Debug, Clone, Default)]
+pub(super) struct GridBaselinePlan {
+    shims: Vec<GridBaselineSizingShim>,
+}
+
+impl GridBaselinePlan {
+    fn shim(&self, index: usize) -> Option<GridBaselineSizingShim> {
+        self.shims.get(index).copied()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.shims.iter().all(|shim| {
+            shim.top == 0.0 && shim.bottom == 0.0 && shim.left == 0.0 && shim.right == 0.0
+        })
+    }
+}
+
+/// Construct the Grid track-sizing shims for baseline-aligned row groups.
+///
+/// Taffy's Grid implementation uses physical rows/columns, while the
+/// measured text baselines currently available to this adapter are physical
+/// top-edge offsets.  Therefore this phase contributes row shims for a
+/// horizontal grid; vertical/column baseline geometry remains represented by
+/// the participation resolution and falls back safely until its physical
+/// baseline table is measured by the inline adapter.
+fn grid_baseline_plan(
+    container_style: &ComputedStyle,
+    _children: &[GridChild<'_>],
+    estimates: &[GridItemEstimate],
+    resolutions: &[GridBaselineResolution],
+    items: &[GridItemLayout],
+) -> GridBaselinePlan {
+    let mut plan = GridBaselinePlan {
+        shims: vec![GridBaselineSizingShim::default(); items.len()],
+    };
+    if WritingModeAxes::new(container_style.writing_mode, container_style.direction)
+        .swaps_physical_axes()
+    {
+        return plan;
+    }
+    for baseline_set in [GridBaselineSet::First, GridBaselineSet::Last] {
+        let mut groups = Vec::<(u16, u16)>::new();
+        for item in items {
+            let Some(area) = item.area else {
+                continue;
+            };
+            let group = grid_baseline_group_key(area, baseline_set);
+            if !groups.contains(&group) {
+                groups.push(group);
+            }
+        }
+        for (row_start, row_end) in groups {
+            let participants = items
+                .iter()
+                .enumerate()
+                .filter(|(index, item)| {
+                    grid_item_in_baseline_group(item, row_start, row_end, baseline_set)
+                        && resolutions[*index]
+                            .self_alignment(GridAxis::Row)
+                            .shares(baseline_set)
+                })
+                .collect::<Vec<_>>();
+            if participants.len() < 2 {
+                continue;
+            }
+            let greatest_distance = participants
+                .iter()
+                .map(|(index, item)| {
+                    let baseline =
+                        grid_item_border_box_baseline(&estimates[*index], item, baseline_set);
+                    match baseline_set {
+                        GridBaselineSet::First => baseline,
+                        GridBaselineSet::Last => (item.height() - baseline).max(0.0),
+                    }
+                })
+                .fold(0.0_f32, f32::max);
+            for (index, item) in participants {
+                let baseline = grid_item_border_box_baseline(&estimates[index], item, baseline_set);
+                let distance = match baseline_set {
+                    GridBaselineSet::First => baseline,
+                    GridBaselineSet::Last => (item.height() - baseline).max(0.0),
+                };
+                let shim = (greatest_distance - distance).max(0.0);
+                match baseline_set {
+                    GridBaselineSet::First => plan.shims[index].top = shim,
+                    GridBaselineSet::Last => plan.shims[index].bottom = shim,
+                }
+            }
+        }
+    }
+    plan
+}
+
+/// Convert authored margins to the sizing-only margin model with an optional
+/// Grid baseline shim.  Grid resolves cyclic margin percentages before this
+/// boundary, so any non-auto edge can safely become one fixed Taffy length.
+fn grid_taffy_margin_with_baseline_shim<Source: Copy>(
+    style: &ComputedStyle,
+    percentage_basis: LogicalInlinePercentageBasis<Source>,
+    shim: Option<GridBaselineSizingShim>,
+) -> taffy_layout::Rect<taffy_layout::LengthPercentageAuto> {
+    let mut margin = taffy_bridge::margin(
+        style,
+        percentage_basis,
+        taffy_bridge::TaffyCyclicPercentage::ResolveToLengthComponent,
+    );
+    let Some(shim) = shim else {
+        return margin;
+    };
+    fn add(
+        value: taffy_layout::LengthPercentageAuto,
+        amount: f32,
+    ) -> taffy_layout::LengthPercentageAuto {
+        if amount == 0.0 || value.is_auto() {
+            return value;
+        }
+        taffy_layout::LengthPercentageAuto::length(
+            value.resolve_to_option(0.0, |_, _| 0.0).unwrap_or(0.0) + amount,
+        )
+    }
+    margin.top = add(margin.top, shim.top);
+    margin.bottom = add(margin.bottom, shim.bottom);
+    margin.left = add(margin.left, shim.left);
+    margin.right = add(margin.right, shim.right);
+    margin
 }
 
 impl GridBaselineResolution {
@@ -3449,136 +4497,280 @@ fn apply_grid_aspect_ratio_item_size_corrections(
     }
 }
 
-/// Resolve a contained subgrid item's cyclic percentage after track sizing.
-///
-/// Layout and paint containment turn each subgridded axis into `none`. A
-/// percentage item on the resulting implicit track is automatic while sizing,
-/// but resolves against its final grid area for item layout.
-/// <https://drafts.csswg.org/css-grid-2/#subgrid-listing>
-/// <https://www.w3.org/TR/css-grid-1/#grid-item-sizing>
-fn apply_grid_deferred_percentage_item_size_corrections(
+/// Restore the intrinsic used size of an automatically sized replaced Grid
+/// item after track sizing. A replaced item with `align-self: normal` is not
+/// stretch-fit like an ordinary block; its intrinsic dimensions may overflow a
+/// zero-breadth `minmax(auto, 0)` track without contributing that size to the
+/// track itself.
+/// <https://www.w3.org/TR/css-grid-1/#algo-single-span-items>
+/// <https://www.w3.org/TR/css-align-3/#valdef-justify-self-normal>
+pub(super) fn apply_grid_replaced_item_size_corrections(
     container_style: &ComputedStyle,
     children: &[GridChild<'_>],
-    container_width: PhysicalContentWidth,
-    container_height: f32,
-    column_line_offsets: &[f32],
-    row_line_offsets: &[f32],
+    estimates: &[GridItemEstimate],
     items: &mut [GridItemLayout],
 ) {
-    if WritingModeAxes::new(container_style.writing_mode, container_style.direction)
-        .swaps_physical_axes()
-    {
-        return;
+    for ((child, estimate), item) in children.iter().zip(estimates).zip(items) {
+        if !child.style.box_values.width.is_auto()
+            || !child.style.box_values.height.value().is_auto()
+        {
+            continue;
+        }
+        let Some(used_size) = estimate.replaced_used_size else {
+            continue;
+        };
+        // Unlike `normal`, an explicit (or inherited) stretch alignment
+        // supplies the final grid-area size to a replaced item. An intrinsic
+        // fallback must not restore the image after that zero-sized area was
+        // deliberately selected by `minmax(auto, 0)`.
+        // <https://www.w3.org/TR/css-align-3/#valdef-justify-self-stretch>
+        if matches!(
+            effective_grid_justify_self(&child.style, container_style).keyword,
+            SelfAlignmentKeyword::Stretch
+        ) || matches!(
+            effective_grid_align_self(&child.style, container_style).keyword,
+            SelfAlignmentKeyword::Stretch
+        ) {
+            continue;
+        }
+        let width = used_size.width.points().max(0.0);
+        let height = used_size.height.points().max(0.0);
+        if width == 0.0 || height == 0.0 || (item.width() > 0.0 && item.height() > 0.0) {
+            continue;
+        }
+        // A zero-breadth track can omit its trailing Taffy line from the
+        // detailed layout record. The item's resolved start position remains
+        // authoritative, however, and is precisely where a non-stretch
+        // replaced item is aligned by the preceding self-alignment phase.
+        item.set_axis_geometry(GridAxis::Column, item.x(), width);
+        item.set_axis_geometry(GridAxis::Row, item.y(), height);
     }
-    for (child, item) in children.iter().zip(items) {
+}
+
+/// Resolve cyclic grid-item percentage sizes after final grid-area placement.
+///
+/// Grid must treat a percentage that depends on an intrinsic track as `auto`
+/// while determining track contributions. Once tracks are placed, the same
+/// preferred, minimum, and maximum size values resolve against the final grid
+/// area. Keep that phase transition here rather than using the grid container
+/// as Taffy's percentage basis.
+/// <https://www.w3.org/TR/css-grid-1/#percentage-sizing>
+/// <https://www.w3.org/TR/css-grid-1/#grid-item-sizing>
+struct GridFinalItemPercentagePlacement<'a> {
+    container_style: &'a ComputedStyle,
+    container_width: PhysicalContentWidth,
+    container_height: f32,
+    column_line_offsets: &'a [f32],
+    row_line_offsets: &'a [f32],
+}
+
+fn apply_grid_deferred_percentage_item_size_corrections(
+    placement: GridFinalItemPercentagePlacement<'_>,
+    children: &[GridChild<'_>],
+    estimates: &[GridItemEstimate],
+    items: &mut [GridItemLayout],
+) {
+    for ((child, estimate), item) in children.iter().zip(estimates).zip(items) {
         let Some(area) = item.area else {
             continue;
         };
         let child_style = &child.style;
+        let (
+            horizontal_alignment,
+            vertical_alignment,
+            horizontal_content_alignment,
+            vertical_content_alignment,
+        ) = if WritingModeAxes::new(
+            placement.container_style.writing_mode,
+            placement.container_style.direction,
+        )
+        .swaps_physical_axes()
+        {
+            (
+                effective_grid_align_self(child_style, placement.container_style),
+                effective_grid_justify_self(child_style, placement.container_style),
+                placement.container_style.align_content,
+                placement.container_style.justify_content,
+            )
+        } else {
+            (
+                effective_grid_justify_self(child_style, placement.container_style),
+                effective_grid_align_self(child_style, placement.container_style),
+                placement.container_style.justify_content,
+                placement.container_style.align_content,
+            )
+        };
         let Some(area_x) = content_aligned_grid_line_offset(
-            container_style.justify_content,
-            container_width.points(),
-            column_line_offsets,
+            horizontal_content_alignment,
+            placement.container_width.points(),
+            placement.column_line_offsets,
             usize::from(area.column_start).saturating_sub(1),
         ) else {
             continue;
         };
         let Some(area_right) = content_aligned_grid_line_offset(
-            container_style.justify_content,
-            container_width.points(),
-            column_line_offsets,
+            horizontal_content_alignment,
+            placement.container_width.points(),
+            placement.column_line_offsets,
             usize::from(area.column_end).saturating_sub(1),
         ) else {
             continue;
         };
         let Some(area_y) = content_aligned_grid_line_offset(
-            container_style.align_content,
-            container_height,
-            row_line_offsets,
+            vertical_content_alignment,
+            placement.container_height,
+            placement.row_line_offsets,
             usize::from(area.row_start).saturating_sub(1),
         ) else {
             continue;
         };
         let Some(area_bottom) = content_aligned_grid_line_offset(
-            container_style.align_content,
-            container_height,
-            row_line_offsets,
+            vertical_content_alignment,
+            placement.container_height,
+            placement.row_line_offsets,
             usize::from(area.row_end).saturating_sub(1),
         ) else {
             continue;
         };
         let area_width = (area_right - area_x).max(0.0);
         let area_height = (area_bottom - area_y).max(0.0);
-        let metrics = item.used_box_metrics().unwrap_or_else(|| {
-            used_box_metrics(
-                child_style,
-                PercentageBasis::definite(layout_pt(container_width.points())),
-            )
-        });
-        let horizontal_non_content = metrics.horizontal_non_content_length();
-        let vertical_non_content = metrics.vertical_non_content_length();
-        let justify_self = effective_grid_justify_self(child_style, container_style);
-        let align_self = effective_grid_align_self(child_style, container_style);
-        if grid_item_size_is_percentage(&child_style.box_values.width)
-            && let Some(content_width) = used_content_box_size(
-                child_style.box_values.width.clone(),
-                child_style.box_sizing,
-                PercentageBasis::definite(content_box_pt(area_width)),
-                horizontal_non_content,
-            )
-        {
-            let width = constrain_content_width(
-                child_style,
-                content_width,
-                PercentageBasis::definite(layout_pt(area_width)),
-            )
-            .points()
-                + horizontal_non_content.points();
+        let final_size = resolve_grid_item_final_percentage_size(
+            child,
+            estimate,
+            item,
+            area_width,
+            area_height,
+            placement.container_width,
+        );
+        if let Some(width) = final_size.width {
+            item.mark_final_percentage_axis(GridAxis::Column);
             item.set_axis_geometry(
                 GridAxis::Column,
                 grid_item_aspect_axis_position(
                     area_x,
                     area_right,
-                    width.max(0.0),
-                    justify_self.keyword,
+                    width.points(),
+                    horizontal_alignment.keyword,
                 ),
-                width.max(0.0),
+                width.points(),
             );
         }
-        if grid_item_size_is_percentage(&child_style.box_values.height)
-            && let Some(content_height) = used_content_box_size(
-                child_style.box_values.height.value().clone(),
-                child_style.box_sizing,
-                PercentageBasis::definite(content_box_pt(area_height)),
-                vertical_non_content,
-            )
-        {
-            let height = constrain_content_height(
-                child_style,
-                content_height,
-                PercentageBasis::definite(layout_pt(area_height)),
-            )
-            .points()
-                + vertical_non_content.points();
+        if let Some(height) = final_size.height {
+            item.mark_final_percentage_axis(GridAxis::Row);
             item.set_axis_geometry(
                 GridAxis::Row,
                 grid_item_aspect_axis_position(
                     area_y,
                     area_bottom,
-                    height.max(0.0),
-                    align_self.keyword,
+                    height.points(),
+                    vertical_alignment.keyword,
                 ),
-                height.max(0.0),
+                height.points(),
             );
         }
     }
 }
 
-fn grid_item_size_is_percentage(value: &css::ComputedLengthPercentageOrAuto) -> bool {
-    matches!(
-        value,
-        css::ComputedLengthPercentageOrAuto::LengthPercentage(value) if value.contains_percentage()
+/// Border-box dimensions resolved after a Grid item's final area is known.
+///
+/// A cyclic percentage contributes as `auto` while tracks are intrinsic-sized,
+/// but its preferred/minimum/maximum constraint applies to the final area.
+/// This value is deliberately independent of an item's final origin so Grid
+/// Lanes can use it while determining its perpendicular packing extent.
+/// <https://www.w3.org/TR/css-grid-1/#percentage-sizing>
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct GridItemFinalPercentageSize {
+    pub(super) width: Option<BorderBoxLength>,
+    pub(super) height: Option<BorderBoxLength>,
+}
+
+pub(super) fn resolve_grid_item_final_percentage_size(
+    child: &GridChild<'_>,
+    estimate: &GridItemEstimate,
+    item: &GridItemLayout,
+    area_width: f32,
+    area_height: f32,
+    container_width: PhysicalContentWidth,
+) -> GridItemFinalPercentageSize {
+    let child_style = &child.style;
+    let metrics = item.used_box_metrics().unwrap_or_else(|| {
+        used_box_metrics(
+            child_style,
+            PercentageBasis::definite(layout_pt(container_width.points())),
+        )
+    });
+    let horizontal_non_content = metrics.horizontal_non_content_length();
+    let vertical_non_content = metrics.vertical_non_content_length();
+    let width = grid_item_axis_has_percentage(
+        &child_style.box_values.width,
+        &child_style.box_values.min_width,
+        &child_style.box_values.max_width,
     )
+    .then(|| {
+        let content_width = used_content_box_size(
+            child_style.box_values.width.clone(),
+            child_style.box_sizing,
+            PercentageBasis::definite(content_box_pt(area_width)),
+            horizontal_non_content,
+        )
+        .map(SemanticLengthExt::points)
+        .unwrap_or_else(|| {
+            (estimate.physical_measurements().content_width.points()
+                - horizontal_non_content.points())
+            .max(0.0)
+        });
+        BorderBoxLength::new(
+            constrain_content_width(
+                child_style,
+                content_box_pt(content_width),
+                PercentageBasis::definite(layout_pt(area_width)),
+            )
+            .points()
+                + horizontal_non_content.points(),
+        )
+    });
+    let height = grid_item_axis_has_percentage(
+        child_style.box_values.height.value(),
+        &child_style.box_values.min_height,
+        &child_style.box_values.max_height,
+    )
+    .then(|| {
+        let content_height = used_content_box_size(
+            child_style.box_values.height.value().clone(),
+            child_style.box_sizing,
+            PercentageBasis::definite(content_box_pt(area_height)),
+            vertical_non_content,
+        )
+        .map(SemanticLengthExt::points)
+        .unwrap_or_else(|| {
+            (estimate.physical_measurements().content_height.points()
+                - vertical_non_content.points())
+            .max(0.0)
+        });
+        BorderBoxLength::new(
+            constrain_content_height(
+                child_style,
+                content_box_pt(content_height),
+                PercentageBasis::definite(layout_pt(area_height)),
+            )
+            .points()
+                + vertical_non_content.points(),
+        )
+    });
+    GridItemFinalPercentageSize { width, height }
+}
+
+fn grid_item_axis_has_percentage(
+    preferred: &css::ComputedLengthPercentageOrAuto,
+    minimum: &css::ComputedLengthPercentageOrAuto,
+    maximum: &css::ComputedLengthPercentageOrAuto,
+) -> bool {
+    [preferred, minimum, maximum].into_iter().any(|value| {
+        matches!(
+            value,
+            css::ComputedLengthPercentageOrAuto::LengthPercentage(value) if value.contains_percentage()
+        )
+    })
 }
 
 /// Whether an automatic grid-item axis receives its grid-area size.
@@ -3947,21 +5139,64 @@ fn grid_container_baseline(
         return None;
     }
     let row_index = grid_container_baseline_row(items, baseline_set)?;
-    for (index, item) in items.iter().enumerate() {
-        if grid_item_intersects_row(item, row_index)
-            && resolutions[index]
-                .self_alignment(GridAxis::Row)
-                .shares(baseline_set)
-        {
+    // CSS Grid's exported baseline has an ordered fallback chain.  In
+    // particular, a last-baseline sharing group is still preferable to an
+    // arbitrary item baseline when no first-baseline group exists in the
+    // relevant edge track.
+    // <https://drafts.csswg.org/css-grid-2/#grid-baselines>
+    for requested_set in [baseline_set, grid_opposite_baseline_set(baseline_set)] {
+        if let Some((index, item)) = items.iter().enumerate().find(|(index, item)| {
+            grid_item_is_container_baseline_eligible(item, row_index, requested_set)
+                && resolutions[*index]
+                    .self_alignment(GridAxis::Row)
+                    .shares(requested_set)
+        }) {
             return Some(
-                item.y() + grid_item_border_box_baseline(&estimates[index], item, baseline_set),
+                item.y() + grid_item_border_box_baseline(&estimates[index], item, requested_set),
             );
         }
     }
-    grid_container_baseline_fallback_item(items, row_index, baseline_set).map(|index| {
-        let item = &items[index];
-        item.y() + grid_item_border_box_baseline(&estimates[index], item, baseline_set)
+    if let Some((index, item)) = items.iter().enumerate().find(|(index, item)| {
+        grid_item_is_container_baseline_eligible(item, row_index, baseline_set)
+            && grid_item_has_baseline(&estimates[*index], baseline_set)
+    }) {
+        return Some(
+            item.y() + grid_item_border_box_baseline(&estimates[index], item, baseline_set),
+        );
+    }
+    // The final fallback is the first Grid item in grid order, not merely an
+    // item intersecting the edge track. Its absent baseline is synthesized
+    // from its border box by `grid_item_border_box_baseline`.
+    items.iter().enumerate().find_map(|(index, item)| {
+        item.area.map(|_| {
+            item.y() + grid_item_border_box_baseline(&estimates[index], item, baseline_set)
+        })
     })
+}
+
+fn grid_opposite_baseline_set(baseline_set: GridBaselineSet) -> GridBaselineSet {
+    match baseline_set {
+        GridBaselineSet::First => GridBaselineSet::Last,
+        GridBaselineSet::Last => GridBaselineSet::First,
+    }
+}
+
+fn grid_item_is_container_baseline_eligible(
+    item: &GridItemLayout,
+    row_index: u16,
+    baseline_set: GridBaselineSet,
+) -> bool {
+    item.area.is_some_and(|area| match baseline_set {
+        GridBaselineSet::First => area.row_start == row_index,
+        GridBaselineSet::Last => area.row_end.saturating_sub(1) == row_index,
+    })
+}
+
+fn grid_item_has_baseline(estimate: &GridItemEstimate, baseline_set: GridBaselineSet) -> bool {
+    match baseline_set {
+        GridBaselineSet::First => estimate.first_baseline.is_some(),
+        GridBaselineSet::Last => estimate.last_baseline.is_some(),
+    }
 }
 
 fn grid_container_baseline_row(
@@ -3979,39 +5214,6 @@ fn grid_container_baseline_row(
             GridBaselineSet::First => u16::min,
             GridBaselineSet::Last => u16::max,
         })
-}
-
-fn grid_container_baseline_fallback_item(
-    items: &[GridItemLayout],
-    row_index: u16,
-    baseline_set: GridBaselineSet,
-) -> Option<usize> {
-    let mut candidate = None::<(usize, u16, u16)>;
-    for (index, item) in items.iter().enumerate() {
-        let Some(area) = item.area else {
-            continue;
-        };
-        if !grid_area_intersects_row(area, row_index) {
-            continue;
-        }
-        let key = match baseline_set {
-            GridBaselineSet::First => (area.row_start, area.column_start),
-            GridBaselineSet::Last => (u16::MAX - area.row_end, u16::MAX - area.column_end),
-        };
-        if candidate.is_none_or(|(_, row, column)| (key.0, key.1) < (row, column)) {
-            candidate = Some((index, key.0, key.1));
-        }
-    }
-    candidate.map(|(index, _, _)| index)
-}
-
-fn grid_item_intersects_row(item: &GridItemLayout, row_index: u16) -> bool {
-    item.area
-        .is_some_and(|area| grid_area_intersects_row(area, row_index))
-}
-
-fn grid_area_intersects_row(area: GridItemArea, row_index: u16) -> bool {
-    area.row_start <= row_index && row_index < area.row_end
 }
 
 fn grid_item_border_box_baseline(
@@ -4072,6 +5274,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn static_pdf_grid_overlay_keeps_track_and_outer_sizes_identical() {
+        let mut style = ComputedStyle::initial();
+        style.overflow_x = css::Overflow::Scroll;
+        style.overflow_y = css::Overflow::Scroll;
+        let reservation = grid_scrollbar_reservation(&style);
+
+        assert_eq!(
+            grid_scrollport_content_width(
+                PhysicalContentWidth::new(content_box_pt(100.0)),
+                reservation,
+            )
+            .points(),
+            100.0,
+        );
+        assert_eq!(
+            grid_scrollport_content_height_basis(
+                Some(PhysicalContentHeight::new(content_box_pt(100.0))),
+                reservation,
+            )
+            .unwrap()
+            .points(),
+            100.0,
+        );
+        assert_eq!(
+            grid_total_content_height(
+                PhysicalContentHeight::new(content_box_pt(100.0)),
+                None,
+                reservation,
+            )
+            .points(),
+            100.0,
+        );
+        assert_eq!(
+            grid_total_content_height(
+                PhysicalContentHeight::new(content_box_pt(85.0)),
+                Some(PhysicalContentHeight::new(content_box_pt(100.0))),
+                reservation,
+            )
+            .points(),
+            100.0,
+        );
+    }
+
+    #[test]
     fn typed_physical_height_drives_percentage_gap_relayout() {
         let gap =
             css::ComputedGap::LengthPercentage(css::ComputedLengthPercentage::from_percent(0.5));
@@ -4084,6 +5330,7 @@ mod tests {
     fn grid_layout_retains_a_physical_content_height() {
         let layout = GridLayout {
             height: PhysicalContentHeight::new(content_box_pt(60.0)),
+            baselines: PhysicalBaselineSets::default(),
             first_baseline: None,
             last_baseline: None,
             items: Vec::new(),
@@ -4091,6 +5338,10 @@ mod tests {
             gap_gutters: GapDecorationGridGutters::default(),
             column_line_offsets: Vec::new(),
             row_line_offsets: Vec::new(),
+            column_line_names: Vec::new(),
+            row_line_names: Vec::new(),
+            column_track_sizes: Vec::new(),
+            row_track_sizes: Vec::new(),
         };
 
         let _: PhysicalContentHeight = layout.height;
@@ -4142,6 +5393,91 @@ mod tests {
                 GridAvailableSizeSource::ContainerBlockSize,
             ),
         }
+    }
+
+    fn anonymous_grid_child_with_style(style: ComputedStyle) -> GridChild<'static> {
+        let source = FormattingContextChild {
+            kind: FormattingContextChildKind::AnonymousContent {
+                children: Vec::new(),
+            },
+            style: style.clone(),
+        };
+        let used_style = css::LayoutStyle::from_computed(&style).into_zoomed();
+        GridUsedItem::from_source(source, used_style)
+    }
+
+    #[test]
+    fn final_grid_area_resolves_mixed_percentage_sizes_before_constraints() {
+        let mut style = ComputedStyle::initial();
+        style.box_values.width = css::ComputedLengthPercentageOrAuto::LengthPercentage(
+            css::ComputedLengthPercentage::from_affine(layout_pt(2.0), 1.0, true),
+        );
+        style.box_values.min_width = css::ComputedLengthPercentageOrAuto::LengthPercentage(
+            css::ComputedLengthPercentage::from_percent(0.5),
+        );
+        style.box_values.max_width = css::ComputedLengthPercentageOrAuto::LengthPercentage(
+            css::ComputedLengthPercentage::from_percent(0.75),
+        );
+        let child = anonymous_grid_child_with_style(style);
+        let item = GridItemLayout::new(
+            GridRect::new(GridPoint::new(0.0, 0.0), GridSize::new(10.0, 10.0)),
+            None,
+        );
+
+        let size = resolve_grid_item_final_percentage_size(
+            &child,
+            &GridItemEstimate::fixed(10.0, 10.0),
+            &item,
+            100.0,
+            80.0,
+            PhysicalContentWidth::new(content_box_pt(100.0)),
+        );
+
+        // `calc(2pt + 100%)` resolves to 102pt against the final area, then
+        // the final 75% maximum constrains the used border-box width.
+        assert_eq!(size.width.map(SemanticLengthExt::points), Some(75.0));
+        assert_eq!(size.height, None);
+    }
+
+    #[test]
+    fn flexible_track_span_zeros_only_the_automatic_grid_minimum() {
+        let mut container = ComputedStyle::initial();
+        container.grid_template_columns = grid_tracks(vec![track(
+            css::GridMinTrackBreadth::Auto,
+            css::GridMaxTrackBreadth::Flex(1.0),
+        )]);
+        let mut item = ComputedStyle::initial();
+        item.grid_column_start = css::GridPlacement::Line(css::GridLinePlacement::Number(
+            std::num::NonZeroI32::new(1).unwrap(),
+        ));
+        item.grid_column_end = css::GridPlacement::Span(css::GridSpanPlacement::Count(
+            std::num::NonZeroU16::new(2).unwrap(),
+        ));
+
+        assert_eq!(
+            grid_item_taffy_min_dimension(
+                css::ComputedLengthPercentageOrAuto::Auto,
+                GridAxis::Column,
+                &container,
+                &item,
+                content_box_pt(20.0),
+                content_box_pt(40.0),
+            ),
+            taffy_layout::Dimension::length(0.0),
+        );
+        assert_eq!(
+            grid_item_taffy_min_dimension(
+                css::ComputedLengthPercentageOrAuto::LengthPercentage(
+                    css::ComputedLengthPercentage::from_points(12.0),
+                ),
+                GridAxis::Column,
+                &container,
+                &item,
+                content_box_pt(20.0),
+                content_box_pt(40.0),
+            ),
+            taffy_layout::Dimension::length(12.0),
+        );
     }
 
     #[test]
@@ -4274,5 +5610,96 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn baseline_test_item(area: GridItemArea, y: f32, height: f32) -> GridItemLayout {
+        GridItemLayout::new(
+            GridRect::new(GridPoint::new(0.0, y), GridSize::new(20.0, height)),
+            Some(area),
+        )
+    }
+
+    fn baseline_test_resolution(baseline_set: GridBaselineSet) -> GridBaselineResolution {
+        GridBaselineResolution {
+            row_self: GridBaselineParticipation::Shares(baseline_set),
+            column_self: GridBaselineParticipation::NotRequested,
+            row_content: GridBaselineParticipation::NotRequested,
+            column_content: GridBaselineParticipation::NotRequested,
+        }
+    }
+
+    #[test]
+    fn baseline_shims_equalize_first_baselines_without_used_margins() {
+        let style = ComputedStyle::initial();
+        let items = vec![
+            baseline_test_item(
+                GridItemArea {
+                    row_start: 1,
+                    row_end: 2,
+                    column_start: 1,
+                    column_end: 2,
+                },
+                0.0,
+                30.0,
+            ),
+            baseline_test_item(
+                GridItemArea {
+                    row_start: 1,
+                    row_end: 2,
+                    column_start: 2,
+                    column_end: 3,
+                },
+                0.0,
+                30.0,
+            ),
+        ];
+        let mut first = GridItemEstimate::fixed(20.0, 30.0);
+        first.first_baseline = Some(8.0);
+        let mut second = GridItemEstimate::fixed(20.0, 30.0);
+        second.first_baseline = Some(14.0);
+        let plan = grid_baseline_plan(
+            &style,
+            &[],
+            &[first, second],
+            &[
+                baseline_test_resolution(GridBaselineSet::First),
+                baseline_test_resolution(GridBaselineSet::First),
+            ],
+            &items,
+        );
+
+        assert_eq!(plan.shim(0).unwrap().top, 6.0);
+        assert_eq!(plan.shim(1).unwrap().top, 0.0);
+        assert_eq!(plan.shim(0).unwrap().bottom, 0.0);
+    }
+
+    #[test]
+    fn grid_container_baseline_prefers_last_group_before_item_baseline() {
+        let style = ComputedStyle::initial();
+        let items = vec![baseline_test_item(
+            GridItemArea {
+                row_start: 1,
+                row_end: 2,
+                column_start: 1,
+                column_end: 2,
+            },
+            10.0,
+            30.0,
+        )];
+        let mut estimate = GridItemEstimate::fixed(20.0, 30.0);
+        estimate.first_baseline = Some(4.0);
+        estimate.last_baseline = Some(20.0);
+        let resolution = baseline_test_resolution(GridBaselineSet::Last);
+
+        assert_eq!(
+            grid_container_baseline(
+                &style,
+                &[estimate],
+                &[resolution],
+                &items,
+                GridBaselineSet::First,
+            ),
+            Some(30.0)
+        );
     }
 }

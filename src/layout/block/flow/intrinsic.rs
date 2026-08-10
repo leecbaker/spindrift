@@ -61,6 +61,53 @@ impl BlockIntrinsicContentSizes {
     }
 }
 
+/// Place a resolved physical border-box width in its normal-flow containing
+/// block's axes.
+///
+/// A vertical containing block's logical block axis is physical horizontal,
+/// so its children's resolved physical-width spans begin at the containing
+/// block's logical block-start edge. A horizontal containing block instead
+/// keeps the span produced by the ordinary horizontal width equation. In
+/// particular, an orthogonal vertical child must not select the right edge
+/// merely because its *own* block-start is right.
+///
+/// The span is deliberately typed as [`PageInlineSpan`]: this is the
+/// sizing-to-placement boundary where a child physical extent becomes a
+/// position in the containing block's physical coordinate system.
+/// <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
+fn normal_flow_border_box_inline_span_in_containing_axes(
+    containing_axes: FlowAxes,
+    containing_inline_span: PageInlineSpan,
+    resolved_border_box_inline_span: PageInlineSpan,
+    margin_left: f32,
+    margin_right: f32,
+    root_pseudo_projection: Option<RootPseudoBlockProjection>,
+) -> PageInlineSpan {
+    let Some((block_start, block_end_inset)) = root_pseudo_projection
+        .map(|projection| (projection.block_start, projection.block_end_inset.points()))
+        .or_else(|| {
+            containing_axes
+                .writing_mode()
+                .has_vertical_lines()
+                .then(|| (containing_axes.block_start_side(), 0.0))
+        })
+    else {
+        return resolved_border_box_inline_span;
+    };
+
+    let border_box_width = resolved_border_box_inline_span.width();
+    let start = match block_start {
+        PhysicalSide::Left => containing_inline_span.left_x() + margin_left,
+        PhysicalSide::Right => {
+            containing_inline_span.right_x() - margin_right - block_end_inset - border_box_width
+        }
+        PhysicalSide::Top | PhysicalSide::Bottom => {
+            unreachable!("a horizontal physical block axis must start at left or right")
+        }
+    };
+    PageInlineSpan::new(start, border_box_width)
+}
+
 impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn translate_aligned_block_descendant_bookmarks(
         &mut self,
@@ -934,40 +981,11 @@ impl<'a> LayoutBuilder<'a> {
             0.0,
             0.0,
         );
-        // A baseline-aligned atomic inline's block-start margin moves the
-        // whole line in the logical block direction.  Auto block sizing must
-        // use that placed line extent, rather than treating every line as if
-        // it started at the content edge.  This matters particularly for a
-        // vertical `vertical-rl` block: the shift is physical-leftward and
-        // must not make overflow at the logical block start widen the box.
-        // Paint applies the identical per-line placement in
-        // `prepare_inline_line_fragment`.
-        // <https://drafts.csswg.org/css-inline-3/#line-layout>
-        let mut block_cursor = 0.0;
-        let mut block_end = 0.0_f32;
-        for record in &sequence.records {
-            block_cursor += record.block_before;
-            let line_block_start_margin = record
-                .fragment
-                .as_ref()
-                .map(|fragment| {
-                    fragment
-                        .items()
-                        .iter()
-                        .filter_map(|item| match item.item.as_ref() {
-                            InlineLineItem::Atom(atom) => {
-                                Some(inline_atom_logical_block_start_margin(atom, style))
-                            }
-                            InlineLineItem::Fragment(_) | InlineLineItem::Float(_) => None,
-                        })
-                        .fold(0.0_f32, f32::max)
-                })
-                .unwrap_or(0.0);
-            let line_height = record.height();
-            block_end = block_end.max(block_cursor + line_height - line_block_start_margin);
-            block_cursor += line_height;
-        }
-        block_end.max(0.0)
+        // Atomic margin boxes already contribute their logical block size to
+        // the collected line metrics. Do not subtract the block-start margin
+        // again here: paint keeps the line-box anchor stable and applies the
+        // margin exactly once when placing the atom's border box.
+        sequence.total_height().max(0.0)
     }
 
     pub(in crate::layout) fn block_layout_geometry(
@@ -1249,64 +1267,27 @@ impl<'a> LayoutBuilder<'a> {
             self.containing_block_direction,
             true,
         );
-        // In a parallel vertical block flow, a physical width is the logical
-        // block size. Anchor its resolved border box at logical block-start.
-        // An auto-sized orthogonal horizontal child contributes its intrinsic
-        // physical width along the vertical parent's block axis, so its
-        // static position begins at that block-start edge. A specified
-        // physical width remains an ordinary horizontal block width and uses
-        // the normal static position instead.
+        // Sizing uses the child's logical axes, but static placement uses the
+        // containing block's axes. This is significant for an orthogonal
+        // vertical child of a horizontal block: its physical width is still
+        // placed by the horizontal containing block's width equation, not at
+        // the child's physical block-start edge.
         // <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
         let root_pseudo_projection = self
             .root_pseudo_block_projection
             .filter(|projection| projection.element == element.id);
-        if WritingModeAxes::new(style.writing_mode, style.direction).swaps_physical_axes()
-            && (root_pseudo_projection.is_some()
-                || !crate::layout::block::writing_modes_are_orthogonal(
+        if !matches!(used_style.position, Position::Absolute | Position::Fixed) {
+            width.border_box_inline_span = normal_flow_border_box_inline_span_in_containing_axes(
+                FlowAxes::new(
                     self.containing_block_writing_mode,
-                    style.writing_mode,
-                ))
-        {
-            let border_box_width = width.border_box_inline_span.width();
-            let block_start = root_pseudo_projection
-                .map(|projection| projection.block_start)
-                .unwrap_or_else(|| block_start_side(style.writing_mode));
-            let block_end_inset = root_pseudo_projection
-                .map(|projection| projection.block_end_inset.points())
-                .unwrap_or(0.0);
-            let start = match block_start {
-                PhysicalSide::Left => containing_inline_span.left_x() + used_style.margin.left,
-                PhysicalSide::Right => {
-                    containing_inline_span.right_x()
-                        - used_style.margin.right
-                        - block_end_inset
-                        - border_box_width
-                }
-                PhysicalSide::Top | PhysicalSide::Bottom => {
-                    unreachable!("a vertical writing mode must have a horizontal block axis")
-                }
-            };
-            width.border_box_inline_span = PageInlineSpan::new(start, border_box_width);
-        } else if !style.writing_mode.has_vertical_lines()
-            && self.containing_block_writing_mode.has_vertical_lines()
-        {
-            // The child's physical horizontal border-box span is the
-            // containing vertical flow's logical block span. Its static
-            // position therefore starts at the containing block's logical
-            // block-start edge, regardless of whether CSS `width` is `auto`
-            // or explicitly specified.
-            // <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
-            let border_box_width = width.border_box_inline_span.width();
-            let start = match block_start_side(self.containing_block_writing_mode) {
-                PhysicalSide::Left => containing_inline_span.left_x() + used_style.margin.left,
-                PhysicalSide::Right => {
-                    containing_inline_span.right_x() - used_style.margin.right - border_box_width
-                }
-                PhysicalSide::Top | PhysicalSide::Bottom => {
-                    unreachable!("a vertical containing block must have a horizontal block axis")
-                }
-            };
-            width.border_box_inline_span = PageInlineSpan::new(start, border_box_width);
+                    self.containing_block_direction,
+                ),
+                containing_inline_span,
+                width.border_box_inline_span,
+                used_style.margin.left,
+                used_style.margin.right,
+                root_pseudo_projection,
+            );
         }
         let mut content_width = width.content_width;
         let mut content_width_points = content_width.points();

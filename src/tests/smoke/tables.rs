@@ -4582,7 +4582,7 @@ async fn visibility_collapse_removes_table_column_space() {
             .collect::<Vec<_>>(),
         vec!["B"]
     );
-    assert!(lines[0].x() < RenderOptions::default().page_margins.left() + 1.0);
+    assert!(lines[0].x() < crate::layout::PageMargins::DEFAULT.left() + 1.0);
 }
 
 #[tokio::test]
@@ -4605,7 +4605,7 @@ async fn visibility_collapse_removes_table_column_group_span_space() {
             .collect::<Vec<_>>(),
         vec!["C"]
     );
-    assert!(lines[0].x() < RenderOptions::default().page_margins.left() + 1.0);
+    assert!(lines[0].x() < crate::layout::PageMargins::DEFAULT.left() + 1.0);
 }
 
 #[tokio::test]
@@ -4628,7 +4628,7 @@ async fn collapsed_table_column_group_overrides_visible_child_columns() {
             .collect::<Vec<_>>(),
         vec!["C"]
     );
-    assert!(lines[0].x() < RenderOptions::default().page_margins.left() + 1.0);
+    assert!(lines[0].x() < crate::layout::PageMargins::DEFAULT.left() + 1.0);
 }
 
 #[tokio::test]
@@ -4959,17 +4959,13 @@ async fn table_valign_presentational_hint_aligns_cell_content_by_default() {
 
 #[tokio::test]
 async fn author_css_overrides_table_valign_presentational_hint() {
-    let options = RenderOptions {
-        presentational_hints: true,
-        ..RenderOptions::default()
-    };
     let document = Html::from_string(
         "<style>td { vertical-align: top }</style>\
          <table cellpadding=\"0\" style=\"margin:0;width:60pt;border-spacing:0;font-size:10pt;line-height:10pt\">\
          <tr style=\"height:40pt\"><td valign=\"bottom\" style=\"width:30pt\">Hint</td><td style=\"width:30pt\">Author</td></tr>\
          </table>",
     )
-    .render(&options).await
+    .render(&RenderOptions::default()).await
     .unwrap();
 
     let hinted = document.pages[0]
@@ -4988,10 +4984,6 @@ async fn author_css_overrides_table_valign_presentational_hint() {
 
 #[tokio::test]
 async fn table_rules_groups_presentational_hint_paints_group_borders() {
-    let options = RenderOptions {
-        presentational_hints: true,
-        ..RenderOptions::default()
-    };
     let document = Html::from_string(
         "<style>\
          @page { size: 240pt 260pt; margin: 10pt }\
@@ -5004,7 +4996,7 @@ async fn table_rules_groups_presentational_hint_paints_group_borders() {
          <table id=\"b\" rules=\"groups\"><thead><tr><td>head</td></tr></thead><tbody><tr><td>body</td><td>one</td></tr><tr><td>body</td><td>two</td></tr></tbody><tfoot><tr><td>foot</td></tr></tfoot></table>\
          <table id=\"c\" rules=\"groups\"><thead><tr><td>head</td></tr></thead><tbody><tr><td>body</td><td>one</td></tr><tr><td>body</td><td>two</td></tr></tbody><tfoot><tr><td>foot</td></tr></tfoot></table>",
     )
-    .render(&options).await
+    .render(&RenderOptions::default()).await
     .unwrap();
 
     let thin_gray = document.pages[0]
@@ -5108,6 +5100,71 @@ async fn page_break_inside_avoid_tbody_relaxes_at_a_cell_boundary_when_edge_spac
         .collect::<Vec<_>>();
     assert_eq!(document.pages.len(), 3, "{page_texts:?}");
     assert_eq!(page_texts, vec![vec!["1"], vec!["2"], vec!["3"]]);
+
+    let reference = Html::from_string(
+        "<!DOCTYPE html>\
+         <html lang=\"en-US\"><head>\
+         <style type=\"text/css\">\
+         @page { size:5in 3in; margin:0.5in; }\
+         p { height: 1in; width: 1in; margin:0; background-color:blue; }\
+         </style></head><body>\
+         <p style=\"page-break-after:always\">1</p>\
+         <table><tr><td><p>2</p><p>3</p></td></tr></table>\
+         </body></html>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let blue = CssColor::new(0, 0, 255);
+    let actual_first_table_block = largest_filled_rect(&document.pages[1], blue);
+    let reference_first_table_block = largest_filled_rect(&reference.pages[1], blue);
+    assert!(
+        (actual_first_table_block.y() - reference_first_table_block.y()).abs() < 0.01,
+        "continuation must retain the separated-border leading edge spacing: actual={actual_first_table_block:?}, reference={reference_first_table_block:?}"
+    );
+}
+
+#[tokio::test]
+async fn separated_table_continuation_applies_leading_edge_spacing_before_repeated_header() {
+    let actual = Html::from_string(
+        "<style>@page { size: 120pt 96pt; margin: 12pt }\
+         body, table, td, div, p { margin: 0; padding: 0 }\
+         table { border-spacing: 6pt }\
+         p { width: 20pt; color: transparent }\
+         .before { height: 40pt } .header { height: 10pt; background: red }\
+         .body { height: 30pt; background: blue }</style>\
+         <div class=\"before\"></div>\
+         <table><thead><tr><td><p class=\"header\">H</p></td></tr></thead>\
+         <tbody><tr><td><p class=\"body\">B</p></td></tr></tbody></table>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+    let reference = Html::from_string(
+        "<style>@page { size: 120pt 96pt; margin: 12pt }\
+         body, table, td, div, p { margin: 0; padding: 0 }\
+         table { border-spacing: 6pt }\
+         p { width: 20pt; color: transparent }\
+         .before { height: 40pt; page-break-after: always }\
+         .header { height: 10pt; background: red } .body { height: 30pt; background: blue }</style>\
+         <div class=\"before\"></div>\
+         <table><thead><tr><td><p class=\"header\">H</p></td></tr></thead>\
+         <tbody><tr><td><p class=\"body\">B</p></td></tr></tbody></table>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(actual.pages.len(), 2);
+    assert_eq!(reference.pages.len(), 2);
+    let red = CssColor::new(255, 0, 0);
+    let actual_header = largest_filled_rect(&actual.pages[1], red);
+    let reference_header = largest_filled_rect(&reference.pages[1], red);
+    assert!(
+        (actual_header.y() - reference_header.y()).abs() < 0.01,
+        "repeated header must start after exactly one separated-border edge spacing: actual={actual_header:?}, reference={reference_header:?}"
+    );
 }
 
 #[tokio::test]
@@ -6613,7 +6670,7 @@ async fn honors_table_border_spacing_between_columns() {
             .map(|line| (line.text.as_str(), line.x()))
             .collect::<Vec<_>>()
     );
-    let expected_first_text_x = RenderOptions::default().page_margins.left() + 5.0;
+    let expected_first_text_x = crate::layout::PageMargins::DEFAULT.left() + 5.0;
     assert!(
         (lines[0].x() - expected_first_text_x).abs() < 0.01,
         "expected first text x {expected_first_text_x}, got {}",

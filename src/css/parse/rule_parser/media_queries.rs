@@ -275,6 +275,21 @@ fn media_feature_evaluation(
             "none" => matches_media_value(!media_environment.forced_colors.is_active()),
             _ => MediaQueryEvaluation::Invalid,
         },
+        "prefers-color-scheme" => match value.as_str() {
+            "light" => matches_media_value(matches!(
+                media_environment
+                    .color_scheme_preference
+                    .media_query_scheme(),
+                crate::css::UsedColorScheme::Light
+            )),
+            "dark" => matches_media_value(matches!(
+                media_environment
+                    .color_scheme_preference
+                    .media_query_scheme(),
+                crate::css::UsedColorScheme::Dark
+            )),
+            _ => MediaQueryEvaluation::Invalid,
+        },
         "orientation" => match value.as_str() {
             "portrait" => matches_media_value(
                 media_environment.viewport.height >= media_environment.viewport.width,

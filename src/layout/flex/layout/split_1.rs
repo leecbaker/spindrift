@@ -63,6 +63,20 @@ pub(in crate::layout::flex) struct PositionedFlexStaticContext<'a> {
     pub(in crate::layout::flex) first_fragment_source_block_size: FlexFragmentBlockSize,
 }
 
+/// Selects whether flex-item replay represents one normal-flow container or
+/// an actual fragmentainer slice.
+///
+/// Keeping this distinct from the boundary coordinates prevents an
+/// unfragmented wrapped physical column from being mistaken for a sequence of
+/// page fragments merely because its independent lines overlap on the page
+/// block axis.
+/// <https://www.w3.org/TR/css-flexbox-1/#pagination>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout::flex) enum FlexReplayTopology {
+    Unfragmented,
+    Fragmented,
+}
+
 /// One flex fragmentation boundary in the physical block direction.
 ///
 /// CSS Flexbox fragments row containers by flex line and column containers by
@@ -70,6 +84,7 @@ pub(in crate::layout::flex) struct PositionedFlexStaticContext<'a> {
 /// <https://www.w3.org/TR/css-flexbox-1/#pagination>.
 #[derive(Debug, Clone)]
 pub(in crate::layout::flex) struct FlexBreakUnit {
+    pub(in crate::layout::flex) topology: FlexReplayTopology,
     pub(in crate::layout::flex) item_indices: Vec<usize>,
     pub(in crate::layout::flex) line_start: usize,
     pub(in crate::layout::flex) line_end: usize,
@@ -91,6 +106,7 @@ impl FlexBreakUnit {
         block_end: FlexFragmentBlockOffset,
     ) -> Self {
         Self {
+            topology: self.topology,
             item_indices: self.item_indices.clone(),
             line_start: self.line_start,
             line_end: self.line_end,
@@ -856,6 +872,7 @@ mod tests {
         let horizontal_row = ComputedStyle::initial();
         let line = FlexLineLayout {
             item_indices: vec![0],
+            logical_cross_start_rank: 0,
             source_start: 0,
             source_end: 1,
             main_start: FlexMainOffset::new(0.0),

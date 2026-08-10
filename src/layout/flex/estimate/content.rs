@@ -186,7 +186,7 @@ impl<'a> LayoutBuilder<'a> {
         let Some((element, signature, child_boxes)) = child.element_parts() else {
             return inline_contribution;
         };
-        if child.style.display.is_table() && !child.style.box_values.min_width.is_auto() {
+        if child.style.display.is_table() {
             return self.with_ancestor_signature(signature.clone(), |layout| {
                 let built_child_boxes;
                 let child_boxes = if let Some(child_boxes) = child_boxes {
@@ -201,15 +201,13 @@ impl<'a> LayoutBuilder<'a> {
                 };
                 let fragment =
                     box_tree::build_frozen_table_fragment(element, signature, child_boxes);
-                // A table with an authored minimum still has the table grid's
-                // min-content floor. Its preferred `width` participates
-                // separately in flex-basis/main-size resolution; treating it
-                // as the content-based automatic minimum would prevent a
-                // `flex-basis` from shrinking a table with (for example)
-                // `width: 500px`.
+                // A table wrapper exposes the grid's min-content floor and
+                // independent max-content contribution to intrinsic flex
+                // sizing. Generic block measurement only sees the first
+                // available table-cell contribution.
                 // <https://drafts.csswg.org/css-tables/#used-min-width-of-table>
-                // <https://drafts.csswg.org/css-flexbox-1/#min-size-auto>
-                let (min_content, max_content) = layout.table_intrinsic_widths_from_fragment(
+                // <https://drafts.csswg.org/css-flexbox-1/#intrinsic-main-sizes>
+                let sizing = layout.table_wrapper_flex_sizing_from_fragment(
                     element,
                     &child.style,
                     stylesheets,
@@ -217,8 +215,8 @@ impl<'a> LayoutBuilder<'a> {
                     containing_inline_size.points(),
                 );
                 inline_layout::InlineIntrinsicContribution::new(
-                    LogicalInlineContentSize::new(content_box_pt(min_content)),
-                    LogicalInlineContentSize::new(content_box_pt(max_content)),
+                    sizing.grid_min_content_inline,
+                    sizing.grid_max_content_inline,
                 )
             });
         }
@@ -688,25 +686,44 @@ impl<'a> LayoutBuilder<'a> {
         }
 
         let mut measured_style = style.clone();
+        // Fragmentation transitions do not contribute to a flex item's
+        // hypothetical cross size.  The Flexbox sizing algorithm measures the
+        // item's normal-flow used size before its later pagination replay
+        // honors `break-before`/`break-after`; retaining a forced transition
+        // here would turn one page area into intrinsic content height and
+        // inflate every line containing the item.
+        // <https://www.w3.org/TR/css-flexbox-1/#algo-cross-item>
+        // <https://www.w3.org/TR/css-break-3/#breaking-controls>
+        measured_style.break_before = PageBreak::Auto;
+        measured_style.break_after = PageBreak::Auto;
         if flow_root_measurement {
             measured_style.display.inner = DisplayInner::FlowRoot;
         }
+        // The probe returns the item's content-box block size, while flex
+        // line sizing adds the item's cross-axis margins separately. Keep the
+        // original margins out of this surrogate measurement; otherwise the
+        // block layout cursor consumes them and reports an outer height as a
+        // content height, causing every later line remeasurement to add them
+        // a second time.
+        // <https://www.w3.org/TR/css-flexbox-1/#algo-cross-line> and
+        // <https://www.w3.org/TR/css-box-3/#margin-terms>.
+        measured_style.margin = css::Edges::ZERO;
+        measured_style.box_values.margin =
+            css::CssEdges::all(css::ComputedLengthPercentageOrAuto::ZERO);
+        // `content_width` is a used flex-item content-box width. Freeze it
+        // on the measurement surrogate before using that same width as its
+        // containing block; otherwise an authored percentage width would be
+        // resolved again against itself during the probe.
+        // <https://www.w3.org/TR/css-flexbox-1/#algo-cross-item>
+        // <https://www.w3.org/TR/css-sizing-3/#percentage-sizing>
+        set_style_used_width(&mut measured_style, content_width.points());
+        measured_style.box_sizing = BoxSizing::ContentBox;
         // `measure_auto_positioned_block_height` establishes the supplied
-        // width as this box's containing block.  `content_width` instead is
-        // the already-resolved content-box width of this flex item, so pass
-        // its border-box width at that boundary.  Otherwise re-entered block
-        // layout subtracts the item's padding and border a second time and a
-        // row of floats can spuriously wrap while deriving the flex cross
-        // size.
+        // width as this box's containing block. `content_width` is also the
+        // already-resolved content-box width of this measurement surrogate.
         // <https://www.w3.org/TR/css-box-3/#box-model>
         let measurement_space = PositionedAutoBlockMeasurementSpace {
-            content_width: PhysicalContentWidth::new(content_box_pt(
-                (content_width.points()
-                    + style.padding.left
-                    + style.padding.right
-                    + horizontal_border_width(style))
-                .max(0.0),
-            )),
+            content_width,
             available_physical_height: self
                 .current_child_available_space()
                 .available_physical_height(),

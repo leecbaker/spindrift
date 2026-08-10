@@ -4,7 +4,7 @@ use super::geometry::{PaintClip, PaintRect, PaintTransform, PaintTranslation};
 
 /// A resolved document link annotation in page-local PDF-point coordinates.
 #[derive(Debug, Clone, PartialEq)]
-pub struct LinkAnnotation {
+pub(crate) struct LinkAnnotation {
     pub(crate) rect: PaintRect,
     pub(crate) target: Rc<str>,
 }
@@ -18,62 +18,23 @@ impl LinkAnnotation {
     }
 
     /// Returns the link rectangle's horizontal position in PDF points.
-    ///
-    /// ```no_run
-    /// # fn inspect(link: &quire::LinkAnnotation) {
-    /// let x = link.x();
-    /// # let _ = x;
-    /// # }
-    /// ```
-    pub fn x(&self) -> f32 {
+    pub(crate) fn x(&self) -> f32 {
         self.rect.origin.x
     }
 
     /// Returns the link rectangle's vertical position in PDF points.
-    ///
-    /// ```no_run
-    /// # fn inspect(link: &quire::LinkAnnotation) {
-    /// let y = link.y();
-    /// # let _ = y;
-    /// # }
-    /// ```
-    pub fn y(&self) -> f32 {
+    pub(crate) fn y(&self) -> f32 {
         self.rect.origin.y
     }
 
     /// Returns the link rectangle's width in PDF points.
-    ///
-    /// ```no_run
-    /// # fn inspect(link: &quire::LinkAnnotation) {
-    /// let width = link.width();
-    /// # let _ = width;
-    /// # }
-    /// ```
-    pub fn width(&self) -> f32 {
+    pub(crate) fn width(&self) -> f32 {
         self.rect.size.width
     }
 
     /// Returns the link rectangle's height in PDF points.
-    ///
-    /// ```no_run
-    /// # fn inspect(link: &quire::LinkAnnotation) {
-    /// let height = link.height();
-    /// # let _ = height;
-    /// # }
-    /// ```
-    pub fn height(&self) -> f32 {
+    pub(crate) fn height(&self) -> f32 {
         self.rect.size.height
-    }
-
-    /// Returns the resolved external URL or internal fragment target.
-    ///
-    /// ```no_run
-    /// # fn inspect(link: &quire::LinkAnnotation) {
-    /// assert!(!link.target().is_empty());
-    /// # }
-    /// ```
-    pub fn target(&self) -> &str {
-        &self.target
     }
 
     pub(crate) fn paint_rect(&self) -> PaintRect {
@@ -88,6 +49,15 @@ impl LinkAnnotation {
     pub(in crate::document) fn transformed(&self, transform: PaintTransform) -> Self {
         let clip = transform.apply_clip_to_aabb(PaintClip::from_paint_rect(self.rect));
         Self::from_paint_rect(clip.paint_rect(), Rc::clone(&self.target))
+    }
+
+    /// Restrict an annotation to visible page-local paint before it is handed
+    /// to the PDF backend. Scene-plane fragments may replay one source link
+    /// under several disjoint clips; each retained fragment must contribute
+    /// only its visible rectangle.
+    pub(in crate::document) fn clipped_to(self, clip: PaintClip) -> Option<Self> {
+        let clipped = PaintClip::from_paint_rect(self.rect).intersect(clip)?;
+        Some(Self::from_paint_rect(clipped.paint_rect(), self.target))
     }
 }
 

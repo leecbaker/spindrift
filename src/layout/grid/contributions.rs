@@ -1,3 +1,4 @@
+use super::lanes::{GridLanesItemPlacement, grid_lanes_item_placement};
 use super::*;
 
 /// An intrinsic descendant contribution projected into an enclosing parent
@@ -42,6 +43,34 @@ impl ContributionEdges {
 }
 
 impl SubgridContribution {
+    /// Whether this proxy can affect an inherited parent track.
+    ///
+    /// A zero contribution is not a Grid item and must not trigger the
+    /// sizing replay that introduces a proxy leaf into placement. This is
+    /// especially important for a standalone axis whose descendant has no
+    /// intrinsic size in the other, inherited axis.
+    fn affects_inherited_track_sizing(&self) -> bool {
+        const EPSILON: f32 = 0.01;
+        let column_size = self
+            .estimate
+            .metrics
+            .width
+            .points()
+            .max(self.estimate.metrics.min_width.points())
+            .max(self.estimate.metrics.content_width.points())
+            + self.column_edges.total();
+        let row_size = self
+            .estimate
+            .metrics
+            .height
+            .points()
+            .max(self.estimate.metrics.min_height.points())
+            .max(self.estimate.metrics.content_height.points())
+            + self.row_edges.total();
+        (self.contributes_columns && column_size > EPSILON)
+            || (self.contributes_rows && row_size > EPSILON)
+    }
+
     fn merge(&mut self, other: GridItemEstimate) {
         self.estimate.metrics.width = self.estimate.metrics.width.max(other.metrics.width);
         self.estimate.metrics.height = self.estimate.metrics.height.max(other.metrics.height);
@@ -102,6 +131,43 @@ struct ContributionProjection {
     contributes_rows: bool,
     column_edges: ContributionEdges,
     row_edges: ContributionEdges,
+}
+
+/// An automatic Grid Lanes subgrid has no known final parent range while
+/// intrinsic tracks are sized. Its descendants therefore contribute through a
+/// virtual copy of every parent span the subgrid could occupy.
+/// <https://drafts.csswg.org/css-grid-3/#subgrid-item-contributions>
+fn grid_lanes_subgrid_contribution_areas(
+    layout: &GridLayout,
+    fallback: GridItemArea,
+    placement: Option<GridLanesItemPlacement>,
+) -> Vec<GridItemArea> {
+    let Some(GridLanesItemPlacement::Automatic { grid_axis, span }) = placement else {
+        return vec![fallback];
+    };
+    let track_count = layout.physical_track_sizes(grid_axis).len();
+    let span = span.min(track_count);
+    if span == 0 {
+        return vec![fallback];
+    }
+    (0..=track_count - span)
+        .map(|start| {
+            let start = u16::try_from(start.saturating_add(1)).unwrap_or(u16::MAX);
+            let end = start.saturating_add(u16::try_from(span).unwrap_or(u16::MAX));
+            match grid_axis {
+                GridAxis::Column => GridItemArea {
+                    column_start: start,
+                    column_end: end,
+                    ..fallback
+                },
+                GridAxis::Row => GridItemArea {
+                    row_start: start,
+                    row_end: end,
+                    ..fallback
+                },
+            }
+        })
+        .collect()
 }
 
 impl ContributionProjection {
@@ -167,36 +233,42 @@ impl<'a> LayoutBuilder<'a> {
             }) {
                 continue;
             }
-            let Some(context) = ResolvedSubgridContext::from_parent(
-                parent_style,
-                preliminary,
-                &child.style,
-                parent_area,
-            ) else {
-                continue;
-            };
+            let placement = grid_lanes_item_placement(parent_style, child);
             let (column_edges, row_edges) = subgrid_box_edges(&child.style);
-            self.collect_subgrid_contributions_from_context(
-                child,
-                context,
-                ContributionProjection {
-                    area: parent_area,
-                    contributes_columns: matches!(
-                        child.style.grid_template_columns,
-                        css::GridTrackList::Subgrid { .. }
-                    ),
-                    contributes_rows: matches!(
-                        child.style.grid_template_rows,
-                        css::GridTrackList::Subgrid { .. }
-                    ),
-                    column_edges,
-                    row_edges,
-                },
-                stylesheets,
-                parent_item.width().max(0.0),
-                parent_item.height().max(0.0),
-                &mut contributions,
-            );
+            for parent_area in
+                grid_lanes_subgrid_contribution_areas(preliminary, parent_area, placement)
+            {
+                let Some(context) = ResolvedSubgridContext::from_parent(
+                    parent_style,
+                    preliminary,
+                    &child.style,
+                    parent_area,
+                    placement,
+                ) else {
+                    continue;
+                };
+                self.collect_subgrid_contributions_from_context(
+                    child,
+                    context,
+                    ContributionProjection {
+                        area: parent_area,
+                        contributes_columns: matches!(
+                            child.style.grid_template_columns,
+                            css::GridTrackList::Subgrid { .. }
+                        ),
+                        contributes_rows: matches!(
+                            child.style.grid_template_rows,
+                            css::GridTrackList::Subgrid { .. }
+                        ),
+                        column_edges,
+                        row_edges,
+                    },
+                    stylesheets,
+                    parent_item.width().max(0.0),
+                    parent_item.height().max(0.0),
+                    &mut contributions,
+                );
+            }
         }
         merge_subgrid_contributions(contributions)
     }
@@ -265,6 +337,7 @@ impl<'a> LayoutBuilder<'a> {
                 &child_layout,
                 &grandchild.style,
                 area,
+                item.grid_lanes_placement(),
             ) {
                 let nested_projection = projection.nested(area, &nested_context, &grandchild.style);
                 // A nested grid which is standalone in one root-shared axis
@@ -385,6 +458,9 @@ fn merge_subgrid_contributions(
         }
     }
     merged
+        .into_iter()
+        .filter(SubgridContribution::affects_inherited_track_sizing)
+        .collect()
 }
 
 #[cfg(test)]
@@ -455,6 +531,29 @@ mod tests {
             },
         ]);
         assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn discards_a_zero_contribution_in_the_inherited_axis() {
+        let area = GridItemArea {
+            row_start: 1,
+            row_end: 2,
+            column_start: 1,
+            column_end: 2,
+        };
+        let merged = merge_subgrid_contributions(vec![SubgridContribution {
+            area,
+            // A standalone inline contribution does not size an inherited
+            // row; retaining it as a proxy would incorrectly affect parent
+            // placement without changing track sizing.
+            estimate: GridItemEstimate::fixed(100.0, 0.0),
+            contributes_columns: false,
+            contributes_rows: true,
+            column_edges: ContributionEdges::default(),
+            row_edges: ContributionEdges::default(),
+            swaps_physical_axes: false,
+        }]);
+        assert!(merged.is_empty());
     }
 
     #[test]

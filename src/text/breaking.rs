@@ -1124,6 +1124,7 @@ pub(crate) fn contains_bidi_text(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::css::ContentLanguage;
 
     #[test]
     fn loose_cjk_hyphen_breaks_follow_the_content_writing_system() {
@@ -1132,7 +1133,7 @@ mod tests {
         for language in ["ja", "zh", "en-Hrkt", "ko-Hani"] {
             let mut style = ComputedStyle::initial();
             style.line_break = CssLineBreak::Loose;
-            style.language = Some(language.to_string());
+            style.language = ContentLanguage::from_html_attribute(language);
             assert!(
                 measured_break_opportunities(text, &style).contains(&wave_dash_boundary),
                 "{language} must allow a loose break before U+301C"
@@ -1141,7 +1142,9 @@ mod tests {
         for language in [None, Some("en"), Some("ko-Hang"), Some("ja-Hang")] {
             let mut style = ComputedStyle::initial();
             style.line_break = CssLineBreak::Loose;
-            style.language = language.map(str::to_string);
+            style.language = language
+                .map(ContentLanguage::from_html_attribute)
+                .unwrap_or(ContentLanguage::Unknown);
             assert!(
                 !measured_break_opportunities(text, &style).contains(&wave_dash_boundary),
                 "{language:?} must not allow a loose break before U+301C"
@@ -1156,6 +1159,26 @@ mod tests {
         assert_eq!(
             measured_break_opportunities("　XX　　XX", &style),
             [3, 8, 11, 13]
+        );
+    }
+
+    #[test]
+    fn narrow_no_break_space_keeps_french_punctuation_glue() {
+        let style = ComputedStyle::initial();
+        for text in ["moi\u{202f}?", "Mince\u{202f}!"] {
+            let breaks = measured_break_opportunities(text, &style);
+            let before_glue = text.find('\u{202f}').expect("test contains U+202F");
+            let after_glue = before_glue + '\u{202f}'.len_utf8();
+            assert!(
+                !breaks.contains(&before_glue) && !breaks.contains(&after_glue),
+                "ordinary UAX #14 wrapping must keep {text:?} together: {breaks:?}"
+            );
+        }
+
+        let text = "mot \u{202f}?";
+        assert!(
+            measured_break_opportunities(text, &style).contains(&"mot ".len()),
+            "LB12a retains the ordinary break after a regular space before GL"
         );
     }
 

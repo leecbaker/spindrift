@@ -823,7 +823,7 @@ fn resolve_image_float_area(
             height,
         );
     }
-    let threshold = (style.shape_image_threshold * 255.0).round() as u8;
+    let threshold = (style.shape_image_threshold.value() * 255.0).round() as u8;
     let shape_margin = resolve_shape_margin(style, containing_inline_size);
     // The alpha source is sized to the content box, but the resulting shape
     // (including `shape-margin`) is clipped by the float's margin box. A

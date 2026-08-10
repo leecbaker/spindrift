@@ -218,6 +218,16 @@ impl<'a> LayoutBuilder<'a> {
         self.content_left = content_left;
         self.content_right = content_left + content_width;
         self.cursor_y = content_top;
+        // A query container exposes its content box to descendants.
+        // Scrollbar gutters define the scrollport used for clipping and
+        // scrolling, but do not change the content-box percentage basis from
+        // which container-relative lengths are resolved.
+        // <https://drafts.csswg.org/css-conditional-5/#container-lengths>
+        let container_unit_scope = self.push_container_unit_context(
+            style,
+            PhysicalContentWidth::new(content_box_pt(content_width)),
+            PhysicalContentHeight::new(content_box_pt(definite_content_height.unwrap_or(0.0))),
+        );
         // Atomic inline boxes establish an independent formatting context, so
         // their descendants never pass through the normal block-flow scroll
         // capture boundary. Keep the static scroll scope here instead.
@@ -540,7 +550,7 @@ impl<'a> LayoutBuilder<'a> {
             border_box_height,
         )
         .paint_clip();
-        let border_bottom = border_box.y();
+        let scratch_border_box_origin = PaintPoint::new(border_box.x(), border_box.y());
         let scroll_padding_box = paint_space_rect(
             borders.left,
             border_box.y() + borders.bottom,
@@ -564,8 +574,7 @@ impl<'a> LayoutBuilder<'a> {
         // descendants below, not to that decoration.
         // <https://www.w3.org/TR/css-overflow-3/#overflow-clipping>
         if static_scroll_snap_scope {
-            policy.effects.overflow_clip = None;
-            policy.effects.rounded_overflow_clip = None;
+            policy.effects.clear_overflow_clip_effects();
         }
         let escaped_positioned_layers =
             if matches!(policy.child_layer_policy, ChildLayerPolicy::EscapeAll)
@@ -590,61 +599,70 @@ impl<'a> LayoutBuilder<'a> {
                 style,
             ));
         }
-        // Atomic inline fragments are normalized from their temporary page
-        // into atom-local coordinates before inline painting replays them.
-        // The overflow effect must be created in that same coordinate space;
-        // otherwise its clip remains at the temporary page's 10,000pt origin.
-        let local_scroll_padding_box =
-            scroll_padding_box.translate(PaintTranslation::new(0.0, -border_bottom).into());
-        let mut fragment = fragment.translated(PaintTranslation::new(0.0, -border_bottom));
+        // Keep raw scratch paint and its border-box-to-border-box bridge
+        // together. Outer margins are already resolved by the parent line.
+        let replay_coordinates =
+            AtomicInlineCaptureFrame::for_scratch_border_box(scratch_border_box_origin)
+                .replay_coordinates();
         if static_scroll_snap_scope {
-            // Descendant block backgrounds occupy the captured fragment's
-            // background band until atomic-inline paint is replayed. Promote
-            // them to their normal-flow slot before applying the contents
-            // clip; the atom's own decoration is emitted after restoration.
-            fragment.promote_background_border_to_in_flow_block();
-            let overflow_clip = PaintClip::from_paint_rect(local_scroll_padding_box);
-            fragment = fragment
-                .with_primitives_clipped_to_rect_preserving_structure(overflow_clip)
-                .with_effect_scoped_to_rect_all_bands(overflow_clip);
+            let overflow_clip = PaintClip::from_paint_rect(scroll_padding_box);
+            // The atomic principal's border and background are replayed as
+            // its own decoration, not scrolling contents. Scope only the
+            // captured descendant bands so an overflow clip cannot trim the
+            // scroll container's blue border.
+            // <https://www.w3.org/TR/css-overflow-3/#overflow-clipping>
+            fragment = fragment.with_contents_effect_scoped_to_rect(overflow_clip);
         }
-        let escaped_positioned_layers = escaped_positioned_layers
-            .into_iter()
-            .chain(
-                escaped_normal_flow_contexts
-                    .into_iter()
-                    .map(|context| PositionedPaintLayer {
+        let escaped_positioned_layers =
+            escaped_positioned_layers
+                .into_iter()
+                .chain(escaped_normal_flow_contexts.into_iter().map(|context| {
+                    PositionedPaintLayer {
                         page_index: self.pages.len(),
+                        transaction_depth: self.positioned_paint_transaction_depth,
                         source_element: None,
                         source_style: style.as_computed().clone(),
+                        source_style_identity: style.as_computed() as *const ComputedStyle as usize,
+                        multicol_fragment_index: None,
                         source_is_target: false,
                         stack_level: context.stack_level,
                         context,
                         links: Vec::new(),
                         escaped_atom_translation: EscapedAtomTranslation::normal_flow_fragment(),
-                    }),
-            )
-            .map(|layer| {
-                let escape_offset = layer.escaped_atom_translation.escape_offset(-border_bottom);
-                layer.translated(escape_offset)
-            })
-            .collect::<Vec<_>>();
+                    }
+                }))
+                .map(|layer| {
+                    let escape_offset = layer
+                        .escaped_atom_translation
+                        .escape_offset(-scratch_border_box_origin.y);
+                    layer.translated(escape_offset)
+                })
+                .collect::<Vec<_>>();
         let escaped_positioned_layers = (!escaped_positioned_layers.is_empty())
             .then(|| escaped_positioned_layers.into_boxed_slice());
-        let line_baseline_offset = multicol_outcome
-            .and_then(|outcome| outcome.final_in_flow_baseline())
-            .filter(|_| !containment.is_some_and(|effects| effects.layout))
-            .map(|baseline| borders.top + style.padding.top + baseline.points())
-            .or_else(|| {
-                self.last_in_flow_line_baseline_y
-                    .map(|baseline_y| (top - baseline_y).max(0.0))
-            });
+        // Layout containment suppresses all descendant baseline sources, not
+        // only multicolumn's committed baseline. In particular, the captured
+        // atomic flow's last line must not be reintroduced through the
+        // `last_in_flow_line_baseline_y` fallback.
+        // <https://www.w3.org/TR/css-contain-1/#containment-layout>
+        let line_baseline_offset = (!containment.is_some_and(|effects| effects.layout))
+            .then(|| {
+                multicol_outcome
+                    .and_then(|outcome| outcome.final_in_flow_baseline())
+                    .map(|baseline| borders.top + style.padding.top + baseline.points())
+                    .or_else(|| {
+                        self.last_in_flow_line_baseline_y
+                            .map(|baseline_y| (top - baseline_y).max(0.0))
+                    })
+            })
+            .flatten();
         let baseline_offset = Self::inline_block_baseline_offset_with_containment(
             style,
             containment.is_some_and(|effects| effects.layout),
             border_box_height,
             line_baseline_offset,
         );
+        self.pop_container_unit_context(container_unit_scope);
         self.restore(snapshot);
         self.pending_outside_marker_anchors = pending_outside_marker_anchors;
 
@@ -658,7 +676,9 @@ impl<'a> LayoutBuilder<'a> {
         let atom = InlineAtom::new(
             InlineAtomContent::InlineFragment {
                 fragment: Box::new(fragment),
+                replay_coordinates,
                 table_cell_context: None,
+                contents_overflow_clip_applied: static_scroll_snap_scope,
             },
             style.as_computed().clone(),
             escaped_positioned_layers,
@@ -836,7 +856,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn layout_containment_uses_the_bottom_margin_edge_when_no_baseline_is_exported() {
+    fn layout_containment_uses_the_bottom_margin_edge_when_descendant_baseline_exists() {
         let mut style = ComputedStyle::initial();
         style.margin.bottom = 2.0;
 

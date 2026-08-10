@@ -7,72 +7,83 @@ use super::*;
 /// properties through `writing-mode` and `direction`:
 /// <https://www.w3.org/TR/css-cascade-5/#shorthand> and
 /// <https://www.w3.org/TR/css-logical-1/#border-properties>.
-pub(in crate::css) fn affected_longhands(
+/// String-to-target lookup retained at the declaration parsing boundary.
+/// Typed cascade code must call [`affected_longhands`] instead.
+pub(in crate::css) fn affected_longhand_names(
     name: &str,
     direction: Direction,
     writing_mode: WritingMode,
-) -> Option<Vec<&'static str>> {
+) -> Option<ResolvedLonghandTargets> {
+    if name.eq_ignore_ascii_case("all") {
+        return Some(ResolvedLonghandTargets::All);
+    }
+    if matches!(name, "line-clamp" | "-webkit-line-clamp") {
+        return Some(ResolvedLonghandTargets::from_names([
+            "max-lines",
+            "block-ellipsis",
+            "continue",
+        ]));
+    }
     if let Some(longhand) = logical_size_physical_longhand(name, writing_mode) {
-        return Some(vec![longhand]);
+        return Some(ResolvedLonghandTargets::from_names([longhand]));
+    }
+    if let Some(longhand) = logical_contain_intrinsic_size_physical_longhand(name, writing_mode) {
+        return Some(ResolvedLonghandTargets::from_names([longhand]));
     }
     if matches!(name, "margin-block" | "margin-inline") {
         let [start, end] = logical_box_axis_side_names(name)?;
-        return Some(vec![
+        return Some(ResolvedLonghandTargets::from_names([
             physical_margin_side_longhand(logical_box_side(start, direction, writing_mode)?),
             physical_margin_side_longhand(logical_box_side(end, direction, writing_mode)?),
-        ]);
+        ]));
     }
     if matches!(name, "padding-block" | "padding-inline") {
         let [start, end] = logical_box_axis_side_names(name)?;
-        return Some(vec![
+        return Some(ResolvedLonghandTargets::from_names([
             physical_padding_side_longhand(logical_box_side(start, direction, writing_mode)?),
             physical_padding_side_longhand(logical_box_side(end, direction, writing_mode)?),
-        ]);
+        ]));
     }
     if matches!(name, "scroll-padding-block" | "scroll-padding-inline") {
         let [start, end] = logical_box_axis_side_names(name)?;
-        return Some(vec![
+        return Some(ResolvedLonghandTargets::from_names([
             physical_scroll_padding_side_longhand(logical_box_side(
                 start,
                 direction,
                 writing_mode,
             )?),
             physical_scroll_padding_side_longhand(logical_box_side(end, direction, writing_mode)?),
-        ]);
+        ]));
     }
     if matches!(name, "scroll-margin-block" | "scroll-margin-inline") {
         let [start, end] = logical_box_axis_side_names(name)?;
-        return Some(vec![
+        return Some(ResolvedLonghandTargets::from_names([
             physical_scroll_margin_side_longhand(logical_box_side(start, direction, writing_mode)?),
             physical_scroll_margin_side_longhand(logical_box_side(end, direction, writing_mode)?),
-        ]);
+        ]));
     }
     if matches!(name, "inset-block" | "inset-inline") {
         let [start, end] = logical_box_axis_side_names(name)?;
-        return Some(vec![
+        return Some(ResolvedLonghandTargets::from_names([
             physical_inset_side_longhand(logical_box_side(start, direction, writing_mode)?),
             physical_inset_side_longhand(logical_box_side(end, direction, writing_mode)?),
-        ]);
+        ]));
     }
     if matches!(
         name,
         "margin-block-start" | "margin-block-end" | "margin-inline-start" | "margin-inline-end"
     ) {
-        return Some(vec![physical_margin_side_longhand(logical_box_side(
-            name,
-            direction,
-            writing_mode,
-        )?)]);
+        return Some(ResolvedLonghandTargets::from_names([
+            physical_margin_side_longhand(logical_box_side(name, direction, writing_mode)?),
+        ]));
     }
     if matches!(
         name,
         "padding-block-start" | "padding-block-end" | "padding-inline-start" | "padding-inline-end"
     ) {
-        return Some(vec![physical_padding_side_longhand(logical_box_side(
-            name,
-            direction,
-            writing_mode,
-        )?)]);
+        return Some(ResolvedLonghandTargets::from_names([
+            physical_padding_side_longhand(logical_box_side(name, direction, writing_mode)?),
+        ]));
     }
     if matches!(
         name,
@@ -81,9 +92,9 @@ pub(in crate::css) fn affected_longhands(
             | "scroll-padding-inline-start"
             | "scroll-padding-inline-end"
     ) {
-        return Some(vec![physical_scroll_padding_side_longhand(
-            logical_box_side(name, direction, writing_mode)?,
-        )]);
+        return Some(ResolvedLonghandTargets::from_names([
+            physical_scroll_padding_side_longhand(logical_box_side(name, direction, writing_mode)?),
+        ]));
     }
     if matches!(
         name,
@@ -92,22 +103,22 @@ pub(in crate::css) fn affected_longhands(
             | "scroll-margin-inline-start"
             | "scroll-margin-inline-end"
     ) {
-        return Some(vec![physical_scroll_margin_side_longhand(
-            logical_box_side(name, direction, writing_mode)?,
-        )]);
+        return Some(ResolvedLonghandTargets::from_names([
+            physical_scroll_margin_side_longhand(logical_box_side(name, direction, writing_mode)?),
+        ]));
     }
     if matches!(
         name,
         "inset-block-start" | "inset-block-end" | "inset-inline-start" | "inset-inline-end"
     ) {
-        return Some(vec![physical_inset_side_longhand(logical_box_side(
-            name,
-            direction,
-            writing_mode,
-        )?)]);
+        return Some(ResolvedLonghandTargets::from_names([
+            physical_inset_side_longhand(logical_box_side(name, direction, writing_mode)?),
+        ]));
     }
     if name == "inset" {
-        return Some(vec!["top", "right", "bottom", "left"]);
+        return Some(ResolvedLonghandTargets::from_names([
+            "top", "right", "bottom", "left",
+        ]));
     }
     if matches!(
         name,
@@ -125,61 +136,50 @@ pub(in crate::css) fn affected_longhands(
             "border-inline-end-radius" => ["border-start-end-radius", "border-end-end-radius"],
             _ => unreachable!(),
         };
-        return corners
-            .into_iter()
-            .map(|corner| logical_corner_radius_longhand(corner, direction, writing_mode))
-            .collect();
+        return Some(ResolvedLonghandTargets::from_names([
+            logical_corner_radius_longhand(corners[0], direction, writing_mode)?,
+            logical_corner_radius_longhand(corners[1], direction, writing_mode)?,
+        ]));
     }
     if matches!(name, "border-block" | "border-inline") {
         let logical_sides = logical_axis_side_names(name)?;
-        return Some(
-            logical_sides
-                .into_iter()
-                .map(|logical_side| {
-                    Some(border_side_component_longhands(logical_border_side(
-                        logical_side,
-                        direction,
-                        writing_mode,
-                    )?))
-                })
-                .collect::<Option<Vec<_>>>()?
-                .into_iter()
-                .flatten()
-                .collect(),
-        );
+        let [first, second] = logical_sides;
+        let first =
+            border_side_component_longhands(logical_border_side(first, direction, writing_mode)?);
+        let second =
+            border_side_component_longhands(logical_border_side(second, direction, writing_mode)?);
+        return Some(ResolvedLonghandTargets::from_names([
+            first[0], first[1], first[2], second[0], second[1], second[2],
+        ]));
     }
     if matches!(
         name,
         "border-block-start" | "border-block-end" | "border-inline-start" | "border-inline-end"
     ) {
-        return Some(
-            border_side_component_longhands(logical_border_side(name, direction, writing_mode)?)
-                .to_vec(),
-        );
+        return Some(ResolvedLonghandTargets::from_names(
+            border_side_component_longhands(logical_border_side(name, direction, writing_mode)?),
+        ));
     }
     if matches!(name, "border-block-width" | "border-inline-width") {
-        return Some(
-            logical_axis_sides(name, direction, writing_mode)?
-                .into_iter()
-                .map(|side| physical_border_side_component_longhand(side, "width"))
-                .collect(),
-        );
+        let [start, end] = logical_axis_sides(name, direction, writing_mode)?;
+        return Some(ResolvedLonghandTargets::from_names([
+            physical_border_side_component_longhand(start, "width"),
+            physical_border_side_component_longhand(end, "width"),
+        ]));
     }
     if matches!(name, "border-block-style" | "border-inline-style") {
-        return Some(
-            logical_axis_sides(name, direction, writing_mode)?
-                .into_iter()
-                .map(|side| physical_border_side_component_longhand(side, "style"))
-                .collect(),
-        );
+        let [start, end] = logical_axis_sides(name, direction, writing_mode)?;
+        return Some(ResolvedLonghandTargets::from_names([
+            physical_border_side_component_longhand(start, "style"),
+            physical_border_side_component_longhand(end, "style"),
+        ]));
     }
     if matches!(name, "border-block-color" | "border-inline-color") {
-        return Some(
-            logical_axis_sides(name, direction, writing_mode)?
-                .into_iter()
-                .map(|side| physical_border_side_component_longhand(side, "color"))
-                .collect(),
-        );
+        let [start, end] = logical_axis_sides(name, direction, writing_mode)?;
+        return Some(ResolvedLonghandTargets::from_names([
+            physical_border_side_component_longhand(start, "color"),
+            physical_border_side_component_longhand(end, "color"),
+        ]));
     }
     if matches!(
         name,
@@ -188,10 +188,12 @@ pub(in crate::css) fn affected_longhands(
             | "border-inline-start-width"
             | "border-inline-end-width"
     ) {
-        return Some(vec![physical_border_side_component_longhand(
-            logical_border_side(name, direction, writing_mode)?,
-            "width",
-        )]);
+        return Some(ResolvedLonghandTargets::from_names([
+            physical_border_side_component_longhand(
+                logical_border_side(name, direction, writing_mode)?,
+                "width",
+            ),
+        ]));
     }
     if matches!(
         name,
@@ -200,10 +202,12 @@ pub(in crate::css) fn affected_longhands(
             | "border-inline-start-style"
             | "border-inline-end-style"
     ) {
-        return Some(vec![physical_border_side_component_longhand(
-            logical_border_side(name, direction, writing_mode)?,
-            "style",
-        )]);
+        return Some(ResolvedLonghandTargets::from_names([
+            physical_border_side_component_longhand(
+                logical_border_side(name, direction, writing_mode)?,
+                "style",
+            ),
+        ]));
     }
     if matches!(
         name,
@@ -212,10 +216,12 @@ pub(in crate::css) fn affected_longhands(
             | "border-inline-start-color"
             | "border-inline-end-color"
     ) {
-        return Some(vec![physical_border_side_component_longhand(
-            logical_border_side(name, direction, writing_mode)?,
-            "color",
-        )]);
+        return Some(ResolvedLonghandTargets::from_names([
+            physical_border_side_component_longhand(
+                logical_border_side(name, direction, writing_mode)?,
+                "color",
+            ),
+        ]));
     }
     if matches!(
         name,
@@ -224,11 +230,9 @@ pub(in crate::css) fn affected_longhands(
             | "border-end-start-radius"
             | "border-end-end-radius"
     ) {
-        return Some(vec![logical_corner_radius_longhand(
-            name,
-            direction,
-            writing_mode,
-        )?]);
+        return Some(ResolvedLonghandTargets::from_names([
+            logical_corner_radius_longhand(name, direction, writing_mode)?,
+        ]));
     }
 
     let longhands: &[&str] = match name {
@@ -418,6 +422,27 @@ pub(in crate::css) fn affected_longhands(
         "grid-row-gap" => &["row-gap"],
         "column-gap" => &["column-gap"],
         "grid-column-gap" => &["column-gap"],
+        "grid-row" => &["grid-row-start", "grid-row-end"],
+        "grid-column" => &["grid-column-start", "grid-column-end"],
+        "grid-area" => &[
+            "grid-row-start",
+            "grid-column-start",
+            "grid-row-end",
+            "grid-column-end",
+        ],
+        "grid-template" => &[
+            "grid-template-rows",
+            "grid-template-columns",
+            "grid-template-areas",
+        ],
+        "grid" => &[
+            "grid-template-rows",
+            "grid-template-columns",
+            "grid-template-areas",
+            "grid-auto-flow",
+            "grid-auto-rows",
+            "grid-auto-columns",
+        ],
         "rule" => &[
             "column-rule-width",
             "column-rule-style",
@@ -565,8 +590,16 @@ pub(in crate::css) fn affected_longhands(
         "text-emphasis-position" => &["text-emphasis-position"],
         "text-emphasis-skip" => &["text-emphasis-skip"],
         "ruby-position" => &["ruby-position"],
+        "ruby-align" => &["ruby-align"],
+        "ruby-overhang" => &["ruby-overhang"],
         "text-shadow" => &["text-shadow"],
         "box-shadow" => &["box-shadow"],
+        // CSS Masking defines `mask` as a reset shorthand for the
+        // mask-border family as well as mask-image.
+        // <https://drafts.csswg.org/css-masking/#propdef-mask>
+        "mask" => &["mask-image", "mask-border-source"],
+        "mask-border" => &["mask-border-source"],
+        "container" => &["container-name", "container-type"],
         "overflow" => &["overflow-x", "overflow-y"],
         "overflow-x" => &["overflow-x"],
         "overflow-y" => &["overflow-y"],
@@ -596,6 +629,30 @@ pub(in crate::css) fn affected_longhands(
         "scroll-margin-bottom" => &["scroll-margin-bottom"],
         "scroll-margin-left" => &["scroll-margin-left"],
         "word-wrap" | "overflow-wrap" => &["overflow-wrap"],
+        "animation" => &["animation-name", "animation-duration", "animation-delay"],
+        "animation-name" => &["animation-name"],
+        "animation-duration" => &["animation-duration"],
+        "animation-delay" => &["animation-delay"],
+        "font" => &[
+            "font-style",
+            "font-weight",
+            "font-width",
+            "font-family",
+            "font-size",
+            "line-height",
+            "font-feature-settings",
+            "font-kerning",
+            "font-language-override",
+            "font-size-adjust",
+            "font-variation-settings",
+            "font-variant-ligatures",
+            "font-variant-position",
+            "font-variant-caps",
+            "font-variant-numeric",
+            "font-variant-alternates",
+            "font-variant-east-asian",
+            "font-variant-emoji",
+        ],
         "font-variant" => &[
             "font-variant-ligatures",
             "font-variant-position",
@@ -618,7 +675,26 @@ pub(in crate::css) fn affected_longhands(
         "page-break-inside" | "break-inside" => &["break-inside"],
         _ => return None,
     };
-    Some(longhands.to_vec())
+    Some(ResolvedLonghandTargets::static_names(longhands))
+}
+
+/// Returns the modeled longhands reset by the CSS Cascade `all` shorthand.
+///
+/// `direction` and `unicode-bidi` remain in `ALL_MODELED_LONGHANDS` because
+/// they participate in ordinary inheritance and computed-style copying, but
+/// CSS Cascade explicitly excludes them from `all`:
+/// <https://drafts.csswg.org/css-cascade-5/#all-shorthand>.
+pub(in crate::css) fn all_shorthand_longhands() -> impl Iterator<Item = ModeledLonghand> {
+    all_modeled_longhands()
+}
+
+/// Returns the canonical physical targets addressed by a typed property.
+pub(in crate::css) fn affected_longhands(
+    property: &ModeledProperty,
+    direction: Direction,
+    writing_mode: WritingMode,
+) -> ResolvedLonghandTargets {
+    property.resolve_targets(direction, writing_mode)
 }
 
 pub(in crate::css) fn logical_axis_side_names(name: &str) -> Option<[&'static str; 2]> {
@@ -640,8 +716,16 @@ pub(in crate::css) fn logical_axis_side_names(name: &str) -> Option<[&'static st
 /// <https://www.w3.org/TR/css-logical-1/#box>.
 pub(in crate::css) fn logical_box_axis_side_names(name: &str) -> Option<[&'static str; 2]> {
     match name {
-        "margin-block" | "padding-block" | "inset-block" => Some(["block-start", "block-end"]),
-        "margin-inline" | "padding-inline" | "inset-inline" => Some(["inline-start", "inline-end"]),
+        "margin-block"
+        | "padding-block"
+        | "scroll-padding-block"
+        | "scroll-margin-block"
+        | "inset-block" => Some(["block-start", "block-end"]),
+        "margin-inline"
+        | "padding-inline"
+        | "scroll-padding-inline"
+        | "scroll-margin-inline"
+        | "inset-inline" => Some(["inline-start", "inline-end"]),
         _ => None,
     }
 }
@@ -738,36 +822,41 @@ impl CssWideDefaultKeyword {
 /// Applies CSS-wide defaulting keywords to modeled properties.
 ///
 /// CSS Cascade Level 5 defines `initial`, `inherit`, and `unset` as defaulting
-/// behaviors accepted by every property. Shorthands, including `all`, apply the
-/// keyword to their longhands:
+/// behaviors accepted by every property. Shorthands apply the keyword to their
+/// longhands:
 /// <https://www.w3.org/TR/css-cascade-5/#defaulting-keywords> and
 /// <https://www.w3.org/TR/css-cascade-5/#all-shorthand>.
 pub(in crate::css) fn apply_css_wide_default_keyword(
     style: &mut ComputedStyle,
-    name: &str,
+    property: &ModeledProperty,
     keyword: CssWideDefaultKeyword,
     defaulted_style: &ComputedStyle,
 ) {
-    if name.eq_ignore_ascii_case("all") {
-        for longhand in ALL_MODELED_LONGHANDS {
-            apply_css_wide_default_longhand(style, longhand, keyword, defaulted_style);
-        }
-        return;
-    }
-    if let Some(longhands) = affected_longhands(name, style.direction, style.writing_mode) {
-        for longhand in longhands {
-            apply_css_wide_default_longhand(style, longhand, keyword, defaulted_style);
-        }
-    } else {
-        apply_css_wide_default_longhand(style, name, keyword, defaulted_style);
+    // `all: initial` and `all: unset` can target every modeled longhand.
+    // Build their shared initial source once rather than constructing one full
+    // computed style for every affected property.
+    let initial = matches!(
+        keyword,
+        CssWideDefaultKeyword::Initial | CssWideDefaultKeyword::Unset
+    )
+    .then(ComputedStyle::initial);
+    for longhand in affected_longhands(property, style.direction, style.writing_mode) {
+        apply_css_wide_default_longhand(
+            style,
+            longhand,
+            keyword,
+            defaulted_style,
+            initial.as_ref(),
+        );
     }
 }
 
 pub(in crate::css) fn apply_css_wide_default_longhand(
     style: &mut ComputedStyle,
-    name: &str,
+    longhand: ModeledLonghand,
     keyword: CssWideDefaultKeyword,
     defaulted_style: &ComputedStyle,
+    initial: Option<&ComputedStyle>,
 ) {
     // `font-size` retains a deferred inheritance representation so a normal
     // inherited font can resolve against the immediate parent's used metric.
@@ -776,25 +865,23 @@ pub(in crate::css) fn apply_css_wide_default_longhand(
     // re-inheriting it after the defaulting pass:
     // <https://drafts.csswg.org/css-cascade-5/#initial> and
     // <https://drafts.csswg.org/css-fonts-4/#font-size-prop>.
-    if name.eq_ignore_ascii_case("font-size") && keyword == CssWideDefaultKeyword::Initial {
-        set_font_size(style, ComputedStyle::initial().font_size);
+    if longhand == ModeledLonghand::FontSize && keyword == CssWideDefaultKeyword::Initial {
+        set_font_size(
+            style,
+            initial
+                .expect("initial source for `font-size: initial`")
+                .font_size,
+        );
         return;
     }
-    let initial;
     let source = match keyword {
-        CssWideDefaultKeyword::Initial => {
-            initial = ComputedStyle::initial();
-            &initial
-        }
+        CssWideDefaultKeyword::Initial => initial.expect("initial defaulting source"),
         CssWideDefaultKeyword::Inherit => defaulted_style,
-        CssWideDefaultKeyword::Unset if property_is_inherited(name) => defaulted_style,
-        CssWideDefaultKeyword::Unset => {
-            initial = ComputedStyle::initial();
-            &initial
-        }
+        CssWideDefaultKeyword::Unset if longhand.is_inherited() => defaulted_style,
+        CssWideDefaultKeyword::Unset => initial.expect("initial unset source"),
     };
-    copy_modeled_property(style, source, name);
-    if name.eq_ignore_ascii_case("page") && matches!(style.page, PageAssignment::Unspecified) {
+    copy_modeled_longhand(style, source, longhand);
+    if longhand == ModeledLonghand::Page && matches!(style.page, PageAssignment::Unspecified) {
         style.page = PageAssignment::Auto;
     }
 }
@@ -817,7 +904,7 @@ pub(in crate::css) fn parse_margin_trim(value: &str) -> Option<MarginTrim> {
     let mut trim = MarginTrim::NONE;
     let mut saw_token = false;
     let mut saw_none = false;
-    for token in trim_css_value(value).split_whitespace() {
+    for token in try_split_css_component_values(trim_css_value(value))? {
         saw_token = true;
         match token.to_ascii_lowercase().as_str() {
             "none" if !saw_none && trim == MarginTrim::NONE => saw_none = true,
@@ -932,5 +1019,89 @@ mod tests {
         apply_cascaded_declarations_with_inheritance_source(&mut grandchild, &declarations, &child);
         assert_eq!(grandchild.zoom.factor(), 1.0);
         assert_eq!(grandchild.effective_zoom.factor(), 4.0);
+    }
+
+    #[test]
+    fn css_wide_defaults_copy_every_modeled_sizing_and_outline_longhand() {
+        let mut parent = ComputedStyle::initial();
+        apply_declarations(
+            &mut parent,
+            &parse_declarations(
+                "aspect-ratio: 3 / 2; outline-offset: 7pt; \
+                 contain-intrinsic-size: 11pt 13pt; column-height: 17pt; column-wrap: wrap",
+            ),
+        );
+        let initial = ComputedStyle::initial();
+
+        for (keyword, inherits_parent_value) in [
+            ("initial", false),
+            ("inherit", true),
+            // All covered properties are non-inherited, so `unset` selects
+            // their initial value rather than the parent value.
+            ("unset", false),
+        ] {
+            let mut child = ComputedStyle::initial();
+            let declarations = parse_declarations(&format!(
+                "aspect-ratio: {keyword}; outline-offset: {keyword}; \
+                 contain-intrinsic-size: {keyword}; column-height: {keyword}; column-wrap: {keyword}"
+            ));
+            let declarations = cascaded_declarations_from(&declarations, StylesheetOrigin::Author);
+            apply_cascaded_declarations_with_inheritance_source(&mut child, &declarations, &parent);
+
+            let expected = if inherits_parent_value {
+                &parent
+            } else {
+                &initial
+            };
+            assert_eq!(child.aspect_ratio, expected.aspect_ratio, "{keyword}");
+            assert_eq!(child.outline_offset, expected.outline_offset, "{keyword}");
+            assert_eq!(
+                child.contain_intrinsic_size, expected.contain_intrinsic_size,
+                "{keyword}"
+            );
+            assert_eq!(child.column_height, expected.column_height, "{keyword}");
+            assert_eq!(child.column_wrap, expected.column_wrap, "{keyword}");
+        }
+    }
+
+    #[test]
+    fn css_wide_defaults_resolve_logical_containment_to_the_physical_longhand() {
+        let mut parent = ComputedStyle::initial();
+        apply_declarations(
+            &mut parent,
+            &parse_declarations(
+                "writing-mode: vertical-rl; \
+                 contain-intrinsic-inline-size: 11pt; contain-intrinsic-block-size: 13pt",
+            ),
+        );
+
+        let mut child = ComputedStyle::initial();
+        let declarations = parse_declarations(
+            "writing-mode: vertical-rl; \
+             contain-intrinsic-inline-size: inherit; contain-intrinsic-block-size: inherit",
+        );
+        let declarations = cascaded_declarations_from(&declarations, StylesheetOrigin::Author);
+        apply_cascaded_declarations_with_inheritance_source(&mut child, &declarations, &parent);
+
+        assert_eq!(child.contain_intrinsic_size, parent.contain_intrinsic_size);
+    }
+
+    #[test]
+    fn all_initial_resets_the_complete_modeled_defaulting_state() {
+        let mut style = ComputedStyle::initial();
+        apply_declarations(
+            &mut style,
+            &parse_declarations(
+                "aspect-ratio: 3 / 2; outline-offset: 7pt; \
+                 contain-intrinsic-size: 11pt 13pt; column-height: 17pt; column-wrap: wrap; all: initial",
+            ),
+        );
+        let initial = ComputedStyle::initial();
+
+        assert_eq!(style.aspect_ratio, initial.aspect_ratio);
+        assert_eq!(style.outline_offset, initial.outline_offset);
+        assert_eq!(style.contain_intrinsic_size, initial.contain_intrinsic_size);
+        assert_eq!(style.column_height, initial.column_height);
+        assert_eq!(style.column_wrap, initial.column_wrap);
     }
 }

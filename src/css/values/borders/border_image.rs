@@ -99,6 +99,32 @@ pub(crate) fn parse_border_image(value: &str, font_size: f32) -> Option<BorderIm
     Some(image)
 }
 
+/// Parse the source subproperty of the CSS Masking `mask-border` shorthand.
+///
+/// Its source/slice/width/outset/repeat grammar is the border-image grammar,
+/// with an additional optional `alpha`/`luminance` mask-border mode. The mode
+/// is irrelevant to CSS Transforms' grouping decision, so this adapter removes
+/// it and delegates the remaining grammar to the typed border-image parser.
+/// <https://drafts.csswg.org/css-masking/#propdef-mask-border>
+pub(crate) fn parse_mask_border_source(value: &str, font_size: f32) -> Option<ComputedImage> {
+    if trim_css_value(value).is_empty() {
+        return None;
+    }
+    let mut saw_mode = false;
+    let mut border_image_tokens = Vec::new();
+    for token in split_css_component_values(value) {
+        if matches!(token.to_ascii_lowercase().as_str(), "alpha" | "luminance") {
+            if saw_mode {
+                return None;
+            }
+            saw_mode = true;
+        } else {
+            border_image_tokens.push(token);
+        }
+    }
+    Some(parse_border_image(&border_image_tokens.join(" "), font_size)?.source)
+}
+
 pub(in crate::css) fn parse_border_image_source_token(
     token: &str,
     image: &mut BorderImage,
@@ -324,4 +350,23 @@ pub(in crate::css) fn parse_non_negative_number(value: &str) -> Option<f32> {
     let mut parser = Parser::new(&mut input);
     let value = parser.expect_number().ok()?;
     (value >= 0.0 && parser.is_exhausted()).then_some(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mask_border_shorthand_tracks_the_reset_only_source() {
+        assert!(matches!(
+            parse_mask_border_source("alpha", 12.0),
+            Some(ComputedImage::None)
+        ));
+        assert!(matches!(
+            parse_mask_border_source("none luminance", 12.0),
+            Some(ComputedImage::None)
+        ));
+        assert!(parse_mask_border_source("alpha luminance", 12.0).is_none());
+        assert!(parse_mask_border_source("", 12.0).is_none());
+    }
 }

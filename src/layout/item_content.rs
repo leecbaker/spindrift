@@ -32,15 +32,43 @@ pub(in crate::layout) fn replayed_item_fragmentation_base_style(
     style.break_after = PageBreak::Auto;
 
     if matches!(fragmentation_policy, ReplayedItemFragmentationPolicy::Grid) {
-        style.break_inside_avoid = false;
-        style.break_inside_avoid_column = false;
+        style.break_inside = css::BreakInsideAvoidance::Auto;
     }
 
     style
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(in crate::layout) enum ReplayFloatScope {
+    /// The replay participates in its parent's float formatting context.
+    ///
+    /// This is only appropriate when the replay is another view of the
+    /// parent's own in-flow content, rather than an independently formatted
+    /// child.
+    #[default]
+    InheritContainingBlock,
+    /// The replay establishes an independent formatting context whose
+    /// descendants must not observe or mutate ancestor float exclusions.
+    ///
+    /// Flex items, grid items, inline-blocks, table cells, and other
+    /// flow-root-like replay roots use this variant. Keeping it explicit
+    /// prevents a nested replay from applying an ancestor float band a second
+    /// time.
+    /// <https://www.w3.org/TR/CSS22/visuren.html#block-boxes>
+    /// <https://www.w3.org/TR/css-display-3/#establishing-formatting-contexts>
+    IsolatedFormattingContext,
+}
+
+/// Immutable placement inputs for replaying an independently formatted child.
+///
+/// A layout algorithm resolves this record before the child is replayed. The
+/// child-layout boundary installs exactly these inputs and restores its caller
+/// afterwards, rather than allowing the replay to reconstruct its geometry
+/// from mutable [`LayoutBuilder`] state. Algorithm-specific sizing remains
+/// outside this record; this is only the common formatting-context boundary.
+/// <https://www.w3.org/TR/css-display-3/#independent-formatting-context>
 #[derive(Debug, Clone, Copy)]
-pub(in crate::layout) struct FormattingContextItemPlacement {
+pub(in crate::layout) struct PlacedFormattingContext {
     pub(in crate::layout) content_left: f32,
     /// The item's physical content-box width, independent of its writing
     /// mode. Its logical inline size may instead be its physical height.
@@ -56,6 +84,27 @@ pub(in crate::layout) struct FormattingContextItemPlacement {
     pub(in crate::layout) scope_content_logical_inline_size: bool,
     pub(in crate::layout) cursor_y: f32,
     pub(in crate::layout) page_start_margin_policy: PageStartMarginPolicy,
+    pub(in crate::layout) float_scope: ReplayFloatScope,
+}
+
+/// Sizing inputs supplied when an absolutely positioned table is replayed.
+///
+/// CSS Tables computes an auto table inline size against the containing block,
+/// while CSS Positioned Layout resolves the final inset position separately.
+/// A definite table block size must also reach table row distribution rather
+/// than being lost in the generic positioned flow surrogate. Keeping these
+/// values together prevents an inset-modified containing block from being
+/// reused as the table's sizing basis, and prevents nested tables from
+/// inheriting the outer table's inputs:
+/// <https://drafts.csswg.org/css-tables-3/#computing-the-table-width>,
+/// <https://drafts.csswg.org/css-tables-3/#computing-the-table-height>,
+/// <https://www.w3.org/TR/css-position-3/#absolute-positioning>, and
+/// <https://www.w3.org/TR/CSS22/visudet.html#containing-block-details>.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct PositionedTableSizing {
+    pub(in crate::layout) available_inline_size: LogicalInlineContentSize,
+    pub(in crate::layout) definite_block_content_size: Option<LogicalBlockContentSize>,
+    pub(in crate::layout) writing_mode: WritingMode,
 }
 
 /// Return the table-wrapper size supplied by flex/grid alignment for an
@@ -85,9 +134,9 @@ impl<'a> LayoutBuilder<'a> {
     /// container layout resumes with its previous cursor and content bounds:
     /// <https://www.w3.org/TR/css-flexbox-1/#flex-items> and
     /// <https://www.w3.org/TR/css-grid-1/#grid-items>.
-    pub(in crate::layout) fn with_formatting_context_item_placement<R>(
+    pub(in crate::layout) fn with_placed_formatting_context<R>(
         &mut self,
-        placement: FormattingContextItemPlacement,
+        placement: PlacedFormattingContext,
         style: &ComputedStyle,
         layout: impl FnOnce(&mut Self) -> R,
     ) -> R {
@@ -113,7 +162,6 @@ impl<'a> LayoutBuilder<'a> {
         let push_item_inline_size = placement.scope_content_logical_inline_size
             && matches!(placement.writing_mode, WritingMode::HorizontalTb);
         let push_table_wrapper_block_size = placement.table_wrapper_border_box_block_size.is_some();
-
         self.content_left = placement.content_left;
         self.content_right = placement.content_left + placement.content_width.points();
         self.cursor_y = placement.cursor_y;
@@ -138,9 +186,7 @@ impl<'a> LayoutBuilder<'a> {
         ) {
             self.truncate_page_start_margins = false;
         }
-
-        let result = layout(self);
-
+        let result = self.with_replay_float_scope(placement.float_scope, layout);
         if push_item_inline_size {
             self.content_logical_inline_size_stack.pop();
         }
@@ -157,6 +203,28 @@ impl<'a> LayoutBuilder<'a> {
         result
     }
 
+    /// Run a nested replay with its declared float visibility.
+    ///
+    /// This is deliberately a closure-scoped operation: a nested formatting
+    /// context cannot forget to restore the parent float stack after a
+    /// measurement or paint replay.
+    /// <https://www.w3.org/TR/CSS22/visuren.html#block-boxes>
+    pub(in crate::layout) fn with_replay_float_scope<R>(
+        &mut self,
+        scope: ReplayFloatScope,
+        replay: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let isolates = matches!(scope, ReplayFloatScope::IsolatedFormattingContext);
+        if isolates {
+            self.push_float_context();
+        }
+        let result = replay(self);
+        if isolates {
+            self.pop_float_context();
+        }
+        result
+    }
+
     /// Consume the flex/grid table-wrapper size assigned to the root table in
     /// the current item-placement scope.
     ///
@@ -167,6 +235,25 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
     ) -> Option<BorderBoxLength> {
         self.table_wrapper_block_size_overrides
+            .last_mut()
+            .and_then(Option::take)
+    }
+
+    /// Install the one-shot sizing contract for the next positioned table
+    /// formatting context. Nested table roots push their own contract before
+    /// replay, so the outer record cannot leak into descendants.
+    pub(in crate::layout) fn push_positioned_table_sizing(
+        &mut self,
+        sizing: PositionedTableSizing,
+    ) {
+        self.positioned_table_sizing.push(Some(sizing));
+    }
+
+    /// Consume the current positioned table's sizing contract.
+    pub(in crate::layout) fn take_positioned_table_sizing(
+        &mut self,
+    ) -> Option<PositionedTableSizing> {
+        self.positioned_table_sizing
             .last_mut()
             .and_then(Option::take)
     }
@@ -247,8 +334,7 @@ mod tests {
         style.page = css::PageAssignment::Named(css::PageName::new("chapter".to_string()));
         style.break_before = PageBreak::Page;
         style.break_after = PageBreak::Page;
-        style.break_inside_avoid = true;
-        style.break_inside_avoid_column = true;
+        style.break_inside = css::BreakInsideAvoidance::Avoid;
         style
     }
 
@@ -272,8 +358,7 @@ mod tests {
         );
 
         assert_common_replay_state(&style);
-        assert!(style.break_inside_avoid);
-        assert!(style.break_inside_avoid_column);
+        assert_eq!(style.break_inside, css::BreakInsideAvoidance::Avoid);
     }
 
     #[test]
@@ -284,7 +369,6 @@ mod tests {
         );
 
         assert_common_replay_state(&style);
-        assert!(!style.break_inside_avoid);
-        assert!(!style.break_inside_avoid_column);
+        assert_eq!(style.break_inside, css::BreakInsideAvoidance::Auto);
     }
 }

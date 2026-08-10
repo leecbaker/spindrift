@@ -492,6 +492,14 @@ impl<'a> LayoutBuilder<'a> {
                 );
             }
         }
+        if matches!(layout_kind, ElementLayoutKind::BlockFlow)
+            && !element.tag.eq_ignore_ascii_case("html")
+        {
+            self.last_principal_transform_box = self
+                .last_block_layout_outcome
+                .static_border_box
+                .map(assets::TransformReferenceBox::css_layout);
+        }
     }
 
     pub(in crate::layout) fn should_capture_non_positioned_effect_context(
@@ -503,7 +511,8 @@ impl<'a> LayoutBuilder<'a> {
         !matches!(
             layout_kind,
             ElementLayoutKind::None | ElementLayoutKind::Positioned
-        ) && StackingContextPolicy::style_needs_non_positioned_scope(element, style)
+        ) && (self.preserve_3d_context_depth > 0
+            || StackingContextPolicy::style_needs_non_positioned_scope(element, style))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -520,13 +529,29 @@ impl<'a> LayoutBuilder<'a> {
         let paint_checkpoint = self.current_page.paint_checkpoint();
         let paint_page_index = self.pages.len();
         let positioned_layer_start = self.positioned_layers.len();
-        let initial_policy = StackingContextPolicy::for_non_positioned_effect(
+        self.last_principal_transform_box = None;
+        let mut initial_policy = StackingContextPolicy::for_non_positioned_effect(
             element,
             style,
             PaintClip::from_paint_rect(paint_space_rect(0.0, 0.0, 0.0, 0.0)),
         );
+        let deferred_flattening_boundary = self.preserve_3d_context_depth > 0
+            && matches!(initial_policy.context_kind, StackingContextKind::None);
+        if deferred_flattening_boundary {
+            // A plain descendant might contain an independently flattened 3D
+            // subtree. Keep its positioned descendants available until their
+            // used effects are known below. If none needs flattening, they
+            // are allowed to escape again so Appendix E paint bands remain
+            // interleaved with the ancestor plane.
+            initial_policy.child_layer_policy = ChildLayerPolicy::CaptureAll;
+        }
         let previous_defer_block_decoration_promotion = self.defer_next_block_decoration_promotion;
         self.defer_next_block_decoration_promotion = true;
+        let enters_3d_context =
+            assets::used_transform_style(style) == css::TransformStyle::Preserve3d;
+        if enters_3d_context {
+            self.preserve_3d_context_depth += 1;
+        }
         self.layout_element_inner_kind(
             layout_kind,
             element,
@@ -536,6 +561,9 @@ impl<'a> LayoutBuilder<'a> {
             child_boxes,
             table_fragment,
         );
+        if enters_3d_context {
+            self.preserve_3d_context_depth -= 1;
+        }
         self.defer_next_block_decoration_promotion = previous_defer_block_decoration_promotion;
         let child_layers = if positioned_layer_start < self.positioned_layers.len()
             && !matches!(
@@ -546,7 +574,7 @@ impl<'a> LayoutBuilder<'a> {
         } else {
             Vec::new()
         };
-        let (child_layers, escaped_layers): (Vec<_>, Vec<_>) =
+        let (mut child_layers, escaped_layers): (Vec<_>, Vec<_>) =
             match initial_policy.child_layer_policy {
                 ChildLayerPolicy::CaptureAll => (child_layers, Vec::new()),
                 ChildLayerPolicy::CaptureAutoLevel => child_layers
@@ -557,6 +585,21 @@ impl<'a> LayoutBuilder<'a> {
         self.positioned_layers.extend(escaped_layers);
         let mut fragments =
             self.take_positioned_fragments_since(paint_page_index, paint_checkpoint);
+        let contains_affine_3d_subtree = child_layers
+            .iter()
+            .any(|layer| layer.context.effects.affine_3d_transform.is_some())
+            || fragments
+                .iter()
+                .any(|(_, fragment)| fragment.contains_affine_3d_transform());
+        if deferred_flattening_boundary && !contains_affine_3d_subtree {
+            // CSS Transforms only gives the context root and 3D-transformed
+            // participants their own planes. An ordinary flat wrapper with
+            // no 3D subtree stays in its ancestor's Appendix-E plane, so its
+            // positioned descendants must escape this provisional capture.
+            // <https://drafts.csswg.org/css-transforms-2/#3d-rendering-contexts>
+            self.positioned_layers
+                .extend(std::mem::take(&mut child_layers));
+        }
         for layer in &child_layers {
             if !fragments
                 .iter()
@@ -610,8 +653,33 @@ impl<'a> LayoutBuilder<'a> {
                     page_width,
                     page_height,
                 )));
-            let mut policy =
-                StackingContextPolicy::for_non_positioned_effect(element, style, bounds);
+            // The captured fragment's bounds are paint ink, not the used box
+            // that CSS Transforms uses for transform-origin and percentage
+            // translations. Block layout reports that exact untransformed
+            // border box after sizing, while paint bounds remain responsible
+            // only for context culling and stacking.
+            let geometry = self
+                .last_principal_transform_box
+                .map(|transform_box| {
+                    assets::PrincipalPaintGeometry::with_transform_box(bounds, transform_box)
+                })
+                .unwrap_or_else(|| assets::PrincipalPaintGeometry::css_layout(bounds));
+            let mut policy = StackingContextPolicy::for_non_positioned_effect_with_geometry(
+                element, style, geometry,
+            );
+            if matches!(
+                layout_kind,
+                ElementLayoutKind::Canvas
+                    | ElementLayoutKind::Image
+                    | ElementLayoutKind::GeneratedImage
+                    | ElementLayoutKind::Svg
+            ) {
+                // Replaced content carries its used content-edge contour on
+                // the image/SVG primitive.  This dispatcher scope contains
+                // the element's own background and border as well, so the
+                // generic padding-box overflow effect must not wrap it.
+                policy.effects.clear_overflow_clip_effects();
+            }
             if self
                 .document_canvas_overflow
                 .is_viewport_overflow_source(element)
@@ -621,10 +689,22 @@ impl<'a> LayoutBuilder<'a> {
                 // stacking policy only sees computed style, so remove the
                 // stale local clip at this used-value boundary.
                 // <https://drafts.csswg.org/css-overflow-3/#overflow-propagation>
-                policy.effects.overflow_clip = None;
-                policy.effects.rounded_overflow_clip = None;
+                policy.effects.clear_overflow_clip_effects();
             }
-            if let Some(overflow_clip) = policy.effects.overflow_clip.take() {
+            if fragment.top_level_contents_overflow_clip().is_some() {
+                // The formatting context already resolved this box's
+                // padding-box edge from used geometry and retained it around
+                // its descendants. Reconstructing another overflow effect
+                // from captured ink can duplicate the clip and substitute a
+                // transformed child's source bounds for the owner's
+                // scrollport.
+                // <https://www.w3.org/TR/css-overflow-3/#overflow-clipping>
+                // <https://www.w3.org/TR/css-transforms-1/#transform-rendering>
+                policy.effects.clear_overflow_clip_effects();
+            }
+            if let Some(crate::document::paint::contours::OverflowClipEffect::Rect(overflow_clip)) =
+                policy.effects.overflow_clip_effect.take()
+            {
                 if matches!(policy.context_kind, StackingContextKind::None)
                     && child_contexts.is_empty()
                 {
@@ -653,6 +733,7 @@ impl<'a> LayoutBuilder<'a> {
             if matches!(policy.context_kind, StackingContextKind::None)
                 && child_contexts.is_empty()
                 && policy.effects == PaintEffects::default()
+                && !contains_affine_3d_subtree
             {
                 self.append_or_defer_scoped_paint_fragment(page_index, fragment);
                 continue;
@@ -710,27 +791,114 @@ impl<'a> LayoutBuilder<'a> {
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
     ) {
-        if self.absolute_static_position.is_none()
-            && style.abspos_static_source.is_inline_level()
-            && let Some(static_baseline_y) = self.current_page.lines.last().map(|line| line.y())
-        {
+        if self.absolute_static_position.is_none() && style.abspos_static_source.is_inline_level() {
+            // A direct inline-level positioned child of a block formatting
+            // context still has an inline hypothetical box.  Measuring it
+            // against the previous committed page line loses the current
+            // float exclusions (and therefore `direction`/`text-align`)
+            // whenever no ordinary inline sibling has painted a line yet.
+            // Reuse the same non-painting placeholder path as collected
+            // inline descendants so the hypothetical static position is
+            // selected by the current line formatting context.
+            //
+            // The source style inherits the block's inline formatting
+            // properties, which are the only block-style inputs used by this
+            // empty source stream. The placeholder itself supplies the
+            // blockified subject's hypothetical footprint.
+            // <https://drafts.csswg.org/css-position-3/#staticpos-rect>
+            // <https://www.w3.org/TR/CSS22/visudet.html#abs-non-replaced-width>
+            let static_position = self.inline_static_position_from_hypothetical_placeholder(
+                element,
+                style,
+                stylesheets,
+                child_boxes,
+                table_fragment,
+                style,
+                None,
+                &[],
+            );
             self.layout_positioned_block_with_inline_static_position(
                 element,
                 style,
                 stylesheets,
                 child_boxes,
                 table_fragment,
-                InlineStaticPosition {
-                    start_x: self.content_left,
-                    end_x: self.content_right,
-                    top_y: self.cursor_y,
-                    baseline_y: static_baseline_y,
-                    use_margin_box_top: false,
-                },
+                static_position,
             );
             return;
         }
+        let previous_absolute_static_position = self.absolute_static_position;
+        if !style.abspos_static_source.is_inline_level()
+            && (self
+                .absolute_static_position
+                .and_then(AbsoluteStaticPosition::static_alignment)
+                .is_none()
+                || self.escaped_atom_positioning_depth > 0)
+        {
+            let context = self.block_static_position_contexts.last().copied();
+            let writing_mode = context.map_or(self.containing_block_writing_mode, |context| {
+                context.axes.writing_mode()
+            });
+            let direction = context.map_or(self.containing_block_direction, |context| {
+                context.axes.direction()
+            });
+            // A block-level positioned source following a buffered inline
+            // run is hypothetically placed after that run's line boxes. The
+            // deferred line advance must be part of the retained static
+            // rectangle itself: final abspos self-alignment resolves from
+            // this rectangle and would otherwise discard a later scalar
+            // static-position correction.
+            // <https://drafts.csswg.org/css-position-3/#staticpos-rect>
+            let static_block_top_y = if writing_mode.has_vertical_lines() {
+                self.cursor_y
+            } else {
+                self.cursor_y - self.block_static_position_y_offset.unwrap_or(0.0)
+            };
+            let area = if writing_mode.has_vertical_lines() {
+                let x = match block_start_side(writing_mode) {
+                    PhysicalSide::Left => self.content_left,
+                    PhysicalSide::Right => self.content_right,
+                    PhysicalSide::Top | PhysicalSide::Bottom => {
+                        unreachable!("a vertical writing mode has a horizontal block axis")
+                    }
+                };
+                PageTopRect::new(
+                    x,
+                    context.map_or(self.cursor_y, |context| context.content_rect.top_y()),
+                    0.0,
+                    context.map_or(0.0, |context| context.content_rect.height()),
+                )
+            } else {
+                PageTopRect::new(
+                    self.content_left,
+                    static_block_top_y,
+                    (self.content_right - self.content_left).max(0.0),
+                    0.0,
+                )
+            };
+            let rectangle = StaticPositionRectangle {
+                area,
+                writing_mode,
+                direction,
+                justify_items: context
+                    .map_or(css::SelfAlignment::NORMAL, |context| context.justify_items),
+                align_items: context
+                    .map_or(css::SelfAlignment::NORMAL, |context| context.align_items),
+            };
+            self.absolute_static_position = Some(
+                self.absolute_static_position
+                    .unwrap_or_else(|| {
+                        AbsoluteStaticPosition::from_page_rect(
+                            self.content_left,
+                            self.content_right,
+                            static_block_top_y,
+                        )
+                    })
+                    .with_static_position_rectangle(rectangle),
+            );
+        }
         self.layout_positioned_block(element, style, stylesheets, child_boxes, table_fragment);
+        self.absolute_static_position = previous_absolute_static_position;
     }
 
     pub(in crate::layout) fn layout_anonymous_block(
@@ -883,8 +1051,10 @@ impl<'a> LayoutBuilder<'a> {
                     return InlineLayoutOutcome {
                         next_line_index: 0,
                         clamp_line_slots: 0,
+                        clamp_block_advance: Default::default(),
                         has_non_phantom_line: true,
                         has_flow_effects: true,
+                        has_local_continuation_cutoff: false,
                     };
                 }
                 Err(returned_items) => items = returned_items,

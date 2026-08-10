@@ -527,11 +527,20 @@ pub(in crate::layout::flex) fn taffy_justify_content(
             keyword: taffy_layout::AlignContentKeyword::End,
             safety,
         }),
-        ContentAlignmentKeyword::Left => Some(
-            if matches!(
-                flex_direction,
-                FlexDirection::RowReverse | FlexDirection::ColumnReverse
-            ) {
+        // `left` and `right` only have a physical meaning when the main axis
+        // is parallel to the inline axis. On a column main axis they compute
+        // to `start`, including for reverse flex directions.
+        // <https://drafts.csswg.org/css-align-3/#justify-content-property>
+        ContentAlignmentKeyword::Left | ContentAlignmentKeyword::Right
+            if flex_direction.is_column_axis() =>
+        {
+            Some(taffy_layout::JustifyContent {
+                keyword: taffy_layout::AlignContentKeyword::Start,
+                safety,
+            })
+        }
+        ContentAlignmentKeyword::Left => {
+            Some(if matches!(flex_direction, FlexDirection::RowReverse) {
                 taffy_layout::JustifyContent {
                     keyword: taffy_layout::AlignContentKeyword::FlexEnd,
                     safety,
@@ -541,20 +550,10 @@ pub(in crate::layout::flex) fn taffy_justify_content(
                     keyword: taffy_layout::AlignContentKeyword::FlexStart,
                     safety,
                 }
-            },
-        ),
+            })
+        }
         ContentAlignmentKeyword::Right => {
-            Some(if matches!(flex_direction, FlexDirection::Column) {
-                taffy_layout::JustifyContent {
-                    keyword: taffy_layout::AlignContentKeyword::FlexStart,
-                    safety,
-                }
-            } else if matches!(flex_direction, FlexDirection::ColumnReverse) {
-                taffy_layout::JustifyContent {
-                    keyword: taffy_layout::AlignContentKeyword::FlexEnd,
-                    safety,
-                }
-            } else if matches!(flex_direction, FlexDirection::RowReverse) {
+            Some(if matches!(flex_direction, FlexDirection::RowReverse) {
                 taffy_layout::JustifyContent {
                     keyword: taffy_layout::AlignContentKeyword::FlexStart,
                     safety,
@@ -706,7 +705,6 @@ pub(in crate::layout::flex) enum FlexBaselineSource {
 pub(in crate::layout::flex) enum FlexBaselineParticipation {
     Shares,
     Fallback,
-    AutoCrossMargin,
 }
 
 /// An item resolved for one first- or last-baseline set.
@@ -717,21 +715,113 @@ pub(in crate::layout::flex) struct ResolvedFlexBaselineParticipant {
     pub(in crate::layout::flex) participation: FlexBaselineParticipation,
 }
 
-/// The complete first- or last-baseline decision for a single flex line.
+/// The final cross-axis behavior of one flex item after CSS Align has resolved
+/// `align-self:auto` and the item's writing-mode-dependent sides.
 ///
-/// The physical line axis is derived from authored `flex-direction` and the
-/// container writing mode.  It is deliberately retained separately from the
-/// physical Taffy direction, which is only an adapter for geometry:
-/// <https://www.w3.org/TR/css-flexbox-1/#flex-baselines> and
-/// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::layout::flex) struct FlexBaselineResolution {
-    pub(in crate::layout::flex) baseline_set: FlexBaselineSet,
-    pub(in crate::layout::flex) line_axis: PhysicalAxis,
-    pub(in crate::layout::flex) participants: Vec<ResolvedFlexBaselineParticipant>,
+/// Taffy receives only a sizing-compatible placeholder for several of these
+/// values. This record preserves the CSS decision until final flex-line slots
+/// exist, preventing later remeasurement from mixing a stale Taffy position
+/// with Quire's baseline or subject-axis correction.
+/// <https://www.w3.org/TR/css-align-3/#self-alignment> and
+/// <https://www.w3.org/TR/css-flexbox-1/#algo-cross-align>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout::flex) enum FlexCrossPlacementMode {
+    AutoCrossMargin,
+    Stretch,
+    Side(PhysicalSide),
+    Center,
+    Baseline {
+        set: FlexBaselineSet,
+        source: FlexBaselineSource,
+        participation: FlexBaselineParticipation,
+    },
 }
 
-/// Resolve and apply every flex baseline self-alignment exactly once.
+/// Final CSS cross-axis alignment data for an active flex item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout::flex) struct ResolvedFlexCrossAlignment {
+    pub(in crate::layout::flex) mode: FlexCrossPlacementMode,
+    pub(in crate::layout::flex) safety: AlignmentSafety,
+    pub(in crate::layout::flex) flex_cross_start: PhysicalSide,
+    pub(in crate::layout::flex) flex_cross_end: PhysicalSide,
+    pub(in crate::layout::flex) self_start: PhysicalSide,
+    pub(in crate::layout::flex) self_end: PhysicalSide,
+}
+
+/// Derive the CSS cross-axis alignment decision once for each active item.
+pub(in crate::layout::flex) fn resolve_flex_cross_alignments(
+    estimates: &[FlexItemEstimate],
+    children: &[StyledChild<'_>],
+    container_style: &ComputedStyle,
+    physical_direction: FlexDirection,
+) -> Vec<ResolvedFlexCrossAlignment> {
+    let flex_cross_start = flex_cross_start_side(container_style);
+    let flex_cross_end = flex_cross_end_side(container_style);
+    let baseline_line_axis = flex_baseline_line_axis(container_style);
+    children
+        .iter()
+        .zip(estimates)
+        .map(|(child, estimate)| {
+            let child_style = &child.style;
+            let alignment = effective_align_self(child_style, container_style);
+            let self_start = child_self_start_side(child_style, container_style);
+            let self_end = child_self_end_side(child_style, container_style);
+            let mode = if flex_item_has_auto_cross_margin(child_style, physical_direction) {
+                FlexCrossPlacementMode::AutoCrossMargin
+            } else {
+                match alignment.keyword {
+                    SelfAlignmentKeyword::Baseline | SelfAlignmentKeyword::LastBaseline => {
+                        let set = if alignment.keyword == SelfAlignmentKeyword::Baseline {
+                            FlexBaselineSet::First
+                        } else {
+                            FlexBaselineSet::Last
+                        };
+                        let participation = if flex_item_baseline_axis_is_parallel_to_main_axis(
+                            child_style,
+                            physical_direction,
+                        ) {
+                            FlexBaselineParticipation::Shares
+                        } else {
+                            // The fallback is resolved by the final baseline
+                            // placement phase, which preserves the packed
+                            // `wrap-reverse` line slot before aligning the
+                            // subject to safe self-start/self-end.
+                            FlexBaselineParticipation::Fallback
+                        };
+                        FlexCrossPlacementMode::Baseline {
+                            set,
+                            source: flex_item_baseline_source(estimate, set, baseline_line_axis),
+                            participation,
+                        }
+                    }
+                    SelfAlignmentKeyword::Center => FlexCrossPlacementMode::Center,
+                    SelfAlignmentKeyword::SelfStart => FlexCrossPlacementMode::Side(self_start),
+                    SelfAlignmentKeyword::SelfEnd => FlexCrossPlacementMode::Side(self_end),
+                    SelfAlignmentKeyword::End | SelfAlignmentKeyword::FlexEnd => {
+                        FlexCrossPlacementMode::Side(flex_cross_end)
+                    }
+                    SelfAlignmentKeyword::Normal
+                    | SelfAlignmentKeyword::Stretch
+                    | SelfAlignmentKeyword::Auto => FlexCrossPlacementMode::Stretch,
+                    SelfAlignmentKeyword::Start
+                    | SelfAlignmentKeyword::FlexStart
+                    | SelfAlignmentKeyword::Left
+                    | SelfAlignmentKeyword::Right => FlexCrossPlacementMode::Side(flex_cross_start),
+                }
+            };
+            ResolvedFlexCrossAlignment {
+                mode,
+                safety: alignment.safety,
+                flex_cross_start,
+                flex_cross_end,
+                self_start,
+                self_end,
+            }
+        })
+        .collect()
+}
+
+/// Resolve every flex cross-axis placement exactly once.
 ///
 /// Taffy's measure callback has no baseline channel, so its output is used for
 /// flex sizing and line construction only.  Quire then resolves CSS Flexbox
@@ -740,38 +830,80 @@ pub(in crate::layout::flex) struct FlexBaselineResolution {
 /// row, column, and fallback passes disagreeing about the same item:
 /// <https://www.w3.org/TR/css-flexbox-1/#algo-cross-line> and
 /// <https://drafts.csswg.org/css-align-3/#baseline-align-self>.
-pub(in crate::layout::flex) fn resolve_flex_baseline_self_alignment(
+pub(in crate::layout::flex) fn finalize_flex_cross_axis_placement(
     items: &mut [FlexItemLayout],
     estimates: &[FlexItemEstimate],
     children: &[StyledChild<'_>],
     lines: &mut [FlexLineLayout],
     container_style: &ComputedStyle,
     physical_direction: FlexDirection,
+    alignments: &[ResolvedFlexCrossAlignment],
 ) {
     for line in &*lines {
+        for &index in &line.item_indices {
+            let alignment = alignments[index];
+            let child_style = &children[index].style;
+            match alignment.mode {
+                FlexCrossPlacementMode::AutoCrossMargin | FlexCrossPlacementMode::Stretch => {}
+                FlexCrossPlacementMode::Side(side) => {
+                    let outer_size =
+                        item_outer_cross_size(&items[index], child_style, physical_direction);
+                    let target_side = if alignment.safety == AlignmentSafety::Safe
+                        && (line.cross_size() - outer_size).is_negative()
+                    {
+                        alignment.flex_cross_start
+                    } else {
+                        side
+                    };
+                    align_item_cross_side(
+                        &mut items[index],
+                        child_style,
+                        physical_direction,
+                        line,
+                        target_side,
+                    );
+                }
+                FlexCrossPlacementMode::Center => {
+                    align_item_cross_center(
+                        &mut items[index],
+                        child_style,
+                        physical_direction,
+                        line,
+                        alignment,
+                    );
+                }
+                FlexCrossPlacementMode::Baseline { .. } => {}
+            }
+        }
         for baseline_set in [FlexBaselineSet::First, FlexBaselineSet::Last] {
-            let resolution = resolve_flex_line_baseline_set(
-                line,
-                estimates,
-                children,
-                container_style,
-                baseline_set,
-                physical_direction,
-            );
-            if resolution.participants.is_empty() {
+            let participants = line
+                .item_indices
+                .iter()
+                .filter_map(|&index| match alignments[index].mode {
+                    FlexCrossPlacementMode::Baseline {
+                        set,
+                        source,
+                        participation,
+                    } if set == baseline_set => Some(ResolvedFlexBaselineParticipant {
+                        index,
+                        source,
+                        participation,
+                    }),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if participants.is_empty() {
                 continue;
             }
 
-            let mut sharing_participants = resolution
-                .participants
+            let mut sharing_participants = participants
                 .iter()
                 .filter(|participant| {
                     participant.participation == FlexBaselineParticipation::Shares
                 })
                 .copied()
                 .collect::<Vec<_>>();
-            let mut fallback_indices = resolution
-                .participants
+            let mut fallback_indices = participants
                 .iter()
                 .filter(|participant| {
                     participant.participation == FlexBaselineParticipation::Fallback
@@ -780,8 +912,9 @@ pub(in crate::layout::flex) fn resolve_flex_baseline_self_alignment(
                 .collect::<Vec<_>>();
 
             // CSS Align requires at least two compatible participants for a
-            // baseline-sharing group.  A sole otherwise-compatible item uses
+            // baseline-sharing group. A sole otherwise-compatible item uses
             // the same safe self-alignment fallback as an incompatible item.
+            // <https://drafts.csswg.org/css-align-3/#baseline-alignment>
             if sharing_participants.len() <= 1 {
                 fallback_indices.extend(
                     sharing_participants
@@ -838,47 +971,33 @@ pub(in crate::layout::flex) fn resolve_flex_baseline_self_alignment(
     );
 }
 
-pub(in crate::layout::flex) fn resolve_flex_line_baseline_set(
-    line: &FlexLineLayout,
-    estimates: &[FlexItemEstimate],
-    children: &[StyledChild<'_>],
-    container_style: &ComputedStyle,
-    baseline_set: FlexBaselineSet,
+/// Align a margin box to the center of one final flex-line slot.
+fn align_item_cross_center(
+    item: &mut FlexItemLayout,
+    child_style: &ComputedStyle,
     physical_direction: FlexDirection,
-) -> FlexBaselineResolution {
-    let line_axis = flex_baseline_line_axis(container_style);
-    let participants = line
-        .item_indices
-        .iter()
-        .copied()
-        .filter(|&index| {
-            flex_baseline_set(&children[index].style, container_style) == Some(baseline_set)
-        })
-        .map(|index| {
-            let child_style = &children[index].style;
-            let participation = if flex_item_has_auto_cross_margin(child_style, physical_direction)
-            {
-                FlexBaselineParticipation::AutoCrossMargin
-            } else if flex_item_baseline_axis_is_parallel_to_main_axis(
-                child_style,
-                physical_direction,
-            ) {
-                FlexBaselineParticipation::Shares
-            } else {
-                FlexBaselineParticipation::Fallback
-            };
-            ResolvedFlexBaselineParticipant {
-                index,
-                source: flex_item_baseline_source(&estimates[index], baseline_set, line_axis),
-                participation,
-            }
-        })
-        .collect();
-    FlexBaselineResolution {
-        baseline_set,
-        line_axis,
-        participants,
+    line: &FlexLineLayout,
+    alignment: ResolvedFlexCrossAlignment,
+) {
+    let outer_size = item_outer_cross_size(item, child_style, physical_direction);
+    if alignment.safety == AlignmentSafety::Safe && (line.cross_size() - outer_size).is_negative() {
+        align_item_cross_side(
+            item,
+            child_style,
+            physical_direction,
+            line,
+            alignment.flex_cross_start,
+        );
+        return;
     }
+    let axes = FlexAxes::from_physical_direction(PhysicalFlexDirection::new(physical_direction));
+    let free_space = line.cross_size() - outer_size;
+    let cross_start = if physical_direction.is_row_axis() {
+        line.cross_start + free_space.half() + FlexCrossLength::new(child_style.margin.top)
+    } else {
+        line.cross_start + free_space.half() + FlexCrossLength::new(child_style.margin.left)
+    };
+    item.set_cross_start(axes, cross_start);
 }
 
 pub(in crate::layout::flex) fn flex_item_baseline_source(
@@ -1051,6 +1170,27 @@ pub(in crate::layout::flex) fn measured_item_horizontal_border_box_baseline(
     container_style: &ComputedStyle,
     baseline_set: FlexBaselineSet,
 ) -> FlexHorizontalBaselineOffset {
+    measured_item_horizontal_border_box_baseline_for_line_axis(
+        item,
+        estimate,
+        child_style,
+        container_style,
+        baseline_set,
+        flex_baseline_line_axis(container_style),
+    )
+}
+
+/// Return an item's physical horizontal baseline for the supplied baseline
+/// line axis. Flex container baseline export can request an axis different
+/// from the line's self-alignment axis, notably for a column flex container.
+pub(in crate::layout::flex) fn measured_item_horizontal_border_box_baseline_for_line_axis(
+    item: &FlexItemLayout,
+    estimate: &FlexItemEstimate,
+    child_style: &ComputedStyle,
+    container_style: &ComputedStyle,
+    baseline_set: FlexBaselineSet,
+    baseline_line_axis: PhysicalAxis,
+) -> FlexHorizontalBaselineOffset {
     let measured = match baseline_set {
         FlexBaselineSet::First => estimate.baselines.horizontal.first,
         FlexBaselineSet::Last => estimate.baselines.horizontal.last,
@@ -1061,7 +1201,7 @@ pub(in crate::layout::flex) fn measured_item_horizontal_border_box_baseline(
             child_style,
             container_style,
             baseline_set,
-            flex_baseline_line_axis(container_style),
+            baseline_line_axis,
         )
         .horizontal()
     })
@@ -1152,7 +1292,7 @@ pub(in crate::layout::flex) fn synthesized_item_border_box_baseline(
     };
     match side {
         PhysicalSide::Top => {
-            FlexPhysicalBaselineOffset::Vertical(FlexVerticalBaselineOffset::new(0.0))
+            FlexPhysicalBaselineOffset::Vertical(flex_vertical_baseline_from_points(0.0))
         }
         PhysicalSide::Right => FlexPhysicalBaselineOffset::Horizontal(
             flex_horizontal_baseline_from_physical_width(item.width()),
@@ -1161,7 +1301,7 @@ pub(in crate::layout::flex) fn synthesized_item_border_box_baseline(
             flex_vertical_baseline_from_physical_height(item.height()),
         ),
         PhysicalSide::Left => {
-            FlexPhysicalBaselineOffset::Horizontal(FlexHorizontalBaselineOffset::new(0.0))
+            FlexPhysicalBaselineOffset::Horizontal(flex_horizontal_baseline_from_points(0.0))
         }
     }
 }
@@ -1234,6 +1374,7 @@ mod tests {
     fn measured_baseline_selection_uses_order_modified_flex_line_order() {
         let line = FlexLineLayout {
             item_indices: vec![2, 5],
+            logical_cross_start_rank: 0,
             source_start: 0,
             source_end: 2,
             main_start: FlexMainOffset::new(0.0),
@@ -1281,18 +1422,6 @@ mod tests {
 
     #[test]
     fn baseline_resolution_keeps_sharing_fallback_and_auto_margin_distinct() {
-        let line = FlexLineLayout {
-            item_indices: vec![0, 1, 2],
-            source_start: 0,
-            source_end: 3,
-            main_start: FlexMainOffset::new(0.0),
-            main_end: FlexMainOffset::new(30.0),
-            cross_start: FlexCrossOffset::new(0.0),
-            cross_end: FlexCrossOffset::new(20.0),
-            first_baseline: None,
-            last_baseline: None,
-            collapsed_struts: Vec::new(),
-        };
         let mut measured_style = ComputedStyle::initial();
         measured_style.align_self = css::SelfAlignment::new(SelfAlignmentKeyword::Baseline);
         let mut orthogonal_style = measured_style.clone();
@@ -1323,7 +1452,7 @@ mod tests {
             PhysicalContentWidth::new(content_box_pt(10.0)),
             PhysicalContentHeight::new(content_box_pt(10.0)),
         );
-        measured.baselines.vertical.first = Some(FlexVerticalBaselineOffset::new(5.0));
+        measured.baselines.vertical.first = Some(flex_vertical_baseline_from_points(5.0));
         let estimates = vec![
             measured,
             FlexItemEstimate::fixed(
@@ -1337,42 +1466,143 @@ mod tests {
         ];
         let container = ComputedStyle::initial();
 
-        let resolution = resolve_flex_line_baseline_set(
-            &line,
-            &estimates,
-            &children,
-            &container,
-            FlexBaselineSet::First,
-            FlexDirection::Row,
-        );
+        let alignments =
+            resolve_flex_cross_alignments(&estimates, &children, &container, FlexDirection::Row);
 
-        assert_eq!(resolution.line_axis, PhysicalAxis::Horizontal);
         assert_eq!(
-            resolution.participants,
-            vec![
-                ResolvedFlexBaselineParticipant {
-                    index: 0,
-                    source: FlexBaselineSource::Measured,
-                    participation: FlexBaselineParticipation::Shares,
-                },
-                ResolvedFlexBaselineParticipant {
-                    index: 1,
-                    source: FlexBaselineSource::Synthesized,
-                    participation: FlexBaselineParticipation::Fallback,
-                },
-                ResolvedFlexBaselineParticipant {
-                    index: 2,
-                    source: FlexBaselineSource::Synthesized,
-                    participation: FlexBaselineParticipation::AutoCrossMargin,
-                },
-            ]
+            alignments[0].mode,
+            FlexCrossPlacementMode::Baseline {
+                set: FlexBaselineSet::First,
+                source: FlexBaselineSource::Measured,
+                participation: FlexBaselineParticipation::Shares,
+            }
         );
+        assert_eq!(
+            alignments[1].mode,
+            FlexCrossPlacementMode::Baseline {
+                set: FlexBaselineSet::First,
+                source: FlexBaselineSource::Synthesized,
+                participation: FlexBaselineParticipation::Fallback,
+            }
+        );
+        assert_eq!(alignments[2].mode, FlexCrossPlacementMode::AutoCrossMargin);
+    }
+
+    #[test]
+    fn cross_alignment_resolution_preserves_subject_sides_and_safe_centering() {
+        let mut self_end_style = ComputedStyle::initial();
+        self_end_style.align_self = css::SelfAlignment::safe(SelfAlignmentKeyword::SelfEnd);
+
+        let mut center_style = ComputedStyle::initial();
+        center_style.align_self = css::SelfAlignment::safe(SelfAlignmentKeyword::Center);
+
+        let mut auto_margin_style = ComputedStyle::initial();
+        auto_margin_style.align_self = css::SelfAlignment::new(SelfAlignmentKeyword::Center);
+        auto_margin_style.box_values.margin.top = css::ComputedLengthPercentageOrAuto::Auto;
+
+        let children = vec![
+            StyledChild {
+                kind: FormattingContextChildKind::AnonymousContent {
+                    children: Vec::new(),
+                },
+                style: self_end_style,
+            },
+            StyledChild {
+                kind: FormattingContextChildKind::AnonymousContent {
+                    children: Vec::new(),
+                },
+                style: center_style,
+            },
+            StyledChild {
+                kind: FormattingContextChildKind::AnonymousContent {
+                    children: Vec::new(),
+                },
+                style: auto_margin_style,
+            },
+        ];
+        let estimates = vec![
+            FlexItemEstimate::fixed(
+                PhysicalContentWidth::new(content_box_pt(10.0)),
+                PhysicalContentHeight::new(content_box_pt(10.0)),
+            );
+            3
+        ];
+        let container = ComputedStyle::initial();
+        let alignments =
+            resolve_flex_cross_alignments(&estimates, &children, &container, FlexDirection::Row);
+
+        assert_eq!(
+            alignments[0].mode,
+            FlexCrossPlacementMode::Side(PhysicalSide::Bottom)
+        );
+        assert_eq!(alignments[0].safety, AlignmentSafety::Safe);
+        assert_eq!(alignments[0].self_start, PhysicalSide::Top);
+        assert_eq!(alignments[0].self_end, PhysicalSide::Bottom);
+        assert_eq!(alignments[1].mode, FlexCrossPlacementMode::Center);
+        assert_eq!(alignments[1].safety, AlignmentSafety::Safe);
+        assert_eq!(alignments[2].mode, FlexCrossPlacementMode::AutoCrossMargin);
+    }
+
+    #[test]
+    fn centered_cross_placement_uses_margin_box_geometry_and_safe_start() {
+        let mut child_style = ComputedStyle::initial();
+        child_style.margin.top = -5.0;
+        child_style.margin.bottom = 15.0;
+        let line = FlexLineLayout {
+            item_indices: vec![0],
+            logical_cross_start_rank: 0,
+            source_start: 0,
+            source_end: 1,
+            main_start: FlexMainOffset::new(0.0),
+            main_end: FlexMainOffset::new(10.0),
+            cross_start: FlexCrossOffset::new(0.0),
+            cross_end: FlexCrossOffset::new(100.0),
+            first_baseline: None,
+            last_baseline: None,
+            collapsed_struts: Vec::new(),
+        };
+        let mut item = FlexItemLayout::new(ContainerRect::new(
+            ContainerPoint::new(0.0, 0.0),
+            ContainerSize::new(10.0, 10.0),
+        ));
+        let centered = ResolvedFlexCrossAlignment {
+            mode: FlexCrossPlacementMode::Center,
+            safety: AlignmentSafety::Default,
+            flex_cross_start: PhysicalSide::Top,
+            flex_cross_end: PhysicalSide::Bottom,
+            self_start: PhysicalSide::Top,
+            self_end: PhysicalSide::Bottom,
+        };
+
+        align_item_cross_center(&mut item, &child_style, FlexDirection::Row, &line, centered);
+        // The margin box is 20px tall, so its 40px cross start is centered
+        // in the 100px line slot; the border box starts 5px before it.
+        assert_eq!(item.y(), FlexPhysicalVerticalOffset::new(35.0));
+
+        let mut overflowing_line = line.clone();
+        overflowing_line.cross_end = FlexCrossOffset::new(10.0);
+        let mut safe_item = FlexItemLayout::new(ContainerRect::new(
+            ContainerPoint::new(0.0, 0.0),
+            ContainerSize::new(10.0, 10.0),
+        ));
+        align_item_cross_center(
+            &mut safe_item,
+            &child_style,
+            FlexDirection::Row,
+            &overflowing_line,
+            ResolvedFlexCrossAlignment {
+                safety: AlignmentSafety::Safe,
+                ..centered
+            },
+        );
+        assert_eq!(safe_item.y(), FlexPhysicalVerticalOffset::new(-5.0));
     }
 
     #[test]
     fn baseline_sharing_resolves_absolute_cross_starts_from_line_baseline() {
         let line = FlexLineLayout {
             item_indices: vec![0, 1],
+            logical_cross_start_rank: 0,
             source_start: 0,
             source_end: 2,
             main_start: FlexMainOffset::new(0.0),
@@ -1387,9 +1617,9 @@ mod tests {
             PhysicalContentWidth::new(content_box_pt(10.0)),
             PhysicalContentHeight::new(content_box_pt(10.0)),
         );
-        first.baselines.vertical.first = Some(FlexVerticalBaselineOffset::new(4.0));
+        first.baselines.vertical.first = Some(flex_vertical_baseline_from_points(4.0));
         let mut second = first;
-        second.baselines.vertical.first = Some(FlexVerticalBaselineOffset::new(8.0));
+        second.baselines.vertical.first = Some(flex_vertical_baseline_from_points(8.0));
         let children = vec![
             StyledChild {
                 kind: FormattingContextChildKind::AnonymousContent {

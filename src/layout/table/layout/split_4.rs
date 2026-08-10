@@ -120,7 +120,7 @@ pub(in crate::layout::table) fn table_cell_content_pass(
 pub(in crate::layout::table) fn table_cell_content_relayout_policy(
     cell_style: &ComputedStyle,
     table_style: &ComputedStyle,
-    table_height_is_definite: bool,
+    _table_height_is_definite: bool,
 ) -> TableCellContentSizingPolicy {
     if cell_style
         .box_values
@@ -130,15 +130,13 @@ pub(in crate::layout::table) fn table_cell_content_relayout_policy(
     {
         return TableCellContentSizingPolicy::FinalRelayout;
     }
-    if table_height_is_definite
-        && (matches!(
-            table_style.box_values.height.value().clone(),
-            css::ComputedLengthPercentageOrAuto::LengthPercentage(_)
-        ) || matches!(
-            table_style.box_values.min_height.clone(),
-            css::ComputedLengthPercentageOrAuto::LengthPercentage(_)
-        ))
-    {
+    if matches!(
+        table_style.box_values.height.value().clone(),
+        css::ComputedLengthPercentageOrAuto::LengthPercentage(_)
+    ) || matches!(
+        table_style.box_values.min_height.clone(),
+        css::ComputedLengthPercentageOrAuto::LengthPercentage(_)
+    ) {
         return TableCellContentSizingPolicy::FinalRelayout;
     }
     TableCellContentSizingPolicy::RowMinimum
@@ -692,6 +690,21 @@ mod tests {
             .final_basis()
             .expect("only a committed cell height selects the replaced-content relayout pass");
         assert_eq!(basis.percentage_basis().points(), Some(80.0));
+    }
+
+    #[test]
+    fn percentage_table_height_selects_final_relayout_even_if_its_basis_is_indefinite() {
+        let cell = ComputedStyle::initial();
+        let mut table = ComputedStyle::initial();
+        table.box_values.height.replace_with_used(
+            css::ComputedLengthPercentageOrAuto::LengthPercentage(
+                css::ComputedLengthPercentage::from_percent(1.0),
+            ),
+        );
+
+        let pass = table_cell_content_pass(&cell, &table, 80.0, css::Edges::ZERO, false);
+
+        assert!(matches!(pass, TableCellContentPass::FinalRelayout(_)));
     }
 
     fn first_element_by_tag<'a>(node: &'a Node, tag: &str) -> Option<&'a Element> {

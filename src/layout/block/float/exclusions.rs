@@ -49,6 +49,20 @@ impl FloatRunState {
 }
 
 impl FloatContext {
+    /// Whether this fragmentainer contains a CSS float in this block
+    /// formatting context.
+    ///
+    /// A normal-flow BFC root needs float-avoidance placement only when an
+    /// earlier CSS float can constrain its available inline space. Other flow
+    /// exclusions, such as initial letters, do not participate in CSS 2.2
+    /// float placement or clearance:
+    /// <https://www.w3.org/TR/CSS22/visuren.html#floats>.
+    pub(in crate::layout) fn has_css_float_on_page(&self, page_index: usize) -> bool {
+        self.shapes
+            .iter()
+            .any(|shape| shape.is_css_float() && shape.page_index == page_index)
+    }
+
     /// Resolve an initial letter's logical block-start column around already
     /// placed CSS floats.
     ///

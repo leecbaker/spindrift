@@ -73,19 +73,41 @@ impl BackgroundRepeat {
 /// <https://www.w3.org/TR/css-backgrounds-3/#border-color>.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct BorderColors {
+    pub top: CssColorOrCurrentColor,
+    pub right: CssColorOrCurrentColor,
+    pub bottom: CssColorOrCurrentColor,
+    pub left: CssColorOrCurrentColor,
+}
+
+impl BorderColors {
+    pub const CURRENT_COLOR: Self = Self {
+        top: CssColorOrCurrentColor::CurrentColor,
+        right: CssColorOrCurrentColor::CurrentColor,
+        bottom: CssColorOrCurrentColor::CurrentColor,
+        left: CssColorOrCurrentColor::CurrentColor,
+    };
+
+    pub(crate) const fn resolve(self, current_color: CssColor) -> ResolvedBorderColors {
+        ResolvedBorderColors {
+            top: self.top.resolve(current_color),
+            right: self.right.resolve(current_color),
+            bottom: self.bottom.resolve(current_color),
+            left: self.left.resolve(current_color),
+        }
+    }
+}
+
+/// Border colors ready for used-value layout and paint.
+///
+/// Keeping this separate from [`BorderColors`] prevents a symbolic
+/// `currentcolor` from reaching a painter without the foreground color of the
+/// concrete fragment that owns the border.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ResolvedBorderColors {
     pub top: CssColor,
     pub right: CssColor,
     pub bottom: CssColor,
     pub left: CssColor,
-}
-
-impl BorderColors {
-    pub const BLACK: Self = Self {
-        top: CssColor::BLACK,
-        right: CssColor::BLACK,
-        bottom: CssColor::BLACK,
-        left: CssColor::BLACK,
-    };
 }
 
 /// Computed physical border styles.

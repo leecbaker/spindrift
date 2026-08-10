@@ -1,4 +1,5 @@
 use super::*;
+use crate::css::quotes::{ResolvedAutoQuotes, resolved_auto_quotes_for_language};
 
 pub(in crate::css) static NEXT_ELEMENT_SIGNATURE_OPAQUE_ID: AtomicUsize = AtomicUsize::new(1);
 
@@ -366,20 +367,26 @@ pub(crate) enum GeneratedQuote {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Quotes {
-    Auto {
-        language: Option<String>,
-        resolved: bool,
-    },
+    Auto(AutoQuoteResolution),
     None,
     Pairs(Vec<(String, String)>),
 }
 
+/// Whether the `quotes: auto` value has captured its parent content language.
+///
+/// CSS Generated Content Level 3 resolves `auto` from that language at
+/// computed-value time. The resolved form retains only references to static
+/// quote data, not the language text itself:
+/// <https://www.w3.org/TR/css-content-3/#quotes-property>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AutoQuoteResolution {
+    Unresolved,
+    Resolved(ResolvedAutoQuotes),
+}
+
 impl Quotes {
     pub(crate) fn auto() -> Self {
-        Self::Auto {
-            language: None,
-            resolved: false,
-        }
+        Self::Auto(AutoQuoteResolution::Unresolved)
     }
 
     /// Return the value inherited by ordinary `quotes` inheritance.
@@ -390,28 +397,30 @@ impl Quotes {
     /// <https://www.w3.org/TR/css-content-3/#quotes-property>.
     pub(crate) fn inherited(&self) -> Self {
         match self {
-            Self::Auto { .. } => Self::auto(),
+            Self::Auto(_) => Self::auto(),
             Self::None => Self::None,
             Self::Pairs(pairs) => Self::Pairs(pairs.clone()),
         }
     }
 
     pub(crate) fn resolve_auto_language(&mut self, language: Option<&str>) {
-        if let Self::Auto {
-            language: auto_language,
-            resolved,
-        } = self
-            && !*resolved
-        {
-            *auto_language = language.map(str::to_string);
-            *resolved = true;
+        if let Self::Auto(resolution @ AutoQuoteResolution::Unresolved) = self {
+            *resolution =
+                AutoQuoteResolution::Resolved(resolved_auto_quotes_for_language(language));
         }
     }
 
-    pub(crate) fn auto_language(&self) -> Option<&str> {
-        match self {
-            Self::Auto { language, .. } => language.as_deref(),
-            Self::None | Self::Pairs(_) => None,
+    /// Return the static quotation marks selected for a resolved `quotes: auto`
+    /// value. An uncomputed initial style falls back to the default system.
+    pub(crate) fn auto_quote_pair(&self, depth: usize) -> (&'static str, &'static str) {
+        let Self::Auto(resolution) = self else {
+            unreachable!("only `Quotes::Auto` has an automatic quote pair")
+        };
+        match resolution {
+            AutoQuoteResolution::Unresolved => {
+                resolved_auto_quotes_for_language(None).pair_at_depth(depth)
+            }
+            AutoQuoteResolution::Resolved(system) => system.pair_at_depth(depth),
         }
     }
 }
@@ -487,14 +496,212 @@ pub(crate) enum MixBlendMode {
     Luminosity,
 }
 
+/// A finite CSS filter amount validated as non-negative.
+///
+/// CSS Filter Effects uses this grammar for functions such as `brightness()`
+/// and `saturate()`. Individual functions decide whether values above one are
+/// clamped, permitted, or require a raster backend.
+/// <https://www.w3.org/TR/filter-effects-1/#filter-functions>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct NonNegativeFilterAmount(f32);
+
+impl NonNegativeFilterAmount {
+    pub(crate) fn new(value: f32) -> Option<Self> {
+        (value.is_finite() && value >= 0.0).then_some(Self(value))
+    }
+
+    pub(crate) const fn value(self) -> f32 {
+        self.0
+    }
+
+    pub(crate) fn clamped_unit_interval(self) -> UnitFilterAmount {
+        UnitFilterAmount(self.0.min(1.0))
+    }
+}
+
+/// A CSS filter amount known to be in the closed unit interval.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct UnitFilterAmount(f32);
+
+impl UnitFilterAmount {
+    pub(crate) const ONE: Self = Self(1.0);
+
+    pub(crate) const fn value(self) -> f32 {
+        self.0
+    }
+
+    pub(crate) fn multiplied(self, other: Self) -> Self {
+        Self((self.0 * other.0).clamp(0.0, 1.0))
+    }
+}
+
+/// A bounded linear transform of encoded sRGB components.
+///
+/// Rows are non-negative and sum to at most one. This preserves the unit RGB
+/// cube, black, and alpha, which makes the transform distributable across a
+/// normal source-over paint tree without introducing a clamp-dependent color
+/// change. The type intentionally cannot represent color matrices such as
+/// `sepia()` or `hue-rotate()` that require a raster filter surface.
+/// <https://www.w3.org/TR/filter-effects-1/#filter-functions>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct BoundedSrgbColorTransform {
+    rows: [[f32; 3]; 3],
+}
+
+impl BoundedSrgbColorTransform {
+    const EPSILON: f32 = 1e-5;
+
+    pub(crate) const IDENTITY: Self = Self {
+        rows: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+    };
+
+    fn new(rows: [[f32; 3]; 3]) -> Option<Self> {
+        rows.iter()
+            .all(|row| {
+                row.iter()
+                    .all(|component| component.is_finite() && *component >= 0.0)
+                    && row.iter().sum::<f32>() <= 1.0 + Self::EPSILON
+            })
+            .then_some(Self { rows })
+    }
+
+    /// Compose `next` after this transform in CSS filter-list order.
+    pub(crate) fn then(self, next: Self) -> Self {
+        let mut rows = [[0.0; 3]; 3];
+        for (row_index, row) in rows.iter_mut().enumerate() {
+            for (column_index, component) in row.iter_mut().enumerate() {
+                *component = (0..3)
+                    .map(|index| next.rows[row_index][index] * self.rows[index][column_index])
+                    .sum();
+            }
+        }
+        Self::new(rows).expect("bounded sRGB transforms are closed under composition")
+    }
+
+    pub(crate) fn apply(self, components: [f32; 3]) -> [f32; 3] {
+        self.rows.map(|row| {
+            (row[0] * components[0] + row[1] * components[1] + row[2] * components[2])
+                .clamp(0.0, 1.0)
+        })
+    }
+
+    pub(crate) fn grayscale(amount: UnitFilterAmount) -> Self {
+        let amount = amount.value();
+        let retained = 1.0 - amount;
+        Self::new([
+            [
+                0.2126 + 0.7874 * retained,
+                0.7152 - 0.7152 * retained,
+                0.0722 - 0.0722 * retained,
+            ],
+            [
+                0.2126 - 0.2126 * retained,
+                0.7152 + 0.2848 * retained,
+                0.0722 - 0.0722 * retained,
+            ],
+            [
+                0.2126 - 0.2126 * retained,
+                0.7152 - 0.7152 * retained,
+                0.0722 + 0.9278 * retained,
+            ],
+        ])
+        .expect("CSS grayscale matrix is bounded for a unit amount")
+    }
+
+    pub(crate) fn saturate(amount: UnitFilterAmount) -> Self {
+        let amount = amount.value();
+        Self::new([
+            [
+                0.213 + 0.787 * amount,
+                0.715 - 0.715 * amount,
+                0.072 - 0.072 * amount,
+            ],
+            [
+                0.213 - 0.213 * amount,
+                0.715 + 0.285 * amount,
+                0.072 - 0.072 * amount,
+            ],
+            [
+                0.213 - 0.213 * amount,
+                0.715 - 0.715 * amount,
+                0.072 + 0.928 * amount,
+            ],
+        ])
+        .expect("CSS saturation matrix is bounded for a unit amount")
+    }
+
+    pub(crate) fn brightness(amount: UnitFilterAmount) -> Self {
+        let amount = amount.value();
+        Self::new([[amount, 0.0, 0.0], [0.0, amount, 0.0], [0.0, 0.0, amount]])
+            .expect("CSS brightness matrix is bounded for a unit amount")
+    }
+}
+
+/// The exact filter subset that can be lowered into ordinary source-over
+/// paint without a raster filter surface.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ExactFilterLowering {
+    pub(crate) color: BoundedSrgbColorTransform,
+    pub(crate) alpha: UnitFilterAmount,
+}
+
+/// Computed CSS filter functions retained for later execution selection.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum FilterFunction {
+    Grayscale(UnitFilterAmount),
+    Saturate(NonNegativeFilterAmount),
+    Brightness(NonNegativeFilterAmount),
+    Opacity(UnitFilterAmount),
+    /// A valid filter function that this first lowering pass cannot render.
+    RequiresRasterBackend(String),
+}
+
 /// Computed `filter` value retained for stacking and later effect emission.
 ///
 /// Non-`none` filter function lists establish a stacking context:
 /// <https://www.w3.org/TR/filter-effects-1/#FilterProperty>.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum FilterValue {
     None,
-    Functions(String),
+    Functions(Vec<FilterFunction>),
+}
+
+impl FilterValue {
+    pub(crate) fn exact_lowering(&self) -> Option<ExactFilterLowering> {
+        let Self::Functions(functions) = self else {
+            return None;
+        };
+        let mut lowering = ExactFilterLowering {
+            color: BoundedSrgbColorTransform::IDENTITY,
+            alpha: UnitFilterAmount::ONE,
+        };
+        for function in functions {
+            match *function {
+                FilterFunction::Grayscale(amount) => {
+                    lowering.color = lowering
+                        .color
+                        .then(BoundedSrgbColorTransform::grayscale(amount));
+                }
+                FilterFunction::Saturate(amount) if amount.value() <= 1.0 => {
+                    lowering.color = lowering.color.then(BoundedSrgbColorTransform::saturate(
+                        amount.clamped_unit_interval(),
+                    ));
+                }
+                FilterFunction::Brightness(amount) if amount.value() <= 1.0 => {
+                    lowering.color = lowering.color.then(BoundedSrgbColorTransform::brightness(
+                        amount.clamped_unit_interval(),
+                    ));
+                }
+                FilterFunction::Opacity(amount) => {
+                    lowering.alpha = lowering.alpha.multiplied(amount)
+                }
+                FilterFunction::Saturate(_)
+                | FilterFunction::Brightness(_)
+                | FilterFunction::RequiresRasterBackend(_) => return None,
+            }
+        }
+        Some(lowering)
+    }
 }
 
 /// Computed mask image/source value retained for stacking and later masking.
@@ -604,6 +811,36 @@ pub(crate) enum ClipPath {
     },
     Shape,
     Url,
+}
+
+/// Computed legacy CSS 2 `clip` value for absolutely positioned boxes.
+///
+/// Unlike `clip-path`, `clip` is a rectangle whose four physical edges are
+/// offsets from the box's border edges. Percentages are invalid and `auto`
+/// keeps the corresponding generated border-box edge. Keeping the edges
+/// typed until paint has the used border box prevents a layout-relative value
+/// from escaping into page paint as an untyped scalar.
+/// <https://drafts.csswg.org/css2/#propdef-clip>
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum LegacyClip {
+    Auto,
+    Rect([LegacyClipEdge; 4]),
+}
+
+impl LegacyClip {
+    pub(crate) const AUTO: Self = Self::Auto;
+
+    pub(crate) fn forces_flattening(&self) -> bool {
+        !matches!(self, Self::Auto)
+    }
+}
+
+/// One physical edge of a legacy CSS 2 `clip: rect()` value, in top, right,
+/// bottom, left order.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum LegacyClipEdge {
+    Auto,
+    Length(ComputedLengthPercentage),
 }
 
 /// One `<length-percentage> <length-percentage>` vertex of `polygon()`.
@@ -1083,7 +1320,80 @@ pub(crate) enum TransformFunction {
     Rotate(euclid::Angle<f32>),
     Rotate3D(CssRotate3D),
     Skew(CssSkewAngles),
-    Perspective(ComputedLengthPercentage),
+    Perspective(ComputedPerspective),
+}
+
+/// A computed CSS perspective distance.
+///
+/// The grammar accepts `none` and non-negative lengths, including zero. The
+/// zero value is preserved through cascade and clamped only for rendering.
+/// <https://drafts.csswg.org/css-transforms-2/#perspective-property>
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ComputedPerspective {
+    None,
+    Distance(NonNegativeComputedLength),
+}
+
+impl ComputedPerspective {
+    pub(crate) const NONE: Self = Self::None;
+
+    pub(crate) fn used_for_rendering(&self) -> Option<UsedPerspectiveDistance> {
+        let Self::Distance(distance) = self else {
+            return None;
+        };
+        Some(UsedPerspectiveDistance(layout_pt(
+            distance.length().max(crate::css::CSS_PX_TO_PT),
+        )))
+    }
+
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
+        if let Self::Distance(distance) = self {
+            distance.resolve_font_metric_lengths(ch_advance);
+        }
+    }
+
+    pub(crate) fn requires_ch_advance(&self) -> bool {
+        matches!(self, Self::Distance(distance) if distance.requires_ch_advance())
+    }
+}
+
+/// A non-negative absolute computed length. Percentages cannot cross this
+/// boundary, preserving the CSS grammar for perspective distances.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct NonNegativeComputedLength(ComputedLengthPercentage);
+
+impl NonNegativeComputedLength {
+    pub(crate) fn new(value: ComputedLengthPercentage) -> Option<Self> {
+        value
+            .length_if_no_percent()
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .map(|_| Self(value))
+    }
+
+    pub(crate) fn length(&self) -> f32 {
+        self.0
+            .length_if_no_percent()
+            .expect("perspective distance cannot contain percentages")
+    }
+
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
+        self.0.resolve_font_metric_lengths(ch_advance);
+        debug_assert!(self.length() >= 0.0);
+    }
+
+    pub(crate) fn requires_ch_advance(&self) -> bool {
+        self.0.requires_ch_advance()
+    }
+}
+
+/// A non-zero paint-space perspective distance after CSS's rendering clamp.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct UsedPerspectiveDistance(LayoutLength);
+
+impl UsedPerspectiveDistance {
+    pub(crate) fn points(self) -> f32 {
+        self.0.points()
+    }
 }
 
 impl TransformFunction {
@@ -1098,7 +1408,7 @@ impl TransformFunction {
                 translation.y.resolve_font_metric_lengths(ch_advance);
                 translation.z.resolve_font_metric_lengths(ch_advance);
             }
-            Self::Perspective(length) => length.resolve_font_metric_lengths(ch_advance),
+            Self::Perspective(perspective) => perspective.resolve_font_metric_lengths(ch_advance),
             _ => {}
         }
     }
@@ -1113,7 +1423,7 @@ impl TransformFunction {
                     || translation.y.requires_ch_advance()
                     || translation.z.requires_ch_advance()
             }
-            Self::Perspective(length) => length.requires_ch_advance(),
+            Self::Perspective(perspective) => perspective.requires_ch_advance(),
             _ => false,
         }
     }
@@ -1169,6 +1479,66 @@ pub(crate) struct TransformOrigin {
     pub(crate) x: ComputedLengthPercentage,
     pub(crate) y: ComputedLengthPercentage,
     pub(crate) z: ComputedLengthPercentage,
+    /// Distinguishes CSS `initial` from an author-specified `50% 50%`.
+    /// SVG graphics resolve the former to `0 0`, while HTML boxes resolve it
+    /// to the property’s ordinary `50% 50%` initial used value.
+    pub(crate) is_initial: bool,
+}
+
+/// The two-dimensional reference-box point from which an element projects
+/// descendants under the CSS `perspective` property.
+/// <https://drafts.csswg.org/css-transforms-2/#perspective-origin-property>
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PerspectiveOrigin {
+    pub(crate) x: ComputedLengthPercentage,
+    pub(crate) y: ComputedLengthPercentage,
+}
+
+impl PerspectiveOrigin {
+    pub(crate) const INITIAL: Self = Self {
+        x: ComputedLengthPercentage::from_percent(0.5),
+        y: ComputedLengthPercentage::from_percent(0.5),
+    };
+
+    pub(crate) const fn new(x: ComputedLengthPercentage, y: ComputedLengthPercentage) -> Self {
+        Self { x, y }
+    }
+
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
+        self.x.resolve_font_metric_lengths(ch_advance);
+        self.y.resolve_font_metric_lengths(ch_advance);
+    }
+
+    pub(crate) fn requires_ch_advance(&self) -> bool {
+        self.x.requires_ch_advance() || self.y.requires_ch_advance()
+    }
+
+    /// Resolve the origin against the perspective element's transform
+    /// reference box.  Unlike `transform-origin`, CSS never gives this
+    /// property a z component.
+    pub(crate) fn resolve_against_paint_rect(
+        self,
+        border_box: crate::document::paint::geometry::PaintRect,
+    ) -> crate::document::paint::geometry::PaintPoint {
+        crate::document::paint::geometry::PaintPoint::new(
+            border_box.origin.x
+                + self
+                    .x
+                    .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(
+                        border_box.size.width,
+                    )))
+                    .map(layout_points)
+                    .unwrap_or(0.0),
+            border_box.origin.y + border_box.size.height
+                - self
+                    .y
+                    .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(
+                        border_box.size.height,
+                    )))
+                    .map(layout_points)
+                    .unwrap_or(0.0),
+        )
+    }
 }
 
 /// Whether the back-facing side of a flattened 3D transform is painted.
@@ -1177,6 +1547,18 @@ pub(crate) struct TransformOrigin {
 pub(crate) enum BackfaceVisibility {
     Visible,
     Hidden,
+}
+
+/// Whether a transformable element flattens descendants into its own plane or
+/// extends a CSS 3D rendering context.
+///
+/// The computed value is the specified keyword, while grouping properties can
+/// force the used value to [`Self::Flat`].
+/// <https://drafts.csswg.org/css-transforms-2/#transform-style-property>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransformStyle {
+    Flat,
+    Preserve3d,
 }
 
 /// Reference box selected for CSS transform percentages and `transform-origin`.
@@ -1337,7 +1719,21 @@ impl TransformOrigin {
         x: ComputedLengthPercentage::from_percent(0.5),
         y: ComputedLengthPercentage::from_percent(0.5),
         z: ComputedLengthPercentage::ZERO,
+        is_initial: true,
     };
+
+    pub(crate) const fn specified(
+        x: ComputedLengthPercentage,
+        y: ComputedLengthPercentage,
+        z: ComputedLengthPercentage,
+    ) -> Self {
+        Self {
+            x,
+            y,
+            z,
+            is_initial: false,
+        }
+    }
 
     pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         self.x.resolve_font_metric_lengths(ch_advance);
@@ -1672,6 +2068,9 @@ pub(crate) struct ElementSiblingSignature {
     pub attrs: HashMap<String, String>,
     pub namespace_attrs: Vec<ElementAttributeSignature>,
     pub opaque_id: Rc<usize>,
+    /// Stable source-DOM identity, when this signature represents a real
+    /// element rather than a generated layout snapshot.
+    pub source_element_id: Option<crate::dom::ElementId>,
     pub children: ElementSiblingSignatureList,
     pub has_text_child: bool,
     pub is_target: bool,
@@ -1696,12 +2095,18 @@ impl ElementSiblingSignature {
             attrs,
             namespace_attrs,
             opaque_id: next_element_signature_opaque_id(),
+            source_element_id: None,
             children: ElementSiblingSignatureList::empty(),
             has_text_child: false,
             is_target: false,
             has_target_descendant: false,
             document_direction: None,
         }
+    }
+
+    pub(crate) fn with_source_element_id(mut self, id: crate::dom::ElementId) -> Self {
+        self.source_element_id = Some(id);
+        self
     }
 
     pub(crate) fn with_namespace(
@@ -1767,28 +2172,39 @@ pub(crate) enum ResolvedLanguage {
     Unresolved,
     Unknown,
     Tag(String),
+    /// A present HTML language attribute that is not a well-formed BCP 47
+    /// tag. This selector-only state preserves the authored computed value
+    /// without allowing `:lang()` matching.
+    Malformed(String),
 }
 
 impl ResolvedLanguage {
     pub(crate) fn from_html_attribute(value: &str) -> Self {
-        let value = value.trim();
-        if value.is_empty() {
-            Self::Unknown
-        } else {
-            Self::Tag(value.to_string())
+        match ContentLanguage::from_html_attribute(value) {
+            ContentLanguage::Unknown => Self::Unknown,
+            ContentLanguage::Tagged(tag) if tag.locale().is_some() => {
+                Self::Tag(tag.as_str().to_owned())
+            }
+            ContentLanguage::Tagged(tag) => Self::Malformed(tag.as_str().to_owned()),
         }
     }
 
-    pub(crate) fn from_computed(value: Option<&str>) -> Self {
-        value
-            .map(Self::from_html_attribute)
-            .unwrap_or(Self::Unknown)
+    pub(crate) fn from_computed(value: &ContentLanguage) -> Self {
+        match value {
+            ContentLanguage::Unknown => Self::Unknown,
+            ContentLanguage::Tagged(tag) if tag.locale().is_some() => {
+                Self::Tag(tag.as_str().to_owned())
+            }
+            ContentLanguage::Tagged(tag) => Self::Malformed(tag.as_str().to_owned()),
+        }
     }
 
-    pub(crate) fn as_computed_language(&self) -> Option<String> {
+    pub(crate) fn as_computed_language(&self) -> ContentLanguage {
         match self {
-            Self::Tag(language) => Some(language.clone()),
-            Self::Unresolved | Self::Unknown => None,
+            Self::Tag(language) | Self::Malformed(language) => {
+                ContentLanguage::Tagged(LanguageTag::new(language))
+            }
+            Self::Unresolved | Self::Unknown => ContentLanguage::Unknown,
         }
     }
 }
@@ -1801,6 +2217,7 @@ pub(crate) struct ElementSignature {
     pub attrs: HashMap<String, String>,
     pub namespace_attrs: Vec<ElementAttributeSignature>,
     pub opaque_id: Rc<usize>,
+    pub source_element_id: Option<crate::dom::ElementId>,
     pub sibling_index: Option<usize>,
     pub sibling_signatures: ElementSiblingSignatureList,
     pub child_signatures: ElementSiblingSignatureList,
@@ -1832,7 +2249,7 @@ impl ResolveViewportLengths for TransformFunction {
                 translation.y.resolve_viewport_lengths(basis);
                 translation.z.resolve_viewport_lengths(basis);
             }
-            Self::Perspective(length) => length.resolve_viewport_lengths(basis),
+            Self::Perspective(_) => {}
             _ => {}
         }
     }
@@ -1902,5 +2319,53 @@ impl ResolveViewportLengths for TransformOrigin {
         self.x.resolve_viewport_lengths(basis);
         self.y.resolve_viewport_lengths(basis);
         self.z.resolve_viewport_lengths(basis);
+    }
+}
+
+impl ResolveViewportLengths for PerspectiveOrigin {
+    fn resolve_viewport_lengths(&mut self, basis: ViewportLengthBasis) {
+        self.x.resolve_viewport_lengths(basis);
+        self.y.resolve_viewport_lengths(basis);
+    }
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+
+    #[test]
+    fn grayscale_clamps_and_preserves_neutral_colors() {
+        let amount = NonNegativeFilterAmount::new(2.0)
+            .unwrap()
+            .clamped_unit_interval();
+        let transform = BoundedSrgbColorTransform::grayscale(amount);
+        assert_eq!(transform.apply([0.25, 0.25, 0.25]), [0.25, 0.25, 0.25]);
+        let [red, green, blue] = transform.apply([1.0, 0.0, 0.0]);
+        assert!((red - 0.2126).abs() < 0.0001);
+        assert!((green - 0.2126).abs() < 0.0001);
+        assert!((blue - 0.2126).abs() < 0.0001);
+    }
+
+    #[test]
+    fn exact_filter_lowering_rejects_expanding_matrices() {
+        let filter = FilterValue::Functions(vec![FilterFunction::Brightness(
+            NonNegativeFilterAmount::new(1.01).unwrap(),
+        )]);
+        assert_eq!(filter.exact_lowering(), None);
+    }
+
+    #[test]
+    fn exact_filter_composes_authored_order_and_alpha() {
+        let filter = FilterValue::Functions(vec![
+            FilterFunction::Brightness(NonNegativeFilterAmount::new(0.5).unwrap()),
+            FilterFunction::Opacity(UnitFilterAmount(0.5)),
+            FilterFunction::Grayscale(UnitFilterAmount(1.0)),
+        ]);
+        let lowering = filter.exact_lowering().unwrap();
+        assert_eq!(lowering.alpha.value(), 0.5);
+        let [red, green, blue] = lowering.color.apply([1.0, 0.0, 0.0]);
+        assert!((red - 0.1063).abs() < 0.0001);
+        assert!((green - red).abs() < 0.0001);
+        assert!((blue - red).abs() < 0.0001);
     }
 }

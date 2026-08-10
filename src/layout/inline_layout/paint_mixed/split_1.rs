@@ -1,7 +1,7 @@
 use super::*;
 use crate::layout::assets::{
     apply_object_fit, native_generated_gradient_primitive, raster_image_interpolation,
-    svg_replaced_group,
+    replaced_content_contour, svg_replaced_group_with_viewport_clip,
 };
 use crate::layout::text_paint::{
     TextDecorationLineGeometry, TextDecorationLineGlyphCoverage, TextDecorationLineGlyphSequence,
@@ -37,7 +37,6 @@ impl<'a> LayoutBuilder<'a> {
         context: InlinePaintContext<'_>,
     ) -> Option<PreparedInlineLine> {
         let block_style = context.block_style;
-        let line_metrics = line_fragment.metrics;
         let should_justify_line = context.text_align.justifies()
             && !matches!(block_style.text_justify, TextJustify::None);
         let split_for_inter_character =
@@ -134,29 +133,67 @@ impl<'a> LayoutBuilder<'a> {
         } else {
             line_fragment.items().to_vec()
         };
+        // Alignment and justification consume the final visual inline
+        // advances, not the pre-bidi source estimate recorded during line
+        // selection. In particular, a ZWJ/ZWNJ can remain in the source and
+        // shaping context while contributing no visual advance after fallback
+        // controls are removed. Retain the selected line's block metrics, but
+        // reconcile its inline measure with these final paint items.
+        // <https://www.w3.org/TR/css-text-3/#boundary-shaping> and
+        // <https://www.w3.org/TR/css-text-3/#text-encoding>
+        let visual_widths =
+            crate::layout::inline_layout::graph::inline_content_width_for_line_items(
+                &line,
+                &mut self.font_system,
+                |item| item.width,
+            );
+        let final_painted_width = self.final_painted_inline_width(&line, block_style);
+        let final_content_width = (final_painted_width
+            - visual_widths.trailing_space_width
+            - visual_widths.trailing_tracking_width)
+            .max(0.0);
+        let mut line_metrics = line_fragment.metrics;
+        // Align using the final visual paint sequence. The source-selection
+        // metric can differ from this width not only for CSS bidi controls,
+        // but also after fallback shaping or shared boundary-cluster
+        // ownership. CSS alignment applies to the used inline content, not a
+        // pre-paint source estimate.
+        // <https://www.w3.org/TR/css-text-3/#text-align-property>
+        line_metrics.width = final_content_width;
+        // The final visual width still includes a punctuation glyph which
+        // CSS Text lets hang outside the line measure.  The selected record
+        // normally applied this subtraction before paint, but replacing its
+        // source metric above requires preserving that same exclusion here.
+        // <https://www.w3.org/TR/css-text-3/#hanging-punctuation-property>
+        if line_box_uses_hanging_punctuation_alignment(block_style) {
+            line_metrics.width = (line_metrics.width
+                - line_fragment.hanging_widths.start
+                - line_fragment.hanging_widths.end)
+                .max(0.0);
+        }
         let line_items = measured_inline_items(&line);
-        // A baseline-aligned atomic inline's block-start margin belongs to
-        // the line participant, not only to the atom's border-box replay.
-        // Anchor the whole horizontal line after that leading margin so its
-        // text siblings and captured atomic fragments share the same logical
-        // line placement. Vertical writing projects this at the line-geometry
-        // boundary instead of changing the legacy physical page cursor.
-        // <https://www.w3.org/TR/css-inline-3/#line-layout>
+        // Atomic inline baseline metrics are expressed from their logical
+        // margin-box start, while captured atom contents replay from their
+        // border box. Align the shared line anchor with that same margin-box
+        // reference before positioning text and atoms. Line-relative atoms
+        // and inline-table wrappers opt out in the shared helper because
+        // their placement owns the margin at a different boundary.
+        // <https://drafts.csswg.org/css-inline-3/#line-layout>
         let line_block_start_margin = line
             .iter()
             .filter_map(|item| match item.as_ref() {
-                InlineLineItem::Atom(atom) => {
-                    Some(inline_atom_logical_block_start_margin(atom, block_style))
-                }
+                InlineLineItem::Atom(atom) => Some(inline_atom_line_anchor_block_start_margin(
+                    atom,
+                    block_style,
+                )),
                 InlineLineItem::Fragment(_) | InlineLineItem::Float(_) => None,
             })
             .fold(0.0, f32::max);
-        let line_top = self.cursor_y
-            - if block_style.writing_mode == WritingMode::HorizontalTb {
-                line_block_start_margin
-            } else {
-                0.0
-            };
+        let line_top = if block_style.writing_mode == WritingMode::HorizontalTb {
+            self.cursor_y - line_block_start_margin
+        } else {
+            self.cursor_y
+        };
         let mut line_geometry = InlineLineGeometry::new(
             self.content_left,
             self.content_right,
@@ -165,16 +202,7 @@ impl<'a> LayoutBuilder<'a> {
             context,
         );
         if block_style.writing_mode.has_vertical_lines() {
-            line_geometry.block_start =
-                match WritingModeAxes::new(block_style.writing_mode, block_style.used_direction())
-                    .physical_side(LogicalSide::BlockStart)
-                {
-                    PhysicalSide::Left => line_geometry.block_start + line_block_start_margin,
-                    PhysicalSide::Right => line_geometry.block_start - line_block_start_margin,
-                    PhysicalSide::Top | PhysicalSide::Bottom => {
-                        unreachable!("vertical writing modes always have a horizontal block axis")
-                    }
-                };
+            line_geometry.apply_logical_block_start_margin(line_block_start_margin);
         }
         // Unicode space separators hang unconditionally at a selected visual
         // line edge. Their advance is excluded from both fitting and
@@ -202,15 +230,15 @@ impl<'a> LayoutBuilder<'a> {
             should_justify_line,
         );
         let justification_line_width = if should_justify_line {
-            let natural_width = self
+            let natural_painted_width = self
                 .natural_painted_inline_width_for_justification(
                     &line,
                     &justification_plan,
                     block_style,
                 )
                 .max(0.0);
-            if natural_width > 0.0 {
-                natural_width
+            if natural_painted_width > 0.0 {
+                natural_painted_width
             } else {
                 line_metrics.width
             }
@@ -300,6 +328,7 @@ impl<'a> LayoutBuilder<'a> {
                     let fragment_edge_content_bottom_y =
                         inline_fragment_horizontal_content_bottom_y(
                             &fragment,
+                            fragment.line_relative_alignment(),
                             line_top,
                             line_metrics.height,
                             line_baseline_offset,
@@ -390,6 +419,9 @@ impl<'a> LayoutBuilder<'a> {
                     // advance existed (and can re-enable contextual forms).
                     let can_append = leading_tracking == 0.0
                         && preserves_justification_policy
+                        && pending_fragments.last().is_none_or(|previous| {
+                            previous.link_target() == fragment.link_target()
+                        })
                         && ((extra_space_width == 0.0
                             || justification_plan.justifies_inter_word())
                             && pending_fragments.last().is_some_and(|previous| {
@@ -585,7 +617,7 @@ impl<'a> LayoutBuilder<'a> {
                         {
                             let paint_inline_start =
                                 inline_position + inline_box_edge_paint_offset(*edge);
-                            let content_rect = trim_inline_content_rect(
+                            let border_box = trim_inline_content_rect(
                                 line_geometry.visual_line_item_rect(
                                     line_logical_inline_start,
                                     line_physical_origin,
@@ -600,7 +632,7 @@ impl<'a> LayoutBuilder<'a> {
                             .translated(atom.visual_offset);
                             paint_items.push(PreparedInlinePaintItem::Atom(PreparedInlineAtom {
                                 atom: atom.clone(),
-                                content_rect,
+                                border_box,
                             }));
                         }
                         inline_position += edge.advance;
@@ -663,7 +695,7 @@ impl<'a> LayoutBuilder<'a> {
                             parent_metrics: parent_fragment_metrics,
                         },
                     );
-                    let content_rect = line_geometry
+                    let border_box = line_geometry
                         .visual_line_item_rect(
                             line_logical_inline_start,
                             line_physical_origin,
@@ -675,7 +707,7 @@ impl<'a> LayoutBuilder<'a> {
                         .translated(atom.visual_offset);
                     paint_items.push(PreparedInlinePaintItem::Atom(PreparedInlineAtom {
                         atom: atom.clone(),
-                        content_rect,
+                        border_box,
                     }));
                     inline_position += inline_atom_logical_inline_size(atom, block_style);
                     let atom_expansion_count =
@@ -797,6 +829,195 @@ impl<'a> LayoutBuilder<'a> {
         line_rendered_baseline_shift.get_or_insert(line_layout_baseline_y - group.y());
     }
 
+    /// Measure the final visual paint sequence used to position an inline line.
+    ///
+    /// A retained source-shaped slice can intentionally include the advance of
+    /// a neighboring cluster when a default-ignorable join control shares its
+    /// source provenance. Its paint group is re-shaped from the final visual
+    /// sequence, where the control has no advance. Alignment must use that
+    /// final advance rather than the source-slice fitting estimate.
+    ///
+    /// This mirrors paint-time text-group ownership but does not create paint
+    /// operations. The caller applies the common trailing-space and tracking
+    /// ownership policy afterwards.
+    /// <https://www.w3.org/TR/css-text-3/#boundary-shaping> and
+    /// <https://www.w3.org/TR/css-text-3/#text-align-property>
+    fn final_painted_inline_width(
+        &mut self,
+        line: &[MeasuredInlineItem],
+        block_style: &ComputedStyle,
+    ) -> f32 {
+        let mut natural_width = 0.0f32;
+        let mut inline_position = 0.0f32;
+        let mut pending_fragments = Vec::new();
+        let mut pending_inline_position = 0.0;
+        let mut pending_preserve_leading_summary_space = false;
+        let mut previous_item_was_opaque_atom = false;
+
+        let flush_pending = |this: &mut Self,
+                             pending_fragments: &mut Vec<PendingInlineFragment<'_>>,
+                             pending_inline_position: f32,
+                             pending_preserve_leading_summary_space: bool,
+                             inline_position: &mut f32,
+                             natural_width: &mut f32| {
+            if let Some(group) = this.prepare_inline_text_group_with_summary_policy(
+                pending_fragments,
+                0.0,
+                pending_preserve_leading_summary_space,
+                pending_inline_position,
+                block_style,
+            ) {
+                let end = pending_inline_position + group.width();
+                *inline_position = end;
+                *natural_width = (*natural_width).max(end);
+            }
+            pending_fragments.clear();
+        };
+
+        for (item_index, measured_item) in line.iter().enumerate() {
+            match &measured_item.item {
+                InlineLineItem::Fragment(fragment) => {
+                    let leading_tracking = fragment.leading_tracking().points();
+                    if leading_tracking != 0.0 && !pending_fragments.is_empty() {
+                        flush_pending(
+                            self,
+                            &mut pending_fragments,
+                            pending_inline_position,
+                            pending_preserve_leading_summary_space,
+                            &mut inline_position,
+                            &mut natural_width,
+                        );
+                    }
+                    inline_position += leading_tracking;
+                    let out_of_flow_paint_inline_advance = fragment
+                        .out_of_flow_paint_inline_advance()
+                        .map(|advance| advance.points());
+                    let fragment =
+                        PendingInlineFragment::new(fragment, measured_item.shaped.as_deref());
+                    if inline_fragment_is_join_control_only(&fragment) {
+                        if pending_fragments.is_empty() {
+                            pending_inline_position = inline_position;
+                            pending_preserve_leading_summary_space =
+                                item_index > 0 || previous_item_was_opaque_atom;
+                        }
+                        pending_fragments.push(fragment);
+                        continue;
+                    }
+
+                    let can_append = leading_tracking == 0.0
+                        && pending_fragments.last().is_some_and(|previous| {
+                            previous.style().text_justify == fragment.style().text_justify
+                        })
+                        && pending_fragments.last().is_some_and(|previous| {
+                            previous.link_target() == fragment.link_target()
+                        })
+                        && (pending_fragments.last().is_some_and(|previous| {
+                            can_queue_inline_fragments_for_shaping(previous, &fragment)
+                        }) || pending_fragments.last().is_some_and(|previous| {
+                            inline_fragment_can_append_collapsible_space(previous, &fragment)
+                        }) || pending_inline_fragments_are_collapsible_space(
+                            &pending_fragments,
+                        ));
+                    if pending_fragments.is_empty() {
+                        pending_inline_position = inline_position;
+                        pending_preserve_leading_summary_space = previous_item_was_opaque_atom
+                            || (item_index > 0 && !inline_fragment_is_collapsible_space(&fragment));
+                    } else if !can_append {
+                        flush_pending(
+                            self,
+                            &mut pending_fragments,
+                            pending_inline_position,
+                            pending_preserve_leading_summary_space,
+                            &mut inline_position,
+                            &mut natural_width,
+                        );
+                        pending_inline_position = inline_position;
+                        pending_preserve_leading_summary_space = previous_item_was_opaque_atom
+                            || (item_index > 0 && !inline_fragment_is_collapsible_space(&fragment));
+                    }
+
+                    if fragment.style().visibility == Visibility::Visible
+                        && inline_fragment_has_visible_text_paint(&fragment)
+                    {
+                        pending_fragments.push(fragment);
+                    } else {
+                        let width = out_of_flow_paint_inline_advance
+                            .unwrap_or(measured_item.width - leading_tracking)
+                            .max(0.0);
+                        inline_position += width;
+                        natural_width = natural_width.max(inline_position);
+                    }
+                    previous_item_was_opaque_atom = false;
+                }
+                InlineLineItem::Atom(atom) => {
+                    if matches!(atom.content(), InlineAtomContent::Leader(_)) {
+                        continue;
+                    }
+                    if !inline_atom_preserves_pending_text_shaping(atom)
+                        || atom.leading_tracking().points() != 0.0
+                    {
+                        flush_pending(
+                            self,
+                            &mut pending_fragments,
+                            pending_inline_position,
+                            pending_preserve_leading_summary_space,
+                            &mut inline_position,
+                            &mut natural_width,
+                        );
+                        pending_preserve_leading_summary_space = false;
+                    }
+                    inline_position += atom.leading_tracking().points();
+
+                    if let InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge)) =
+                        atom.content()
+                    {
+                        if !inline_box_edge_is_painted_by_adjacent_fragment(
+                            line,
+                            item_index,
+                            atom.style(),
+                            *edge,
+                        ) {
+                            natural_width = natural_width.max(
+                                inline_position
+                                    + inline_box_edge_paint_offset(*edge)
+                                    + edge.paint_extent,
+                            );
+                        }
+                        inline_position += edge.advance;
+                    } else {
+                        inline_position += inline_atom_logical_inline_size(atom, block_style);
+                    }
+                    natural_width = natural_width.max(inline_position);
+                    previous_item_was_opaque_atom =
+                        inline_atom_content_preserves_adjacent_space_summary(atom.content());
+                }
+                InlineLineItem::Float(_) => {
+                    flush_pending(
+                        self,
+                        &mut pending_fragments,
+                        pending_inline_position,
+                        pending_preserve_leading_summary_space,
+                        &mut inline_position,
+                        &mut natural_width,
+                    );
+                    inline_position += measured_item.width;
+                    natural_width = natural_width.max(inline_position);
+                    previous_item_was_opaque_atom = false;
+                }
+            }
+        }
+
+        flush_pending(
+            self,
+            &mut pending_fragments,
+            pending_inline_position,
+            pending_preserve_leading_summary_space,
+            &mut inline_position,
+            &mut natural_width,
+        );
+        natural_width
+    }
+
     pub(in crate::layout) fn natural_painted_inline_width_for_justification(
         &mut self,
         line: &[MeasuredInlineItem],
@@ -854,10 +1075,13 @@ impl<'a> LayoutBuilder<'a> {
                         .unwrap_or(measured_item.width - leading_tracking)
                         .max(0.0);
 
-                    let can_append = (justification_plan.justifies_inter_word()
-                        && pending_fragments.last().is_some_and(|previous| {
-                            can_queue_inline_fragments_for_shaping(previous, &fragment)
-                        }))
+                    let can_append = pending_fragments
+                        .last()
+                        .is_some_and(|previous| previous.link_target() == fragment.link_target())
+                        && (justification_plan.justifies_inter_word()
+                            && pending_fragments.last().is_some_and(|previous| {
+                                can_queue_inline_fragments_for_shaping(previous, &fragment)
+                            }))
                         || pending_fragments.last().is_some_and(|previous| {
                             inline_fragment_can_append_collapsible_space(previous, &fragment)
                         })
@@ -1358,7 +1582,7 @@ impl<'a> LayoutBuilder<'a> {
         let checkpoint = self.current_page.paint_checkpoint();
         if let Some(marker) = atom.outside_marker() {
             let borders = used_border_widths(atom.style());
-            let text_top = prepared.content_rect.y() + prepared.content_rect.height()
+            let text_top = prepared.border_box.y() + prepared.border_box.height()
                 - borders.top
                 - atom.style().padding.top;
             let formatted_line_block_start = PageTopBlockPosition::new(text_top);
@@ -1369,8 +1593,8 @@ impl<'a> LayoutBuilder<'a> {
                 atom.style(),
                 OutsideMarkerAnchor {
                     content_inline_span: PageInlineSpan::from_edges(
-                        prepared.content_rect.x() + borders.left,
-                        prepared.content_rect.x() + prepared.content_rect.width() - borders.right,
+                        prepared.border_box.x() + borders.left,
+                        prepared.border_box.x() + prepared.border_box.width() - borders.right,
                     ),
                     formatted_line_block_start,
                     alphabetic_baseline: formatted_line_block_start
@@ -1381,34 +1605,59 @@ impl<'a> LayoutBuilder<'a> {
         self.paint_prepared_inline_atom_contents(prepared);
         let fragment = self.current_page.take_paint_fragment_since(checkpoint);
         if !fragment.is_empty() {
-            let mut bounds = prepared.content_rect.paint_clip();
+            let bounds = prepared.border_box.paint_clip();
+            let mut policy = match atom.content() {
+                // SVG 2 requires an embedded outermost SVG element to be an
+                // isolated, atomic stacking context.  Its box decorations
+                // and rendered SVG scene have already been recorded in this
+                // fragment in source paint order; the policy gives that
+                // semantic group a single compositing boundary.
+                // <https://www.w3.org/TR/SVG2/render.html#EstablishingANewStackingContext>
+                InlineAtomContent::Svg { .. } => StackingContextPolicy::for_inline_svg_root(
+                    atom.style(),
+                    PaintBand::Inline,
+                    bounds,
+                ),
+                _ => StackingContextPolicy::for_atomic(atom.style(), PaintBand::Inline, bounds),
+            };
+            // A replaced atom's CSS content clip is attached directly to its
+            // image/SVG primitive.  The atomic context also contains the
+            // principal decoration, so a generic padding-box overflow effect
+            // here would both clip that decoration and introduce a duplicate
+            // rectangular raster edge before the exact contour. Captured
+            // formatting contexts, including inline tables, do not have that
+            // primitive-owned contour and must retain their own CSS overflow
+            // clip around the replayed descendant fragment.
+            // <https://www.w3.org/TR/css-overflow-3/#overflow-clipping>
             if matches!(
                 atom.content(),
-                InlineAtomContent::Image(_) | InlineAtomContent::Gradient { .. }
-            ) && self.root_principal_flow_context.active_body.is_some()
-                && self.principal_flow.writing_mode == WritingMode::VerticalRl
-            {
-                // The propagated vertical-rl body owns the initial canvas's
-                // inline-end inset. Keep that extent in the atomic image's
-                // layout clip without altering the image's used content
-                // rect or resampling it.
-                // <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
-                bounds = PaintClip::from_paint_rect(paint_space_rect(
-                    bounds.x(),
-                    bounds.y(),
-                    bounds.width(),
-                    bounds.height()
-                        + self
-                            .root_principal_flow_context
-                            .active_body_inline_end_inset
-                            .points(),
-                ));
+                InlineAtomContent::Canvas
+                    | InlineAtomContent::Iframe(_)
+                    | InlineAtomContent::Image(_)
+                    | InlineAtomContent::Gradient { .. }
+                    | InlineAtomContent::Svg { .. }
+                    | InlineAtomContent::InlineFragment {
+                        contents_overflow_clip_applied: true,
+                        ..
+                    }
+            ) {
+                policy.effects.clear_overflow_clip_effects();
             }
-            let policy = StackingContextPolicy::for_atomic(atom.style(), PaintBand::Inline, bounds);
-            let context = PaintStackingContext::from_banded_fragment(fragment, Vec::new())
-                .with_source_order(self.next_paint_source_order())
-                .with_effects(policy.effects)
-                .with_bounds(bounds);
+            // Preserve the atom's original stack level through this atomic
+            // replay boundary.  `escaped_positioned_layers` later extracts
+            // such contexts and uses their level to insert them into the
+            // nearest real parent stacking context; rebuilding it as `auto`
+            // would incorrectly move a negative descendant above the
+            // parent's in-flow inline paint.
+            // <https://www.w3.org/TR/CSS22/zindex.html>
+            let context = PaintStackingContext::from_banded_fragment_with_stack_level(
+                policy.stack_level,
+                fragment,
+                Vec::new(),
+            )
+            .with_source_order(self.next_paint_source_order())
+            .with_effects(policy.effects)
+            .with_bounds(bounds);
             let fragment =
                 PaintFragment::from_stacking_context_in_band(policy.parent_band, context);
             self.current_page
@@ -1428,7 +1677,7 @@ impl<'a> LayoutBuilder<'a> {
             for layer in layers.iter() {
                 let atom_offset = layer
                     .escaped_atom_translation
-                    .atom_offset(prepared.content_rect.x(), prepared.content_rect.y());
+                    .atom_offset(prepared.border_box.x(), prepared.border_box.y());
                 let mut layer = layer.clone().translated(atom_offset);
                 layer.page_index = layer
                     .escaped_atom_translation
@@ -1440,6 +1689,10 @@ impl<'a> LayoutBuilder<'a> {
 
     fn paint_inline_atom_box_background(&mut self, border_rect: PaintRect, style: &ComputedStyle) {
         for primitive in self.box_background_primitives(border_rect, style) {
+            // The atomic inline context itself is inserted in its parent's
+            // inline phase. Within that context, its own decoration remains
+            // before its in-flow block descendants.
+            // <https://www.w3.org/TR/CSS22/zindex.html>
             self.push_primitive_in_band(PaintBand::BackgroundBorder, primitive);
         }
     }
@@ -1449,17 +1702,21 @@ impl<'a> LayoutBuilder<'a> {
         prepared: &PreparedInlineAtom,
     ) {
         let atom = &prepared.atom;
-        let content_x = prepared.content_rect.x();
-        let y = prepared.content_rect.y();
-        let content_width = prepared.content_rect.width();
-        let content_height = prepared.content_rect.height();
+        let content_x = prepared.border_box.x();
+        let y = prepared.border_box.y();
+        let content_width = prepared.border_box.width();
+        let content_height = prepared.border_box.height();
         if !matches!(
             atom.content(),
             InlineAtomContent::InlineEdge(_)
                 | InlineAtomContent::Leader(_)
                 | InlineAtomContent::StaticPositionPlaceholder
-        ) && (atom.style().background_color.is_potentially_visible()
-            || atom.style().background_image.is_image()
+        ) && (atom
+            .style()
+            .background
+            .background_color
+            .is_potentially_visible()
+            || atom.style().background.background_image.is_image()
             || used_border_width(atom.style()) > layout_pt(0.0))
         {
             self.paint_inline_atom_box_background(
@@ -1506,12 +1763,21 @@ impl<'a> LayoutBuilder<'a> {
                 ));
                 fragment.promote_page_background_to_in_flow_block();
                 fragment.promote_background_border_to_in_flow_block();
-                fragment = fragment.with_contents_effect_scoped_to_rect(clip);
+                // An embedded page background is still child browsing-context
+                // paint. Keep it in the iframe viewport along with the
+                // translated child scroll contents.
+                // <https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element>
+                fragment = fragment.with_effect_scoped_to_rect_all_bands(clip);
                 self.current_page
                     .append_paint_fragment_owned(fragment, PaintTranslation::identity());
             }
             InlineAtomContent::Image(decoded) => {
                 let borders = used_border_widths(atom.style());
+                let content_contour = replaced_content_contour(
+                    paint_space_rect(content_x, y, content_width, content_height),
+                    atom.style(),
+                    borders,
+                );
                 let image_x = content_x + borders.left + atom.style().padding.left;
                 let image_y = y + borders.bottom + atom.style().padding.bottom;
                 let image_width = (content_width
@@ -1539,6 +1805,12 @@ impl<'a> LayoutBuilder<'a> {
                 )
                 .with_raster_color_space(decoded.color_space.clone())
                 .with_image_id(decoded.image_id);
+                if let Some(clip) = content_contour
+                    .as_ref()
+                    .and_then(ResolvedBoxContentClip::path_clip)
+                {
+                    image = image.with_clip(clip);
+                }
                 if apply_object_fit(
                     &mut image,
                     atom.style().object_fit,
@@ -1602,6 +1874,11 @@ impl<'a> LayoutBuilder<'a> {
             InlineAtomContent::Svg { asset } => {
                 if let Some(asset) = asset {
                     let borders = used_border_widths(atom.style());
+                    let content_contour = replaced_content_contour(
+                        paint_space_rect(content_x, y, content_width, content_height),
+                        atom.style(),
+                        borders,
+                    );
                     let svg_x = content_x + borders.left + atom.style().padding.left;
                     let svg_y = y + borders.bottom + atom.style().padding.bottom;
                     let svg_width = (content_width
@@ -1617,19 +1894,25 @@ impl<'a> LayoutBuilder<'a> {
                         - atom.style().padding.bottom)
                         .max(0.0);
                     // Inline SVG follows the same concrete-object and source
-                    // selection path as block replaced SVG, including its
-                    // CSS root viewport specialization.
+                    // selection path as block replaced SVG. Unlike an image
+                    // asset, however, an embedded SVG's root viewport obeys
+                    // the element's computed CSS overflow.
                     if svg_width > 0.0 && svg_height > 0.0 {
-                        self.push_svg_group_in_band(
-                            PaintBand::Inline,
-                            svg_replaced_group(
-                                asset,
-                                paint_space_rect(svg_x, svg_y, svg_width, svg_height),
-                                atom.style().object_fit,
-                                atom.style().object_position.clone(),
-                                atom.style().object_view_box.clone(),
-                            ),
+                        let mut group = svg_replaced_group_with_viewport_clip(
+                            asset,
+                            paint_space_rect(svg_x, svg_y, svg_width, svg_height),
+                            atom.style().object_fit,
+                            atom.style().object_position.clone(),
+                            atom.style().object_view_box.clone(),
+                            style_clips_overflow(atom.style()),
                         );
+                        if let Some(clip) = content_contour
+                            .as_ref()
+                            .and_then(ResolvedBoxContentClip::path_clip)
+                        {
+                            group = group.with_clip(clip);
+                        }
+                        self.push_svg_group_in_band(PaintBand::Inline, group);
                     }
                 }
             }
@@ -1678,6 +1961,7 @@ impl<'a> LayoutBuilder<'a> {
                         .max(0.0)
                 });
                 let ruby_origin = ruby::RubyPaintOrigin::new(text_x, y);
+                let resolved_placement = atom.ruby_placement();
                 // Paint the base at the ruby atom's logical under side. Each
                 // annotation level is stacked toward its logical over side;
                 // the horizontal coordinates are a backend boundary, while
@@ -1689,8 +1973,14 @@ impl<'a> LayoutBuilder<'a> {
                 // is represented by the normalized column spans and is
                 // completed before this paint boundary.
                 // <https://drafts.csswg.org/css-ruby-1/#ruby-align-property>
-                let base_x = ruby_origin.inline()
-                    + (text_available_width - base.paint_inline_size).max(0.0) / 2.0;
+                let base_x = resolved_placement.map_or_else(
+                    || {
+                        ruby_origin.inline()
+                            + (text_available_width - base.paint_inline_size.points()).max(0.0)
+                                / 2.0
+                    },
+                    |placement| ruby_origin.inline() + placement.base_inline_offset.points(),
+                );
                 let all_annotations_are_under = annotation_sides
                     .iter()
                     .all(|side| *side == css::RubyAnnotationSide::Under);
@@ -1720,20 +2010,36 @@ impl<'a> LayoutBuilder<'a> {
                 let mut over_annotation_baseline = base_paint_top;
                 let mut under_annotation_baseline =
                     ruby_origin.block_offset(ruby::RubyBlockExtent::default());
-                for ((annotation, annotation_block_size), side) in annotations
+                for (annotation_index, ((annotation, annotation_block_size), side)) in annotations
                     .iter()
                     .zip(annotation_block_sizes)
                     .zip(annotation_sides)
+                    .enumerate()
                 {
                     let annotation_available_width =
                         if annotation.starts_span && annotation.column_span > 1 {
-                            annotation.containing_inline_size
+                            annotation.containing_inline_size.points()
                         } else {
                             text_available_width
                         };
-                    let annotation_x = ruby_origin.inline()
-                        + (annotation_available_width - annotation.paint_inline_size).max(0.0)
-                            / 2.0;
+                    let annotation_x = resolved_placement.map_or_else(
+                        || {
+                            ruby_origin.inline()
+                                + (annotation_available_width
+                                    - annotation.paint_inline_size.points())
+                                .max(0.0)
+                                    / 2.0
+                        },
+                        |placement| {
+                            ruby_origin.inline()
+                                + placement
+                                    .annotation_inline_offsets
+                                    .get(annotation_index)
+                                    .copied()
+                                    .unwrap_or(ruby::RubyInlineDisplacement::ZERO)
+                                    .points()
+                        },
+                    );
                     // The captured sequence's first visible glyph may have a
                     // different ascent from the annotation line box (for
                     // example Ahem). Reconcile that glyph baseline with the
@@ -1772,12 +2078,14 @@ impl<'a> LayoutBuilder<'a> {
                     sequence,
                     horizontal_style,
                     *inline_scale,
-                    prepared.content_rect,
+                    prepared.border_box,
                 );
             }
             InlineAtomContent::InlineFragment {
                 fragment,
+                replay_coordinates,
                 table_cell_context,
+                ..
             } => {
                 if let Some(context) = table_cell_context {
                     // The fragment is already normalized to its atomic
@@ -1798,8 +2106,10 @@ impl<'a> LayoutBuilder<'a> {
                     ));
                     debug_assert!(matches!(context.direction, Direction::Ltr | Direction::Rtl));
                 }
-                self.current_page
-                    .append_paint_fragment(fragment, PaintTranslation::new(content_x, y));
+                self.current_page.append_paint_fragment(
+                    fragment,
+                    replay_coordinates.replay_translation(prepared.border_box),
+                );
             }
         }
         for primitive in self.box_outline_primitives(
@@ -1818,8 +2128,10 @@ impl<'a> LayoutBuilder<'a> {
 
     /// Paint a horizontal tate-chu-yoko sequence inside its one-em atomic
     /// vertical box.  Capturing the nested sequence before adding the scale
-    /// keeps glyphs, shadows, decorations, clipping, and links in one normal
-    /// paint subtree rather than applying disconnected per-glyph offsets.
+    /// keeps glyphs, shadows, decorations, and links in one normal paint
+    /// subtree rather than applying disconnected per-glyph offsets. The
+    /// measured square limits layout only: CSS permits glyph ink to extend
+    /// outside it, so this replay deliberately establishes no overflow clip.
     /// <https://drafts.csswg.org/css-writing-modes-4/#text-combine-layout>
     fn paint_text_combine_upright(
         &mut self,
@@ -1848,15 +2160,12 @@ impl<'a> LayoutBuilder<'a> {
                 -content_rect.x(),
                 0.0,
             )));
-        let bounds = content_rect.paint_clip();
         let context = PaintStackingContext::from_banded_fragment(fragment, Vec::new())
             .with_source_order(self.next_paint_source_order())
             .with_effects(PaintEffects {
                 transform: Some(transform),
-                overflow_clip: Some(bounds),
                 ..PaintEffects::default()
-            })
-            .with_bounds(bounds);
+            });
         self.current_page.append_paint_fragment_owned(
             PaintFragment::from_stacking_context_in_band(PaintBand::Inline, context),
             PaintTranslation::identity(),
@@ -1871,9 +2180,16 @@ impl<'a> LayoutBuilder<'a> {
         available_width: f32,
         block_top: f32,
     ) {
+        // This is a nested paint replay. Its selected lines may establish an
+        // internal baseline (for example a ruby base or annotation), but
+        // that baseline is not a line of the enclosing formatting context
+        // and therefore must not escape through inline-block baseline export.
+        // <https://drafts.csswg.org/css-inline-3/#baseline-layout>
+        // <https://drafts.csswg.org/css-ruby-1/#ruby-layout>
         let saved_content_left = self.content_left;
         let saved_content_right = self.content_right;
         let saved_cursor_y = self.cursor_y;
+        let saved_last_in_flow_line_baseline_y = self.last_in_flow_line_baseline_y;
         self.content_left = content_left;
         self.content_right = content_left + available_width;
         self.cursor_y = block_top;
@@ -1888,6 +2204,7 @@ impl<'a> LayoutBuilder<'a> {
         self.content_left = saved_content_left;
         self.content_right = saved_content_right;
         self.cursor_y = saved_cursor_y;
+        self.last_in_flow_line_baseline_y = saved_last_in_flow_line_baseline_y;
     }
 
     /// Paint the owned decoration of a split inline box edge.
@@ -1902,23 +2219,26 @@ impl<'a> LayoutBuilder<'a> {
         prepared: &PreparedInlineAtom,
         edge: InlineBoxEdgeFragment,
     ) {
-        if edge.paint_extent <= 0.0 || prepared.content_rect.height() <= 0.0 {
+        if edge.paint_extent <= 0.0 || prepared.border_box.height() <= 0.0 {
             return;
         }
         let mut style = prepared.atom.style().clone();
+        if let Some(color) = prepared.atom.current_color_override() {
+            style.color = color;
+        }
         apply_inline_box_edge_paint_style(&mut style, edge);
-        if style.background_color.is_transparent()
-            && style.background_image.is_none()
+        if style.background.background_color.is_transparent()
+            && style.background.background_image.is_none()
             && used_border_width(&style) == layout_pt(0.0)
         {
             return;
         }
         for primitive in self.box_background_primitives(
             paint_space_rect(
-                prepared.content_rect.x(),
-                prepared.content_rect.y(),
-                prepared.content_rect.width(),
-                prepared.content_rect.height(),
+                prepared.border_box.x(),
+                prepared.border_box.y(),
+                prepared.border_box.width(),
+                prepared.border_box.height(),
             ),
             &style,
         ) {

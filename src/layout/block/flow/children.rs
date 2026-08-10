@@ -50,10 +50,18 @@ impl<'a> LayoutBuilder<'a> {
             run_in_inline_items_laid_out,
             use_ordered_mixed_flow,
             has_preceding_inline_flow_content,
+            preceding_inline_local_cutoff,
+            discard_region_limit,
+            direct_automatic_block_size_constraint,
             definite_content_height,
             descendant_percentage_height_basis,
         } = *input;
-        let mut traversal_state = BlockFlowChildTraversalState::new(style);
+        let mut traversal_state =
+            BlockFlowChildTraversalState::new(style, direct_automatic_block_size_constraint);
+        if preceding_inline_local_cutoff {
+            traversal_state.mark_local_continuation_cutoff();
+        }
+        traversal_state.set_discard_region_limit(discard_region_limit);
         let descendant_percentage_height_basis =
             descendant_percentage_height_basis.unwrap_or_else(|| {
                 block_size_percentage_basis_from_points(
@@ -110,6 +118,7 @@ impl<'a> LayoutBuilder<'a> {
                 applied_start_margin,
                 clearance_consumed_adjoining_start_margin,
                 starts_at_page_top,
+                has_preceding_inline_flow_content,
                 &mut traversal_state,
             )
         };
@@ -120,6 +129,8 @@ impl<'a> LayoutBuilder<'a> {
             collapsed_start_margin_offset: traversal_outcome.collapsed_start_margin_offset,
             rendered_legend: traversal_outcome.rendered_legend,
             descendant_clamp_line_slots: traversal_state.descendant_clamp_line_slots(),
+            has_local_continuation_cutoff: traversal_state.has_local_continuation_cutoff(),
+            discard_source_prefix: traversal_state.discard_source_prefix(),
         }
     }
 }
@@ -127,7 +138,7 @@ impl<'a> LayoutBuilder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::css::{ComputedClampContinuation, ComputedLineClamp};
+    use crate::css::{BlockEllipsis, Continue, MaxLines, PositiveLineCount, RemainingLineSlots};
     use crate::{Html, RenderOptions};
 
     async fn rendered_text(source: &str) -> String {
@@ -158,6 +169,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn automatic_line_clamp_selects_a_measured_terminal_line() {
+        let text = rendered_text(
+            "<style>@page { size: 160pt 120pt; margin: 10pt } \
+             .clamp { line-clamp: auto; max-height: 40pt; width: 100pt; \
+             font: 10pt/10pt monospace; white-space: pre } </style> \
+             <div class=clamp>one\ntwo\nthree\nfour\nfive</div>",
+        )
+        .await;
+        assert_eq!(text, "onetwothreefour…");
+    }
+
+    #[tokio::test]
+    async fn automatic_line_clamp_resolves_lh_against_the_used_line_height() {
+        let text = rendered_text(
+            "<style>@page { size: 160pt 120pt; margin: 10pt } \
+             .clamp { line-clamp: auto; max-height: 4lh; width: 100pt; \
+             font: 10pt/10pt monospace; white-space: pre } </style> \
+             <div class=clamp>one\ntwo\nthree\nfour\nfive</div>",
+        )
+        .await;
+        assert_eq!(text, "onetwothreefour…");
+    }
+
+    #[tokio::test]
+    async fn automatic_line_clamp_uses_min_height_when_it_exceeds_max_height() {
+        let text = rendered_text(
+            "<style>@page { size: 160pt 160pt; margin: 10pt } \
+             .clamp { line-clamp: auto; min-height: 4lh; max-height: 3lh; \
+             width: 100pt; font: 10pt/10pt monospace; white-space: pre } </style> \
+             <div class=clamp>one\ntwo\nthree\nfour\nfive\nsix</div>",
+        )
+        .await;
+
+        assert!(text.contains("four…"), "clamped text={text:?}");
+        assert!(!text.contains("five"), "clamped text={text:?}");
+    }
+
+    #[tokio::test]
+    async fn automatic_line_clamp_propagates_a_typed_block_constraint_to_a_descendant() {
+        let text = rendered_text(
+            "<style>@page { size: 160pt 160pt; margin: 10pt } \
+             .clamp { line-clamp: auto; max-height: 40pt; width: 100pt; \
+             font: 10pt/10pt monospace; white-space: pre } </style> \
+             <div class=clamp><div>one\ntwo\nthree\nfour\nfive</div></div>",
+        )
+        .await;
+
+        assert!(text.contains("four…"), "clamped text={text:?}");
+        assert!(!text.contains("five"), "clamped text={text:?}");
+    }
+
+    #[tokio::test]
+    async fn discard_captures_an_unforced_local_region_break_without_pagination() {
+        let text = rendered_text(
+            "<style>@page { size: 160pt 120pt; margin: 10pt } \
+             .discard { continue: discard; block-ellipsis: auto; max-height: 40pt; \
+             width: 100pt; font: 10pt/10pt monospace; white-space: pre } </style> \
+             <div class=discard>one\ntwo\nthree\nfour\nfive</div>",
+        )
+        .await;
+        assert_eq!(text, "onetwothreefour…");
+    }
+
+    #[tokio::test]
     async fn line_clamp_marks_a_terminal_child_line_when_a_later_block_is_discarded() {
         let text = rendered_text(
             "<style>@page { size: 160pt 120pt; margin: 10pt } \
@@ -168,6 +243,20 @@ mod tests {
         .await;
 
         assert!(text.contains("visible…"), "clamped text={text:?}");
+        assert!(!text.contains("discarded"), "clamped text={text:?}");
+    }
+
+    #[tokio::test]
+    async fn independently_cascaded_discard_longhands_use_the_line_limit_cutoff() {
+        let text = rendered_text(
+            "<style>@page { size: 160pt 120pt; margin: 10pt } \
+             .clamp { max-lines: 1; block-ellipsis: \" [more]\"; continue: discard; \
+                       width: 100pt; font: 10pt/10pt monospace } p { margin: 0 }</style>\
+             <div class=\"clamp\"><p>visible</p><p>discarded</p></div>",
+        )
+        .await;
+
+        assert!(text.contains("visible [more]"), "clamped text={text:?}");
         assert!(!text.contains("discarded"), "clamped text={text:?}");
     }
 
@@ -229,6 +318,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn automatic_inline_cutoff_discards_following_block_source_locally() {
+        let text = rendered_text(
+            r#"<style>@page { size: 160pt 120pt; margin: 10pt }
+             .clamp { line-clamp: auto; max-height: 20pt; width: 100pt;
+                      font: 10pt/10pt monospace }
+             p { margin: 0 }</style>
+             <div class=clamp>one<br>two<br>three<p>discarded block</p></div>"#,
+        )
+        .await;
+
+        assert!(text.contains("two…"), "clamped text={text:?}");
+        assert!(!text.contains("three"), "clamped text={text:?}");
+        assert!(!text.contains("discarded"), "clamped text={text:?}");
+    }
+
+    #[tokio::test]
+    async fn automatic_line_clamp_resolves_a_definite_percentage_block_constraint() {
+        let text = rendered_text(
+            r#"<style>@page { size: 160pt 160pt; margin: 10pt }
+             .outer { height: 60pt }
+             .clamp { line-clamp: auto; max-height: 50%; width: 100pt;
+                      font: 10pt/10pt monospace; white-space: pre }</style>
+             <div class=outer><div class=clamp>one
+two
+three
+four</div></div>"#,
+        )
+        .await;
+
+        assert!(text.contains("three…"), "clamped text={text:?}");
+        assert!(!text.contains("four"), "clamped text={text:?}");
+    }
+
+    #[tokio::test]
+    async fn unforced_discard_break_does_not_advance_to_a_page_or_block_sibling() {
+        let text = rendered_text(
+            r#"<style>@page { size: 160pt 120pt; margin: 10pt }
+             .discard { continue: discard; block-ellipsis: auto; max-height: 20pt; width: 100pt;
+                        font: 10pt/10pt monospace }
+             p { margin: 0 }</style>
+             <div class=discard>one<br>two<br>three<p>discarded block</p></div>"#,
+        )
+        .await;
+
+        assert!(text.contains("two…"), "discarded text={text:?}");
+        assert!(!text.contains("three"), "discarded text={text:?}");
+        assert!(!text.contains("discarded"), "discarded text={text:?}");
+    }
+
+    #[tokio::test]
     async fn display_contents_generated_inline_content_keeps_its_source_order() {
         let text = rendered_text(
             r#"<style>
@@ -274,36 +413,41 @@ mod tests {
     #[test]
     fn avoid_replay_restores_the_saved_remaining_line_clamp_budget() {
         let mut style = ComputedStyle::initial();
-        style.line_clamp = Some(ComputedLineClamp::new(
-            std::num::NonZeroUsize::new(3).unwrap(),
-            ComputedClampContinuation::Collapse,
-        ));
-        let mut traversal_state = BlockFlowChildTraversalState::new(&style);
+        style.max_lines = MaxLines::Lines(std::num::NonZeroUsize::new(3).unwrap());
+        style.block_ellipsis = BlockEllipsis::Auto;
+        style.continue_ = Continue::Collapse;
+        let mut traversal_state = BlockFlowChildTraversalState::new(&style, None);
 
-        traversal_state.debit(1);
+        traversal_state.debit(PositiveLineCount::from_rendered_slots(1).unwrap());
         let saved_remaining = traversal_state.capture_avoid_replay();
-        traversal_state.debit(2);
+        traversal_state.debit(PositiveLineCount::from_rendered_slots(2).unwrap());
         traversal_state.restore_avoid_replay(saved_remaining);
 
         let mut replayed_style = ComputedStyle::initial();
         traversal_state.apply_to(&mut replayed_style);
         assert_eq!(
-            replayed_style.used_line_clamp.map(|clamp| clamp.max_lines),
-            Some(2),
+            replayed_style
+                .line_limit_traversal
+                .map(|clamp| clamp.remaining),
+            Some(RemainingLineSlots::Available(
+                PositiveLineCount::from_rendered_slots(2).unwrap()
+            )),
         );
-        assert_eq!(style.line_clamp.unwrap().max_lines.get(), 3);
+        assert_eq!(
+            style.max_lines,
+            MaxLines::Lines(std::num::NonZeroUsize::new(3).unwrap())
+        );
     }
 
     #[test]
     fn multicol_container_does_not_create_a_used_line_clamp_budget() {
         let mut style = ComputedStyle::initial();
-        style.line_clamp = Some(ComputedLineClamp::new(
-            std::num::NonZeroUsize::new(2).unwrap(),
-            ComputedClampContinuation::Collapse,
-        ));
+        style.max_lines = MaxLines::Lines(std::num::NonZeroUsize::new(2).unwrap());
+        style.block_ellipsis = BlockEllipsis::Auto;
+        style.continue_ = Continue::Collapse;
         style.column_count = css::ColumnCount::Count(std::num::NonZeroUsize::new(3).unwrap());
 
-        let traversal_state = BlockFlowChildTraversalState::new(&style);
+        let traversal_state = BlockFlowChildTraversalState::new(&style, None);
         assert!(!traversal_state.has_active_clamp());
     }
 }

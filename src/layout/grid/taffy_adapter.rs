@@ -95,12 +95,31 @@ fn taffy_grid_item_dimension_for_purpose(
                             .points()
                             .map(|_| taffy_layout::Dimension::percent(percent))
                             .unwrap_or_else(taffy_layout::Dimension::auto)
+                    } else if value.contains_percentage() {
+                        // A mixed length-percentage cannot be represented by
+                        // Taffy's scalar percentage dimension. More
+                        // importantly, its percentage component is cyclic
+                        // while Grid sizes intrinsic tracks. Defer the whole
+                        // value until the final grid-area sizing phase rather
+                        // than resolving it against the grid container.
+                        // <https://www.w3.org/TR/css-grid-1/#percentage-sizing>
+                        taffy_layout::Dimension::auto()
                     } else {
                         taffy_dimension_from_length_percentage_with_basis(value, percentage_basis)
                     }
                 }
                 GridTaffyDimensionPurpose::TrackSizingConstraint => {
-                    taffy_dimension_from_length_percentage_with_basis(value, percentage_basis)
+                    // Grid item percentage sizes (including min/max
+                    // constraints) are cyclic while intrinsic tracks are
+                    // sized, and therefore behave as `auto`. Taffy's
+                    // available space here is the grid container, not the
+                    // final grid area, so it must not become the CSS basis.
+                    // <https://www.w3.org/TR/css-grid-1/#percentage-sizing>
+                    if value.contains_percentage() {
+                        taffy_layout::Dimension::auto()
+                    } else {
+                        taffy_dimension_from_length_percentage_with_basis(value, percentage_basis)
+                    }
                 }
             }
         }
@@ -146,8 +165,8 @@ fn taffy_grid_item_dimension_for_purpose(
 /// Taffy's grid algorithm resolves a percentage `Dimension` relative to its
 /// available sizing input while calculating tracks. That is appropriate for a
 /// used item size only after its grid area is known, but not for a constraint
-/// that participates in track sizing. Keep the established definite-basis
-/// conversion for constraints until they can be applied after area resolution.
+/// that participates in track sizing. Preserve the automatic intrinsic phase
+/// until final-area resolution applies the constraint.
 pub(super) fn taffy_grid_item_constraint_dimension(
     value: css::ComputedLengthPercentageOrAuto,
     percentage_basis: GridPercentageBasis,
@@ -336,7 +355,7 @@ mod tests {
                 content_box_pt(12.0),
                 content_box_pt(48.0),
             ),
-            taffy_layout::Dimension::length(40.0),
+            taffy_layout::Dimension::auto(),
         );
         assert!(
             taffy_grid_item_dimension(
@@ -417,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn grid_dimension_purposes_keep_zero_percentage_definite_without_a_basis() {
+    fn grid_item_cyclic_zero_percentage_stays_automatic_during_track_sizing() {
         let zero_percent = css::ComputedLengthPercentageOrAuto::LengthPercentage(
             css::ComputedLengthPercentage::from_percent(0.0),
         );
@@ -430,7 +449,7 @@ mod tests {
                 content_box_pt(12.0),
                 content_box_pt(48.0),
             ),
-            taffy_layout::Dimension::length(0.0),
+            taffy_layout::Dimension::auto(),
         );
         assert_eq!(
             taffy_grid_item_constraint_dimension(
@@ -439,7 +458,7 @@ mod tests {
                 content_box_pt(12.0),
                 content_box_pt(48.0),
             ),
-            taffy_layout::Dimension::length(0.0),
+            taffy_layout::Dimension::auto(),
         );
     }
 
@@ -1508,7 +1527,7 @@ fn add_grid_line_name(names: &mut Vec<String>, name: String) {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum GridAxis {
     Row,
     Column,

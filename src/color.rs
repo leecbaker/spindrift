@@ -153,6 +153,24 @@ pub(crate) fn convert_color(color: CssColor, target: CssColorSpace) -> Option<Cs
     crate::css::color_to_predefined_rgb(color, target)
 }
 
+/// Apply a filter color transform in the sRGB space mandated for CSS Filter
+/// Functions, before the PDF output profile selects its own representation.
+///
+/// The transform is deliberately restricted to the bounded linear subset so
+/// this operation preserves alpha and can be distributed through normal
+/// source-over descendants of an isolated filter group.
+/// <https://www.w3.org/TR/filter-effects-1/#filter-functions>
+pub(crate) fn apply_bounded_srgb_filter_transform(
+    color: CssColor,
+    transform: crate::css::BoundedSrgbColorTransform,
+) -> CssColor {
+    let color = convert_color(color, CssColorSpace::Srgb)
+        .or_else(|| crate::css::color_to_predefined_rgb(color, CssColorSpace::Srgb))
+        .expect("sRGB is a built-in CSS color space");
+    let [red, green, blue] = transform.apply(color.components());
+    CssColor::in_space(CssColorSpace::Srgb, red, green, blue, color.alpha())
+}
+
 /// Applies CSS CssColor's missing-component replacement in the selected
 /// interpolation coordinates, then uses premultiplied component interpolation.
 pub(crate) fn interpolate_color_with_missing(
@@ -692,9 +710,20 @@ pub(crate) fn convert_embedded_rgb_samples(
     Some(output)
 }
 
+/// The ICC's published sRGB v4 profile is used for tagged PDF sRGB output.
+///
+/// This binary is the unmodified `sRGB2014.icc` distributed with WeasyPrint,
+/// whose BSD-3-Clause license is retained in its checked-out source tree. It
+/// maps the CSS sRGB primary and secondary endpoints exactly in common PDF
+/// rasterizers; generated profiles remain appropriate for CSS-only spaces.
+const SRGB_2014_ICC_PROFILE: &[u8] = include_bytes!("pdf/sRGB2014.icc");
+
 /// Build the ICC bytes embedded by the PDF writer for a built-in CSS space.
 pub(crate) fn icc_profile_bytes(space: CssColorSpace) -> Result<Vec<u8>> {
-    profile(space)?.encode().map_err(mox_error)
+    match space {
+        CssColorSpace::Srgb => Ok(SRGB_2014_ICC_PROFILE.to_vec()),
+        _ => profile(space)?.encode().map_err(mox_error),
+    }
 }
 
 fn transform_options() -> TransformOptions {
@@ -801,6 +830,17 @@ mod tests {
                 "{space:?} profile component space"
             );
         }
+    }
+
+    #[test]
+    fn tagged_srgb_uses_the_standard_profile_bytes_for_exact_primary_endpoints() {
+        let bytes = icc_profile_bytes(CssColorSpace::Srgb).unwrap();
+
+        assert_eq!(bytes, SRGB_2014_ICC_PROFILE);
+        assert_eq!(
+            ColorProfile::new_from_slice(&bytes).unwrap().color_space,
+            DataColorSpace::Rgb
+        );
     }
 
     #[test]

@@ -31,6 +31,7 @@ pub struct RenderedImagePattern {
     pub tiling: PaintPatternTiling,
     pub interpolate: bool,
     clip: Option<RenderedPathClip>,
+    transform: PaintTransform,
 }
 
 #[allow(dead_code)]
@@ -62,6 +63,7 @@ impl RenderedImagePattern {
             tiling,
             interpolate,
             clip: None,
+            transform: PaintTransform::identity(),
         }
     }
 
@@ -97,6 +99,10 @@ impl RenderedImagePattern {
 
     pub(crate) fn clip(&self) -> Option<&RenderedPathClip> {
         self.clip.as_ref()
+    }
+
+    pub(crate) fn transform(&self) -> PaintTransform {
+        self.transform
     }
 
     pub(crate) fn with_image_id(mut self, image_id: Option<ImageId>) -> Self {
@@ -143,6 +149,23 @@ impl RenderedImagePattern {
                 }
             }
         }
+        self
+    }
+
+    /// Move the destination paint geometry while retaining CSS tile phase.
+    ///
+    /// Table fragmentation projects a source clip into a destination
+    /// fragmentainer after the image has already been resolved against its
+    /// unfragmented background positioning area. The clip and filled region
+    /// move, but the positioning area's tile origin remains in source space.
+    /// <https://www.w3.org/TR/css-backgrounds-3/#background-position>
+    /// <https://www.w3.org/TR/css-break-3/#break-decoration>
+    pub(in crate::document) fn translated_geometry_preserving_tile_origin(
+        mut self,
+        offset: PaintTranslation,
+    ) -> Self {
+        self.rect = offset.transform_rect(&self.rect);
+        translate_pattern_clip(&mut self.clip, offset);
         self
     }
 }
@@ -195,7 +218,10 @@ impl RenderedGradientPattern {
         self.transform
     }
 
+    #[cfg(test)]
     pub(crate) fn transformed(mut self, transform: PaintTransform) -> Self {
+        // The retained transform is emitted around the source-local pattern
+        // fill; leave the CSS tile geometry in that source space.
         self.transform = transform.multiply(self.transform);
         self
     }
@@ -221,6 +247,8 @@ impl RenderedGradientPattern {
 
     pub(in crate::document) fn translated(mut self, offset: PaintTranslation) -> Self {
         if self.transform != PaintTransform::identity() {
+            // Preserve source-local pattern geometry while composing the
+            // retained destination transform.
             self.transform = PaintTransform::translate(offset).multiply(self.transform);
             return self;
         }
@@ -240,6 +268,16 @@ impl RenderedGradientPattern {
         }
         self
     }
+
+    /// See [`RenderedImagePattern::translated_geometry_preserving_tile_origin`].
+    pub(in crate::document) fn translated_geometry_preserving_tile_origin(
+        mut self,
+        offset: PaintTranslation,
+    ) -> Self {
+        self.rect = offset.transform_rect(&self.rect);
+        translate_pattern_clip(&mut self.clip, offset);
+        self
+    }
 }
 
 /// A reusable vector tile for a repeated URL SVG background.
@@ -252,6 +290,7 @@ pub struct RenderedSvgPattern {
     pub(crate) tiling: PaintPatternTiling,
     pub(crate) paths: Vec<RenderedPath>,
     clip: Option<RenderedPathClip>,
+    transform: PaintTransform,
 }
 
 impl RenderedSvgPattern {
@@ -267,6 +306,7 @@ impl RenderedSvgPattern {
             tiling,
             paths,
             clip,
+            transform: PaintTransform::identity(),
         }
     }
 
@@ -276,6 +316,10 @@ impl RenderedSvgPattern {
 
     pub(crate) fn clip(&self) -> Option<&RenderedPathClip> {
         self.clip.as_ref()
+    }
+
+    pub(crate) fn transform(&self) -> PaintTransform {
+        self.transform
     }
 
     pub(in crate::document) fn translated(mut self, offset: PaintTranslation) -> Self {
@@ -294,6 +338,29 @@ impl RenderedSvgPattern {
             }
         }
         self
+    }
+
+    /// See [`RenderedImagePattern::translated_geometry_preserving_tile_origin`].
+    pub(in crate::document) fn translated_geometry_preserving_tile_origin(
+        mut self,
+        offset: PaintTranslation,
+    ) -> Self {
+        self.rect = offset.transform_rect(&self.rect);
+        translate_pattern_clip(&mut self.clip, offset);
+        self
+    }
+}
+
+fn translate_pattern_clip(clip: &mut Option<RenderedPathClip>, offset: PaintTranslation) {
+    if let Some(clip) = clip {
+        for command in &mut clip.commands {
+            command.translate(offset);
+        }
+        for nested_clip in &mut clip.additional_clips {
+            for command in &mut nested_clip.commands {
+                command.translate(offset);
+            }
+        }
     }
 }
 

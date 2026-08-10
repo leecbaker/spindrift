@@ -15,7 +15,7 @@ pub(in crate::css) fn parse_positive_integer(value: &str) -> Option<usize> {
 /// and minimum characters after the break:
 /// <https://www.w3.org/TR/css-text-4/#hyphenate-limit-chars>.
 pub(in crate::css) fn parse_hyphenate_limit_chars(value: &str) -> Option<HyphenateLimitChars> {
-    let parts = value.split_whitespace().collect::<Vec<_>>();
+    let parts = try_split_css_component_values(value)?;
     if parts.is_empty() || parts.len() > 3 {
         return None;
     }

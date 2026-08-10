@@ -238,23 +238,23 @@ pub(in crate::css) fn apply_cascaded_text_declaration(
             style.break_after = parse_page_break(value);
         }
         "break-inside" => {
-            let value = value.trim().to_ascii_lowercase();
-            style.break_inside_avoid = matches!(value.as_str(), "avoid" | "avoid-page");
-            style.break_inside_avoid_column = matches!(value.as_str(), "avoid" | "avoid-column");
+            if let Some(avoidance) = BreakInsideAvoidance::parse_modern(value) {
+                style.break_inside = avoidance;
+            }
         }
         "page-break-inside" => {
-            let value = value.trim().to_ascii_lowercase();
-            style.break_inside_avoid = matches!(value.as_str(), "avoid" | "avoid-page");
-            style.break_inside_avoid_column = false;
+            if let Some(avoidance) = BreakInsideAvoidance::parse_legacy_page(value) {
+                style.break_inside = avoidance;
+            }
         }
         "orphans" => {
             if let Some(value) = parse_positive_integer(value) {
-                style.orphans = value;
+                style.orphans = Orphans::try_new(value).expect("positive integer parser");
             }
         }
         "widows" => {
             if let Some(value) = parse_positive_integer(value) {
-                style.widows = value;
+                style.widows = Widows::try_new(value).expect("positive integer parser");
             }
         }
         "text-decoration" => {
@@ -435,11 +435,22 @@ pub(in crate::css) fn apply_cascaded_text_declaration(
             "avoid" => style.wrap_inside = WrapInside::Avoid,
             _ => {}
         },
-        "line-clamp" | "-webkit-line-clamp" => {
-            let legacy_webkit = name == "-webkit-line-clamp";
-            if let Some(line_clamp) = parse_line_clamp(value, legacy_webkit) {
-                style.line_clamp = line_clamp;
-                style.used_line_clamp = None;
+        "max-lines" => {
+            if let Some(max_lines) = parse_max_lines(value) {
+                style.max_lines = max_lines;
+                style.line_limit_traversal = None;
+            }
+        }
+        "block-ellipsis" => {
+            if let Some(ellipsis) = parse_block_ellipsis(value) {
+                style.block_ellipsis = ellipsis;
+                style.line_limit_traversal = None;
+            }
+        }
+        "continue" => {
+            if let Some(continuation) = parse_continue(value) {
+                style.continue_ = continuation;
+                style.line_limit_traversal = None;
             }
         }
         "overflow-clip-margin" => {
@@ -672,43 +683,50 @@ fn set_scroll_margin_side(value: &str, font_size: f32, set: impl FnOnce(Computed
     }
 }
 
-/// Parse the non-auto subset of the CSS Overflow `line-clamp` shorthand.
-///
-/// The tokenization deliberately keeps the optional quoted block ellipsis as
-/// one authored string. `line-clamp:auto` remains unimplemented rather than
-/// being conflated with an unlimited clamp.
-/// <https://drafts.csswg.org/css-overflow-4/#line-clamp>
-fn parse_line_clamp(value: &str, legacy_webkit: bool) -> Option<Option<ComputedLineClamp>> {
+/// Parse CSS Overflow's independently cascaded `max-lines` longhand.
+/// <https://drafts.csswg.org/css-overflow-4/#max-lines>
+fn parse_max_lines(value: &str) -> Option<MaxLines> {
     let value = value.trim();
     if value.eq_ignore_ascii_case("none") {
-        return Some(None);
+        return Some(MaxLines::None);
     }
-    let (limit, remainder) = value
-        .split_once(char::is_whitespace)
-        .map_or((value, ""), |(limit, remainder)| (limit, remainder.trim()));
-    let max_lines = std::num::NonZeroUsize::new(limit.parse::<usize>().ok()?)?;
-    if legacy_webkit && !remainder.is_empty() {
+    std::num::NonZeroUsize::new(value.parse::<usize>().ok()?).map(MaxLines::Lines)
+}
+
+/// Parse the inherited block overflow marker and collapse forced line breaks
+/// in authored strings as required by CSS Overflow.
+/// <https://drafts.csswg.org/css-overflow-4/#block-ellipsis>
+fn parse_block_ellipsis(value: &str) -> Option<BlockEllipsis> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("auto") {
+        return Some(BlockEllipsis::Auto);
+    }
+    if value.eq_ignore_ascii_case("no-ellipsis") {
+        return Some(BlockEllipsis::NoEllipsis);
+    }
+    let (string, rest) = parse_css_string_token(value)?;
+    if !rest.trim().is_empty() {
         return None;
     }
-    let ellipsis = if remainder.is_empty() || remainder.eq_ignore_ascii_case("auto") {
-        BlockEllipsis::Auto
-    } else if remainder.eq_ignore_ascii_case("no-ellipsis") {
-        BlockEllipsis::None
-    } else {
-        let string = remainder
-            .strip_prefix('"')
-            .and_then(|string| string.strip_suffix('"'))?;
-        BlockEllipsis::String(string.to_string())
-    };
-    Some(Some(ComputedLineClamp {
-        max_lines,
-        ellipsis,
-        continuation: if legacy_webkit {
-            ComputedClampContinuation::WebkitLegacy
-        } else {
-            ComputedClampContinuation::Collapse
-        },
-    }))
+    let normalized = string
+        .split(['\r', '\n'])
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(BlockEllipsis::String(std::sync::Arc::from(normalized)))
+}
+
+/// Parse the continuation policy. `-webkit-legacy` is accepted because the
+/// line-clamp shorthands expand to this real computed value.
+/// <https://drafts.csswg.org/css-overflow-4/#continue>
+fn parse_continue(value: &str) -> Option<Continue> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" => Some(Continue::Auto),
+        "collapse" => Some(Continue::Collapse),
+        "discard" => Some(Continue::Discard),
+        "-webkit-legacy" => Some(Continue::WebkitLegacy),
+        _ => None,
+    }
 }
 
 /// Parse the Level 3 `overflow-clip-margin` shorthand.
@@ -719,7 +737,7 @@ fn parse_line_clamp(value: &str, legacy_webkit: bool) -> Option<Option<ComputedL
 fn parse_overflow_clip_margin(value: &str, font_size: f32) -> Option<OverflowClipMargin> {
     let mut reference_box = None;
     let mut length = None;
-    for component in value.split_whitespace() {
+    for component in try_split_css_component_values(value)? {
         let component = component.to_ascii_lowercase();
         match component.as_str() {
             "border-box" if reference_box.is_none() => {

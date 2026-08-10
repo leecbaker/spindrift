@@ -888,7 +888,7 @@ impl<'a> LayoutBuilder<'a> {
                     push_named_string_items(&mut output, items);
                 }
                 NamedStringPart::Attr { name, fallback } => {
-                    if let Some(value) = element.attrs.get(name) {
+                    if let Some(value) = element.unprefixed_css_attr(name) {
                         push_named_string_text_part(&mut output, value);
                     } else if let Some(fallback) = fallback {
                         push_named_string_text_part(&mut output, fallback);

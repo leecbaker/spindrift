@@ -54,14 +54,22 @@ impl<'a> LayoutBuilder<'a> {
             .or(child_bounds)
             .unwrap_or(fallback_bounds);
         let mut policy = StackingContextPolicy::for_atomic(style, PaintBand::Float, bounds);
+        // The replayed float root is laid out through the ordinary principal
+        // effect path, which owns its exact used border-box transform. This
+        // outer float wrapper owns float ordering and exclusion only; applying
+        // the same CTM here would scale/rotate the subtree twice.
+        // <https://drafts.csswg.org/css-transforms-1/#transform-rendering>
+        if style.has_transform() {
+            policy.effects.transform = None;
+            policy.effects.suppress_paint = false;
+        }
         if replaced_content_is_clipped {
             // CSS overflow clips a box's contents rather than its background
             // and border. Raster replaced-element painting already clips its
             // concrete object to the content box, so a float-wide effect
             // scope would otherwise apply a second PDF clip around decoration.
             // <https://www.w3.org/TR/css-overflow-3/#overflow-clipping>
-            policy.effects.overflow_clip = None;
-            policy.effects.rounded_overflow_clip = None;
+            policy.effects.clear_overflow_clip_effects();
         }
         let context = PaintStackingContext::from_banded_fragment(fragment, child_contexts)
             .with_source_order(source_order)

@@ -1,40 +1,66 @@
 use super::*;
-use crate::layout::assets::BorderPaint;
+use crate::layout::assets::{
+    BorderPaint, ResolvedBackgroundImagePaint, has_opaque_square_normal_border,
+};
 
-/// Whether every background layer is either empty or a decoded raster URL
-/// whose source can use the independent decoration-phase painter.
+/// One visible destination slice of a continuously decorated fragmented box.
 ///
-/// This intentionally excludes SVG and generated CSS images: those paths are
-/// still coupled to legacy aggregate paint-time geometry and must move to the
-/// phase model with their own source-specific tests.
-fn uses_only_raster_url_background_layers(style: &ComputedStyle) -> bool {
-    if !style.background_layers.is_empty() {
-        return style
-            .background_layers
-            .iter()
-            .all(|layer| match layer.image.as_image() {
-                None => layer.image.is_none(),
-                Some(BackgroundImage::Url { src, .. }) => raster_url_suffix(src),
-                _ => false,
-            });
-    }
-    match style.background_image.as_image() {
-        None => style.background_image.is_none(),
-        Some(BackgroundImage::Url { src, .. }) => raster_url_suffix(src),
-        _ => false,
-    }
+/// `source_border_rect` is the border box of the unfragmented (for
+/// `box-decoration-break: slice`) box. `destination_border_rect` is solely
+/// the visible fragment's paint and clipping geometry.  The owner supplies
+/// the already-projected translation between those coordinate spaces, which
+/// keeps physical page coordinates out of the fragmentation contract.
+///
+/// <https://www.w3.org/TR/css-break-3/#break-decoration>
+/// <https://www.w3.org/TR/css-backgrounds-3/#background-position>
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout) struct FragmentedDecorationSlice {
+    source_border_rect: PaintRect,
+    destination_border_rect: PaintRect,
+    source_to_destination: PaintTranslation,
+    owns_block_start: bool,
+    owns_block_end: bool,
 }
 
-fn raster_url_suffix(url: &str) -> bool {
-    let path = url
-        .split(['?', '#'])
-        .next()
-        .unwrap_or(url)
-        .trim()
-        .to_ascii_lowercase();
-    [".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".bmp"]
-        .iter()
-        .any(|suffix| path.ends_with(suffix))
+impl FragmentedDecorationSlice {
+    pub(in crate::layout) fn new(
+        source_border_rect: PaintRect,
+        destination_border_rect: PaintRect,
+        source_to_destination: PaintTranslation,
+        owns_block_start: bool,
+        owns_block_end: bool,
+    ) -> Self {
+        Self {
+            source_border_rect,
+            destination_border_rect,
+            source_to_destination,
+            owns_block_start,
+            owns_block_end,
+        }
+    }
+
+    /// The area used to resolve `background-position` and `background-size`.
+    /// The destination rectangle deliberately remains a clip: it never
+    /// becomes the positioning area for a sliced decoration.
+    pub(in crate::layout) fn positioning_border_rect(
+        self,
+        decoration_break: css::BoxDecorationBreak,
+    ) -> PaintRect {
+        if decoration_break == css::BoxDecorationBreak::Clone {
+            self.destination_border_rect
+        } else {
+            self.source_to_destination
+                .transform_rect(&self.source_border_rect)
+        }
+    }
+
+    pub(in crate::layout) fn owns_block_start(self) -> bool {
+        self.owns_block_start
+    }
+
+    pub(in crate::layout) fn owns_block_end(self) -> bool {
+        self.owns_block_end
+    }
 }
 
 /// Builds CSS outline paint primitives for a box border area.
@@ -61,9 +87,9 @@ pub(in crate::layout) fn outline_primitives_for_border_rect(
     }
 
     let mut outline_style = style.clone();
-    outline_style.background_color = css::BackgroundColor::TRANSPARENT;
-    outline_style.background_image = css::ComputedImage::None;
-    outline_style.background_layers.clear();
+    outline_style.background.background_color = css::BackgroundColor::TRANSPARENT;
+    outline_style.background.background_image = css::ComputedImage::None;
+    outline_style.background.background_layers.clear();
     outline_style.border_image = css::BorderImage::initial();
     // CSS outlines are their own final paint step. Reusing the decoration
     // helper must not replay the element's box shadows around the synthetic
@@ -293,8 +319,44 @@ impl<'a> LayoutBuilder<'a> {
         // producing their content primitive, so wrapping the whole atomic
         // fragment here would incorrectly clip the principal decoration too.
         // <https://www.w3.org/TR/css-overflow-3/#overflow-clipping>
-        policy.effects.overflow_clip = None;
-        policy.effects.rounded_overflow_clip = None;
+        policy.effects.clear_overflow_clip_effects();
+        self.scope_current_page_fragment_with_policy(
+            checkpoint,
+            policy,
+            bounds,
+            fragment,
+            Vec::new(),
+        )
+    }
+
+    /// Scope an embedded SVG root as its required isolated SVG stacking
+    /// context.
+    ///
+    /// This captures the CSS box decoration emitted before the SVG scene and
+    /// the scene itself in one atomic group. The root's SVG viewport clipping
+    /// remains on the scene primitives, so the principal box decoration is
+    /// not incorrectly clipped by CSS overflow.
+    /// <https://www.w3.org/TR/SVG2/render.html#EstablishingANewStackingContext>
+    /// <https://www.w3.org/TR/SVG2/render.html#ParentCompositing>
+    pub(super) fn scope_current_page_inline_svg_root_paint_since(
+        &mut self,
+        checkpoint: &PaintCheckpoint,
+        band: PaintBand,
+        bounds: PaintClip,
+        style: &ComputedStyle,
+    ) -> bool {
+        if self.float_paint_capture_depth > 0 {
+            return false;
+        }
+        let fragment = self
+            .current_page
+            .paint_tree_fragment_since(checkpoint)
+            .with_monolithic_fragmentation_scope(bounds);
+        let mut policy = StackingContextPolicy::for_inline_svg_root(style, band, bounds);
+        // Overflow clips a box's contents, not its own background and border.
+        // The inline SVG scene owns its viewport clip before it enters this
+        // root compositing group.
+        policy.effects.clear_overflow_clip_effects();
         self.scope_current_page_fragment_with_policy(
             checkpoint,
             policy,
@@ -353,7 +415,7 @@ impl<'a> LayoutBuilder<'a> {
         positioning_border_rect: PaintRect,
         style: &ComputedStyle,
     ) -> Vec<PaintPrimitive> {
-        let background_images = self.background_image_primitives_with_paint_areas(
+        let background_images = self.resolved_background_image_paint_with_paint_areas(
             positioning_border_rect,
             border_rect,
             style,
@@ -365,43 +427,68 @@ impl<'a> LayoutBuilder<'a> {
         &self,
         border_rect: PaintRect,
         style: &ComputedStyle,
-        background_images: Vec<PaintPrimitive>,
+        background_images: ResolvedBackgroundImagePaint,
     ) -> Vec<PaintPrimitive> {
-        if uses_only_raster_url_background_layers(style)
-            && style.box_shadow.is_empty()
-            && !style.border_image.source.is_image()
-        {
-            return self.raster_background_box_primitives_in_css_paint_order(
-                border_rect,
-                style,
-                background_images,
-            );
-        }
-
         let border_paint = self.border_image_paint(border_rect, style);
         let mut normal_border_style = style.clone();
-        if matches!(&border_paint, BorderPaint::UseNormalBorder) {
-            normal_border_style.border_image.source = css::ComputedImage::None;
-        }
+        // Normal and replacement borders are emitted in their own final
+        // phase. The shared decoration phases must never let an authored
+        // border-image affect their background or shadow primitives.
+        normal_border_style.border_image.source = css::ComputedImage::None;
+        let border_insets = used_border_widths(&normal_border_style);
+        let defer_border_disjoint_images = background_images.border_disjoint_tile_geometry
+            && matches!(&border_paint, BorderPaint::UseNormalBorder)
+            && has_opaque_square_normal_border(style)
+            && !style.box_shadow.iter().any(|shadow| shadow.inset);
+        let mut background_images = background_images.primitives;
         let mut primitives = Vec::new();
-        let (rects, rounded_rects, paths, strokes) =
-            block_paint_ops(border_rect, &normal_border_style);
-        primitives.extend(
-            rects
-                .into_iter()
-                .filter_map(|rect| self.clip_rendered_rect(rect))
-                .map(PaintPrimitive::Rect),
+        self.append_box_paint_phase(
+            &mut primitives,
+            block_paint_ops_with_phases(
+                border_rect,
+                &normal_border_style,
+                border_insets,
+                true,
+                true,
+                false,
+                false,
+            ),
         );
-        primitives.extend(rounded_rects.into_iter().map(PaintPrimitive::RoundedRect));
-        primitives.extend(paths.into_iter().map(PaintPrimitive::Path));
-        primitives.extend(background_images);
-        if let BorderPaint::ReplaceNormalBorder {
-            primitives: border_primitives,
-        } = border_paint
-        {
-            primitives.extend(border_primitives);
+        if !defer_border_disjoint_images {
+            primitives.append(&mut background_images);
         }
-        primitives.extend(strokes.into_iter().map(PaintPrimitive::Stroke));
+        self.append_box_paint_phase(
+            &mut primitives,
+            block_paint_ops_with_phases(
+                border_rect,
+                &normal_border_style,
+                border_insets,
+                false,
+                false,
+                true,
+                false,
+            ),
+        );
+        match border_paint {
+            BorderPaint::UseNormalBorder => self.append_box_paint_phase(
+                &mut primitives,
+                block_paint_ops_with_phases(
+                    border_rect,
+                    &normal_border_style,
+                    border_insets,
+                    false,
+                    false,
+                    false,
+                    true,
+                ),
+            ),
+            BorderPaint::ReplaceNormalBorder {
+                primitives: border_primitives,
+            } => primitives.extend(border_primitives),
+        }
+        if defer_border_disjoint_images {
+            primitives.append(&mut background_images);
+        }
         primitives
     }
 
@@ -414,7 +501,11 @@ impl<'a> LayoutBuilder<'a> {
         &self,
         border_rect: PaintRect,
         style: &ComputedStyle,
-    ) -> Option<(Vec<PaintPrimitive>, Vec<PaintPrimitive>)> {
+    ) -> Option<(
+        Vec<PaintPrimitive>,
+        Vec<PaintPrimitive>,
+        Vec<PaintPrimitive>,
+    )> {
         if style.border_image.source.is_image()
             || matches!(
                 self.border_image_paint(border_rect, style),
@@ -426,6 +517,12 @@ impl<'a> LayoutBuilder<'a> {
         let mut normal_border_style = style.clone();
         normal_border_style.border_image.source = css::ComputedImage::None;
         let insets = used_border_widths(&normal_border_style);
+        let background_images =
+            self.resolved_background_image_paint_with_paint_areas(border_rect, border_rect, style);
+        let defer_border_disjoint_images = background_images.border_disjoint_tile_geometry
+            && has_opaque_square_normal_border(style)
+            && !style.box_shadow.iter().any(|shadow| shadow.inset);
+        let mut background_images = background_images.primitives;
         let mut backgrounds = Vec::new();
         let background_phase = block_paint_ops_with_phases(
             border_rect,
@@ -433,11 +530,23 @@ impl<'a> LayoutBuilder<'a> {
             insets,
             true,
             true,
-            true,
+            false,
             false,
         );
         self.append_box_paint_phase(&mut backgrounds, background_phase);
-        backgrounds.extend(self.background_image_primitives(border_rect, style));
+        if !defer_border_disjoint_images {
+            backgrounds.append(&mut background_images);
+        }
+        let inset_shadow_phase = block_paint_ops_with_phases(
+            border_rect,
+            &normal_border_style,
+            insets,
+            false,
+            false,
+            true,
+            false,
+        );
+        self.append_box_paint_phase(&mut backgrounds, inset_shadow_phase);
         let mut borders = Vec::new();
         let border_phase = block_paint_ops_with_phases(
             border_rect,
@@ -449,7 +558,12 @@ impl<'a> LayoutBuilder<'a> {
             true,
         );
         self.append_box_paint_phase(&mut borders, border_phase);
-        Some((backgrounds, borders))
+        let deferred_images = if defer_border_disjoint_images {
+            background_images
+        } else {
+            Vec::new()
+        };
+        Some((backgrounds, borders, deferred_images))
     }
 
     /// Clip rectangular border primitives to the fieldset regions visible
@@ -478,49 +592,6 @@ impl<'a> LayoutBuilder<'a> {
             }
         }
         clipped
-    }
-
-    /// Emit simple raster URL backgrounds in CSS Backgrounds' decoration
-    /// order. This keeps a translucent border above the image it overlays.
-    ///
-    /// Generated images and SVGs keep the aggregate path until they can use
-    /// the same fully phase-typed representation; unlike decoded raster URLs,
-    /// they still have legacy paint-time dependencies on that aggregate path.
-    /// <https://www.w3.org/TR/css-backgrounds-3/#layering>.
-    fn raster_background_box_primitives_in_css_paint_order(
-        &self,
-        border_rect: PaintRect,
-        style: &ComputedStyle,
-        background_images: Vec<PaintPrimitive>,
-    ) -> Vec<PaintPrimitive> {
-        let border_insets = used_border_widths(style);
-        let mut primitives = Vec::new();
-        self.append_box_paint_phase(
-            &mut primitives,
-            block_paint_ops_with_phases(
-                border_rect,
-                style,
-                border_insets,
-                true,
-                true,
-                false,
-                false,
-            ),
-        );
-        primitives.extend(background_images);
-        self.append_box_paint_phase(
-            &mut primitives,
-            block_paint_ops_with_phases(
-                border_rect,
-                style,
-                border_insets,
-                false,
-                false,
-                false,
-                true,
-            ),
-        );
-        primitives
     }
 
     fn append_box_paint_phase(
@@ -619,9 +690,12 @@ impl<'a> LayoutBuilder<'a> {
     }
 
     pub(super) fn push_overflow_clip(&mut self, clip: OverflowClip) {
-        if clip.width() > 0.0 && clip.height() > 0.0 {
-            self.overflow_clips.push(clip);
-        }
+        // An empty used scrollport is still an active overflow clip: it
+        // suppresses every descendant rather than becoming `overflow:
+        // visible`. Retaining it also keeps push/pop scope depth balanced;
+        // dropping it would let `pop_overflow_clip` remove an ancestor clip.
+        // <https://www.w3.org/TR/css-overflow-3/#overflow-clipping>
+        self.overflow_clips.push(clip);
     }
 
     /// Push a CSS overflow clip for a box's padding box.
@@ -635,6 +709,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
+        scrollbar_reservation: Option<ScrollbarGutterReservation>,
         outer_x: f32,
         block_top: f32,
         border_widths: css::Edges,
@@ -645,6 +720,7 @@ impl<'a> LayoutBuilder<'a> {
         if !style_clips_overflow(style) && !containment.clips_descendant_paint() {
             return false;
         }
+        let used_overflow = UsedOverflowAxes::from_style(style);
         let (clip_edge_x, clip_edge_y) = overflow_clip_edge_axes(style);
         let (clip_x, clip_y) = overflow_clipping_axes(style);
         let margin = if clip_edge_x || clip_edge_y {
@@ -660,19 +736,19 @@ impl<'a> LayoutBuilder<'a> {
             clip_height + margin * 2.0,
         )
         .paint_clip();
-        let scrollport = ScrollportGeometry::for_padding_box(
-            padding_box,
-            style,
-            UsedOverflowAxes::from_style(style),
-            false,
-            false,
+        let scrollport = scrollbar_reservation.map_or_else(
+            || ScrollportGeometry::for_padding_box(padding_box, style, used_overflow, false, false),
+            |reservation| {
+                ScrollportGeometry::for_padding_box_with_reservation(padding_box, reservation)
+            },
         );
-        self.push_overflow_clip(
-            OverflowClip::from_paint_rect(scrollport.scrollport.paint_rect()).with_axes(
-                clip_x || containment.clips_descendant_paint(),
-                clip_y || containment.clips_descendant_paint(),
-            ),
-        );
+        self.push_overflow_clip(OverflowClip::from_paint_rect_with_axes_and_non_scrollable(
+            scrollport.scrollport.paint_rect(),
+            clip_x || containment.clips_descendant_paint(),
+            clip_y || containment.clips_descendant_paint(),
+            used_overflow.non_scrollable_clip_x(),
+            used_overflow.non_scrollable_clip_y(),
+        ));
         true
     }
 
@@ -807,6 +883,30 @@ mod tests {
             expanded_outline_paint_rect(border_rect, 5.0),
             paint_space_rect(8.0, 24.0, 30.0, 50.0)
         );
+    }
+
+    #[test]
+    fn fragmented_decoration_keeps_source_positioning_separate_from_destination_clip() {
+        let source = paint_space_rect(10.0, 20.0, 100.0, 200.0);
+        let destination = paint_space_rect(40.0, 80.0, 100.0, 60.0);
+        let slice = FragmentedDecorationSlice::new(
+            source,
+            destination,
+            PaintTranslation::new(30.0, 60.0),
+            false,
+            true,
+        );
+
+        assert_eq!(
+            slice.positioning_border_rect(css::BoxDecorationBreak::Slice),
+            paint_space_rect(40.0, 80.0, 100.0, 200.0)
+        );
+        assert_eq!(
+            slice.positioning_border_rect(css::BoxDecorationBreak::Clone),
+            destination
+        );
+        assert!(!slice.owns_block_start());
+        assert!(slice.owns_block_end());
     }
 
     #[test]

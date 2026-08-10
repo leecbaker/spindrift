@@ -115,11 +115,21 @@ pub(in crate::layout) fn apply_object_fit(
         full_height,
     ));
     if let Some(clip) = object_view_box_clip(&view_box, natural_size, geometry) {
+        // `fill` maps the complete source directly to the destination. Its
+        // visible-area rectangle is therefore already the paint primitive's
+        // own boundary. Appending it to an existing shaped content contour
+        // creates a second raster edge in the same graphics state without
+        // changing the CSS intersection.
+        if !view_box.applies() && matches!(object_fit, ObjectFit::Fill) {
+            if image.clip().is_none() {
+                *image = image.clone().with_destination_rect_clip(clip);
+            }
+            return true;
+        }
         // `object-view-box` crops the source image, but it must not discard
         // an enclosing CSS clip such as `border-shape`. PDF applies multiple
         // clipping paths as their intersection in one graphics state.
         // <https://drafts.csswg.org/css-images-4/#object-view-box>
-        let has_existing_clip = image.clip().is_some();
         let clip = if let Some(existing) = image.clip().cloned() {
             let mut combined = existing;
             combined
@@ -130,22 +140,7 @@ pub(in crate::layout) fn apply_object_fit(
         } else {
             clip
         };
-        // `object-fit` always constructs a visible-area clip. If the full
-        // source is already wholly visible, that clip is exactly the final
-        // image rectangle and has no CSS effect. Preserve this fact as
-        // semantic metadata; the independently-computed path may differ by
-        // one floating-point operation from the final paint rectangle.
-        // `fill` scales the entire replaced object directly into its destination
-        // rectangle. This is semantic knowledge about the object-fit operation,
-        // rather than a conclusion recovered by comparing the two floating-point
-        // paths we happened to construct above.
-        let is_destination_rect_clip =
-            !has_existing_clip && !view_box.applies() && matches!(object_fit, ObjectFit::Fill);
-        *image = if is_destination_rect_clip {
-            image.clone().with_destination_rect_clip(clip)
-        } else {
-            image.clone().with_clip(clip)
-        };
+        *image = image.clone().with_clip(clip);
     }
     true
 }
@@ -228,6 +223,32 @@ pub(in crate::layout) fn svg_replaced_group(
     object_position: css::BackgroundPosition,
     object_view_box: css::ObjectViewBox,
 ) -> crate::svg::SvgPaintGroup {
+    svg_replaced_group_with_viewport_clip(
+        asset,
+        destination,
+        object_fit,
+        object_position,
+        object_view_box,
+        true,
+    )
+}
+
+/// Paint an SVG replaced object while preserving the root viewport's CSS
+/// overflow policy.
+///
+/// CSS Images consumers always select a finite source rectangle and therefore
+/// use [`svg_replaced_group`]'s clipping behavior. An embedded SVG root is a
+/// CSS box in its own right: `overflow: visible` lets its SVG descendants
+/// extend beyond that viewport.
+/// <https://www.w3.org/TR/SVG2/render.html#OverflowAndClipProperties>
+pub(in crate::layout) fn svg_replaced_group_with_viewport_clip(
+    asset: &SharedSvgAsset,
+    destination: PaintRect,
+    object_fit: ObjectFit,
+    object_position: css::BackgroundPosition,
+    object_view_box: css::ObjectViewBox,
+    clip_viewport: bool,
+) -> crate::svg::SvgPaintGroup {
     let natural_size = asset.replaced_intrinsic_size();
     let view_box = resolved_object_view_box_for_svg(object_view_box, asset);
     let source_view_box = view_box.source_rect();
@@ -269,7 +290,11 @@ pub(in crate::layout) fn svg_replaced_group(
             source_size.height * source_view_box.size.height * visible_height,
         ),
     );
-    let group = viewport_asset.paint_group_for_source_rect(geometry.visible, source);
+    let group = viewport_asset.paint_group_for_source_rect_with_viewport_clip(
+        geometry.visible,
+        source,
+        clip_viewport,
+    );
     // `paint_group_for_source_rect` already clips the SVG root viewport to
     // `geometry.visible`. Re-applying that same rectangular clip is
     // redundant and can introduce an additional antialiased edge. An effective
@@ -287,23 +312,26 @@ pub(in crate::layout) fn svg_replaced_group(
     }
 }
 
-/// Build the clipped content contour for a replaced box with one
-/// `border-shape` and clipping overflow.
+/// Resolve the CSS Borders content edge for an atomic replaced primitive.
 ///
-/// Replaced content is emitted as an atomic image/SVG primitive, outside the
-/// normal-flow fragment capture that supplies ordinary overflow effects.  It
-/// therefore carries the shape clip directly while the principal decoration
-/// remains outside the clip.
-pub(in crate::layout) fn single_border_shape_content_clip(
+/// This is intentionally independent of `overflow`: CSS Borders requires a
+/// replaced element's content to follow the curved/shaped content edge even
+/// when ordinary descendant overflow remains visible.
+pub(in crate::layout) fn replaced_content_contour(
     border_rect: PaintRect,
     style: &ComputedStyle,
     border_insets: css::Edges,
-) -> Option<ReplacedBorderShapeContentClip> {
-    let overflow_clip = single_border_shape_overflow_path_clip(border_rect, style, border_insets)?;
-    let BorderShapeOverflowClip::Path(clip) = overflow_clip else {
-        return Some(ReplacedBorderShapeContentClip::Empty);
-    };
-    Some(ReplacedBorderShapeContentClip::Path(clip))
+) -> Option<ResolvedBoxContentClip> {
+    if style.border_radius.clone().is_zero() && matches!(style.border_shape, css::BorderShape::None)
+    {
+        return None;
+    }
+    resolve_box_content_contour(
+        border_rect,
+        style,
+        border_insets,
+        BoxContentContourRequest::ReplacedContent,
+    )
 }
 
 /// Emit tiled vector paths for one CSS border-image slice.

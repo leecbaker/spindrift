@@ -1,4 +1,5 @@
 use super::*;
+use crate::css::FontFamilyName;
 use crate::units::SemanticLengthExt;
 
 pub(super) fn fontique_weight(weight: FontWeight) -> FontiqueFontWeight {
@@ -125,16 +126,12 @@ pub(super) fn parley_font_family_source(family: &FontFamily) -> String {
             .map(parley_font_family_source)
             .collect::<Vec<_>>()
             .join(", "),
-        FontFamily::Names(names) => names
-            .iter()
-            .map(|name| {
-                let escaped = fontique_family_name(name)
-                    .replace('\\', "\\\\")
-                    .replace('"', "\\\"");
-                format!("\"{escaped}\"")
-            })
-            .collect::<Vec<_>>()
-            .join(", "),
+        FontFamily::Named(name) => {
+            let escaped = fontique_family_name(name.as_str())
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"");
+            format!("\"{escaped}\"")
+        }
     }
 }
 
@@ -514,7 +511,6 @@ fn push_vertical_form_feature_ranges(
 fn push_vertical_form_features(features: &mut Vec<ParleyFontFeature>, policy: FontFeaturePolicy) {
     if policy.vertical_forms {
         push_parley_font_feature(features, *b"vert", 1);
-        push_parley_font_feature(features, *b"vrt2", 1);
     }
 }
 
@@ -961,7 +957,7 @@ pub(super) fn generic_query_families(
         FontFamily::UiMonospace => Some(UI_MONOSPACE),
         FontFamily::UiRounded => Some(UI_ROUNDED),
         FontFamily::List(_) => None,
-        FontFamily::Names(_) => None,
+        FontFamily::Named(_) => None,
     }
 }
 
@@ -977,20 +973,12 @@ impl FontRequest {
             FontFamily::UiMonospace => Some(GenericFontRequest::UiMonospace),
             FontFamily::UiRounded => Some(GenericFontRequest::UiRounded),
             FontFamily::List(_) => None,
-            FontFamily::Names(_) => None,
+            FontFamily::Named(_) => None,
         }
     }
 
-    fn normalized_names_key(names: &[String]) -> FontRequestFamily {
-        let names = names
-            .iter()
-            .map(|name| normalize_family(name))
-            .collect::<Vec<_>>();
-        if names.len() == 1 {
-            FontRequestFamily::Named(names.into_iter().next().unwrap())
-        } else {
-            FontRequestFamily::Names(names)
-        }
+    fn normalized_name_key(name: &FontFamilyName) -> FontRequestFamily {
+        FontRequestFamily::Named(normalize_family(name.as_str()))
     }
 
     fn family_key(family: &FontFamily) -> FontRequestFamily {
@@ -998,7 +986,7 @@ impl FontRequest {
             return FontRequestFamily::Generic(generic);
         }
         match family {
-            FontFamily::Names(names) => Self::normalized_names_key(names),
+            FontFamily::Named(name) => Self::normalized_name_key(name),
             FontFamily::List(families) => {
                 FontRequestFamily::List(families.iter().map(Self::family_key).collect())
             }
@@ -1180,7 +1168,9 @@ pub(super) fn sanitize_pdf_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::css::{FontFeatureSetting, FontFeatureSettings, FontLanguageOverride, WritingMode};
+    use crate::css::{
+        ContentLanguage, FontFeatureSetting, FontFeatureSettings, FontLanguageOverride, WritingMode,
+    };
 
     fn vertical_range_texts<'a>(text: &'a str, style: &ComputedStyle) -> Vec<&'a str> {
         vertical_form_feature_ranges(text, style)
@@ -1216,7 +1206,7 @@ mod tests {
     #[test]
     fn font_language_override_replaces_only_the_shaping_locale() {
         let mut style = ComputedStyle::initial();
-        style.language = Some("tr".to_string());
+        style.language = ContentLanguage::from_html_attribute("tr");
         style.font_language_override = FontLanguageOverride::OpenType(*b"DEU ");
         assert_eq!(parley_language(&style).unwrap().as_str(), "de");
         style.font_language_override = FontLanguageOverride::OpenType(*b"TRK ");
@@ -1374,7 +1364,7 @@ mod tests {
 
         let enabled = parley_font_features(&style, 0.0, None, FontFeaturePolicy::UPRIGHT_VERTICAL);
         assert_eq!(feature_value(&enabled, *b"vert"), Some(1));
-        assert_eq!(feature_value(&enabled, *b"vrt2"), Some(1));
+        assert_eq!(feature_value(&enabled, *b"vrt2"), None);
 
         let mut overridden = style.clone();
         overridden.font_feature_settings = FontFeatureSettings(vec![

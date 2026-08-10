@@ -57,12 +57,17 @@ pub(in crate::layout) fn inline_atom_boundary_role(
 ) -> InlineBoundaryRole {
     match content {
         InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(_))
+        | InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace(_))
         | InlineAtomContent::StaticPositionPlaceholder => {
             // Out-of-flow boxes retain a zero-size placeholder for static
             // positioning, but CSS Text processes the surrounding source as
             // one text sequence. The placeholder must not create a text
             // context reset or a soft-wrap boundary.
-            // <https://drafts.csswg.org/css-text-3/#line-break-details>
+            // A text-autospace adjustment is likewise a non-text boundary
+            // effect: it never supplies UAX #14's atomic-object input or
+            // resets the source text context.
+            // <https://drafts.csswg.org/css-text-3/#line-break-details> and
+            // <https://drafts.csswg.org/css-text-4/#text-autospace-property>
             InlineBoundaryRole::TransparentTextBoundary
         }
         InlineAtomContent::InlineBox { .. }
@@ -76,7 +81,6 @@ pub(in crate::layout) fn inline_atom_boundary_role(
         | InlineAtomContent::Image(_)
         | InlineAtomContent::Gradient { .. }
         | InlineAtomContent::Svg { .. }
-        | InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace)
         | InlineAtomContent::Leader(_) => InlineBoundaryRole::OpaqueAtomic,
     }
 }

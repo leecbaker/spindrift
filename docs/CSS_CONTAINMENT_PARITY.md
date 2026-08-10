@@ -1,5 +1,7 @@
 # CSS Containment parity
 
+Last updated: 2026-08-04
+
 Root/body containment is resolved before layout from the cascaded `html` and
 first eligible `body` styles. A non-`none` used `contain` value (including
 `inline-size` and `style`) on either element disables body property
@@ -13,6 +15,9 @@ This is not a statement about CSS Container Query evaluation.
 
 - `container-type`, `container-name`, and the `container` shorthand are parsed
   into typed computed-style fields.
+- Logical `contain-intrinsic-inline-size` and
+  `contain-intrinsic-block-size` resolve to their physical computed owner
+  before CSS-wide defaulting and rollback, including vertical writing modes.
 - `cqw`, `cqh`, `cqi`, `cqb`, `cqmin`, and `cqmax` are preserved through
   `calc()`, `min()`, `max()`, `clamp()`, and `calc-size()` length values.
 - When no query container is available, these units resolve against the paged
@@ -23,9 +28,15 @@ This is not a statement about CSS Container Query evaluation.
   keeping generated-quote nesting local to the containment scope.
 - Layout and paint containment establish independent formatting contexts for
   block and atomic-inline layout, including local float and margin behavior.
-  A layout-contained atomic inline suppresses a descendant-exported baseline
-  but uses the ordinary bottom-margin-edge fallback; forced breaks remain
-  consumable by the active local fragmentainer.
+  Captured atomic-inline paint retains an explicit scratch-to-border-box replay
+  transform, so descendant margin placement, paint-containment clipping, and
+  stacking-context bounds use one resolved border box without treating the
+  parent line's margin-box geometry as fragment-local paint coordinates.
+  Layout containment also establishes a stacking context. A layout-contained
+  atomic inline suppresses every descendant baseline source—including Grid,
+  multicolumn, and captured fragment line baselines—and uses the ordinary
+  bottom-margin-edge fallback; forced breaks remain consumable by the active
+  local fragmentainer.
 - The used containment record is the layout and paint source of truth. It
   rejects non-atomic inline and excluded internal-table principal boxes while
   retaining effects for eligible table cells; layout/paint boundaries export

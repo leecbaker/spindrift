@@ -377,8 +377,8 @@ impl FlexIntrinsicItem {
             max_cross_contribution,
             flex_base_size,
             hypothetical_main_size,
-            grow: FlexGrowFactor::new(style.flex_grow),
-            shrink: FlexShrinkFactor::new(style.flex_shrink),
+            grow: FlexGrowFactor::new(style.flex_grow.value()),
+            shrink: FlexShrinkFactor::new(style.flex_shrink.value()),
             preferred_aspect_ratio: style
                 .aspect_ratio
                 .preferred_ratio_for_non_replaced(child.is_replaced_element()),

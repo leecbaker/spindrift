@@ -1,16 +1,7 @@
 use super::*;
+use crate::layout::asset_helpers::CssImageNaturalDimensions;
 use std::rc::Rc;
 
-/// The descendant-content clip carried by an atomic replaced element.
-///
-/// An empty contour is distinct from the absence of `border-shape`: it
-/// suppresses content entirely, rather than falling back to the rectangular
-/// content box.
-#[derive(Debug, Clone)]
-pub(in crate::layout) enum ReplacedBorderShapeContentClip {
-    Path(RenderedPathClip),
-    Empty,
-}
 /// A positioned box's source style and its normalized layout style.
 ///
 /// Positioned layout must retain the source style for cascade-owned decisions
@@ -106,7 +97,7 @@ impl<'a> LayoutBuilder<'a> {
         let border_y = border_origin.y;
         let paint_checkpoint = self.current_page.paint_checkpoint();
         if style.visibility == Visibility::Visible
-            && (style.background_color.is_potentially_visible()
+            && (style.background.background_color.is_potentially_visible()
                 || used_border_width(style) > layout_pt(0.0))
         {
             let (rects, rounded_rects, paths, strokes) = block_paint_ops(
@@ -149,10 +140,13 @@ impl<'a> LayoutBuilder<'a> {
             ));
             fragment.promote_page_background_to_in_flow_block();
             fragment.promote_background_border_to_in_flow_block();
-            fragment = fragment.with_contents_effect_scoped_to_rect_if_needed(
-                page,
-                PaintClip::from_paint_rect(content_rect),
-            );
+            // The embedded page canvas is descendant paint of the iframe,
+            // rather than the embedding element's own decoration.  Its
+            // background must therefore stay inside the same viewport clip
+            // as the child document's translated scroll contents.
+            // <https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element>
+            fragment = fragment
+                .with_effect_scoped_to_rect_all_bands(PaintClip::from_paint_rect(content_rect));
             self.current_page
                 .append_paint_fragment_owned(fragment, PaintTranslation::identity());
         }
@@ -205,35 +199,30 @@ impl<'a> LayoutBuilder<'a> {
         let paint_checkpoint = self.current_page.paint_checkpoint();
         let decoration_rect =
             paint_space_rect(border_x, border_y, border_box_width, border_box_height);
-        let border_shape_content_clip =
-            single_border_shape_content_clip(decoration_rect, style, border_widths);
+        let content_contour = replaced_content_contour(decoration_rect, style, border_widths);
         if style.visibility == Visibility::Visible {
-            if style.background_color.is_potentially_visible()
+            if style.background.background_color.is_potentially_visible()
                 || used_border_width(style) > layout_pt(0.0)
             {
-                // Replaced content occupies the content layer: its box
-                // background belongs below it, while inset shadows and the
-                // border must paint above it. A monolithic decoration pass
-                // reverses that order and lets the image erase its border.
-                let (rects, rounded_rects, paths, strokes) = block_paint_ops_with_phases(
-                    decoration_rect,
-                    style,
-                    border_widths,
-                    true,
-                    true,
-                    false,
-                    false,
-                );
+                // A principal box's complete decoration paints in its
+                // parent block phase before its contents.  Replaced content
+                // is an atomic content layer, not a reason to split the
+                // element's background and border around an image draw.
+                // Its content-edge contour below keeps it out of the border
+                // region without changing that paint order.
+                // <https://www.w3.org/TR/CSS22/zindex.html>
+                let (rects, rounded_rects, paths, strokes) =
+                    block_paint_ops(decoration_rect, style);
                 for rect in rects {
-                    self.push_rect_in_band(PaintBand::InFlowBlock, rect);
+                    self.push_rect_in_band(PaintBand::BackgroundBorder, rect);
                 }
                 for rounded_rect in rounded_rects {
-                    self.push_rounded_rect_in_band(PaintBand::InFlowBlock, rounded_rect);
+                    self.push_rounded_rect_in_band(PaintBand::BackgroundBorder, rounded_rect);
                 }
                 for path in paths {
-                    self.push_path_in_band(PaintBand::InFlowBlock, path);
+                    self.push_path_in_band(PaintBand::BackgroundBorder, path);
                 }
-                self.extend_strokes_in_band(PaintBand::InFlowBlock, strokes);
+                self.extend_strokes_in_band(PaintBand::BackgroundBorder, strokes);
             }
             let image_x = border_x + border_widths.left + style.padding.left;
             let image_y = border_y + border_widths.bottom + style.padding.bottom;
@@ -245,8 +234,8 @@ impl<'a> LayoutBuilder<'a> {
             if content_width > 0.0
                 && content_height > 0.0
                 && !matches!(
-                    border_shape_content_clip,
-                    Some(ReplacedBorderShapeContentClip::Empty)
+                    content_contour.as_ref().map(|clip| &clip.contour),
+                    Some(BoxContentContour::Empty)
                 )
             {
                 if let Some(asset) = image.svg {
@@ -257,8 +246,9 @@ impl<'a> LayoutBuilder<'a> {
                         style.object_position.clone(),
                         style.object_view_box.clone(),
                     );
-                    if let Some(ReplacedBorderShapeContentClip::Path(clip)) =
-                        border_shape_content_clip
+                    if let Some(clip) = content_contour
+                        .as_ref()
+                        .and_then(ResolvedBoxContentClip::path_clip)
                     {
                         group = group.with_clip(clip);
                     }
@@ -277,8 +267,9 @@ impl<'a> LayoutBuilder<'a> {
                     )
                     .with_raster_color_space(image.decoded.color_space.clone())
                     .with_image_id(image.decoded.image_id);
-                    if let Some(ReplacedBorderShapeContentClip::Path(clip)) =
-                        border_shape_content_clip
+                    if let Some(clip) = content_contour
+                        .as_ref()
+                        .and_then(ResolvedBoxContentClip::path_clip)
                     {
                         rendered = rendered.with_clip(clip);
                     }
@@ -291,29 +282,6 @@ impl<'a> LayoutBuilder<'a> {
                         self.push_image(rendered);
                     }
                 }
-            }
-            if style.background_color.is_potentially_visible()
-                || used_border_width(style) > layout_pt(0.0)
-            {
-                let (rects, rounded_rects, paths, strokes) = block_paint_ops_with_phases(
-                    decoration_rect,
-                    style,
-                    border_widths,
-                    false,
-                    false,
-                    true,
-                    true,
-                );
-                for rect in rects {
-                    self.push_rect_in_band(PaintBand::InFlowBlock, rect);
-                }
-                for rounded_rect in rounded_rects {
-                    self.push_rounded_rect_in_band(PaintBand::InFlowBlock, rounded_rect);
-                }
-                for path in paths {
-                    self.push_path_in_band(PaintBand::InFlowBlock, path);
-                }
-                self.extend_strokes_in_band(PaintBand::InFlowBlock, strokes);
             }
         }
         self.scope_current_page_replaced_paint_since(
@@ -374,7 +342,7 @@ impl<'a> LayoutBuilder<'a> {
         let border_y = border_origin.y;
         let paint_checkpoint = self.current_page.paint_checkpoint();
         if style.visibility == Visibility::Visible {
-            if style.background_color.is_potentially_visible()
+            if style.background.background_color.is_potentially_visible()
                 || used_border_width(style) > layout_pt(0.0)
             {
                 let (rects, rounded_rects, paths, strokes) = block_paint_ops(
@@ -490,31 +458,29 @@ impl<'a> LayoutBuilder<'a> {
         let paint_checkpoint = self.current_page.paint_checkpoint();
         let border_paint_rect =
             paint_space_rect(border_x, border_y, border_box_width, border_box_height);
-        let border_shape_content_clip = style_clips_overflow(style)
-            .then(|| single_border_shape_content_clip(border_paint_rect, style, border_widths))
-            .flatten();
+        let content_contour = replaced_content_contour(border_paint_rect, style, border_widths);
         if style.visibility == Visibility::Visible
-            && (style.background_color.is_potentially_visible()
+            && (style.background.background_color.is_potentially_visible()
                 || used_border_width(style) > layout_pt(0.0))
         {
             let (rects, rounded_rects, paths, strokes) = block_paint_ops(border_paint_rect, style);
             for rect in rects {
-                self.push_rect_in_band(PaintBand::InFlowBlock, rect);
+                self.push_rect_in_band(PaintBand::BackgroundBorder, rect);
             }
             for rounded_rect in rounded_rects {
-                self.push_rounded_rect_in_band(PaintBand::InFlowBlock, rounded_rect);
+                self.push_rounded_rect_in_band(PaintBand::BackgroundBorder, rounded_rect);
             }
             for path in paths {
-                self.push_path_in_band(PaintBand::InFlowBlock, path);
+                self.push_path_in_band(PaintBand::BackgroundBorder, path);
             }
-            self.extend_strokes_in_band(PaintBand::InFlowBlock, strokes);
+            self.extend_strokes_in_band(PaintBand::BackgroundBorder, strokes);
         }
         if style.visibility == Visibility::Visible
             && content_width > 0.0
             && content_height > 0.0
             && !matches!(
-                border_shape_content_clip,
-                Some(ReplacedBorderShapeContentClip::Empty)
+                content_contour.as_ref().map(|clip| &clip.contour),
+                Some(BoxContentContour::Empty)
             )
         {
             let content_x = border_x + border_widths.left + style.padding.left;
@@ -531,12 +497,15 @@ impl<'a> LayoutBuilder<'a> {
                 paint_space_rect(content_x, content_y, content_width, content_height),
                 style_clips_overflow(style),
             );
-            if let Some(ReplacedBorderShapeContentClip::Path(clip)) = border_shape_content_clip {
+            if let Some(clip) = content_contour
+                .as_ref()
+                .and_then(ResolvedBoxContentClip::path_clip)
+            {
                 group = group.with_clip(clip);
             }
             self.push_svg_group_in_band(PaintBand::InFlowBlock, group);
         }
-        self.scope_current_page_replaced_paint_since(
+        self.scope_current_page_inline_svg_root_paint_since(
             &paint_checkpoint,
             PaintBand::InFlowBlock,
             PaintClip::from_paint_rect(border_paint_rect),
@@ -578,33 +547,14 @@ impl<'a> LayoutBuilder<'a> {
         )
     }
 
-    pub(in crate::layout) fn background_image_primitives(
-        &self,
-        border_rect: PaintRect,
-        style: &ComputedStyle,
-    ) -> Vec<PaintPrimitive> {
-        self.background_image_primitives_with_paint_areas(border_rect, border_rect, style)
-    }
-
-    /// Resolve a box background with independent positioning and clipping
-    /// border areas.
-    ///
-    /// Fragmented boxes keep one background positioning area while each
-    /// fragment contributes its own clip area.  This is the CSS Backgrounds
-    /// `box-decoration-break: slice` model: a continuation must clip the
-    /// source box's image rather than re-position a new layer in itself.
-    /// Keeping this at the asset boundary also preserves `fixed` attachment's
-    /// containing block while float paint capture re-parents the result.
-    ///
-    /// <https://www.w3.org/TR/css-backgrounds-3/#background-position>
-    /// <https://www.w3.org/TR/css-backgrounds-3/#box-decoration-break>
-    /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
-    pub(in crate::layout) fn background_image_primitives_with_paint_areas(
+    /// Resolve image primitives together with the finite-tile geometry used
+    /// to choose the normal-box PDF decoration phase.
+    pub(in crate::layout) fn resolved_background_image_paint_with_paint_areas(
         &self,
         positioning_border_rect: PaintRect,
         clip_border_rect: PaintRect,
         style: &ComputedStyle,
-    ) -> Vec<PaintPrimitive> {
+    ) -> ResolvedBackgroundImagePaint {
         let fixed_positioning_area = self
             .fixed_containing_blocks
             .last()
@@ -630,7 +580,7 @@ impl<'a> LayoutBuilder<'a> {
                     ),
                 )
             });
-        background_image_primitives_for_style_with_paint_areas_and_fixed_positioning_area(
+        background_image_paint_for_style_with_paint_areas_and_fixed_positioning_area(
             PaintBackgroundArea::from_paint_rect(positioning_border_rect),
             PaintBackgroundArea::from_paint_rect(clip_border_rect),
             Some(fixed_positioning_area),
@@ -679,6 +629,7 @@ impl<'a> LayoutBuilder<'a> {
                     .or(style.border_image.source_root_url.as_ref()),
                 self.resource_cache,
                 style.image_orientation == css::ImageOrientation::FromImage,
+                crate::svg::SvgImageContext::from_used_color_scheme(style.used_color_scheme),
                 request_modifiers,
             ),
             image => rasterize_generated_css_image(
@@ -702,6 +653,33 @@ impl<'a> LayoutBuilder<'a> {
             Some(asset) => asset,
             None => return BorderPaint::UseNormalBorder,
         };
+        let borders = used_border_widths(style);
+        let outsets = used_border_image_outsets(style, borders);
+        let area_width = border_rect.size.width + outsets.left + outsets.right;
+        let area_height = border_rect.size.height + outsets.top + outsets.bottom;
+        let asset = match asset {
+            ResolvedImageAsset::Raster(asset) => ResolvedImageAsset::Raster(asset),
+            // Resolve the vector source's default concrete object size before
+            // `border-image-slice` resolves its vector-coordinate offsets.
+            // This preserves a supplied intrinsic axis or aspect ratio while
+            // using the border-image area as the default object size.
+            // <https://www.w3.org/TR/css-backgrounds-3/#border-image-slice>
+            // <https://www.w3.org/TR/css-images-3/#default-sizing>
+            ResolvedImageAsset::Svg(asset) => {
+                let dimensions = asset.intrinsic_dimensions();
+                if dimensions.width.is_some() && dimensions.height.is_some() {
+                    ResolvedImageAsset::Svg(asset)
+                } else {
+                    let concrete_size = CssImageNaturalDimensions::from_layout_axes(
+                        dimensions.width,
+                        dimensions.height,
+                        dimensions.aspect_ratio,
+                    )
+                    .default_size(PaintSize::new(area_width, area_height));
+                    ResolvedImageAsset::Svg(Rc::new(asset.with_css_image_viewport(concrete_size)))
+                }
+            }
+        };
         let (source_width, source_height) = match &asset {
             ResolvedImageAsset::Raster(decoded) => (decoded.pixel_width, decoded.pixel_height),
             ResolvedImageAsset::Svg(asset) => {
@@ -717,10 +695,6 @@ impl<'a> LayoutBuilder<'a> {
             source_width,
             source_height,
         );
-        let borders = used_border_widths(style);
-        let outsets = used_border_image_outsets(style, borders);
-        let area_width = border_rect.size.width + outsets.left + outsets.right;
-        let area_height = border_rect.size.height + outsets.top + outsets.bottom;
         let image_widths = fit_border_image_widths_to_area(
             used_border_image_widths(
                 style,

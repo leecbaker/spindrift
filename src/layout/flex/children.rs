@@ -129,50 +129,68 @@ pub(super) fn flex_child_lists_from_boxes<'a>(
             establish_independent_formatting_context: true,
         },
     );
-    trim_flex_item_margins_at_container_inline_edges(container_style, &mut in_flow);
+    if !container_style.flex_wrap.wraps() {
+        apply_single_line_flex_margin_trim(container_style, &mut in_flow);
+    }
     (in_flow, positioned)
 }
 
-/// Apply a flex container's `margin-trim: inline` to its edge flex items.
+/// Apply the single-line subset of a flex container's `margin-trim`.
 ///
-/// `margin-trim` is defined against the containing block's logical edges, not
-/// against an item's own writing mode.  Applying the zeroed physical margin to
-/// the item style before both intrinsic estimation and the Taffy adapter keeps
-/// every flex sizing and placement phase in agreement:
-/// <https://drafts.csswg.org/css-box-4/#margin-trim> and
-/// <https://www.w3.org/TR/css-flexbox-1/#layout-algorithm>.
-fn trim_flex_item_margins_at_container_inline_edges(
+/// Multi-line containers refine this plan once flex-line topology is known.
+/// This eager application is nevertheless the exact final plan for the
+/// overwhelmingly common single-line case, and ensures intrinsic estimation
+/// and the Taffy adapter receive the same used margins.
+/// <https://drafts.csswg.org/css-box-4/#margin-trim-flex>.
+fn apply_single_line_flex_margin_trim(
     container_style: &ComputedStyle,
     children: &mut [StyledChild<'_>],
 ) {
     if children.is_empty() {
         return;
     }
-    let Some((main_start, main_end)) = flex_main_logical_edges(container_style) else {
-        return;
-    };
     let axes = WritingModeAxes::new(
         container_style.writing_mode,
         container_style.used_direction(),
     );
-    let inline_start = axes.physical_side(LogicalSide::InlineStart);
-    let inline_end = axes.physical_side(LogicalSide::InlineEnd);
+    let (main_start, main_end) = flex_main_logical_edges(container_style);
+    let main_start = axes.physical_side(main_start);
+    let main_end = axes.physical_side(main_end);
+    let mut plan = MarginTrimPlan::for_item_count(children.len());
 
-    if container_style.margin_trim.inline_start {
-        if axes.physical_side(main_start) == inline_start {
-            trim_physical_item_margin(&mut children[0].style, inline_start);
+    for (trimmed, side) in [
+        (
+            container_style.margin_trim.block_start,
+            LogicalSide::BlockStart,
+        ),
+        (container_style.margin_trim.block_end, LogicalSide::BlockEnd),
+        (
+            container_style.margin_trim.inline_start,
+            LogicalSide::InlineStart,
+        ),
+        (
+            container_style.margin_trim.inline_end,
+            LogicalSide::InlineEnd,
+        ),
+    ] {
+        if !trimmed {
+            continue;
         }
-        if axes.physical_side(main_end) == inline_start {
-            trim_physical_item_margin(&mut children[children.len() - 1].style, inline_start);
+        let physical_side = axes.physical_side(side);
+        if physical_side.axis() != main_start.axis() {
+            // The container edge is parallel to the main axis, so every item
+            // on the only flex line adjoins it.
+            for index in 0..children.len() {
+                plan.trim(index, physical_side);
+            }
+        } else if physical_side == main_start {
+            plan.trim(0, physical_side);
+        } else if physical_side == main_end {
+            plan.trim(children.len() - 1, physical_side);
         }
     }
-    if container_style.margin_trim.inline_end {
-        if axes.physical_side(main_start) == inline_end {
-            trim_physical_item_margin(&mut children[0].style, inline_end);
-        }
-        if axes.physical_side(main_end) == inline_end {
-            trim_physical_item_margin(&mut children[children.len() - 1].style, inline_end);
-        }
+    for (index, child) in children.iter_mut().enumerate() {
+        plan.apply_to_style(index, &mut child.style);
     }
 }
 
@@ -181,40 +199,12 @@ fn trim_flex_item_margins_at_container_inline_edges(
 /// CSS Flexbox defines `row` from the container inline axis and `column` from
 /// its block axis; the reverse variants exchange those edges:
 /// <https://www.w3.org/TR/css-flexbox-1/#flex-direction-property>.
-fn flex_main_logical_edges(style: &ComputedStyle) -> Option<(LogicalSide, LogicalSide)> {
+fn flex_main_logical_edges(style: &ComputedStyle) -> (LogicalSide, LogicalSide) {
     match style.flex_direction {
-        FlexDirection::Row => Some((LogicalSide::InlineStart, LogicalSide::InlineEnd)),
-        FlexDirection::RowReverse => Some((LogicalSide::InlineEnd, LogicalSide::InlineStart)),
-        FlexDirection::Column => Some((LogicalSide::BlockStart, LogicalSide::BlockEnd)),
-        FlexDirection::ColumnReverse => Some((LogicalSide::BlockEnd, LogicalSide::BlockStart)),
-    }
-}
-
-/// Set a physical margin to its specified zero used value.
-///
-/// Both the eagerly resolved edge and the computed source value must change:
-/// Flexbox uses the former during its post-Taffy corrections and the latter at
-/// the Taffy sizing boundary.  CSS Box defines a trimmed margin as zero:
-/// <https://drafts.csswg.org/css-box-4/#margin-trim>.
-fn trim_physical_item_margin(style: &mut ComputedStyle, side: PhysicalSide) {
-    let zero = css::ComputedLengthPercentageOrAuto::ZERO;
-    match side {
-        PhysicalSide::Top => {
-            style.margin.top = 0.0;
-            style.box_values.margin.top = zero;
-        }
-        PhysicalSide::Right => {
-            style.margin.right = 0.0;
-            style.box_values.margin.right = zero;
-        }
-        PhysicalSide::Bottom => {
-            style.margin.bottom = 0.0;
-            style.box_values.margin.bottom = zero;
-        }
-        PhysicalSide::Left => {
-            style.margin.left = 0.0;
-            style.box_values.margin.left = zero;
-        }
+        FlexDirection::Row => (LogicalSide::InlineStart, LogicalSide::InlineEnd),
+        FlexDirection::RowReverse => (LogicalSide::InlineEnd, LogicalSide::InlineStart),
+        FlexDirection::Column => (LogicalSide::BlockStart, LogicalSide::BlockEnd),
+        FlexDirection::ColumnReverse => (LogicalSide::BlockEnd, LogicalSide::BlockStart),
     }
 }
 
@@ -262,7 +252,7 @@ mod tests {
             style: item,
         }];
 
-        trim_flex_item_margins_at_container_inline_edges(&container, &mut children);
+        apply_single_line_flex_margin_trim(&container, &mut children);
 
         assert_eq!(children[0].style.margin.left, 0.0);
         assert_eq!(children[0].style.margin.right, 0.0);

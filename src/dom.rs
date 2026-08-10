@@ -77,6 +77,30 @@ pub(crate) struct NamespacedAttribute {
     pub value: String,
 }
 
+impl Element {
+    /// Return the null-namespace attribute addressed by an unprefixed CSS
+    /// `attr()` name on this element.
+    ///
+    /// The HTML host language lowercases the requested name only for HTML
+    /// elements in HTML documents; foreign-content and XML names remain
+    /// case-sensitive.
+    /// <https://html.spec.whatwg.org/multipage/semantics-other.html#case-sensitivity-of-the-css-attr()-function>
+    pub(crate) fn unprefixed_css_attr(&self, name: &str) -> Option<&str> {
+        self.namespace_attrs
+            .iter()
+            .find(|attribute| {
+                crate::css::unprefixed_attr_name_matches(
+                    &self.namespace_url,
+                    self.document_syntax == DocumentSyntax::Html,
+                    &attribute.namespace_url,
+                    &attribute.local_name,
+                    name,
+                )
+            })
+            .map(|attribute| attribute.value.as_str())
+    }
+}
+
 impl Node {
     pub fn element(tag: impl Into<String>) -> Self {
         Self {
@@ -318,6 +342,52 @@ pub(crate) fn first_meta_content(node: &Node, name: &str) -> Option<String> {
     }
 }
 
+/// Returns every `content` value from matching `<meta>` elements in source order.
+pub(crate) fn meta_contents(node: &Node, name: &str) -> Vec<String> {
+    let mut contents = Vec::new();
+    collect_meta_contents(node, name, &mut contents);
+    contents
+}
+
+fn collect_meta_contents(node: &Node, name: &str, contents: &mut Vec<String>) {
+    match &node.kind {
+        NodeKind::Text(_) => {}
+        NodeKind::Element(element) => {
+            if element.tag == "meta"
+                && element
+                    .attrs
+                    .get("name")
+                    .or_else(|| element.attrs.get("property"))
+                    .is_some_and(|value| value.eq_ignore_ascii_case(name))
+                && let Some(content) = element.attrs.get("content")
+            {
+                contents.push(content.clone());
+            }
+            for child in &element.children {
+                collect_meta_contents(child, name, contents);
+            }
+        }
+    }
+}
+
+/// Returns the non-empty `lang` attribute of the document's root HTML element.
+pub(crate) fn document_language(node: &Node) -> Option<String> {
+    let NodeKind::Element(document) = &node.kind else {
+        return None;
+    };
+
+    document.children.iter().find_map(|child| {
+        let NodeKind::Element(element) = &child.kind else {
+            return None;
+        };
+        (element.tag == "html")
+            .then(|| element.attrs.get("lang"))
+            .flatten()
+            .filter(|language| !language.is_empty())
+            .cloned()
+    })
+}
+
 /// An author stylesheet source in document order.
 ///
 /// CSS Cascade orders author stylesheets by their position in the document;
@@ -326,24 +396,37 @@ pub(crate) fn first_meta_content(node: &Node, name: &str) -> Option<String> {
 /// <https://www.w3.org/TR/css-cascade-5/#cascade-order>.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StylesheetSource {
-    Embedded(String),
-    Link(String),
+    Embedded {
+        css: String,
+        scope_anchor: crate::css::StylesheetScopeAnchor,
+    },
+    Link {
+        href: String,
+        scope_anchor: crate::css::StylesheetScopeAnchor,
+    },
 }
 
 pub(crate) fn stylesheet_sources_in_document_order(node: &Node) -> Vec<StylesheetSource> {
     let mut sources = Vec::new();
-    collect_stylesheet_sources_in_document_order(node, &mut sources);
+    collect_stylesheet_sources_in_document_order(node, &mut sources, None);
     sources
 }
 
-fn collect_stylesheet_sources_in_document_order(node: &Node, output: &mut Vec<StylesheetSource>) {
+fn collect_stylesheet_sources_in_document_order(
+    node: &Node,
+    output: &mut Vec<StylesheetSource>,
+    parent: Option<ElementId>,
+) {
     let NodeKind::Element(element) = &node.kind else {
         return;
     };
+    let scope_anchor = parent
+        .map(crate::css::StylesheetScopeAnchor::Element)
+        .unwrap_or(crate::css::StylesheetScopeAnchor::DocumentRoot);
     if element.tag == "style" {
         let mut css = String::new();
         collect_descendant_text(node, &mut css);
-        output.push(StylesheetSource::Embedded(css));
+        output.push(StylesheetSource::Embedded { css, scope_anchor });
         return;
     }
     if element.tag == "link"
@@ -353,10 +436,13 @@ fn collect_stylesheet_sources_in_document_order(node: &Node, output: &mut Vec<St
         })
         && let Some(href) = element.attrs.get("href")
     {
-        output.push(StylesheetSource::Link(href.clone()));
+        output.push(StylesheetSource::Link {
+            href: href.clone(),
+            scope_anchor,
+        });
     }
     for child in &element.children {
-        collect_stylesheet_sources_in_document_order(child, output);
+        collect_stylesheet_sources_in_document_order(child, output, Some(element.id));
     }
 }
 
@@ -396,7 +482,8 @@ fn collapse_whitespace(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DocumentSyntax, NodeKind, first_element_text, parse, parse_with_syntax, without_xml_doctype,
+        DocumentSyntax, NodeKind, StylesheetSource, first_element_text, parse, parse_with_syntax,
+        stylesheet_sources_in_document_order, without_xml_doctype,
     };
 
     #[test]
@@ -501,6 +588,36 @@ mod tests {
         assert_eq!(html.namespace_url, "http://www.w3.org/1999/xhtml");
         assert_eq!(image.tag, "img");
         assert_eq!(image.attrs.get("src"), Some(&"image.png".to_string()));
+    }
+
+    #[test]
+    fn embedded_stylesheet_records_its_parent_as_the_implicit_scope_root() {
+        let mut root = super::Node::element("document");
+        let mut section = super::Node::element("section");
+        let section_id = section.as_element().expect("section element").id;
+        let mut style = super::Node::element("style");
+        style
+            .as_element_mut()
+            .expect("style element")
+            .children
+            .push(super::Node::text("@scope { p { color: red } }"));
+        section
+            .as_element_mut()
+            .expect("section element")
+            .children
+            .push(style);
+        root.as_element_mut()
+            .expect("document element")
+            .children
+            .push(section);
+
+        let sources = stylesheet_sources_in_document_order(&root);
+        assert_eq!(sources.len(), 1);
+        assert!(matches!(
+            &sources[0],
+            StylesheetSource::Embedded { scope_anchor, .. }
+                if *scope_anchor == crate::css::StylesheetScopeAnchor::Element(section_id)
+        ));
     }
 
     #[test]

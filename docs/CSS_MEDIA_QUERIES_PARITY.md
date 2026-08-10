@@ -2,8 +2,8 @@
 
 Quire evaluates `@media` and `@import` media lists in an explicit rendering
 environment. PDF output defaults to the `print` media type; callers can select
-the `screen` media type and an initial viewport through the render options/CLI
-without changing the default PDF semantics. The implementation preserves the Media Queries distinction
+the `screen` media type and an initial viewport through render options without
+changing the default PDF semantics. The implementation preserves the Media Queries distinction
 between an invalid query and a valid query that does not match, so negation
 cannot accidentally activate malformed syntax.
 
@@ -28,7 +28,7 @@ cannot accidentally activate malformed syntax.
 
 The WPT `css/mediaqueries/mq-gamut-*` group passes 5/5 tests with the local
 WPT runner after this implementation. With the WPT screen environment
-(`--media-type screen --page-size 800px 600px`), the complete
+(an 800×600 CSS-pixel viewport), the complete
 `css/mediaqueries/` run passes 41/43 executable tests (95.35%).
 
 ## Remaining Work

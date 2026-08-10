@@ -47,6 +47,7 @@ pub(in crate::layout) fn push_inline_words_for_style(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::css::ContentLanguage;
     use std::rc::Rc;
 
     fn word_styles(items: &[InlineItem]) -> Vec<InlineStyle> {
@@ -374,6 +375,114 @@ mod tests {
             })
             .collect::<String>();
         assert_eq!(text, "a  b");
+        assert!(items.iter().any(|item| {
+            matches!(
+                item,
+                InlineItem::Word(word)
+                    if word.text == " "
+                        && word.source
+                            == InlineTextSource::WordSpaceTransform(
+                                ExplicitWordSeparatorSource::AuthoredZeroWidthSpace
+                            )
+            )
+        }));
+    }
+
+    #[test]
+    fn word_space_transform_marks_generated_wbr_without_source_text() {
+        let mut style = ComputedStyle::initial();
+        style.word_space_transform = css::WordSpaceTransform {
+            replacement: Some(css::WordSpaceReplacement::IdeographicSpace),
+            auto_phrase: false,
+        };
+        let mut items = Vec::new();
+        push_generated_inline_words_for_style_with_source(
+            "a\u{200b}b",
+            &style,
+            None,
+            0.0,
+            InlineVisualOffset::zero(),
+            InlineTextSource::GeneratedWbr,
+            &mut items,
+        );
+
+        normalize_inline_whitespace_items(&mut items);
+
+        assert!(items.iter().any(|item| {
+            matches!(
+                item,
+                InlineItem::Word(word)
+                    if word.text == "\u{3000}"
+                        && word.source
+                            == InlineTextSource::WordSpaceTransform(
+                                ExplicitWordSeparatorSource::HtmlWbr
+                            )
+            )
+        }));
+    }
+
+    #[test]
+    fn word_space_transform_crosses_transparent_edge_with_origin_style() {
+        let mut separator_style = ComputedStyle::initial();
+        separator_style.font_size = 23.0;
+        separator_style.word_space_transform = css::WordSpaceTransform {
+            replacement: Some(css::WordSpaceReplacement::Space),
+            auto_phrase: false,
+        };
+        let following_style = ComputedStyle::initial();
+        let transparent_edge = InlineItem::Atom(Box::new(InlineAtom::new(
+            InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(InlineBoxEdgeFragment {
+                logical_edge: InlineLogicalEdge::End,
+                physical_side: PhysicalSide::Right,
+                positioning_containing_block_id: None,
+                advance: 0.0,
+                paint_extent: 0.0,
+            })),
+            following_style.clone(),
+            None,
+            InlineSize::new(0.0, following_style.line_height),
+            0.0,
+            0.0,
+            None,
+            None,
+        )));
+        let mut items = Vec::new();
+        push_inline_text_run(
+            "a\u{200b}",
+            &separator_style,
+            None,
+            0.0,
+            InlineVisualOffset::zero(),
+            &mut items,
+        );
+        items.push(transparent_edge);
+        push_inline_text_run(
+            "b",
+            &following_style,
+            None,
+            0.0,
+            InlineVisualOffset::zero(),
+            &mut items,
+        );
+
+        normalize_inline_whitespace_items(&mut items);
+
+        let separator = items
+            .iter()
+            .find_map(|item| match item {
+                InlineItem::Word(word)
+                    if word.source
+                        == InlineTextSource::WordSpaceTransform(
+                            ExplicitWordSeparatorSource::AuthoredZeroWidthSpace,
+                        ) =>
+                {
+                    Some(word)
+                }
+                _ => None,
+            })
+            .expect("the explicit separator should survive a transparent inline edge");
+        assert_eq!(separator.text, " ");
+        assert_eq!(separator.style.font_size, separator_style.font_size);
     }
 
     #[test]
@@ -467,7 +576,7 @@ mod tests {
     #[test]
     fn removable_segment_break_rejoins_one_typographic_run() {
         let mut style = ComputedStyle::initial();
-        style.language = Some("ja".to_string());
+        style.language = ContentLanguage::from_html_attribute("ja");
         let mut items = Vec::new();
         push_inline_text_run(
             "Edge\n・\nChrome",
@@ -490,7 +599,7 @@ mod tests {
     }
 
     #[test]
-    fn uax14_bk_and_nl_controls_use_forced_breaks() {
+    fn css_text_controls_are_visible_while_unicode_line_separators_break() {
         let style = ComputedStyle::initial();
         let mut items = Vec::new();
         push_inline_text_run(
@@ -508,7 +617,7 @@ mod tests {
                 .iter()
                 .filter(|item| matches!(item, InlineItem::Break(_)))
                 .count(),
-            5
+            2
         );
     }
 
@@ -602,11 +711,28 @@ pub(in crate::layout) fn push_generated_inline_words_for_style(
     visual_offset: InlineVisualOffset,
     output: &mut Vec<InlineItem>,
 ) {
-    // Generated-content strings are subject to the same CSS Text white-space
-    // processing as authored DOM text, including visible handling of
-    // non-whitespace Unicode control characters.
-    // <https://www.w3.org/TR/css-text-3/#white-space-processing>
-    let text = text_with_visible_control_characters(text);
+    push_generated_inline_words_for_style_with_source(
+        text,
+        style,
+        link_target,
+        baseline_shift,
+        visual_offset,
+        InlineTextSource::Generated,
+        output,
+    );
+}
+
+/// Collect generated text while retaining an element-specific source when the
+/// UA generated it for an HTML element rather than ordinary CSS `content`.
+pub(in crate::layout) fn push_generated_inline_words_for_style_with_source(
+    text: &str,
+    style: &ComputedStyle,
+    link_target: Option<String>,
+    baseline_shift: f32,
+    visual_offset: InlineVisualOffset,
+    source: InlineTextSource,
+    output: &mut Vec<InlineItem>,
+) {
     let normalized_style;
     let style = if anonymous_inline_content_needs_normalized_style(style) {
         normalized_style = normalized_anonymous_inline_content_style(style);
@@ -615,12 +741,12 @@ pub(in crate::layout) fn push_generated_inline_words_for_style(
         style
     };
     push_inline_text_run_with_source(
-        &text,
+        text,
         style,
         link_target,
         baseline_shift,
         visual_offset,
-        InlineTextSource::Generated,
+        source,
         output,
     );
 }
@@ -1085,6 +1211,7 @@ impl InlineWhitespaceProcessor {
     }
 
     pub(in crate::layout) fn push_word(&mut self, word: InlineWord) {
+        let text = css_text_rendering_text(&word.text);
         let meta = InlineTextRunMeta {
             style: word.style,
             baseline_shift: word.baseline_shift,
@@ -1095,8 +1222,7 @@ impl InlineWhitespaceProcessor {
             hanging_edges: word.hanging_edges,
             ancestor_inline_decorations: word.ancestor_inline_decorations,
         };
-        let mut chars = word.text.chars().peekable();
-        while let Some(character) = chars.next() {
+        for character in text.chars() {
             if character == '\u{200b}'
                 && let Some(replacement) = meta.style.word_space_transform.replacement
             {
@@ -1105,20 +1231,6 @@ impl InlineWhitespaceProcessor {
                     replacement,
                     meta: meta.clone(),
                 });
-            } else if character == '\r' {
-                self.discard_pending_word_space_transform();
-                // CSS Text maps CR to a space; it is not a segment break in
-                // authored or generated text. HTML input CRLF pairs are
-                // canonicalized before collection, but retain this handling
-                // for CSS strings and programmatic sources.
-                if meta.style.white_space.collapses_spaces() {
-                    self.push_collapsible_space(&meta);
-                } else {
-                    self.push_text_character(' ', &meta);
-                }
-                if chars.peek() == Some(&'\n') {
-                    chars.next();
-                }
             } else if character == '\n' {
                 self.discard_pending_word_space_transform();
                 self.push_segment_break(&meta, false);
@@ -1138,10 +1250,10 @@ impl InlineWhitespaceProcessor {
     /// Materialize an explicit virtual word separator for CSS Text 4 layout.
     ///
     /// `<wbr>` is represented by generated U+200B in the HTML UA sheet, so
-    /// this is deliberately applied to both authored U+200B and the generated
-    /// form. The transformed character remains a text fragment long enough for
-    /// the shared graph to discover its normal line-break opportunity; it is
-    /// not sent through Phase I's collapsible-space coalescer.
+    /// its generated separator has no document-text ownership. The transformed
+    /// character remains a text fragment long enough for the shared graph to
+    /// discover its normal line-break opportunity; it is not sent through
+    /// Phase I's collapsible-space coalescer.
     ///
     /// A following authored collapsible space is still handled by Phase I. The
     /// remaining source-range ownership work is tracked separately from this
@@ -1152,15 +1264,30 @@ impl InlineWhitespaceProcessor {
         replacement: css::WordSpaceReplacement,
         meta: &InlineTextRunMeta,
     ) {
+        let source = if meta.source == InlineTextSource::GeneratedWbr {
+            ExplicitWordSeparatorSource::HtmlWbr
+        } else {
+            ExplicitWordSeparatorSource::AuthoredZeroWidthSpace
+        };
         match replacement {
             css::WordSpaceReplacement::Space => {
                 self.flush_run();
-                self.push_word_run(" ", meta);
+                self.push_word_run_with_source(
+                    " ",
+                    meta,
+                    InlineTextSource::WordSpaceTransform(source),
+                );
                 self.output_ends_with_virtual_word_space = true;
                 self.last_text_character = Some(' ');
             }
             css::WordSpaceReplacement::IdeographicSpace => {
-                self.push_text_character('\u{3000}', meta)
+                self.flush_run();
+                self.push_word_run_with_source(
+                    "\u{3000}",
+                    meta,
+                    InlineTextSource::WordSpaceTransform(source),
+                );
+                self.last_text_character = Some('\u{3000}');
             }
         }
     }
@@ -1522,10 +1649,18 @@ impl InlineWhitespaceProcessor {
     }
 
     pub(in crate::layout) fn push_word_run(&mut self, text: &str, meta: &InlineTextRunMeta) {
+        self.push_word_run_with_source(text, meta, meta.source);
+    }
+
+    fn push_word_run_with_source(
+        &mut self,
+        text: &str,
+        meta: &InlineTextRunMeta,
+        source: InlineTextSource,
+    ) {
         if text.is_empty() {
             return;
         }
-        let text = text_with_visible_control_characters(text);
         if self.merge_next_run_after_removed_segment_break {
             self.merge_next_run_after_removed_segment_break = false;
             if let Some(InlineItem::Word(previous)) = self.output.last_mut()
@@ -1534,22 +1669,22 @@ impl InlineWhitespaceProcessor {
                 && previous.visual_offset == meta.visual_offset
                 && previous.link_target == meta.link_target
                 && previous.mergeable == meta.mergeable
-                && previous.source == meta.source
+                && previous.source == source
                 && previous.hanging_edges == meta.hanging_edges
                 && previous.ancestor_inline_decorations == meta.ancestor_inline_decorations
             {
-                previous.text.push_str(&text);
+                previous.text.push_str(text);
                 return;
             }
         }
         self.output.push(InlineItem::Word(Box::new(InlineWord {
-            text,
+            text: text.to_string(),
             style: Rc::clone(&meta.style),
             baseline_shift: meta.baseline_shift,
             visual_offset: meta.visual_offset,
             link_target: meta.link_target.clone(),
             mergeable: meta.mergeable,
-            source: meta.source,
+            source,
             hanging_edges: meta.hanging_edges,
             ancestor_inline_decorations: Rc::clone(&meta.ancestor_inline_decorations),
         })));

@@ -5,6 +5,11 @@ computed CSS lengths, percentages, and sizing keywords.
 
 ## Current Support
 
+- CSS-wide `initial`, `inherit`, `unset`, and `all` resolve the modeled
+  `aspect-ratio` and physical/logical `contain-intrinsic-*` values through
+  their canonical computed longhands. `all` therefore resets those
+  non-inherited sizing values without changing `direction`, `unicode-bidi`,
+  or custom properties.
 - Intrinsic `min-content` and `max-content` inline-size calculations preserve
   fixed length components inside cyclic percentage margin and padding values.
   For example, `calc(0% + 30px)` contributes the fixed `30px` component when

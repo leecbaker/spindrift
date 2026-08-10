@@ -27,10 +27,10 @@ fn collapsed_cell_decoration_style(style: &ComputedStyle, collapsed: bool) -> Co
         return decoration_style;
     }
 
-    if decoration_style.background_clip == css::BackgroundBox::Border {
-        decoration_style.background_clip = css::BackgroundBox::Padding;
+    if decoration_style.background.background_clip == css::BackgroundBox::Border {
+        decoration_style.background.background_clip = css::BackgroundBox::Padding;
     }
-    for layer in &mut decoration_style.background_layers {
+    for layer in &mut decoration_style.background.background_layers {
         if layer.clip == css::BackgroundBox::Border {
             layer.clip = css::BackgroundBox::Padding;
         }
@@ -90,8 +90,21 @@ pub(in crate::layout::table) struct TableBodyRowsInput<'table, 'ctx> {
     pub(in crate::layout::table) style: &'ctx ComputedStyle,
     pub(in crate::layout::table) stylesheets: &'ctx Stylesheets<'ctx>,
     pub(in crate::layout::table) table_x: f32,
+    pub(in crate::layout::table) wrapper_table_x: PageInlinePosition,
     /// Immutable unfragmented table grid used as the source paint space.
     pub(in crate::layout::table) source_grid_placement: TableGridPlacement,
+    /// Canonical grid-local source placement for the table root's own
+    /// background positioning area. Structural row and column backgrounds
+    /// retain `source_grid_placement` instead.
+    pub(in crate::layout::table) root_background_source_grid_placement: TableGridPlacement,
+    /// First destination grid placement after wrapper-owned top-caption
+    /// progress. This can differ from the source placement when the caption
+    /// crosses a page or column boundary.
+    pub(in crate::layout::table) initial_destination_grid_placement: TableGridPlacement,
+    /// Retained wrapper source/destination progress shared by every body
+    /// fragment. This carries caption progress without making captions part
+    /// of table-root background geometry.
+    pub(in crate::layout::table) wrapper_timeline: TableWrapperFragmentTimeline,
     pub(in crate::layout::table) logical_inline_extent: LogicalInlineContentSize,
     pub(in crate::layout::table) physical_grid_width: PhysicalContentWidth,
     pub(in crate::layout::table) table_cellpadding: Option<f32>,
@@ -140,6 +153,10 @@ pub(in crate::layout::table) struct TableBodyFragmentCommitContext<'table, 'ctx>
     pub(in crate::layout::table) style: &'ctx ComputedStyle,
     pub(in crate::layout::table) stylesheets: &'ctx Stylesheets<'ctx>,
     pub(in crate::layout::table) table_x: f32,
+    pub(in crate::layout::table) wrapper_table_x: PageInlinePosition,
+    /// Physical inline origin of the table wrapper, retained when later body
+    /// slices rebase their logical block coordinate into another fragmentainer.
+    pub(in crate::layout::table) table_inline_origin: PageTopBlockPosition,
     pub(in crate::layout::table) continuation_inline_offset: TableContinuationInlineOffset,
     pub(in crate::layout::table) logical_inline_extent: LogicalInlineContentSize,
     pub(in crate::layout::table) physical_grid_width: PhysicalContentWidth,

@@ -89,10 +89,10 @@ pub(in crate::css) fn apply_cascaded_visual_declaration(
             }
         }
         "shape-image-threshold" => {
-            if let Some(threshold) = parse_css_number(value)
-                && threshold.is_finite()
+            if let Some(threshold) =
+                parse_css_number(value).and_then(ShapeImageThreshold::new_clamped)
             {
-                style.shape_image_threshold = threshold.clamp(0.0, 1.0);
+                style.shape_image_threshold = threshold;
             }
         }
         "corner" => {
@@ -179,7 +179,7 @@ pub(in crate::css) fn apply_cascaded_visual_declaration(
             apply_background_shorthand(style, value, declaration.base_url, declaration.root_url)
         }
         "background-color" => {
-            style.background_color = if value.eq_ignore_ascii_case("currentcolor") {
+            style.background.background_color = if value.eq_ignore_ascii_case("currentcolor") {
                 BackgroundColor::CurrentColor
             } else if parse_color_from_currentcolor_in_scheme(
                 value,
@@ -195,7 +195,7 @@ pub(in crate::css) fn apply_cascaded_visual_declaration(
             } else if let Some(color) = parse_color(value) {
                 BackgroundColor::Color(color)
             } else {
-                style.background_color.clone()
+                style.background.background_color.clone()
             };
         }
         "background-image" => {
@@ -374,31 +374,6 @@ pub(in crate::css) fn apply_cascaded_visual_declaration(
             // Applied in a pre-pass so same-rule `em` lengths use the
             // element's computed font size instead of declaration order.
         }
-        "font" => {
-            if let Some(font) = parse_font_shorthand_with_line_height_font_size(
-                value,
-                inheritance_source.font_size,
-                parent_ch_advance,
-                style.font_weight,
-                Some(style.font_size),
-            ) {
-                style.font_style = font.style;
-                style.font_weight = font.weight;
-                style.font_width = font.width;
-                style.font_family = font.family;
-                style.font_language_override = FontLanguageOverride::Normal;
-                style.font_size_adjust = FontSizeAdjust::None;
-                style.font_variant_ligatures = FontVariantLigatures::Normal;
-                style.font_variant_position = FontVariantPosition::Normal;
-                style.font_variant_caps = font.variant_caps;
-                style.font_variant_numeric = FontVariantNumeric::Normal;
-                style.font_variant_alternates = FontVariantAlternates::Normal;
-                style.font_variant_east_asian = FontVariantEastAsian::Normal;
-                style.font_variant_emoji = FontVariantEmoji::Normal;
-                style.line_height_value = font.line_height.unwrap_or(ComputedLineHeight::Normal);
-                project_line_height(style);
-            }
-        }
         "line-height" => {
             // CSS Values resolves `lh` in the `line-height` property against
             // the inherited line height, not the value being established by
@@ -438,6 +413,16 @@ pub(in crate::css) fn apply_cascaded_visual_declaration(
                 style.ruby_position = position;
             }
         }
+        "ruby-align" => {
+            if let Some(align) = parse_ruby_align(value) {
+                style.ruby_align = align;
+            }
+        }
+        "ruby-overhang" => {
+            if let Some(overhang) = parse_ruby_overhang(value) {
+                style.ruby_overhang = overhang;
+            }
+        }
         "transform" => {
             if let Some(transform) = parse_transform(value, style.font_size) {
                 style.transform = transform;
@@ -463,9 +448,28 @@ pub(in crate::css) fn apply_cascaded_visual_declaration(
                 style.transform_origin = origin;
             }
         }
+        "perspective" => {
+            if value.eq_ignore_ascii_case("none") {
+                style.perspective = ComputedPerspective::NONE;
+            } else if let Some(length) = parse_computed_length_percentage(value, style.font_size)
+                && let Some(length) = NonNegativeComputedLength::new(length)
+            {
+                style.perspective = ComputedPerspective::Distance(length);
+            }
+        }
+        "perspective-origin" => {
+            if let Some(origin) = parse_perspective_origin(value, style.font_size) {
+                style.perspective_origin = origin;
+            }
+        }
         "transform-box" => {
             if let Some(transform_box) = parse_transform_box(value) {
                 style.transform_box = transform_box;
+            }
+        }
+        "transform-style" => {
+            if let Some(transform_style) = parse_transform_style(value) {
+                style.transform_style = transform_style;
             }
         }
         "backface-visibility" => {
@@ -488,25 +492,49 @@ pub(in crate::css) fn apply_cascaded_visual_declaration(
             }
         }
         "filter" => {
-            let value = trim_css_value(value);
-            style.filter = if value.eq_ignore_ascii_case("none") {
-                FilterValue::None
-            } else {
-                FilterValue::Functions(value.to_string())
-            };
+            if let Some(filter) = parse_filter(value) {
+                style.filter = filter;
+            }
+        }
+        "clip" => {
+            if let Some(clip) = parse_legacy_clip(value, style.font_size) {
+                style.legacy_clip = clip;
+            }
         }
         "clip-path" => {
             if let Some(clip_path) = parse_clip_path(value, style.font_size) {
                 style.clip_path = clip_path;
             }
         }
-        "mask" | "mask-image" => {
+        "mask" => {
             let value = trim_css_value(value);
             style.mask = if value.eq_ignore_ascii_case("none") {
                 MaskValue::None
             } else {
                 MaskValue::Image(value.to_string())
             };
+            // `mask` resets the complete mask-border shorthand, including
+            // its reset-only `mask-border-source` subproperty.
+            // <https://drafts.csswg.org/css-masking/#propdef-mask>
+            style.mask_border_source = ComputedImage::None;
+        }
+        "mask-image" => {
+            let value = trim_css_value(value);
+            style.mask = if value.eq_ignore_ascii_case("none") {
+                MaskValue::None
+            } else {
+                MaskValue::Image(value.to_string())
+            };
+        }
+        "mask-border-source" => {
+            if let Some(source) = parse_border_image_source(value) {
+                style.mask_border_source = source;
+            }
+        }
+        "mask-border" => {
+            if let Some(source) = parse_mask_border_source(value, style.font_size) {
+                style.mask_border_source = source;
+            }
         }
         "contain" => {
             if let Some(contain) = parse_contain(value) {
@@ -646,6 +674,68 @@ pub(in crate::css) fn apply_cascaded_visual_declaration(
     true
 }
 
+/// Applies one modeled longhand emitted by the `font` shorthand.
+///
+/// `font` is expanded for cascade purposes before inherited font metrics are
+/// available. The component therefore retains the shorthand token stream and
+/// resolves it here, where its parent-relative size and final line-height
+/// basis are known. CSS Fonts requires omitted reset-only subproperties to
+/// receive their initial values.
+/// <https://www.w3.org/TR/css-fonts-4/#font-prop>
+pub(in crate::css) fn apply_font_shorthand_component(
+    style: &mut ComputedStyle,
+    component: ModeledLonghand,
+    font: &ParsedFontShorthand,
+) {
+    match component {
+        ModeledLonghand::FontStyle => style.font_style = font.style,
+        ModeledLonghand::FontWeight => style.font_weight = font.weight,
+        ModeledLonghand::FontWidth => style.font_width = font.width,
+        ModeledLonghand::FontFamily => style.font_family = font.family.clone(),
+        // Font size is applied by the dependency prepass so all dependent
+        // longhands see its winning computed value.
+        ModeledLonghand::FontSize => {}
+        ModeledLonghand::LineHeight => {
+            style.line_height_value = font
+                .line_height
+                .clone()
+                .unwrap_or(ComputedLineHeight::Normal);
+            project_line_height(style);
+        }
+        ModeledLonghand::FontFeatureSettings => {
+            style.font_feature_settings = FontFeatureSettings::NORMAL;
+        }
+        ModeledLonghand::FontKerning => style.font_kerning = FontKerning::Auto,
+        ModeledLonghand::FontLanguageOverride => {
+            style.font_language_override = FontLanguageOverride::Normal;
+        }
+        ModeledLonghand::FontSizeAdjust => style.font_size_adjust = FontSizeAdjust::None,
+        ModeledLonghand::FontVariationSettings => {
+            style.font_variation_settings = FontVariationSettings::NORMAL;
+        }
+        ModeledLonghand::FontVariantLigatures => {
+            style.font_variant_ligatures = FontVariantLigatures::Normal;
+        }
+        ModeledLonghand::FontVariantPosition => {
+            style.font_variant_position = FontVariantPosition::Normal;
+        }
+        ModeledLonghand::FontVariantCaps => style.font_variant_caps = font.variant_caps,
+        ModeledLonghand::FontVariantNumeric => {
+            style.font_variant_numeric = FontVariantNumeric::Normal;
+        }
+        ModeledLonghand::FontVariantAlternates => {
+            style.font_variant_alternates = FontVariantAlternates::Normal;
+        }
+        ModeledLonghand::FontVariantEastAsian => {
+            style.font_variant_east_asian = FontVariantEastAsian::Normal;
+        }
+        ModeledLonghand::FontVariantEmoji => {
+            style.font_variant_emoji = FontVariantEmoji::Normal;
+        }
+        _ => unreachable!("font shorthand component must be a font longhand"),
+    }
+}
+
 /// Parse CSS Ruby's `ruby-position` keywords. The distinct inter-character
 /// layout is retained in the computed value so it cannot silently select a
 /// supported interlinear side.
@@ -656,6 +746,28 @@ fn parse_ruby_position(value: &str) -> Option<RubyPosition> {
         "over" => Some(RubyPosition::Over),
         "under" => Some(RubyPosition::Under),
         "inter-character" => Some(RubyPosition::InterCharacter),
+        _ => None,
+    }
+}
+
+/// Parse CSS Ruby's inline-axis content-distribution keywords.
+/// <https://drafts.csswg.org/css-ruby-1/#ruby-align-property>
+fn parse_ruby_align(value: &str) -> Option<RubyAlign> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "start" => Some(RubyAlign::Start),
+        "center" => Some(RubyAlign::Center),
+        "space-between" => Some(RubyAlign::SpaceBetween),
+        "space-around" => Some(RubyAlign::SpaceAround),
+        _ => None,
+    }
+}
+
+/// Parse CSS Ruby's annotation-overhang policy.
+/// <https://drafts.csswg.org/css-ruby-1/#ruby-overhang>
+fn parse_ruby_overhang(value: &str) -> Option<RubyOverhang> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" => Some(RubyOverhang::Auto),
+        "spaces" | "none" => Some(RubyOverhang::Spaces),
         _ => None,
     }
 }
@@ -778,12 +890,12 @@ fn parse_container_names(value: &str) -> Option<ContainerNames> {
 /// <https://www.w3.org/TR/css-contain-3/#container-shorthand>
 fn parse_container_shorthand(value: &str) -> Option<(ContainerNames, ContainerType)> {
     let value = trim_css_value(value);
-    let mut pieces = value.split('/');
-    let names = pieces.next()?.trim();
-    let type_part = pieces.next().map(str::trim);
-    if pieces.next().is_some() {
+    let pieces = try_split_css_top_level_delimiter(value, '/')?;
+    let ([names] | [names, _]) = pieces.as_slice() else {
         return None;
-    }
+    };
+    let names = names.trim();
+    let type_part = pieces.get(1).copied().map(str::trim);
     match type_part {
         Some(type_part) if !type_part.is_empty() => Some((
             parse_container_names(names)?,
@@ -802,8 +914,17 @@ pub(super) fn parse_aspect_ratio(value: &str) -> Option<AspectRatio> {
         return Some(AspectRatio::AUTO);
     }
 
-    let normalized = value.replace('/', " / ");
-    let mut tokens = normalized.split_whitespace().collect::<Vec<_>>();
+    let slash_parts = try_split_css_top_level_delimiter(value, '/')?;
+    if slash_parts.len() > 2 {
+        return None;
+    }
+    let mut tokens = Vec::new();
+    for (index, part) in slash_parts.iter().enumerate() {
+        tokens.extend(try_split_css_component_values(part)?);
+        if index + 1 < slash_parts.len() {
+            tokens.push("/");
+        }
+    }
     let auto = if tokens
         .first()
         .is_some_and(|token| token.eq_ignore_ascii_case("auto"))
