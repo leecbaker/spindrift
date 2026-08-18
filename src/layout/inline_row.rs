@@ -14,21 +14,29 @@ impl<'a> LayoutBuilder<'a> {
         element: &Element,
         style: &ComputedStyle,
         stylesheets: &Stylesheets<'_>,
+        block_basis: IntrinsicBlockBasis,
     ) -> (f32, f32) {
-        let measurement =
-            self.with_intrinsic_inline_percentage_basis(PercentageBasis::indefinite(), |layout| {
-                layout.intrinsic_inline_measurement_for_element(
-                    element,
-                    style,
-                    stylesheets,
-                    None,
-                    f32::MAX,
-                )
-            });
-        (
-            measurement.contribution.max_content.points(),
-            measurement.height(),
-        )
+        self.with_flex_item_percentage_height_basis(block_basis, |layout| {
+            let measurement =
+                layout.with_ancestor_signature(element_signature(element), |layout| {
+                    layout.with_intrinsic_inline_percentage_basis(
+                        PercentageBasis::indefinite(),
+                        |layout| {
+                            layout.intrinsic_inline_measurement_for_element(
+                                element,
+                                style,
+                                stylesheets,
+                                None,
+                                f32::MAX,
+                            )
+                        },
+                    )
+                });
+            (
+                measurement.contribution.max_content.points(),
+                measurement.height(),
+            )
+        })
     }
 
     pub(super) fn push_ancestor_signature(&mut self, signature: ElementSignature) {

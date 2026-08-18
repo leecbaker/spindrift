@@ -92,6 +92,7 @@ impl Page {
             paths: self.paths.clone(),
             strokes: self.strokes.clone(),
             images: self.images.clone(),
+            svg_pattern_images: self.svg_pattern_images.clone(),
             image_patterns: self.image_patterns.clone(),
             gradient_patterns: self.gradient_patterns.clone(),
             svg_patterns: self.svg_patterns.clone(),
@@ -112,6 +113,7 @@ impl Page {
         self.paths = checkpoint.paths;
         self.strokes = checkpoint.strokes;
         self.images = checkpoint.images;
+        self.svg_pattern_images = checkpoint.svg_pattern_images;
         self.image_patterns = checkpoint.image_patterns;
         self.gradient_patterns = checkpoint.gradient_patterns;
         self.svg_patterns = checkpoint.svg_patterns;
@@ -293,6 +295,7 @@ impl Page {
         self.paths.clear();
         self.strokes.clear();
         self.images.clear();
+        self.svg_pattern_images.clear();
         self.image_patterns.clear();
         self.gradient_patterns.clear();
         self.svg_patterns.clear();
@@ -347,7 +350,12 @@ impl Page {
                     let operation = self.record_path(*path).1;
                     PaintDisplayItem::Operation(operation)
                 }
-                crate::svg::SvgPaintItem::Group(group) => {
+                crate::svg::SvgPaintItem::RasterImage(image) => {
+                    let operation = self.record_image(*image).1;
+                    PaintDisplayItem::Operation(operation)
+                }
+                crate::svg::SvgPaintItem::Group(group)
+                | crate::svg::SvgPaintItem::NestedSvg(group) => {
                     PaintDisplayItem::EffectScope(self.record_svg_group(*group))
                 }
             })
@@ -652,7 +660,20 @@ impl Page {
         ensure_all_operations_referenced(&rounded_rects_seen, page_index, "rounded rect")?;
         ensure_all_operations_referenced(&paths_seen, page_index, "path")?;
         ensure_all_operations_referenced(&strokes_seen, page_index, "stroke")?;
-        ensure_all_operations_referenced(&images_seen, page_index, "image")?;
+        for (index, seen) in images_seen.into_iter().enumerate() {
+            if !seen
+                && !self
+                    .svg_pattern_images
+                    .iter()
+                    .any(|resource| self.images.get(index) == Some(resource))
+            {
+                return Err(Error::InvalidInput(format!(
+                    "page {} has unreferenced image {} while paint operations are present",
+                    page_index + 1,
+                    index
+                )));
+            }
+        }
         ensure_all_operations_referenced(&image_patterns_seen, page_index, "image pattern")?;
         ensure_all_operations_referenced(&gradient_patterns_seen, page_index, "gradient pattern")?;
         ensure_all_operations_referenced(&svg_patterns_seen, page_index, "SVG pattern")?;
@@ -689,6 +710,20 @@ impl Page {
     }
 
     pub(crate) fn record_path(&mut self, path: RenderedPath) -> (usize, PaintOperation) {
+        // SVG paint-server cells own image resources but do not emit their
+        // images in page painting order. Register those sources with the page
+        // resource inventory so PDF planning can deduplicate and bind them to
+        // the cell Form without manufacturing a page-level draw operation.
+        for paint in [path.fill_paint.as_ref(), path.stroke_paint.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            if let crate::document::paint::paths::RenderedPathPaint::SvgPattern(pattern) = paint {
+                let mut images = Vec::new();
+                pattern.scene.raster_images(&mut images);
+                self.svg_pattern_images.extend(images.into_iter().cloned());
+            }
+        }
         let index = self.paths.len();
         self.paths.push(path);
         (index, PaintOperation::Path(index))
@@ -994,6 +1029,7 @@ pub(crate) struct PaintCheckpoint {
     pub(in crate::document) paths: Vec<RenderedPath>,
     pub(in crate::document) strokes: Vec<RenderedStroke>,
     pub(in crate::document) images: Vec<RenderedImage>,
+    pub(in crate::document) svg_pattern_images: Vec<RenderedImage>,
     pub(in crate::document) image_patterns: Vec<RenderedImagePattern>,
     pub(in crate::document) gradient_patterns: Vec<RenderedGradientPattern>,
     pub(in crate::document) svg_patterns: Vec<RenderedSvgPattern>,

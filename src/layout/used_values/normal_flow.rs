@@ -32,6 +32,27 @@ pub(in crate::layout) struct BlockContentWidthInputs {
     /// A resolved physical height, which is the logical inline-size of a
     /// vertical block while its auto physical width is being measured.
     pub(in crate::layout) definite_content_height: Option<PhysicalContentHeight>,
+    /// The formatting role whose automatic physical width is being resolved.
+    ///
+    /// A normal-flow principal root/body owns the document canvas and retains
+    /// its initial-containing-block width. Other vertical normal-flow blocks,
+    /// and positioned boxes, derive an automatic physical width from their
+    /// logical block-size contribution.
+    /// <https://www.w3.org/TR/css-writing-modes-4/#dimension-mapping>
+    pub(in crate::layout) auto_width_role: BlockAutoWidthRole,
+}
+
+/// Formatting role for resolving a block box's automatic physical width.
+///
+/// This is deliberately separate from the physical width inputs: the same
+/// available size has different root-canvas semantics in normal flow and
+/// absolute positioning.
+/// <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
+/// <https://www.w3.org/TR/css-position-3/#abspos-layout>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) enum BlockAutoWidthRole {
+    NormalFlow,
+    PositionedShrinkToFit,
 }
 
 /// Return the outer available inline size used by `width:auto` block boxes.

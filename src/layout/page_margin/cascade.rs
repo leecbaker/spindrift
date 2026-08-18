@@ -1,7 +1,6 @@
 use super::*;
 use crate::css::LayerOrder;
 use crate::units::LayoutSize;
-use std::rc::Rc;
 
 pub(in crate::layout) struct PageMarginBoxSpec {
     pub(in crate::layout) name: String,
@@ -88,6 +87,14 @@ pub(in crate::layout) fn page_margin_boxes_for_rules(
     context: PageMarginCascadeContext<'_>,
 ) -> Vec<PageMarginBoxSpec> {
     let mut boxes = Vec::new();
+    let initial_viewport = LayoutSize::new(
+        context.initial_page_size.width(),
+        context.initial_page_size.height(),
+    );
+    // Most pages have several generated margin boxes. Resolve their shared
+    // page context only once, but keep it lazy so unmatched page-margin rules
+    // do not trigger a page-context cascade.
+    let mut resolved_page_style = None;
     for name in PAGE_MARGIN_BOX_NAMES {
         let page_specific_declarations =
             cascade_page_rule_declarations(context.page_rules.iter().filter_map(|rule| {
@@ -116,23 +123,26 @@ pub(in crate::layout) fn page_margin_boxes_for_rules(
         // document render options so inherited typography such as the root
         // font-size is visible when @page omits an explicit value.
         // https://www.w3.org/TR/css-page-3/#cascading-and-page-context
-        let initial_viewport = LayoutSize::new(
-            context.initial_page_size.width(),
-            context.initial_page_size.height(),
-        );
-        let mut page_style = context.base_page_style.clone();
-        css::apply_declarations(&mut page_style, context.page_declarations);
-        page_style.resolve_deferred_font_size_with_viewport(
-            css::FontRelativeLengthBasis::new(
-                layout_pt(context.base_page_style.font_size),
-                layout_pt(0.0),
-            ),
-            initial_viewport,
-        );
-        page_style
-            .quotes
-            .resolve_auto_language(page_style.language.as_deref());
-        let mut style = page_margin_style_inheriting_page_context(&page_style);
+        let page_style = resolved_page_style.get_or_insert_with(|| {
+            let mut page_style = context.base_page_style.clone();
+            css::apply_declarations_with_inheritance_source(
+                &mut page_style,
+                context.page_declarations,
+                context.base_page_style,
+            );
+            page_style.resolve_deferred_font_size_with_viewport(
+                css::FontRelativeLengthBasis::new(
+                    layout_pt(context.base_page_style.font_size),
+                    layout_pt(0.0),
+                ),
+                initial_viewport,
+            );
+            page_style
+                .quotes
+                .resolve_auto_language(page_style.language.as_deref());
+            page_style
+        });
+        let mut style = page_margin_style_inheriting_page_context(page_style);
         apply_page_margin_box_ua_defaults(&mut style, name);
         css::apply_declarations(&mut style, &declarations);
         // Viewport-relative lengths in a page-margin rule use the initial
@@ -161,7 +171,7 @@ pub(in crate::layout) fn page_margin_boxes_for_rules(
         let (line_height, _, _) = style.line_height_value.clone().projected(style.font_size);
         style.line_height = line_height;
         style.finalize_computed_font_relative_lengths();
-        finalize_page_margin_text_decoration_style(&mut style);
+        style.rebuild_own_text_decoration_layer();
         style
             .quotes
             .resolve_auto_language(page_style.language.as_deref());
@@ -337,18 +347,6 @@ pub(in crate::layout) fn page_margin_style_inheriting_page_context(
     style.empty_cells = page_style.empty_cells;
     style.border_spacing = page_style.border_spacing.clone();
     style
-}
-
-pub(in crate::layout) fn finalize_page_margin_text_decoration_style(style: &mut ComputedStyle) {
-    if style.text_decoration.clone().has_visible_line() {
-        let decoration = style.text_decoration.clone();
-        let mut origin_style = style.clone();
-        origin_style.text_decoration_layers.clear();
-        style.text_decoration_layers.push(css::TextDecorationLayer {
-            decoration,
-            origin_style: Rc::new(origin_style),
-        });
-    }
 }
 
 pub(in crate::layout) fn page_context_style_from_options(options: &RenderOptions) -> ComputedStyle {

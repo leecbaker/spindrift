@@ -224,8 +224,18 @@ impl BaselineShift {
         }
     }
 
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        if let Self::LengthPercentage(value) = self {
+            value.resolve_root_font_metric_lengths(basis);
+        }
+    }
+
     pub(crate) fn requires_ch_advance(&self) -> bool {
         matches!(self, Self::LengthPercentage(value) if value.requires_ch_advance())
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        matches!(self, Self::LengthPercentage(value) if value.requires_root_font_metrics())
     }
 
     /// Resolve `<length-percentage>` against the element's own line-height.
@@ -296,8 +306,16 @@ impl VerticalAlign {
         self.baseline_shift.resolve_font_metric_lengths(ch_advance);
     }
 
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        self.baseline_shift.resolve_root_font_metric_lengths(basis);
+    }
+
     pub(crate) fn requires_ch_advance(&self) -> bool {
         self.baseline_shift.requires_ch_advance()
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        self.baseline_shift.requires_root_font_metrics()
     }
 
     /// Return whether `baseline-shift` positions the aligned subtree relative
@@ -496,6 +514,18 @@ pub(crate) enum ScrollPadding {
     #[default]
     Auto,
     LengthPercentage(ComputedLengthPercentage),
+}
+
+impl ScrollPadding {
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        if let Self::LengthPercentage(value) = self {
+            value.resolve_root_font_metric_lengths(basis);
+        }
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        matches!(self, Self::LengthPercentage(value) if value.requires_root_font_metrics())
+    }
 }
 
 impl Overflow {

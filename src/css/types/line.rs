@@ -39,6 +39,15 @@ impl ComputedLineHeight {
         }
     }
 
+    pub(crate) fn resolve_selected_font_metric_lengths(
+        &mut self,
+        basis: super::SelectedFontMetricLengthBasis,
+    ) {
+        if let Self::Length(value) = self {
+            value.resolve_selected_font_metric_lengths(basis);
+        }
+    }
+
     /// Resolves `em` components after the element's used font size is known.
     /// <https://www.w3.org/TR/css-values-4/#em>
     pub(crate) fn resolve_em_relative_lengths(&mut self, font_size: LayoutLength) {
@@ -47,8 +56,34 @@ impl ComputedLineHeight {
         }
     }
 
+    /// Resolve `lh` in `line-height` against the inherited computed line
+    /// height. CSS Values makes this an exception to the normal local `lh`
+    /// basis, preventing a declaration from depending on the value it sets.
+    /// <https://drafts.csswg.org/css-values-4/#lh>
+    pub(crate) fn resolve_inherited_line_height_relative_lengths(
+        &mut self,
+        inherited_line_height: LayoutLength,
+    ) {
+        if let Self::Length(value) = self {
+            value.resolve_line_height_relative_lengths(inherited_line_height);
+        }
+    }
+
     pub(crate) fn requires_ch_advance(&self) -> bool {
         matches!(self, Self::Length(value) if value.requires_ch_advance())
+    }
+
+    /// Whether this line-height needs a metric from its selected font.
+    /// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>
+    pub(crate) fn requires_selected_font_metrics(&self) -> bool {
+        matches!(self, Self::Length(value) if value.requires_selected_font_metrics())
+    }
+
+    /// Whether this line-height needs a metric from the document root's
+    /// selected font.
+    /// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        matches!(self, Self::Length(value) if value.requires_root_font_metrics())
     }
 
     /// Resolves root-font metric units against the document root's selected
@@ -57,24 +92,6 @@ impl ComputedLineHeight {
     pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
         if let Self::Length(value) = self {
             value.resolve_root_font_metric_lengths(basis);
-        }
-    }
-
-    pub(crate) fn resolve_ic_relative_lengths(&mut self, ic_advance: LayoutLength) {
-        if let Self::Length(value) = self {
-            value.resolve_ic_relative_lengths(ic_advance);
-        }
-    }
-
-    pub(crate) fn resolve_ex_relative_lengths(&mut self, x_height: f32) {
-        if let Self::Length(value) = self {
-            value.resolve_ex_relative_lengths(x_height);
-        }
-    }
-
-    pub(crate) fn resolve_cap_relative_lengths(&mut self, cap_height: f32) {
-        if let Self::Length(value) = self {
-            value.resolve_cap_relative_lengths(cap_height);
         }
     }
 
@@ -122,6 +139,14 @@ impl ComputedTextIndent {
         hanging: false,
         each_line: false,
     };
+
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        self.amount.resolve_root_font_metric_lengths(basis);
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        self.amount.requires_root_font_metrics()
+    }
 }
 
 /// Computed CSS `hanging-punctuation` keyword set.

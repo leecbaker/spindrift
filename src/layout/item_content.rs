@@ -1,4 +1,5 @@
 use super::*;
+use crate::layout::block::DefinitePhysicalContentHeight;
 use crate::layout::block::child_available_space_for_formatting_context;
 
 #[derive(Debug, Clone, Copy)]
@@ -12,6 +13,25 @@ pub(in crate::layout) enum PageStartMarginPolicy {
 pub(in crate::layout) enum ReplayedItemFragmentationPolicy {
     Flex,
     Grid,
+}
+
+/// Identifies the code path responsible for a replayed formatting-context
+/// root's principal-box decoration.
+///
+/// A parent layout algorithm can paint an item's decoration at its resolved
+/// placement before replaying its contents. This belongs to that replay root
+/// only; it must not be ambient builder state that a descendant can consume.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(in crate::layout) enum PrincipalBoxPaintMode {
+    #[default]
+    RootPaints,
+    ParentPaints,
+}
+
+impl PrincipalBoxPaintMode {
+    pub(in crate::layout) const fn root_paints(self) -> bool {
+        matches!(self, Self::RootPaints)
+    }
 }
 
 /// Build the common base style for a flex or grid item replayed in a later
@@ -75,13 +95,16 @@ pub(in crate::layout) struct PlacedFormattingContext {
     pub(in crate::layout) content_width: PhysicalContentWidth,
     /// A definite physical content-box height when one is available for
     /// descendant percentage resolution.
-    pub(in crate::layout) content_height: Option<PhysicalContentHeight>,
+    pub(in crate::layout) content_height: Option<DefinitePhysicalContentHeight>,
     /// A flex/grid-assigned table wrapper border-box block size. CSS Tables
     /// distinguishes this used wrapper geometry from an authored `height`,
     /// which targets the table grid.
     pub(in crate::layout) table_wrapper_border_box_block_size: Option<BorderBoxLength>,
-    pub(in crate::layout) writing_mode: WritingMode,
-    pub(in crate::layout) scope_content_logical_inline_size: bool,
+    /// The final logical inline content size to use while replaying this
+    /// independently formatted item. This is separate from physical
+    /// containing-block geometry because vertical writing maps its inline
+    /// axis to physical height.
+    pub(in crate::layout) replay_logical_inline_size: Option<LogicalInlineContentSize>,
     pub(in crate::layout) cursor_y: f32,
     pub(in crate::layout) page_start_margin_policy: PageStartMarginPolicy,
     pub(in crate::layout) float_scope: ReplayFloatScope,
@@ -157,10 +180,9 @@ impl<'a> LayoutBuilder<'a> {
             placement.content_width,
             placement.content_height,
             inherited_orthogonal_available_height,
-            PhysicalContentHeight::new(content_box_pt(self.page_area_height())),
+            self.initial_containing_block_physical_height(),
         );
-        let push_item_inline_size = placement.scope_content_logical_inline_size
-            && matches!(placement.writing_mode, WritingMode::HorizontalTb);
+        let replay_logical_inline_size = placement.replay_logical_inline_size;
         let push_table_wrapper_block_size = placement.table_wrapper_border_box_block_size.is_some();
         self.content_left = placement.content_left;
         self.content_right = placement.content_left + placement.content_width.points();
@@ -170,15 +192,15 @@ impl<'a> LayoutBuilder<'a> {
         self.normal_flow_relative_containing_blocks
             .push(NormalFlowRelativeContainingBlock {
                 physical_content_width: placement.content_width,
-                physical_content_height: placement.content_height,
+                physical_content_height: placement.content_height.map(|height| height.value()),
             });
         if push_table_wrapper_block_size {
             self.table_wrapper_block_size_overrides
                 .push(placement.table_wrapper_border_box_block_size);
         }
-        if push_item_inline_size {
+        if let Some(inline_size) = replay_logical_inline_size {
             self.content_logical_inline_size_stack
-                .push(placement.content_width.points());
+                .push(inline_size.points());
         }
         if matches!(
             placement.page_start_margin_policy,
@@ -187,7 +209,7 @@ impl<'a> LayoutBuilder<'a> {
             self.truncate_page_start_margins = false;
         }
         let result = self.with_replay_float_scope(placement.float_scope, layout);
-        if push_item_inline_size {
+        if replay_logical_inline_size.is_some() {
             self.content_logical_inline_size_stack.pop();
         }
         self.child_available_space_stack.pop();
@@ -270,6 +292,7 @@ impl<'a> LayoutBuilder<'a> {
         child: &FormattingContextChild<'_>,
         placed_style: &ComputedStyle,
         stylesheets: &Stylesheets<'_>,
+        principal_box_paint_mode: PrincipalBoxPaintMode,
     ) {
         if let Some((child_element, signature, child_boxes)) = child.element_parts() {
             self.push_ancestor_signature(signature.clone());
@@ -290,6 +313,7 @@ impl<'a> LayoutBuilder<'a> {
                     &[],
                     child_boxes,
                     None,
+                    principal_box_paint_mode,
                 );
             } else {
                 self.layout_element_with_child_boxes_run_ins_and_table_fragment_with_principal_effect_context(
@@ -300,6 +324,7 @@ impl<'a> LayoutBuilder<'a> {
                     child_boxes,
                     child.table_fragment(),
                     false,
+                    principal_box_paint_mode,
                 );
             }
             self.pop_page_name_element_scope_suppression();
@@ -310,6 +335,9 @@ impl<'a> LayoutBuilder<'a> {
             // root formatting context for the item, so consume the marker here
             // while the definite basis itself remains scoped by the caller.
             let _ = self.take_replayed_flex_item_percentage_height_basis();
+            // Anonymous flex items do not have independently styleable
+            // principal-box decoration, so parent ownership is a no-op.
+            let _ = principal_box_paint_mode;
             self.layout_anonymous_block(placed_style, children, stylesheets, None);
         }
     }

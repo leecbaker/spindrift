@@ -2,6 +2,34 @@ use super::*;
 use std::cmp::Ordering;
 use std::rc::Rc;
 
+/// The selected-font metrics used to absolutize local font-relative lengths
+/// on one element. These are a property of the element's inline formatting
+/// context, not of an individual physical box edge.
+/// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct SelectedFontMetricLengthBasis {
+    pub(crate) ch_advance: LayoutLength,
+    pub(crate) ic_advance: LayoutLength,
+    pub(crate) x_height: LayoutLength,
+    pub(crate) cap_height: LayoutLength,
+}
+
+impl SelectedFontMetricLengthBasis {
+    pub(crate) const fn new(
+        ch_advance: LayoutLength,
+        ic_advance: LayoutLength,
+        x_height: LayoutLength,
+        cap_height: LayoutLength,
+    ) -> Self {
+        Self {
+            ch_advance,
+            ic_advance,
+            x_height,
+            cap_height,
+        }
+    }
+}
+
 /// The affine subset of CSS `<length-percentage>`.
 ///
 /// This is the common representation: an absolute component plus a percentage
@@ -622,8 +650,23 @@ impl ComputedLengthPercentage {
         matches!(self, Self::Expression(expression) if expression.requires_term(DeferredLengthUnit::Ch))
     }
 
-    /// Whether this value needs a metric from the document root's selected
-    /// font rather than from its element or parent font.
+    /// Whether this value needs a metric from its selected font.
+    ///
+    /// These units resolve after font selection, rather than against the
+    /// font-size fallback used during computed-value construction:
+    /// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>.
+    pub(crate) fn requires_selected_font_metrics(&self) -> bool {
+        matches!(self, Self::Expression(expression) if [
+            DeferredLengthUnit::Ch,
+            DeferredLengthUnit::Ex,
+            DeferredLengthUnit::Cap,
+            DeferredLengthUnit::Ic,
+        ]
+        .into_iter()
+        .any(|unit| expression.requires_term(unit)))
+    }
+
+    /// Whether this value needs the document root's resolved font basis.
     pub(crate) fn requires_root_font_metrics(&self) -> bool {
         matches!(self, Self::Expression(expression) if [
             DeferredLengthUnit::Rex,
@@ -634,6 +677,18 @@ impl ComputedLengthPercentage {
         ]
         .into_iter()
         .any(|unit| expression.requires_term(unit)))
+    }
+
+    /// Whether this value needs the document root's used font-size.
+    ///
+    /// `rem` is distinct from the root metric units above: it only needs the
+    /// root font size, not a selected-font measurement.  Keeping that
+    /// distinction lets ordinary computed-value processing remain metric-free
+    /// while allowing lazily built styles to replace their initial-value
+    /// fallback once the document root is known.
+    /// <https://www.w3.org/TR/css-values-4/#root-font-relative-lengths>
+    pub(crate) fn requires_document_root_font_size(&self) -> bool {
+        matches!(self, Self::Expression(expression) if expression.requires_term(DeferredLengthUnit::Rem))
     }
 
     /// Whether a deferred `font-size` needs a selected metric from its parent
@@ -659,6 +714,23 @@ impl ComputedLengthPercentage {
     pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         self.resolve_terms(|unit, coefficient| {
             (unit == DeferredLengthUnit::Ch).then_some(layout_pt(coefficient * ch_advance.points()))
+        });
+    }
+
+    /// Absolutizes the local metrics whose values come from this element's
+    /// selected font. `lh` is intentionally excluded because it depends on
+    /// the computed line-height produced after this pass.
+    /// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>
+    pub(crate) fn resolve_selected_font_metric_lengths(
+        &mut self,
+        basis: SelectedFontMetricLengthBasis,
+    ) {
+        self.resolve_terms(|unit, coefficient| match unit {
+            DeferredLengthUnit::Ch => Some(layout_pt(coefficient * basis.ch_advance.points())),
+            DeferredLengthUnit::Ic => Some(layout_pt(coefficient * basis.ic_advance.points())),
+            DeferredLengthUnit::Ex => Some(layout_pt(coefficient * basis.x_height.points())),
+            DeferredLengthUnit::Cap => Some(layout_pt(coefficient * basis.cap_height.points())),
+            _ => None,
         });
     }
 
@@ -694,6 +766,12 @@ impl ComputedLengthPercentage {
 
     pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
         self.resolve_terms(|unit, coefficient| match unit {
+            // The root metric snapshot is also the authoritative root-font
+            // size snapshot. Resolving `rem` here keeps every computed
+            // length carrier on the same document-root basis as `rch` and
+            // the other root metric units.
+            // <https://www.w3.org/TR/css-values-4/#font-relative-lengths>
+            DeferredLengthUnit::Rem => Some(layout_pt(coefficient * basis.font_size.points())),
             DeferredLengthUnit::Rex => Some(layout_pt(coefficient * basis.x_height.points())),
             DeferredLengthUnit::Rcap => Some(layout_pt(coefficient * basis.cap_height.points())),
             DeferredLengthUnit::Rch => Some(layout_pt(coefficient * basis.ch_advance.points())),
@@ -1499,14 +1577,17 @@ mod tests {
     #[test]
     fn root_font_metric_terms_resolve_to_an_affine_value() {
         let mut value = ComputedLengthPercentage::sum(
-            ComputedLengthPercentage::from_rex(1.0),
+            ComputedLengthPercentage::from_rem(1.0),
             ComputedLengthPercentage::sum(
-                ComputedLengthPercentage::from_rcap(1.0),
+                ComputedLengthPercentage::from_rex(1.0),
                 ComputedLengthPercentage::sum(
-                    ComputedLengthPercentage::from_rch(1.0),
+                    ComputedLengthPercentage::from_rcap(1.0),
                     ComputedLengthPercentage::sum(
-                        ComputedLengthPercentage::from_ric(1.0),
-                        ComputedLengthPercentage::from_rlh(1.0),
+                        ComputedLengthPercentage::from_rch(1.0),
+                        ComputedLengthPercentage::sum(
+                            ComputedLengthPercentage::from_ric(1.0),
+                            ComputedLengthPercentage::from_rlh(1.0),
+                        ),
                     ),
                 ),
             ),
@@ -1523,8 +1604,20 @@ mod tests {
         assert!(matches!(value, ComputedLengthPercentage::Affine(_)));
         assert_eq!(
             value.used_length_with_percentage_basis(PercentageBasis::<LayoutLength>::indefinite()),
-            Some(layout_pt(20.0)),
+            Some(layout_pt(30.0)),
         );
+    }
+
+    #[test]
+    fn rem_requires_the_document_root_size_but_not_root_font_metrics() {
+        let rem = ComputedLengthPercentage::from_rem(1.0);
+
+        assert!(rem.requires_document_root_font_size());
+        assert!(!rem.requires_root_font_metrics());
+
+        let root_metric = ComputedLengthPercentage::from_rch(1.0);
+        assert!(!root_metric.requires_document_root_font_size());
+        assert!(root_metric.requires_root_font_metrics());
     }
 
     #[test]

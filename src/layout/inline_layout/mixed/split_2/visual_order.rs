@@ -389,14 +389,20 @@ impl<'a> LayoutBuilder<'a> {
                 .then(|| {
                     Rc::new(BoundaryShapedSource {
                         shaped: Rc::clone(&shaped),
-                        fragment_ranges: Rc::from(ranges.clone().into_boxed_slice()),
                     })
                 });
-            let slices = ranges
-                .iter()
-                .cloned()
-                .map(|range| shaped.source_slice(range))
-                .collect::<Vec<_>>();
+            // The inserted ZWNJ is an implementation-only boundary marker,
+            // never an authored source artifact.  A selection from such a
+            // shape must take the ordinary re-shaping path at paint time.
+            let selections = if starts_after_shaping_boundary || ends_before_shaping_boundary {
+                vec![None; ranges.len()]
+            } else {
+                ranges
+                    .iter()
+                    .cloned()
+                    .map(|range| SourceShapedSelection::from_source(Rc::clone(&shaped), range))
+                    .collect::<Vec<_>>()
+            };
             let original_fragment_width = fragment_indices
                 .iter()
                 .map(|&fragment_index| items[fragment_index].width)
@@ -406,13 +412,13 @@ impl<'a> LayoutBuilder<'a> {
             // still need the full source's aggregate advance for bidi
             // alignment; distribute it proportionally until paint consumes
             // the shared glyph stream once.
-            let fallback_width_scale = if slices.iter().any(Option::is_none) {
+            let fallback_width_scale = if selections.iter().any(Option::is_none) {
                 shaped.advance_width() / original_fragment_width.max(f32::EPSILON)
             } else {
                 1.0
             };
             let mut fragment_ranges = ranges.into_iter();
-            let mut slices = slices.into_iter();
+            let mut selections = selections.into_iter();
             for item in &items[start..index] {
                 if let InlineLineItem::Fragment(fragment) = &item.item {
                     let range = fragment_ranges
@@ -423,20 +429,19 @@ impl<'a> LayoutBuilder<'a> {
                         fragment
                             .set_boundary_shaped_source(Rc::clone(boundary_source), range.clone());
                     }
-                    let slice = slices
+                    let selection = selections
                         .next()
-                        .expect("every logical shaping fragment has one source slice");
-                    if slice.is_some() {
-                        fragment.set_preserves_source_shaping(true);
-                    }
-                    let width = slice
+                        .expect("every logical shaping fragment has one source selection");
+                    let width = selection
                         .as_ref()
-                        .map(ShapedInlineLine::advance_width)
+                        .map(|selection| selection.selected().advance_width())
                         .unwrap_or(item.width * fallback_width_scale);
+                    let selected = selection.as_ref().map(SourceShapedSelection::selected_rc);
+                    fragment.set_source_shaped_selection(selection);
                     output.push(MeasuredInlineItem {
                         item: InlineLineItem::Fragment(fragment),
                         width,
-                        shaped: slice.map(Rc::new).or_else(|| item.shaped.clone()),
+                        shaped: selected.or_else(|| item.shaped.clone()),
                     });
                 } else {
                     output.push(item.clone());
@@ -597,7 +602,14 @@ impl<'a> LayoutBuilder<'a> {
     ) -> Option<MeasuredInlineItem> {
         match &ranged.item.item {
             InlineLineItem::Fragment(fragment) => {
-                let complete_boundary_source = fragment.boundary_shaped_source_and_range();
+                // A boundary source shaped before this full line's UBA pass
+                // still carries the fragment's CSS embedding/override. Once
+                // a line contains bidi scope controls it cannot be reused for
+                // a visual slice: that would run the scope a second time and
+                // erase an explicit LTR override of intrinsically RTL text.
+                let complete_boundary_source = (!line_has_bidi_scope_controls)
+                    .then(|| fragment.boundary_shaped_source_and_range())
+                    .flatten();
                 let visual_slice = expand_visual_slice_with_owned_join_controls(
                     fragment.text(),
                     ranged.range.clone(),
@@ -629,30 +641,30 @@ impl<'a> LayoutBuilder<'a> {
                 // has established its final UAX #9 level. Re-shape mirrored
                 // characters under that final level; all other source slices
                 // retain their contextual glyph forms and joining behavior.
-                let mut selected_shaped = (!line_has_bidi_scope_controls
+                let mut source_selection = (!line_has_bidi_scope_controls
                     && !text
                         .chars()
                         .any(|character| bidi_mirroring_glyph(character).is_some()))
                 .then(|| {
-                    ranged
-                        .item
-                        .shaped
-                        .as_deref()
-                        .and_then(|shaped| shaped.source_slice(relative_start..relative_end))
+                    fragment
+                        .source_shaped_selection()
+                        .and_then(|selection| selection.subselection(relative_start..relative_end))
                 })
                 .flatten();
+                // Keep the logical paint text available to the shaped-source
+                // selection after transferring its owned copy to the
+                // fragment below.
+                let bidi_context_text = Rc::<str>::from(&*text);
                 fragment.set_text(text);
-                // Bidi formatting and join controls are not paint text, so
-                // `set_text` can legitimately change the selected string
-                // even when this visual item still represents the complete
-                // authored fragment.  Restore the shared logical source in
-                // that case; a partial selection remains deliberately
-                // ineligible and follows the ordinary strict-slice path.
-                if relative_start == 0
-                    && relative_end == ranged.range.len()
-                    && let Some((source, range)) = complete_boundary_source
-                {
-                    fragment.set_boundary_shaped_source(source, range);
+                // A visual slice preserves its precise authored range in the
+                // shared logical shape. A paint group may put those slices
+                // in a different order, but it can reuse the full source
+                // only after its ranges collectively cover it once.
+                // <https://www.w3.org/TR/css-text-3/#boundary-shaping>
+                if let Some((source, range)) = complete_boundary_source {
+                    let selected_range =
+                        (range.start + relative_start)..(range.start + relative_end);
+                    fragment.set_boundary_shaped_source(source, selected_range);
                 }
                 fragment.set_resolved_bidi_direction(Some(resolved_direction));
                 // The source line has already been shaped and resolved by
@@ -661,28 +673,47 @@ impl<'a> LayoutBuilder<'a> {
                 // resolve edge neutrals differently and loses the source
                 // glyph form even when no cursive context is involved.
                 // <https://www.w3.org/TR/css-writing-modes-4/#bidi-algo>
-                if let Some(selected_shaped) = &mut selected_shaped {
+                if let Some(selection) = &mut source_selection {
                     // The graph source shape predates visual-level selection.
                     // Apply UAX #9 L4 while handing it to this visual slice,
                     // before its advance becomes part of line layout.
-                    self.font_system
-                        .apply_resolved_bidi_glyph_mirroring(selected_shaped, resolved_direction);
+                    self.font_system.apply_resolved_bidi_glyph_mirroring(
+                        selection.selected_mut(),
+                        resolved_direction,
+                    );
+                    selection.resolve_bidi_context(resolved_direction, bidi_context_text);
                 }
-                fragment.set_preserves_source_shaping(selected_shaped.is_some());
-                if selected_shaped.is_some() {
+                if source_selection.as_ref().is_some_and(|selection| {
+                    selection.is_reusable_for(fragment.text(), Some(resolved_direction))
+                }) {
                     // `set_text()` resets this source-dependent flag, but a
                     // slice of the graph's durable shaped line already had
                     // its backend terminal tracking normalized.
                     fragment.mark_terminal_tracking_normalized();
+                    fragment.set_source_shaped_selection(source_selection);
+                } else {
+                    fragment.set_source_shaped_selection(None);
                 }
-                let shaped = selected_shaped.or_else(|| {
-                    self.font_system.shape_visual_ordered_line(
-                        fragment.text(),
-                        fragment.style(),
-                        fragment.style().line_height,
-                        resolved_direction,
-                    )
-                });
+                let shaped = fragment
+                    .source_shaped_selection()
+                    .map(SourceShapedSelection::selected_rc)
+                    .map(|selection| selection.as_ref().clone())
+                    .or_else(|| {
+                        // UAX #9 resolved this slice at the enclosing line's
+                        // paragraph level. Keep that outer context while the
+                        // visual-order shaper installs its own unscoped guard;
+                        // using the inline's `direction:ltr` as a new paragraph
+                        // changes the final glyph positioning of an LTR override
+                        // embedded in RTL text.
+                        let mut visual_context_style = fragment.style().clone();
+                        visual_context_style.direction = block_style.used_direction();
+                        self.font_system.shape_visual_ordered_line(
+                            fragment.text(),
+                            &visual_context_style,
+                            visual_context_style.line_height,
+                            resolved_direction,
+                        )
+                    });
                 let width = shaped
                     .as_ref()
                     .map(ShapedInlineLine::advance_width)
@@ -779,11 +810,8 @@ impl<'a> LayoutBuilder<'a> {
                 if fragment.style().font_size == 0.0 || fragment.style().line_height == 0.0 {
                     return InlineBaselineExtents::new(0.0, 0.0);
                 }
-                let metrics = self.inline_text_box_metrics(
-                    fragment.style(),
-                    item.shaped.as_deref(),
-                    fragment.baseline_shift,
-                );
+                let metrics =
+                    self.inline_text_box_metrics(fragment.style(), fragment.baseline_shift);
                 if inline_fragment_uses_text_edge_layout(fragment) {
                     return self.inline_text_edge_baseline_extents(
                         fragment.style(),
@@ -814,7 +842,7 @@ impl<'a> LayoutBuilder<'a> {
                     InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(_))
                 ) =>
             {
-                let metrics = self.inline_text_box_metrics(atom.style(), None, atom.baseline_shift);
+                let metrics = self.inline_text_box_metrics(atom.style(), atom.baseline_shift);
                 if !matches!(atom.style().text_box_trim, TextBoxTrim::None)
                     || !matches!(atom.style().line_fit_edge, LineFitEdge::Leading)
                 {
@@ -838,7 +866,7 @@ impl<'a> LayoutBuilder<'a> {
                     && block_style.writing_mode.has_vertical_lines() =>
             {
                 let parent_text_baselines = ParentTextOverUnderBaselines::from_metrics(
-                    self.inline_text_box_metrics(block_style, None, 0.0),
+                    self.inline_text_box_metrics(block_style, 0.0),
                 );
                 parent_text_baselines.text_combine_upright_square_extents(
                     inline_atom_logical_block_size(atom, block_style),
@@ -916,7 +944,7 @@ impl<'a> LayoutBuilder<'a> {
             {
                 block_size * 0.5
             }
-            _ => inline_atom_logical_margin_box_baseline_offset(atom, containing_style),
+            _ => inline_atom_logical_margin_box_baseline_offset(atom, containing_style).points(),
         };
         InlineBaselineExtents::from_baseline_and_block_size(
             unshifted_baseline + atom.baseline_shift,
@@ -949,8 +977,7 @@ impl<'a> LayoutBuilder<'a> {
     ) -> Option<InlineBaselineExtents> {
         let (vertical_align, block_size) = match &item.item {
             InlineLineItem::Fragment(fragment) => {
-                let metrics =
-                    self.inline_text_box_metrics(fragment.style(), item.shaped.as_deref(), 0.0);
+                let metrics = self.inline_text_box_metrics(fragment.style(), 0.0);
                 (
                     fragment.style().vertical_align.clone(),
                     metrics.line_block_size,
@@ -962,7 +989,7 @@ impl<'a> LayoutBuilder<'a> {
             ),
             InlineLineItem::Float(_) => return None,
         };
-        let parent_metrics = self.inline_text_box_metrics(block_style, None, 0.0);
+        let parent_metrics = self.inline_text_box_metrics(block_style, 0.0);
         let parent_content_above = parent_metrics.content_baseline_offset;
         let parent_content_below =
             parent_metrics.content_block_size - parent_metrics.content_baseline_offset;
@@ -1000,7 +1027,7 @@ impl<'a> LayoutBuilder<'a> {
         style: &ComputedStyle,
         baseline_shift: f32,
     ) -> InlineBaselineExtents {
-        let metrics = self.inline_text_box_metrics(style, None, baseline_shift);
+        let metrics = self.inline_text_box_metrics(style, baseline_shift);
         InlineBaselineExtents::from_shifted_baseline_and_block_size(
             metrics.line_baseline_offset,
             metrics.line_block_size,
@@ -1011,10 +1038,9 @@ impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn inline_text_box_metrics(
         &mut self,
         style: &ComputedStyle,
-        shaped: Option<&ShapedInlineLine>,
         _baseline_shift: f32,
     ) -> InlineTextBoxMetrics {
-        let resolved = self.font_system.resolved_inline_text_metrics(style, shaped);
+        let resolved = self.font_system.resolved_inline_text_metrics(style);
         let content_block_size = layout_points(resolved.content_block_size()).max(0.0);
         let content_baseline_offset = layout_points(resolved.content.above_baseline);
         let line_block_size = layout_points(resolved.line_block_size()).max(0.0);
@@ -1142,7 +1168,7 @@ impl<'a> LayoutBuilder<'a> {
                 // <https://www.w3.org/TR/CSS22/visudet.html#propdef-vertical-align>
                 let participant_height = match item {
                     InlineLineItem::Fragment(fragment) => {
-                        self.inline_text_box_metrics(fragment.style(), None, 0.0)
+                        self.inline_text_box_metrics(fragment.style(), 0.0)
                             .line_block_size
                     }
                     InlineLineItem::Atom(_) | InlineLineItem::Float(_) => {
@@ -1155,7 +1181,7 @@ impl<'a> LayoutBuilder<'a> {
                     InlineLineItem::Float(_) => None,
                 }
                 .map(|scope| {
-                    self.inline_text_box_metrics(scope.line_relative_style(), None, 0.0)
+                    self.inline_text_box_metrics(scope.line_relative_style(), 0.0)
                         .line_block_size
                 })
                 .unwrap_or(0.0);
@@ -1189,7 +1215,7 @@ impl<'a> LayoutBuilder<'a> {
                     // line that it is meant to align to.
                     // <https://www.w3.org/TR/css-inline-3/#line-height-property>
                     InlineLineItem::Fragment(fragment) => {
-                        self.inline_text_box_metrics(fragment.style(), None, 0.0)
+                        self.inline_text_box_metrics(fragment.style(), 0.0)
                             .line_block_size
                     }
                     InlineLineItem::Atom(_) | InlineLineItem::Float(_) => {
@@ -1239,7 +1265,8 @@ pub(in crate::layout) fn apply_visual_tracking_boundaries(items: &mut [MeasuredI
             InlineLineItem::Fragment(_) | InlineLineItem::Atom(_) | InlineLineItem::Float(_) => {
                 None
             }
-        };
+        }
+        .filter(|advance| *advance != 0.0);
         if let Some(terminal_tracking) = terminal_tracking {
             // The shaping backend owns this advance in its glyph stream.
             // Normalize the visual artifact together with its scalar width;
@@ -1253,12 +1280,17 @@ pub(in crate::layout) fn apply_visual_tracking_boundaries(items: &mut [MeasuredI
         }
         match &mut item.item {
             InlineLineItem::Fragment(fragment) => {
-                fragment.set_leading_tracking(layout_pt(0.0));
+                if leading != 0.0 {
+                    fragment.set_leading_tracking(layout_pt(0.0));
+                }
                 if terminal_tracking.is_some() {
                     fragment.mark_terminal_tracking_normalized();
                 }
             }
-            InlineLineItem::Atom(atom) => atom.set_leading_tracking(layout_pt(0.0)),
+            InlineLineItem::Atom(atom) if leading != 0.0 => {
+                atom.set_leading_tracking(layout_pt(0.0));
+            }
+            InlineLineItem::Atom(_) => {}
             InlineLineItem::Float(_) => {}
         }
     }
@@ -1266,70 +1298,71 @@ pub(in crate::layout) fn apply_visual_tracking_boundaries(items: &mut [MeasuredI
     let mut previous_unit = None::<VisualTrackingUnit>;
     let mut sequence_is_open = true;
     for item_index in 0..items.len() {
-        let item = items[item_index].clone();
-        match &item.item {
+        let current = match &items[item_index].item {
             InlineLineItem::Fragment(fragment)
                 if inline_fragment_is_inter_character_unit(fragment) =>
             {
-                let Some(scope) = fragment.tracking_scope().cloned() else {
-                    sequence_is_open = false;
-                    continue;
-                };
-                let current = VisualTrackingUnit {
-                    kind: VisualTrackingUnitKind::Text,
-                    first_item: item_index,
-                    first_scope: Rc::clone(&scope),
-                    last_scope: scope,
-                    text_allows_gap_before: crate::text::text_allows_inter_character_gap_before(
-                        fragment.text(),
-                    ),
-                    text_allows_gap_after: crate::text::text_allows_inter_character_gap_after(
-                        fragment.text(),
-                    ),
-                    starts_visual_fragment: fragment.starts_visual_fragment(),
-                };
-                if let Some(previous) = &previous_unit {
-                    apply_visual_tracking_boundary(items, previous, &current);
-                }
-                previous_unit = Some(current);
-                sequence_is_open = true;
-            }
-            InlineLineItem::Atom(atom) if inline_atom_is_inter_character_unit(atom) => {
-                let Some(scope) = atom.tracking_scope().cloned() else {
-                    sequence_is_open = false;
-                    continue;
-                };
-                if sequence_is_open
-                    && matches!(
-                        previous_unit.as_ref().map(|unit| unit.kind),
-                        Some(VisualTrackingUnitKind::AtomicRun)
-                    )
-                {
-                    previous_unit
-                        .as_mut()
-                        .expect("checked atomic run")
-                        .last_scope = scope;
-                } else {
-                    let current = VisualTrackingUnit {
-                        kind: VisualTrackingUnitKind::AtomicRun,
+                fragment
+                    .tracking_scope()
+                    .cloned()
+                    .map(|scope| VisualTrackingUnit {
+                        kind: VisualTrackingUnitKind::Text,
                         first_item: item_index,
                         first_scope: Rc::clone(&scope),
                         last_scope: scope,
-                        text_allows_gap_before: false,
-                        text_allows_gap_after: false,
-                        starts_visual_fragment: false,
-                    };
-                    if let Some(previous) = &previous_unit {
-                        apply_visual_tracking_boundary(items, previous, &current);
-                    }
-                    previous_unit = Some(current);
-                }
-                sequence_is_open = true;
+                        text_allows_gap_before: crate::text::text_allows_inter_character_gap_before(
+                            fragment.text(),
+                        ),
+                        text_allows_gap_after: crate::text::text_allows_inter_character_gap_after(
+                            fragment.text(),
+                        ),
+                        starts_visual_fragment: fragment.starts_visual_fragment(),
+                    })
             }
-            InlineLineItem::Atom(atom) if inline_atom_is_inter_character_transparent(atom) => {}
-            InlineLineItem::Atom(_) | InlineLineItem::Float(_) => sequence_is_open = false,
-            InlineLineItem::Fragment(_) => {}
+            InlineLineItem::Atom(atom) if inline_atom_is_inter_character_unit(atom) => atom
+                .tracking_scope()
+                .cloned()
+                .map(|scope| VisualTrackingUnit {
+                    kind: VisualTrackingUnitKind::AtomicRun,
+                    first_item: item_index,
+                    first_scope: Rc::clone(&scope),
+                    last_scope: scope,
+                    text_allows_gap_before: false,
+                    text_allows_gap_after: false,
+                    starts_visual_fragment: false,
+                }),
+            InlineLineItem::Atom(atom) if inline_atom_is_inter_character_transparent(atom) => {
+                continue;
+            }
+            InlineLineItem::Atom(_) | InlineLineItem::Float(_) => {
+                sequence_is_open = false;
+                continue;
+            }
+            InlineLineItem::Fragment(_) => continue,
+        };
+        let Some(current) = current else {
+            sequence_is_open = false;
+            continue;
+        };
+
+        if current.kind == VisualTrackingUnitKind::AtomicRun
+            && sequence_is_open
+            && matches!(
+                previous_unit.as_ref().map(|unit| unit.kind),
+                Some(VisualTrackingUnitKind::AtomicRun)
+            )
+        {
+            previous_unit
+                .as_mut()
+                .expect("checked atomic run")
+                .last_scope = current.last_scope;
+        } else {
+            if let Some(previous) = &previous_unit {
+                apply_visual_tracking_boundary(items, previous, &current);
+            }
+            previous_unit = Some(current);
         }
+        sequence_is_open = true;
     }
 }
 
@@ -1368,6 +1401,90 @@ mod tests {
             width,
             shaped: None,
         }
+    }
+
+    fn tracked_canvas_atom(style: ComputedStyle, scope: Rc<InlineTrackingScope>) -> InlineAtom {
+        InlineAtom::new(
+            InlineAtomContent::Canvas,
+            style,
+            None,
+            InlineSize::new(20.0, 20.0),
+            20.0,
+            0.0,
+            None,
+            None,
+        )
+        .with_tracking_scope(scope)
+    }
+
+    #[test]
+    fn zero_tracking_keeps_shared_fragment_and_atom_data() {
+        let style = ComputedStyle::initial();
+        let scope = InlineTrackingScope::root(&style);
+        let source_fragment = tracked_fragment("A", style.clone(), Rc::clone(&scope));
+        let source_atom = tracked_canvas_atom(style, scope);
+        let mut items = vec![
+            measured_fragment(source_fragment.clone(), 10.0),
+            MeasuredInlineItem {
+                item: InlineLineItem::Atom(source_atom.clone()),
+                width: 20.0,
+                shaped: None,
+            },
+        ];
+
+        apply_visual_tracking_boundaries(&mut items);
+
+        let InlineLineItem::Fragment(fragment) = &items[0].item else {
+            panic!("test setup creates text")
+        };
+        let InlineLineItem::Atom(atom) = &items[1].item else {
+            panic!("test setup creates an atom")
+        };
+        assert!(Rc::ptr_eq(&source_fragment.data, &fragment.data));
+        assert!(Rc::ptr_eq(&source_atom.data, &atom.data));
+        assert!(!fragment.terminal_tracking_normalized());
+    }
+
+    #[test]
+    fn applying_visual_tracking_twice_is_idempotent() {
+        let style = tracked_style(11.0);
+        let scope = InlineTrackingScope::root(&style);
+        let mut items = vec![
+            measured_fragment(
+                tracked_fragment("a", style.clone(), Rc::clone(&scope)),
+                21.0,
+            ),
+            measured_fragment(tracked_fragment("b", style, scope), 21.0),
+        ];
+
+        apply_visual_tracking_boundaries(&mut items);
+        let first_widths: Vec<_> = items.iter().map(|item| item.width).collect();
+        let first_tracking: Vec<_> = items
+            .iter()
+            .map(|item| match &item.item {
+                InlineLineItem::Fragment(fragment) => fragment.leading_tracking(),
+                InlineLineItem::Atom(atom) => atom.leading_tracking(),
+                InlineLineItem::Float(_) => layout_pt(0.0),
+            })
+            .collect();
+
+        apply_visual_tracking_boundaries(&mut items);
+
+        assert_eq!(
+            items.iter().map(|item| item.width).collect::<Vec<_>>(),
+            first_widths
+        );
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| match &item.item {
+                    InlineLineItem::Fragment(fragment) => fragment.leading_tracking(),
+                    InlineLineItem::Atom(atom) => atom.leading_tracking(),
+                    InlineLineItem::Float(_) => layout_pt(0.0),
+                })
+                .collect::<Vec<_>>(),
+            first_tracking
+        );
     }
 
     #[test]
@@ -1483,7 +1600,7 @@ mod tests {
             );
 
             assert_eq!(
-                inline_atom_logical_margin_box_baseline_offset(&atom, &style),
+                inline_atom_logical_margin_box_baseline_offset(&atom, &style).points(),
                 10.0,
                 "{writing_mode:?} projects its block-start margin"
             );
@@ -1494,40 +1611,51 @@ mod tests {
     }
 
     #[test]
-    fn inline_table_baseline_uses_table_box_not_wrapper_margin() {
+    fn inline_table_line_metrics_include_wrapper_margin_but_replay_uses_table_box() {
         for writing_mode in [
             WritingMode::HorizontalTb,
             WritingMode::VerticalRl,
             WritingMode::VerticalLr,
         ] {
-            let style = containing_style_with_block_margins(writing_mode, 3.0, 4.0);
-            let size = match writing_mode {
-                WritingMode::HorizontalTb => InlineSize::new(10.0, 27.0),
-                WritingMode::VerticalRl | WritingMode::VerticalLr => InlineSize::new(27.0, 10.0),
-                WritingMode::SidewaysRl | WritingMode::SidewaysLr => unreachable!(),
-            };
-            let atom = InlineAtom::new(
-                InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace(
-                    InlineTextBoundarySpacing::new(layout_pt(size.width), false),
-                )),
-                style.clone(),
-                None,
-                size,
-                7.0,
-                0.0,
-                None,
-                None,
-            )
-            .with_exported_table_box_baseline();
+            for (block_start, expected_margin_box_baseline, expected_descent) in
+                [(3.0, 10.0, 17.0), (-3.0, 4.0, 23.0)]
+            {
+                let style = containing_style_with_block_margins(writing_mode, block_start, 4.0);
+                let size = match writing_mode {
+                    WritingMode::HorizontalTb => InlineSize::new(10.0, 27.0),
+                    WritingMode::VerticalRl | WritingMode::VerticalLr => {
+                        InlineSize::new(27.0, 10.0)
+                    }
+                    WritingMode::SidewaysRl | WritingMode::SidewaysLr => unreachable!(),
+                };
+                let atom = InlineAtom::new(
+                    InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace(
+                        InlineTextBoundarySpacing::new(layout_pt(size.width), false),
+                    )),
+                    style.clone(),
+                    None,
+                    size,
+                    7.0,
+                    0.0,
+                    None,
+                    None,
+                )
+                .with_exported_table_box_baseline();
 
-            assert_eq!(
-                inline_atom_logical_margin_box_baseline_offset(&atom, &style),
-                7.0,
-                "{writing_mode:?} must not add the inline-table wrapper block-start margin"
-            );
-            let extents = LayoutBuilder::inline_atom_line_baseline_extents(&atom, &style);
-            assert_eq!(extents.baseline_offset, 7.0);
-            assert_eq!(extents.descent, 20.0);
+                assert_eq!(
+                    inline_atom_logical_margin_box_baseline_offset(&atom, &style).points(),
+                    expected_margin_box_baseline,
+                    "{writing_mode:?} must preserve the signed inline-table wrapper block-start margin in line metrics"
+                );
+                assert_eq!(
+                    inline_atom_logical_content_placement_baseline_offset(&atom, &style).points(),
+                    7.0,
+                    "{writing_mode:?} must replay the inline table from its table-box baseline"
+                );
+                let extents = LayoutBuilder::inline_atom_line_baseline_extents(&atom, &style);
+                assert_eq!(extents.baseline_offset, expected_margin_box_baseline);
+                assert_eq!(extents.descent, expected_descent);
+            }
         }
     }
 
@@ -1559,7 +1687,7 @@ mod tests {
             .with_synthesized_border_box_block_end_baseline();
 
             assert_eq!(
-                inline_atom_logical_margin_box_baseline_offset(&atom, &style),
+                inline_atom_logical_margin_box_baseline_offset(&atom, &style).points(),
                 23.0,
                 "{writing_mode:?} projects its synthesized block-end baseline"
             );

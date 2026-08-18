@@ -52,7 +52,7 @@ pub(in crate::layout) fn prepare_text_decoration_strokes(
     );
     let mut strokes = Vec::new();
 
-    if phase.paints_before_text()
+    if phase.paints_underlines()
         && decoration.underline
         && !text_decoration_skip_self_suppresses(style, TextDecorationLineKind::Underline)
     {
@@ -80,7 +80,7 @@ pub(in crate::layout) fn prepare_text_decoration_strokes(
         });
     }
 
-    if phase.paints_before_text()
+    if phase.paints_overlines()
         && decoration.overline
         && !text_decoration_skip_self_suppresses(style, TextDecorationLineKind::Overline)
     {
@@ -136,7 +136,7 @@ pub(in crate::layout) fn prepare_text_decoration_strokes(
         });
     }
 
-    if phase.paints_before_text() && decoration.spelling_error {
+    if phase.paints_underlines() && decoration.spelling_error {
         strokes.push(PreparedTextDecorationStroke {
             axis,
             baseline,
@@ -161,7 +161,7 @@ pub(in crate::layout) fn prepare_text_decoration_strokes(
         });
     }
 
-    if phase.paints_before_text() && decoration.grammar_error {
+    if phase.paints_underlines() && decoration.grammar_error {
         strokes.push(PreparedTextDecorationStroke {
             axis,
             baseline,

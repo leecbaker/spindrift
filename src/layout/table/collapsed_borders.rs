@@ -1,13 +1,81 @@
 use super::*;
 
 pub(super) struct CollapsedBorderGrid {
-    horizontal: Vec<Vec<Option<CollapsedBorder>>>,
-    vertical: Vec<Vec<Option<CollapsedBorder>>>,
+    /// Winners on logical block boundaries, indexed by row boundary then
+    /// column segment.
+    block_boundaries: Vec<Vec<Option<CollapsedBorder>>>,
+    /// Winners on logical inline boundaries, indexed by row segment then
+    /// column boundary.
+    inline_boundaries: Vec<Vec<Option<CollapsedBorder>>>,
     /// The table root alone determines how physical border sides map to
     /// logical grid edges.  Descendant `direction` values do not reorder the
     /// table's column grid.
-    direction: Direction,
+    axes: TableAxes,
     column_count: usize,
+}
+
+/// Resolved half-widths on the table root's logical grid edges.
+///
+/// Collapsed-border resolution must remain in grid coordinates until a caller
+/// needs physical box-model insets.  This narrow conversion boundary keeps a
+/// vertical table from treating a block-start winner as `top`:
+/// <https://drafts.csswg.org/css-tables-3/#collapsing-borders> and
+/// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>.
+#[derive(Debug, Clone, Copy, Default)]
+struct TableGridEdgeInsets {
+    inline_start: f32,
+    inline_end: f32,
+    block_start: f32,
+    block_end: f32,
+}
+
+impl TableGridEdgeInsets {
+    fn physical_edges(self, axes: TableAxes) -> css::Edges {
+        let mut physical = css::Edges {
+            top: 0.0,
+            right: 0.0,
+            bottom: 0.0,
+            left: 0.0,
+        };
+        for (edge, inset) in [
+            (TableGridEdge::InlineStart, self.inline_start),
+            (TableGridEdge::InlineEnd, self.inline_end),
+            (TableGridEdge::BlockStart, self.block_start),
+            (TableGridEdge::BlockEnd, self.block_end),
+        ] {
+            match axes.physical_side_for_grid_edge(edge) {
+                PhysicalSide::Top => physical.top = inset,
+                PhysicalSide::Right => physical.right = inset,
+                PhysicalSide::Bottom => physical.bottom = inset,
+                PhysicalSide::Left => physical.left = inset,
+            }
+        }
+        physical
+    }
+}
+
+/// A rectangular owner span in root table-grid coordinates.
+///
+/// Border candidates from table parts cover a logical grid span before their
+/// physical declaration side chooses one of its edges:
+/// <https://drafts.csswg.org/css-tables-3/#collapsing-borders>.
+#[derive(Debug, Clone, Copy)]
+struct TableGridOwnerSpan {
+    row_start: usize,
+    row_end: usize,
+    column_start: usize,
+    column_end: usize,
+}
+
+impl TableGridOwnerSpan {
+    const fn new(row_start: usize, row_end: usize, column_start: usize, column_end: usize) -> Self {
+        Self {
+            row_start,
+            row_end,
+            column_start,
+            column_end,
+        }
+    }
 }
 
 /// One collapsed-border grid-line segment in page top-edge coordinates.
@@ -126,11 +194,11 @@ fn sort_collapsed_boundary_segments(commands: &mut [CollapsedBorderPaintCommand]
 }
 
 impl CollapsedBorderGrid {
-    pub(super) fn new(row_count: usize, column_count: usize, direction: Direction) -> Self {
+    pub(super) fn new(row_count: usize, column_count: usize, axes: TableAxes) -> Self {
         Self {
-            horizontal: vec![vec![None; column_count]; row_count + 1],
-            vertical: vec![vec![None; column_count + 1]; row_count],
-            direction,
+            block_boundaries: vec![vec![None; column_count]; row_count + 1],
+            inline_boundaries: vec![vec![None; column_count + 1]; row_count],
+            axes,
             column_count,
         }
     }
@@ -141,60 +209,20 @@ impl CollapsedBorderGrid {
         row_count: usize,
         column_count: usize,
     ) {
-        for column in 0..column_count {
-            self.add_horizontal(0, column, style, BorderSide::Top, BorderOrigin::Table, 0);
-            self.add_horizontal(
-                row_count,
-                column,
-                style,
-                BorderSide::Bottom,
-                BorderOrigin::Table,
-                0,
-            );
-        }
-        for row in 0..row_count {
-            self.add_vertical(
-                row,
-                self.inline_left_boundary(0, column_count),
-                style,
-                BorderSide::Left,
-                BorderOrigin::Table,
-            );
-            self.add_vertical(
-                row,
-                self.inline_right_boundary(0, column_count),
-                style,
-                BorderSide::Right,
-                BorderOrigin::Table,
-            );
-        }
+        self.add_physical_box_edges(
+            TableGridOwnerSpan::new(0, row_count, 0, column_count),
+            style,
+            BorderOrigin::Table,
+            0,
+        );
     }
 
     pub(super) fn add_row(&mut self, row: usize, column_count: usize, style: &ComputedStyle) {
-        for column in 0..column_count {
-            self.add_horizontal(row, column, style, BorderSide::Top, BorderOrigin::Row, row);
-            self.add_horizontal(
-                row + 1,
-                column,
-                style,
-                BorderSide::Bottom,
-                BorderOrigin::Row,
-                row,
-            );
-        }
-        self.add_vertical(
-            row,
-            self.inline_left_boundary(0, column_count),
+        self.add_physical_box_edges(
+            TableGridOwnerSpan::new(row, row + 1, 0, column_count),
             style,
-            BorderSide::Left,
             BorderOrigin::Row,
-        );
-        self.add_vertical(
             row,
-            self.inline_right_boundary(0, column_count),
-            style,
-            BorderSide::Right,
-            BorderOrigin::Row,
         );
     }
 
@@ -205,40 +233,12 @@ impl CollapsedBorderGrid {
         column_count: usize,
         style: &ComputedStyle,
     ) {
-        for column in 0..column_count {
-            self.add_horizontal(
-                start_row,
-                column,
-                style,
-                BorderSide::Top,
-                BorderOrigin::RowGroup,
-                start_row,
-            );
-            self.add_horizontal(
-                end_row,
-                column,
-                style,
-                BorderSide::Bottom,
-                BorderOrigin::RowGroup,
-                start_row,
-            );
-        }
-        for row in start_row..end_row {
-            self.add_vertical(
-                row,
-                self.inline_left_boundary(0, column_count),
-                style,
-                BorderSide::Left,
-                BorderOrigin::RowGroup,
-            );
-            self.add_vertical(
-                row,
-                self.inline_right_boundary(0, column_count),
-                style,
-                BorderSide::Right,
-                BorderOrigin::RowGroup,
-            );
-        }
+        self.add_physical_box_edges(
+            TableGridOwnerSpan::new(start_row, end_row, 0, column_count),
+            style,
+            BorderOrigin::RowGroup,
+            start_row,
+        );
     }
 
     pub(super) fn add_column_group(
@@ -288,34 +288,12 @@ impl CollapsedBorderGrid {
         style: &ComputedStyle,
         origin: BorderOrigin,
     ) {
-        for column in start_column..end_column {
-            let tie_position = self.physical_column_position(column);
-            self.add_horizontal(0, column, style, BorderSide::Top, origin, tie_position);
-            self.add_horizontal(
-                row_count,
-                column,
-                style,
-                BorderSide::Bottom,
-                origin,
-                tie_position,
-            );
-        }
-        for row in 0..row_count {
-            self.add_vertical(
-                row,
-                self.inline_left_boundary(start_column, end_column),
-                style,
-                BorderSide::Left,
-                origin,
-            );
-            self.add_vertical(
-                row,
-                self.inline_right_boundary(start_column, end_column),
-                style,
-                BorderSide::Right,
-                origin,
-            );
-        }
+        self.add_physical_box_edges(
+            TableGridOwnerSpan::new(0, row_count, start_column, end_column),
+            style,
+            origin,
+            self.physical_column_position(start_column),
+        );
     }
 
     pub(super) fn add_cell(
@@ -330,52 +308,26 @@ impl CollapsedBorderGrid {
             return;
         }
         let column_end = (column + colspan.max(1)).min(self.column_count);
-        let row_end = (row + rowspan.max(1)).min(self.horizontal.len().saturating_sub(1));
-        for segment_column in column..column_end {
-            self.add_horizontal(
-                row,
-                segment_column,
-                style,
-                BorderSide::Top,
-                BorderOrigin::Cell,
-                row,
-            );
-            self.add_horizontal(
-                row_end,
-                segment_column,
-                style,
-                BorderSide::Bottom,
-                BorderOrigin::Cell,
-                row,
-            );
-        }
+        let row_end = (row + rowspan.max(1)).min(self.block_boundaries.len().saturating_sub(1));
+        self.add_physical_box_edges(
+            TableGridOwnerSpan::new(row, row_end, column, column_end),
+            style,
+            BorderOrigin::Cell,
+            row,
+        );
         for boundary in row + 1..row_end {
             for segment_column in column..column_end {
                 // CSS collapsed borders have no internal cell edge through a row-spanning cell.
                 // A strong null cell-origin candidate suppresses lower-precedence row borders.
-                self.add_strong_null_horizontal(boundary, segment_column, row);
+                self.add_strong_null_block_boundary(boundary, segment_column, row);
             }
         }
         for segment_row in row..row_end {
             for boundary in column + 1..column_end {
                 // CSS collapsed borders also have no internal cell edge through a
                 // column-spanning cell. Suppress column and column-group borders there.
-                self.add_strong_null_vertical(segment_row, boundary, column);
+                self.add_strong_null_inline_boundary(segment_row, boundary, column);
             }
-            self.add_vertical(
-                segment_row,
-                self.inline_left_boundary(column, column_end),
-                style,
-                BorderSide::Left,
-                BorderOrigin::Cell,
-            );
-            self.add_vertical(
-                segment_row,
-                self.inline_right_boundary(column, column_end),
-                style,
-                BorderSide::Right,
-                BorderOrigin::Cell,
-            );
         }
     }
 
@@ -386,8 +338,13 @@ impl CollapsedBorderGrid {
     /// spanning cell, so this durable null candidate prevents row, column, and
     /// group borders from painting through the cell interior.
     /// <https://www.w3.org/TR/CSS22/tables.html#border-conflict-resolution>
-    fn add_strong_null_horizontal(&mut self, boundary: usize, column: usize, tie_position: usize) {
-        if let Some(row) = self.horizontal.get_mut(boundary)
+    fn add_strong_null_block_boundary(
+        &mut self,
+        boundary: usize,
+        column: usize,
+        tie_position: usize,
+    ) {
+        if let Some(row) = self.block_boundaries.get_mut(boundary)
             && let Some(edge) = row.get_mut(column)
         {
             resolve_collapsed_border(
@@ -399,12 +356,17 @@ impl CollapsedBorderGrid {
 
     /// Add a hidden cell-origin candidate for an internal spanning-cell edge.
     ///
-    /// This is the inline-axis counterpart of `add_strong_null_horizontal` and
+    /// This is the inline-axis counterpart of `add_strong_null_block_boundary` and
     /// is required for colspans so column borders do not leak through a cell.
     /// <https://www.w3.org/TR/CSS22/tables.html#collapsing-borders>
-    fn add_strong_null_vertical(&mut self, row: usize, boundary: usize, tie_position: usize) {
+    fn add_strong_null_inline_boundary(
+        &mut self,
+        row: usize,
+        boundary: usize,
+        tie_position: usize,
+    ) {
         let tie_position = self.physical_boundary_position(tie_position);
-        if let Some(row_edges) = self.vertical.get_mut(row)
+        if let Some(row_edges) = self.inline_boundaries.get_mut(row)
             && let Some(edge) = row_edges.get_mut(boundary)
         {
             resolve_collapsed_border(
@@ -414,16 +376,16 @@ impl CollapsedBorderGrid {
         }
     }
 
-    pub(super) fn add_horizontal(
+    fn add_block_boundary(
         &mut self,
         boundary: usize,
         column: usize,
         style: &ComputedStyle,
-        side: BorderSide,
+        side: PhysicalBorderSide,
         origin: BorderOrigin,
         tie_position: usize,
     ) {
-        if let Some(row) = self.horizontal.get_mut(boundary)
+        if let Some(row) = self.block_boundaries.get_mut(boundary)
             && let Some(edge) = row.get_mut(column)
         {
             resolve_collapsed_border(
@@ -433,16 +395,16 @@ impl CollapsedBorderGrid {
         }
     }
 
-    pub(super) fn add_vertical(
+    fn add_inline_boundary(
         &mut self,
         row: usize,
         boundary: usize,
         style: &ComputedStyle,
-        side: BorderSide,
+        side: PhysicalBorderSide,
         origin: BorderOrigin,
     ) {
         let tie_position = self.physical_boundary_position(boundary);
-        if let Some(row_edges) = self.vertical.get_mut(row)
+        if let Some(row_edges) = self.inline_boundaries.get_mut(row)
             && let Some(edge) = row_edges.get_mut(boundary)
         {
             resolve_collapsed_border(
@@ -452,29 +414,81 @@ impl CollapsedBorderGrid {
         }
     }
 
-    fn inline_left_boundary(&self, start_column: usize, end_column: usize) -> usize {
-        match self.direction {
-            Direction::Ltr => start_column,
-            Direction::Rtl => end_column,
+    /// Insert one physical CSS border declaration on the root-owned logical
+    /// grid edge that it occupies.  The declaration's physical side remains
+    /// attached to the candidate for side-aware 3D border painting.
+    fn add_physical_edge(
+        &mut self,
+        owner: TableGridOwnerSpan,
+        style: &ComputedStyle,
+        side: PhysicalBorderSide,
+        origin: BorderOrigin,
+        block_tie_position: usize,
+    ) {
+        match self.axes.grid_edge_for_physical_side(side.physical_side()) {
+            TableGridEdge::BlockStart => {
+                for column in owner.column_start..owner.column_end {
+                    self.add_block_boundary(
+                        owner.row_start,
+                        column,
+                        style,
+                        side,
+                        origin,
+                        block_tie_position,
+                    );
+                }
+            }
+            TableGridEdge::BlockEnd => {
+                for column in owner.column_start..owner.column_end {
+                    self.add_block_boundary(
+                        owner.row_end,
+                        column,
+                        style,
+                        side,
+                        origin,
+                        block_tie_position,
+                    );
+                }
+            }
+            TableGridEdge::InlineStart => {
+                for row in owner.row_start..owner.row_end {
+                    self.add_inline_boundary(row, owner.column_start, style, side, origin);
+                }
+            }
+            TableGridEdge::InlineEnd => {
+                for row in owner.row_start..owner.row_end {
+                    self.add_inline_boundary(row, owner.column_end, style, side, origin);
+                }
+            }
         }
     }
 
-    fn inline_right_boundary(&self, start_column: usize, end_column: usize) -> usize {
-        match self.direction {
-            Direction::Ltr => end_column,
-            Direction::Rtl => start_column,
+    fn add_physical_box_edges(
+        &mut self,
+        owner: TableGridOwnerSpan,
+        style: &ComputedStyle,
+        origin: BorderOrigin,
+        block_tie_position: usize,
+    ) {
+        for side in [
+            PhysicalBorderSide::Top,
+            PhysicalBorderSide::Right,
+            PhysicalBorderSide::Bottom,
+            PhysicalBorderSide::Left,
+        ] {
+            self.add_physical_edge(owner, style, side, origin, block_tie_position);
         }
     }
 
     fn physical_boundary_position(&self, boundary: usize) -> usize {
-        match self.direction {
+        match self.axes.direction {
             Direction::Ltr => boundary,
             Direction::Rtl => self.column_count.saturating_sub(boundary),
         }
     }
 
     fn physical_column_position(&self, column: usize) -> usize {
-        match self.direction {
+        match self.axes.direction {
             Direction::Ltr => column,
             Direction::Rtl => self.column_count.saturating_sub(column + 1),
         }
@@ -554,7 +568,7 @@ impl CollapsedBorderGrid {
                 );
             }
 
-            let Some(row) = self.vertical.get(original_row) else {
+            let Some(row) = self.inline_boundaries.get(original_row) else {
                 continue;
             };
             let mut vertical_paint_commands = Vec::new();
@@ -610,10 +624,10 @@ impl CollapsedBorderGrid {
             return;
         }
         painted_boundaries.push(boundary);
-        let Some(row) = self.horizontal.get(boundary) else {
+        let Some(row) = self.block_boundaries.get(boundary) else {
             return;
         };
-        let row_count = self.vertical.len();
+        let row_count = self.inline_boundaries.len();
         let mut commands = Vec::new();
         for (column, border) in row.iter().enumerate() {
             let Some(border) = border else {
@@ -677,9 +691,9 @@ impl CollapsedBorderGrid {
     ) -> f32 {
         let before = horizontal_boundary
             .checked_sub(1)
-            .and_then(|row| self.vertical_border_width(row, vertical_boundary));
+            .and_then(|row| self.inline_boundary_width(row, vertical_boundary));
         let after = (horizontal_boundary < row_count)
-            .then(|| self.vertical_border_width(horizontal_boundary, vertical_boundary))
+            .then(|| self.inline_boundary_width(horizontal_boundary, vertical_boundary))
             .flatten();
         before.into_iter().chain(after).fold(0.0_f32, f32::max) / 2.0
     }
@@ -697,20 +711,20 @@ impl CollapsedBorderGrid {
     ) -> f32 {
         let before = vertical_boundary
             .checked_sub(1)
-            .and_then(|column| self.horizontal_border_width(horizontal_boundary, column));
-        let after = self.horizontal_border_width(horizontal_boundary, vertical_boundary);
+            .and_then(|column| self.block_boundary_width(horizontal_boundary, column));
+        let after = self.block_boundary_width(horizontal_boundary, vertical_boundary);
         before.into_iter().chain(after).fold(0.0_f32, f32::max) / 2.0
     }
 
-    fn vertical_border_width(&self, row: usize, boundary: usize) -> Option<f32> {
-        self.vertical
+    fn inline_boundary_width(&self, row: usize, boundary: usize) -> Option<f32> {
+        self.inline_boundaries
             .get(row)?
             .get(boundary)?
             .map(|border| border.used_side().used_width.get())
     }
 
-    fn horizontal_border_width(&self, boundary: usize, column: usize) -> Option<f32> {
-        self.horizontal
+    fn block_boundary_width(&self, boundary: usize, column: usize) -> Option<f32> {
+        self.block_boundaries
             .get(boundary)?
             .get(column)?
             .map(|border| border.used_side().used_width.get())
@@ -729,33 +743,32 @@ impl CollapsedBorderGrid {
         colspan: usize,
         rowspan: usize,
     ) -> css::Edges {
-        let row_end = (row + rowspan.max(1)).min(self.horizontal.len().saturating_sub(1));
+        let row_end = (row + rowspan.max(1)).min(self.block_boundaries.len().saturating_sub(1));
         let column_end = (column + colspan.max(1)).min(self.column_count);
-        let top = (column..column_end)
-            .filter_map(|segment_column| self.horizontal_border_width(row, segment_column))
+        let block_start = (column..column_end)
+            .filter_map(|segment_column| self.block_boundary_width(row, segment_column))
             .fold(0.0_f32, f32::max)
             / 2.0;
-        let bottom = (column..column_end)
-            .filter_map(|segment_column| self.horizontal_border_width(row_end, segment_column))
+        let block_end = (column..column_end)
+            .filter_map(|segment_column| self.block_boundary_width(row_end, segment_column))
             .fold(0.0_f32, f32::max)
             / 2.0;
-        let left_boundary = self.inline_left_boundary(column, column_end);
-        let right_boundary = self.inline_right_boundary(column, column_end);
-        let left = (row..row_end)
-            .filter_map(|segment_row| self.vertical_border_width(segment_row, left_boundary))
+        let inline_start = (row..row_end)
+            .filter_map(|segment_row| self.inline_boundary_width(segment_row, column))
             .fold(0.0_f32, f32::max)
             / 2.0;
-        let right = (row..row_end)
-            .filter_map(|segment_row| self.vertical_border_width(segment_row, right_boundary))
+        let inline_end = (row..row_end)
+            .filter_map(|segment_row| self.inline_boundary_width(segment_row, column_end))
             .fold(0.0_f32, f32::max)
             / 2.0;
 
-        css::Edges {
-            top,
-            right,
-            bottom,
-            left,
+        TableGridEdgeInsets {
+            inline_start,
+            inline_end,
+            block_start,
+            block_end,
         }
+        .physical_edges(self.axes)
     }
 
     /// Return the table wrapper insets created by collapsed outer grid borders.
@@ -768,56 +781,49 @@ impl CollapsedBorderGrid {
     /// <https://www.w3.org/TR/CSS22/tables.html#collapsing-borders> and
     /// <https://drafts.csswg.org/css-tables-3/#drawing-backgrounds-and-borders>
     pub(super) fn outer_insets(&self) -> css::Edges {
-        let top = self
-            .horizontal
+        let block_start = self
+            .block_boundaries
             .first()
             .into_iter()
             .flat_map(|row| row.iter())
             .filter_map(|border| border.map(|border| border.used_side().used_width.get()))
             .fold(0.0_f32, f32::max)
             / 2.0;
-        let bottom = self
-            .horizontal
+        let block_end = self
+            .block_boundaries
             .last()
             .into_iter()
             .flat_map(|row| row.iter())
             .filter_map(|border| border.map(|border| border.used_side().used_width.get()))
             .fold(0.0_f32, f32::max)
             / 2.0;
-        // The grid is indexed in logical column order, while these insets are
-        // physical box-model edges.  `direction: rtl` reverses the physical
-        // placement of column zero, so using `first`/`last` directly here
-        // would apply the outer borders to the wrong physical sides and shift
-        // every collapsed border join.
-        // <https://www.w3.org/TR/css-writing-modes-4/#direction>
-        let left_boundary = self.inline_left_boundary(0, self.column_count);
-        let right_boundary = self.inline_right_boundary(0, self.column_count);
-        let left = self
-            .vertical
+        let inline_start = self
+            .inline_boundaries
             .iter()
-            .filter_map(|row| row.get(left_boundary))
+            .filter_map(|row| row.first())
             .filter_map(|border| border.map(|border| border.used_side().used_width.get()))
             .fold(0.0_f32, f32::max)
             / 2.0;
-        let right = self
-            .vertical
+        let inline_end = self
+            .inline_boundaries
             .iter()
-            .filter_map(|row| row.get(right_boundary))
+            .filter_map(|row| row.get(self.column_count))
             .filter_map(|border| border.map(|border| border.used_side().used_width.get()))
             .fold(0.0_f32, f32::max)
             / 2.0;
 
-        css::Edges {
-            top,
-            right,
-            bottom,
-            left,
+        TableGridEdgeInsets {
+            inline_start,
+            inline_end,
+            block_start,
+            block_end,
         }
+        .physical_edges(self.axes)
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum BorderSide {
+pub(super) enum PhysicalBorderSide {
     Top,
     Right,
     Bottom,
@@ -839,7 +845,7 @@ pub(super) struct CollapsedBorder {
     width: LayoutLength,
     style: BorderStyle,
     color: CssColor,
-    side: BorderSide,
+    side: PhysicalBorderSide,
     origin: BorderOrigin,
     tie_position: usize,
 }
@@ -847,24 +853,26 @@ pub(super) struct CollapsedBorder {
 impl CollapsedBorder {
     pub(super) fn from_style(
         style: &ComputedStyle,
-        side: BorderSide,
+        side: PhysicalBorderSide,
         origin: BorderOrigin,
         tie_position: usize,
     ) -> Self {
         let colors = style.border_colors.resolve(style.color);
         let (width, border_style, color) = match side {
-            BorderSide::Top => (style.border_widths.top, style.border_styles.top, colors.top),
-            BorderSide::Right => (
+            PhysicalBorderSide::Top => {
+                (style.border_widths.top, style.border_styles.top, colors.top)
+            }
+            PhysicalBorderSide::Right => (
                 style.border_widths.right,
                 style.border_styles.right,
                 colors.right,
             ),
-            BorderSide::Bottom => (
+            PhysicalBorderSide::Bottom => (
                 style.border_widths.bottom,
                 style.border_styles.bottom,
                 colors.bottom,
             ),
-            BorderSide::Left => (
+            PhysicalBorderSide::Left => (
                 style.border_widths.left,
                 style.border_styles.left,
                 colors.left,
@@ -885,7 +893,7 @@ impl CollapsedBorder {
             width: layout_pt(0.0),
             style: BorderStyle::Hidden,
             color: CssColor::TRANSPARENT,
-            side: BorderSide::Top,
+            side: PhysicalBorderSide::Top,
             origin,
             tie_position,
         }
@@ -922,13 +930,22 @@ impl CollapsedBorder {
     }
 }
 
-impl BorderSide {
+impl PhysicalBorderSide {
+    fn physical_side(self) -> PhysicalSide {
+        match self {
+            Self::Top => PhysicalSide::Top,
+            Self::Right => PhysicalSide::Right,
+            Self::Bottom => PhysicalSide::Bottom,
+            Self::Left => PhysicalSide::Left,
+        }
+    }
+
     fn border_edge(self) -> BorderEdge {
         match self {
-            BorderSide::Top => BorderEdge::Top,
-            BorderSide::Right => BorderEdge::Right,
-            BorderSide::Bottom => BorderEdge::Bottom,
-            BorderSide::Left => BorderEdge::Left,
+            Self::Top => BorderEdge::Top,
+            Self::Right => BorderEdge::Right,
+            Self::Bottom => BorderEdge::Bottom,
+            Self::Left => BorderEdge::Left,
         }
     }
 }
@@ -1146,12 +1163,35 @@ mod tests {
         style
     }
 
+    fn style_with_asymmetric_solid_borders(widths_css_px: css::Edges) -> ComputedStyle {
+        let mut style = ComputedStyle::initial();
+        style.border_widths = css::Edges {
+            top: widths_css_px.top * css::CSS_PX_TO_PT,
+            right: widths_css_px.right * css::CSS_PX_TO_PT,
+            bottom: widths_css_px.bottom * css::CSS_PX_TO_PT,
+            left: widths_css_px.left * css::CSS_PX_TO_PT,
+        };
+        style.border_styles = css::BorderStyles {
+            top: BorderStyle::Solid,
+            right: BorderStyle::Solid,
+            bottom: BorderStyle::Solid,
+            left: BorderStyle::Solid,
+        };
+        style.border_colors = css::BorderColors {
+            top: css::CssColorOrCurrentColor::Color(CssColor::new(255, 0, 0)),
+            right: css::CssColorOrCurrentColor::Color(CssColor::new(0, 128, 0)),
+            bottom: css::CssColorOrCurrentColor::Color(CssColor::new(0, 0, 255)),
+            left: css::CssColorOrCurrentColor::Color(CssColor::BLACK),
+        };
+        style
+    }
+
     fn solid_border(width_css_px: f32, origin: BorderOrigin) -> CollapsedBorder {
         CollapsedBorder {
             width: layout_pt(width_css_px * css::CSS_PX_TO_PT),
             style: BorderStyle::Solid,
             color: CssColor::BLACK,
-            side: BorderSide::Top,
+            side: PhysicalBorderSide::Top,
             origin,
             tie_position: 0,
         }
@@ -1163,7 +1203,7 @@ mod tests {
                 width: layout_pt(2.0 * css::CSS_PX_TO_PT),
                 style: BorderStyle::Solid,
                 color,
-                side: BorderSide::Left,
+                side: PhysicalBorderSide::Left,
                 origin: BorderOrigin::Cell,
                 tie_position: 0,
             },
@@ -1221,7 +1261,7 @@ mod tests {
 
     #[test]
     fn equal_width_group_loser_does_not_expand_resolved_cell_insets() {
-        let mut grid = CollapsedBorderGrid::new(1, 1, Direction::Ltr);
+        let mut grid = CollapsedBorderGrid::new(1, 1, TableAxes::for_direction(Direction::Ltr));
         let loser = style_with_solid_border(25.0, CssColor::new(255, 0, 0));
         let winner = style_with_solid_border(25.0, CssColor::new(0, 128, 0));
 
@@ -1234,6 +1274,83 @@ mod tests {
         assert!((insets.right - expected_side).abs() < 0.01);
         assert!((insets.top - expected_side).abs() < 0.01);
         assert!((insets.bottom - expected_side).abs() < 0.01);
+    }
+
+    #[test]
+    fn asymmetric_physical_insets_follow_the_root_table_axes() {
+        let widths = css::Edges {
+            top: 2.0,
+            right: 4.0,
+            bottom: 6.0,
+            left: 8.0,
+        };
+        let style = style_with_asymmetric_solid_borders(widths);
+        let expected = css::Edges {
+            top: widths.top * css::CSS_PX_TO_PT / 2.0,
+            right: widths.right * css::CSS_PX_TO_PT / 2.0,
+            bottom: widths.bottom * css::CSS_PX_TO_PT / 2.0,
+            left: widths.left * css::CSS_PX_TO_PT / 2.0,
+        };
+
+        for writing_mode in [
+            WritingMode::HorizontalTb,
+            WritingMode::VerticalRl,
+            WritingMode::VerticalLr,
+            WritingMode::SidewaysRl,
+            WritingMode::SidewaysLr,
+        ] {
+            for direction in [Direction::Ltr, Direction::Rtl] {
+                let axes = TableAxes {
+                    flow: FlowAxes::new(writing_mode, direction),
+                    direction,
+                };
+
+                let mut cell_grid = CollapsedBorderGrid::new(1, 1, axes);
+                cell_grid.add_cell(0, 0, 1, 1, &style);
+                assert_eq!(cell_grid.cell_insets(0, 0, 1, 1), expected);
+
+                let mut table_grid = CollapsedBorderGrid::new(1, 1, axes);
+                table_grid.add_table(&style, 1, 1);
+                assert_eq!(table_grid.outer_insets(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn orthogonal_cell_style_does_not_change_root_collapsed_grid_edge() {
+        let axes = TableAxes {
+            flow: FlowAxes::new(WritingMode::VerticalRl, Direction::Ltr),
+            direction: Direction::Ltr,
+        };
+        let mut horizontal_cell = style_with_asymmetric_solid_borders(css::Edges {
+            top: 12.0,
+            right: 0.0,
+            bottom: 0.0,
+            left: 0.0,
+        });
+        horizontal_cell.writing_mode = WritingMode::HorizontalTb;
+        let mut vertical_cell = horizontal_cell.clone();
+        vertical_cell.writing_mode = WritingMode::VerticalLr;
+
+        let mut horizontal_grid = CollapsedBorderGrid::new(1, 1, axes);
+        horizontal_grid.add_cell(0, 0, 1, 1, &horizontal_cell);
+        let mut vertical_grid = CollapsedBorderGrid::new(1, 1, axes);
+        vertical_grid.add_cell(0, 0, 1, 1, &vertical_cell);
+
+        // Physical `top` is root-inline-start for a vertical-rl LTR table,
+        // irrespective of the cell's own writing mode.
+        assert_eq!(
+            horizontal_grid.inline_boundaries[0][0]
+                .expect("root inline-start candidate")
+                .side,
+            PhysicalBorderSide::Top
+        );
+        assert_eq!(
+            vertical_grid.inline_boundaries[0][0]
+                .expect("root inline-start candidate")
+                .side,
+            PhysicalBorderSide::Top
+        );
     }
 
     #[test]

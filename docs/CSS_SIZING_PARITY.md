@@ -36,7 +36,9 @@ computed CSS lengths, percentages, and sizing keywords.
   height, normal-flow block layout transfers that constrained result back to
   its dependent automatic width and re-runs the block-width equation. This
   preserves width constraints and auto margins while avoiding an unconstrained
-  ratio-sized overflow.
+  ratio-sized overflow. A post-layout min/max replay substitutes the winning
+  fixed constraint in its own `box-sizing` coordinate space, so a border-box
+  constraint does not apply padding and borders a second time.
 - For ratio-derived automatic block dimensions, normal flow retains the
   content-based automatic minimum in the opposite axis. This uses the typed
   block intrinsic contribution rather than a formatting-context-specific
@@ -51,6 +53,12 @@ computed CSS lengths, percentages, and sizing keywords.
 - Flex intrinsic estimates export a ratio-transferred automatic width when a
   definite height supplies it. This keeps `flex-basis: content` and intrinsic
   flex-container sizing on the same preferred aspect-ratio contribution.
+- Replaced elements with an intrinsic ratio and two automatic preferred axes
+  resolve min/max conflicts through the CSS 2.2 constraint table. This covers
+  ratio-only SVGs whose normal-flow tentative stretch-fit width is enlarged by
+  `min-height` and capped by `max-width`, while one-definite-axis cases use
+  CSS Sizing's transferred-constraint rules without changing the definite
+  preferred size.
 - For one intrinsic flex line with a definite main size, flex grow resolution
   now precedes aspect-ratio transfer into an automatic cross contribution.
   This covers inline-flex and replaced items whose final cross size depends on
@@ -71,6 +79,10 @@ computed CSS lengths, percentages, and sizing keywords.
   from that final block size. This applies the CSS Sizing size transfer after
   the absolute-position block equation, including size-contained fallback
   content.
+- Automatic absolute-positioned size measurement keeps the absolute-position
+  containing block definite for the principal's percentages, while ordinary
+  block layout preserves cyclic percentage behavior for descendants. A
+  ratio-derived definite physical height bypasses the content probe.
 - Normal-flow `min-width: stretch` and `max-width: stretch` constraints are
   resolved against the available margin box rather than dropped during the
   final block-width constraint pass.

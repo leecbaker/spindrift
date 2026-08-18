@@ -9,7 +9,9 @@ mod structure;
 
 use collapsed_borders::*;
 use geometry::*;
-pub(in crate::layout) use layout::{TableCellContentCoordinateContext, TableHeightPlan};
+pub(in crate::layout) use layout::{
+    TableCellContentCoordinateContext, TableHeightDistributionTargetKey, TableHeightPlan,
+};
 use model::*;
 use sizing::*;
 pub(in crate::layout) use sizing::{ResolvedTableWrapperInsets, TableWrapperFlexSizing};

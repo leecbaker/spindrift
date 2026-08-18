@@ -1,9 +1,11 @@
 use std::borrow::Cow;
+use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use html5ever::parse_document as parse_html_document;
 use html5ever::tendril::TendrilSink;
+use html5ever::tree_builder::QuirksMode as HtmlParserQuirksMode;
 use markup5ever_rcdom::{Handle, NodeData as RcNodeData, RcDom};
 use xml5ever::driver::parse_document as parse_xml_document;
 
@@ -11,6 +13,29 @@ use xml5ever::driver::parse_document as parse_xml_document;
 pub(crate) enum DocumentSyntax {
     Html,
     Xml,
+}
+
+/// Compatibility mode selected by HTML's tree-construction algorithm.
+///
+/// This is document state rather than a CSS heuristic: HTML determines it
+/// from the parsed doctype and passes it to layout and selector matching.
+/// <https://html.spec.whatwg.org/multipage/parsing.html#the-initial-insertion-mode>
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum DocumentCompatibilityMode {
+    #[default]
+    NoQuirks,
+    LimitedQuirks,
+    Quirks,
+}
+
+impl From<HtmlParserQuirksMode> for DocumentCompatibilityMode {
+    fn from(mode: HtmlParserQuirksMode) -> Self {
+        match mode {
+            HtmlParserQuirksMode::NoQuirks => Self::NoQuirks,
+            HtmlParserQuirksMode::LimitedQuirks => Self::LimitedQuirks,
+            HtmlParserQuirksMode::Quirks => Self::Quirks,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,10 +55,14 @@ pub(crate) struct Element {
     pub tag: String,
     pub namespace_url: String,
     pub document_syntax: DocumentSyntax,
+    pub document_compatibility_mode: DocumentCompatibilityMode,
     pub attrs: HashMap<String, String>,
     pub namespace_attrs: Vec<NamespacedAttribute>,
     pub children: Vec<Node>,
     pub is_target: bool,
+    /// Selector metadata materialized once after the prepared DOM has reached
+    /// its render-time stable state (including fragment-target selection).
+    pub(crate) selector_snapshot: OnceCell<crate::css::ElementSiblingSignature>,
     /// Static rendering outcome selected for an HTML `<object>` element.
     ///
     /// The HTML resource-selection algorithm decides whether an object
@@ -109,10 +138,12 @@ impl Node {
                 tag: tag.into(),
                 namespace_url: String::new(),
                 document_syntax: DocumentSyntax::Html,
+                document_compatibility_mode: DocumentCompatibilityMode::NoQuirks,
                 attrs: HashMap::new(),
                 namespace_attrs: Vec::new(),
                 children: Vec::new(),
                 is_target: false,
+                selector_snapshot: OnceCell::new(),
                 object_rendering: ObjectRendering::Fallback,
             }),
         }
@@ -155,7 +186,11 @@ pub(crate) fn parse_with_syntax(source: &str, syntax: DocumentSyntax) -> crate::
 
 fn parse_html(source: &str) -> Node {
     let dom = parse_html_document(RcDom::default(), Default::default()).one(source);
-    convert_document(&dom.document, DocumentSyntax::Html)
+    convert_document(
+        &dom.document,
+        DocumentSyntax::Html,
+        dom.quirks_mode.get().into(),
+    )
 }
 
 fn parse_xml(source: &str) -> crate::Result<Node> {
@@ -172,7 +207,11 @@ fn parse_xml(source: &str) -> crate::Result<Node> {
             "XML parse error: {error}"
         )));
     }
-    Ok(convert_document(&dom.document, DocumentSyntax::Xml))
+    Ok(convert_document(
+        &dom.document,
+        DocumentSyntax::Xml,
+        DocumentCompatibilityMode::NoQuirks,
+    ))
 }
 
 /// Remove the optional XML document type declaration before tree construction.
@@ -208,27 +247,37 @@ fn without_xml_doctype(source: &str) -> Cow<'_, str> {
     Cow::Borrowed(source)
 }
 
-fn convert_document(handle: &Handle, syntax: DocumentSyntax) -> Node {
+fn convert_document(
+    handle: &Handle,
+    syntax: DocumentSyntax,
+    compatibility_mode: DocumentCompatibilityMode,
+) -> Node {
     let mut root = Node::element("document");
     let element = root.as_element_mut().unwrap();
     element.document_syntax = syntax;
+    element.document_compatibility_mode = compatibility_mode;
     for child in handle.children.borrow().iter() {
-        if let Some(child) = convert_node(child, syntax) {
+        if let Some(child) = convert_node(child, syntax, compatibility_mode) {
             element.children.push(child);
         }
     }
     root
 }
 
-fn convert_node(handle: &Handle, syntax: DocumentSyntax) -> Option<Node> {
+fn convert_node(
+    handle: &Handle,
+    syntax: DocumentSyntax,
+    compatibility_mode: DocumentCompatibilityMode,
+) -> Option<Node> {
     match &handle.data {
-        RcNodeData::Document => Some(convert_document(handle, syntax)),
+        RcNodeData::Document => Some(convert_document(handle, syntax, compatibility_mode)),
         RcNodeData::Text { contents } => Some(Node::text(contents.borrow().to_string())),
         RcNodeData::Element { name, attrs, .. } => {
             let mut node = Node::element(name.local.to_string());
             let element = node.as_element_mut().unwrap();
             element.namespace_url = name.ns.to_string();
             element.document_syntax = syntax;
+            element.document_compatibility_mode = compatibility_mode;
             for attr in attrs.borrow().iter() {
                 element
                     .attrs
@@ -240,7 +289,7 @@ fn convert_node(handle: &Handle, syntax: DocumentSyntax) -> Option<Node> {
                 });
             }
             for child in handle.children.borrow().iter() {
-                if let Some(child) = convert_node(child, syntax) {
+                if let Some(child) = convert_node(child, syntax, compatibility_mode) {
                     element.children.push(child);
                 }
             }
@@ -482,7 +531,8 @@ fn collapse_whitespace(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DocumentSyntax, NodeKind, StylesheetSource, first_element_text, parse, parse_with_syntax,
+        DocumentCompatibilityMode, DocumentSyntax, NodeKind, StylesheetSource,
+        collect_descendant_text, first_element_text, parse, parse_with_syntax,
         stylesheet_sources_in_document_order, without_xml_doctype,
     };
 
@@ -497,6 +547,27 @@ mod tests {
             panic!("expected element");
         };
         assert_eq!(root.children.len(), 1);
+    }
+
+    #[test]
+    fn html_parser_compatibility_mode_is_preserved_on_the_document_tree() {
+        let quirks = parse("<p>quirks");
+        let standards = parse("<!doctype html><p>standards");
+        let NodeKind::Element(quirks_document) = quirks.kind else {
+            panic!("expected document element");
+        };
+        let NodeKind::Element(standards_document) = standards.kind else {
+            panic!("expected document element");
+        };
+
+        assert_eq!(
+            quirks_document.document_compatibility_mode,
+            DocumentCompatibilityMode::Quirks
+        );
+        assert_eq!(
+            standards_document.document_compatibility_mode,
+            DocumentCompatibilityMode::NoQuirks
+        );
     }
 
     #[test]
@@ -523,6 +594,30 @@ mod tests {
     }
 
     #[test]
+    fn html_table_fixup_preserves_implicit_rows_and_cells() {
+        let document = parse(
+            "<table><col width=40><col width=100><tr><td class=corner><td class=edge></table>",
+        );
+
+        fn collect_tags(node: &super::Node, tags: &mut Vec<String>) {
+            let NodeKind::Element(element) = &node.kind else {
+                return;
+            };
+            tags.push(element.tag.clone());
+            for child in &element.children {
+                collect_tags(child, tags);
+            }
+        }
+
+        let mut tags = Vec::new();
+        collect_tags(&document, &mut tags);
+        assert_eq!(tags.iter().filter(|tag| tag.as_str() == "col").count(), 2);
+        assert_eq!(tags.iter().filter(|tag| tag.as_str() == "tbody").count(), 1);
+        assert_eq!(tags.iter().filter(|tag| tag.as_str() == "tr").count(), 1);
+        assert_eq!(tags.iter().filter(|tag| tag.as_str() == "td").count(), 2);
+    }
+
+    #[test]
     fn title_text_uses_parser_decoded_character_references_once() {
         let root = parse("<title>&copy; &#x1f642; &amp;lt;</title>");
 
@@ -530,6 +625,35 @@ mod tests {
             first_element_text(&root, "title"),
             Some("© 🙂 &lt;".to_string())
         );
+    }
+
+    /// HTML retains legacy named references without a semicolon when their
+    /// following character cannot continue an ASCII name.  The two references
+    /// here are separated by `&` and `<`, respectively.
+    /// <https://html.spec.whatwg.org/multipage/parsing.html#named-character-reference-state>
+    #[test]
+    fn html_legacy_named_references_without_semicolons_are_decoded() {
+        let root = parse("<p>&nbsp&nbsp</p>");
+        let mut text = String::new();
+        collect_descendant_text(&root, &mut text);
+
+        assert_eq!(text, "\u{a0}\u{a0}");
+    }
+
+    /// HTML maps C1 numeric character references through its Windows-1252
+    /// replacement table, but preserves a literal NEL scalar in the DOM.
+    /// <https://html.spec.whatwg.org/multipage/parsing.html#numeric-character-reference-end-state>
+    #[test]
+    fn html_c1_numeric_reference_is_not_a_literal_nel() {
+        let literal = parse("<p>A\u{0085}B</p>");
+        let numeric_reference = parse("<p>A&#x0085;B</p>");
+        let mut literal_text = String::new();
+        let mut numeric_reference_text = String::new();
+        collect_descendant_text(&literal, &mut literal_text);
+        collect_descendant_text(&numeric_reference, &mut numeric_reference_text);
+
+        assert_eq!(literal_text, "A\u{0085}B");
+        assert_eq!(numeric_reference_text, "A\u{2026}B");
     }
 
     #[test]

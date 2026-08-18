@@ -167,13 +167,6 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         page_name: Option<&str>,
     ) -> Option<Option<String>> {
-        if std::env::var_os("QUIRE_TRACE_FLOATS").is_some() {
-            eprintln!(
-                "enter page name current={:?} next={page_name:?} page={}",
-                self.current_page_name,
-                self.pages.len(),
-            );
-        }
         if self.current_page_name.as_deref() == page_name {
             return None;
         }
@@ -261,13 +254,13 @@ impl<'a> LayoutBuilder<'a> {
             child_boxes,
             table_fragment,
             true,
+            PrincipalBoxPaintMode::RootPaints,
         );
     }
 
-    /// Lay out an element while allowing an enclosing replay context to own
-    /// this principal box's paint effects.
+    /// Lay out an element with explicit ownership for its principal-box paint.
     ///
-    /// The flag applies only to this element. It is not propagated into
+    /// The paint mode applies only to this element. It is not propagated into
     /// `layout_element_inner_kind`, so descendants still create their own CSS
     /// stacking contexts and compositing groups. CSS Grid and Flexbox place
     /// the item as a stacking unit after its independent formatting context
@@ -284,6 +277,7 @@ impl<'a> LayoutBuilder<'a> {
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
         capture_principal_effect_context: bool,
+        principal_box_paint_mode: PrincipalBoxPaintMode,
     ) {
         // `content-visibility` has its own content-skipping behavior, but its
         // principal box establishes the containment effects needed to size and
@@ -346,6 +340,7 @@ impl<'a> LayoutBuilder<'a> {
                 run_in_children,
                 child_boxes,
                 table_fragment,
+                principal_box_paint_mode,
             );
             return;
         }
@@ -357,6 +352,7 @@ impl<'a> LayoutBuilder<'a> {
             run_in_children,
             child_boxes,
             table_fragment,
+            principal_box_paint_mode,
         );
     }
 
@@ -370,6 +366,7 @@ impl<'a> LayoutBuilder<'a> {
         run_in_children: &[box_tree::FormattingBox<'_>],
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
+        principal_box_paint_mode: PrincipalBoxPaintMode,
     ) {
         let replayed_flex_item_percentage_height_basis =
             self.take_replayed_flex_item_percentage_height_basis();
@@ -397,18 +394,22 @@ impl<'a> LayoutBuilder<'a> {
             // <https://drafts.csswg.org/css-page-3/#using-named-pages>
             // <https://drafts.csswg.org/css-break-3/#forced-breaks>
             ElementLayoutKind::Canvas => {
+                debug_assert!(principal_box_paint_mode.root_paints());
                 self.layout_canvas(element, style);
                 self.apply_forced_break_after_box_in(self.active_fragmentainer_kind(), style);
             }
             ElementLayoutKind::Image => {
+                debug_assert!(principal_box_paint_mode.root_paints());
                 self.layout_image(element, style);
                 self.apply_forced_break_after_box_in(self.active_fragmentainer_kind(), style);
             }
             ElementLayoutKind::GeneratedImage => {
+                debug_assert!(principal_box_paint_mode.root_paints());
                 self.layout_generated_image(element, style);
                 self.apply_forced_break_after_box_in(self.active_fragmentainer_kind(), style);
             }
             ElementLayoutKind::Svg => {
+                debug_assert!(principal_box_paint_mode.root_paints());
                 self.layout_svg(element, style);
                 self.apply_forced_break_after_box_in(self.active_fragmentainer_kind(), style);
             }
@@ -418,6 +419,7 @@ impl<'a> LayoutBuilder<'a> {
                 stylesheets,
                 child_boxes,
                 replayed_flex_item_percentage_height_basis,
+                principal_box_paint_mode,
             ),
             ElementLayoutKind::Grid => self.layout_grid_with_descendant_percentage_height_basis(
                 element,
@@ -425,8 +427,10 @@ impl<'a> LayoutBuilder<'a> {
                 stylesheets,
                 child_boxes,
                 replayed_flex_item_percentage_height_basis,
+                principal_box_paint_mode,
             ),
             ElementLayoutKind::Table => {
+                debug_assert!(principal_box_paint_mode.root_paints());
                 let built_child_boxes;
                 let table_children = if let Some(children) = child_boxes {
                     children
@@ -454,6 +458,7 @@ impl<'a> LayoutBuilder<'a> {
                 self.layout_table(element, style, stylesheets, fragment)
             }
             ElementLayoutKind::InlineFlow => {
+                debug_assert!(principal_box_paint_mode.root_paints());
                 let text = inline_text_for_style(element, style);
                 if !text.is_empty() {
                     if style.display.is_list_item() {
@@ -489,6 +494,7 @@ impl<'a> LayoutBuilder<'a> {
                     run_in_children,
                     child_boxes,
                     replayed_flex_item_percentage_height_basis,
+                    principal_box_paint_mode,
                 );
             }
         }
@@ -525,6 +531,7 @@ impl<'a> LayoutBuilder<'a> {
         run_in_children: &[box_tree::FormattingBox<'_>],
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
+        principal_box_paint_mode: PrincipalBoxPaintMode,
     ) {
         let paint_checkpoint = self.current_page.paint_checkpoint();
         let paint_page_index = self.pages.len();
@@ -560,6 +567,7 @@ impl<'a> LayoutBuilder<'a> {
             run_in_children,
             child_boxes,
             table_fragment,
+            principal_box_paint_mode,
         );
         if enters_3d_context {
             self.preserve_3d_context_depth -= 1;
@@ -585,6 +593,45 @@ impl<'a> LayoutBuilder<'a> {
         self.positioned_layers.extend(escaped_layers);
         let mut fragments =
             self.take_positioned_fragments_since(paint_page_index, paint_checkpoint);
+        if matches!(
+            initial_policy.child_layer_policy,
+            ChildLayerPolicy::CaptureAutoLevel
+        ) {
+            // A relatively positioned box with `z-index: auto` is an atomic
+            // paint unit in the parent auto/zero phase, but it is not a real
+            // stacking context. Non-auto descendant contexts must therefore
+            // remain in the parent's negative/positive phases. Flex and Grid
+            // items can create exactly such contexts while still being
+            // statically positioned, so they are present in the captured
+            // fragment rather than in `positioned_layers` above.
+            // <https://www.w3.org/TR/CSS22/zindex.html>
+            // <https://drafts.csswg.org/css-flexbox/#painting>
+            for (page_index, fragment) in &mut fragments {
+                let (captured_contexts, escaped_contexts): (Vec<_>, Vec<_>) = fragment
+                    .take_positioned_stacking_contexts()
+                    .into_iter()
+                    .partition(|context| matches!(context.stack_level, StackLevel::Auto));
+                fragment.restore_positioned_stacking_contexts(captured_contexts);
+                self.positioned_layers
+                    .extend(
+                        escaped_contexts
+                            .into_iter()
+                            .map(|context| PositionedPaintLayer {
+                                page_index: *page_index,
+                                transaction_depth: self.positioned_paint_transaction_depth,
+                                source_element: None,
+                                source_style: style.clone(),
+                                source_style_identity: style as *const ComputedStyle as usize,
+                                multicol_fragment_index: None,
+                                source_is_target: false,
+                                stack_level: context.stack_level,
+                                context,
+                                links: Vec::new(),
+                                escaped_atom_translation: EscapedAtomTranslation::none(),
+                            }),
+                    );
+            }
+        }
         let contains_affine_3d_subtree = child_layers
             .iter()
             .any(|layer| layer.context.effects.affine_3d_transform.is_some())
@@ -691,7 +738,17 @@ impl<'a> LayoutBuilder<'a> {
                 // <https://drafts.csswg.org/css-overflow-3/#overflow-propagation>
                 policy.effects.clear_overflow_clip_effects();
             }
-            if fragment.top_level_contents_overflow_clip().is_some() {
+            if matches!(layout_kind, ElementLayoutKind::Table)
+                && policy.effects.overflow_clip_effect.is_some()
+            {
+                // Table layout owns the table-box overflow effect because it
+                // has to split the table-root decoration from the grid. The
+                // generic element capture includes that decoration and table
+                // wrapper captions, which CSS table overflow must not clip.
+                // <https://www.w3.org/Style/css2-updates/REC-CSS2-20110607-errata.html#s.11.1.1b>
+                // <https://drafts.csswg.org/css-tables-3/#table-layout>
+                policy.effects.clear_overflow_clip_effects();
+            } else if fragment.top_level_contents_overflow_clip().is_some() {
                 // The formatting context already resolved this box's
                 // padding-box edge from used geometry and retained it around
                 // its descendants. Reconstructing another overflow effect
@@ -779,7 +836,70 @@ impl<'a> LayoutBuilder<'a> {
             self.pending_paint_fragments.push(PendingPaintFragment {
                 page_index,
                 fragment,
+                kind: PendingPaintFragmentKind::PositionedOrScoped,
             });
+        }
+    }
+
+    /// Build the ordinary-flow static-position rectangle at a captured block
+    /// cursor, rather than at a later mutable layout cursor.
+    ///
+    /// A block-flow traversal owns this source position. Out-of-flow siblings
+    /// must not move it: CSS Positioned Layout derives each automatic inset
+    /// from the box's hypothetical in-flow position, and absolutely positioned
+    /// boxes do not participate in that flow.
+    /// <https://drafts.csswg.org/css-position-3/#staticpos-rect>
+    pub(in crate::layout) fn block_static_position_rectangle_at(
+        &self,
+        source_block_start: PageTopBlockPosition,
+    ) -> StaticPositionRectangle {
+        let context = self.static_position_containing_blocks.last().copied();
+        let writing_mode = context.map_or(self.containing_block_writing_mode, |context| {
+            context.axes.writing_mode()
+        });
+        let direction = context.map_or(self.containing_block_direction, |context| {
+            context.axes.direction()
+        });
+        let static_block_top_y = if writing_mode.has_vertical_lines() {
+            source_block_start.points()
+        } else {
+            source_block_start.points() - self.block_static_position_y_offset.unwrap_or(0.0)
+        };
+        let area = if writing_mode.has_vertical_lines() {
+            let x = match block_start_side(writing_mode) {
+                PhysicalSide::Left => context.map_or(self.content_left, |context| {
+                    context.content_rect.x() + context.content_rect.width()
+                }),
+                PhysicalSide::Right => {
+                    context.map_or(self.content_right, |context| context.content_rect.x())
+                }
+                PhysicalSide::Top | PhysicalSide::Bottom => {
+                    unreachable!("a vertical writing mode has a horizontal block axis")
+                }
+            };
+            PageTopRect::new(
+                x,
+                context.map_or(source_block_start.points(), |context| {
+                    context.content_rect.top_y()
+                }),
+                0.0,
+                context.map_or(0.0, |context| context.content_rect.height()),
+            )
+        } else {
+            PageTopRect::new(
+                self.content_left,
+                static_block_top_y,
+                (self.content_right - self.content_left).max(0.0),
+                0.0,
+            )
+        };
+        StaticPositionRectangle {
+            area,
+            writing_mode,
+            direction,
+            justify_items: context
+                .map_or(css::SelfAlignment::NORMAL, |context| context.justify_items),
+            align_items: css::SelfAlignment::NORMAL,
         }
     }
 
@@ -828,14 +948,25 @@ impl<'a> LayoutBuilder<'a> {
             return;
         }
         let previous_absolute_static_position = self.absolute_static_position;
+        // Flex and Grid install a complete static-position alignment container
+        // before entering the generic positioned-box dispatcher. An ordinary
+        // block-flow rectangle is a different static-position source: replacing
+        // the formatting-context source would discard its alignment defaults
+        // and axes, including Grid's RTL and orthogonal-flow semantics.
+        // <https://drafts.csswg.org/css-position-3/#staticpos-rect>
+        // <https://drafts.csswg.org/css-align-3/#align-abspos>
+        let has_formatting_context_static_alignment = self
+            .absolute_static_position
+            .is_some_and(AbsoluteStaticPosition::has_formatting_context_static_alignment);
         if !style.abspos_static_source.is_inline_level()
+            && !has_formatting_context_static_alignment
             && (self
                 .absolute_static_position
-                .and_then(AbsoluteStaticPosition::static_alignment)
+                .and_then(AbsoluteStaticPosition::static_position_rectangle)
                 .is_none()
                 || self.escaped_atom_positioning_depth > 0)
         {
-            let context = self.block_static_position_contexts.last().copied();
+            let context = self.static_position_containing_blocks.last().copied();
             let writing_mode = context.map_or(self.containing_block_writing_mode, |context| {
                 context.axes.writing_mode()
             });
@@ -856,8 +987,20 @@ impl<'a> LayoutBuilder<'a> {
             };
             let area = if writing_mode.has_vertical_lines() {
                 let x = match block_start_side(writing_mode) {
-                    PhysicalSide::Left => self.content_left,
-                    PhysicalSide::Right => self.content_right,
+                    // The hypothetical block-level static rectangle is
+                    // anchored to the source formatting context's used
+                    // content box. `self.content_left/right` can already
+                    // describe the orthogonal child being dispatched, which
+                    // would select the subject's own block edge instead of
+                    // the parent source edge.
+                    // <https://drafts.csswg.org/css-position-3/#staticpos-rect>
+                    // <https://drafts.csswg.org/css-writing-modes-4/#orthogonal-flows>
+                    PhysicalSide::Left => context.map_or(self.content_left, |context| {
+                        context.content_rect.x() + context.content_rect.width()
+                    }),
+                    PhysicalSide::Right => {
+                        context.map_or(self.content_right, |context| context.content_rect.x())
+                    }
                     PhysicalSide::Top | PhysicalSide::Bottom => {
                         unreachable!("a vertical writing mode has a horizontal block axis")
                     }
@@ -882,8 +1025,7 @@ impl<'a> LayoutBuilder<'a> {
                 direction,
                 justify_items: context
                     .map_or(css::SelfAlignment::NORMAL, |context| context.justify_items),
-                align_items: context
-                    .map_or(css::SelfAlignment::NORMAL, |context| context.align_items),
+                align_items: css::SelfAlignment::NORMAL,
             };
             self.absolute_static_position = Some(
                 self.absolute_static_position
@@ -1341,6 +1483,7 @@ impl<'a> LayoutBuilder<'a> {
     #[track_caller]
     pub(in crate::layout) fn push_page(&mut self) {
         self.push_page_for_page_name(self.current_page_name.clone().as_deref());
+        self.record_current_fragmentainer_destination();
     }
 
     /// Materializes a page transition while retaining the source page type for
@@ -1359,9 +1502,6 @@ impl<'a> LayoutBuilder<'a> {
     ) {
         if self.footnote_measurement_depth == 0 {
             self.flush_current_page_footnotes();
-        }
-        if std::env::var_os("QUIRE_TRACE_FLOATS").is_some() {
-            eprintln!("push_page from {}", std::panic::Location::caller());
         }
         let next_fragmentainer_index = self.pages.len() + 1;
         let next_override_context = self
@@ -1396,7 +1536,7 @@ impl<'a> LayoutBuilder<'a> {
             });
             let context = next_override_context.unwrap_or_else(|| {
                 self.resolved_page_context_for_name(
-                    self.pages.len() + 1,
+                    self.destination_document_page_number(self.pages.len() + 1),
                     false,
                     destination_page_name,
                 )
@@ -1455,7 +1595,11 @@ impl<'a> LayoutBuilder<'a> {
                 .unwrap_or_else(|| self.current_fragment_offsets_for_page_break())
         };
         let next_context = next_override_context.unwrap_or_else(|| {
-            self.resolved_page_context_for_name(self.pages.len() + 2, false, destination_page_name)
+            self.resolved_page_context_for_name(
+                self.destination_document_page_number(self.pages.len() + 2),
+                false,
+                destination_page_name,
+            )
         });
         let next_page = page_for_context(next_context);
         let page = std::mem::replace(&mut self.current_page, next_page);
@@ -1478,7 +1622,7 @@ impl<'a> LayoutBuilder<'a> {
         // CSS Fragmentation forced left/right/recto/verso breaks can generate
         // blank pages. Those pages are real page boxes and match `@page :blank`.
         // https://www.w3.org/TR/css-break-3/#break-between
-        let page_number = self.pages.len() + 1;
+        let page_number = self.destination_document_page_number(self.pages.len() + 1);
         let context = self.resolved_page_context(page_number, true);
         self.pages.push(page_for_context(context));
         self.page_names.push(self.current_page_name.clone());
@@ -1489,15 +1633,6 @@ impl<'a> LayoutBuilder<'a> {
 
     #[track_caller]
     pub(in crate::layout) fn push_page_if_nonempty(&mut self) {
-        if std::env::var_os("QUIRE_TRACE_FLOATS").is_some() {
-            eprintln!(
-                "push_page_if_nonempty from {} left={} right={} offsets={:?}",
-                std::panic::Location::caller(),
-                self.content_left,
-                self.content_right,
-                self.current_fragment_offsets(),
-            );
-        }
         if self.current_page_has_content() {
             self.push_page();
         }
@@ -1596,12 +1731,12 @@ impl<'a> LayoutBuilder<'a> {
 
     /// Apply a captured continuation to an already-selected destination page.
     ///
-    /// The live stacks remain in place except for float exclusions, which are
-    /// page-local state. `push_page` carries the old exclusions until replay;
-    /// restore the captured contexts here so a continuation can intentionally
-    /// clear root-flow floats that belonged to the preceding page. The record
-    /// also supplies the local insets used to recreate the empty destination
-    /// page.
+    /// `push_page` carries mutable layout stacks until replay. Reinstall the
+    /// captured continuation state before applying the destination page so
+    /// page-area rebasing starts from the source formatting context rather
+    /// than from a partially advanced sibling or scratch fragment. The page
+    /// context then recalculates only entries that genuinely represent the
+    /// destination page area.
     pub(in crate::layout) fn replay_fragment_continuation_on_page(
         &mut self,
         continuation: &FragmentContinuationContext,
@@ -1609,30 +1744,12 @@ impl<'a> LayoutBuilder<'a> {
     ) {
         debug_assert_eq!(continuation.fragmentainer_kind, FragmentainerKind::Page);
         debug_assert_eq!(self.active_fragmentainer_kind(), FragmentainerKind::Page);
-        debug_assert_eq!(
-            self.document_canvas_fragment_insets, continuation.canvas_insets,
-            "page transition must retain active root/body canvas insets"
-        );
-        debug_assert_eq!(
-            self.content_logical_inline_size_stack.len(),
-            continuation.logical_inline_sizes.len(),
-            "page transition must retain logical inline percentage bases"
-        );
-        debug_assert_eq!(
-            self.child_available_space_stack.len(),
-            continuation.child_available_space.len(),
-            "page transition must retain child available-space scopes"
-        );
-        debug_assert_eq!(
-            self.definite_block_size_stack.len(),
-            continuation.definite_block_sizes.len(),
-            "page transition must retain block percentage bases"
-        );
-        debug_assert_eq!(self.containing_block_direction, continuation.direction);
-        debug_assert_eq!(
-            self.containing_block_writing_mode,
-            continuation.writing_mode
-        );
+        self.document_canvas_fragment_insets = continuation.canvas_insets.clone();
+        self.content_logical_inline_size_stack = continuation.logical_inline_sizes.clone();
+        self.child_available_space_stack = continuation.child_available_space.clone();
+        self.definite_block_size_stack = continuation.definite_block_sizes.clone();
+        self.containing_block_direction = continuation.direction;
+        self.containing_block_writing_mode = continuation.writing_mode;
         self.float_contexts = continuation.float_contexts.clone();
 
         self.current_page = page_for_context(destination);
@@ -1654,7 +1771,7 @@ impl<'a> LayoutBuilder<'a> {
             top: self
                 .fragment_top_offsets
                 .last()
-                .cloned()
+                .map(|offset| offset.first_fragment_start())
                 .unwrap_or_else(|| self.current_page_context.top() - self.cursor_y),
         };
         let canvas = self.document_canvas_fragment_insets.iter().fold(
@@ -1696,7 +1813,17 @@ impl<'a> LayoutBuilder<'a> {
             return FragmentOffsets {
                 left: self.content_left - self.current_page_context.left(),
                 right: self.current_page_context.right() - self.content_right,
-                top: 0.0,
+                // Synthetic column fragmentainers retain their local inline
+                // containing block, but `clone` still restarts every active
+                // block below its cloned block-start border and padding.
+                // Returning a raw zero here made definite blocks consume
+                // that start edge as source content, leaving the following
+                // sibling fifteen CSS pixels too high in clone-004.
+                top: self
+                    .fragment_top_offsets
+                    .iter()
+                    .map(|offset| offset.continuation_start())
+                    .sum(),
             };
         }
         let mut offsets = self.current_fragment_offsets();
@@ -1718,20 +1845,29 @@ impl<'a> LayoutBuilder<'a> {
         );
         offsets.left += canvas.left;
         offsets.right += canvas.right;
-        if self.principal_flow.writing_mode.has_vertical_lines() {
-            // In a vertical principal flow the physical horizontal axis is
-            // logical block progression. A page continuation restarts that
-            // axis at the destination page's block-start edge, while the
-            // vertical physical axis remains the logical inline coordinate.
-            // Treating `top` as the universal continuation axis retained an
-            // exhausted horizontal root cursor and overlaid every following
-            // block on the first sheet.
-            // <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
-            // <https://www.w3.org/TR/css-break-3/#fragmentation-model>
-            offsets.left = 0.0;
-            offsets.right = 0.0;
-        } else {
-            offsets.top = 0.0;
+        // Reset the exhausted source *block-start* coordinate only. In a
+        // vertical principal flow, clearing both physical horizontal insets
+        // incorrectly widens the continuation and loses the root/body
+        // block-end inset; `vertical-rl` restarts from the right and
+        // `vertical-lr` from the left.
+        // <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+        // <https://www.w3.org/TR/css-break-4/#box-splitting>
+        offsets.clear_fragmentainer_block_start(FlowAxes::new(
+            self.principal_flow.writing_mode,
+            self.principal_flow.used_direction(),
+        ));
+        // A cloned ancestor creates a fresh border/padding inset in every
+        // continuation.  The regular fragment-offset reset above implements
+        // `slice`; reapply only the explicitly recorded clone start edges.
+        // These are physical top insets because this page-flow path is the
+        // horizontal principal-flow continuation boundary. Vertical roots
+        // use their dedicated logical page-fragmentation projection instead.
+        if self.principal_flow.writing_mode == WritingMode::HorizontalTb {
+            offsets.top += self
+                .fragment_top_offsets
+                .iter()
+                .map(|offset| offset.continuation_start())
+                .sum::<f32>();
         }
         offsets
     }
@@ -1754,6 +1890,28 @@ impl<'a> LayoutBuilder<'a> {
         self.cursor_y = context.top() - offsets.top;
         self.content_left = context.left() + offsets.left;
         self.content_right = (context.right() - offsets.right).max(self.content_left);
+        self.rebase_page_area_context_caches(previous_context, context);
+    }
+
+    /// Selects the first destination fragmentainer for an out-of-flow scratch
+    /// layout without changing the already-resolved physical box geometry.
+    ///
+    /// Absolutely positioned boxes resolve their insets in their continuous
+    /// containing block, then fragment their contents through destination
+    /// page areas.  When the static-position rectangle begins on a later
+    /// page, the scratch layout must use that page's percentage bases and
+    /// continuation dimensions from its first fragment.  Its physical cursor
+    /// and containing-block coordinates have already been resolved, however,
+    /// and must not be reset to the page-area origin.
+    /// <https://drafts.csswg.org/css-position-3/#fragmenting-absolutely-positioned-elements>
+    /// <https://www.w3.org/TR/css-page-3/#page-model>
+    pub(in crate::layout) fn rebase_positioned_scratch_page_context(
+        &mut self,
+        context: PageContext,
+    ) {
+        let previous_context = self.current_page_context;
+        self.current_page_context = context;
+        self.current_page = page_for_context(context);
         self.rebase_page_area_context_caches(previous_context, context);
     }
 
@@ -1797,7 +1955,7 @@ impl<'a> LayoutBuilder<'a> {
             Some(PhysicalContentHeight::new(content_box_pt(
                 next_context.area_height(),
             ))),
-            PhysicalContentHeight::new(content_box_pt(next_context.area_height())),
+            self.initial_containing_block_physical_height(),
         );
         if self
             .child_available_space_stack
@@ -1881,14 +2039,14 @@ impl<'a> LayoutBuilder<'a> {
         }
         while !forced_break_satisfied(
             forced_break,
-            self.pages.len() + 1,
+            self.destination_document_page_number(self.pages.len() + 1),
             self.page_progression_direction,
         ) {
             self.push_blank_page();
         }
         if !self.current_page_has_content() && !current_empty_named_destination {
             let offsets = self.current_fragment_offsets_for_page_break();
-            let page_number = self.pages.len() + 1;
+            let page_number = self.destination_document_page_number(self.pages.len() + 1);
             let context = self.resolved_page_context(page_number, false);
             self.current_page = page_for_context(context);
             self.apply_page_context(context, offsets);
@@ -1920,11 +2078,12 @@ impl<'a> LayoutBuilder<'a> {
         if self.fragmentation_suppression_depth > 0 {
             return;
         }
-        if self
-            .fragmentainer_override
-            .is_some_and(|override_| override_.kind == fragmentainer_kind)
+        if fragmentainer_kind == FragmentainerKind::Column
+            && self
+                .fragmentainer_override
+                .is_some_and(|override_| override_.kind == FragmentainerKind::Column)
         {
-            self.push_page();
+            self.materialize_column_continuation();
             return;
         }
         if !fragmentainer_kind.materializes_page_cursor() {
@@ -2019,12 +2178,13 @@ impl<'a> LayoutBuilder<'a> {
                 .is_some_and(|override_| override_.kind == kind)
     }
 
-    /// Marks the current page as carrying non-empty normal-flow geometry.
+    /// Marks the current page as carrying source-owned normal-flow content.
     ///
     /// CSS Fragmentation fragments boxes into page fragmentainers even when a
     /// particular fragment has no visible paint. A used border box with
-    /// positive area therefore advances the layout cursor and participates in
-    /// forced breaks independently from PDF paint primitives. At document
+    /// positive area, or a zero-size box placed after clearance in a new
+    /// fragmentainer, therefore participates in forced breaks independently
+    /// from PDF paint primitives. At document
     /// finalization, a trailing run with no paint or page-owning side effect
     /// can be omitted from static PDF output:
     /// <https://www.w3.org/TR/css-break-3/#fragmentation-model> and
@@ -2051,6 +2211,12 @@ impl<'a> LayoutBuilder<'a> {
         self.current_page_context.top()
     }
 
+    /// Whether the active traversal resolves an automatic positioned block
+    /// size before the positioned box has been fragmented.
+    pub(in crate::layout) fn is_positioned_auto_size_measurement(&self) -> bool {
+        self.layout_pass_kind == LayoutPassKind::PositionedAutoSizeMeasurement
+    }
+
     pub(in crate::layout) fn page_bottom(&self) -> f32 {
         if self.fragmentation_suppression_depth > 0 || self.footnote_measurement_depth > 0 {
             self.current_page_context.bottom() - 1_000_000.0
@@ -2061,6 +2227,16 @@ impl<'a> LayoutBuilder<'a> {
                     .get(&self.pages.len())
                     .copied()
                     .unwrap_or(0.0)
+                // Every active cloned block owns its block-end padding and
+                // border in this fragmentainer. Keep that reservation in the
+                // layout capacity so descendants cannot consume the space
+                // that its principal-box decoration must occupy.
+                // <https://www.w3.org/TR/css-break-3/#box-model-for-breaking>
+                + self
+                    .fragment_top_offsets
+                    .iter()
+                    .map(|offset| offset.continuation_end())
+                    .sum::<f32>()
         }
     }
 
@@ -2070,6 +2246,19 @@ impl<'a> LayoutBuilder<'a> {
 
     pub(in crate::layout) fn page_area_height(&self) -> f32 {
         self.page_top() - self.page_bottom()
+    }
+
+    /// The physical block-axis size of the document initial containing block.
+    ///
+    /// This is the immutable initial printable page area, not the remaining
+    /// extent of the current fragmentainer. Orthogonal-flow line fitting falls
+    /// back to this size after direct and scroll-container candidates have
+    /// been exhausted.
+    /// <https://drafts.csswg.org/css-writing-modes-4/#orthogonal-flows>
+    pub(in crate::layout) fn initial_containing_block_physical_height(
+        &self,
+    ) -> PhysicalContentHeight {
+        PhysicalContentHeight::new(content_box_pt(self.initial_viewport_context.area_height()))
     }
 
     pub(in crate::layout) fn current_content_logical_inline_size(&self) -> f32 {
@@ -2111,7 +2300,7 @@ impl<'a> LayoutBuilder<'a> {
             Some(PhysicalContentHeight::new(content_box_pt(
                 self.page_area_height(),
             ))),
-            PhysicalContentHeight::new(content_box_pt(self.page_area_height())),
+            self.initial_containing_block_physical_height(),
         )
     }
 
@@ -2131,6 +2320,18 @@ impl<'a> LayoutBuilder<'a> {
         self.resolved_page_context_for_name(page_number, is_blank, page_name.as_deref())
     }
 
+    /// Convert a scratch-local 1-based page ordinal into the page number of
+    /// its eventual document destination. Normal flow has no scratch origin,
+    /// so its ordinal is already the document page number.
+    /// <https://drafts.csswg.org/css-position-3/#fragmenting-abspos>
+    pub(in crate::layout) fn destination_document_page_number(
+        &self,
+        local_page_number: usize,
+    ) -> usize {
+        self.positioned_scratch_page_origin
+            .map_or(local_page_number, |origin| origin.get() + local_page_number)
+    }
+
     /// Resolves a concrete destination page context without changing the page
     /// type of the source page currently being committed.
     ///
@@ -2148,24 +2349,53 @@ impl<'a> LayoutBuilder<'a> {
         let base = PageContext::from_options(self.options);
         let page_style = self.page_context_style_for_declarations(&declarations);
         let ch_advance = self.ch_advance_for_style(&page_style, page_style.requires_ch_advance());
+        // The first empty page context is needed before the document root is
+        // traversed, so root-relative page lengths cannot yet use the selected
+        // root font. Bootstrap with the page style's initial metric estimates;
+        // `layout_dom_with_font_system` rebuilds this still-empty context as
+        // soon as document-root metrics have been established.
+        // <https://www.w3.org/TR/css-values-4/#root-relative-fonts>
+        let root_metrics =
+            self.root_metric_state
+                .font_size_basis()
+                .unwrap_or(css::RootFontMetricLengthBasis {
+                    font_size: layout_pt(page_style.font_size),
+                    ch_advance,
+                    x_height: layout_pt(page_style.font_size * 0.5),
+                    cap_height: layout_pt(page_style.font_size * 0.7),
+                    ic_advance: ch_advance,
+                    line_height: layout_pt(page_style.line_height),
+                });
         // CSS Paged Media defines page size and page margins in the page
         // context; these declarations select the page box before its content
         // area is used for layout.
         // https://www.w3.org/TR/css-page-3/#page-model
-        let size = css::page_size_from_with_ch_advance(&declarations, base.size, ch_advance);
-        let page_edges =
-            page_box_edges_from_declarations_with_ch_advance(&declarations, size, ch_advance);
+        let size = css::page_size_from_with_ch_advance_and_root_metrics(
+            &declarations,
+            base.size,
+            ch_advance,
+            root_metrics,
+        );
+        let page_edges = page_box_edges_from_declarations_with_ch_advance_and_root_metrics(
+            &declarations,
+            size,
+            ch_advance,
+            root_metrics,
+        );
         PageContext {
             size,
             margins:
-                css::page_margins_from_for_size_and_edges_with_ch_advance_and_page_context_style(
+                css::page_margins_from_for_size_and_edges_with_ch_advance_and_page_context_style_and_root_metrics(
                     &declarations,
                     base.margins,
                     size,
-                    self.page_descriptor_viewport_size,
-                    page_edges.total(),
-                    ch_advance,
-                    &page_style,
+                    css::PageMarginResolutionContext {
+                        viewport_size: self.page_descriptor_viewport_size,
+                        non_margin_edges: page_edges.total(),
+                        ch_advance,
+                        style: &page_style,
+                        root_metrics,
+                    },
                 ),
             edges: page_edges,
             rotation: css::page_rotation_from(&declarations, base.rotation),
@@ -2183,19 +2413,27 @@ impl<'a> LayoutBuilder<'a> {
         let base = PageContext::from_options(self.options);
         let page_style = self.page_context_style_for_declarations(&declarations);
         let ch_advance = self.ch_advance_for_style(&page_style, page_style.requires_ch_advance());
-        let page_edges =
-            page_box_edges_from_declarations_with_ch_advance(&declarations, page_size, ch_advance);
+        let root_metrics = self.root_metric_state.resolved().basis();
+        let page_edges = page_box_edges_from_declarations_with_ch_advance_and_root_metrics(
+            &declarations,
+            page_size,
+            ch_advance,
+            root_metrics,
+        );
         PageContext {
             size: page_size,
             margins:
-                css::page_margins_from_for_size_and_edges_with_ch_advance_and_page_context_style(
+                css::page_margins_from_for_size_and_edges_with_ch_advance_and_page_context_style_and_root_metrics(
                     &declarations,
                     base.margins,
                     page_size,
-                    self.page_descriptor_viewport_size,
-                    page_edges.total(),
-                    ch_advance,
-                    &page_style,
+                    css::PageMarginResolutionContext {
+                        viewport_size: self.page_descriptor_viewport_size,
+                        non_margin_edges: page_edges.total(),
+                        ch_advance,
+                        style: &page_style,
+                        root_metrics,
+                    },
                 ),
             edges: page_edges,
             rotation: css::page_rotation_from(&declarations, base.rotation),
@@ -2208,7 +2446,11 @@ impl<'a> LayoutBuilder<'a> {
         declarations: &Declarations,
     ) -> ComputedStyle {
         let mut style = self.page_margin_inherited_style.clone();
-        css::apply_declarations(&mut style, declarations);
+        css::apply_declarations_with_inheritance_source(
+            &mut style,
+            declarations,
+            &self.page_margin_inherited_style,
+        );
         style
     }
 
@@ -2248,7 +2490,7 @@ impl<'a> LayoutBuilder<'a> {
             .iter()
             .map(|inset| inset.top)
             .sum::<f32>();
-        let page_number = self.pages.len() + 1;
+        let page_number = self.destination_document_page_number(self.pages.len() + 1);
         let context = self.resolved_page_context(page_number, false);
         self.current_page = page_for_context(context);
         self.apply_page_context(context, offsets);
@@ -2283,8 +2525,11 @@ impl<'a> LayoutBuilder<'a> {
             top: previous_context.top() - self.cursor_y,
         };
         let page_name = self.current_page_name.clone();
-        let context =
-            self.resolved_page_context_for_name(self.pages.len() + 1, false, page_name.as_deref());
+        let context = self.resolved_page_context_for_name(
+            self.destination_document_page_number(self.pages.len() + 1),
+            false,
+            page_name.as_deref(),
+        );
         self.current_page = page_for_context(context);
         self.apply_page_context(context, offsets);
         self.current_page_selected_name = self.current_page_name.clone();

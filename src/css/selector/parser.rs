@@ -72,9 +72,8 @@ impl<'i> SelectorParser<'i> for QuireSelectorParser {
         match name.as_ref().to_ascii_lowercase().as_str() {
             "link" => Ok(QuirePseudoClass::Link),
             "any-link" => Ok(QuirePseudoClass::AnyLink),
-            // A static document renderer has no browser history. Treat links
-            // as visited so the print rendering environment has a stable
-            // visited-link used style rather than depending on host history.
+            // Static documents derive their private visited state from a
+            // deterministic self-link check during DOM preparation.
             "visited" => Ok(QuirePseudoClass::Visited),
             "target" => Ok(QuirePseudoClass::Target),
             "target-within" => Ok(QuirePseudoClass::TargetWithin),

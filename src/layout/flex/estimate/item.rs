@@ -1,6 +1,61 @@
 use super::*;
 
 impl<'a> LayoutBuilder<'a> {
+    /// Measures the content-size suggestion used by a flex item's automatic
+    /// main-axis minimum.
+    ///
+    /// A definite preferred main size supplies the flex base, but Flexbox
+    /// measures the content-size suggestion with that preferred size
+    /// suppressed. This keeps the automatic-minimum input distinct from a
+    /// definite flex basis in both intrinsic contribution sizing and final
+    /// flexible-length resolution:
+    /// <https://www.w3.org/TR/css-flexbox-1/#min-size-auto>.
+    pub(in crate::layout::flex) fn estimate_flex_item_automatic_main_min_content(
+        &mut self,
+        child: &StyledChild<'_>,
+        stylesheets: &Stylesheets<'_>,
+        item_available: FlexItemAvailableSpace,
+        physical_direction: FlexDirection,
+    ) -> Option<ContentBoxLength> {
+        let specified_min = if physical_direction.is_row_axis() {
+            child.style.box_values.min_width.clone()
+        } else {
+            child.style.box_values.min_height.clone()
+        };
+        flex_main_axis_content_based_minimum_kind(&specified_min, &child.style, physical_direction)
+            .is_some()
+            .then(|| {
+                let mut content_child = child.clone();
+                let mut content_item_available = item_available;
+                if physical_direction.is_row_axis() {
+                    content_child.style.box_values.width =
+                        css::ComputedLengthPercentageOrAuto::Auto;
+                } else {
+                    content_child
+                        .style
+                        .box_values
+                        .height
+                        .replace_with_used(css::ComputedLengthPercentageOrAuto::Auto);
+                    // The probe has removed the item's preferred physical main
+                    // height. Its retained numeric constraint is still useful to
+                    // the flex estimator, but it must no longer make descendant
+                    // percentage heights definite.
+                    content_item_available.make_height_percentage_basis_indefinite();
+                }
+                let content_estimate = self.estimate_flex_item_size(
+                    &content_child,
+                    stylesheets,
+                    content_item_available,
+                    physical_direction,
+                );
+                if physical_direction.is_row_axis() {
+                    content_estimate.min_width
+                } else {
+                    content_estimate.min_height
+                }
+            })
+    }
+
     /// Estimates the hypothetical content size of a flex item.
     ///
     /// CSS Flexbox defines flex base sizes and intrinsic contributions before
@@ -17,7 +72,16 @@ impl<'a> LayoutBuilder<'a> {
         available: FlexItemAvailableSpace,
         physical_direction: FlexDirection,
     ) -> FlexItemEstimate {
-        let percentage_height_basis = flex_item_estimate_percentage_height_basis(available);
+        let vertical_non_content = non_content_pt(
+            child.style.padding.top
+                + child.style.padding.bottom
+                + vertical_border_width(&child.style),
+        );
+        let percentage_height_basis = flex_item_estimate_percentage_height_basis(
+            &child.style,
+            available,
+            vertical_non_content,
+        );
         let mut estimate =
             self.with_flex_item_percentage_height_basis(percentage_height_basis, |layout| {
                 layout.estimate_flex_item_size_with_percentage_basis(

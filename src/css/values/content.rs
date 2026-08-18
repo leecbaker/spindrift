@@ -435,12 +435,12 @@ fn parse_generated_image_token<'a>(
     if let Some((url, tail)) = parse_css_url_token(value) {
         return Some((
             GeneratedContentPart::Image {
-                image: ComputedImage::image(BackgroundImage::Url {
-                    src: url,
+                image: ComputedImage::image(BackgroundImage::Url(ImageUrl {
+                    href: url,
                     base_url: base_url.cloned(),
                     root_url: root_url.cloned(),
                     request_modifiers: RequestUrlModifiers::default(),
-                }),
+                })),
             },
             tail,
         ));
@@ -459,6 +459,7 @@ fn parse_generated_image_token<'a>(
         return Some((GeneratedContentPart::Image { image }, tail));
     }
     for name in [
+        "light-dark",
         "linear-gradient",
         "repeating-linear-gradient",
         "radial-gradient",

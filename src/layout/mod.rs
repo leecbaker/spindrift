@@ -36,8 +36,10 @@ use crate::document::paint::paths::{
     RenderedPathClipPath, RenderedPathCommand, RenderedPathFillRule, RenderedPathLineCap,
     RenderedPathStrokeStyle, paint_rect_path_commands,
 };
+#[cfg(test)]
+use crate::document::paint::patterns::RenderedImageSourceRect;
 use crate::document::paint::patterns::{
-    RenderedGradientPattern, RenderedImagePattern, RenderedImageSourceRect, RenderedSvgPattern,
+    RenderedGradientPattern, RenderedImagePattern, RenderedSvgPattern,
 };
 use crate::document::paint::shapes::{
     RenderedCornerRadius, RenderedRect, RenderedRoundedRect, RenderedRoundedRectRadii,
@@ -55,15 +57,16 @@ use crate::dom::{self, Element, ElementId, Node, NodeKind};
 use crate::resource::ResourceCache;
 use crate::svg::SharedSvgAsset;
 use crate::text::{
-    BidiVisualRange, FontSystem, FontSystemLoad, GlyphInkBox, OBJECT_REPLACEMENT_CHARACTER,
-    ResolvedBidiDirection, ShapedInlineLine, StyledTextSpan, TextDecorationFontMetrics,
-    bidi_control_scope_for_style, character_has_joining_behavior, character_is_arabic_tatweel,
-    character_is_bidi_format_control, character_is_default_ignorable_code_point,
-    character_is_first_hangable_punctuation, character_is_first_letter_associated_space,
-    character_is_first_letter_suffix_punctuation, character_is_hangable_stop_or_comma,
-    character_is_join_control, character_is_last_hangable_punctuation,
-    character_is_unicode_alphanumeric, character_is_unicode_first_letter_base,
-    character_is_unicode_mark, character_is_unicode_punctuation, character_is_unicode_symbol,
+    BidiVisualRange, FontSystem, FontSystemLoad, GlyphInkBox, InlineBoundaryEffect,
+    OBJECT_REPLACEMENT_CHARACTER, ResolvedBidiDirection, ShapedInlineLine, StyledTextSpan,
+    TextDecorationFontMetrics, bidi_control_scope_for_style, character_has_joining_behavior,
+    character_is_arabic_tatweel, character_is_bidi_format_control,
+    character_is_default_ignorable_code_point, character_is_first_hangable_punctuation,
+    character_is_first_letter_associated_space, character_is_first_letter_suffix_punctuation,
+    character_is_hangable_stop_or_comma, character_is_join_control,
+    character_is_last_hangable_punctuation, character_is_unicode_alphanumeric,
+    character_is_unicode_first_letter_base, character_is_unicode_mark,
+    character_is_unicode_punctuation, character_is_unicode_symbol,
     character_preserves_word_boundary_context, character_receives_text_emphasis_mark,
     contains_bidi_text, css_text_rendering_text, is_css_collapsible_whitespace,
     plaintext_direction_for_text, text_with_hyphenation_controls,
@@ -71,12 +74,14 @@ use crate::text::{
 };
 use crate::timing::DebugTimer;
 use crate::units::{
-    BorderBoxLength, BorderBoxSize, ContentBoxLength, ContentBoxSize, LayoutLength,
-    MarginBoxLength, MarginBoxSize, NonContentLength, PercentageBasis, RasterPixelSize,
-    SemanticLengthExt, border_box_pt, border_box_to_content_box_length, content_box_pt,
-    content_box_size_pt, content_box_to_border_box_length, content_box_to_border_box_size,
-    layout_points, layout_pt, margin_box_pt, margin_box_size_pt, non_content_pt,
-    raster_natural_layout_size,
+    AtomicInlineBaselineSourceOffset, AtomicInlineMarginBoxBaselineOffset,
+    AtomicInlinePaintPlacementBaselineOffset, BorderBoxLength, BorderBoxSize, ContentBoxLength,
+    ContentBoxSize, Definite, LayoutLength, MarginBoxLength, MarginBoxSize, NonContentLength,
+    PercentageBasis, RasterPixelSize, SemanticLengthExt, atomic_inline_baseline_source_pt,
+    atomic_inline_margin_box_baseline_pt, atomic_inline_paint_placement_baseline_pt, border_box_pt,
+    border_box_to_content_box_length, content_box_pt, content_box_size_pt,
+    content_box_to_border_box_length, content_box_to_border_box_size, layout_points, layout_pt,
+    margin_box_pt, margin_box_size_pt, non_content_pt,
 };
 use std::collections::HashMap;
 use taffy::prelude as taffy_layout;
@@ -116,13 +121,16 @@ pub(crate) fn generated_radial_gradient_raster_color_space(
     )
 }
 mod block;
-#[allow(unused_imports)]
 pub(in crate::layout) use self::block::{
-    AutoFloatMeasurementKey, FloatAvoidanceCandidate, FloatAvoidanceInlineContainment,
-    FloatAvoidingBfcPlacement, FloatBand, FloatBandPlacement, FloatBandQuery,
-    FloatClearanceResolution, FloatContext, FloatId, FloatPaintFragment, FloatPlacement,
-    FloatRunState, FloatShape, LogicalFloatBand, UsedFloatSide,
+    AutoFloatMeasurementKey, BlockClearance, BlockClearanceRequest, BlockMarginCollapseBoundary,
+    BlockStartMarginArrangement, FloatAvoidanceCandidate, FloatAvoidanceInlineContainment,
+    FloatBand, FloatBandQuery, FloatContext, FloatId, FloatRunState, FloatShape, UsedFloatSide,
     float_avoiding_auto_border_box_width, vertical_physical_inline_span,
+};
+#[cfg(test)]
+pub(in crate::layout) use self::block::{
+    ClearedFloatOuterBlockEnd, FloatBandPlacement, FloatClearanceTarget, FloatPlacement,
+    HypotheticalClearBorderEdge, LogicalFloatBand,
 };
 mod box_tree;
 mod builder;
@@ -175,11 +183,9 @@ pub(crate) fn rasterize_generated_image(
         }
     }?;
     Some(crate::image_store::RasterImage {
-        metadata: crate::image_store::ImageMetadata {
-            pixel_width: decoded.pixel_width,
-            pixel_height: decoded.pixel_height,
-        },
+        metadata: crate::image_store::ImageMetadata::from_pixel_size(decoded.pixel_size),
         color_space: decoded.color_space,
+        sample_depth: crate::image_store::RasterSampleDepth::Eight,
         rgb: decoded.rgb.to_vec(),
         alpha: decoded.alpha.as_deref().map(ToOwned::to_owned),
     })
@@ -208,7 +214,7 @@ use used_values::*;
 mod split_1;
 pub use self::split_1::RenderOptions;
 pub(in crate::layout) use self::split_1::*;
-pub(crate) use self::split_1::{PageMargins, PageSize};
+pub(crate) use self::split_1::{IframeEmbeddingContext, PageMargins, PageSize};
 pub(crate) use self::split_1::{PreparedDomLayout, layout_prepared_dom, start_font_system_load};
 mod split_2;
 pub(in crate::layout) use self::split_2::*;

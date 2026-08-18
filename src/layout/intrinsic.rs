@@ -90,6 +90,48 @@ pub(super) fn intrinsic_content_box_width_keyword(
     }
 }
 
+/// Resolve an intrinsic block-size keyword into a content-box length.
+///
+/// `min-content` and `max-content` block contributions are supplied by the
+/// formatting context after it has measured its contents. `fit-content` uses
+/// the same CSS Sizing clamp as the inline-axis form, but with the available
+/// block extent and vertical non-content edges:
+/// <https://www.w3.org/TR/css-sizing-3/#sizing-values> and
+/// <https://www.w3.org/TR/css-sizing-3/#fit-content-size>.
+pub(super) fn intrinsic_content_box_height_keyword(
+    value: css::ComputedLengthPercentageOrAuto,
+    min_content: ContentBoxLength,
+    max_content: ContentBoxLength,
+    available_outer_height: LayoutLength,
+    vertical_non_content: NonContentLength,
+) -> Option<ContentBoxLength> {
+    let min_content = min_content.points().max(0.0);
+    let max_content = max_content.points().max(0.0);
+    match value {
+        css::ComputedLengthPercentageOrAuto::MinContent => Some(content_box_pt(min_content)),
+        css::ComputedLengthPercentageOrAuto::MaxContent => Some(content_box_pt(max_content)),
+        css::ComputedLengthPercentageOrAuto::FitContent(limit) => {
+            let stretch =
+                (available_outer_height.points() - vertical_non_content.points()).max(0.0);
+            let limit = limit
+                .map(|limit| {
+                    used_length_percentage(limit, PercentageBasis::definite(available_outer_height))
+                        .points()
+                })
+                .unwrap_or(stretch);
+            Some(content_box_pt(max_content.min(min_content.max(limit))))
+        }
+        css::ComputedLengthPercentageOrAuto::Auto
+        | css::ComputedLengthPercentageOrAuto::LengthPercentage(_)
+        | css::ComputedLengthPercentageOrAuto::CalcSize(_) => None,
+        css::ComputedLengthPercentageOrAuto::Stretch => Some(stretch_fit_content_box_size(
+            available_outer_height,
+            layout_pt(0.0),
+            vertical_non_content,
+        )),
+    }
+}
+
 /// Resolve an intrinsic content-box width from a margin-box availability.
 ///
 /// Margins and padding/border have distinct CSS box-model roles. The helper
@@ -223,6 +265,35 @@ pub(super) fn content_box_width_from_intrinsic(
 mod tests {
     use super::*;
     use crate::units::non_content_pt;
+
+    #[test]
+    fn intrinsic_block_keyword_uses_final_content_contributions() {
+        let min_content = content_box_pt(18.0);
+        let max_content = content_box_pt(42.0);
+        let available = layout_pt(30.0);
+        let non_content = non_content_pt(4.0);
+
+        assert_eq!(
+            intrinsic_content_box_height_keyword(
+                css::ComputedLengthPercentageOrAuto::MinContent,
+                min_content,
+                max_content,
+                available,
+                non_content,
+            ),
+            Some(min_content),
+        );
+        assert_eq!(
+            intrinsic_content_box_height_keyword(
+                css::ComputedLengthPercentageOrAuto::FitContent(None),
+                min_content,
+                max_content,
+                available,
+                non_content,
+            ),
+            Some(content_box_pt(26.0)),
+        );
+    }
 
     #[test]
     fn intrinsic_margin_box_width_keeps_margin_and_non_content_distinct() {

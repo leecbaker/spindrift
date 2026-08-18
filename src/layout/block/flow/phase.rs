@@ -8,10 +8,9 @@ pub(in crate::layout) struct BlockFlowChildrenPhaseInput<'a, 'boxes> {
     pub(in crate::layout) child_boxes: Option<&'a [box_tree::FormattingBox<'boxes>]>,
     pub(in crate::layout) can_collapse_start_margin: bool,
     pub(in crate::layout) can_collapse_end_margin: bool,
-    pub(in crate::layout) applied_start_margin: LayoutLength,
-    /// Whether a cleared parent's applied start margin already includes its
-    /// first adjoining in-flow descendant's start-margin contribution.
-    pub(in crate::layout) clearance_consumed_adjoining_start_margin: bool,
+    /// CSS2's used block-start margin arrangement for this block. Clearance
+    /// keeps the adjusted margin separate from adjoining parent/child sets.
+    pub(in crate::layout) start_margin_arrangement: BlockStartMarginArrangement,
     pub(in crate::layout) starts_at_page_top: bool,
     pub(in crate::layout) laid_out_column_children: bool,
     pub(in crate::layout) use_box_inline_items: bool,
@@ -26,6 +25,13 @@ pub(in crate::layout) struct BlockFlowChildrenPhaseInput<'a, 'boxes> {
     /// captured local discard break. Later in-flow block source is beyond the
     /// same cutoff and must not enter ordinary traversal.
     pub(in crate::layout) preceding_inline_local_cutoff: bool,
+    /// Used block-axis contribution of the direct inline source that precedes
+    /// this block-child traversal.  Automatic clamp selection is expressed in
+    /// the owning content-box coordinate system, so this must be debited
+    /// before the first block child establishes a possible clamp point.
+    ///
+    /// <https://drafts.csswg.org/css-overflow-4/#line-clamp-containers>
+    pub(in crate::layout) preceding_inline_clamp_block_advance: crate::units::ContentBoxLength,
     /// Maximum number of local multicol regions which this traversal may
     /// enter for `continue: discard`. This is not a page/column fragmentainer
     /// limit; it only decides when later source is omitted.
@@ -35,7 +41,7 @@ pub(in crate::layout) struct BlockFlowChildrenPhaseInput<'a, 'boxes> {
     /// as a layout-only controller; percentage constraints resolve later.
     pub(in crate::layout) direct_automatic_block_size_constraint:
         Option<crate::units::ContentBoxLength>,
-    pub(in crate::layout) definite_content_height: Option<f32>,
+    pub(in crate::layout) definite_content_height: Option<DefinitePhysicalContentHeight>,
     pub(in crate::layout) descendant_percentage_height_basis: Option<BlockSizePercentageBasis>,
 }
 
@@ -43,6 +49,9 @@ pub(in crate::layout) struct BlockFlowChildrenPhaseInput<'a, 'boxes> {
 pub(in crate::layout) struct BlockFlowChildrenPhaseOutcome {
     pub(in crate::layout) pending_end_margin_collapse: Option<BlockEndMarginCollapse>,
     pub(in crate::layout) collapsed_start_margin_offset: LayoutLength,
+    /// Dynamic separation of the traversed adjoining-margin set by actual
+    /// CSS2 clearance in a normal-flow descendant.
+    pub(in crate::layout) adjoining_margin_set_boundary: BlockMarginCollapseBoundary,
     /// Geometry of the rendered legend selected by an HTML fieldset child
     /// traversal. It crosses this phase boundary unchanged so only the
     /// fieldset's own decoration pass can consume it.

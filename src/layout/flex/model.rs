@@ -1,9 +1,11 @@
 use super::*;
 use crate::document::paint::geometry::AxisSelectivePaintClip;
+use crate::layout::assets::FragmentainerOrdinal;
 use crate::layout::baseline::{
     BaselinePair, PhysicalBaselineSets, PhysicalLeftBaselineAxis, PhysicalLeftBaselineOffset,
     PhysicalTopBaselineAxis, PhysicalTopBaselineOffset,
 };
+use crate::layout::block::DefinitePhysicalContentHeight;
 use std::num::NonZeroUsize;
 use std::ops::{Add, Deref, DerefMut, Sub};
 
@@ -24,8 +26,8 @@ impl FlexUsedStyle {
         Self(style)
     }
 
-    pub(super) fn as_computed(&self) -> &ComputedStyle {
-        &self.0
+    pub(super) fn clone_used_style(&self) -> css::ZoomedLayoutStyle {
+        self.0.clone()
     }
 }
 
@@ -283,6 +285,97 @@ pub(super) type FlexCrossLength = FlexAxisLength<FlexCrossAxis>;
 pub(super) type FlexMainSize = FlexAxisSize<FlexMainAxis>;
 pub(super) type FlexCrossSize = FlexAxisSize<FlexCrossAxis>;
 
+/// Whether the flex item's computed CSS size property on the physical cross
+/// axis is `auto`.
+///
+/// This is deliberately a CSS-property classification, rather than a used
+/// size. A replaced item's automatic preferred size and an item's intrinsic
+/// contribution are separate inputs: neither changes the computed-property
+/// predicate used by Flexbox's stretch step.
+/// <https://www.w3.org/TR/css-flexbox-1/#algo-cross-align>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FlexCrossSizeProperty {
+    Auto,
+    NonAuto,
+}
+
+impl FlexCrossSizeProperty {
+    pub(super) const fn is_auto(self) -> bool {
+        matches!(self, Self::Auto)
+    }
+}
+
+/// The Flexbox algorithm phase that owns an item's cross-size input.
+///
+/// Hypothetical sizing occurs before flex lines are sized. A line stretch is
+/// a later used-size operation, and must not be substituted into the
+/// hypothetical measurement merely because the container cross size is
+/// definite.
+/// <https://www.w3.org/TR/css-flexbox-1/#algo-cross-item>
+/// <https://www.w3.org/TR/css-flexbox-1/#algo-cross-align>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum FlexCrossSizingPhase {
+    Hypothetical,
+    StretchToLine {
+        line_outer_cross_size: FlexCrossSize,
+    },
+}
+
+/// The automatic cross-size behavior used only while deriving a hypothetical
+/// cross size. This cannot describe a final stretched used size.
+/// <https://www.w3.org/TR/css-flexbox-1/#algo-cross-item>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum FlexHypotheticalAutomaticCrossSize {
+    Intrinsic,
+    FitContent { used_content_size: ContentBoxLength },
+}
+
+/// A flex item's border-box cross-axis origin in container coordinates.
+///
+/// Flex lines expose margin-edge coordinates, while item placement stores a
+/// border-box coordinate. Keeping this conversion explicit prevents a line
+/// edge from being used as an item origin without accounting for its signed
+/// cross-start margin:
+/// <https://www.w3.org/TR/css-flexbox-1/#valdef-align-items-baseline>.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub(super) struct FlexItemBorderBoxCrossStart(FlexCrossOffset);
+
+impl FlexItemBorderBoxCrossStart {
+    /// Record a cross-axis coordinate already known to address the item's
+    /// border-box start edge.
+    pub(super) const fn from_border_box_offset(offset: FlexCrossOffset) -> Self {
+        Self(offset)
+    }
+
+    /// Convert a flex-line cross-start margin edge and a signed item margin
+    /// into the item's border-box start coordinate.
+    pub(super) fn from_line_cross_start_margin(
+        line_cross_start: FlexCrossOffset,
+        margin_cross_start: FlexCrossLength,
+    ) -> Self {
+        Self(line_cross_start + margin_cross_start)
+    }
+
+    /// Convert a flex-line cross-end margin edge and a signed item margin
+    /// into the item's border-box start coordinate.
+    pub(super) fn from_line_cross_end_margin(
+        line_cross_end: FlexCrossOffset,
+        margin_cross_end: FlexCrossLength,
+        border_box_cross_size: FlexCrossSize,
+    ) -> Self {
+        Self(line_cross_end - margin_cross_end - border_box_cross_size)
+    }
+
+    /// Translate an existing item border-box coordinate along the cross axis.
+    pub(super) fn translated(self, delta: FlexCrossLength) -> Self {
+        Self(self.0 + delta)
+    }
+
+    pub(super) const fn offset(self) -> FlexCrossOffset {
+        self.0
+    }
+}
+
 /// Marker for a physical horizontal coordinate or extent in the flex
 /// container's post-writing-mode coordinate system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -363,6 +456,28 @@ impl FlexItemReplayDimensions {
     /// See [`Self::available_width_for_replay`].
     pub(super) fn available_height_for_replay(self) -> PhysicalContentHeight {
         PhysicalContentHeight::new(content_box_pt(self.height.points()))
+    }
+
+    /// Project the final physical replay geometry onto the item's logical
+    /// inline axis.
+    ///
+    /// A vertical writing mode needs a definite physical content height to
+    /// establish this measure. Horizontal writing instead maps the logical
+    /// inline axis to physical content width.
+    /// <https://www.w3.org/TR/css-writing-modes-4/#dimensional-mapping>
+    pub(super) fn logical_inline_size_for_replay(
+        self,
+        writing_mode: WritingMode,
+        physical_content_height: Option<DefinitePhysicalContentHeight>,
+    ) -> Option<LogicalInlineContentSize> {
+        if writing_mode.has_vertical_lines() {
+            physical_content_height
+                .map(|height| LogicalInlineContentSize::new(height.value().content_box_length()))
+        } else {
+            Some(LogicalInlineContentSize::new(
+                self.available_width_for_replay().content_box_length(),
+            ))
+        }
     }
 }
 
@@ -524,6 +639,17 @@ impl SpecifiedFlexDirection {
     pub(super) const fn new(value: FlexDirection) -> Self {
         Self(value)
     }
+
+    pub(super) fn is_row_axis(self) -> bool {
+        self.0.is_row_axis()
+    }
+
+    pub(super) fn reverses_main_axis(self) -> bool {
+        matches!(
+            self.0,
+            FlexDirection::RowReverse | FlexDirection::ColumnReverse
+        )
+    }
 }
 
 /// A flex direction expressed in Taffy's physical row/column coordinate space.
@@ -541,6 +667,25 @@ impl PhysicalFlexDirection {
 
     pub(super) fn is_row_axis(self) -> bool {
         self.0.is_row_axis()
+    }
+}
+
+/// The physical row/column choice needed by geometry that only reads or moves
+/// an item along a physical axis.
+///
+/// This deliberately omits CSS start/end semantics.  Post-Taffy code that
+/// needs a logical flex edge must receive [`FlexAxes`], which retains the
+/// container's writing mode, direction, reversal, and wrap projection.  It
+/// prevents a physical direction from being inflated back into an artificial
+/// horizontal-LTR `FlexAxes` merely to select X versus Y.
+pub(super) trait FlexPhysicalAxis: Copy {
+    /// Whether the physical main axis is horizontal.
+    fn is_main_row_axis(self) -> bool;
+}
+
+impl FlexPhysicalAxis for PhysicalFlexDirection {
+    fn is_main_row_axis(self) -> bool {
+        self.is_row_axis()
     }
 }
 
@@ -592,8 +737,13 @@ pub(super) struct FlexLayout {
 pub(super) enum FlexDefiniteSizeSource {
     PostFlexingMainSizeFromDefiniteContainer,
     PostFlexingMainSizeFromDefiniteFlexBase,
-    SpecifiedMainSize,
     StretchedCrossSizeFromDefiniteSingleLineContainer,
+    /// The flex line selected a used cross size and the item's stretch
+    /// relayout therefore supplies a definite cross-size basis to its
+    /// descendant formatting context.
+    ///
+    /// <https://www.w3.org/TR/css-flexbox-1/#algo-cross-item>
+    StretchedCrossSizeFromResolvedLine,
     ResolvedLineCrossSize,
 }
 
@@ -613,6 +763,11 @@ pub(super) enum FlexAvailableSizeSource {
     ContainingBlock,
     IntrinsicContainerSize,
     DefiniteCrossSize,
+    /// A cross-axis slot reserved by an explicitly balanced flex line count.
+    BalancedLineSlot,
+    /// A single-line container's definite cross size assigned by stretch.
+    /// This is available while calculating the flex base size.
+    DefiniteSingleLineStretch,
     DefiniteFlexBase,
     /// The flex algorithm has resolved this item's used main size. Descendant
     /// measurement uses it as a definite inline-size constraint while the
@@ -625,6 +780,35 @@ pub(super) enum FlexAvailableSizeSource {
 
 pub(super) type FlexAvailablePercentageBasis =
     PercentageBasis<ContentBoxLength, FlexAvailableSizeSource>;
+
+/// A cross-axis size known early enough to participate in flex-base
+/// measurement. It is intentionally distinct from final stretch replay:
+/// only an explicit balanced line slot or a definite single-line container
+/// can make this pre-measurement size definite.
+/// <https://drafts.csswg.org/css-flexbox/#algo-main-item>
+/// <https://drafts.csswg.org/css-flexbox/#definite-sizes>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum FlexPremeasureCrossSize {
+    BalancedLineSlot(FlexCrossSize),
+    DefiniteSingleLineContainer(FlexCrossSize),
+}
+
+impl FlexPremeasureCrossSize {
+    pub(super) fn size(self) -> FlexCrossSize {
+        match self {
+            Self::BalancedLineSlot(size) | Self::DefiniteSingleLineContainer(size) => size,
+        }
+    }
+
+    pub(super) fn available_size_source(self) -> FlexAvailableSizeSource {
+        match self {
+            Self::BalancedLineSlot(_) => FlexAvailableSizeSource::BalancedLineSlot,
+            Self::DefiniteSingleLineContainer(_) => {
+                FlexAvailableSizeSource::DefiniteSingleLineStretch
+            }
+        }
+    }
+}
 
 pub(super) fn flex_available_percentage_basis(
     value: Option<ContentBoxLength>,
@@ -895,7 +1079,7 @@ impl FlexFragmentPlan {
     /// Append a fragment after its paint and page-side effects are committed.
     pub(super) fn push_materialized_fragment(&mut self, fragment: MaterializedFlexFragment) {
         debug_assert!(
-            fragment.source_bounds.end().points() >= fragment.source_bounds.start().points(),
+            fragment.source_bounds().end().points() >= fragment.source_bounds().start().points(),
             "a materialized flex fragment has a monotonic source range",
         );
         for item in &fragment.item_fragments {
@@ -987,18 +1171,6 @@ impl FlexFragmentPlan {
     }
 }
 
-/// Decoration ownership for one committed flex container fragment.
-///
-/// Fragment start/end decorations belong to the container fragment, not to an
-/// adjacent flex item. Keeping that distinction at commit time prevents a
-/// trailing border or padding edge from changing item source ranges.
-/// <https://www.w3.org/TR/css-break-3/#box-splitting>
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::layout::flex) struct FlexFragmentDecorationState {
-    pub(in crate::layout::flex) includes_block_start: bool,
-    pub(in crate::layout::flex) includes_block_end: bool,
-}
-
 /// Page-local paint geometry for one item slice in a committed flex fragment.
 ///
 /// This record owns the immutable source intersection as well as the local
@@ -1063,13 +1235,11 @@ impl MaterializedFlexItemFragment {
 #[derive(Debug, Clone, PartialEq)]
 pub(in crate::layout::flex) struct MaterializedFlexFragment {
     pub(in crate::layout::flex) layout: FlexFragmentLayout,
-    pub(in crate::layout::flex) source_bounds: FlexFragmentBlockBounds,
-    pub(in crate::layout::flex) destination_border_box: Option<PaintClip>,
+    pub(in crate::layout::flex) disposition: CommittedContainerFragment<FlexFragmentBlockBounds>,
     /// Padding-box overflow clip resolved for this committed destination
     /// fragmentainer. It is assigned after the container's final used height
     /// is known, without altering the source range or decoration ownership.
     pub(in crate::layout::flex) contents_overflow_clip: Option<AxisSelectivePaintClip>,
-    pub(in crate::layout::flex) decoration: FlexFragmentDecorationState,
     pub(in crate::layout::flex) local_to_page_translation: PaintTranslation,
     pub(in crate::layout::flex) item_fragments: Vec<MaterializedFlexItemFragment>,
 }
@@ -1077,21 +1247,76 @@ pub(in crate::layout::flex) struct MaterializedFlexFragment {
 impl MaterializedFlexFragment {
     pub(in crate::layout::flex) fn new(
         layout: FlexFragmentLayout,
-        destination_border_box: Option<PaintClip>,
-        decoration: FlexFragmentDecorationState,
+        kind: ContainerFragmentKind,
         local_to_page_translation: PaintTranslation,
     ) -> Self {
         let source_bounds = FlexFragmentBlockBounds::new(layout.block_start, layout.block_end);
         debug_assert!(source_bounds.end().points() >= source_bounds.start().points());
+        let fragmentainer = FragmentainerOrdinal::new(layout.page_index);
+        let disposition = match kind {
+            ContainerFragmentKind::Principal(fragment) => CommittedContainerFragment::principal(
+                fragmentainer,
+                source_bounds,
+                fragment.border_box(),
+                fragment.decoration(),
+            ),
+            ContainerFragmentKind::DescendantOverflowOnly => {
+                CommittedContainerFragment::descendant_overflow_only(fragmentainer, source_bounds)
+            }
+        };
+        debug_assert_eq!(disposition.fragmentainer().get(), layout.page_index);
         Self {
             layout,
-            source_bounds,
-            destination_border_box,
+            disposition,
             contents_overflow_clip: None,
-            decoration,
             local_to_page_translation,
             item_fragments: Vec::new(),
         }
+    }
+
+    pub(in crate::layout::flex) fn principal(
+        layout: FlexFragmentLayout,
+        border_box: PaintClip,
+        decoration: FragmentDecoration,
+        local_to_page_translation: PaintTranslation,
+    ) -> Self {
+        Self::new(
+            layout,
+            ContainerFragmentKind::Principal(DecoratedBoxFragment::new(border_box, decoration)),
+            local_to_page_translation,
+        )
+    }
+
+    pub(in crate::layout::flex) fn descendant_overflow_only(
+        layout: FlexFragmentLayout,
+        local_to_page_translation: PaintTranslation,
+    ) -> Self {
+        Self::new(
+            layout,
+            ContainerFragmentKind::DescendantOverflowOnly,
+            local_to_page_translation,
+        )
+    }
+
+    pub(in crate::layout::flex) fn source_bounds(&self) -> FlexFragmentBlockBounds {
+        *self.disposition.source_slice()
+    }
+
+    pub(in crate::layout::flex) const fn principal_box(&self) -> Option<&DecoratedBoxFragment> {
+        self.disposition.kind().principal_box()
+    }
+
+    pub(in crate::layout::flex) fn principal_box_mut(
+        &mut self,
+    ) -> Option<&mut DecoratedBoxFragment> {
+        self.disposition.kind_mut().principal_box_mut()
+    }
+
+    pub(in crate::layout::flex) const fn is_descendant_overflow_only(&self) -> bool {
+        matches!(
+            self.disposition.kind(),
+            ContainerFragmentKind::DescendantOverflowOnly
+        )
     }
 }
 
@@ -1369,7 +1594,23 @@ pub(super) struct FlexFragmentSlice {
 pub(super) struct FlexAxes {
     pub(super) flow: FlowAxes,
     pub(super) specified_direction: SpecifiedFlexDirection,
+    pub(super) flex_wrap: FlexWrap,
     pub(super) physical_direction: PhysicalFlexDirection,
+}
+
+/// The coordinate conversion needed after Taffy has resolved a physical Flex
+/// layout.
+///
+/// Taffy can represent horizontal reversal through its `Direction` input, but
+/// it has no corresponding bottom-to-top switch for a physical vertical cross
+/// axis. Keep that one exceptional conversion in the axis projection itself,
+/// rather than asking later Flexbox phases to remember which coordinate system
+/// their line rectangles inhabit:
+/// <https://www.w3.org/TR/css-writing-modes-4/#inline-flow>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TaffyCrossAxisProjection {
+    Identity,
+    Reflect,
 }
 
 impl FlexAxes {
@@ -1377,19 +1618,133 @@ impl FlexAxes {
         Self {
             flow: FlowAxes::for_style(style),
             specified_direction: SpecifiedFlexDirection::new(style.flex_direction),
+            flex_wrap: style.flex_wrap,
             physical_direction: PhysicalFlexDirection::new(physical_flex_direction(style)),
         }
     }
 
-    pub(super) fn from_physical_direction(physical_direction: PhysicalFlexDirection) -> Self {
-        Self {
-            flow: FlowAxes::new(WritingMode::HorizontalTb, Direction::Ltr),
-            specified_direction: SpecifiedFlexDirection::new(physical_direction.taffy_direction()),
-            physical_direction,
+    pub(super) fn is_main_row_axis(self) -> bool {
+        self.physical_direction.is_row_axis()
+    }
+
+    /// Return the physical flex main-start edge after `flex-direction` has
+    /// reversed its logical axis, but before any line-packing behavior is
+    /// applied.
+    ///
+    /// Keeping this mapping here lets the Taffy adapter and Quire's final
+    /// placement agree about the same CSS edge in RTL and vertical writing
+    /// modes.  `flex-wrap: reverse` changes only the cross axis.
+    /// <https://www.w3.org/TR/css-flexbox-1/#flex-direction-property>
+    pub(super) fn main_start_side(self) -> PhysicalSide {
+        let start = if self.specified_direction.is_row_axis() {
+            self.flow.inline_start_side()
+        } else {
+            self.flow.block_start_side()
+        };
+        if self.specified_direction.reverses_main_axis() {
+            start.opposite()
+        } else {
+            start
         }
     }
 
-    pub(super) fn is_main_row_axis(self) -> bool {
+    /// Return the physical flex main-end edge corresponding to
+    /// [`Self::main_start_side`].
+    pub(super) fn main_end_side(self) -> PhysicalSide {
+        self.main_start_side().opposite()
+    }
+
+    /// Return the cross-start edge before `wrap-reverse` flips flex-line
+    /// stacking.
+    pub(super) fn unreversed_cross_start_side(self) -> PhysicalSide {
+        if self.specified_direction.is_row_axis() {
+            self.flow.block_start_side()
+        } else {
+            self.flow.inline_start_side()
+        }
+    }
+
+    pub(super) fn unreversed_cross_end_side(self) -> PhysicalSide {
+        self.unreversed_cross_start_side().opposite()
+    }
+
+    /// Return the CSS cross-start edge after `flex-wrap` has selected the
+    /// line-stacking direction.
+    pub(super) fn cross_start_side(self) -> PhysicalSide {
+        if self.flex_wrap.reverses_cross_axis() {
+            self.unreversed_cross_end_side()
+        } else {
+            self.unreversed_cross_start_side()
+        }
+    }
+
+    /// Return the CSS cross-end edge after `flex-wrap` has selected the
+    /// line-stacking direction.
+    pub(super) fn cross_end_side(self) -> PhysicalSide {
+        self.cross_start_side().opposite()
+    }
+
+    /// Map CSS's resolved physical axes to the direction switch available in
+    /// Taffy. Taffy can reverse physical horizontal coordinates, while
+    /// physical vertical cross-coordinate reversal is reprojected at the
+    /// Taffy result boundary by [`Self::taffy_cross_axis_projection`].
+    pub(super) fn taffy_layout_direction(self) -> ::taffy::Direction {
+        if self.flow.inline_start_side().axis() == PhysicalAxis::Horizontal
+            && self.flow.block_start_side().axis() == PhysicalAxis::Vertical
+        {
+            return if self.flow.inline_start_side() == PhysicalSide::Right {
+                ::taffy::Direction::Rtl
+            } else {
+                ::taffy::Direction::Ltr
+            };
+        }
+        if !self.physical_direction.is_row_axis()
+            && self.unreversed_cross_start_side() == PhysicalSide::Right
+        {
+            ::taffy::Direction::Rtl
+        } else {
+            ::taffy::Direction::Ltr
+        }
+    }
+
+    /// Return Taffy's physical flex-direction input.
+    pub(super) fn taffy_flex_direction(self) -> FlexDirection {
+        self.physical_direction.taffy_direction()
+    }
+
+    /// Return the conversion from Taffy's physical cross coordinate to CSS's
+    /// physical cross coordinate. The conversion is applied as soon as Taffy
+    /// returns item rectangles, before Quire rebuilds line slots or resolves
+    /// CSS Align placement.
+    pub(super) fn taffy_cross_axis_projection(self) -> TaffyCrossAxisProjection {
+        if self.is_main_row_axis()
+            && self.unreversed_cross_start_side() == PhysicalSide::Bottom
+            && self.unreversed_cross_end_side() == PhysicalSide::Top
+        {
+            TaffyCrossAxisProjection::Reflect
+        } else {
+            TaffyCrossAxisProjection::Identity
+        }
+    }
+
+    /// Project CSS logical gaps into Taffy's physical X/Y gap order.
+    ///
+    /// CSS Box Alignment assigns `column-gap` to the inline axis and
+    /// `row-gap` to the block axis, irrespective of the flex main direction.
+    /// <https://www.w3.org/TR/css-align-3/#gaps>
+    pub(super) fn physical_gaps(self, style: &ComputedStyle) -> PhysicalFlexGaps {
+        let (horizontal, vertical) = self
+            .flow
+            .physical_size(style.column_gap.clone(), style.row_gap.clone());
+        PhysicalFlexGaps {
+            horizontal,
+            vertical,
+        }
+    }
+}
+
+impl FlexPhysicalAxis for FlexAxes {
+    fn is_main_row_axis(self) -> bool {
         self.physical_direction.is_row_axis()
     }
 }
@@ -1437,13 +1792,7 @@ pub(super) fn physical_flex_direction(style: &ComputedStyle) -> FlexDirection {
 /// <https://www.w3.org/TR/css-align-3/#gaps> and
 /// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>.
 pub(super) fn physical_flex_gaps(style: &ComputedStyle) -> PhysicalFlexGaps {
-    let axes = WritingModeAxes::new(style.writing_mode, style.used_direction());
-    let (horizontal, vertical) =
-        axes.physical_size(style.column_gap.clone(), style.row_gap.clone());
-    PhysicalFlexGaps {
-        horizontal,
-        vertical,
-    }
+    FlexAxes::for_style(style).physical_gaps(style)
 }
 
 /// Returns whether a flex item is collapsed by `visibility: collapse`.
@@ -1615,13 +1964,10 @@ pub(in crate::layout::flex) fn balanced_flex_item_measure_available_space(
     physical_direction: FlexDirection,
     available: FlexAvailableSpace,
 ) -> FlexAvailableSpace {
-    let css::FlexLineCount::Count(line_count) = style.flex_line_count else {
-        return available;
-    };
     if !style.flex_wrap.balances_lines() {
         return available;
     }
-    let line_count = line_count.get();
+    let line_count = style.flex_line_count.get();
     if line_count <= 1 {
         return available;
     }
@@ -1716,6 +2062,21 @@ impl FlexItemAvailableSpace {
     ) {
         self.height = Some(height);
         self.height_basis = PercentageBasis::definite_from(height.content_box_length(), source);
+    }
+
+    /// Retain a numeric measurement constraint while making physical-height
+    /// percentages cyclic for an intrinsic probe.
+    ///
+    /// A flex item's automatic main minimum is measured after suppressing its
+    /// preferred main size. In a physical column that removes the item's own
+    /// definite height, even when the surrounding flex algorithm still carries
+    /// a numeric height constraint for line formation. Keeping the two
+    /// concerns separate prevents a descendant percentage from resolving
+    /// against the suppressed preferred size.
+    /// <https://www.w3.org/TR/css-flexbox-1/#min-size-auto>
+    /// <https://drafts.csswg.org/css-sizing-3/#cyclic-percentage-contribution>
+    pub(super) fn make_height_percentage_basis_indefinite(&mut self) {
+        self.height_basis = PercentageBasis::indefinite();
     }
 
     /// Project a resolved Flex cross size back into the physical content-box
@@ -1978,9 +2339,134 @@ pub(super) struct FlexPhysicalIntrinsicMetrics {
     pub(super) content_height: PhysicalContentHeight,
 }
 
+/// CSS Images' automatic preferred physical size for a replaced flex item.
+///
+/// This is neither an authored preferred size nor the flex line's provisional
+/// stretch geometry. Ratio-only SVG images still have CSS's default object
+/// size, and Flexbox uses that automatic physical size as a definite input to
+/// its transferred-size suggestion.
+/// <https://www.w3.org/TR/css-images-3/#default-sizing>
+/// <https://www.w3.org/TR/css-flexbox-1/#transferred-size-suggestion>
+#[derive(Debug, Clone, Copy)]
+pub(super) struct FlexAutomaticPreferredPhysicalSize {
+    pub(super) width: PhysicalContentWidth,
+    pub(super) height: PhysicalContentHeight,
+}
+
+/// A ratio-only replaced item's temporary physical content size while Flexbox
+/// determines its content-derived flex base size.
+///
+/// This is neither the CSS Images default object size nor a final used size.
+/// Flexbox sizes a content-based item into its available space before taking
+/// the resulting main size as its flex base size, so a viewBox-only SVG uses
+/// its margin-adjusted logical inline space at this stage. Keeping the two
+/// physical axes together prevents an inline-space candidate from being
+/// confused with a final flex cross size.
+/// <https://www.w3.org/TR/css-flexbox-1/#algo-main-item>
+/// <https://www.w3.org/TR/css-images-3/#default-sizing>
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RatioOnlyReplacedFlexBaseSize {
+    width: PhysicalContentWidth,
+    height: PhysicalContentHeight,
+}
+
+/// The source of a flex item's content-size suggestion for its automatic
+/// main-axis minimum.
+///
+/// A ratio-only replaced item has CSS Images' automatic preferred object size,
+/// but it has no intrinsic axis to contribute as Flexbox's content-size
+/// suggestion. Keeping that distinction explicit prevents the default object
+/// size from being promoted from a transferred-size input into min-content.
+/// <https://www.w3.org/TR/css-flexbox-1/#min-size-auto>
+/// <https://www.w3.org/TR/css-images-3/#default-sizing>
+#[derive(Debug, Clone, Copy)]
+pub(super) enum FlexAutomaticMinimumContentSizeSource {
+    Intrinsic(ContentBoxLength),
+    RatioOnlyReplaced,
+}
+
+impl FlexAutomaticMinimumContentSizeSource {
+    pub(super) fn content_size_suggestion(self) -> ContentBoxLength {
+        match self {
+            Self::Intrinsic(size) => size,
+            Self::RatioOnlyReplaced => content_box_pt(0.0),
+        }
+    }
+}
+
+/// A CSS Images fallback retained exclusively as a transferred-size source.
+///
+/// The named source keeps CSS Images' default object size separate from both
+/// authored preferred sizes and an intrinsic content-size suggestion.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum FlexAutomaticMinimumAutomaticPreferredCrossSize {
+    None,
+    CssImagesDefaultObjectSize(ContentBoxLength),
+}
+
+impl FlexAutomaticMinimumAutomaticPreferredCrossSize {
+    pub(super) fn content_box_size(self) -> Option<ContentBoxLength> {
+        match self {
+            Self::None => None,
+            Self::CssImagesDefaultObjectSize(size) => Some(size),
+        }
+    }
+}
+
+/// The cross-axis intrinsic inputs used by an automatic-minimum transfer.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct FlexAutomaticMinimumCrossIntrinsicContributions {
+    pub(super) min_content: ContentBoxLength,
+    pub(super) max_content: ContentBoxLength,
+}
+
+/// The pass-scoped inputs to Flexbox's automatic main-axis minimum.
+///
+/// This travels with the flex item so Taffy's primary flexible-length pass and
+/// Quire's post-layout safeguard cannot reconstruct different content or
+/// transferred suggestions from a scalar intrinsic estimate.
+/// <https://www.w3.org/TR/css-flexbox-1/#min-size-auto>
+#[derive(Debug, Clone, Copy)]
+pub(super) struct FlexAutomaticMinimumInputs {
+    pub(super) content_size_source: FlexAutomaticMinimumContentSizeSource,
+    pub(super) max_content_size: ContentBoxLength,
+    pub(super) automatic_preferred_cross_size: FlexAutomaticMinimumAutomaticPreferredCrossSize,
+    pub(super) cross_intrinsic: FlexAutomaticMinimumCrossIntrinsicContributions,
+    pub(super) preferred_aspect_ratio: Option<f32>,
+    pub(super) is_replaced: bool,
+    /// An authored definite preferred main size. A temporary flex base never
+    /// occupies this field.
+    pub(super) definite_preferred_content_size: Option<ContentBoxLength>,
+}
+
+impl RatioOnlyReplacedFlexBaseSize {
+    pub(super) fn new(width: PhysicalContentWidth, height: PhysicalContentHeight) -> Self {
+        Self { width, height }
+    }
+
+    pub(super) fn main_content_size(self, direction: FlexDirection) -> ContentBoxLength {
+        if direction.is_row_axis() {
+            self.width.content_box_length()
+        } else {
+            self.height.content_box_length()
+        }
+    }
+
+    pub(super) fn cross_content_size(self, direction: FlexDirection) -> ContentBoxLength {
+        if direction.is_row_axis() {
+            self.height.content_box_length()
+        } else {
+            self.width.content_box_length()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(super) struct FlexItemEstimate {
     pub(super) metrics: IntrinsicItemMetrics,
+    /// A replaced item's CSS automatic preferred physical size, when it is
+    /// distinct from both an authored size and flex stretch geometry.
+    pub(super) automatic_preferred_physical_size: Option<FlexAutomaticPreferredPhysicalSize>,
     /// The CSS rule that produced the resolved flex basis used by Taffy.
     ///
     /// This travels with the estimate because a numeric flex rectangle cannot
@@ -1988,6 +2474,9 @@ pub(super) struct FlexItemEstimate {
     /// aspect-ratio size. The final normal-flow span correction is valid only
     /// for the former.
     pub(super) main_size_provenance: FlexMainSizeProvenance,
+    /// Inputs selected once for this flex pass's automatic main-axis minimum.
+    /// They are shared by Taffy and the post-layout minimum safeguard.
+    pub(super) automatic_main_minimum_inputs: Option<FlexAutomaticMinimumInputs>,
     /// Descendant content extent measured from the flex item's border-box
     /// block start that must remain available to CSS Fragmentation replay.
     ///
@@ -2024,7 +2513,9 @@ impl FlexItemEstimate {
         let fragmentable_overflow_height = PhysicalContentHeight::new(metrics.content_height);
         Self {
             metrics,
+            automatic_preferred_physical_size: None,
             main_size_provenance: FlexMainSizeProvenance::NormalFlowContent,
+            automatic_main_minimum_inputs: None,
             fragmentable_overflow_height,
             baselines,
             normal_flow_line_box_span: None,
@@ -2085,6 +2576,21 @@ impl FlexItemEstimate {
         self.main_size_provenance = provenance;
     }
 
+    /// Preserve the automatic-minimum inputs used by both Taffy's
+    /// flexible-length allocation and Quire's final guard.
+    pub(super) fn set_automatic_main_minimum_inputs(&mut self, inputs: FlexAutomaticMinimumInputs) {
+        self.automatic_main_minimum_inputs = Some(inputs);
+    }
+
+    /// Retain a replaced item's automatic preferred physical size for the
+    /// later Flexbox automatic-minimum calculation.
+    pub(super) fn set_automatic_preferred_physical_size(
+        &mut self,
+        size: FlexAutomaticPreferredPhysicalSize,
+    ) {
+        self.automatic_preferred_physical_size = Some(size);
+    }
+
     /// Record the measured descendant source extent independently of the
     /// estimate's ordinary used/intrinsic block metric.
     pub(super) fn set_fragmentable_overflow_height(&mut self, height: PhysicalContentHeight) {
@@ -2135,6 +2641,23 @@ impl FlexItemEstimate {
         self.fragmentable_overflow_height = remeasured.fragmentable_overflow_height;
         self.merge_fragmentable_overflow_height(previous_fragmentable_overflow);
     }
+
+    /// Replace the row cross metrics with the used span from final normal-flow
+    /// layout, preserving independently tracked fragmentation replay extent.
+    ///
+    /// The preceding intrinsic remeasurement has already refreshed baseline
+    /// data at the resolved main size. This method supplies the one remaining
+    /// authoritative result: the block span of the line boxes actually
+    /// selected by the item's formatting context.
+    /// <https://www.w3.org/TR/css-flexbox-1/#algo-cross-item>
+    /// <https://www.w3.org/TR/css-inline-3/#line-box>
+    pub(super) fn replace_row_cross_metrics_with_final_normal_flow_span(
+        &mut self,
+        span: PhysicalContentHeight,
+    ) {
+        self.metrics.height = span.content_box_length();
+        self.metrics.content_height = span.content_box_length();
+    }
 }
 
 impl Deref for FlexItemEstimate {
@@ -2149,6 +2672,71 @@ impl DerefMut for FlexItemEstimate {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.metrics
     }
+}
+
+/// One flex item's sizing state after Taffy has allocated its provisional
+/// border box and before Quire measures the item's final formatting context.
+///
+/// The intrinsic estimate and allocation have different roles, but they must
+/// advance through the final normal-flow probe together. Keeping that
+/// relationship in one record prevents an item index from accidentally
+/// combining the allocation of one item with the intrinsic metrics of another
+/// as later Flexbox sizing stages grow more precise.
+///
+/// Taffy remains responsible only for flexible-length allocation. Quire owns
+/// the final content measurement and may update `estimate` from that result;
+/// it must not treat the provisional allocation as an intrinsic measurement.
+/// <https://www.w3.org/TR/css-flexbox-1/#layout-algorithm>
+/// <https://www.w3.org/TR/css-flexbox-1/#algo-cross-item>
+#[derive(Debug, Clone)]
+pub(super) struct FlexItemSizingState {
+    estimate: FlexItemEstimate,
+    allocation: FlexItemLayout,
+}
+
+impl FlexItemSizingState {
+    pub(super) fn new(estimate: FlexItemEstimate, allocation: FlexItemLayout) -> Self {
+        Self {
+            estimate,
+            allocation,
+        }
+    }
+
+    pub(super) const fn estimate(&self) -> FlexItemEstimate {
+        self.estimate
+    }
+
+    pub(super) fn estimate_mut(&mut self) -> &mut FlexItemEstimate {
+        &mut self.estimate
+    }
+
+    pub(super) fn allocation(&self) -> &FlexItemLayout {
+        &self.allocation
+    }
+
+    pub(super) fn allocation_mut(&mut self) -> &mut FlexItemLayout {
+        &mut self.allocation
+    }
+
+    /// Restore the legacy vectors only at a boundary whose helpers have not
+    /// yet been migrated to consume sizing state directly.
+    pub(super) fn into_parts(states: Vec<Self>) -> (Vec<FlexItemLayout>, Vec<FlexItemEstimate>) {
+        states
+            .into_iter()
+            .map(|state| (state.allocation, state.estimate))
+            .unzip()
+    }
+}
+
+/// One cloned item fragment's destination interval and source-content slice.
+///
+/// Flex line fragmentation chooses the destination interval, while nested
+/// item replay must remain in the item's content-source coordinate system.
+/// <https://www.w3.org/TR/css-break-3/#box-model-for-breaking>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct FlexClonedItemFragmentSlice {
+    destination: FlexFragmentSlice,
+    source: FlexFragmentSlice,
 }
 
 /// Final flex item border-box geometry in physical container coordinates.
@@ -2171,6 +2759,16 @@ pub(super) struct FlexItemLayout {
     /// slices for the overflowing content:
     /// <https://www.w3.org/TR/css-flexbox-1/#pagination>.
     fragmentation_height: PhysicalContentHeight,
+    /// Source content extent represented by the item's fragmented
+    /// destination slices. Normally this equals `fragmentation_height`; a
+    /// cloned item keeps its repeated border and padding out of this source
+    /// coordinate system.
+    fragmentation_source_height: PhysicalContentHeight,
+    /// Destination-to-source mapping for cloned item fragments. The flex
+    /// line planner uses the destination extent, while child replay consumes
+    /// only the mapped source-content interval.
+    cloned_fragment_slices: Vec<FlexClonedItemFragmentSlice>,
+    cloned_fragment_reservation: Option<FragmentDecorationReservation>,
     pub(super) metadata: FragmentPageMetadata,
     pub(super) percentage_height_basis: FlexPercentageBasis,
 }
@@ -2187,13 +2785,18 @@ impl FlexItemLayout {
         );
         Self {
             fragmentation_height: PhysicalContentHeight::new(content_box_pt(rect.size.height)),
+            fragmentation_source_height: PhysicalContentHeight::new(content_box_pt(
+                rect.size.height,
+            )),
+            cloned_fragment_slices: Vec::new(),
+            cloned_fragment_reservation: None,
             rect,
             metadata,
             percentage_height_basis: PercentageBasis::indefinite(),
         }
     }
 
-    pub(super) fn from_taffy_rect(rect: TaffyRect, _axes: FlexAxes) -> Self {
+    pub(super) fn from_taffy_rect(rect: TaffyRect) -> Self {
         Self::new(ContainerRect::new(
             ContainerPoint::new(rect.origin.x, rect.origin.y),
             ContainerSize::new(rect.size.width, rect.size.height),
@@ -2237,6 +2840,130 @@ impl FlexItemLayout {
         ))
     }
 
+    /// Source content extent selected for descendant replay.
+    pub(super) fn fragmentation_source_height(&self) -> PhysicalContentHeight {
+        self.fragmentation_source_height
+    }
+
+    pub(super) fn has_cloned_fragment_projection(&self) -> bool {
+        self.cloned_fragment_reservation.is_some()
+    }
+
+    /// Preserve the source content of a cloned item separately from the
+    /// physical destination extent that its repeated decorations occupy.
+    pub(super) fn configure_cloned_fragment_source(
+        &mut self,
+        source_height: PhysicalContentHeight,
+        reservation: FragmentDecorationReservation,
+    ) {
+        self.fragmentation_source_height = source_height;
+        self.cloned_fragment_reservation = Some(reservation);
+        self.cloned_fragment_slices.clear();
+    }
+
+    /// Expand a cloned item's destination height into explicit source slices
+    /// for the current fragmentainer sequence.
+    pub(super) fn project_cloned_fragment_destinations(
+        &mut self,
+        initial_raw_extent: LayoutLength,
+        continuation_raw_extent: LayoutLength,
+    ) -> bool {
+        let Some(reservation) = self.cloned_fragment_reservation else {
+            return false;
+        };
+        let initial_capacity = reservation.fresh_content_extent(initial_raw_extent);
+        let continuation_capacity = reservation.fresh_content_extent(continuation_raw_extent);
+        if initial_capacity.points() <= 0.01 || continuation_capacity.points() <= 0.01 {
+            return false;
+        }
+        let mut remaining_source = self.fragmentation_source_height.points().max(0.0);
+        let mut source_offset = 0.0;
+        let mut destination_offset = 0.0;
+        let mut slices = Vec::new();
+        let mut content_capacity = initial_capacity;
+        while remaining_source > 0.01 {
+            let source_length = remaining_source.min(content_capacity.points());
+            let destination_length = reservation.block_start().points()
+                + source_length
+                + reservation.block_end().points();
+            slices.push(FlexClonedItemFragmentSlice {
+                destination: FlexFragmentSlice {
+                    block_start: FlexFragmentBlockOffset::new(destination_offset),
+                    block_end: FlexFragmentBlockOffset::new(
+                        destination_offset + destination_length,
+                    ),
+                },
+                source: FlexFragmentSlice {
+                    block_start: FlexFragmentBlockOffset::new(source_offset),
+                    block_end: FlexFragmentBlockOffset::new(source_offset + source_length),
+                },
+            });
+            remaining_source -= source_length;
+            source_offset += source_length;
+            destination_offset += destination_length;
+            content_capacity = continuation_capacity;
+        }
+        if slices.is_empty() {
+            return false;
+        }
+        let changed = (self.fragmentation_height.points() - destination_offset).abs() > 0.01;
+        self.fragmentation_height = PhysicalContentHeight::new(content_box_pt(destination_offset));
+        self.cloned_fragment_slices = slices;
+        changed
+    }
+
+    /// Map one destination interval selected by flex-line fragmentation back
+    /// to the item's source content interval.
+    pub(super) fn source_slice_for_destination_slice(
+        &self,
+        destination_slice: FlexFragmentSlice,
+    ) -> Option<FlexFragmentSlice> {
+        let reservation = self.cloned_fragment_reservation?;
+        let mut source_start = None;
+        let mut source_end = None;
+        for fragment in &self.cloned_fragment_slices {
+            let start = destination_slice
+                .block_start
+                .points()
+                .max(fragment.destination.block_start.points());
+            let end = destination_slice
+                .block_end
+                .points()
+                .min(fragment.destination.block_end.points());
+            if end <= start + 0.01 {
+                continue;
+            }
+            let fragment_destination_content_start =
+                fragment.destination.block_start.points() + reservation.block_start().points();
+            let local_source_start = (start - fragment_destination_content_start).clamp(
+                0.0,
+                fragment.source.block_end.points() - fragment.source.block_start.points(),
+            );
+            let local_source_end = (end - fragment_destination_content_start).clamp(
+                0.0,
+                fragment.source.block_end.points() - fragment.source.block_start.points(),
+            );
+            let start = fragment.source.block_start.points() + local_source_start;
+            let end = fragment.source.block_start.points() + local_source_end;
+            source_start.get_or_insert(start);
+            source_end = Some(end);
+        }
+        Some(FlexFragmentSlice {
+            block_start: FlexFragmentBlockOffset::new(source_start.unwrap_or_else(|| {
+                destination_slice
+                    .block_start
+                    .points()
+                    .min(self.fragmentation_source_height.points())
+            })),
+            block_end: FlexFragmentBlockOffset::new(source_end.unwrap_or_else(|| {
+                destination_slice
+                    .block_start
+                    .points()
+                    .min(self.fragmentation_source_height.points())
+            })),
+        })
+    }
+
     pub(super) fn set_x(&mut self, x: FlexPhysicalHorizontalOffset) {
         self.rect.origin.x = x.points();
     }
@@ -2254,88 +2981,114 @@ impl FlexItemLayout {
         self.fragmentation_height = PhysicalContentHeight::new(content_box_pt(
             self.fragmentation_height.points().max(height.points()),
         ));
+        if self.cloned_fragment_reservation.is_none() {
+            self.fragmentation_source_height = PhysicalContentHeight::new(content_box_pt(
+                self.fragmentation_source_height
+                    .points()
+                    .max(height.points()),
+            ));
+        }
     }
 
     pub(super) fn set_fragmentation_height(&mut self, height: PhysicalContentHeight) {
         self.fragmentation_height = PhysicalContentHeight::new(content_box_pt(
             height.points().max(self.height().points()).max(0.0),
         ));
+        if self.cloned_fragment_reservation.is_none() {
+            self.fragmentation_source_height = self.fragmentation_height;
+        }
     }
 
-    pub(super) fn main_start(&self, axes: FlexAxes) -> FlexMainOffset {
-        if axes.is_main_row_axis() {
+    pub(super) fn main_start(&self, axis: impl FlexPhysicalAxis) -> FlexMainOffset {
+        if axis.is_main_row_axis() {
             FlexMainOffset::new(self.x().points())
         } else {
             FlexMainOffset::new(self.y().points())
         }
     }
 
-    pub(super) fn set_main_start(&mut self, axes: FlexAxes, main_start: FlexMainOffset) {
-        if axes.is_main_row_axis() {
+    pub(super) fn set_main_start(
+        &mut self,
+        axis: impl FlexPhysicalAxis,
+        main_start: FlexMainOffset,
+    ) {
+        if axis.is_main_row_axis() {
             self.set_x(FlexPhysicalHorizontalOffset::new(main_start.points()));
         } else {
             self.set_y(FlexPhysicalVerticalOffset::new(main_start.points()));
         }
     }
 
-    pub(super) fn main_size(&self, axes: FlexAxes) -> FlexMainSize {
-        if axes.is_main_row_axis() {
+    pub(super) fn main_size(&self, axis: impl FlexPhysicalAxis) -> FlexMainSize {
+        if axis.is_main_row_axis() {
             FlexMainSize::new(self.width().points())
         } else {
             FlexMainSize::new(self.height().points())
         }
     }
 
-    pub(super) fn set_main_size(&mut self, axes: FlexAxes, size: FlexMainSize) {
-        if axes.is_main_row_axis() {
+    pub(super) fn set_main_size(&mut self, axis: impl FlexPhysicalAxis, size: FlexMainSize) {
+        if axis.is_main_row_axis() {
             self.set_width(FlexPhysicalHorizontalSize::new(size.points()));
         } else {
             self.set_height(FlexPhysicalVerticalSize::new(size.points()));
         }
     }
 
-    pub(super) fn cross_start(&self, axes: FlexAxes) -> FlexCrossOffset {
-        if axes.is_main_row_axis() {
+    pub(super) fn cross_start(&self, axis: impl FlexPhysicalAxis) -> FlexCrossOffset {
+        if axis.is_main_row_axis() {
             FlexCrossOffset::new(self.y().points())
         } else {
             FlexCrossOffset::new(self.x().points())
         }
     }
 
-    pub(super) fn set_cross_start(&mut self, axes: FlexAxes, cross_start: FlexCrossOffset) {
-        if axes.is_main_row_axis() {
-            self.set_y(FlexPhysicalVerticalOffset::new(cross_start.points()));
+    pub(super) fn set_cross_start(
+        &mut self,
+        axis: impl FlexPhysicalAxis,
+        cross_start: FlexItemBorderBoxCrossStart,
+    ) {
+        if axis.is_main_row_axis() {
+            self.set_y(FlexPhysicalVerticalOffset::new(
+                cross_start.offset().points(),
+            ));
         } else {
-            self.set_x(FlexPhysicalHorizontalOffset::new(cross_start.points()));
+            self.set_x(FlexPhysicalHorizontalOffset::new(
+                cross_start.offset().points(),
+            ));
         }
     }
 
-    pub(super) fn cross_size(&self, axes: FlexAxes) -> FlexCrossSize {
-        if axes.is_main_row_axis() {
+    pub(super) fn cross_size(&self, axis: impl FlexPhysicalAxis) -> FlexCrossSize {
+        if axis.is_main_row_axis() {
             FlexCrossSize::new(self.height().points())
         } else {
             FlexCrossSize::new(self.width().points())
         }
     }
 
-    pub(super) fn set_cross_size(&mut self, axes: FlexAxes, size: FlexCrossSize) {
-        if axes.is_main_row_axis() {
+    pub(super) fn set_cross_size(&mut self, axis: impl FlexPhysicalAxis, size: FlexCrossSize) {
+        if axis.is_main_row_axis() {
             self.set_height(FlexPhysicalVerticalSize::new(size.points()));
         } else {
             self.set_width(FlexPhysicalHorizontalSize::new(size.points()));
         }
     }
 
-    pub(super) fn translate_cross(&mut self, axes: FlexAxes, delta: FlexCrossLength) {
-        self.set_cross_start(axes, self.cross_start(axes) + delta);
+    pub(super) fn translate_cross(&mut self, axis: impl FlexPhysicalAxis, delta: FlexCrossLength) {
+        self.set_cross_start(
+            axis,
+            FlexItemBorderBoxCrossStart::from_border_box_offset(self.cross_start(axis))
+                .translated(delta),
+        );
     }
 
     pub(super) fn outer_main_bounds(
         &self,
-        axes: FlexAxes,
+        axis: impl FlexPhysicalAxis,
         style: &ComputedStyle,
     ) -> (FlexMainOffset, FlexMainOffset) {
-        if axes.is_main_row_axis() {
+        if axis.is_main_row_axis() {
             (
                 FlexMainOffset::new(self.x().points() - style.margin.left),
                 FlexMainOffset::new(self.x().points() + self.width().points() + style.margin.right),
@@ -2352,10 +3105,10 @@ impl FlexItemLayout {
 
     pub(super) fn outer_cross_bounds(
         &self,
-        axes: FlexAxes,
+        axis: impl FlexPhysicalAxis,
         style: &ComputedStyle,
     ) -> (FlexCrossOffset, FlexCrossOffset) {
-        if axes.is_main_row_axis() {
+        if axis.is_main_row_axis() {
             (
                 FlexCrossOffset::new(self.y().points() - style.margin.top),
                 FlexCrossOffset::new(
@@ -2378,6 +3131,9 @@ pub(super) type StyledChild<'a> = FormattingContextChild<'a>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::flex::compute::{
+        flex_cross_start_side, reproject_taffy_item_cross_axis_coordinates,
+    };
     use crate::layout::flex::layout::{
         flex_container_page_contents_overflow_clip, flex_container_page_fragment_bounds,
     };
@@ -2465,6 +3221,161 @@ mod tests {
     }
 
     #[test]
+    fn flex_axis_projection_matrix_preserves_css_sides_at_the_taffy_boundary() {
+        for writing_mode in [
+            WritingMode::HorizontalTb,
+            WritingMode::VerticalRl,
+            WritingMode::VerticalLr,
+            WritingMode::SidewaysRl,
+            WritingMode::SidewaysLr,
+        ] {
+            for direction in [Direction::Ltr, Direction::Rtl] {
+                for flex_direction in [
+                    FlexDirection::Row,
+                    FlexDirection::RowReverse,
+                    FlexDirection::Column,
+                    FlexDirection::ColumnReverse,
+                ] {
+                    for flex_wrap in [FlexWrap::NoWrap, FlexWrap::Wrap, FlexWrap::WrapReverse] {
+                        let mut style = ComputedStyle::initial();
+                        style.writing_mode = writing_mode;
+                        style.direction = direction;
+                        style.flex_direction = flex_direction;
+                        style.flex_wrap = flex_wrap;
+
+                        let axes = FlexAxes::for_style(&style);
+                        let ordinary_main_start = if flex_direction.is_row_axis() {
+                            axes.flow.inline_start_side()
+                        } else {
+                            axes.flow.block_start_side()
+                        };
+                        let expected_main_start = if matches!(
+                            flex_direction,
+                            FlexDirection::RowReverse | FlexDirection::ColumnReverse
+                        ) {
+                            ordinary_main_start.opposite()
+                        } else {
+                            ordinary_main_start
+                        };
+                        let ordinary_cross_start = if flex_direction.is_row_axis() {
+                            axes.flow.block_start_side()
+                        } else {
+                            axes.flow.inline_start_side()
+                        };
+                        let expected_cross_start = if flex_wrap.reverses_cross_axis() {
+                            ordinary_cross_start.opposite()
+                        } else {
+                            ordinary_cross_start
+                        };
+
+                        assert_eq!(axes.main_start_side(), expected_main_start);
+                        assert_eq!(axes.main_end_side(), expected_main_start.opposite());
+                        assert_eq!(axes.unreversed_cross_start_side(), ordinary_cross_start);
+                        assert_eq!(flex_cross_start_side(&style), expected_cross_start);
+                        assert_eq!(axes.cross_start_side(), expected_cross_start);
+                        assert_eq!(axes.cross_end_side(), expected_cross_start.opposite());
+                        assert_eq!(axes.taffy_flex_direction(), physical_flex_direction(&style),);
+                        let expected_taffy_layout_direction =
+                            if axes.flow.inline_start_side().axis() == PhysicalAxis::Horizontal
+                                && axes.flow.block_start_side().axis() == PhysicalAxis::Vertical
+                            {
+                                if axes.flow.inline_start_side() == PhysicalSide::Right {
+                                    ::taffy::Direction::Rtl
+                                } else {
+                                    ::taffy::Direction::Ltr
+                                }
+                            } else if !axes.physical_direction.is_row_axis()
+                                && ordinary_cross_start == PhysicalSide::Right
+                            {
+                                ::taffy::Direction::Rtl
+                            } else {
+                                ::taffy::Direction::Ltr
+                            };
+                        assert_eq!(
+                            axes.taffy_layout_direction(),
+                            expected_taffy_layout_direction
+                        );
+                        assert_eq!(
+                            axes.taffy_cross_axis_projection(),
+                            if axes.physical_direction.is_row_axis()
+                                && ordinary_cross_start == PhysicalSide::Bottom
+                            {
+                                TaffyCrossAxisProjection::Reflect
+                            } else {
+                                TaffyCrossAxisProjection::Identity
+                            },
+                        );
+
+                        // Feed the adapter two physical Taffy lines with two
+                        // items apiece.  The ordering is intentionally held
+                        // constant for `wrap` and `wrap-reverse`: Taffy owns
+                        // that reversal, while this boundary may only change
+                        // the unavailable bottom-to-top physical coordinate.
+                        let mut items = if axes.is_main_row_axis() {
+                            vec![
+                                FlexItemLayout::new(ContainerRect::new(
+                                    ContainerPoint::new(0.0, 0.0),
+                                    ContainerSize::new(20.0, 30.0),
+                                )),
+                                FlexItemLayout::new(ContainerRect::new(
+                                    ContainerPoint::new(20.0, 0.0),
+                                    ContainerSize::new(20.0, 30.0),
+                                )),
+                                FlexItemLayout::new(ContainerRect::new(
+                                    ContainerPoint::new(0.0, 30.0),
+                                    ContainerSize::new(20.0, 30.0),
+                                )),
+                                FlexItemLayout::new(ContainerRect::new(
+                                    ContainerPoint::new(20.0, 30.0),
+                                    ContainerSize::new(20.0, 30.0),
+                                )),
+                            ]
+                        } else {
+                            vec![
+                                FlexItemLayout::new(ContainerRect::new(
+                                    ContainerPoint::new(0.0, 0.0),
+                                    ContainerSize::new(30.0, 20.0),
+                                )),
+                                FlexItemLayout::new(ContainerRect::new(
+                                    ContainerPoint::new(0.0, 20.0),
+                                    ContainerSize::new(30.0, 20.0),
+                                )),
+                                FlexItemLayout::new(ContainerRect::new(
+                                    ContainerPoint::new(30.0, 0.0),
+                                    ContainerSize::new(30.0, 20.0),
+                                )),
+                                FlexItemLayout::new(ContainerRect::new(
+                                    ContainerPoint::new(30.0, 20.0),
+                                    ContainerSize::new(30.0, 20.0),
+                                )),
+                            ]
+                        };
+                        reproject_taffy_item_cross_axis_coordinates(
+                            &mut items,
+                            axes,
+                            FlexCrossSize::new(60.0),
+                        );
+                        let final_rect_order = items
+                            .iter()
+                            .map(|item| (item.x().points(), item.y().points()))
+                            .collect::<Vec<_>>();
+                        let expected_final_rect_order = if axes.is_main_row_axis()
+                            && ordinary_cross_start == PhysicalSide::Bottom
+                        {
+                            vec![(0.0, 30.0), (20.0, 30.0), (0.0, 0.0), (20.0, 0.0)]
+                        } else if axes.is_main_row_axis() {
+                            vec![(0.0, 0.0), (20.0, 0.0), (0.0, 30.0), (20.0, 30.0)]
+                        } else {
+                            vec![(0.0, 0.0), (0.0, 20.0), (30.0, 0.0), (30.0, 20.0)]
+                        };
+                        assert_eq!(final_rect_order, expected_final_rect_order);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn flex_item_fixed_estimate_stores_content_box_lengths() {
         let estimate = FlexItemEstimate::fixed(
             PhysicalContentWidth::new(content_box_pt(24.0)),
@@ -2478,6 +3389,31 @@ mod tests {
         assert_eq!(estimate.content_width.points(), 24.0);
         assert_eq!(estimate.content_height.points(), 36.0);
         assert_eq!(estimate.fragmentable_overflow_height.points(), 36.0);
+    }
+
+    #[test]
+    fn sizing_state_keeps_taffy_allocation_paired_with_its_intrinsic_estimate() {
+        let estimate = FlexItemEstimate::fixed(
+            PhysicalContentWidth::new(content_box_pt(24.0)),
+            PhysicalContentHeight::new(content_box_pt(36.0)),
+        );
+        let allocation = FlexItemLayout::new(ContainerRect::new(
+            ContainerPoint::new(4.0, 8.0),
+            ContainerSize::new(40.0, 60.0),
+        ));
+
+        let (allocations, estimates) =
+            FlexItemSizingState::into_parts(vec![FlexItemSizingState::new(estimate, allocation)]);
+
+        assert_eq!(estimates[0].content_width, content_box_pt(24.0));
+        assert_eq!(estimates[0].content_height, content_box_pt(36.0));
+        assert_eq!(allocations[0].x(), FlexPhysicalHorizontalOffset::new(4.0));
+        assert_eq!(allocations[0].y(), FlexPhysicalVerticalOffset::new(8.0));
+        assert_eq!(
+            allocations[0].width(),
+            FlexPhysicalHorizontalSize::new(40.0)
+        );
+        assert_eq!(allocations[0].height(), FlexPhysicalVerticalSize::new(60.0));
     }
 
     #[test]
@@ -2579,10 +3515,35 @@ mod tests {
     }
 
     #[test]
+    fn intrinsic_auto_main_probe_keeps_constraint_but_drops_height_percentage_basis() {
+        let available = FlexAvailableSpace {
+            width: PhysicalContentWidth::new(content_box_pt(80.0)),
+            width_basis: PercentageBasis::definite_from(
+                content_box_pt(80.0),
+                FlexAvailableSizeSource::ContainingBlock,
+            ),
+            height: Some(PhysicalContentHeight::new(content_box_pt(75.0))),
+            height_basis: PercentageBasis::definite_from(
+                content_box_pt(75.0),
+                FlexAvailableSizeSource::DefinitePreferredMainSize,
+            ),
+        };
+        let mut item = FlexItemAvailableSpace::from_container(available);
+
+        item.make_height_percentage_basis_indefinite();
+
+        assert_eq!(
+            item.height,
+            Some(PhysicalContentHeight::new(content_box_pt(75.0)))
+        );
+        assert_eq!(item.height_basis, PercentageBasis::indefinite());
+    }
+
+    #[test]
     fn explicit_balanced_line_count_reserves_cross_measurement_space() {
         let mut style = ComputedStyle::initial();
         style.flex_wrap = FlexWrap::Balance;
-        style.flex_line_count = css::FlexLineCount::Count(
+        style.flex_line_count = css::FlexLineCount::new(
             std::num::NonZeroUsize::new(2).expect("line count is non-zero"),
         );
         let available = FlexAvailableSpace {
@@ -2646,37 +3607,33 @@ mod tests {
 
     #[test]
     fn flex_item_layout_projects_main_and_cross_axes() {
-        let row_axes =
-            FlexAxes::from_physical_direction(PhysicalFlexDirection::new(FlexDirection::Row));
-        let column_axes =
-            FlexAxes::from_physical_direction(PhysicalFlexDirection::new(FlexDirection::Column));
+        let row_axis = PhysicalFlexDirection::new(FlexDirection::Row);
+        let column_axis = PhysicalFlexDirection::new(FlexDirection::Column);
         let mut item = FlexItemLayout::new(ContainerRect::new(
             ContainerPoint::new(10.0, 20.0),
             ContainerSize::new(30.0, 40.0),
         ));
 
-        assert_eq!(item.main_start(row_axes), FlexMainOffset::new(10.0));
-        assert_eq!(item.main_size(row_axes), FlexMainSize::new(30.0));
-        assert_eq!(item.cross_start(row_axes), FlexCrossOffset::new(20.0));
-        assert_eq!(item.cross_size(row_axes), FlexCrossSize::new(40.0));
+        assert_eq!(item.main_start(row_axis), FlexMainOffset::new(10.0));
+        assert_eq!(item.main_size(row_axis), FlexMainSize::new(30.0));
+        assert_eq!(item.cross_start(row_axis), FlexCrossOffset::new(20.0));
+        assert_eq!(item.cross_size(row_axis), FlexCrossSize::new(40.0));
 
-        assert_eq!(item.main_start(column_axes), FlexMainOffset::new(20.0));
-        assert_eq!(item.main_size(column_axes), FlexMainSize::new(40.0));
-        assert_eq!(item.cross_start(column_axes), FlexCrossOffset::new(10.0));
-        assert_eq!(item.cross_size(column_axes), FlexCrossSize::new(30.0));
+        assert_eq!(item.main_start(column_axis), FlexMainOffset::new(20.0));
+        assert_eq!(item.main_size(column_axis), FlexMainSize::new(40.0));
+        assert_eq!(item.cross_start(column_axis), FlexCrossOffset::new(10.0));
+        assert_eq!(item.cross_size(column_axis), FlexCrossSize::new(30.0));
 
-        item.set_main_start(column_axes, FlexMainOffset::new(25.0));
-        item.translate_cross(column_axes, FlexCrossLength::new(5.0));
+        item.set_main_start(column_axis, FlexMainOffset::new(25.0));
+        item.translate_cross(column_axis, FlexCrossLength::new(5.0));
         assert_eq!(item.y(), FlexPhysicalVerticalOffset::new(25.0));
         assert_eq!(item.x(), FlexPhysicalHorizontalOffset::new(15.0));
     }
 
     #[test]
     fn flex_item_layout_wraps_taffy_rects_at_boundary() {
-        let axes =
-            FlexAxes::from_physical_direction(PhysicalFlexDirection::new(FlexDirection::Row));
         let rect = TaffyRect::new(TaffyPoint::new(4.0, 8.0), TaffySize::new(16.0, 32.0));
-        let item = FlexItemLayout::from_taffy_rect(rect, axes);
+        let item = FlexItemLayout::from_taffy_rect(rect);
 
         assert_eq!(item.x(), FlexPhysicalHorizontalOffset::new(4.0));
         assert_eq!(item.y(), FlexPhysicalVerticalOffset::new(8.0));
@@ -2695,6 +3652,35 @@ mod tests {
         assert_eq!(
             replay.available_height_for_replay(),
             PhysicalContentHeight::new(content_box_pt(32.0))
+        );
+    }
+
+    #[test]
+    fn flex_replay_projects_logical_inline_size_from_final_physical_axis() {
+        let replay = FlexItemReplayDimensions {
+            width: FlexPhysicalHorizontalSize::new(16.0),
+            height: FlexPhysicalVerticalSize::new(32.0),
+        };
+
+        assert_eq!(
+            replay.logical_inline_size_for_replay(WritingMode::HorizontalTb, None),
+            Some(LogicalInlineContentSize::new(content_box_pt(16.0)))
+        );
+        assert_eq!(
+            replay.logical_inline_size_for_replay(WritingMode::VerticalLr, None),
+            None
+        );
+
+        let height = Some(Definite::new(PhysicalContentHeight::new(content_box_pt(
+            32.0,
+        ))));
+        assert_eq!(
+            replay.logical_inline_size_for_replay(WritingMode::VerticalLr, height),
+            Some(LogicalInlineContentSize::new(content_box_pt(32.0)))
+        );
+        assert_eq!(
+            replay.logical_inline_size_for_replay(WritingMode::VerticalRl, height),
+            Some(LogicalInlineContentSize::new(content_box_pt(32.0)))
         );
     }
 
@@ -2768,13 +3754,14 @@ mod tests {
             first.items[0].continuation.child_fragment_replay_ordinal(),
             0
         );
-        let mut materialized_first = MaterializedFlexFragment::new(
+        let mut materialized_first = MaterializedFlexFragment::principal(
             first,
-            Some(PaintClip::new(0.0, 0.0, 20.0, 75.0)),
-            FlexFragmentDecorationState {
-                includes_block_start: true,
-                includes_block_end: false,
-            },
+            PaintClip::new(0.0, 0.0, 20.0, 75.0),
+            FragmentDecoration::for_box_decoration_break(
+                css::BoxDecorationBreak::Slice,
+                true,
+                false,
+            ),
             PaintTranslation::identity(),
         );
         materialized_first
@@ -2792,18 +3779,18 @@ mod tests {
         plan.push_materialized_fragment(materialized_first);
         assert_eq!(plan.materialized_fragments.len(), 1);
         assert_eq!(
-            plan.materialized_fragments[0].source_bounds,
+            plan.materialized_fragments[0].source_bounds(),
             FlexFragmentBlockBounds::new(
                 FlexFragmentBlockOffset::new(0.0),
                 FlexFragmentBlockOffset::new(75.0),
             ),
         );
-        assert!(
-            plan.materialized_fragments[0]
-                .decoration
-                .includes_block_start
-        );
-        assert!(!plan.materialized_fragments[0].decoration.includes_block_end);
+        let decoration = plan.materialized_fragments[0]
+            .principal_box()
+            .expect("the test fragment is principal")
+            .decoration();
+        assert!(decoration.owns_block_start());
+        assert!(!decoration.owns_block_end());
         assert_eq!(plan.materialized_fragments[0].item_fragments.len(), 1);
         let materialized_item = &plan.materialized_fragments[0].item_fragments[0];
         assert_eq!(

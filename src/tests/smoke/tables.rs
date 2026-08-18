@@ -747,6 +747,110 @@ async fn sideways_vertical_ch_units_size_table_columns_like_sideways_reference()
 }
 
 #[tokio::test]
+async fn fixed_vertical_sideways_table_columns_use_physical_heights() {
+    let document = Html::from_string(
+        "<style>@page { size: 120pt 120pt; margin: 0 }\
+         body, table, td { margin: 0; padding: 0; border-spacing: 0 }\
+         table { writing-mode: vertical-rl; text-orientation: sideways; table-layout: fixed; width: 20pt; height: 60pt }\
+         td:first-child { background: red }\
+         td:last-child { background: blue }</style>\
+         <table><col style=\"height: 15pt\"><col style=\"height: 45pt\"><tr><td></td><td></td></tr></table>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = largest_filled_rect(page, CssColor::new(255, 0, 0));
+    let blue = largest_filled_rect(page, CssColor::new(0, 0, 255));
+
+    assert!(
+        (red.height() - 15.0).abs() < 0.01,
+        "first fixed vertical column must use its physical height: {red:?}"
+    );
+    assert!(
+        (blue.height() - 45.0).abs() < 0.01,
+        "second fixed vertical column must use its physical height: {blue:?}"
+    );
+}
+
+#[tokio::test]
+async fn fixed_vertical_and_sideways_first_row_cells_use_root_inline_heights() {
+    for writing_mode in ["vertical-lr", "vertical-rl", "sideways-lr", "sideways-rl"] {
+        let document = Html::from_string(
+            format!(
+                "<style>@page {{ size: 120pt 120pt; margin: 0 }}\
+                 body, table, td {{ margin: 0; padding: 0; border-spacing: 0 }}\
+                 table {{ writing-mode: {writing_mode}; table-layout: fixed; width: 20pt; height: 60pt }}\
+                 td:first-child {{ width: 45pt; height: 15pt; background: red }}\
+                 td:last-child {{ width: 15pt; height: 45pt; background: blue }}</style>\
+                 <table><tr><td></td><td></td></tr></table>"
+            ),
+        )
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+
+        let page = &document.pages[0];
+        let red = largest_filled_rect(page, CssColor::new(255, 0, 0));
+        let blue = largest_filled_rect(page, CssColor::new(0, 0, 255));
+        assert!(
+            (red.height() - 15.0).abs() < 0.01,
+            "{writing_mode} must use the first cell's physical height, not width: {red:?}"
+        );
+        assert!(
+            (blue.height() - 45.0).abs() < 0.01,
+            "{writing_mode} must use the second cell's physical height, not width: {blue:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn fixed_vertical_column_declarations_override_first_row_cells() {
+    let document = Html::from_string(
+        "<style>@page { size: 120pt 120pt; margin: 0 }\
+         body, table, td { margin: 0; padding: 0; border-spacing: 0 }\
+         table { writing-mode: vertical-rl; table-layout: fixed; width: 20pt; height: 30pt }\
+         td:first-child { height: 50pt; background: red }\
+         td:last-child { height: 10pt; background: blue }</style>\
+         <table><col style=\"height: 20pt\"><col><tr><td></td><td></td></tr></table>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = largest_filled_rect(page, CssColor::new(255, 0, 0));
+    let blue = largest_filled_rect(page, CssColor::new(0, 0, 255));
+    assert!((red.height() - 20.0).abs() < 0.01, "red={red:?}");
+    assert!((blue.height() - 10.0).abs() < 0.01, "blue={blue:?}");
+}
+
+#[tokio::test]
+async fn fixed_vertical_first_row_cells_respect_box_sizing_and_percentages() {
+    let document = Html::from_string(
+        "<style>@page { size: 160pt 120pt; margin: 0 }\
+         body, table, td { margin: 0; border-spacing: 0 }\
+         table { writing-mode: vertical-lr; table-layout: fixed; width: 20pt; height: 80pt }\
+         .content { height: 10pt; padding-top: 2pt; padding-bottom: 2pt; border-top: 3pt solid red; border-bottom: 3pt solid red; background: red }\
+         .border { box-sizing: border-box; height: 25%; padding-top: 2pt; padding-bottom: 2pt; border-top: 3pt solid blue; border-bottom: 3pt solid blue; background: blue }\
+         .remainder { background: green }</style>\
+         <table><tr><td class=\"content\"></td><td class=\"border\"></td><td class=\"remainder\"></td></tr></table>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = largest_filled_rect(page, CssColor::new(255, 0, 0));
+    let blue = largest_filled_rect(page, CssColor::new(0, 0, 255));
+    let green = largest_filled_rect(page, CssColor::new(0, 128, 0));
+    assert!((red.height() - 20.0).abs() < 0.01, "red={red:?}");
+    assert!((blue.height() - 20.0).abs() < 0.01, "blue={blue:?}");
+    assert!((green.height() - 40.0).abs() < 0.01, "green={green:?}");
+}
+
+#[tokio::test]
 async fn table_cell_second_pass_resolves_percentage_height_canvas() {
     let document = Html::from_string(
         "<style>@page { size: 200pt 160pt; margin: 10pt } body { margin: 0 }</style>\
@@ -765,6 +869,91 @@ async fn table_cell_second_pass_resolves_percentage_height_canvas() {
     .unwrap();
 
     assert_green_100px_square(&document);
+}
+
+#[tokio::test]
+async fn table_row_minimum_ignores_percentage_height_source_less_image() {
+    let document = Html::from_string(
+        "<style>@page{size:160pt 160pt;margin:0}body{margin:0}table{width:100px;height:100px;border-spacing:0;background:green}td{padding:0}.first{height:20px}.second{height:100%}img{width:100%;height:100%;visibility:hidden}</style>\
+         <table><tr><td class=\"first\"></td></tr><tr><td class=\"second\"><img></td></tr></table>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let green = largest_filled_rect(&document.pages[0], CssColor::new(0, 128, 0));
+    assert!(
+        (green.width() - 75.0).abs() < 0.01 && (green.height() - 75.0).abs() < 0.01,
+        "a source-less percentage-height image must not enlarge the table row minimum: {green:?}"
+    );
+}
+
+#[tokio::test]
+async fn table_cell_final_relayout_sizes_percentage_source_less_image_inside_scrollport() {
+    let document = Html::from_string(
+        "<style>@page{size:240pt 240pt;margin:0}body{margin:0}.table{display:table;border:solid 5px black;width:150px;height:100px}.cell{display:table-cell;background:cyan;overflow:scroll;padding:5px 15px 10px 20px;border:solid magenta;border-width:12px 9px 6px 3px}img{display:block;background:yellow;width:100%;height:100%}</style>\
+         <div class=\"table\"><div class=\"cell\"><img></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let black = filled_rect_bounds(page, CssColor::BLACK);
+    let cyan = largest_filled_rect(page, CssColor::new(0, 255, 255));
+    let yellow = largest_filled_rect(page, CssColor::new(255, 255, 0));
+
+    assert!(
+        ((black.2 - black.0) - 120.0).abs() < 0.01 && ((black.3 - black.1) - 82.5).abs() < 0.01,
+        "table border box must keep its 150px by 100px content size: {black:?}"
+    );
+    assert!(
+        (cyan.width() - 112.5).abs() < 0.01 && (cyan.height() - 75.0).abs() < 0.01,
+        "cell background must use the distributed table height: {cyan:?}"
+    );
+    assert!(
+        (yellow.width() - 77.25).abs() < 0.01 && (yellow.height() - 50.25).abs() < 0.01,
+        "final image must resolve against the cell content box: {yellow:?}"
+    );
+    assert!(
+        rect_covers(cyan, yellow),
+        "final percentage-height image must remain inside the cell scrollport: cyan={cyan:?}, yellow={yellow:?}"
+    );
+}
+
+#[tokio::test]
+async fn vertical_table_cell_final_relayout_uses_projected_physical_content_box() {
+    for writing_mode in ["vertical-lr", "vertical-rl"] {
+        let document = Html::from_string(format!(
+            "<style>@page{{size:260pt 260pt;margin:0}}body{{margin:0}}\
+             table{{writing-mode:{writing_mode};width:100pt;height:160pt;border-spacing:0}}\
+             td{{background:cyan;overflow:scroll;padding:5pt 15pt 10pt 20pt;border:solid magenta;border-width:12pt 9pt 6pt 3pt}}\
+             img{{display:block;background:yellow;width:100%;height:100%}}</style>\
+             <table><tr><td><img></td></tr></table>"
+        ))
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+
+        let page = &document.pages[0];
+        let cell = largest_filled_rect(page, CssColor::new(0, 255, 255));
+        let image = largest_filled_rect(page, CssColor::new(255, 255, 0));
+        let expected_width = cell.width() - 3.0 - 9.0 - 20.0 - 15.0;
+        let expected_height = cell.height() - 12.0 - 6.0 - 5.0 - 10.0;
+
+        assert!(
+            (image.width() - expected_width).abs() < 0.01,
+            "{writing_mode}: percentage width must resolve against the projected physical content width: cell={cell:?}, image={image:?}"
+        );
+        assert!(
+            (image.height() - expected_height).abs() < 0.01,
+            "{writing_mode}: percentage height must resolve against the projected physical content height: cell={cell:?}, image={image:?}"
+        );
+        assert!(
+            image.height() > image.width(),
+            "{writing_mode}: the final relayout must not substitute the row/block track for the physical content height: image={image:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1021,8 +1210,8 @@ async fn upright_vertical_rowspan_text_applies_each_glyph_origin_once() {
     assert_eq!(glyph_origins.len(), 3);
     for (index, origin) in glyph_origins.iter().enumerate() {
         assert!(
-            (*origin - (-12.0 - index as f32 * 12.0)).abs() < 0.01,
-            "glyph {index} must receive its 1em vertical origin once, after its normal-flow advance: line={line:?}"
+            (*origin - (-(index as f32) * 12.0)).abs() < 0.01,
+            "glyph {index} must receive its normal-flow vertical advance once: line={line:?}"
         );
     }
 }
@@ -3167,6 +3356,49 @@ async fn table_overflow_hidden_clips_to_table_box_not_bottom_caption() {
 }
 
 #[tokio::test]
+async fn table_overflow_hidden_clips_grid_without_clipping_table_decoration_or_caption() {
+    let pdf = Html::from_string(
+        "<!doctype html>\
+         <style>\
+         @page { size: 160px 160px; margin: 0 } body { margin: 0 }\
+         table { overflow: hidden; border: 20px solid green; border-spacing: 0 }\
+         caption { height: 30px; background: lightblue; caption-side: bottom }\
+         td { padding: 0; width: 50px; height: 50px }\
+         .overflow { width: 500px; height: 500px; background: pink }\
+         </style>\
+         <table><tr><td><div style=\"width:50px;height:50px\"><div class=\"overflow\"></div></div></td></tr><caption>caption</caption></table>",
+    )
+    .write_pdf_bytes(&RenderOptions::default(), &crate::PdfOptions::default())
+    .await
+    .unwrap();
+    let rendered = pdf_searchable_text(&pdf);
+
+    for border_edge in [
+        "0 105 67.5 15 re",
+        "52.5 52.5 15 67.5 re",
+        "0 52.5 67.5 15 re",
+        "0 52.5 15 67.5 re",
+    ] {
+        assert!(
+            rendered.contains(border_edge),
+            "table overflow must not clip its own border edge {border_edge:?}: {rendered}"
+        );
+    }
+    assert!(
+        rendered.contains("15 67.5 37.5 37.5 re\nW\nn"),
+        "the oversized grid descendant must be clipped at the table padding edge: {rendered}"
+    );
+    assert!(
+        rendered.contains("15 -270 375 375 re\nf"),
+        "the oversized descendant should remain under the padding-edge clip: {rendered}"
+    );
+    assert!(
+        rendered.contains("0 30 67.5 22.5 re\nf"),
+        "the bottom caption must remain outside the table-grid clip: {rendered}"
+    );
+}
+
+#[tokio::test]
 async fn table_overflow_auto_on_table_box_behaves_as_visible() {
     let pdf = Html::from_string(
         "<!doctype html>\
@@ -5123,6 +5355,69 @@ async fn page_break_inside_avoid_tbody_relaxes_at_a_cell_boundary_when_edge_spac
         (actual_first_table_block.y() - reference_first_table_block.y()).abs() < 0.01,
         "continuation must retain the separated-border leading edge spacing: actual={actual_first_table_block:?}, reference={reference_first_table_block:?}"
     );
+}
+
+#[tokio::test]
+async fn page_break_inside_avoid_row_matches_forced_header_break_with_separated_borders() {
+    let render = |body: &str, extra_style: &str| {
+        Html::from_string(format!(
+            "<!DOCTYPE html><style>@page {{ size:5in 3in; margin:.5in }} p {{ height:1in; width:1in; margin:0; background:blue }} {extra_style}</style><body>{body}</body>"
+        ))
+    };
+    let actual = render(
+        "<table border=\"1\"><thead><tr><td><p>1</p></td></tr></thead><tbody><tr class=\"test\"><td><p>2</p><p>3</p></td></tr></tbody></table>",
+        ".test { page-break-inside: avoid }",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+    let reference = render(
+        "<table border=\"1\"><thead><tr><td><p>1</p></td></tr></thead><tbody><tr><td><p>2</p><p>3</p></td></tr></tbody></table>",
+        "thead { page-break-after: always }",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(actual.pages.len(), reference.pages.len());
+    let blue = CssColor::new(0, 0, 255);
+    for (page_index, (actual_page, reference_page)) in
+        actual.pages.iter().zip(&reference.pages).enumerate()
+    {
+        assert_eq!(
+            actual_page
+                .lines()
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            reference_page
+                .lines()
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            "page {page_index} text"
+        );
+        let actual_blue = actual_page
+            .rects()
+            .iter()
+            .filter(|rect| rect.fill == Some(blue))
+            .collect::<Vec<_>>();
+        let reference_blue = reference_page
+            .rects()
+            .iter()
+            .filter(|rect| rect.fill == Some(blue))
+            .collect::<Vec<_>>();
+        assert_eq!(actual_blue.len(), reference_blue.len(), "page {page_index}");
+        for (actual_rect, reference_rect) in actual_blue.iter().zip(reference_blue) {
+            assert!(
+                (actual_rect.x() - reference_rect.x()).abs() < 0.01
+                    && (actual_rect.y() - reference_rect.y()).abs() < 0.01
+                    && (actual_rect.width() - reference_rect.width()).abs() < 0.01
+                    && (actual_rect.height() - reference_rect.height()).abs() < 0.01,
+                "page {page_index} blue geometry differs: actual={actual_rect:?}, reference={reference_rect:?}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -8992,10 +9287,19 @@ async fn running_table_row_replays_nested_table_and_flex_descendants() {
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
-    assert!(lines.contains(&"Flex Item"), "{lines:?}");
+    assert!(lines.contains(&"Flex"), "{lines:?}");
+    assert!(lines.contains(&"Item"), "{lines:?}");
     assert!(lines.contains(&"Inner Table"), "{lines:?}");
     assert_eq!(
-        lines.iter().filter(|text| **text == "Flex Item").count(),
+        lines
+            .iter()
+            .filter(|text| **text == "Flex" || **text == "Item")
+            .count(),
+        2,
+        "nested replay should only appear through the page margin: {lines:?}"
+    );
+    assert_eq!(
+        lines.iter().filter(|text| **text == "Inner Table").count(),
         1,
         "nested replay should only appear through the page margin: {lines:?}"
     );

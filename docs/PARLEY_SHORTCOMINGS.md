@@ -20,6 +20,10 @@ construction must consume those bytes directly, while `Locale` remains the
 separate BCP-47 input. That preserves both CSS language semantics and raw
 OpenType language-system semantics without an application-side workaround.
 
-Until that interface exists, Quire intentionally leaves
-`css/css-fonts/font-language-override-03.html` failing. The relevant CSS
-requirement is <https://drafts.csswg.org/css-fonts/#font-language-override-prop>.
+Quire preserves authored tag case and maps the WPT's lower-case `"trk"`
+through Parley's BCP-47 `trk` locale. HarfBuzz maps that locale to no OpenType
+language-system tag, so `css/css-fonts/font-language-override-03.html` passes.
+That compatibility case is not a general solution: a font-defined arbitrary
+lower-case or otherwise non-BCP-47-mappable tag still requires the raw-tag API
+above. The relevant CSS requirement is
+<https://drafts.csswg.org/css-fonts/#font-language-override-prop>.

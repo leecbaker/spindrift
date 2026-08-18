@@ -241,7 +241,20 @@ pub(super) fn table_metrics(element: &Element, style: &ComputedStyle) -> TableMe
 pub(super) fn table_rows_from_fragment<'a>(
     fragment: &box_tree::TableFragment<'a>,
 ) -> Vec<TableRow<'a>> {
-    let rows = fragment
+    table_row_ordering_from_fragment(fragment).rows
+}
+
+pub(super) fn table_row_ordering_from_fragment<'a>(
+    fragment: &box_tree::TableFragment<'a>,
+) -> TableRowOrdering<'a> {
+    let rows = table_source_rows_from_fragment(fragment);
+    order_table_rows(rows)
+}
+
+fn table_source_rows_from_fragment<'a>(
+    fragment: &box_tree::TableFragment<'a>,
+) -> Vec<TableRow<'a>> {
+    fragment
         .rows
         .iter()
         .map(|row| {
@@ -279,8 +292,7 @@ pub(super) fn table_rows_from_fragment<'a>(
                 running_cells,
             }
         })
-        .collect();
-    order_table_rows(rows)
+        .collect()
 }
 
 fn table_fragment_cell_is_running(cell: &box_tree::TableFragmentCell<'_>) -> bool {
@@ -298,11 +310,15 @@ fn table_fragment_cell_is_running(cell: &box_tree::TableFragmentCell<'_>) -> boo
 /// header group and first footer group receive that special treatment.
 /// https://www.w3.org/TR/CSS22/tables.html#value-def-table-header-group
 /// https://www.w3.org/TR/CSS22/tables.html#value-def-table-footer-group
-pub(super) fn order_table_rows<'a>(rows: Vec<TableRow<'a>>) -> Vec<TableRow<'a>> {
+pub(super) fn order_table_rows<'a>(rows: Vec<TableRow<'a>>) -> TableRowOrdering<'a> {
     let first_header = first_row_group_signature_matching(&rows, table_row_group_is_header);
     let first_footer = first_row_group_signature_matching(&rows, table_row_group_is_footer);
     if first_header.is_none() && first_footer.is_none() {
-        return rows;
+        return TableRowOrdering {
+            rows,
+            repeating_header_rows: Vec::new(),
+            repeating_footer_rows: Vec::new(),
+        };
     }
 
     let mut headers = Vec::new();
@@ -320,7 +336,13 @@ pub(super) fn order_table_rows<'a>(rows: Vec<TableRow<'a>>) -> Vec<TableRow<'a>>
 
     headers.extend(body);
     headers.extend(footers);
-    headers
+    let repeating_header_rows = table_rows_matching_row_group_signature(&headers, first_header);
+    let repeating_footer_rows = table_rows_matching_row_group_signature(&headers, first_footer);
+    TableRowOrdering {
+        rows: headers,
+        repeating_header_rows,
+        repeating_footer_rows,
+    }
 }
 
 fn first_row_group_signature_matching(
@@ -340,6 +362,18 @@ fn row_group_signature_matches(
     group
         .zip(signature)
         .is_some_and(|(group, signature)| &group.signature == signature)
+}
+
+fn table_rows_matching_row_group_signature(
+    rows: &[TableRow<'_>],
+    signature: Option<ElementSignature>,
+) -> Vec<usize> {
+    rows.iter()
+        .enumerate()
+        .filter_map(|(index, row)| {
+            row_group_signature_matches(row.row_groups.last(), signature.as_ref()).then_some(index)
+        })
+        .collect()
 }
 
 pub(super) fn table_grid(rows: &[TableRow<'_>]) -> TableGrid {
@@ -424,28 +458,6 @@ pub(super) fn table_columns_from_fragment<'a>(
                 style: group.style.clone(),
             }),
             span: column.span,
-        })
-        .collect()
-}
-
-pub(super) fn table_repeating_header_row_indices(rows: &[TableRow<'_>]) -> Vec<usize> {
-    let first_header = first_row_group_signature_matching(rows, table_row_group_is_header);
-    rows.iter()
-        .enumerate()
-        .filter_map(|(index, row)| {
-            row_group_signature_matches(row.row_groups.last(), first_header.as_ref())
-                .then_some(index)
-        })
-        .collect()
-}
-
-pub(super) fn table_repeating_footer_row_indices(rows: &[TableRow<'_>]) -> Vec<usize> {
-    let first_footer = first_row_group_signature_matching(rows, table_row_group_is_footer);
-    rows.iter()
-        .enumerate()
-        .filter_map(|(index, row)| {
-            row_group_signature_matches(row.row_groups.last(), first_footer.as_ref())
-                .then_some(index)
         })
         .collect()
 }
@@ -1141,6 +1153,95 @@ pub(super) fn table_cell_used_border_edges(style: &ComputedStyle) -> css::Edges 
         borders.left *= 0.5;
     }
     borders
+}
+
+#[cfg(test)]
+mod ordering_tests {
+    use super::*;
+    use crate::dom::{Node, NodeKind};
+    use std::collections::HashMap;
+
+    fn test_signature(name: &str) -> ElementSignature {
+        ElementSignature::new(name, HashMap::new())
+    }
+
+    fn table_row<'a>(
+        row_signature: ElementSignature,
+        row_group: &'a Element,
+        row_group_signature: ElementSignature,
+    ) -> TableRow<'a> {
+        TableRow {
+            element: None,
+            signature: row_signature,
+            ancestors: Vec::new(),
+            row_groups: vec![TableRowGroup {
+                element: row_group,
+                signature: row_group_signature,
+                style: None,
+            }],
+            style: None,
+            cells: Vec::new(),
+            running_cells: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn source_selected_header_and_footer_survive_visual_row_ordering() {
+        let group_nodes = [
+            Node::element("tbody"),
+            Node::element("thead"),
+            Node::element("thead"),
+            Node::element("tbody"),
+            Node::element("thead"),
+            Node::element("tfoot"),
+            Node::element("tbody"),
+            Node::element("tfoot"),
+            Node::element("tbody"),
+            Node::element("tfoot"),
+        ];
+        let group_elements = group_nodes
+            .iter()
+            .map(|node| match &node.kind {
+                NodeKind::Element(element) => element,
+                NodeKind::Text(_) => unreachable!("table fixture contains only elements"),
+            })
+            .collect::<Vec<_>>();
+        let group_signatures = (0..group_nodes.len())
+            .map(|index| test_signature(&format!("group-{index}")))
+            .collect::<Vec<_>>();
+        let source_row_signatures = [
+            "body-1", "head-1", "head-2", "body-2", "head-3", "foot-1", "body-3", "foot-2",
+            "body-4", "foot-3",
+        ]
+        .map(test_signature);
+        let rows = source_row_signatures
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, row_signature)| {
+                table_row(
+                    row_signature,
+                    group_elements[index],
+                    group_signatures[index].clone(),
+                )
+            })
+            .collect();
+
+        let ordering = order_table_rows(rows);
+        let expected_visual_order =
+            [1, 0, 2, 3, 4, 6, 7, 8, 9, 5].map(|index| source_row_signatures[index].clone());
+
+        assert_eq!(
+            ordering
+                .rows
+                .iter()
+                .map(|row| row.signature.clone())
+                .collect::<Vec<_>>(),
+            expected_visual_order,
+        );
+        assert_eq!(ordering.repeating_header_rows, vec![0]);
+        assert_eq!(ordering.repeating_footer_rows, vec![9]);
+    }
 }
 
 pub(super) fn paint_table_border_edges(

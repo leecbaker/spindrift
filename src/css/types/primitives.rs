@@ -460,6 +460,7 @@ pub(crate) struct FontRelativeLengthBasis {
     x_height: LayoutLength,
     cap_height: LayoutLength,
     ic_advance: LayoutLength,
+    line_height: LayoutLength,
 }
 
 impl FontRelativeLengthBasis {
@@ -472,6 +473,7 @@ impl FontRelativeLengthBasis {
             x_height: layout_pt(font_size.points() * 0.5),
             cap_height: layout_pt(font_size.points() * 0.7),
             ic_advance: font_size,
+            line_height: layout_pt(font_size.points() * 1.2),
         }
     }
 
@@ -495,12 +497,24 @@ impl FontRelativeLengthBasis {
         self
     }
 
+    /// Records the computed line-height used by parent-relative `lh` terms
+    /// in font-affecting properties.
+    /// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>
+    pub(crate) const fn with_line_height(mut self, line_height: LayoutLength) -> Self {
+        self.line_height = line_height;
+        self
+    }
+
     pub(crate) const fn font_size(self) -> LayoutLength {
         self.font_size
     }
 
     pub(crate) const fn ch_advance(self) -> LayoutLength {
         self.ch_advance
+    }
+
+    pub(crate) const fn line_height(self) -> LayoutLength {
+        self.line_height
     }
 
     pub(crate) const fn x_height(self) -> LayoutLength {

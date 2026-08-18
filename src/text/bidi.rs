@@ -258,4 +258,32 @@ mod tests {
             "\u{1e904}\u{1e901}\u{1e902}\u{1e901}\u{1e900}"
         );
     }
+
+    #[test]
+    fn astral_adlam_ltr_isolate_override_keeps_override_visual_order() {
+        // `isolate-override` with `direction:ltr` is FSI + LRO … PDF + PDI.
+        // The override must retain the Adlam source sequence even though the
+        // same astral characters are intrinsically RTL.
+        // <https://drafts.csswg.org/css-writing-modes-4/#unicode-bidi>
+        let adlam = "\u{1e900}\u{1e901}\u{1e902}\u{1e903}";
+        let isolate_override = format!("\u{2068}\u{202d}{adlam}\u{202c}\u{2069}");
+
+        let overridden = visual_text(&isolate_override, Direction::Ltr);
+        let intrinsic = visual_text(adlam, Direction::Ltr);
+
+        assert_eq!(overridden, adlam);
+        assert_ne!(overridden, intrinsic);
+        assert!(
+            resolve_bidi_visual_ranges(&isolate_override, Direction::Ltr)
+                .iter()
+                .all(|range| isolate_override.is_char_boundary(range.range.start)
+                    && isolate_override.is_char_boundary(range.range.end))
+        );
+    }
+
+    #[test]
+    fn ltr_isolate_keeps_ideographic_content_in_visual_ranges() {
+        let text = "東\u{2066}京都東京\u{2069}都";
+        assert_eq!(visual_text(text, Direction::Ltr), "東京都東京都");
+    }
 }

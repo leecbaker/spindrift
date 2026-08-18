@@ -1,5 +1,5 @@
 use super::super::super::*;
-use super::{exclusions::FLOAT_EPSILON, model::*};
+use super::{HypotheticalClearBorderEdge, exclusions::FLOAT_EPSILON, model::*};
 
 /// Resolve the auto border-box width available to a BFC root beside floats.
 ///
@@ -97,7 +97,13 @@ impl FloatContext {
     ) -> FloatBandPlacement {
         let width = margin_box_size.width;
         let height = margin_box_size.height;
-        let mut top = self.clearance_top(clear, writing_mode, direction, page_index, top);
+        let mut top = self.clearance_top(
+            clear,
+            writing_mode,
+            direction,
+            page_index,
+            HypotheticalClearBorderEdge::new(top),
+        );
         // A later float may share a row with an earlier float, but its outer
         // top may not be above that earlier float's outer top. Resolve
         // `clear` first, then apply this independent source-order constraint:
@@ -167,7 +173,13 @@ impl FloatContext {
     where
         F: FnMut(FloatBand, PageTopBlockPosition) -> FloatAvoidanceCandidate,
     {
-        let mut top = self.clearance_top(clear, writing_mode, direction, page_index, top);
+        let mut top = self.clearance_top(
+            clear,
+            writing_mode,
+            direction,
+            page_index,
+            HypotheticalClearBorderEdge::new(top),
+        );
         let inline_span = PageInlineSpan::from_edges(left, right);
         let mut last_placement = None;
         for _ in 0..self.shapes.len().saturating_add(2) {
@@ -319,7 +331,13 @@ impl FloatContext {
     ) -> FloatBandPlacement {
         let width = margin_box_size.width;
         let height = margin_box_size.height;
-        let top = self.clearance_top(clear, clear_writing_mode, direction, page_index, top);
+        let top = self.clearance_top(
+            clear,
+            clear_writing_mode,
+            direction,
+            page_index,
+            HypotheticalClearBorderEdge::new(top),
+        );
         let inline_size = (top.points() - page_bottom.points()).max(height).max(1.0);
         // With no exclusions, a BFC root remains at its hypothetical physical
         // top regardless of whether the vertical inline axis starts at the

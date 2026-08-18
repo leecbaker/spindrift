@@ -1,6 +1,6 @@
 # CSS Grid Parity
 
-Last updated: 2026-08-04
+Last updated: 2026-08-13
 
 This document tracks Quire's CSS Grid implementation. It is a living
 tracking document: update it whenever grid behavior is added, narrowed,
@@ -34,9 +34,9 @@ Paged PDF keeps native scrollbar reservation/interaction out of scope; this
 work covers the common scrollport clipping geometry rather than scrollbar
 chrome.
 
-Three focused cases are intentionally not counted as Grid implementation
-targets: `display-grid.html` and `display-inline-grid.html` compare authored
-fixed Grid tracks with legacy table row-height distribution, and
+Two focused cases are intentionally not counted as Grid implementation
+targets: `display-inline-grid.html` compares authored fixed Grid tracks with
+legacy table row-height distribution, and
 `grid-container-ignores-first-letter-002.html` requires HTML button control
 display semantics in addition to Grid.
 
@@ -68,10 +68,11 @@ or writing-mode behavior.
   metrics are retained with the placed item and reused by replay and
   post-layout corrections, preventing either physical-width resolution or a
   second application of the same edge.
-- Taffy 0.11.0 is already a dependency and its default feature set includes
-  CSS Grid support. Grid integration should use Taffy for the core Grid Level
-  1 placement and track-sizing algorithm where its public model matches the
-  CSS model.
+- Taffy 0.13.0 is the core Grid engine. Its template-area representation
+  preserves authored row/column dimensions even when cells are unnamed, and it
+  resolves horizontal-tb `self-start`/`self-end` against each item's direction.
+  Quire retains vertical-writing, baseline, fragmentation, and physical-side
+  corrections outside that public model.
 - CSS display parsing now accepts `grid`, `inline-grid`, `block grid`,
   `inline grid`, and `run-in grid`. Grid boxes are recognized as independent
   formatting contexts.
@@ -106,6 +107,9 @@ or writing-mode behavior.
   collects normal-flow grid items, runs a Taffy-backed Grid Level 1 layout,
   and replays each item through Quire's existing block, inline, table, flex,
   replaced, paint, and side-effect machinery. Grid container
+  roots accept explicit parent-owned principal-box paint during flex replay;
+  this suppresses only the grid root's decoration and gap rules, never its
+  descendants' paint.
   definite/available-height setup reserves block-axis margins through the
   shared cursor-bounds fragmentainer capacity primitive used by block, flex,
   and table fragmentation. Grid now builds a grid-local committed fragment plan
@@ -172,7 +176,10 @@ or writing-mode behavior.
   same-page path. Fixed-size `repeat(auto-fill, ...)` expands to the number of
   repeated tracks that fit a definite same-page grid inline size, and
   fixed-size `repeat(auto-fit, ...)` collapses empty repeated tracks before
-  content alignment. Flexible `fr` tracks distribute definite container width for
+  content alignment. Fixed-size auto-repeat fragments resolve mixed
+  length-percentage `calc()` track breadths against a definite grid axis before
+  entering Taffy, while retaining its `auto-fit` empty-track collapse.
+  Flexible `fr` tracks distribute definite container width for
   basic same-page normal-flow grids. Simple backward named spans from a
   definite end line and negative named line placements can synthesize startward
   implicit tracks in non-repeat and finite numbered-repeat column and row
@@ -261,6 +268,9 @@ or writing-mode behavior.
   Area-created explicit columns from `grid-template-areas` also use cycled
   auto-column sizes and generated area lines when `grid-template-columns` is
   absent or shorter than the area grid.
+  In row flow, automatic items create only the implicit columns required by
+  their largest span and any definite-row placement; subsequent automatic
+  items fill newly created rows rather than adding columns to intrinsic width.
   Column-flow grids with no simple placed items avoid synthesizing an empty
   implicit column.
   Percentage explicit column track breadths are treated as `auto` for grid

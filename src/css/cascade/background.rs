@@ -1,6 +1,6 @@
 use super::*;
 use crate::css::component_values::{
-    css_single_function, css_single_ident, split_css_top_level_once,
+    css_leading_ident, css_single_function, css_single_ident, split_css_top_level_once,
     try_split_css_component_values, try_split_css_top_level_delimiter,
 };
 
@@ -499,6 +499,18 @@ pub(crate) enum ParsedImage {
     Image(ComputedImage),
 }
 
+/// The grammar position in which an image is parsed.
+///
+/// CSS Images forbids `image-set()` from appearing directly or indirectly in
+/// one of its candidates. Other image positions, including `light-dark()`
+/// branches, admit the complete supported `<image>` grammar.
+/// <https://drafts.csswg.org/css-images-4/#image-set-notation>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageParseContext {
+    General,
+    ImageSetCandidate,
+}
+
 /// Parse one complete CSS image value while retaining computed invalid-image
 /// state for every property that accepts `<image>`.
 pub(crate) fn parse_css_image(
@@ -506,11 +518,22 @@ pub(crate) fn parse_css_image(
     base_url: Option<&url::Url>,
     root_url: Option<&url::Url>,
 ) -> ParsedImage {
-    match parse_image_set(value, base_url, root_url) {
-        ParsedImage::NotAnImage => {}
-        image => return image,
+    parse_css_image_in_context(value, base_url, root_url, ImageParseContext::General)
+}
+
+fn parse_css_image_in_context(
+    value: &str,
+    base_url: Option<&url::Url>,
+    root_url: Option<&url::Url>,
+    context: ImageParseContext,
+) -> ParsedImage {
+    if context == ImageParseContext::General {
+        match parse_image_set(value, base_url, root_url) {
+            ParsedImage::NotAnImage => {}
+            image => return image,
+        }
     }
-    parse_css_image_without_image_set(value, base_url, root_url)
+    parse_css_image_without_image_set_in_context(value, base_url, root_url, context)
 }
 
 /// Parse a supported concrete `<image>` while deliberately excluding
@@ -522,13 +545,30 @@ fn parse_css_image_without_image_set(
     base_url: Option<&url::Url>,
     root_url: Option<&url::Url>,
 ) -> ParsedImage {
+    parse_css_image_without_image_set_in_context(
+        value,
+        base_url,
+        root_url,
+        ImageParseContext::ImageSetCandidate,
+    )
+}
+
+fn parse_css_image_without_image_set_in_context(
+    value: &str,
+    base_url: Option<&url::Url>,
+    root_url: Option<&url::Url>,
+    context: ImageParseContext,
+) -> ParsedImage {
+    if let Some(image) = parse_light_dark_image(value, base_url, root_url, context) {
+        return image;
+    }
     if let Some(gradient) = parse_conic_gradient(value) {
         return ParsedImage::Image(ComputedImage::image(BackgroundImage::ConicGradient(
             gradient,
         )));
     }
-    if let Some(color) = parse_color_image(value) {
-        return ParsedImage::Image(ComputedImage::image(BackgroundImage::CssColor(color)));
+    if let Some(image) = parse_image_function(value, base_url, root_url) {
+        return image;
     }
     if let Some(gradient) = parse_linear_gradient(value) {
         return ParsedImage::Image(ComputedImage::image(BackgroundImage::LinearGradient(
@@ -543,12 +583,56 @@ fn parse_css_image_without_image_set(
     let Some(url) = parse_first_css_url_with_modifiers(value) else {
         return ParsedImage::NotAnImage;
     };
-    ParsedImage::Image(ComputedImage::image(BackgroundImage::Url {
-        src: url.src,
+    ParsedImage::Image(ComputedImage::image(BackgroundImage::Url(ImageUrl {
+        href: url.src,
         base_url: base_url.cloned(),
         root_url: root_url.cloned(),
         request_modifiers: url.modifiers,
-    }))
+    })))
+}
+
+/// Parse CSS Color 5's image form of `light-dark()`.
+///
+/// The color form is deliberately left to the color parser. In an image
+/// grammar both arguments must be an image or `none`; `none` computes to the
+/// transparent generated image rather than the CSS image keyword `none`.
+/// <https://drafts.csswg.org/css-color-5/#light-dark>
+fn parse_light_dark_image(
+    value: &str,
+    base_url: Option<&url::Url>,
+    root_url: Option<&url::Url>,
+    context: ImageParseContext,
+) -> Option<ParsedImage> {
+    let (arguments, tail) = css_leading_function_matching(trim_css_value(value), "light-dark")?;
+    if !tail.trim().is_empty() {
+        return Some(ParsedImage::SyntaxError);
+    }
+    let branches = crate::css::component_values::split_css_top_level_delimiter(arguments, ',');
+    let [light, dark] = branches.as_slice() else {
+        return Some(ParsedImage::SyntaxError);
+    };
+    let parse_branch = |branch: &&str| {
+        let branch = trim_css_value(branch);
+        if branch.eq_ignore_ascii_case("none") {
+            return ParsedImage::Image(ComputedImage::image(BackgroundImage::CssColor(
+                ColorImageColor::CssColor(CssColor::TRANSPARENT),
+            )));
+        }
+        parse_css_image_in_context(branch, base_url, root_url, context)
+    };
+    match (parse_branch(light), parse_branch(dark)) {
+        (
+            ParsedImage::Image(ComputedImage::Image(light)),
+            ParsedImage::Image(ComputedImage::Image(dark)),
+        ) => Some(ParsedImage::Image(ComputedImage::image(
+            BackgroundImage::LightDark(LightDarkImage { light, dark }),
+        ))),
+        // CSS Color 5 defines an independent color form. Keep that value
+        // available to grammars such as the `background` shorthand, whose
+        // color component parses it after image recognition has declined it.
+        (ParsedImage::NotAnImage, ParsedImage::NotAnImage) => Some(ParsedImage::NotAnImage),
+        _ => Some(ParsedImage::SyntaxError),
+    }
 }
 
 /// Parse a concrete image for legacy consumers that cannot represent invalid
@@ -564,18 +648,129 @@ pub(crate) fn parse_background_image(
     }
 }
 
-/// Parse CSS Images Level 4's `image(<color>)` subset. A color image has no
-/// intrinsic dimensions, so it participates in background sizing like every
-/// other generated image.
-/// <https://drafts.csswg.org/css-images-4/#image-notation>
-fn parse_color_image(value: &str) -> Option<ColorImageColor> {
-    let (argument, tail) = css_leading_function_matching(trim_css_value(value), "image")?;
-    tail.trim().is_empty().then_some(())?;
-    if argument.trim().eq_ignore_ascii_case("currentcolor") {
-        Some(ColorImageColor::CurrentColor)
-    } else {
-        parse_color(argument.trim()).map(ColorImageColor::CssColor)
+/// Parse CSS Images Level 5's URL/color fallback notation.
+///
+/// The grammar admits one optional image source, one optional fallback color,
+/// and an optional source-direction tag. `image(<color>)` remains the
+/// dimensionless solid-color image form.
+/// <https://drafts.csswg.org/css-images-5/#image-notation>
+fn parse_image_function(
+    value: &str,
+    base_url: Option<&url::Url>,
+    root_url: Option<&url::Url>,
+) -> Option<ParsedImage> {
+    let (arguments, tail) = css_leading_function_matching(trim_css_value(value), "image")?;
+    if !tail.trim().is_empty() {
+        return Some(ParsedImage::SyntaxError);
     }
+    let arguments = crate::css::component_values::split_css_top_level_delimiter(arguments, ',');
+    let ([before] | [before, _]) = arguments.as_slice() else {
+        return Some(ParsedImage::SyntaxError);
+    };
+    let has_fallback_slot = arguments.len() == 2;
+    let mut before = trim_css_value(before);
+    let mut directionality = None;
+    if let Some((ident, tail)) = css_leading_ident(before)
+        && let Some(direction) = match ident.to_ascii_lowercase().as_str() {
+            "ltr" => Some(ImageDirectionality::Ltr),
+            "rtl" => Some(ImageDirectionality::Rtl),
+            _ => None,
+        }
+    {
+        directionality = Some(direction);
+        before = trim_css_value(tail);
+    }
+
+    if let Some((_, tail)) = css_leading_function_matching(before, "url")
+        && !tail.trim().is_empty()
+    {
+        return Some(ParsedImage::SyntaxError);
+    }
+    if before.len() >= 4
+        && before[..4].eq_ignore_ascii_case("url(")
+        && before
+            .rfind(')')
+            .is_none_or(|close| !before[close + 1..].trim().is_empty())
+    {
+        return Some(ParsedImage::SyntaxError);
+    }
+    let source = parse_image_function_source(before, base_url, root_url);
+    if source.is_none()
+        && (css_leading_function_matching(before, "url").is_some()
+            || parse_css_string_token(before).is_some())
+    {
+        // Do not let a permissive color parser reinterpret a malformed URL or
+        // string source as a color with trailing tokens.
+        return Some(ParsedImage::SyntaxError);
+    }
+    let fallback_color = if has_fallback_slot {
+        let fallback = trim_css_value(arguments[1]);
+        if fallback.is_empty() {
+            return Some(ParsedImage::SyntaxError);
+        } else if parse_image_function_source(fallback, base_url, root_url).is_some() {
+            // A second source is the obsolete fallback-chain syntax, not a
+            // CSS Images 5 fallback color.
+            return Some(ParsedImage::SyntaxError);
+        } else if fallback.eq_ignore_ascii_case("currentcolor") {
+            Some(ColorImageColor::CurrentColor)
+        } else {
+            Some(parse_color(fallback).map(ColorImageColor::CssColor)?)
+        }
+    } else if before.is_empty() {
+        None
+    } else if source.is_none() {
+        if before.eq_ignore_ascii_case("currentcolor") {
+            Some(ColorImageColor::CurrentColor)
+        } else {
+            Some(parse_color(before).map(ColorImageColor::CssColor)?)
+        }
+    } else {
+        None
+    };
+
+    // A direction tag is meaningful only for an external source. A comma
+    // separates the source slot from the fallback-color slot; colors before
+    // that comma are therefore syntactically invalid.
+    if source.is_none() && !before.is_empty() && has_fallback_slot
+        || directionality.is_some() && source.is_none()
+        || source.is_none() && fallback_color.is_none()
+    {
+        return Some(ParsedImage::SyntaxError);
+    }
+    Some(ParsedImage::Image(ComputedImage::image(
+        BackgroundImage::ImageFunction(ImageFunction {
+            source,
+            fallback_color,
+            directionality,
+        }),
+    )))
+}
+
+fn parse_image_function_source(
+    value: &str,
+    base_url: Option<&url::Url>,
+    root_url: Option<&url::Url>,
+) -> Option<ImageUrl> {
+    if value.is_empty() {
+        return None;
+    }
+    if let Some((url, tail)) = parse_css_url_token_with_modifiers(value)
+        && tail.trim().is_empty()
+    {
+        return Some(ImageUrl {
+            href: url.src,
+            base_url: base_url.cloned(),
+            root_url: root_url.cloned(),
+            request_modifiers: url.modifiers,
+        });
+    }
+    let (href, tail) = parse_css_string_token(value)?;
+    tail.trim().is_empty().then_some(ImageUrl {
+        href,
+        base_url: base_url.cloned(),
+        root_url: root_url.cloned(),
+        request_modifiers: RequestUrlModifiers::default(),
+    })
 }
 
 /// Parse CSS Images Level 4 conic gradients into their angular color-line.
@@ -797,23 +992,23 @@ fn parse_image_set_option_image<'a>(
 ) -> Option<(BackgroundImage, &'a str)> {
     if let Some((url, tail)) = parse_css_url_token_with_modifiers(value) {
         return Some((
-            BackgroundImage::Url {
-                src: url.src,
+            BackgroundImage::Url(ImageUrl {
+                href: url.src,
                 base_url: base_url.cloned(),
                 root_url: root_url.cloned(),
                 request_modifiers: url.modifiers,
-            },
+            }),
             tail,
         ));
     }
     if let Some((url, tail)) = parse_css_string_token(value) {
         return Some((
-            BackgroundImage::Url {
-                src: url,
+            BackgroundImage::Url(ImageUrl {
+                href: url,
                 base_url: base_url.cloned(),
                 root_url: root_url.cloned(),
                 request_modifiers: RequestUrlModifiers::default(),
-            },
+            }),
             tail,
         ));
     }
@@ -826,6 +1021,7 @@ fn parse_image_set_option_image<'a>(
         "repeating-radial-gradient",
         "conic-gradient",
         "repeating-conic-gradient",
+        "light-dark",
     ]
     .iter()
     .any(|known| name.eq_ignore_ascii_case(known))
@@ -1705,6 +1901,17 @@ fn strip_background_noise(value: &str) -> Option<String> {
                         Some("scroll" | "fixed" | "local")
                     )
                     && parse_background_box(token).is_none()
+                    // `light-dark()` colors require a used color scheme to
+                    // compute, but shorthand grammar validation only needs
+                    // to recognize them as a color component. A fixed dummy
+                    // context validates the grammar without affecting the
+                    // later scheme-aware used value.
+                    && parse_color_from_currentcolor_in_scheme(
+                        token,
+                        CssColor::BLACK,
+                        UsedColorScheme::Light,
+                    )
+                    .is_none()
                     && parse_color(token).is_none()
             })
             .collect::<Vec<_>>()

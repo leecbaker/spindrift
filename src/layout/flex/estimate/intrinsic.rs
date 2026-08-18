@@ -46,6 +46,8 @@ mod tests {
             automatic_cross_size: false,
             main_outer_extras: FlexMainLength::new(0.0),
             cross_outer_extras: FlexCrossLength::new(0.0),
+            min_main_negative_outer_contribution: FlexMainLength::new(0.0),
+            max_main_negative_outer_contribution: FlexMainLength::new(0.0),
         }
     }
 
@@ -107,6 +109,49 @@ mod tests {
                 None,
             ),
             FlexMainSize::new(0.0)
+        );
+    }
+
+    #[test]
+    fn non_growable_definite_flex_basis_caps_intrinsic_contribution() {
+        // `min-width: auto` is a used-size automatic minimum; it must not
+        // replace this intrinsic flex-base cap.
+        assert_eq!(
+            flex_intrinsic_main_size_contribution(
+                FlexMainLength::new(30.0),
+                None,
+                Some(FlexMainSize::new(16.5)),
+                None,
+                None,
+                None,
+            ),
+            FlexMainSize::new(16.5),
+        );
+    }
+
+    #[test]
+    fn automatic_basis_with_definite_preferred_main_size_caps_contribution() {
+        let mut style = ComputedStyle::initial();
+        style.flex_grow = css::FlexGrowFactor::ZERO;
+        style.flex_basis = css::ComputedFlexBasis::Auto;
+
+        assert_eq!(
+            definite_intrinsic_flex_base_size(
+                &style,
+                FlexMainSize::new(16.5),
+                PercentageBasis::indefinite(),
+                true,
+            ),
+            Some(FlexMainSize::new(16.5)),
+        );
+        assert_eq!(
+            definite_intrinsic_flex_base_size(
+                &style,
+                FlexMainSize::new(16.5),
+                PercentageBasis::indefinite(),
+                false,
+            ),
+            None,
         );
     }
 
@@ -190,6 +235,43 @@ mod tests {
     }
 
     #[test]
+    fn intrinsic_balance_uses_normal_wrap_count_before_the_minimum() {
+        let mut style = ComputedStyle::initial();
+        style.flex_wrap = FlexWrap::Balance;
+        style.flex_direction = FlexDirection::Column;
+        style.box_values.height.replace_with_used(
+            css::ComputedLengthPercentageOrAuto::LengthPercentage(
+                css::ComputedLengthPercentage::from_points(75.0),
+            ),
+        );
+        let available = FlexAvailableSpace {
+            width: PhysicalContentWidth::new(content_box_pt(100.0)),
+            width_basis: PercentageBasis::indefinite(),
+            height: Some(PhysicalContentHeight::new(content_box_pt(75.0))),
+            height_basis: PercentageBasis::definite_from(
+                content_box_pt(75.0),
+                FlexAvailableSizeSource::ContainingBlock,
+            ),
+        };
+        let items = (0..4)
+            .map(|_| intrinsic_item(FlexMainSize::new(18.75), FlexCrossSize::new(18.75)))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            intrinsic_balanced_line_count(
+                &style,
+                FlexDirection::Column,
+                &items,
+                FlexMainSize::new(7.5),
+                available,
+                FlexMainSize::new(18.75),
+                FlexMainSize::new(97.5),
+            ),
+            2,
+        );
+    }
+
+    #[test]
     fn wrapped_intrinsic_minimum_uses_item_minimum_when_main_basis_is_indefinite() {
         let mut style = ComputedStyle::initial();
         style.flex_wrap = FlexWrap::Wrap;
@@ -238,6 +320,13 @@ pub(in crate::layout::flex) struct FlexIntrinsicItem {
     pub(in crate::layout::flex) automatic_cross_size: bool,
     pub(in crate::layout::flex) main_outer_extras: FlexMainLength,
     pub(in crate::layout::flex) cross_outer_extras: FlexCrossLength,
+    /// The signed part of an intrinsic outer main contribution which is below
+    /// zero because margins may be negative. Item-local used sizes stay
+    /// non-negative, but Flexbox sums outer intrinsic contributions before
+    /// clamping the container result.
+    /// <https://www.w3.org/TR/css-flexbox-1/#intrinsic-item-contributions>
+    pub(in crate::layout::flex) min_main_negative_outer_contribution: FlexMainLength,
+    pub(in crate::layout::flex) max_main_negative_outer_contribution: FlexMainLength,
 }
 
 impl FlexIntrinsicItem {
@@ -297,6 +386,22 @@ impl FlexIntrinsicItem {
         )
         .map(|size| flex_main_size_from_content_box(size) + edges.main)
         .map(FlexMainLength::non_negative_size);
+        // Flexbox's content-based automatic minimum is a used min-main-size
+        // constraint during intrinsic contribution sizing. Keep it in content
+        // box space until joining the signed outer edges, so padding, borders,
+        // and margins each contribute exactly once.
+        // <https://www.w3.org/TR/css-flexbox-1/#min-size-auto> and
+        // <https://www.w3.org/TR/css-flexbox-1/#intrinsic-item-contributions>
+        let used_min_main_constraint = automatic_minimum_main_content_size(
+            child,
+            &size,
+            containing_style,
+            direction,
+            available,
+        )
+        .map(|size| flex_main_size_from_content_box(size) + edges.main)
+        .map(FlexMainLength::non_negative_size)
+        .or(min_main_constraint);
         let max_main_constraint = definite_flex_item_max_main_content_size(
             style,
             direction,
@@ -305,21 +410,18 @@ impl FlexIntrinsicItem {
         )
         .map(|size| flex_main_size_from_content_box(size) + edges.main)
         .map(FlexMainLength::non_negative_size);
-        let automatic_main_minimum = flex_min_size_uses_automatic_minimum(
-            if direction.is_row_axis() {
-                style.box_values.min_width.clone()
-            } else {
-                style.box_values.min_height.clone()
-            },
-            style.writing_mode,
-            direction,
+        // Flexbox caps an inflexible contribution by its flex base, then
+        // clamps it by the used minimum and maximum main sizes. In particular,
+        // a content-based automatic minimum floors the capped result instead
+        // of disabling the flex-base cap.
+        // <https://www.w3.org/TR/css-flexbox-1/#intrinsic-item-contributions>
+        let definite_flex_base_size = definite_intrinsic_flex_base_size(
+            style,
+            flex_base_size,
+            main_percentage_basis,
+            definite_main.is_some(),
         );
-        let definite_flex_base_size = (!automatic_main_minimum)
-            .then(|| {
-                definite_intrinsic_flex_base_size(style, flex_base_size, main_percentage_basis)
-            })
-            .flatten();
-        let min_main_contribution = flex_intrinsic_main_size_contribution(
+        let min_main_signed_contribution = flex_intrinsic_main_size_contribution_unclamped(
             flex_main_size_from_content_box(min_main_content) + edges.main,
             definite_main
                 .map(flex_main_size_from_content_box)
@@ -330,19 +432,21 @@ impl FlexIntrinsicItem {
             // case instead derives its contribution from max-content below:
             // <https://www.w3.org/TR/css-flexbox-1/#intrinsic-main-sizes>.
             (style.flex_shrink <= 0.0 && style.flex_grow > 0.0).then_some(flex_base_size),
-            min_main_constraint,
+            used_min_main_constraint,
             max_main_constraint,
         );
-        let max_main_contribution = flex_intrinsic_main_size_contribution(
+        let max_main_signed_contribution = flex_intrinsic_main_size_contribution_unclamped(
             flex_main_size_from_content_box(max_main_content) + edges.main,
             definite_main
                 .map(flex_main_size_from_content_box)
                 .map(|size| size + edges.main),
             definite_flex_base_size,
             (style.flex_shrink <= 0.0).then_some(flex_base_size),
-            min_main_constraint,
+            used_min_main_constraint,
             max_main_constraint,
         );
+        let min_main_contribution = min_main_signed_contribution.non_negative_size();
+        let max_main_contribution = max_main_signed_contribution.non_negative_size();
         let hypothetical_main_size = flex_base_size
             .max(min_main_contribution)
             .min(max_main_contribution.max(min_main_contribution));
@@ -389,6 +493,12 @@ impl FlexIntrinsicItem {
             },
             main_outer_extras: edges.main,
             cross_outer_extras: edges.cross,
+            min_main_negative_outer_contribution: FlexMainLength::new(
+                min_main_signed_contribution.points().min(0.0),
+            ),
+            max_main_negative_outer_contribution: FlexMainLength::new(
+                max_main_signed_contribution.points().min(0.0),
+            ),
         }
     }
 
@@ -531,6 +641,7 @@ fn constrained_flex_intrinsic_cross_content_sizes(
 /// An inflexible item still floors its max-content contribution at its flex
 /// base size so max-content layout preserves its used base size:
 /// <https://www.w3.org/TR/css-flexbox-1/#intrinsic-item-contributions>.
+#[cfg(test)]
 pub(in crate::layout::flex) fn flex_intrinsic_main_size_contribution(
     content_contribution: FlexMainLength,
     preferred_main_size: Option<FlexMainLength>,
@@ -539,36 +650,64 @@ pub(in crate::layout::flex) fn flex_intrinsic_main_size_contribution(
     min_main_size: Option<FlexMainSize>,
     max_main_size: Option<FlexMainSize>,
 ) -> FlexMainSize {
+    flex_intrinsic_main_size_contribution_unclamped(
+        content_contribution,
+        preferred_main_size,
+        definite_flex_base_size,
+        inflexible_flex_base_size,
+        min_main_size,
+        max_main_size,
+    )
+    .non_negative_size()
+}
+
+/// Resolve an intrinsic item contribution while retaining a negative outer
+/// margin contribution for the container-level merge.
+fn flex_intrinsic_main_size_contribution_unclamped(
+    content_contribution: FlexMainLength,
+    preferred_main_size: Option<FlexMainLength>,
+    definite_flex_base_size: Option<FlexMainSize>,
+    inflexible_flex_base_size: Option<FlexMainSize>,
+    min_main_size: Option<FlexMainSize>,
+    max_main_size: Option<FlexMainSize>,
+) -> FlexMainLength {
     let contribution = preferred_main_size
         .map(|preferred| content_contribution.max(preferred))
-        .unwrap_or(content_contribution)
-        .non_negative_size();
+        .unwrap_or(content_contribution);
     let contribution = definite_flex_base_size
-        .map(|basis| contribution.min(basis))
+        .map(|basis| FlexMainLength::new(contribution.points().min(basis.points())))
         .unwrap_or(contribution);
     let contribution = inflexible_flex_base_size
-        .map(|basis| contribution.max(basis))
+        .map(|basis| FlexMainLength::new(contribution.points().max(basis.points())))
         .unwrap_or(contribution);
     let contribution = min_main_size
-        .map(|minimum| contribution.max(minimum))
+        .map(|minimum| FlexMainLength::new(contribution.points().max(minimum.points())))
         .unwrap_or(contribution);
     max_main_size
-        .map(|maximum| contribution.min(maximum))
+        .map(|maximum| FlexMainLength::new(contribution.points().min(maximum.points())))
         .unwrap_or(contribution)
 }
 
-/// Return the flex base size only when the authored basis resolves without an
-/// indefinite percentage basis. `flex-basis:auto` instead follows the
-/// preferred main size and must not constrain intrinsic contributions.
+/// Return the flex base size when it is definite and the item cannot grow.
+///
+/// `flex-basis:auto` inherits a definite preferred main size, so it is just
+/// as definite a cap as a length-valued `flex-basis`. An automatic basis with
+/// an automatic preferred size remains content-based instead.
 fn definite_intrinsic_flex_base_size(
     style: &ComputedStyle,
     flex_base_size: FlexMainSize,
     main_percentage_basis: FlexAvailablePercentageBasis,
+    has_definite_preferred_main_size: bool,
 ) -> Option<FlexMainSize> {
     match &style.flex_basis {
         css::ComputedFlexBasis::LengthPercentage(length)
             if style.flex_grow <= 0.0
                 && (!length.contains_percentage() || main_percentage_basis.is_definite()) =>
+        {
+            Some(flex_base_size)
+        }
+        css::ComputedFlexBasis::Auto
+            if style.flex_grow <= 0.0 && has_definite_preferred_main_size =>
         {
             Some(flex_base_size)
         }
@@ -748,11 +887,12 @@ pub(in crate::layout::flex) fn intrinsic_flex_container_min_main_size(
         return FlexMainSize::new(0.0);
     }
     if style.flex_wrap == FlexWrap::NoWrap {
-        return items
-            .iter()
-            .map(|item| item.min_main_contribution)
-            .fold(FlexMainSize::new(0.0), |sum, size| sum + size)
-            + intrinsic_gap_total(gap, items.len());
+        return intrinsic_flex_container_main_sum(items, gap, |item| {
+            (
+                item.min_main_contribution,
+                item.min_main_negative_outer_contribution,
+            )
+        });
     }
 
     let intrinsic_min_line_limit = items
@@ -796,20 +936,26 @@ pub(in crate::layout::flex) fn intrinsic_flex_container_max_main_size(
     if items.is_empty() {
         return FlexMainSize::new(0.0);
     }
-    if style.flex_wrap.balances_lines()
-        && let css::FlexLineCount::Count(line_count) = style.flex_line_count
-    {
-        let line_count = line_count.get();
-        return intrinsic_balanced_flex_lines(items, line_count, gap)
-            .iter()
-            .map(|line| line.max_main)
-            .fold(FlexMainSize::new(0.0), FlexMainSize::max);
-    }
     let intrinsic_min_line_limit = items
         .iter()
         .map(|item| item.min_main_contribution)
         .fold(FlexMainSize::new(0.0), FlexMainSize::max);
     let intrinsic_max_line_limit = intrinsic_flex_container_max_main_size_no_wrap(items, gap);
+    if style.flex_wrap.balances_lines() {
+        let line_count = intrinsic_balanced_line_count(
+            style,
+            direction,
+            items,
+            gap,
+            available,
+            intrinsic_min_line_limit,
+            intrinsic_max_line_limit,
+        );
+        return intrinsic_balanced_flex_lines(items, line_count, gap)
+            .iter()
+            .map(|line| line.max_main)
+            .fold(FlexMainSize::new(0.0), FlexMainSize::max);
+    }
     if style.flex_wrap != FlexWrap::NoWrap
         && let Some(line_limit) = intrinsic_flex_container_line_limit(
             style,
@@ -902,10 +1048,16 @@ pub(in crate::layout::flex) fn intrinsic_flex_container_cross_sizes(
         return (min_cross, max_cross.max(min_cross));
     }
 
-    if style.flex_wrap.balances_lines()
-        && let css::FlexLineCount::Count(line_count) = style.flex_line_count
-    {
-        let line_count = line_count.get();
+    if style.flex_wrap.balances_lines() {
+        let line_count = intrinsic_balanced_line_count(
+            style,
+            direction,
+            items,
+            inputs.main_gap,
+            inputs.available,
+            inputs.min_main,
+            inputs.max_main,
+        );
         let lines = intrinsic_balanced_flex_lines(items, line_count, inputs.main_gap);
         let min_cross = intrinsic_flex_container_min_cross_size_for_lines(
             direction,
@@ -1087,6 +1239,35 @@ pub(in crate::layout::flex) fn intrinsic_balanced_flex_lines(
         .collect()
 }
 
+/// Select the number of lines used by an intrinsic balanced flex container.
+///
+/// Flexbox Level 2 first forms the normal-wrap lines from hypothetical outer
+/// main sizes, then raises that count to the authored `flex-line-count`
+/// minimum. Intrinsic cross sizing has the same topology requirement: a
+/// definite main-axis constraint can require multiple balanced columns even
+/// when the computed minimum is the initial value of one.
+///
+/// <https://drafts.csswg.org/css-flexbox-2/#algo-balance>
+/// <https://drafts.csswg.org/css-flexbox-2/#flex-line-count-property>
+fn intrinsic_balanced_line_count(
+    style: &ComputedStyle,
+    direction: FlexDirection,
+    items: &[FlexIntrinsicItem],
+    gap: FlexMainSize,
+    available: FlexAvailableSpace,
+    min_main: FlexMainSize,
+    max_main: FlexMainSize,
+) -> usize {
+    debug_assert!(!items.is_empty());
+    let normal_line_count =
+        intrinsic_flex_container_line_limit(style, direction, available, min_main, max_main)
+            .map(|line_limit| intrinsic_flex_lines(items, line_limit, gap).len())
+            .unwrap_or(1);
+    normal_line_count
+        .max(style.flex_line_count.get())
+        .min(items.len())
+}
+
 pub(in crate::layout::flex) fn intrinsic_flex_line(
     items: &[FlexIntrinsicItem],
     gap: FlexMainSize,
@@ -1114,11 +1295,27 @@ pub(in crate::layout::flex) fn intrinsic_flex_container_max_main_size_no_wrap(
     gap: FlexMainSize,
 ) -> FlexMainSize {
     let flex_fraction = intrinsic_max_content_flex_fraction(items);
-    items
-        .iter()
-        .map(|item| item.resolved_with_flex_fraction(flex_fraction))
-        .fold(FlexMainSize::new(0.0), |sum, size| sum + size)
-        + intrinsic_gap_total(gap, items.len())
+    intrinsic_flex_container_main_sum(items, gap, |item| {
+        (
+            item.resolved_with_flex_fraction(flex_fraction),
+            item.max_main_negative_outer_contribution,
+        )
+    })
+}
+
+/// Sum margin-inclusive intrinsic main contributions and clamp only the
+/// resulting container extent. This retains an item's negative outer margin
+/// long enough for a following item to occupy that recovered space.
+fn intrinsic_flex_container_main_sum(
+    items: &[FlexIntrinsicItem],
+    gap: FlexMainSize,
+    contribution: impl Fn(&FlexIntrinsicItem) -> (FlexMainSize, FlexMainLength),
+) -> FlexMainSize {
+    let sum = items.iter().fold(FlexMainLength::new(0.0), |sum, item| {
+        let (size, negative_outer) = contribution(item);
+        sum + FlexMainLength::new(size.points()) + negative_outer
+    }) + FlexMainLength::new(intrinsic_gap_total(gap, items.len()).points());
+    sum.non_negative_size()
 }
 
 pub(in crate::layout::flex) fn definite_flex_container_axis_size(

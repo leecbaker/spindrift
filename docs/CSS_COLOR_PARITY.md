@@ -70,7 +70,10 @@
   forms with a `currentcolor` origin resolve against each element's own
   computed `color`; relative RGB and HSL preserve extended-range target-space
   components.
-- `light-dark()` selects its light branch in Quire's fixed light print scheme.
+- CSS Color 5 `light-dark()` resolves color and image branches from each
+  consuming element's used color scheme. Image branches resolve before
+  `image-set()` candidate negotiation; `none` becomes a transparent generated
+  image with no natural size.
 - Deterministic print-palette values for CSS system colors and their deprecated
   aliases, so aliases compare consistently within a generated PDF.
 - CSS Color Adjustment forced-colors used values, including configurable light

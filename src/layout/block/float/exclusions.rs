@@ -1,7 +1,416 @@
 use super::super::super::*;
 use super::model::*;
+use std::num::NonZeroUsize;
 
 pub(in crate::layout) const FLOAT_EPSILON: f32 = 0.01;
+
+/// CSS clearance inserted immediately before an in-flow block's top margin.
+///
+/// This is not a position delta: CSS 2.2 re-resolves adjoining margins after
+/// clearance is introduced, so the clearance space itself can be negative or
+/// zero while still inhibiting margin collapse.
+/// <https://www.w3.org/TR/CSS22/visuren.html#flow-control>
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(in crate::layout) struct ClearanceSpace(LayoutLength);
+
+impl ClearanceSpace {
+    fn new(value: LayoutLength) -> Self {
+        Self(value)
+    }
+
+    fn flush_to_float(
+        margin_edge_before_top_margin: PageTopBlockPosition,
+        used_top_margin: LayoutLength,
+        cleared_outer_block_end: PageTopBlockPosition,
+    ) -> Self {
+        // With page-top coordinates, block progression subtracts from the
+        // margin edge. The signed clearance is therefore the residual after
+        // the non-collapsed top margin has been arranged before the flush
+        // border edge. CSS2 expressly allows this residual to be negative.
+        Self::new(layout_pt(
+            margin_edge_before_top_margin.points()
+                - cleared_outer_block_end.points()
+                - used_top_margin.points(),
+        ))
+    }
+
+    fn applied_border_edge(
+        self,
+        margin_edge_before_top_margin: PageTopBlockPosition,
+        used_top_margin: LayoutLength,
+    ) -> PageTopBlockPosition {
+        PageTopBlockPosition::new(
+            margin_edge_before_top_margin.points() - used_top_margin.points() - self.0.points(),
+        )
+    }
+}
+
+/// The used block-start margin of a box whose CSS2 clearance is inserted
+/// immediately before its authored top margin.
+///
+/// This is intentionally distinct from an authored margin. It exists only at
+/// the block-flow boundary where clearance prevents adjoining-margin collapse.
+/// <https://www.w3.org/TR/CSS22/visuren.html#flow-control>
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(in crate::layout) struct ClearanceAdjustedTopMargin(LayoutLength);
+
+impl ClearanceAdjustedTopMargin {
+    fn from_clearance_and_top_margin(clearance: ClearanceSpace, top_margin: LayoutLength) -> Self {
+        Self(layout_pt(clearance.0.points() + top_margin.points()))
+    }
+
+    pub(in crate::layout) fn border_edge_from(
+        self,
+        margin_edge_before_top_margin: PageTopBlockPosition,
+    ) -> PageTopBlockPosition {
+        PageTopBlockPosition::new(margin_edge_before_top_margin.points() - self.0.points())
+    }
+}
+
+/// The geometry and flow-relative direction used to resolve CSS2 clearance.
+///
+/// The three edges intentionally remain distinct: the hypothetical edge
+/// selects the float target, while the uncleared and margin edges describe
+/// the used normal-flow arrangement.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(in crate::layout) struct HypotheticalClearBorderEdge(PageTopBlockPosition);
+
+impl HypotheticalClearBorderEdge {
+    pub(in crate::layout) fn new(edge: PageTopBlockPosition) -> Self {
+        Self(edge)
+    }
+
+    pub(in crate::layout) fn position(self) -> PageTopBlockPosition {
+        self.0
+    }
+}
+
+/// The clear:none position inherited by a child whose start margin would
+/// otherwise adjoin its parent's block-start margin.
+///
+/// CSS 2.2 calculates clearance against this counterfactual position, not
+/// against the child's used post-margin position.
+/// <https://www.w3.org/TR/CSS22/visuren.html#flow-control>
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(in crate::layout) struct ParentStartClearanceHypothesis(HypotheticalClearBorderEdge);
+
+impl ParentStartClearanceHypothesis {
+    pub(in crate::layout) fn new(parent_border_edge: PageTopBlockPosition) -> Self {
+        Self(HypotheticalClearBorderEdge::new(parent_border_edge))
+    }
+
+    pub(in crate::layout) fn border_edge(self) -> HypotheticalClearBorderEdge {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(in crate::layout) struct UnclearedBorderEdge(PageTopBlockPosition);
+
+impl UnclearedBorderEdge {
+    pub(in crate::layout) fn new(edge: PageTopBlockPosition) -> Self {
+        Self(edge)
+    }
+
+    pub(in crate::layout) fn position(self) -> PageTopBlockPosition {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(in crate::layout) struct MarginEdgeBeforeClearance(PageTopBlockPosition);
+
+impl MarginEdgeBeforeClearance {
+    pub(in crate::layout) fn new(edge: PageTopBlockPosition) -> Self {
+        Self(edge)
+    }
+
+    pub(in crate::layout) fn position(self) -> PageTopBlockPosition {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(in crate::layout) struct ClearedFloatOuterBlockEnd(PageTopBlockPosition);
+
+impl ClearedFloatOuterBlockEnd {
+    pub(in crate::layout) fn new(edge: PageTopBlockPosition) -> Self {
+        Self(edge)
+    }
+
+    pub(in crate::layout) fn position(self) -> PageTopBlockPosition {
+        self.0
+    }
+
+    fn lowest(self, other: Self) -> Self {
+        if self.position().points() <= other.position().points() {
+            self
+        } else {
+            other
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(in crate::layout) struct BlockClearanceRequest {
+    pub(in crate::layout) clear: Clear,
+    pub(in crate::layout) writing_mode: WritingMode,
+    pub(in crate::layout) direction: Direction,
+    hypothetical_border_edge: HypotheticalClearBorderEdge,
+    uncleared_border_edge: UnclearedBorderEdge,
+    margin_edge_before_top_margin: MarginEdgeBeforeClearance,
+    used_top_margin: LayoutLength,
+}
+
+impl BlockClearanceRequest {
+    /// Construct a clearance query whose hypothetical, uncleared, and margin
+    /// edges coincide. Inline, flex, and grid callers have no adjoining
+    /// block-start margin relationship to re-resolve.
+    pub(in crate::layout) fn coincident_edges(
+        clear: Clear,
+        writing_mode: WritingMode,
+        direction: Direction,
+        edge: PageTopBlockPosition,
+    ) -> Self {
+        Self {
+            clear,
+            writing_mode,
+            direction,
+            hypothetical_border_edge: HypotheticalClearBorderEdge::new(edge),
+            uncleared_border_edge: UnclearedBorderEdge::new(edge),
+            margin_edge_before_top_margin: MarginEdgeBeforeClearance::new(edge),
+            used_top_margin: layout_pt(0.0),
+        }
+    }
+
+    /// Construct the request for an ordinary in-flow block. A first child
+    /// that would adjoin its parent's start margin when `clear:none` supplies
+    /// the counterfactual parent edge explicitly.
+    pub(in crate::layout) fn block_flow(
+        clear: Clear,
+        writing_mode: WritingMode,
+        direction: Direction,
+        uncleared_border_edge: PageTopBlockPosition,
+        margin_edge_before_top_margin: PageTopBlockPosition,
+        used_top_margin: LayoutLength,
+        parent_start_hypothesis: Option<ParentStartClearanceHypothesis>,
+    ) -> Self {
+        Self {
+            clear,
+            writing_mode,
+            direction,
+            hypothetical_border_edge: parent_start_hypothesis.map_or_else(
+                || HypotheticalClearBorderEdge::new(uncleared_border_edge),
+                ParentStartClearanceHypothesis::border_edge,
+            ),
+            uncleared_border_edge: UnclearedBorderEdge::new(uncleared_border_edge),
+            margin_edge_before_top_margin: MarginEdgeBeforeClearance::new(
+                margin_edge_before_top_margin,
+            ),
+            used_top_margin,
+        }
+    }
+
+    /// Construct the request for an independent BFC root. Its hypothetical
+    /// edge is its margin edge, while its uncleared border edge is after the
+    /// used top margin.
+    pub(in crate::layout) fn bfc_root(
+        clear: Clear,
+        writing_mode: WritingMode,
+        direction: Direction,
+        margin_edge_before_top_margin: PageTopBlockPosition,
+        uncleared_border_edge: PageTopBlockPosition,
+        used_top_margin: LayoutLength,
+    ) -> Self {
+        Self {
+            clear,
+            writing_mode,
+            direction,
+            hypothetical_border_edge: HypotheticalClearBorderEdge::new(
+                margin_edge_before_top_margin,
+            ),
+            uncleared_border_edge: UnclearedBorderEdge::new(uncleared_border_edge),
+            margin_edge_before_top_margin: MarginEdgeBeforeClearance::new(
+                margin_edge_before_top_margin,
+            ),
+            used_top_margin,
+        }
+    }
+}
+
+/// Whether CSS `clear` introduced a margin-collapse boundary for one
+/// non-floating block-level box.
+/// <https://www.w3.org/TR/CSS22/visuren.html#flow-control>
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(in crate::layout) enum BlockClearance {
+    NotIntroduced,
+    Introduced {
+        space: ClearanceSpace,
+        cleared_outer_block_end: ClearedFloatOuterBlockEnd,
+    },
+}
+
+impl BlockClearance {
+    pub(in crate::layout) fn is_introduced(self) -> bool {
+        matches!(self, Self::Introduced { .. })
+    }
+}
+
+/// The block-start margin relationship selected after CSS2 clearance has been
+/// resolved. A zero or negative clearance space still selects the separated
+/// relationship.
+/// <https://www.w3.org/TR/CSS22/visuren.html#flow-control>
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(in crate::layout) enum BlockStartMarginArrangement {
+    Adjoining {
+        applied_start_margin: LayoutLength,
+    },
+    SeparatedByClearance {
+        adjusted_top_margin: ClearanceAdjustedTopMargin,
+    },
+}
+
+impl BlockStartMarginArrangement {
+    pub(in crate::layout) fn from_clearance(
+        clearance: BlockClearance,
+        applied_start_margin: LayoutLength,
+    ) -> Self {
+        match clearance {
+            BlockClearance::NotIntroduced => Self::Adjoining {
+                applied_start_margin,
+            },
+            BlockClearance::Introduced { space, .. } => Self::SeparatedByClearance {
+                adjusted_top_margin: ClearanceAdjustedTopMargin::from_clearance_and_top_margin(
+                    space,
+                    applied_start_margin,
+                ),
+            },
+        }
+    }
+
+    pub(in crate::layout) fn permits_parent_start_collapse(self) -> bool {
+        matches!(self, Self::Adjoining { .. })
+    }
+
+    pub(in crate::layout) fn margin_collapse_boundary(self) -> BlockMarginCollapseBoundary {
+        if self.permits_parent_start_collapse() {
+            BlockMarginCollapseBoundary::Adjoining
+        } else {
+            BlockMarginCollapseBoundary::SeparatedByClearance
+        }
+    }
+
+    pub(in crate::layout) fn applied_start_margin(self) -> Option<LayoutLength> {
+        match self {
+            Self::Adjoining {
+                applied_start_margin,
+            } => Some(applied_start_margin),
+            Self::SeparatedByClearance { .. } => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod clearance_margin_tests {
+    use super::*;
+
+    #[test]
+    fn adjusted_top_margin_preserves_positive_zero_and_negative_clearance() {
+        let margin_edge = PageTopBlockPosition::new(1_000.0);
+        let top_margin = layout_pt(100.0);
+
+        let positive = ClearanceAdjustedTopMargin::from_clearance_and_top_margin(
+            ClearanceSpace::new(layout_pt(100.0)),
+            top_margin,
+        );
+        let zero = ClearanceAdjustedTopMargin::from_clearance_and_top_margin(
+            ClearanceSpace::new(layout_pt(0.0)),
+            top_margin,
+        );
+        let negative = ClearanceAdjustedTopMargin::from_clearance_and_top_margin(
+            ClearanceSpace::new(layout_pt(-50.0)),
+            top_margin,
+        );
+
+        assert_eq!(
+            positive.border_edge_from(margin_edge),
+            PageTopBlockPosition::new(800.0)
+        );
+        assert_eq!(
+            zero.border_edge_from(margin_edge),
+            PageTopBlockPosition::new(900.0)
+        );
+        assert_eq!(
+            negative.border_edge_from(margin_edge),
+            PageTopBlockPosition::new(950.0)
+        );
+    }
+
+    #[test]
+    fn zero_clearance_still_separates_parent_start_margin_collapse() {
+        let arrangement = BlockStartMarginArrangement::from_clearance(
+            BlockClearance::Introduced {
+                space: ClearanceSpace::new(layout_pt(0.0)),
+                cleared_outer_block_end: ClearedFloatOuterBlockEnd::new(PageTopBlockPosition::new(
+                    900.0,
+                )),
+            },
+            layout_pt(100.0),
+        );
+
+        assert!(!arrangement.permits_parent_start_collapse());
+        assert_eq!(
+            arrangement.margin_collapse_boundary(),
+            BlockMarginCollapseBoundary::SeparatedByClearance
+        );
+    }
+
+    #[test]
+    fn parent_start_hypothesis_can_require_negative_clearance() {
+        let margin_edge = PageTopBlockPosition::new(1_000.0);
+        let clearance = ClearanceSpace::flush_to_float(
+            margin_edge,
+            layout_pt(200.0),
+            PageTopBlockPosition::new(950.0),
+        );
+
+        assert_eq!(clearance, ClearanceSpace::new(layout_pt(-150.0)));
+        assert_eq!(
+            clearance.applied_border_edge(margin_edge, layout_pt(200.0)),
+            PageTopBlockPosition::new(950.0)
+        );
+    }
+}
+
+/// Fragmentainer progress performed while following a continued cleared
+/// float.  A column is a fragmentainer just as a page is, so this count must
+/// survive temporary multicolumn-page projection.
+/// <https://drafts.csswg.org/css-break-3/#fragmentation-model>
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::layout) enum ClearanceFragmentainerProgress {
+    Current,
+    Advanced { count: NonZeroUsize },
+}
+
+impl ClearanceFragmentainerProgress {
+    pub(in crate::layout) fn advanced(self) -> bool {
+        matches!(self, Self::Advanced { .. })
+    }
+}
+
+/// The resolved CSS2 clearance state for a non-floating block-level box.
+///
+/// `used_border_edge` is the float-clearance target; callers use
+/// [`BlockClearance`] rather than comparing positions to determine whether
+/// margin collapse is inhibited.
+/// <https://www.w3.org/TR/CSS22/visuren.html#flow-control>
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(in crate::layout) struct ResolvedBlockClearance {
+    pub(in crate::layout) hypothetical_border_edge: PageTopBlockPosition,
+    pub(in crate::layout) used_border_edge: PageTopBlockPosition,
+    pub(in crate::layout) clearance: BlockClearance,
+    pub(in crate::layout) fragmentainer_progress: ClearanceFragmentainerProgress,
+}
 
 impl FloatRunState {
     pub(in crate::layout) fn new(row_span: PageInlineSpan, row_top: PageTopBlockPosition) -> Self {
@@ -614,10 +1023,18 @@ impl FloatContext {
         writing_mode: WritingMode,
         direction: Direction,
         page_index: usize,
-        top: PageTopBlockPosition,
+        hypothetical_border_edge: HypotheticalClearBorderEdge,
     ) -> PageTopBlockPosition {
-        self.clearance_resolution(clear, writing_mode, direction, page_index, top)
-            .top
+        self.clearance_target(
+            clear,
+            writing_mode,
+            direction,
+            page_index,
+            hypothetical_border_edge,
+        )
+        .lowest_matching_outer_block_end
+        .map(ClearedFloatOuterBlockEnd::position)
+        .unwrap_or_else(|| hypothetical_border_edge.position())
     }
 
     /// Resolve page-local clearance against matching floats.
@@ -629,37 +1046,44 @@ impl FloatContext {
     /// is required before clearance is complete:
     /// <https://www.w3.org/TR/CSS22/visuren.html#flow-control> and
     /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>.
-    pub(in crate::layout) fn clearance_resolution(
+    pub(in crate::layout) fn clearance_target(
         &self,
         clear: Clear,
         writing_mode: WritingMode,
         direction: Direction,
         page_index: usize,
-        top: PageTopBlockPosition,
-    ) -> FloatClearanceResolution {
+        hypothetical_border_edge: HypotheticalClearBorderEdge,
+    ) -> FloatClearanceTarget {
         if clear == Clear::None {
-            return FloatClearanceResolution {
-                top,
+            return FloatClearanceTarget {
+                lowest_matching_outer_block_end: None,
                 continued_float: None,
             };
         }
-        let mut cleared_top = top;
+        let mut lowest_matching_outer_block_end: Option<ClearedFloatOuterBlockEnd> = None;
         let mut continued_float = None;
         for shape in self.shapes.iter().filter(|shape| {
             shape.is_css_float()
                 && shape.page_index == page_index
                 && shape.side.matches_clear(clear, writing_mode, direction)
-                && shape.margin_box_block_span().bottom_y() < top.points() + FLOAT_EPSILON
+                && shape.margin_box_block_span().bottom_y()
+                    < hypothetical_border_edge.position().points() + FLOAT_EPSILON
         }) {
-            cleared_top = cleared_top.min(PageTopBlockPosition::new(
+            let block_end = ClearedFloatOuterBlockEnd::new(PageTopBlockPosition::new(
                 shape.margin_box_block_span().bottom_y(),
             ));
+            lowest_matching_outer_block_end = Some(
+                lowest_matching_outer_block_end
+                    .map_or(block_end, |current: ClearedFloatOuterBlockEnd| {
+                        current.lowest(block_end)
+                    }),
+            );
             if shape.continues_on_next_page {
                 continued_float = Some(shape.id);
             }
         }
-        FloatClearanceResolution {
-            top: cleared_top,
+        FloatClearanceTarget {
+            lowest_matching_outer_block_end,
             continued_float,
         }
     }
@@ -859,15 +1283,25 @@ impl<'a> LayoutBuilder<'a> {
         }
     }
 
-    pub(in crate::layout) fn current_float_band(&self, block_span: PageBlockSpan) -> FloatBand {
+    /// Return the float-shortened physical line span for an explicit
+    /// containing span.
+    ///
+    /// Most callers use [`Self::current_float_band`], but outside-marker
+    /// fallbacks retain their containing geometry after descendant layout and
+    /// therefore must not read the builder's transient content edges.
+    pub(in crate::layout) fn float_band_in_span(
+        &self,
+        block_span: PageBlockSpan,
+        containing_inline_span: PageInlineSpan,
+    ) -> FloatBand {
         let offset = self.inline_split_float_exclusion_query_offset;
         let translated_block_span = PageBlockSpan::from_edges(
             block_span.top_y() + offset.y(),
             block_span.bottom_y() + offset.y(),
         );
         let translated_inline_span = PageInlineSpan::from_edges(
-            self.content_left + offset.x(),
-            self.content_right + offset.x(),
+            containing_inline_span.left_x() + offset.x(),
+            containing_inline_span.right_x() + offset.x(),
         );
         let band = self
             .float_contexts
@@ -879,6 +1313,13 @@ impl<'a> LayoutBuilder<'a> {
                 translated_inline_span,
             );
         FloatBand::from_edges(band.left() - offset.x(), band.right() - offset.x())
+    }
+
+    pub(in crate::layout) fn current_float_band(&self, block_span: PageBlockSpan) -> FloatBand {
+        self.float_band_in_span(
+            block_span,
+            PageInlineSpan::from_edges(self.content_left, self.content_right),
+        )
     }
 
     pub(in crate::layout) fn current_logical_float_band(
@@ -915,7 +1356,7 @@ impl<'a> LayoutBuilder<'a> {
             || band.right() < self.content_right - FLOAT_EPSILON
     }
 
-    /// Return the top border edge after applying `clear` in the current BFC.
+    /// Resolve CSS2 clearance for a non-floating block-level box.
     ///
     /// CSS 2.2 clearance is page-local for each float fragment, but CSS
     /// Fragmentation can split a prior float across fragmentainers. When a
@@ -923,32 +1364,63 @@ impl<'a> LayoutBuilder<'a> {
     /// and clear the next page-local fragment before normal flow resumes:
     /// <https://www.w3.org/TR/CSS22/visuren.html#flow-control> and
     /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>.
-    pub(in crate::layout) fn clear_active_floats_top(
+    pub(in crate::layout) fn resolve_block_clearance(
         &mut self,
-        clear: Clear,
-        writing_mode: WritingMode,
-        direction: Direction,
-        mut top: PageTopBlockPosition,
-    ) -> PageTopBlockPosition {
-        if clear == Clear::None {
-            return top;
+        request: BlockClearanceRequest,
+    ) -> ResolvedBlockClearance {
+        if request.clear == Clear::None {
+            return ResolvedBlockClearance {
+                hypothetical_border_edge: request.hypothetical_border_edge.position(),
+                used_border_edge: request.uncleared_border_edge.position(),
+                clearance: BlockClearance::NotIntroduced,
+                fragmentainer_progress: ClearanceFragmentainerProgress::Current,
+            };
         }
+        let mut clearance_query_edge = request.hypothetical_border_edge;
+        let mut used_border_edge = request.uncleared_border_edge.position();
+        let mut margin_edge_for_clearance = request.margin_edge_before_top_margin.position();
         let mut cleared_continuations = 0usize;
+        let mut clearance = BlockClearance::NotIntroduced;
         loop {
-            let resolution = self
+            let target = self
                 .float_contexts
                 .last()
                 .expect("root float context exists")
-                .clearance_resolution(
-                    clear,
-                    writing_mode,
-                    direction,
+                .clearance_target(
+                    request.clear,
+                    request.writing_mode,
+                    request.direction,
                     self.current_float_page_index(),
-                    top,
+                    clearance_query_edge,
                 );
-            top = resolution.top;
-            let Some(continued_float) = resolution.continued_float else {
-                return top;
+            if let Some(cleared_outer_block_end) = target.lowest_matching_outer_block_end {
+                // Clearance is inserted before the top margin.  The current
+                // page coordinate decreases toward block end; construct and
+                // apply the signed margin-space arrangement instead of
+                // treating clearance as a cursor adjustment.
+                let space = ClearanceSpace::flush_to_float(
+                    margin_edge_for_clearance,
+                    request.used_top_margin,
+                    cleared_outer_block_end.position(),
+                );
+                used_border_edge =
+                    space.applied_border_edge(margin_edge_for_clearance, request.used_top_margin);
+                clearance = BlockClearance::Introduced {
+                    space,
+                    cleared_outer_block_end,
+                };
+            }
+            let Some(continued_float) = target.continued_float else {
+                let fragmentainer_progress = NonZeroUsize::new(cleared_continuations)
+                    .map_or(ClearanceFragmentainerProgress::Current, |count| {
+                        ClearanceFragmentainerProgress::Advanced { count }
+                    });
+                return ResolvedBlockClearance {
+                    hypothetical_border_edge: request.hypothetical_border_edge.position(),
+                    used_border_edge,
+                    clearance,
+                    fragmentainer_progress,
+                };
             };
             let next_page_index = self.current_float_page_index() + 1;
             let has_next_fragment = self
@@ -971,11 +1443,23 @@ impl<'a> LayoutBuilder<'a> {
                         .shapes
                         .len()
             {
-                return top;
+                let fragmentainer_progress = NonZeroUsize::new(cleared_continuations)
+                    .map_or(ClearanceFragmentainerProgress::Current, |count| {
+                        ClearanceFragmentainerProgress::Advanced { count }
+                    });
+                return ResolvedBlockClearance {
+                    hypothetical_border_edge: request.hypothetical_border_edge.position(),
+                    used_border_edge,
+                    clearance,
+                    fragmentainer_progress,
+                };
             }
-            self.cursor_y = top.points();
+            self.cursor_y = used_border_edge.points();
             self.push_page();
-            top = PageTopBlockPosition::new(self.cursor_y);
+            clearance_query_edge =
+                HypotheticalClearBorderEdge::new(PageTopBlockPosition::new(self.cursor_y));
+            used_border_edge = clearance_query_edge.position();
+            margin_edge_for_clearance = clearance_query_edge.position();
             cleared_continuations += 1;
         }
     }

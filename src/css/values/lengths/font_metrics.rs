@@ -34,15 +34,15 @@ pub(crate) fn set_deferred_font_size(
     parent_font_size: f32,
     parent_ch_advance: LayoutLength,
 ) {
-    let font_size = match font_size {
-        DeferredFontSize::ParentLineHeight(multiplier) => {
-            DeferredFontSize::Absolute(multiplier * style.line_height)
-        }
-        font_size => font_size,
-    };
-    style.font_size = clamp_used_layout_length(font_size.resolve(
-        crate::css::FontRelativeLengthBasis::new(layout_pt(parent_font_size), parent_ch_advance),
-    ))
+    style.font_size = clamp_used_layout_length(
+        font_size.resolve(
+            crate::css::FontRelativeLengthBasis::new(
+                layout_pt(parent_font_size),
+                parent_ch_advance,
+            )
+            .with_line_height(layout_pt(style.line_height)),
+        ),
+    )
     .points();
     style.deferred_font_size = font_size;
     project_line_height(style);
@@ -118,12 +118,6 @@ pub(crate) fn parse_deferred_font_size(value: &str) -> Option<DeferredFontSize> 
         return Some(DeferredFontSize::RelativeToParent(
             ComputedLengthPercentage::from_em(em),
         ));
-    }
-    if let Some(lh) = lower
-        .strip_suffix("lh")
-        .and_then(|value| value.parse::<f32>().ok())
-    {
-        return Some(DeferredFontSize::ParentLineHeight(lh));
     }
     parse_math_length_percentage_with_root(value, 0.0, ROOT_FONT_SIZE_PT)
         .map(DeferredFontSize::RelativeToParent)

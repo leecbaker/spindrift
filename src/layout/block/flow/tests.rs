@@ -1,6 +1,78 @@
 use super::*;
 
 #[test]
+fn post_layout_constraint_fixes_principal_extent_without_a_percentage_basis() {
+    let content_height = PhysicalContentHeight::new(content_box_pt(40.0));
+    let disposition = PrincipalBlockSizeDisposition::Fixed(
+        FixedPrincipalBlockSize::from_resolved_content_height(
+            content_height,
+            BoxSizing::ContentBox,
+            non_content_pt(0.0),
+        ),
+    );
+
+    assert_eq!(disposition.fixed_content_height(), Some(content_height));
+    assert_eq!(
+        PrincipalBlockSizeDisposition::ContentSized.fixed_content_height(),
+        None
+    );
+    let descendant_percentage_basis: PercentageBasis<ContentBoxLength> =
+        PercentageBasis::Indefinite;
+    assert!(!descendant_percentage_basis.is_definite());
+}
+
+#[test]
+fn fixed_principal_block_size_retains_border_box_fragmentation_origin() {
+    let size = FixedPrincipalBlockSize::from_resolved_content_height(
+        PhysicalContentHeight::new(content_box_pt(180.0)),
+        BoxSizing::BorderBox,
+        non_content_pt(20.0),
+    );
+
+    assert_eq!(
+        size.content_height(),
+        PhysicalContentHeight::new(content_box_pt(180.0))
+    );
+    assert_eq!(
+        size.specified_box(),
+        FixedPrincipalBlockSpecifiedBox::BorderBox(border_box_pt(200.0))
+    );
+}
+
+#[test]
+fn cloned_border_box_progress_reserves_decoration_in_every_fragment() {
+    let size = FixedPrincipalBlockSize::from_resolved_content_height(
+        PhysicalContentHeight::new(content_box_pt(180.0)),
+        BoxSizing::BorderBox,
+        non_content_pt(20.0),
+    );
+    let decoration =
+        FragmentDecoration::for_box_decoration_break(css::BoxDecorationBreak::Clone, false, false);
+    let mut progress = size
+        .cloned_border_box_progress(
+            decoration,
+            FragmentDecorationReservation::new(
+                decoration,
+                non_content_pt(10.0),
+                non_content_pt(10.0),
+            ),
+        )
+        .expect("a cloned border-box needs destination-budget progress");
+
+    assert_eq!(
+        progress.consume_content_capacity(layout_pt(80.0)),
+        layout_pt(80.0)
+    );
+    assert!(!progress.is_complete());
+    assert_eq!(
+        progress.consume_content_capacity(layout_pt(80.0)),
+        layout_pt(80.0)
+    );
+    assert!(progress.is_complete());
+    assert_eq!(progress.remaining_border_box(), border_box_pt(0.0));
+}
+
+#[test]
 fn orthogonality_depends_on_line_geometry_for_all_writing_modes() {
     let modes = [
         WritingMode::HorizontalTb,
@@ -131,6 +203,7 @@ fn typed_border_edges_control_block_margin_collapse() {
     assert!(can_collapse_block_end_margin(
         element,
         &style,
+        PercentageBasis::indefinite(),
         zero_edges,
         false,
         css::Overflow::Visible,
@@ -148,10 +221,106 @@ fn typed_border_edges_control_block_margin_collapse() {
     assert!(!can_collapse_block_end_margin(
         element,
         &style,
+        PercentageBasis::indefinite(),
         UsedEdges {
             bottom: layout_pt(1.0),
             ..zero_edges
         },
+        false,
+        css::Overflow::Visible,
+    ));
+}
+
+#[test]
+fn margin_collapse_height_recognizes_automatic_used_sizes() {
+    let indefinite: BlockSizePercentageBasis = PercentageBasis::indefinite();
+    let definite =
+        block_size_percentage_basis_from_points(Some(120.0), BlockSizeBasisSource::ContainingBlock);
+    let mut style = ComputedStyle::initial();
+
+    assert!(height_behaves_as_auto_for_margin_collapse(
+        &style, indefinite
+    ));
+
+    *style.box_values.height = css::ComputedLengthPercentageOrAuto::LengthPercentage(
+        css::ComputedLengthPercentage::from_percent(100.0),
+    );
+    assert!(height_behaves_as_auto_for_margin_collapse(
+        &style, indefinite
+    ));
+    assert!(!height_behaves_as_auto_for_margin_collapse(
+        &style, definite
+    ));
+
+    for height in [
+        css::ComputedLengthPercentageOrAuto::MinContent,
+        css::ComputedLengthPercentageOrAuto::MaxContent,
+        css::ComputedLengthPercentageOrAuto::FitContent(None),
+    ] {
+        *style.box_values.height = height;
+        assert!(height_behaves_as_auto_for_margin_collapse(
+            &style, indefinite
+        ));
+        assert!(height_behaves_as_auto_for_margin_collapse(&style, definite));
+    }
+
+    *style.box_values.height = css::ComputedLengthPercentageOrAuto::Stretch;
+    assert!(height_behaves_as_auto_for_margin_collapse(
+        &style, indefinite
+    ));
+    assert!(!height_behaves_as_auto_for_margin_collapse(
+        &style, definite
+    ));
+
+    *style.box_values.height = css::ComputedLengthPercentageOrAuto::CalcSize(css::CalcSize {
+        basis: css::CalcSizeBasis::Auto,
+        size_multiplier: 1.0,
+        additive: css::ComputedLengthPercentage::ZERO,
+        lower_bound: None,
+        upper_bound: None,
+    });
+    assert!(height_behaves_as_auto_for_margin_collapse(&style, definite));
+
+    *style.box_values.height = css::ComputedLengthPercentageOrAuto::CalcSize(css::CalcSize {
+        basis: css::CalcSizeBasis::MinContent,
+        size_multiplier: 1.0,
+        additive: css::ComputedLengthPercentage::ZERO,
+        lower_bound: None,
+        upper_bound: None,
+    });
+    assert!(!height_behaves_as_auto_for_margin_collapse(
+        &style, indefinite
+    ));
+}
+
+#[test]
+fn parent_end_margin_collapse_uses_indefinite_percentage_basis() {
+    let node = Node::element("div");
+    let element = node.as_element().expect("constructed an element node");
+    let mut style = ComputedStyle::initial();
+    *style.box_values.height = css::ComputedLengthPercentageOrAuto::LengthPercentage(
+        css::ComputedLengthPercentage::from_percent(100.0),
+    );
+    let zero_edges = UsedEdges {
+        top: layout_pt(0.0),
+        right: layout_pt(0.0),
+        bottom: layout_pt(0.0),
+        left: layout_pt(0.0),
+    };
+
+    assert!(can_collapse_block_end_margin(
+        element,
+        &style,
+        BlockSizePercentageBasis::indefinite(),
+        zero_edges,
+        false,
+        css::Overflow::Visible,
+    ));
+    assert!(!can_collapse_block_end_margin(
+        element,
+        &style,
+        block_size_percentage_basis_from_points(Some(120.0), BlockSizeBasisSource::ContainingBlock),
+        zero_edges,
         false,
         css::Overflow::Visible,
     ));
@@ -245,6 +414,10 @@ fn nearest_scroll_container_selects_and_caps_orthogonal_fallback() {
         available.orthogonal_available_height,
         OrthogonalAvailableHeight::NearestScrollContainer(_)
     ));
+    assert!(matches!(
+        available.orthogonal_inline_measure(),
+        OrthogonalInlineMeasure::NearestScrollContainer(_)
+    ));
     assert_eq!(available.available_physical_height().points(), 600.0);
     assert!(!available.physical_height_percentage_basis().is_definite());
 }
@@ -268,6 +441,10 @@ fn unconstrained_scroll_container_stops_outer_fallback_while_non_scroller_constr
     assert!(matches!(
         reset.orthogonal_available_height,
         OrthogonalAvailableHeight::InitialContainingBlock(_)
+    ));
+    assert!(matches!(
+        reset.orthogonal_inline_measure(),
+        OrthogonalInlineMeasure::InitialContainingBlock(_)
     ));
     assert_eq!(reset.available_physical_height().points(), 600.0);
 
@@ -322,6 +499,12 @@ fn unconstrained_scroll_container_stops_outer_fallback_while_non_scroller_constr
             PhysicalContentHeight::new(content_box_pt(520.0))
         ))
     );
+    assert!(matches!(
+        minimum_floor.orthogonal_inline_measure(),
+        OrthogonalInlineMeasure::DirectContainingBlock(
+            DirectOrthogonalAvailableHeight::MinimumFloor(_)
+        )
+    ));
 
     // A used `height` is the immediate containing block's actual constraint,
     // not the auto-height fallback. It therefore selects the direct
@@ -341,6 +524,12 @@ fn unconstrained_scroll_container_stops_outer_fallback_while_non_scroller_constr
         initial,
     );
     assert_eq!(fixed.available_physical_height().points(), 720.0);
+    assert!(matches!(
+        fixed.orthogonal_inline_measure(),
+        OrthogonalInlineMeasure::DirectContainingBlock(DirectOrthogonalAvailableHeight::Definite(
+            _
+        ))
+    ));
     assert_eq!(
         fixed.direct_orthogonal_available_height,
         Some(DirectOrthogonalAvailableHeight::Definite(

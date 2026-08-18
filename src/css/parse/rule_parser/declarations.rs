@@ -2,9 +2,12 @@ use super::declaration_values::*;
 use super::supports::strip_enclosing_parentheses;
 use super::*;
 use crate::css::ComputedColorScheme;
+use crate::css::cascade::CascadedProperty;
+use crate::css::component_values::parse_var_function_arguments;
 use crate::css::{
     parse_font_palette, parse_font_synthesis, parse_font_synthesis_subproperty, parse_object_fit,
 };
+use std::borrow::Cow;
 
 /// A declaration accepted by Quire's specified-value-time declaration parser.
 ///
@@ -14,17 +17,17 @@ use crate::css::{
 /// before a `var()` reference is substituted:
 /// <https://www.w3.org/TR/css-conditional-3/#at-supports>.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::css) struct DeclarationOperation {
-    pub(in crate::css) name: String,
-    pub(in crate::css) value: String,
+pub(in crate::css) struct DeclarationOperation<'a> {
+    pub(in crate::css) name: Cow<'a, str>,
+    pub(in crate::css) value: Cow<'a, str>,
 }
 
 /// The specified-value-time result of parsing one declaration.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::css) enum DeclarationParseResult {
+pub(in crate::css) enum DeclarationParseResult<'a> {
     UnsupportedProperty,
     InvalidValue,
-    Valid(DeclarationOperation),
+    Valid(DeclarationOperation<'a>),
 }
 
 /// Parses one normal declaration using the grammar shared by the cascade and
@@ -33,10 +36,10 @@ pub(in crate::css) enum DeclarationParseResult {
 /// This is intentionally the one property/value acceptance boundary. The
 /// cascade consumes the `Valid` operation, while a declaration feature query
 /// only observes whether it is valid.
-pub(in crate::css) fn parse_canonical_declaration(
-    raw_name: &str,
-    raw_value: &str,
-) -> DeclarationParseResult {
+pub(in crate::css) fn parse_canonical_declaration<'a>(
+    raw_name: &'a str,
+    raw_value: &'a str,
+) -> DeclarationParseResult<'a> {
     let raw_name = raw_name.trim();
     // Validate the original component stream before removing declaration
     // whitespace. A newline after an unterminated quote is a BadString token,
@@ -52,13 +55,6 @@ pub(in crate::css) fn parse_canonical_declaration(
     {
         return DeclarationParseResult::InvalidValue;
     }
-    let name = match raw_name.to_ascii_lowercase().as_str() {
-        // CSSOM-compatible alias; the cascade has one canonical flex-basis
-        // slot, so feature queries must ask about that same operation.
-        "-webkit-flex-basis" => "flex-basis".to_string(),
-        _ => raw_name.to_ascii_lowercase(),
-    };
-
     // Custom properties accept any sequence of component values, except for
     // the declaration-level syntax restrictions. Their names are
     // case-sensitive and use the `<dashed-ident>` grammar, so do not
@@ -72,10 +68,21 @@ pub(in crate::css) fn parse_canonical_declaration(
     // <https://www.w3.org/TR/css-conditional-3/#at-supports>
     if is_custom_property_name(raw_name) {
         return DeclarationParseResult::Valid(DeclarationOperation {
-            name: raw_name.to_string(),
-            value: value.to_string(),
+            name: Cow::Borrowed(raw_name),
+            value: Cow::Borrowed(value),
         });
     }
+    let lower_case_name = if raw_name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Cow::Owned(raw_name.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(raw_name)
+    };
+    let name = match lower_case_name.as_ref() {
+        // CSSOM-compatible alias; the cascade has one canonical flex-basis
+        // slot, so feature queries must ask about that same operation.
+        "-webkit-flex-basis" => Cow::Borrowed("flex-basis"),
+        _ => lower_case_name,
+    };
     // The typed cascade registry is the single ownership boundary for
     // ordinary declarations.  Keep this check before value-specific parsing:
     // accepting a name here without a typed identity would otherwise allow it
@@ -84,7 +91,7 @@ pub(in crate::css) fn parse_canonical_declaration(
         return DeclarationParseResult::UnsupportedProperty;
     }
     if contains_variable_reference {
-        return declaration_operation_for_modeled_property(&name, value);
+        return declaration_operation_for_modeled_property(name, value);
     }
 
     let value = trim_css_value(value);
@@ -95,9 +102,9 @@ pub(in crate::css) fn parse_canonical_declaration(
         value.to_ascii_lowercase().as_str(),
         "initial" | "inherit" | "unset" | "revert" | "revert-layer"
     ) {
-        return declaration_operation_for_modeled_property(&name, value);
+        return declaration_operation_for_modeled_property(name, value);
     }
-    let valid = match name.as_str() {
+    let valid = match name.as_ref() {
         "display" => supports_display_value(value),
         "direction" => matches!(value.to_ascii_lowercase().as_str(), "ltr" | "rtl"),
         "unicode-bidi" => matches!(
@@ -459,7 +466,7 @@ pub(in crate::css) fn parse_canonical_declaration(
     if valid {
         DeclarationParseResult::Valid(DeclarationOperation {
             name,
-            value: value.to_string(),
+            value: Cow::Borrowed(value),
         })
     } else if supported_property_name(&name) {
         DeclarationParseResult::InvalidValue
@@ -468,15 +475,35 @@ pub(in crate::css) fn parse_canonical_declaration(
     }
 }
 
-fn declaration_operation_for_modeled_property(name: &str, value: &str) -> DeclarationParseResult {
-    if supported_property_name(name) {
+fn declaration_operation_for_modeled_property<'a>(
+    name: Cow<'a, str>,
+    value: &'a str,
+) -> DeclarationParseResult<'a> {
+    if supported_property_name(&name) {
         DeclarationParseResult::Valid(DeclarationOperation {
-            name: name.to_string(),
-            value: value.to_string(),
+            name,
+            value: Cow::Borrowed(value),
         })
     } else {
         DeclarationParseResult::UnsupportedProperty
     }
+}
+
+/// Validates a declaration already classified by the cascade without copying
+/// its property name or value.
+///
+/// Cascaded modeled properties already use their canonical spelling, while
+/// custom-property names retain their authored case. Reusing the normal
+/// specified-value parser keeps this path aligned with declaration feature
+/// queries without rebuilding an owned [`DeclarationOperation`].
+pub(in crate::css) fn cascaded_declaration_is_valid(
+    property: &CascadedProperty<'_>,
+    value: &str,
+) -> bool {
+    matches!(
+        parse_canonical_declaration(property.css_name(), value),
+        DeclarationParseResult::Valid(_)
+    )
 }
 
 /// Validates a whitespace-separated component list without splitting CSS
@@ -622,10 +649,6 @@ fn validate_component_values(
     reject_top_level_bang: bool,
     reject_top_level_semicolon: bool,
 ) -> Option<bool> {
-    // Parse the complete stream before inspecting individual constructs. This
-    // rejects CSS Syntax tokenizer errors (bad strings/URLs and unmatched
-    // closers) while retaining valid CDO/CDC tokens and EOF-closed blocks.
-    crate::css::component_values::CssComponentValueList::parse(value)?;
     let mut input = ParserInput::new(value);
     let mut parser = Parser::new(&mut input);
     validate_component_values_from_parser(
@@ -661,7 +684,7 @@ fn validate_component_values_from_parser(
                 let nested_contains_variable = input
                     .parse_nested_block(|nested| -> Result<bool, cssparser::ParseError<'_, ()>> {
                         let result = if is_variable {
-                            validate_var_function_arguments(nested).map(|_| true)
+                            parse_var_function_arguments(nested).map(|_| true)
                         } else {
                             validate_component_values_from_parser(nested, false, false)
                         };
@@ -691,25 +714,77 @@ fn validate_component_values_from_parser(
     Some(contains_variable_reference)
 }
 
-/// Parses the grammar of `var()`'s argument list.
-///
-/// The first component must be a custom-property name. If a fallback is
-/// present, it follows one comma and may contain arbitrary component values,
-/// except for a top-level `;` or `!` token.
-/// <https://www.w3.org/TR/css-variables-1/#funcdef-var>
-fn validate_var_function_arguments(input: &mut Parser<'_, '_>) -> Option<()> {
-    let name = match input.next().ok()?.clone() {
-        cssparser::Token::Ident(name) => name,
-        _ => return None,
-    };
-    if !is_custom_property_name(&name) {
-        return None;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cascaded_validation_matches_the_shared_declaration_parser() {
+        for (property_name, value) in [
+            ("color", "red"),
+            ("color", "not-a-color"),
+            ("color", "var(--theme-color)"),
+            ("--ThemeColor", "calc(1px + 2px)"),
+            ("flex-basis", "10px"),
+            ("display", "revert-layer"),
+        ] {
+            let property = CascadedProperty::try_from_name(Cow::Borrowed(property_name))
+                .expect("test property must be represented by the cascade");
+            assert_eq!(
+                cascaded_declaration_is_valid(&property, value),
+                matches!(
+                    parse_canonical_declaration(property.css_name(), value),
+                    DeclarationParseResult::Valid(_)
+                ),
+                "{property_name}: {value}"
+            );
+        }
     }
-    if input.is_exhausted() {
-        return Some(());
+
+    #[test]
+    fn canonical_parser_preserves_alias_and_unsupported_property_outcomes() {
+        assert!(matches!(
+            parse_canonical_declaration("-webkit-flex-basis", "10px"),
+            DeclarationParseResult::Valid(_)
+        ));
+        assert!(matches!(
+            parse_canonical_declaration("unsupported-property", "value"),
+            DeclarationParseResult::UnsupportedProperty
+        ));
     }
-    if !matches!(input.next().ok()?, cssparser::Token::Comma) {
-        return None;
+
+    #[test]
+    fn var_functions_are_validated_as_arbitrary_substitution_functions() {
+        for value in [
+            "var(1px)",
+            "var(--)",
+            "var(--name ())",
+            "var(var(--name))",
+            "var(--name,)",
+        ] {
+            assert!(
+                validate_component_values(value, false, true).is_some(),
+                "{value}"
+            );
+        }
+        for value in [
+            "var()",
+            "var(, red)",
+            "var({--name} extra)",
+            "var(--name, !red)",
+        ] {
+            assert!(
+                validate_component_values(value, false, true).is_none(),
+                "{value}"
+            );
+        }
     }
-    validate_component_values_from_parser(input, true, true).map(|_| ())
+
+    #[test]
+    fn invalid_var_name_is_still_a_pending_substitution_at_specified_value_time() {
+        assert!(matches!(
+            parse_canonical_declaration("color", "var(--, green)"),
+            DeclarationParseResult::Valid(_)
+        ));
+    }
 }

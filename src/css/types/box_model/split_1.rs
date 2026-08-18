@@ -448,8 +448,16 @@ impl TableBorderSpacing {
         self.value_mut().resolve_font_metric_lengths(ch_advance);
     }
 
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        self.value_mut().resolve_root_font_metric_lengths(basis);
+    }
+
     pub(crate) fn requires_ch_advance(&self) -> bool {
         self.value().requires_ch_advance()
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        self.value().requires_root_font_metrics()
     }
 
     pub(crate) fn scale_fixed_length_components(&mut self, factor: f32) {
@@ -489,8 +497,17 @@ impl BorderSpacing {
         self.vertical.resolve_font_metric_lengths(ch_advance);
     }
 
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        self.horizontal.resolve_root_font_metric_lengths(basis);
+        self.vertical.resolve_root_font_metric_lengths(basis);
+    }
+
     pub(crate) fn requires_ch_advance(&self) -> bool {
         self.horizontal.requires_ch_advance() || self.vertical.requires_ch_advance()
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        self.horizontal.requires_root_font_metrics() || self.vertical.requires_root_font_metrics()
     }
 
     /// Scale fixed border-spacing components at the CSS `zoom` used-value
@@ -536,11 +553,25 @@ impl BorderRadius {
         self.bottom_left.resolve_font_metric_lengths(ch_advance);
     }
 
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        self.top_left.resolve_root_font_metric_lengths(basis);
+        self.top_right.resolve_root_font_metric_lengths(basis);
+        self.bottom_right.resolve_root_font_metric_lengths(basis);
+        self.bottom_left.resolve_root_font_metric_lengths(basis);
+    }
+
     pub(crate) fn requires_ch_advance(&self) -> bool {
         self.top_left.requires_ch_advance()
             || self.top_right.requires_ch_advance()
             || self.bottom_right.requires_ch_advance()
             || self.bottom_left.requires_ch_advance()
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        self.top_left.requires_root_font_metrics()
+            || self.top_right.requires_root_font_metrics()
+            || self.bottom_right.requires_root_font_metrics()
+            || self.bottom_left.requires_root_font_metrics()
     }
 }
 
@@ -650,8 +681,17 @@ impl CornerRadius {
         self.y.resolve_font_metric_lengths(ch_advance);
     }
 
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        self.x.resolve_root_font_metric_lengths(basis);
+        self.y.resolve_root_font_metric_lengths(basis);
+    }
+
     pub(crate) fn requires_ch_advance(&self) -> bool {
         self.x.requires_ch_advance() || self.y.requires_ch_advance()
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        self.x.requires_root_font_metrics() || self.y.requires_root_font_metrics()
     }
 }
 
@@ -680,8 +720,16 @@ impl CssRadius {
         self.value.resolve_font_metric_lengths(ch_advance);
     }
 
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        self.value.resolve_root_font_metric_lengths(basis);
+    }
+
     pub(crate) fn requires_ch_advance(&self) -> bool {
         self.value.requires_ch_advance()
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        self.value.requires_root_font_metrics()
     }
 }
 
@@ -952,8 +1000,18 @@ impl TabSize {
         }
     }
 
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        if let Self::Length(length) = self {
+            length.resolve_root_font_metric_lengths(basis);
+        }
+    }
+
     pub(crate) fn requires_ch_advance(&self) -> bool {
         matches!(self, Self::Length(length) if length.requires_ch_advance())
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        matches!(self, Self::Length(length) if length.requires_root_font_metrics())
     }
 
     pub(crate) fn used_tab_stop_advance(&self, space_advance: f32) -> LayoutLength {

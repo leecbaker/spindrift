@@ -3,7 +3,7 @@ use std::rc::Rc;
 use crate::image_store::ImageId;
 
 use super::geometry::{PaintPoint, PaintRect, PaintSize, PaintTransform, PaintTranslation};
-use super::images::{InlineRasterImage, RenderedImageSource};
+use super::images::{InlineRasterImage, RasterSampling, RenderedImageSource};
 use super::paths::{RenderedGradient, RenderedPath, RenderedPathClip};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -29,13 +29,34 @@ pub struct RenderedImagePattern {
     pub(crate) source: RenderedImageSource,
     pub(in crate::document) rect: PaintRect,
     pub tiling: PaintPatternTiling,
-    pub interpolate: bool,
+    pub(crate) sampling: RasterSampling,
     clip: Option<RenderedPathClip>,
     transform: PaintTransform,
 }
 
 #[allow(dead_code)]
 impl RenderedImagePattern {
+    /// Paint one retained raster image through a single-cell tiling pattern.
+    ///
+    /// Border-image tiles and CSS background-image tiles both paint a raster
+    /// source into a finite CSS rectangle.  Keeping the source (including a
+    /// source crop) intact here lets the PDF backend use the same coverage
+    /// model for those otherwise equivalent operations.
+    pub(crate) fn single_tile_from_image(image: super::images::RenderedImage) -> Self {
+        let rect = image.rect;
+        Self {
+            background: image.background,
+            source: image.source,
+            rect,
+            tiling: PaintPatternTiling::new(rect.size, rect.size, rect.origin),
+            sampling: image.sampling,
+            // A border-image source tile has no destination-space clip: its
+            // paint rectangle is the tile's complete region.
+            clip: None,
+            transform: image.transform.unwrap_or_else(PaintTransform::identity),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_paint_rect(
         rect: PaintRect,
@@ -43,7 +64,7 @@ impl RenderedImagePattern {
         tiling: PaintPatternTiling,
         pixel_width: u32,
         pixel_height: u32,
-        interpolate: bool,
+        sampling: impl Into<RasterSampling>,
         rgb: Rc<[u8]>,
         alpha: Option<Rc<[u8]>>,
     ) -> Self {
@@ -53,7 +74,9 @@ impl RenderedImagePattern {
                 raster: InlineRasterImage {
                     pixel_width,
                     pixel_height,
+                    natural_size: crate::units::CssPixelSize::new(pixel_width, pixel_height),
                     color_space: crate::color::RasterColorSpace::SRGB,
+                    sample_depth: crate::image_store::RasterSampleDepth::Eight,
                     rgb,
                     alpha,
                 },
@@ -61,7 +84,7 @@ impl RenderedImagePattern {
             },
             rect,
             tiling,
-            interpolate,
+            sampling: sampling.into(),
             clip: None,
             transform: PaintTransform::identity(),
         }
@@ -94,6 +117,20 @@ impl RenderedImagePattern {
     /// <https://www.w3.org/TR/css-backgrounds-3/#background-clip>.
     pub(crate) fn with_clip(mut self, clip: RenderedPathClip) -> Self {
         self.clip = Some(clip);
+        self
+    }
+
+    /// Attach a source crop before a pattern is promoted to a stored PDF
+    /// image resource. The crop stays in source pixels, independently of the
+    /// CSS tile geometry.
+    pub(crate) fn with_source_rect(mut self, source_rect: Option<RenderedImageSourceRect>) -> Self {
+        if let RenderedImageSource::Inline {
+            source_rect: current,
+            ..
+        } = &mut self.source
+        {
+            *current = source_rect;
+        }
         self
     }
 
@@ -132,6 +169,16 @@ impl RenderedImagePattern {
     ) -> Self {
         if let RenderedImageSource::Inline { raster, .. } = &mut self.source {
             raster.color_space = color_space;
+        }
+        self
+    }
+
+    pub(crate) fn with_raster_sample_depth(
+        mut self,
+        sample_depth: crate::image_store::RasterSampleDepth,
+    ) -> Self {
+        if let RenderedImageSource::Inline { raster, .. } = &mut self.source {
+            raster.sample_depth = sample_depth;
         }
         self
     }

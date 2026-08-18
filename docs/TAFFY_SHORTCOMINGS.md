@@ -1,9 +1,9 @@
 # Taffy Shortcomings
 
-Last updated: 2026-07-29
+Last updated: 2026-08-13
 
 This document tracks limitations and impedance mismatches around Quire's use
-of Taffy 0.12.2, as resolved by `Cargo.lock`. Entries here are implementation
+of Taffy 0.13.0, as resolved by `Cargo.lock`. Entries here are implementation
 notes for adapter work and future dependency audits; they are not automatically
 spec divergences. Actual CSS/PDF conformance gaps should still be recorded in
 `SPEC_DIVERGENCES.md`.
@@ -23,13 +23,12 @@ spec divergences. Actual CSS/PDF conformance gaps should still be recorded in
   handle. It cannot carry Quire's owned CSS math representation or its
   percentage-definiteness semantics. Quire resolves mixed values at the
   adapter boundary when the relevant percentage basis is definite.
-- CSS Align cross-axis placement and baseline sharing: CSS Box Alignment maps
-  `self-start`/`self-end` through the alignment subject's own writing mode and
-  defines safe overflow and first/last baseline-sharing behavior. Taffy's flex
-  alignment model only carries container-axis placeholders and no baseline
-  callback, so Quire preserves its sizing, line construction, stretch, and
-  auto-margin results, then resolves final side, center, and baseline placement
-  from the completed flex-line slots.
+- CSS Align cross-axis placement and baseline sharing: Taffy 0.13 resolves
+  `self-start`/`self-end` for its horizontal-tb Grid model, but cannot express
+  a vertical-writing subject or Quire's paged final placement. Its Flex model
+  also has no baseline callback. Quire therefore keeps vertical-writing,
+  baseline, safe-overflow, and final flex-line placement in its own typed
+  post-layout phase.
 - `align-content: baseline`: Taffy's public `AlignContentKeyword` has no
   baseline keywords, so Quire maps them to start packing, records flex line
   metadata, and applies baseline packing in post-processing.

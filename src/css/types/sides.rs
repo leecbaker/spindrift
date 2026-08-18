@@ -142,6 +142,47 @@ impl WritingModeAxes {
         self.physical_side(side)
     }
 
+    /// Resolve the line-relative left edge of an inline formatting context.
+    ///
+    /// This mapping is independent of `direction`: `direction` chooses
+    /// whether inline content progresses from line-left or line-right, while
+    /// the writing mode determines which physical edge represents each
+    /// line-relative side.
+    /// <https://drafts.csswg.org/css-writing-modes-4/#line-directions>
+    pub(crate) const fn line_left_side(self) -> PhysicalSide {
+        match self.writing_mode {
+            WritingMode::HorizontalTb => PhysicalSide::Left,
+            WritingMode::VerticalRl | WritingMode::VerticalLr | WritingMode::SidewaysRl => {
+                PhysicalSide::Top
+            }
+            WritingMode::SidewaysLr => PhysicalSide::Bottom,
+        }
+    }
+
+    /// Resolve the line-relative right edge of an inline formatting context.
+    /// <https://drafts.csswg.org/css-writing-modes-4/#line-directions>
+    pub(crate) const fn line_right_side(self) -> PhysicalSide {
+        self.line_left_side().opposite()
+    }
+
+    /// Resolve the line-relative over edge.
+    /// <https://drafts.csswg.org/css-writing-modes-4/#line-directions>
+    pub(crate) const fn line_over_side(self) -> PhysicalSide {
+        match self.writing_mode {
+            WritingMode::HorizontalTb => PhysicalSide::Top,
+            WritingMode::VerticalRl | WritingMode::VerticalLr | WritingMode::SidewaysRl => {
+                PhysicalSide::Right
+            }
+            WritingMode::SidewaysLr => PhysicalSide::Left,
+        }
+    }
+
+    /// Resolve the line-relative under edge.
+    /// <https://drafts.csswg.org/css-writing-modes-4/#line-directions>
+    pub(crate) const fn line_under_side(self) -> PhysicalSide {
+        self.line_over_side().opposite()
+    }
+
     /// Return the logical axis occupying a physical page axis.
     pub(crate) fn logical_axis_for_physical(self, axis: PhysicalAxis) -> LogicalAxis {
         if self.physical_axis(LogicalAxis::Inline) == axis {
@@ -210,26 +251,14 @@ pub(crate) fn inline_end_side(writing_mode: WritingMode, direction: Direction) -
 ///
 /// <https://www.w3.org/TR/css-writing-modes-4/#line-directions>.
 pub(crate) fn line_over_side(writing_mode: WritingMode) -> PhysicalSide {
-    match writing_mode {
-        WritingMode::HorizontalTb => PhysicalSide::Top,
-        WritingMode::VerticalRl | WritingMode::VerticalLr | WritingMode::SidewaysRl => {
-            PhysicalSide::Right
-        }
-        WritingMode::SidewaysLr => PhysicalSide::Left,
-    }
+    WritingModeAxes::new(writing_mode, Direction::Ltr).line_over_side()
 }
 
 /// Returns the physical side corresponding to the line-relative under side.
 ///
 /// <https://www.w3.org/TR/css-writing-modes-4/#line-directions>.
 pub(crate) fn line_under_side(writing_mode: WritingMode) -> PhysicalSide {
-    match writing_mode {
-        WritingMode::HorizontalTb => PhysicalSide::Bottom,
-        WritingMode::VerticalRl | WritingMode::VerticalLr | WritingMode::SidewaysRl => {
-            PhysicalSide::Left
-        }
-        WritingMode::SidewaysLr => PhysicalSide::Right,
-    }
+    WritingModeAxes::new(writing_mode, Direction::Ltr).line_under_side()
 }
 
 #[cfg(test)]

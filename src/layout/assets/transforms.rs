@@ -426,18 +426,36 @@ pub(in crate::layout) fn compose_css_transform_matrix<Space>(
         transform =
             function_matrix(css::TransformFunction::Translate(translation)).then(&transform);
     }
-    if let Some(angle) = individual.rotate {
+    if let Some(angle) = individual
+        .rotate
+        .filter(|angle| !is_exact_turn_identity(*angle))
+    {
         transform = function_matrix(css::TransformFunction::Rotate(angle)).then(&transform);
     }
     if let Some(scale) = individual.scale {
         transform = function_matrix(css::TransformFunction::Scale(scale)).then(&transform);
     }
     for function in transform_list {
+        if matches!(function, css::TransformFunction::Rotate(angle) if is_exact_turn_identity(*angle))
+        {
+            continue;
+        }
         transform = function_matrix(function.clone()).then(&transform);
     }
     normalize_affine_transform(
         euclid::Transform2D::translation(-origin.x, -origin.y).then(&transform),
     )
+}
+
+/// Whether an already-computed CSS rotation is exactly an integral number of
+/// turns in its finite `f32` representation.
+///
+/// A complete turn is an identity transform. Eliminating it before matrix
+/// multiplication avoids trigonometric round-off changing an otherwise
+/// identical transform list; near-turn values intentionally remain rotations.
+/// <https://drafts.csswg.org/css-transforms-1/#funcdef-transform-rotate>
+fn is_exact_turn_identity(angle: euclid::Angle<f32>) -> bool {
+    angle.radians.is_finite() && angle.radians.rem_euclid(std::f32::consts::TAU) == 0.0
 }
 
 /// Canonicalize trigonometric identity noise so equivalent CSS transform
@@ -548,6 +566,58 @@ pub(in crate::layout) fn transform_function_matrix(
 mod tests {
     use super::*;
     use crate::css::{ComputedLengthPercentage, CssScaleFactors, CssTransformTranslation};
+
+    fn compose_test_rotation(
+        individual: css::IndividualTransforms,
+        transform_list: &[css::TransformFunction],
+    ) -> euclid::Transform2D<f32, PaintSpace, PaintSpace> {
+        compose_css_transform_matrix(
+            PaintPoint::new(0.0, 0.0),
+            individual,
+            transform_list,
+            |function| transform_function_matrix(function, PaintSize::new(0.0, 0.0)),
+        )
+    }
+
+    #[test]
+    fn exact_full_turn_rotations_do_not_change_composed_affine_matrix() {
+        let reference = compose_test_rotation(
+            css::IndividualTransforms::NONE,
+            &[css::TransformFunction::Rotate(euclid::Angle::degrees(45.0))],
+        );
+        let full_turns = [
+            ("degrees", 360.0_f32.to_radians()),
+            ("grads", 400.0 * std::f32::consts::PI / 200.0),
+            ("turns", std::f32::consts::TAU),
+        ];
+        for (unit, full_turn) in full_turns {
+            assert!(
+                is_exact_turn_identity(euclid::Angle::radians(full_turn)),
+                "{unit} full turn must retain its exact parsed f32 representation",
+            );
+            let actual = compose_test_rotation(
+                css::IndividualTransforms::NONE,
+                &[
+                    css::TransformFunction::Rotate(euclid::Angle::degrees(45.0)),
+                    css::TransformFunction::Rotate(euclid::Angle::radians(full_turn)),
+                ],
+            );
+            assert_eq!(actual, reference, "{unit} full turn must be an identity");
+        }
+
+        let individual_full_turn = compose_test_rotation(
+            css::IndividualTransforms {
+                translate: None,
+                rotate: Some(euclid::Angle::radians(std::f32::consts::TAU)),
+                scale: None,
+            },
+            &[],
+        );
+        assert_eq!(individual_full_turn, euclid::Transform2D::identity());
+        assert!(!is_exact_turn_identity(euclid::Angle::radians(
+            std::f32::consts::TAU - 0.0001,
+        )));
+    }
 
     #[test]
     fn typed_border_box_resolves_origin_and_percentage_translation_in_order() {

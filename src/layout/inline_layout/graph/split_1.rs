@@ -1,8 +1,13 @@
 use super::super::mixed::apply_visual_tracking_boundaries;
 use super::*;
-use crate::css::Hyphens;
+use crate::css::{BoxDecorationBreak, DiscretionaryHyphenationPolicy, Hyphens};
+use crate::layout::inline_collect::{
+    InlineBoxEdge, inline_box_edge_components, inline_box_edge_physical_side, inline_box_edge_width,
+};
 use crate::text::character_is_css_other_space_separator;
-use crate::text::typographic_unit_ranges;
+use crate::text::{
+    CursiveProtectedUnitRanges, TextBreakPolicy, collect_measured_break_opportunities,
+};
 use crate::text::{
     DiscretionaryOpportunity, LanguageDiscretionaryReplacement,
     automatic_hyphenation_opportunities, hyphenator_for_language, manual_hyphenation_opportunities,
@@ -26,6 +31,150 @@ pub(in crate::layout) struct InlineParagraphRun {
     pub(in crate::layout) item: InlineLineItem,
     pub(in crate::layout) width: f32,
     pub(in crate::layout) shaped: Option<Rc<ShapedInlineLine>>,
+}
+
+/// One cloneable inline-box scope that crosses a selected line boundary.
+///
+/// The source stream owns the real start/end atoms of an inline box. CSS Box
+/// Fragmentation makes `box-decoration-break: clone` create matching used
+/// edges for every *intermediate* line fragment as well. Retaining the source
+/// start atom gives a continuation all of the otherwise easy-to-lose lexical
+/// metadata (baseline, visual offset, link, positioning scope, and paint
+/// effect identity) while the edge itself is reconstructed for its used side.
+///
+/// <https://www.w3.org/TR/css-break-3/#break-decoration>
+#[derive(Debug, Clone)]
+pub(in crate::layout) struct InlineFragmentContinuation {
+    source_start: InlineAtom,
+    start_edge: InlineBoxEdgeFragment,
+    end_edge: InlineBoxEdgeFragment,
+}
+
+impl InlineFragmentContinuation {
+    /// Capture a cloneable inline scope from its source-owned start edge.
+    pub(in crate::layout) fn from_source_start(atom: &InlineAtom) -> Option<Self> {
+        let InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(start_edge)) = atom.content()
+        else {
+            return None;
+        };
+        (start_edge.logical_edge == InlineLogicalEdge::Start
+            && atom.style().box_decoration_break == BoxDecorationBreak::Clone)
+            .then(|| Self {
+                source_start: atom.clone(),
+                start_edge: *start_edge,
+                end_edge: inline_fragment_continuation_edge(
+                    atom.style(),
+                    InlineLogicalEdge::End,
+                    start_edge.positioning_containing_block_id,
+                ),
+            })
+    }
+
+    /// Materialize one fragment-local edge while preserving the original
+    /// scope's non-geometric metadata.
+    pub(in crate::layout) fn edge_atom(&self, logical_edge: InlineLogicalEdge) -> InlineAtom {
+        let mut atom = self.source_start.clone();
+        let style = atom.style().clone();
+        let edge_fragment = match logical_edge {
+            InlineLogicalEdge::Start => self.start_edge,
+            InlineLogicalEdge::End => self.end_edge,
+        };
+        {
+            let data = Rc::make_mut(&mut atom.data);
+            data.content = InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge_fragment));
+            // The first-line pseudo resolves this deferred value after line
+            // materialization. A continuation must not inherit a used color
+            // from a prior candidate or line fragment.
+            data.current_color_override = None;
+        }
+        match style.writing_mode {
+            WritingMode::HorizontalTb => atom.size.width = edge_fragment.advance,
+            WritingMode::VerticalRl
+            | WritingMode::VerticalLr
+            | WritingMode::SidewaysRl
+            | WritingMode::SidewaysLr => atom.size.height = edge_fragment.advance,
+        }
+        atom
+    }
+
+    pub(in crate::layout) fn start_item(&self) -> InlineItem {
+        InlineItem::Atom(Box::new(self.edge_atom(InlineLogicalEdge::Start)))
+    }
+
+    pub(in crate::layout) fn end_item(&self) -> InlineItem {
+        InlineItem::Atom(Box::new(self.edge_atom(InlineLogicalEdge::End)))
+    }
+
+    fn start_measured_item(&self) -> MeasuredInlineItem {
+        let atom = self.edge_atom(InlineLogicalEdge::Start);
+        MeasuredInlineItem {
+            width: inline_atom_logical_inline_size(&atom, atom.style()),
+            item: InlineLineItem::Atom(atom),
+            shaped: None,
+        }
+    }
+
+    fn end_measured_item(&self) -> MeasuredInlineItem {
+        let atom = self.edge_atom(InlineLogicalEdge::End);
+        MeasuredInlineItem {
+            width: inline_atom_logical_inline_size(&atom, atom.style()),
+            item: InlineLineItem::Atom(atom),
+            shaped: None,
+        }
+    }
+}
+
+fn inline_fragment_continuation_edge(
+    style: &ComputedStyle,
+    logical_edge: InlineLogicalEdge,
+    positioning_containing_block_id: Option<InlinePositioningContainingBlockId>,
+) -> InlineBoxEdgeFragment {
+    let edge = match logical_edge {
+        InlineLogicalEdge::Start => InlineBoxEdge::Start,
+        InlineLogicalEdge::End => InlineBoxEdge::End,
+    };
+    let (_, border, padding) = inline_box_edge_components(style, edge);
+    InlineBoxEdgeFragment {
+        logical_edge,
+        physical_side: inline_box_edge_physical_side(style, edge),
+        positioning_containing_block_id,
+        advance: inline_box_edge_width(style, edge).points(),
+        paint_extent: (border + padding).max(0.0),
+    }
+}
+
+/// Give selected text the fragment-local inline sides created by cloned box
+/// edges. Source collection can mark only the DOM scope's first and last
+/// visible words; a synthetic continuation becomes a real generated fragment
+/// edge only after line selection.
+/// <https://www.w3.org/TR/css-break-3/#break-decoration>
+fn mark_clone_continuation_fragment_edges(
+    items: &mut [MeasuredInlineItem],
+    leading_edge_count: usize,
+    trailing_edge_count: usize,
+) {
+    if leading_edge_count != 0
+        && let Some(InlineLineItem::Fragment(fragment)) = items[leading_edge_count..]
+            .iter_mut()
+            .map(|item| &mut item.item)
+            .find(|item| matches!(item, InlineLineItem::Fragment(fragment) if fragment.source() != InlineTextSource::BidiControl))
+    {
+        let mut edges = fragment.hanging_edges();
+        edges.blocks_start = true;
+        *fragment = fragment.clone().with_hanging_edges(edges);
+    }
+    let trailing_content_end = items.len() - trailing_edge_count;
+    if trailing_edge_count != 0
+        && let Some(InlineLineItem::Fragment(fragment)) = items[..trailing_content_end]
+            .iter_mut()
+            .rev()
+            .map(|item| &mut item.item)
+            .find(|item| matches!(item, InlineLineItem::Fragment(fragment) if fragment.source() != InlineTextSource::BidiControl))
+    {
+        let mut edges = fragment.hanging_edges();
+        edges.blocks_end = true;
+        *fragment = fragment.clone().with_hanging_edges(edges);
+    }
 }
 
 /// Spelling replacement adjacent to a selected discretionary line edge.
@@ -524,6 +673,22 @@ impl BreakAvailability {
     }
 }
 
+/// Translate a source-policy decision into the availability consumed by line
+/// fitting. A disabled policy deliberately emits no graph opportunity.
+///
+/// <https://drafts.csswg.org/css-text-4/#word-break-property>
+pub(in crate::layout) const fn discretionary_hyphenation_availability(
+    policy: DiscretionaryHyphenationPolicy,
+) -> Option<BreakAvailability> {
+    match policy {
+        DiscretionaryHyphenationPolicy::Disabled => None,
+        DiscretionaryHyphenationPolicy::Ordinary => Some(BreakAvailability::Ordinary),
+        DiscretionaryHyphenationPolicy::DeferredForAutoPhrase => Some(
+            BreakAvailability::RelaxedWordBreak(WordBreakRelaxation::AutoPhraseHyphenation),
+        ),
+    }
+}
+
 /// A legal line-break opportunity in an inline paragraph graph.
 ///
 /// The `index` is a run boundary: `0` is before the first run and `n` is after
@@ -611,6 +776,74 @@ struct BidiControlScope {
 }
 
 impl InlineOpportunityGraph {
+    /// Return cloneable inline scopes that are lexically open immediately
+    /// before `position`. The stack retains non-clone scopes as empty entries
+    /// while scanning so a nested clone scope is paired with its real source
+    /// end rather than an unrelated outer edge.
+    fn clone_scopes_before(
+        &self,
+        position: InlineGraphPosition,
+    ) -> Vec<InlineFragmentContinuation> {
+        let mut scopes = Vec::<Option<InlineFragmentContinuation>>::new();
+        for run in self.runs.iter().take(position.run_index) {
+            let InlineLineItem::Atom(atom) = &run.item else {
+                continue;
+            };
+            let InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge)) = atom.content()
+            else {
+                continue;
+            };
+            // A positioned bidi isolate carries a separate zero-advance
+            // marker *inside* its authored isolate controls. It establishes
+            // containing-block identity, but it is not a box-decoration
+            // boundary and must not be replayed outside the virtual controls
+            // added to a continuation line.
+            if edge.is_positioning_marker() {
+                continue;
+            }
+            match edge.logical_edge {
+                InlineLogicalEdge::Start => {
+                    scopes.push(InlineFragmentContinuation::from_source_start(atom));
+                }
+                InlineLogicalEdge::End => {
+                    scopes.pop();
+                }
+            }
+        }
+        scopes.into_iter().flatten().collect()
+    }
+
+    /// Add the synthetic edge atoms required by `box-decoration-break: clone`
+    /// to one selected graph range. Source-owned edges remain in the range;
+    /// only scopes that were already open at the leading/trailing selected
+    /// boundary receive continuation chrome.
+    fn insert_clone_continuation_edges(
+        &self,
+        range: InlineGraphRange,
+        items: &mut Vec<MeasuredInlineItem>,
+    ) {
+        let leading = self.clone_scopes_before(range.start);
+        let trailing = self.clone_scopes_before(range.end);
+        if leading.is_empty() && trailing.is_empty() {
+            return;
+        }
+        let mut continued = Vec::with_capacity(leading.len() + items.len() + trailing.len());
+        continued.extend(
+            leading
+                .iter()
+                .map(InlineFragmentContinuation::start_measured_item),
+        );
+        continued.append(items);
+        continued.extend(
+            trailing
+                .iter()
+                .rev()
+                .map(InlineFragmentContinuation::end_measured_item),
+        );
+        mark_clone_continuation_fragment_edges(&mut continued, leading.len(), trailing.len());
+        *items = continued;
+    }
+
     /// Return virtual UAX #9 controls needed to balance one selected line.
     ///
     /// An isolate is one U+FFFC-like object to its containing bidi paragraph,
@@ -945,6 +1178,12 @@ impl InlineIntrinsicMeasurement {
                 .sequence
                 .records
                 .iter()
+                // A collapsed-space-only record retains source-order data for
+                // painting and extraction, but it does not generate a line
+                // box. Counting it here would turn each discarded space into
+                // an additional vertical column during intrinsic sizing.
+                // <https://drafts.csswg.org/css-inline-3/#line-boxes>
+                .filter(|record| !record.is_phantom)
                 .map(|record| {
                     let line_block_size = record
                         .fragment
@@ -1002,6 +1241,10 @@ pub(in crate::layout) struct InlineLineFragment {
     pub(in crate::layout) edge_effects: InlineLineEdgeEffects,
     pub(in crate::layout) bidi_scope_continuations: BidiLineScopeContinuations,
     pub(in crate::layout) text: Rc<str>,
+    /// Block-axis trim selected for this line's inline box. It is carried
+    /// through the durable line fragment so paint-time links and decorations
+    /// share the background's trimmed content rectangle.
+    pub(in crate::layout) text_box_trim: TextBoxLineTrim,
     /// The selected graph boundary after this line's source. It is retained
     /// so automatic clamping can stay attached to source across a balanced
     /// reflow instead of reusing a raw line ordinal.
@@ -1032,6 +1275,7 @@ impl InlineLineFragment {
             edge_effects: InlineLineEdgeEffects::default(),
             bidi_scope_continuations: BidiLineScopeContinuations::default(),
             text: Rc::from(text.into()),
+            text_box_trim: TextBoxLineTrim::default(),
             source_end: None,
         }
     }
@@ -1467,6 +1711,36 @@ fn selected_line_text_spacing_characters(
     characters
 }
 
+/// Whether selected source can produce a `text-spacing-trim` adjustment.
+///
+/// This deliberately mirrors the target eligibility in
+/// `apply_materialized_text_spacing_trim` without collecting per-character
+/// provenance. Ordinary text is by far the common case, and it does not need
+/// the allocated character list used to resolve selected-line adjacency.
+fn materialized_items_may_use_text_spacing_trim(items: &[MeasuredInlineItem]) -> bool {
+    items.iter().any(|item| {
+        let InlineLineItem::Fragment(fragment) = &item.item else {
+            return false;
+        };
+        if fragment.style().text_spacing_trim.resolved() == TextSpacingTrim::SpaceAll {
+            return false;
+        }
+        let vertical = matches!(
+            fragment.style().text_layout_policy(),
+            crate::css::TextLayoutPolicy::Vertical(_)
+        );
+        fragment.text().chars().any(|character| {
+            !crate::text::character_is_bidi_format_control(character)
+                && crate::text::text_spacing_punctuation_class(
+                    character,
+                    fragment.style().language.as_deref(),
+                    vertical,
+                )
+                .is_some()
+        })
+    })
+}
+
 /// Apply `text-spacing-trim` to one candidate's selected source items.
 ///
 /// The graph keeps its source runs full-width. This function runs only after a
@@ -1486,10 +1760,11 @@ fn apply_materialized_text_spacing_trim(
         Closing, IdeographicSpace, MiddleDot, NarrowClosing, NarrowOpening, Opening,
     };
 
-    let characters = selected_line_text_spacing_characters(items);
-    if characters.is_empty() {
+    if !materialized_items_may_use_text_spacing_trim(items) {
         return;
     }
+    let characters = selected_line_text_spacing_characters(items);
+    debug_assert!(!characters.is_empty());
 
     let mut targets = Vec::<(usize, std::ops::Range<usize>)>::new();
     let mut add_target = |character: TextSpacingCharacter| {
@@ -1621,7 +1896,6 @@ fn push_text_spacing_fragment(
     }
     let mut fragment = source.clone();
     fragment.set_text(Rc::from(text));
-    fragment.set_preserves_source_shaping(false);
     if trimmed {
         let tag = if matches!(
             fragment.style().text_layout_policy(),
@@ -1843,7 +2117,10 @@ fn apply_auto_hyphenation_across_transparent_inline_edges(
             unreachable!("hyphenation group has a first fragment");
         };
         if first.style().hyphens != Hyphens::Auto
-            || first.style().automatic_hyphenation_is_suppressed()
+            || matches!(
+                first.style().automatic_discretionary_hyphenation_policy(),
+                DiscretionaryHyphenationPolicy::Disabled
+            )
             || matches!(first.style().line_break, css::LineBreak::Anywhere)
         {
             continue;
@@ -1859,14 +2136,14 @@ fn apply_auto_hyphenation_across_transparent_inline_edges(
             first.style().hyphenate_limit_chars,
             language,
         );
-        for opportunity in opportunities {
-            automatic_breaks.push(automatic_opportunity_for_source_offset(
+        automatic_breaks.extend(opportunities.into_iter().filter_map(|opportunity| {
+            automatic_opportunity_for_source_offset(
                 opportunity,
                 &fragment_indices,
                 &source_ends,
                 runs,
-            ));
-        }
+            )
+        }));
     }
     automatic_breaks
 }
@@ -1892,7 +2169,10 @@ fn manual_hyphenation_effects_across_transparent_inline_edges(
         let InlineLineItem::Fragment(first) = &runs[fragment_indices[0]].item else {
             unreachable!("hyphenation group has a first fragment");
         };
-        if first.style().hyphenation_is_unconditionally_suppressed() {
+        if matches!(
+            first.style().authored_discretionary_hyphenation_policy(),
+            DiscretionaryHyphenationPolicy::Disabled
+        ) {
             continue;
         }
         let Some(language) = first.style().language.as_deref() else {
@@ -1996,21 +2276,20 @@ fn automatic_opportunity_for_source_offset(
     fragment_indices: &[usize],
     source_ends: &[usize],
     runs: &[InlineParagraphRun],
-) -> InlineBreakOpportunity {
+) -> Option<InlineBreakOpportunity> {
     let position =
         source_position_for_offset(opportunity.byte_offset, fragment_indices, source_ends, runs);
     let availability = match &runs[position.run_index].item {
-        InlineLineItem::Fragment(fragment)
-            if matches!(fragment.style().word_break, css::WordBreak::AutoPhrase) =>
-        {
-            BreakAvailability::RelaxedWordBreak(WordBreakRelaxation::AutoPhraseHyphenation)
-        }
-        InlineLineItem::Fragment(_) => BreakAvailability::Ordinary,
+        InlineLineItem::Fragment(fragment) => discretionary_hyphenation_availability(
+            fragment
+                .style()
+                .automatic_discretionary_hyphenation_policy(),
+        )?,
         InlineLineItem::Atom(_) | InlineLineItem::Float(_) => {
             unreachable!("hyphenation source position is text")
         }
     };
-    InlineBreakOpportunity {
+    Some(InlineBreakOpportunity {
         position,
         kind: BreakEffect::Hyphenation,
         availability,
@@ -2024,7 +2303,7 @@ fn automatic_opportunity_for_source_offset(
             right_replacement: language_replacement_to_line_edge(opportunity.right),
             leading_shaping_context: SelectedLineShapingContext::PreserveJoining,
         }),
-    }
+    })
 }
 
 fn source_position_for_offset(
@@ -2164,7 +2443,22 @@ fn shape_logical_joining_graph_runs(
                 InlineLineItem::Atom(_) => break,
             }
         }
-        if fragment_indices.len() < 2 {
+        let needs_source_shape = fragment_indices.len() == 1
+            && matches!(
+                &runs[fragment_indices[0]].item,
+                InlineLineItem::Fragment(fragment) if {
+                    let mut opportunities = Vec::new();
+                    collect_measured_break_opportunities(
+                        fragment.text(),
+                        TextBreakPolicy::from(fragment.style()),
+                        &mut opportunities,
+                    );
+                    opportunities.into_iter().any(|position| {
+                        position > 0 && position < fragment.text().len()
+                    })
+                }
+            );
+        if fragment_indices.len() < 2 && !needs_source_shape {
             continue;
         }
         let mut spans = Vec::with_capacity(fragment_indices.len());
@@ -2179,7 +2473,7 @@ fn shape_logical_joining_graph_runs(
             let InlineLineItem::Fragment(fragment) = &runs[fragment_index].item else {
                 return false;
             };
-            styles_have_equivalent_text_shaping_inputs(source_style, fragment.style())
+            style_boundary_effect(source_style, fragment.style()) == InlineBoundaryEffect::PaintOnly
         });
         for &fragment_index in &fragment_indices {
             let InlineLineItem::Fragment(fragment) = &runs[fragment_index].item else {
@@ -2208,11 +2502,13 @@ fn shape_logical_joining_graph_runs(
         ) else {
             continue;
         };
+        let shaped = Rc::new(shaped);
         for (&fragment_index, range) in fragment_indices.iter().zip(ranges) {
-            let Some(slice) = shaped.source_slice(range) else {
+            let Some(mut selection) = SourceShapedSelection::from_source(Rc::clone(&shaped), range)
+            else {
                 continue;
             };
-            let mut slice = Some(slice);
+            let mut slice = Some(selection.selected().clone());
             let mut width = slice
                 .as_ref()
                 .map(ShapedInlineLine::advance_width)
@@ -2221,8 +2517,12 @@ fn shape_logical_joining_graph_runs(
                 unreachable!("graph fragment indices name fragments");
             };
             normalize_graph_fragment_terminal_tracking(fragment, &mut slice, &mut width);
+            if let Some(slice) = slice.as_ref() {
+                selection.replace_selected(slice.clone());
+            }
             runs[fragment_index].width = width;
             runs[fragment_index].shaped = slice.map(Rc::new);
+            fragment.set_source_shaped_selection(Some(selection));
         }
     }
 }
@@ -2259,8 +2559,10 @@ pub(in crate::layout) fn push_text_graph_runs(
         return;
     }
     let break_text = if word.style.hyphens == Hyphens::Auto
-        && !word.style.automatic_hyphenation_is_suppressed()
-    {
+        && matches!(
+            word.style.automatic_discretionary_hyphenation_policy(),
+            DiscretionaryHyphenationPolicy::Ordinary
+        ) {
         Cow::Borrowed(text)
     } else {
         text_with_hyphenation_controls(text, &word.style)
@@ -2302,7 +2604,7 @@ pub(in crate::layout) fn push_text_graph_runs(
         );
         return;
     }
-    for range in typographic_unit_ranges(text) {
+    for range in CursiveProtectedUnitRanges::new(text) {
         let mut hanging_edges = word.hanging_edges;
         hanging_edges.blocks_start &= range.start == 0;
         hanging_edges.blocks_end &= range.end == text.len();
@@ -2611,6 +2913,7 @@ impl InlineOpportunityGraph {
                 || matches!(opportunity.kind, BreakEffect::PreservedSpace)
         }));
         let mut items = self.line_measured_items_for_graph_range(range, font_system);
+        self.insert_clone_continuation_edges(range, &mut items);
         let selected_manual_soft_hyphen = selected_break.is_some_and(|opportunity| {
             opportunity.is_discretionary()
                 && self.source_character_before(opportunity.position) == Some('\u{00ad}')
@@ -2946,6 +3249,26 @@ impl InlineOpportunityGraph {
         let run = self.runs.get(run_index)?;
         match &run.item {
             InlineLineItem::Fragment(fragment) => {
+                let bidi_continuations = self.bidi_scope_continuations_for_range(range);
+                let owns_prefix = run_index == range.start.run_index;
+                let last_selected_run = if range.end.byte_offset == 0 {
+                    range.end.run_index.checked_sub(1)
+                } else {
+                    Some(range.end.run_index)
+                };
+                let owns_suffix = Some(run_index) == last_selected_run;
+                let mut bidi_prefix = String::new();
+                if owns_prefix {
+                    bidi_prefix.push_str(&bidi_continuations.prefix_parent_context);
+                    bidi_prefix.push_str(&bidi_continuations.prefix);
+                }
+                let mut bidi_suffix = String::new();
+                if owns_suffix {
+                    bidi_suffix.push_str(&bidi_continuations.trailing_line_edge_context);
+                    bidi_suffix.push_str(&bidi_continuations.suffix);
+                    bidi_suffix.push_str(&bidi_continuations.suffix_parent_context);
+                }
+                let has_bidi_scope_context = !bidi_prefix.is_empty() || !bidi_suffix.is_empty();
                 let text_len = fragment.text().len();
                 let start = if run_index == range.start.run_index {
                     range.start.byte_offset.min(text_len)
@@ -2963,7 +3286,7 @@ impl InlineOpportunityGraph {
                 {
                     return None;
                 }
-                if start == 0 && end == text_len {
+                if start == 0 && end == text_len && !has_bidi_scope_context {
                     return Some(MeasuredInlineItem {
                         item: run.item.clone(),
                         width: run.width,
@@ -2977,30 +3300,54 @@ impl InlineOpportunityGraph {
                 hanging_edges.blocks_start = hanging_edges.blocks_start && start == 0;
                 hanging_edges.blocks_end = hanging_edges.blocks_end && end == text_len;
                 fragment = fragment.with_hanging_edges(hanging_edges);
-                let selected_shaped = run
-                    .shaped
-                    .as_deref()
-                    .and_then(|shaped| shaped.source_slice(start..end));
-                if selected_shaped.is_some() {
+                let mut source_selection = (!has_bidi_scope_context)
+                    .then(|| {
+                        // A transparent inline-boundary group may already
+                        // carry a selection from a larger logical source.
+                        // Derive this line fragment from that original source
+                        // rather than treating the graph's intermediate
+                        // slice as a new word-shaped artifact.
+                        fragment
+                            .source_shaped_selection()
+                            .and_then(|selection| selection.subselection(start..end))
+                            .or_else(|| {
+                                run.shaped.as_ref().and_then(|shaped| {
+                                    SourceShapedSelection::from_source(
+                                        Rc::clone(shaped),
+                                        start..end,
+                                    )
+                                })
+                            })
+                    })
+                    .flatten();
+                if source_selection.is_some() {
                     // Source graph shaping has already removed backend
                     // terminal tracking. Keep that invariant when a selected
                     // line reuses its contextual shaped slice.
                     fragment.mark_terminal_tracking_normalized();
                 }
-                fragment.set_preserves_source_shaping(selected_shaped.is_some());
-                let mut shaped = selected_shaped.or_else(|| {
-                    font_system.shape_untracked_inline_line(
-                        fragment.text(),
-                        fragment.style(),
-                        fragment.style().line_height,
-                    )
-                });
+                let mut shaped = source_selection
+                    .as_ref()
+                    .map(|selection| selection.selected().clone())
+                    .or_else(|| {
+                        font_system.shape_bidi_scoped_logical_line(
+                            fragment.text(),
+                            fragment.style(),
+                            fragment.style().line_height,
+                            &bidi_prefix,
+                            &bidi_suffix,
+                        )
+                    });
                 let mut width = shaped
                     .as_ref()
                     .map(ShapedInlineLine::advance_width)
                     .unwrap_or(0.0);
                 normalize_graph_fragment_terminal_tracking(&mut fragment, &mut shaped, &mut width);
+                if let (Some(selection), Some(shaped)) = (&mut source_selection, shaped.as_ref()) {
+                    selection.replace_selected(shaped.clone());
+                }
                 let shaped = shaped.map(Rc::new);
+                fragment.set_source_shaped_selection(source_selection);
                 Some(MeasuredInlineItem {
                     item: InlineLineItem::Fragment(fragment),
                     width,
@@ -3251,7 +3598,6 @@ fn apply_trailing_line_edge_replacement(
     used.push_str(&text[..prefix_end]);
     used.push_str(replacement.text);
     fragment.set_text(used);
-    fragment.set_preserves_source_shaping(false);
     remeasure_materialized_item(item, font_system);
 }
 
@@ -3276,7 +3622,6 @@ fn apply_leading_line_edge_replacement(
     used.push_str(replacement.text);
     used.push_str(&text[replacement.source_bytes..]);
     fragment.set_text(used);
-    fragment.set_preserves_source_shaping(false);
     remeasure_materialized_item(item, font_system);
 }
 
@@ -3307,7 +3652,6 @@ fn append_discretionary_marker(
     let marker_text = used_discretionary_marker_text(marker_owner);
     let mut marker = marker_owner.clone();
     marker.set_text(marker_text);
-    marker.set_preserves_source_shaping(false);
     marker.mark_selected_discretionary_marker();
     let source_text = source_fragment.text().to_owned();
     let marker_range = source_text.len()..source_text.len() + marker.text().len();
@@ -3341,13 +3685,9 @@ fn append_discretionary_marker(
             let source = &mut items[source_index];
             source.width = source_slice.advance_width();
             source.shaped = Some(Rc::new(source_slice));
-            if let InlineLineItem::Fragment(fragment) = &mut source.item {
-                fragment.set_preserves_source_shaping(true);
-            }
         }
         if let Some(marker_slice) = shaped.source_slice(marker_range) {
             let width = marker_slice.advance_width();
-            marker.set_preserves_source_shaping(true);
             items.push(MeasuredInlineItem {
                 item: InlineLineItem::Fragment(marker),
                 width,
@@ -3466,18 +3806,33 @@ fn resolve_materialized_line_tab_and_ruby_geometry(
     font_system: &mut FontSystem,
     block_style: &ComputedStyle,
 ) {
+    if !items.iter().any(|item| {
+        matches!(
+            &item.item,
+            InlineLineItem::Fragment(fragment) if fragment.text().contains('\t')
+        ) || matches!(
+            &item.item,
+            InlineLineItem::Atom(atom) if matches!(atom.content(), InlineAtomContent::Ruby { .. })
+        )
+    }) {
+        return;
+    }
     const MAX_GEOMETRY_PASSES: usize = 4;
     for _ in 0..MAX_GEOMETRY_PASSES {
-        let previous_widths = items.iter().map(|item| item.width).collect::<Vec<_>>();
-        resolve_materialized_line_tab_advances(items, font_system, block_style);
-        resolve_materialized_ruby_overhang(items, font_system, block_style);
-        if previous_widths
-            .iter()
-            .zip(items.iter())
-            .all(|(previous, current)| (previous - current.width).abs() < 0.01)
-        {
+        let tabs_changed = resolve_materialized_line_tab_advances(items, font_system, block_style);
+        let ruby_changed = resolve_materialized_ruby_overhang(items, font_system, block_style);
+        if !tabs_changed && !ruby_changed {
             break;
         }
+    }
+}
+
+/// Whether a used inline advance changed enough to require another geometry
+/// pass. `NaN` remains non-convergent, matching the former direct comparison.
+fn materialized_inline_geometry_changed(previous: f32, current: f32) -> bool {
+    match (previous - current).abs().partial_cmp(&0.01) {
+        Some(std::cmp::Ordering::Less) => false,
+        Some(std::cmp::Ordering::Equal | std::cmp::Ordering::Greater) | None => true,
     }
 }
 
@@ -3494,7 +3849,8 @@ fn resolve_materialized_ruby_overhang(
     items: &mut [MeasuredInlineItem],
     font_system: &mut FontSystem,
     block_style: &ComputedStyle,
-) {
+) -> bool {
+    let mut geometry_changed = false;
     for item_index in 0..items.len() {
         let Some(placement) =
             resolved_ruby_placement_for_line_item(items, item_index, font_system, block_style)
@@ -3513,9 +3869,12 @@ fn resolve_materialized_ruby_overhang(
             | WritingMode::SidewaysRl
             | WritingMode::SidewaysLr => atom.size.height = flow_span,
         }
+        geometry_changed |=
+            materialized_inline_geometry_changed(items[item_index].width, flow_span);
         items[item_index].width = flow_span;
         items[item_index].item = InlineLineItem::Atom(atom);
     }
+    geometry_changed
 }
 
 fn resolved_ruby_placement_for_line_item(
@@ -3828,9 +4187,10 @@ fn resolve_materialized_line_tab_advances(
     items: &mut [MeasuredInlineItem],
     font_system: &mut FontSystem,
     tab_metric_style: &ComputedStyle,
-) {
+) -> bool {
     let mut cursor = 0.0;
     let mut index = 0;
+    let mut geometry_changed = false;
     while index < items.len() {
         let InlineLineItem::Fragment(first_fragment) = &items[index].item else {
             cursor += items[index].width;
@@ -3838,25 +4198,19 @@ fn resolve_materialized_line_tab_advances(
             continue;
         };
         let start = index;
-        let mut spans = Vec::new();
-        let mut text = String::new();
-        let mut ranges = Vec::new();
         let mut unadjusted_width = 0.0;
         let mut has_tab = false;
+        let mut fragment_count = 0;
+        let mut text_byte_len = 0;
         let mut line_height = first_fragment.style().line_height;
         while let Some(item) = items.get(index) {
             let InlineLineItem::Fragment(fragment) = &item.item else {
                 break;
             };
             has_tab |= fragment.text().contains('\t');
+            fragment_count += 1;
+            text_byte_len += fragment.text().len();
             line_height = fragment.style().line_height;
-            let range_start = text.len();
-            text.push_str(fragment.text());
-            ranges.push(range_start..text.len());
-            spans.push(StyledTextSpan {
-                text: fragment.text(),
-                style: fragment.style(),
-            });
             unadjusted_width += item.width;
             index += 1;
         }
@@ -3864,6 +4218,21 @@ fn resolve_materialized_line_tab_advances(
         if !has_tab {
             cursor += unadjusted_width;
             continue;
+        }
+        let mut spans = Vec::with_capacity(fragment_count);
+        let mut text = String::with_capacity(text_byte_len);
+        let mut ranges = Vec::with_capacity(fragment_count);
+        for item in &items[start..index] {
+            let InlineLineItem::Fragment(fragment) = &item.item else {
+                unreachable!("a contiguous text group only contains fragments");
+            };
+            let range_start = text.len();
+            text.push_str(fragment.text());
+            ranges.push(range_start..text.len());
+            spans.push(StyledTextSpan {
+                text: fragment.text(),
+                style: fragment.style(),
+            });
         }
         let Some(shaped) = font_system.shape_styled_inline_fragments(
             &spans,
@@ -3890,12 +4259,14 @@ fn resolve_materialized_line_tab_advances(
                 unreachable!("a contiguous text group only contains fragments");
             };
             normalize_graph_fragment_terminal_tracking(fragment, &mut slice, &mut width);
-            fragment.set_preserves_source_shaping(true);
+            geometry_changed |=
+                materialized_inline_geometry_changed(items[item_index].width, width);
             items[item_index].width = width;
             items[item_index].shaped = slice.map(Rc::new);
         }
         cursor += used_width;
     }
+    geometry_changed
 }
 
 pub(in crate::layout) fn opportunity_is_soft_wrap(opportunity: InlineBreakOpportunity) -> bool {
@@ -4215,10 +4586,7 @@ pub(in crate::layout) fn normalize_materialized_control_characters(
                 fragment.text(),
                 Some(index) == trailing_soft_hyphen_index,
                 false,
-                fragment
-                    .style()
-                    .hyphenate_character
-                    .used_text_for_language(fragment.style().language.as_deref()),
+                used_discretionary_marker_text(fragment),
             )
         {
             fragment.set_text(text);
@@ -4262,7 +4630,6 @@ fn append_materialized_line_joiner(items: &mut [MeasuredInlineItem], font_system
     text.push_str(fragment.text());
     text.push('\u{200d}');
     fragment.set_text(text);
-    fragment.set_preserves_source_shaping(false);
     remeasure_materialized_item(item, font_system);
 }
 
@@ -4288,7 +4655,6 @@ fn prepend_materialized_line_joiner(
     text.push('\u{200d}');
     text.push_str(fragment.text());
     fragment.set_text(text);
-    fragment.set_preserves_source_shaping(false);
     remeasure_materialized_item(item, font_system);
 }
 
@@ -4330,6 +4696,195 @@ mod tests {
         }
     }
 
+    fn cloneable_box_edge_run(
+        style: ComputedStyle,
+        logical_edge: InlineLogicalEdge,
+        positioning_containing_block_id: usize,
+    ) -> InlineParagraphRun {
+        let physical_side = match logical_edge {
+            InlineLogicalEdge::Start => PhysicalSide::Left,
+            InlineLogicalEdge::End => PhysicalSide::Right,
+        };
+        InlineParagraphRun {
+            item: InlineLineItem::Atom(InlineAtom::new(
+                InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(InlineBoxEdgeFragment {
+                    logical_edge,
+                    physical_side,
+                    positioning_containing_block_id: Some(InlinePositioningContainingBlockId(
+                        positioning_containing_block_id,
+                    )),
+                    advance: 7.0,
+                    paint_extent: 5.0,
+                })),
+                style.clone(),
+                None,
+                InlineSize::new(7.0, style.line_height),
+                11.0,
+                3.0,
+                Some(format!("scope-{positioning_containing_block_id}")),
+                None,
+            )),
+            width: 7.0,
+            shaped: None,
+        }
+    }
+
+    #[test]
+    fn clone_continuations_nest_in_source_order_and_preserve_positioning_scope() {
+        let mut outer = ComputedStyle::initial();
+        outer.box_decoration_break = BoxDecorationBreak::Clone;
+        outer.padding.left = 7.0;
+        outer.padding.right = 7.0;
+        let mut inner = outer.clone();
+        inner.color = CssColor::new(10, 20, 30);
+        let text = bidi_scope_run("x", outer.clone(), InlineTextSource::Normal);
+        let graph = InlineOpportunityGraph::new(
+            vec![
+                cloneable_box_edge_run(outer.clone(), InlineLogicalEdge::Start, 1),
+                cloneable_box_edge_run(inner.clone(), InlineLogicalEdge::Start, 2),
+                text.clone(),
+                cloneable_box_edge_run(inner, InlineLogicalEdge::End, 2),
+                cloneable_box_edge_run(outer, InlineLogicalEdge::End, 1),
+            ],
+            Vec::new(),
+        );
+        let range = InlineGraphRange {
+            start: InlineGraphPosition::at_run_start(2),
+            end: InlineGraphPosition::at_run_start(3),
+        };
+        let mut items = vec![MeasuredInlineItem {
+            item: text.item,
+            width: 0.0,
+            shaped: None,
+        }];
+
+        graph.insert_clone_continuation_edges(range, &mut items);
+
+        let edges = items
+            .iter()
+            .filter_map(|item| match &item.item {
+                InlineLineItem::Atom(atom) => match atom.content() {
+                    InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge)) => Some((
+                        edge.logical_edge,
+                        edge.positioning_containing_block_id,
+                        atom.link_target(),
+                        atom.baseline_offset_from_alignment_source_block_start(
+                            atom.size.height,
+                            atom.style(),
+                        )
+                        .points(),
+                        atom.baseline_shift,
+                    )),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            edges,
+            vec![
+                (
+                    InlineLogicalEdge::Start,
+                    Some(InlinePositioningContainingBlockId(1)),
+                    Some("scope-1"),
+                    11.0,
+                    3.0,
+                ),
+                (
+                    InlineLogicalEdge::Start,
+                    Some(InlinePositioningContainingBlockId(2)),
+                    Some("scope-2"),
+                    11.0,
+                    3.0,
+                ),
+                (
+                    InlineLogicalEdge::End,
+                    Some(InlinePositioningContainingBlockId(2)),
+                    Some("scope-2"),
+                    11.0,
+                    3.0,
+                ),
+                (
+                    InlineLogicalEdge::End,
+                    Some(InlinePositioningContainingBlockId(1)),
+                    Some("scope-1"),
+                    11.0,
+                    3.0,
+                ),
+            ]
+        );
+        assert_eq!(items[0].width, 7.0);
+        assert_eq!(items[1].width, 7.0);
+        assert_eq!(items[3].width, 7.0);
+        assert_eq!(items[4].width, 7.0);
+    }
+
+    #[test]
+    fn clone_continuations_do_not_replay_positioning_markers_outside_bidi_controls() {
+        let mut style = ComputedStyle::initial();
+        style.box_decoration_break = BoxDecorationBreak::Clone;
+        style.padding.left = 7.0;
+        style.padding.right = 7.0;
+        let mut positioning_marker =
+            cloneable_box_edge_run(style.clone(), InlineLogicalEdge::Start, 9);
+        let InlineLineItem::Atom(marker) = &mut positioning_marker.item else {
+            unreachable!("test helper constructs an inline atom");
+        };
+        let marker_data = Rc::make_mut(&mut marker.data);
+        let InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge)) = &mut marker_data.content
+        else {
+            unreachable!("test helper constructs an inline box edge");
+        };
+        edge.advance = 0.0;
+        edge.paint_extent = 0.0;
+
+        let text = bidi_scope_run("x", style.clone(), InlineTextSource::Normal);
+        let graph = InlineOpportunityGraph::new(
+            vec![
+                cloneable_box_edge_run(style.clone(), InlineLogicalEdge::Start, 1),
+                bidi_scope_run("\u{2066}", style.clone(), InlineTextSource::BidiControl),
+                positioning_marker,
+                text.clone(),
+                bidi_scope_run("\u{2069}", style.clone(), InlineTextSource::BidiControl),
+                cloneable_box_edge_run(style, InlineLogicalEdge::End, 1),
+            ],
+            Vec::new(),
+        );
+        let range = InlineGraphRange {
+            start: InlineGraphPosition::at_run_start(3),
+            end: InlineGraphPosition::at_run_start(4),
+        };
+        let mut items = vec![MeasuredInlineItem {
+            item: text.item,
+            width: 0.0,
+            shaped: None,
+        }];
+
+        graph.insert_clone_continuation_edges(range, &mut items);
+
+        let continuation_ids = items
+            .iter()
+            .filter_map(|item| match &item.item {
+                InlineLineItem::Atom(atom) => match atom.content() {
+                    InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge)) => {
+                        Some(edge.positioning_containing_block_id)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            continuation_ids,
+            vec![
+                Some(InlinePositioningContainingBlockId(1)),
+                Some(InlinePositioningContainingBlockId(1))
+            ]
+        );
+        assert_eq!(items.len(), 3, "the virtual bidi prefix owns its marker");
+    }
+
     fn measured_text_spacing_item(
         text: &str,
         style: ComputedStyle,
@@ -4357,6 +4912,106 @@ mod tests {
         if fragment.style().font_feature_settings.0.iter().any(|setting| {
             setting.tag == tag && setting.value == 1
         }))
+    }
+
+    #[test]
+    fn tab_resolution_leaves_adjacent_non_tab_fragments_unchanged() {
+        let style = ComputedStyle::initial();
+        let mut font_system = FontSystem::new();
+        let mut items = vec![
+            measured_text_spacing_item(
+                "prefix",
+                style.clone(),
+                InlineTextSource::Normal,
+                &mut font_system,
+            ),
+            measured_text_spacing_item(
+                "suffix",
+                style.clone(),
+                InlineTextSource::Normal,
+                &mut font_system,
+            ),
+        ];
+        let widths = items.iter().map(|item| item.width).collect::<Vec<_>>();
+        let shaped = items
+            .iter()
+            .map(|item| item.shaped.as_ref().map(Rc::clone))
+            .collect::<Vec<_>>();
+
+        assert!(!resolve_materialized_line_tab_advances(
+            &mut items,
+            &mut font_system,
+            &style,
+        ));
+        assert_eq!(
+            items.iter().map(|item| item.width).collect::<Vec<_>>(),
+            widths
+        );
+        for (item, original) in items.iter().zip(shaped) {
+            assert_eq!(
+                item.shaped.as_ref().map(Rc::as_ptr),
+                original.as_ref().map(Rc::as_ptr),
+                "a non-tab fragment must retain its graph shaping artifact"
+            );
+        }
+    }
+
+    #[test]
+    fn stable_tab_geometry_does_not_force_extra_convergence_passes() {
+        let mut style = ComputedStyle::initial();
+        style.white_space = WhiteSpace::Pre;
+        let mut font_system = FontSystem::new();
+        let mut items = vec![
+            measured_text_spacing_item(
+                "prefix",
+                style.clone(),
+                InlineTextSource::Normal,
+                &mut font_system,
+            ),
+            measured_text_spacing_item(
+                "\tsuffix",
+                style.clone(),
+                InlineTextSource::Normal,
+                &mut font_system,
+            ),
+        ];
+        let widths = items.iter().map(|item| item.width).collect::<Vec<_>>();
+
+        assert!(!resolve_materialized_line_tab_advances(
+            &mut items,
+            &mut font_system,
+            &style,
+        ));
+        assert_eq!(
+            items.iter().map(|item| item.width).collect::<Vec<_>>(),
+            widths
+        );
+        assert!(!resolve_materialized_line_tab_advances(
+            &mut items,
+            &mut font_system,
+            &style,
+        ));
+    }
+
+    #[test]
+    fn text_spacing_trim_eligibility_skips_ordinary_text() {
+        let style = ComputedStyle::initial();
+        let mut font_system = FontSystem::new();
+        let ordinary = vec![measured_text_spacing_item(
+            "ordinary ASCII text",
+            style.clone(),
+            InlineTextSource::Normal,
+            &mut font_system,
+        )];
+        let punctuation = vec![measured_text_spacing_item(
+            "、",
+            style,
+            InlineTextSource::Normal,
+            &mut font_system,
+        )];
+
+        assert!(!materialized_items_may_use_text_spacing_trim(&ordinary));
+        assert!(materialized_items_may_use_text_spacing_trim(&punctuation));
     }
 
     #[test]
@@ -4632,6 +5287,29 @@ mod tests {
             apply_auto_hyphenation_across_transparent_inline_edges(&anywhere_runs).is_empty(),
             "line-break:anywhere supplies its own soft opportunities without a used hyphen"
         );
+    }
+
+    #[test]
+    fn auto_phrase_defers_automatic_hyphenation_opportunities() {
+        let mut style = ComputedStyle::initial();
+        style.hyphens = Hyphens::Auto;
+        style.language = ContentLanguage::from_html_attribute("en");
+        style.word_break = css::WordBreak::AutoPhrase;
+
+        let opportunities =
+            apply_auto_hyphenation_across_transparent_inline_edges(&[bidi_scope_run(
+                "hyphenation",
+                style,
+                InlineTextSource::Normal,
+            )]);
+
+        assert!(opportunities.iter().any(|opportunity| {
+            opportunity.kind == BreakEffect::Hyphenation
+                && opportunity.availability
+                    == BreakAvailability::RelaxedWordBreak(
+                        WordBreakRelaxation::AutoPhraseHyphenation,
+                    )
+        }));
     }
 
     #[test]
@@ -5143,6 +5821,65 @@ mod tests {
         );
 
         assert_eq!(used_discretionary_marker_text(&fragment), "\u{2010}");
+    }
+
+    #[test]
+    fn selected_vertical_soft_hyphen_normalization_uses_the_vertical_auto_marker() {
+        let mut style = ComputedStyle::initial();
+        style.writing_mode = WritingMode::VerticalRl;
+        let fragment = InlineFragment::new(
+            "word\u{00ad}",
+            style,
+            0.0,
+            None,
+            true,
+            InlineTextSource::Normal,
+            false,
+            InlineHangingEdges::default(),
+            Vec::new(),
+        );
+        let mut items = vec![MeasuredInlineItem {
+            item: InlineLineItem::Fragment(fragment),
+            width: 0.0,
+            shaped: None,
+        }];
+
+        normalize_materialized_control_characters(&mut items, true, &mut FontSystem::new());
+
+        let InlineLineItem::Fragment(fragment) = &items[0].item else {
+            panic!("selected source remains a text fragment");
+        };
+        assert_eq!(fragment.text(), "word\u{2010}");
+    }
+
+    #[test]
+    fn selected_vertical_soft_hyphen_normalization_preserves_explicit_marker() {
+        let mut style = ComputedStyle::initial();
+        style.writing_mode = WritingMode::VerticalRl;
+        style.hyphenate_character = HyphenateCharacter::String("+=".into());
+        let fragment = InlineFragment::new(
+            "word\u{00ad}",
+            style,
+            0.0,
+            None,
+            true,
+            InlineTextSource::Normal,
+            false,
+            InlineHangingEdges::default(),
+            Vec::new(),
+        );
+        let mut items = vec![MeasuredInlineItem {
+            item: InlineLineItem::Fragment(fragment),
+            width: 0.0,
+            shaped: None,
+        }];
+
+        normalize_materialized_control_characters(&mut items, true, &mut FontSystem::new());
+
+        let InlineLineItem::Fragment(fragment) = &items[0].item else {
+            panic!("selected source remains a text fragment");
+        };
+        assert_eq!(fragment.text(), "word+=");
     }
 
     #[test]

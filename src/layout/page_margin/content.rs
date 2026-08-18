@@ -59,6 +59,7 @@ pub(in crate::layout) fn resolved_margin_box_content(
             counter_styles: context.counter_styles,
             page_counters: &box_counters,
             page_counters_by_page: context.page_counters_by_page,
+            used_color_scheme: spec.style.used_color_scheme,
             image_set_resolution_dppx: context.image_set_resolution_dppx,
         },
     )

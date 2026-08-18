@@ -571,16 +571,15 @@ pub(in crate::layout) fn generated_linear_gradient_image(
                 crate::image_store::GeneratedRasterImage::Linear {
                     gradient,
                     size,
-                    metadata: crate::image_store::ImageMetadata {
-                        pixel_width: pixel_size.width,
-                        pixel_height: pixel_size.height,
-                    },
+                    metadata: crate::image_store::ImageMetadata::from_pixel_size(pixel_size),
                 },
             );
             DecodedPngImage {
                 image_id: Some(image_id),
-                pixel_width: pixel_size.width,
-                pixel_height: pixel_size.height,
+                pixel_size,
+                source_rect: None,
+                natural_size: crate::units::CssPixelSize::new(pixel_size.width, pixel_size.height),
+                sample_depth: crate::image_store::RasterSampleDepth::Eight,
                 rgb: EncodedRasterRgbSamples::from_shared(resource_cache.image_placeholder_rgb()),
                 alpha: None,
                 color_space: crate::color::RasterColorSpace::SRGB,
@@ -603,16 +602,15 @@ pub(in crate::layout) fn generated_radial_gradient_image(
                 crate::image_store::GeneratedRasterImage::Radial {
                     gradient,
                     size,
-                    metadata: crate::image_store::ImageMetadata {
-                        pixel_width: pixel_size.width,
-                        pixel_height: pixel_size.height,
-                    },
+                    metadata: crate::image_store::ImageMetadata::from_pixel_size(pixel_size),
                 },
             );
             DecodedPngImage {
                 image_id: Some(image_id),
-                pixel_width: pixel_size.width,
-                pixel_height: pixel_size.height,
+                pixel_size,
+                source_rect: None,
+                natural_size: crate::units::CssPixelSize::new(pixel_size.width, pixel_size.height),
+                sample_depth: crate::image_store::RasterSampleDepth::Eight,
                 rgb: EncodedRasterRgbSamples::from_shared(resource_cache.image_placeholder_rgb()),
                 alpha: None,
                 color_space: crate::color::RasterColorSpace::SRGB,

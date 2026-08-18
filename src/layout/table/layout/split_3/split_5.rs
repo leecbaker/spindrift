@@ -25,39 +25,47 @@ impl<'a> LayoutBuilder<'a> {
             return None;
         }
 
-        let snapshot = self.snapshot();
-        let positioned_layer_start = self.positioned_layers.len();
-        self.ancestors = self.table_cell_child_ancestors(cell, row);
-        let width = available_width.max(1.0);
-        let top = 10_000.0;
-        self.current_page = Page::new(width, top);
-        self.overflow_clips.clear();
-        self.truncate_page_start_margins = false;
-        let content_scope = self.enter_table_cell_content_scope_for_rect(
-            cell_style,
-            PageTopRect::new(0.0, top, width, top),
-            self.table_cell_child_ancestors(cell, row),
-            None,
-        );
+        // This fragment plan is replayed into a table cell later; its
+        // off-page lines are not eligible anchors for an enclosing list
+        // item's outside marker.
+        self.with_non_principal_line_capture(|layout, snapshot| {
+            let positioned_layer_start = layout.positioned_layers.len();
+            layout.ancestors = layout.table_cell_child_ancestors(cell, row);
+            let width = available_width.max(1.0);
+            let top = 10_000.0;
+            layout.current_page = Page::new(width, top);
+            layout.overflow_clips.clear();
+            layout.truncate_page_start_margins = false;
+            let content_scope = layout.enter_table_cell_content_scope_for_rect(
+                cell_style,
+                PageTopRect::new(0.0, top, width, top),
+                None,
+                layout.table_cell_child_ancestors(cell, row),
+                None,
+            );
 
-        self.layout_formatting_box_with_parent_decoration(child_box, stylesheets, Some(cell_style));
-        self.flush_positioned_layers_since(positioned_layer_start);
+            layout.layout_formatting_box_with_parent_decoration(
+                child_box,
+                stylesheets,
+                Some(cell_style),
+            );
+            layout.flush_positioned_layers_since(positioned_layer_start);
 
-        let fragment = self
-            .current_page
-            .paint_fragment()
-            .translated(PaintTranslation::new(0.0, -top));
-        let assignments = self.captured_current_page_assignment_values();
-        let height = (top - self.cursor_y).max(0.0);
-        self.restore_table_cell_content_scope(content_scope);
-        self.restore(snapshot);
+            let fragment = layout
+                .current_page
+                .paint_fragment()
+                .translated(PaintTranslation::new(0.0, -top));
+            let assignments = layout.captured_current_page_assignment_values();
+            let height = (top - layout.cursor_y).max(0.0);
+            layout.restore_table_cell_content_scope(content_scope);
 
-        (!fragment.is_empty()).then_some(TableCellNestedFragmentPlan {
-            fragment,
-            width,
-            height,
-            metadata: FragmentPageMetadata::empty(self.pages.len()),
-            assignments,
+            (!fragment.is_empty()).then_some(TableCellNestedFragmentPlan {
+                fragment,
+                width,
+                height,
+                metadata: FragmentPageMetadata::empty(snapshot.rollback.pages.len()),
+                assignments,
+            })
         })
     }
 
@@ -70,6 +78,7 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &Stylesheets<'_>,
         content_geometry: TableCellContentGeometry,
         content_plan: &TableCellContentPlan,
+        overflow_clip: Option<OverflowClip>,
     ) {
         let Some(children) = cell.children.as_deref() else {
             return;
@@ -108,6 +117,7 @@ impl<'a> LayoutBuilder<'a> {
         let content_scope = self.enter_table_cell_content_scope(
             cell_style,
             content_box,
+            overflow_clip,
             self.table_cell_child_ancestors(cell, row),
             PercentageBasis::indefinite(),
         );
@@ -977,7 +987,8 @@ impl<'a> LayoutBuilder<'a> {
                 let mut primitives = backgrounds.split_off(background_start);
                 primitives.extend(outlines.split_off(outline_start));
                 relative_part_paints.push(RelativeTablePartStructuralPaint {
-                    style: row_group_style.as_computed().clone(),
+                    source_style: row_group_style.source().clone(),
+                    style: row_group_style.used_style().clone(),
                     bounds: PageTopRect::new(occupied_x, top, occupied_width, height).paint_clip(),
                     primitives,
                 });
@@ -1044,7 +1055,7 @@ impl<'a> LayoutBuilder<'a> {
                 }
                 let relative_style =
                     matches!(row_style.position, Position::Relative | Position::Sticky)
-                        .then(|| row_style.as_computed().clone())
+                        .then(|| row_style.clone())
                         .or_else(|| {
                             rows[original_row]
                                 .row_groups
@@ -1055,11 +1066,11 @@ impl<'a> LayoutBuilder<'a> {
                                 .filter(|style| {
                                     matches!(style.position, Position::Relative | Position::Sticky)
                                 })
-                                .map(|style| style.as_computed().clone())
                         });
                 if let Some(relative_style) = relative_style {
                     relative_part_paints.push(RelativeTablePartStructuralPaint {
-                        style: relative_style.clone(),
+                        source_style: relative_style.source().clone(),
+                        style: relative_style.used_style().clone(),
                         bounds: PaintClip::from_paint_rect(bounds.paint_rect()),
                         primitives: row_backgrounds,
                     });
@@ -1158,7 +1169,6 @@ impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout::table) fn collapsed_table_fragment_border_primitives(
         &mut self,
         geometry: &CollapsedTableGeometry,
-        table_x: f32,
         column_plan: &TableColumnPlan,
         fragment: &TableBodyPaintFragment,
     ) -> Vec<PaintPrimitive> {
@@ -1166,30 +1176,28 @@ impl<'a> LayoutBuilder<'a> {
         let row_heights = fragment.row_heights();
         let row_offsets = fragment.row_offsets();
         let original_row_heights = fragment.original_row_heights();
-        let horizontal_page_top = fragment.row_tops().into_iter().fold(0.0_f32, f32::max);
-        // Horizontal table fragments retain page-local row coordinates even
-        // when a retained logical placement was not needed by another table
-        // paint phase. Preserve that established projection instead of
-        // suppressing all collapsed-border paint; vertical roots still require
-        // the retained grid placement inside `paint_fragment_rows`.
-        let placement = fragment
+        // A collapsed border is table-grid structural paint.  Its destination
+        // is consequently the same committed grid viewport that owns row,
+        // column, and root-background paint; reconstructing an origin from a
+        // physical row cursor drops caption-consumed wrapper progress and is
+        // invalid for vertical roots.
+        // <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+        // <https://drafts.csswg.org/css-tables-3/#table-fragmentation>
+        let viewport = fragment
             .grid_viewport
             .as_ref()
-            .map(|viewport| viewport.destination_placement())
-            .unwrap_or_else(|| TableGridPlacement::new(PageTopPoint::new(table_x, 0.0)));
+            .expect("every committed table body fragment has a grid viewport");
+        let placement = viewport.destination_placement();
         let (rects, paths) = geometry.grid.paint_fragment_rows(
             placement,
-            TableGridPlacement::new(PageTopPoint::new(table_x, horizontal_page_top)),
+            placement,
             column_plan,
             &rows,
             &fragment.row_tops(),
             &row_heights,
             &row_offsets,
             &original_row_heights,
-            fragment
-                .grid_viewport
-                .as_ref()
-                .map(|viewport| viewport.row_bounds()),
+            Some(viewport.row_bounds()),
         );
         rects
             .into_iter()
@@ -1295,19 +1303,31 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         context: &TableGridLayoutContext<'_, '_>,
     ) -> TableHeightPlan {
+        let target = self
+            .resolve_table_target_content_height(
+                context.table_style,
+                context.collapsed_geometry,
+                context.wrapper_border_box_block_size,
+                context.positioned_table_block_content_size,
+                context.wrapper_non_grid_block_size,
+            )
+            .map(TableHeightDistributionTarget::Definite)
+            .unwrap_or(TableHeightDistributionTarget::Intrinsic);
         let cache_key = context.rows.first().and_then(|row| {
-            row.element.map(|element| {
-                (
-                    element.id,
-                    context.column_plan.total_width().points().to_bits(),
-                    context
-                        .wrapper_border_box_block_size
-                        .map(|size| size.points().to_bits()),
-                    context
-                        .positioned_table_block_content_size
-                        .map(|size| size.points().to_bits()),
-                    context.wrapper_non_grid_block_size.points().to_bits(),
-                )
+            row.element.map(|element| TableHeightPlanCacheKey {
+                table_element: element.id,
+                column_width_bits: context.column_plan.total_width().points().to_bits(),
+                wrapper_border_box_block_size_bits: context
+                    .wrapper_border_box_block_size
+                    .map(|size| size.points().to_bits()),
+                positioned_table_block_content_size_bits: context
+                    .positioned_table_block_content_size
+                    .map(|size| size.points().to_bits()),
+                wrapper_non_grid_block_size_bits: context
+                    .wrapper_non_grid_block_size
+                    .points()
+                    .to_bits(),
+                target: target.into(),
             })
         });
         if let Some(plan) = cache_key
@@ -1325,6 +1345,35 @@ impl<'a> LayoutBuilder<'a> {
         let mut spanning_cells = Vec::new();
         for (row_index, row) in context.rows.iter().enumerate() {
             let row_style = self.style_for_table_row(row, context.table_style, context.stylesheets);
+            // A row is auto-height only when neither the row nor a
+            // single-row cell supplies a specified block-size constraint.
+            // Cell constraints establish the row's reference size during
+            // the second pass, and surplus table height belongs only to rows
+            // that are genuinely content-sized.
+            // <https://drafts.csswg.org/css-tables-3/#height-distribution-algorithm>
+            let has_specified_single_row_cell_height = context.grid.rows[row_index]
+                .iter()
+                .filter(|placement| placement.rowspan == 1)
+                .any(|placement| {
+                    let cell = &row.cells[placement.cell];
+                    let cell_style =
+                        self.style_for_table_cell(cell, row, &row_style, context.stylesheets);
+                    !table_root_block_size(&cell_style).is_auto()
+                });
+            let row_group_has_specified_height = row.row_groups.last().is_some_and(|group| {
+                !table_root_block_size(&self.style_for_table_row_group(
+                    group,
+                    context.table_style,
+                    context.stylesheets,
+                ))
+                .is_auto()
+            });
+            let auto_height = table_root_block_size(&row_style).is_auto()
+                && !has_specified_single_row_cell_height
+                // A row group with an authored block-size supplies a
+                // reference constraint for its rows. It is therefore not an
+                // auto-height receiver when excess table height is assigned.
+                && !row_group_has_specified_height;
             let source_height = if row_style.position.is_running() {
                 0.0
             } else {
@@ -1366,7 +1415,7 @@ impl<'a> LayoutBuilder<'a> {
                 source_height,
                 reference: base,
                 final_height: base,
-                auto: table_root_block_size(&row_style).is_auto(),
+                auto: auto_height,
                 collapsed: false,
             });
             for placement in &context.grid.rows[row_index] {
@@ -1416,13 +1465,6 @@ impl<'a> LayoutBuilder<'a> {
             row.final_height = row.base;
         }
 
-        let target_content_height = self.resolve_table_target_content_height(
-            context.table_style,
-            context.collapsed_geometry,
-            context.wrapper_border_box_block_size,
-            context.positioned_table_block_content_size,
-            context.wrapper_non_grid_block_size,
-        );
         // With no resolved wrapper block-size target, the first row-layout
         // pass already contains every cell and row constraint that can affect
         // the table's intrinsic height.  A second pass against an indefinite
@@ -1431,7 +1473,7 @@ impl<'a> LayoutBuilder<'a> {
         // rather than cell contributions, so retain the reference pass when
         // any group has an authored block size.
         // <https://drafts.csswg.org/css-tables-3/#row-layout>
-        let needs_reference_pass = target_content_height.is_some()
+        let needs_reference_pass = matches!(target, TableHeightDistributionTarget::Definite(_))
             || context.rows.iter().any(|row| {
                 row.row_groups.last().is_some_and(|group| {
                     !table_root_block_size(&self.style_for_table_row_group(
@@ -1446,21 +1488,18 @@ impl<'a> LayoutBuilder<'a> {
             self.compute_table_reference_heights(
                 &mut plan_rows,
                 context,
-                target_content_height
+                target
+                    .definite_content_height()
                     .map(|value| {
                         PercentageBasis::definite_from(value, BlockSizeBasisSource::TableWrapper)
                     })
                     .unwrap_or_else(PercentageBasis::indefinite),
             );
         }
-        self.distribute_table_height_plan(
-            &mut plan_rows,
-            target_content_height,
-            context.table_metrics.clone(),
-        );
+        self.distribute_table_height_plan(&mut plan_rows, target, context.table_metrics.clone());
         let plan = TableHeightPlan {
             rows: plan_rows,
-            target_content_height,
+            target,
         };
         if let Some(key) = cache_key {
             self.speculative_table_height_plans

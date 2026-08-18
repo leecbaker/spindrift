@@ -128,14 +128,10 @@ impl<'i> DeclarationParser<'i> for PropertyRuleBodyParser {
         }
         if name.eq_ignore_ascii_case("initial-value") {
             let start = input.position();
-            let mut has_tokenizer_error = false;
-            while let Ok(token) = input.next_including_whitespace_and_comments() {
-                has_tokenizer_error |= token.is_parse_error();
-            }
+            let is_valid =
+                crate::css::component_values::validate_component_value_list_from_parser(input);
             let value = input.slice_from(start).trim();
-            if has_tokenizer_error
-                || crate::css::component_values::CssComponentValueList::parse(value).is_none()
-            {
+            if !is_valid {
                 return Err(input.new_custom_error(BasicParseErrorKind::QualifiedRuleInvalid));
             }
             self.initial_value = Some(value.to_string());

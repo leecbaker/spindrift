@@ -68,6 +68,108 @@ struct ReversedAccumulator {
     stopped_by_set: bool,
 }
 
+/// Counter scope used exclusively while determining an omitted `reversed()`
+/// start value.
+///
+/// CSS counter values continue to use [`PlannedCounterState`]: a counter
+/// created by a nested list can be inherited by following siblings.  The
+/// initial-value algorithm has a different question, though: which source
+/// mutations belong to the reset declaration's own scope.  In particular, a
+/// nested reset temporarily masks its ancestor while its subtree is visited,
+/// then the ancestor resumes collecting contributions for following siblings.
+///
+/// <https://drafts.csswg.org/css-lists-3/#instantiating-counters>
+#[derive(Debug, Default)]
+struct ReversedStartScopeState {
+    values: HashMap<String, Vec<PlannedCounterInstance>>,
+    frames: Vec<ReversedStartScopeFrame>,
+}
+
+#[derive(Debug, Default)]
+struct ReversedStartScopeFrame {
+    base_lengths: HashMap<String, usize>,
+}
+
+impl ReversedStartScopeState {
+    fn new() -> Self {
+        Self {
+            values: HashMap::new(),
+            frames: vec![ReversedStartScopeFrame::default()],
+        }
+    }
+
+    fn current(&self, name: &str) -> Option<PlannedCounterInstance> {
+        self.values
+            .get(name)
+            .and_then(|values| values.last())
+            .copied()
+    }
+
+    /// Makes a reset visible while its descendants are visited.
+    ///
+    /// A reset at the start of an ancestor's child scope is temporary: it
+    /// owns that subtree's reversed-start contributions, but does not own
+    /// contributions from following siblings in the enclosing scope.  A
+    /// reset that appears after another sibling counter instead shadows that
+    /// counter for the rest of the sibling scope.
+    fn reset_for_node(&mut self, name: &str, instance: PlannedCounterInstance) -> bool {
+        let base_length = self.current_frame_base_length(name);
+        let values = self.values.entry(name.to_string()).or_default();
+        let temporary = values.len() == base_length && base_length > 0;
+        if !temporary {
+            values.truncate(base_length);
+        }
+        values.push(instance);
+        temporary
+    }
+
+    fn ensure(&mut self, name: &str, instance: PlannedCounterInstance) -> PlannedCounterInstance {
+        self.current(name).unwrap_or_else(|| {
+            self.reset_for_node(name, instance);
+            instance
+        })
+    }
+
+    fn push_frame(&mut self) {
+        self.frames.push(ReversedStartScopeFrame::default());
+    }
+
+    fn pop_frame(&mut self) {
+        let frame = self
+            .frames
+            .pop()
+            .expect("reversed-start scope never pops its root frame");
+        for (name, base_length) in frame.base_lengths {
+            if let Some(values) = self.values.get_mut(&name) {
+                values.truncate(base_length);
+                if values.is_empty() {
+                    self.values.remove(&name);
+                }
+            }
+        }
+    }
+
+    fn pop_temporary(&mut self, name: &str) {
+        if let Some(values) = self.values.get_mut(name) {
+            values.pop();
+            if values.is_empty() {
+                self.values.remove(name);
+            }
+        }
+    }
+
+    fn current_frame_base_length(&mut self, name: &str) -> usize {
+        let current_length = self.values.get(name).map_or(0, Vec::len);
+        *self
+            .frames
+            .last_mut()
+            .expect("reversed-start scope always has a root frame")
+            .base_lengths
+            .entry(name.to_string())
+            .or_insert(current_length)
+    }
+}
+
 #[derive(Debug)]
 struct CounterPlanBuilder {
     next_scope_id: usize,
@@ -84,7 +186,14 @@ impl CounterPlanBuilder {
 
     fn build(events: &[box_tree::CounterEventNode<'_>]) -> CounterPlan {
         let mut builder = Self::new();
-        builder.visit_siblings(events, &PlannedCounterState::default(), 0, 0);
+        let mut reversed_start_scopes = ReversedStartScopeState::new();
+        builder.visit_siblings(
+            events,
+            &PlannedCounterState::default(),
+            0,
+            0,
+            &mut reversed_start_scopes,
+        );
         let reversed_initial_values = builder
             .accumulators
             .into_iter()
@@ -112,14 +221,20 @@ impl CounterPlanBuilder {
         parent_state: &PlannedCounterState,
         current_scope: usize,
         mutation_floor: usize,
+        reversed_start_scopes: &mut ReversedStartScopeState,
     ) -> PlannedCounterState {
         let mut preceding_sibling = None;
         let mut preceding_tree_order = parent_state.clone();
         for event in events {
             let membership_source = preceding_sibling.as_ref().unwrap_or(parent_state);
             let state = PlannedCounterState::inherit(membership_source, &preceding_tree_order);
-            let (node_state, last_tree_order) =
-                self.visit(event, state, current_scope, mutation_floor);
+            let (node_state, last_tree_order) = self.visit(
+                event,
+                state,
+                current_scope,
+                mutation_floor,
+                reversed_start_scopes,
+            );
             preceding_sibling = Some(node_state);
             preceding_tree_order = last_tree_order;
         }
@@ -132,8 +247,10 @@ impl CounterPlanBuilder {
         mut state: PlannedCounterState,
         current_scope: usize,
         mutation_floor: usize,
+        reversed_start_scopes: &mut ReversedStartScopeState,
     ) -> (PlannedCounterState, PlannedCounterState) {
         let origin = CounterOriginKey::new(event.element, event.source);
+        let mut temporary_reversed_start_resets = Vec::new();
         for (declaration_index, reset) in event.counter_style.counter_resets.iter().enumerate() {
             let accumulator_id = self.accumulators.len();
             self.accumulators.push(ReversedAccumulator {
@@ -152,6 +269,9 @@ impl CounterPlanBuilder {
                 creator_scope: current_scope,
             };
             state.reset(&reset.name, instance, current_scope);
+            if reversed_start_scopes.reset_for_node(&reset.name, instance) {
+                temporary_reversed_start_resets.push(reset.name.clone());
+            }
         }
 
         let mut increments = Vec::<(String, CounterValue)>::new();
@@ -202,7 +322,8 @@ impl CounterPlanBuilder {
                 .find(|change| change.name == name)
                 .map(|change| change.value);
             let instance = self.ensure(&mut state, &name, origin, current_scope, mutation_floor);
-            self.observe(instance.id, increment, set);
+            let reversed_start_instance = reversed_start_scopes.ensure(&name, instance);
+            self.observe(reversed_start_instance.id, increment, set);
         }
 
         let node_state = state.clone();
@@ -213,12 +334,18 @@ impl CounterPlanBuilder {
         } else {
             mutation_floor
         };
+        reversed_start_scopes.push_frame();
         let last_tree_order = self.visit_siblings(
             &event.children,
             &node_state,
             child_scope,
             child_mutation_floor,
+            reversed_start_scopes,
         );
+        reversed_start_scopes.pop_frame();
+        for name in temporary_reversed_start_resets.into_iter().rev() {
+            reversed_start_scopes.pop_temporary(&name);
+        }
         (node_state, last_tree_order)
     }
 
@@ -837,7 +964,13 @@ impl<'a> LayoutBuilder<'a> {
         };
 
         let counter_stacks = self.counter_stacks_at_origin(element, source);
-        evaluate_generated_content_text(element, content, &counter_stacks, &self.counter_styles)
+        evaluate_generated_content_text(
+            element,
+            content,
+            &counter_stacks,
+            &self.counter_styles,
+            list::CounterStyleRenderContext::for_style(pseudo_style),
+        )
     }
 
     fn evaluate_named_string_set_with_counter_scopes(
@@ -927,10 +1060,11 @@ impl<'a> LayoutBuilder<'a> {
                         .get(name)
                         .and_then(|values| values.last().cloned())
                         .unwrap_or(0);
-                    if let Some(counter) = list::counter_text(
+                    if let Some(counter) = list::counter_text_with_context(
                         counter_style.clone().unwrap_or(ListStyleType::Decimal),
                         value,
                         &self.counter_styles,
+                        list::CounterStyleRenderContext::for_style(style),
                     ) {
                         push_named_string_text_part(&mut output, &counter);
                     }
@@ -950,14 +1084,19 @@ impl<'a> LayoutBuilder<'a> {
                         );
                         continue;
                     }
-                    let style = counter_style.clone().unwrap_or(ListStyleType::Decimal);
+                    let counter_style = counter_style.clone().unwrap_or(ListStyleType::Decimal);
                     let counters = counter_stacks
                         .get(name)
                         .cloned()
                         .unwrap_or_else(|| vec![0])
                         .into_iter()
                         .filter_map(|value| {
-                            list::counter_text(style.clone(), value, &self.counter_styles)
+                            list::counter_text_with_context(
+                                counter_style.clone(),
+                                value,
+                                &self.counter_styles,
+                                list::CounterStyleRenderContext::for_style(style),
+                            )
                         })
                         .collect::<Vec<_>>();
                     push_named_string_text_part(&mut output, &counters.join(separator));
@@ -1017,6 +1156,7 @@ impl<'a> LayoutBuilder<'a> {
                         std::slice::from_ref(part),
                         &counter_stacks,
                         &self.counter_styles,
+                        list::CounterStyleRenderContext::for_style(pseudo_style),
                     );
                     push_named_string_text_part(&mut output, &text);
                 }
@@ -1485,11 +1625,11 @@ fn image_with_context_urls(
     while let css::BackgroundImage::SelectedImageSet { image, .. } = selected {
         selected = image;
     }
-    if let css::BackgroundImage::Url {
+    if let css::BackgroundImage::Url(css::ImageUrl {
         base_url: image_base_url,
         root_url: image_root_url,
         ..
-    } = selected
+    }) = selected
     {
         if image_base_url.is_none() {
             *image_base_url = base_url.cloned();
@@ -1517,12 +1657,12 @@ fn running_element_content_parts(
         && let Some(url) = element.attrs.get("src").filter(|value| !value.is_empty())
     {
         return vec![GeneratedContentPart::Image {
-            image: css::ComputedImage::image(css::BackgroundImage::Url {
-                src: url.clone(),
+            image: css::ComputedImage::image(css::BackgroundImage::Url(css::ImageUrl {
+                href: url.clone(),
                 base_url: base_url.cloned(),
                 root_url: root_url.cloned(),
                 request_modifiers: css::RequestUrlModifiers::default(),
-            }),
+            })),
         }];
     }
     if fallback_text.is_empty() {
@@ -1849,6 +1989,116 @@ mod tests {
         assert_eq!(
             plan.values_at_origin[&principal_origin(&final_outer)]["foo"],
             [2]
+        );
+    }
+
+    #[test]
+    fn nested_reversed_starts_resume_the_enclosing_sibling_scope() {
+        let outer = element("outer");
+        let inner = element("inner");
+        let inner_zero = element("inner-zero");
+        let inner_first = element("inner-first");
+        let inner_second = element("inner-second");
+        let inner_third = element("inner-third");
+        let outer_zero = element("outer-zero");
+        let outer_first = element("outer-first");
+        let outer_second = element("outer-second");
+        let outer_third = element("outer-third");
+        let events = vec![counter_event(
+            &outer,
+            vec![counter_reset("foo", CounterResetKind::Reversed(None))],
+            Vec::new(),
+            Vec::new(),
+            vec![
+                counter_event(
+                    &inner,
+                    vec![counter_reset("foo", CounterResetKind::Reversed(None))],
+                    Vec::new(),
+                    Vec::new(),
+                    vec![
+                        counter_event(
+                            &inner_zero,
+                            Vec::new(),
+                            vec![counter_change("foo", 0)],
+                            Vec::new(),
+                            Vec::new(),
+                        ),
+                        counter_event(
+                            &inner_first,
+                            Vec::new(),
+                            vec![counter_change("foo", 3)],
+                            Vec::new(),
+                            Vec::new(),
+                        ),
+                        counter_event(
+                            &inner_second,
+                            Vec::new(),
+                            vec![counter_change("foo", 1)],
+                            Vec::new(),
+                            Vec::new(),
+                        ),
+                        counter_event(
+                            &inner_third,
+                            Vec::new(),
+                            vec![counter_change("foo", 8)],
+                            Vec::new(),
+                            Vec::new(),
+                        ),
+                    ],
+                ),
+                counter_event(
+                    &outer_zero,
+                    Vec::new(),
+                    vec![counter_change("foo", 0)],
+                    Vec::new(),
+                    Vec::new(),
+                ),
+                counter_event(
+                    &outer_first,
+                    Vec::new(),
+                    vec![counter_change("foo", 3)],
+                    Vec::new(),
+                    Vec::new(),
+                ),
+                counter_event(
+                    &outer_second,
+                    Vec::new(),
+                    vec![counter_change("foo", 1)],
+                    Vec::new(),
+                    Vec::new(),
+                ),
+                counter_event(
+                    &outer_third,
+                    Vec::new(),
+                    vec![counter_change("foo", 8)],
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            ],
+        )];
+
+        let plan = CounterPlanBuilder::build(&events);
+        for element in [&outer, &inner] {
+            assert_eq!(
+                plan.reversed_initial_values[&CounterResetKey {
+                    origin: principal_origin(element),
+                    declaration_index: 0,
+                }]
+                    .get(),
+                -20
+            );
+        }
+        assert_eq!(
+            plan.values_at_origin[&principal_origin(&inner_third)]["foo"],
+            [-20, -8]
+        );
+        assert_eq!(
+            plan.values_at_origin[&principal_origin(&outer_first)]["foo"],
+            [-20, -5]
+        );
+        assert_eq!(
+            plan.values_at_origin[&principal_origin(&outer_third)]["foo"],
+            [-20, 4]
         );
     }
 

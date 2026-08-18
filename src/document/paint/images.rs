@@ -3,8 +3,33 @@ use std::rc::Rc;
 use crate::image_store::{DocumentImageStore, ImageId};
 
 use super::geometry::{PaintRect, PaintTransform, PaintTranslation};
-use super::paths::RenderedPathClip;
+use super::paths::{RenderedPathClip, RenderedPathClipPath};
 use super::patterns::RenderedImageSourceRect;
+
+/// The raster scaling behavior selected by CSS `image-rendering`.
+///
+/// This is retained with an image until PDF resource preparation, where the
+/// final object-fit geometry and output device-density are both known.
+/// <https://drafts.csswg.org/css-images-3/#the-image-rendering>
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub(crate) enum RasterSampling {
+    #[default]
+    Auto,
+    Smooth,
+    HighQuality,
+    Pixelated,
+    CrispEdges,
+}
+
+impl From<bool> for RasterSampling {
+    fn from(interpolate: bool) -> Self {
+        if interpolate {
+            Self::Auto
+        } else {
+            Self::CrispEdges
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum RenderedImageSource {
@@ -24,7 +49,11 @@ pub(crate) enum RenderedImageSource {
 pub(crate) struct InlineRasterImage {
     pub(crate) pixel_width: u32,
     pub(crate) pixel_height: u32,
+    /// CSS intrinsic dimensions after image metadata such as EXIF density has
+    /// been applied. These are distinct from encoded sample dimensions.
+    pub(crate) natural_size: crate::units::CssPixelSize,
     pub(crate) color_space: crate::color::RasterColorSpace,
+    pub(crate) sample_depth: crate::image_store::RasterSampleDepth,
     pub(crate) rgb: Rc<[u8]>,
     pub(crate) alpha: Option<Rc<[u8]>>,
 }
@@ -34,7 +63,7 @@ pub struct RenderedImage {
     pub background: bool,
     pub(crate) source: RenderedImageSource,
     pub(in crate::document) rect: PaintRect,
-    pub interpolate: bool,
+    pub(crate) sampling: RasterSampling,
     pub alt_text: Option<Rc<str>>,
     /// Exact logical text represented by this otherwise non-text paint.
     ///
@@ -76,9 +105,11 @@ impl RenderedImage {
         let source_rect = *source_rect;
         let Some(source) = store.with_rasterized(image_id, |raster| RenderedImageSource::Inline {
             raster: InlineRasterImage {
-                pixel_width: raster.metadata.pixel_width,
-                pixel_height: raster.metadata.pixel_height,
+                pixel_width: raster.metadata.pixel_size.width,
+                pixel_height: raster.metadata.pixel_size.height,
+                natural_size: raster.metadata.natural_size,
                 color_space: raster.color_space,
+                sample_depth: raster.sample_depth,
                 rgb: Rc::from(raster.rgb),
                 alpha: raster.alpha.map(Rc::from),
             },
@@ -96,7 +127,7 @@ impl RenderedImage {
         pixel_width: u32,
         pixel_height: u32,
         source_rect: Option<RenderedImageSourceRect>,
-        interpolate: bool,
+        sampling: impl Into<RasterSampling>,
         rgb: Rc<[u8]>,
         alpha: Option<Rc<[u8]>>,
         alt_text: Option<Rc<str>>,
@@ -107,14 +138,16 @@ impl RenderedImage {
                 raster: InlineRasterImage {
                     pixel_width,
                     pixel_height,
+                    natural_size: crate::units::CssPixelSize::new(pixel_width, pixel_height),
                     color_space: crate::color::RasterColorSpace::SRGB,
+                    sample_depth: crate::image_store::RasterSampleDepth::Eight,
                     rgb,
                     alpha,
                 },
                 source_rect,
             },
             rect,
-            interpolate,
+            sampling: sampling.into(),
             alt_text,
             actual_text: None,
             transform: None,
@@ -155,6 +188,27 @@ impl RenderedImage {
     /// <https://www.w3.org/TR/css-backgrounds-3/#corner-clipping>.
     pub(crate) fn with_clip(mut self, clip: RenderedPathClip) -> Self {
         self.clip = Some(clip);
+        self.destination_rect_clip = false;
+        self
+    }
+
+    /// Intersect this image's retained clip with an SVG descendant clip.
+    ///
+    /// SVG group and viewport clips apply to image nodes just as they do to
+    /// vector paths.  Keeping both contours avoids reconstructing an image's
+    /// object-fit geometry from scalars at the PDF boundary.
+    pub(crate) fn with_intersected_clip(mut self, clip: RenderedPathClip) -> Self {
+        if let Some(existing) = self.clip.take() {
+            let mut combined = clip;
+            combined.additional_clips.push(RenderedPathClipPath::new(
+                existing.commands,
+                existing.fill_rule,
+            ));
+            combined.additional_clips.extend(existing.additional_clips);
+            self.clip = Some(combined);
+        } else {
+            self.clip = Some(clip);
+        }
         self.destination_rect_clip = false;
         self
     }
@@ -245,6 +299,17 @@ impl RenderedImage {
     ) -> Self {
         if let RenderedImageSource::Inline { raster, .. } = &mut self.source {
             raster.color_space = color_space;
+        }
+        self
+    }
+
+    /// Set the depth shared by this image's RGB and opacity sample planes.
+    pub(crate) fn with_raster_sample_depth(
+        mut self,
+        sample_depth: crate::image_store::RasterSampleDepth,
+    ) -> Self {
+        if let RenderedImageSource::Inline { raster, .. } = &mut self.source {
+            raster.sample_depth = sample_depth;
         }
         self
     }

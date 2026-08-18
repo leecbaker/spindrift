@@ -289,7 +289,6 @@ impl<'a> LayoutBuilder<'a> {
             min_cross,
             max_cross,
         );
-
         let line_metrics = estimate_row_flex_container_line_metrics(
             style,
             intrinsic_item_available,
@@ -377,11 +376,30 @@ impl<'a> LayoutBuilder<'a> {
                 physical_direction,
                 available,
             );
-            let size = self.estimate_flex_item_size(
+            let mut size = self.estimate_flex_item_size(
                 child,
                 stylesheets,
                 item_available,
                 physical_direction,
+            );
+            let automatic_main_min_content = self.estimate_flex_item_automatic_main_min_content(
+                child,
+                stylesheets,
+                item_available,
+                physical_direction,
+            );
+            let preferred_aspect_ratio = child
+                .style
+                .aspect_ratio
+                .preferred_ratio(child.is_replaced_element(), size.preferred_aspect_ratio);
+            set_flex_item_automatic_main_minimum_inputs(
+                &mut size,
+                &child.style,
+                physical_direction,
+                automatic_main_min_content,
+                preferred_aspect_ratio,
+                child.is_replaced_element(),
+                available,
             );
             let item = FlexIntrinsicItem::new(child, size, physical_direction, available, style);
             let (first_baseline, last_baseline) =

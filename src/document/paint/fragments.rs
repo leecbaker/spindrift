@@ -165,6 +165,23 @@ impl PaintFragment {
         in_flow.splice(0..0, background_items);
     }
 
+    /// Move an ordinary in-flow box's outline before positioned descendants.
+    ///
+    /// CSS UI leaves overlapping-outline stacking to implementations. Quire's
+    /// compatibility policy follows CSS 2.2's optional per-box outline phase,
+    /// rather than treating every outline as the final outline of its parent
+    /// stacking context:
+    /// <https://drafts.csswg.org/css-ui-4/#outline-painting> and
+    /// <https://www.w3.org/TR/CSS22/zindex.html>.
+    pub(crate) fn promote_outline_to_in_flow_outline(&mut self) {
+        let outline_items =
+            std::mem::take(&mut self.display_list.bands.bands[PaintBand::Outline.index()]);
+        if outline_items.is_empty() {
+            return;
+        }
+        self.display_list.bands.bands[PaintBand::InFlowOutline.index()].extend(outline_items);
+    }
+
     /// Move a following BFC root's own decoration after the float phase.
     ///
     /// A BFC root that follows a float is an independent formatting context:
@@ -231,6 +248,25 @@ impl PaintFragment {
             self.display_list.bands.bands[band.index()] = retained;
         }
         contexts
+    }
+
+    /// Restore positioned stacking contexts that remain scoped by this
+    /// fragment after a caller has promoted sibling stack levels to an
+    /// ancestor paint tree.
+    ///
+    /// A pseudo stacking context, such as a relatively positioned box with
+    /// `z-index: auto`, retains only its auto-level descendants. Positive and
+    /// negative descendants escape to the parent, while these retained
+    /// contexts keep their normal paint band within the fragment.
+    /// <https://www.w3.org/TR/CSS22/zindex.html>
+    pub(crate) fn restore_positioned_stacking_contexts(
+        &mut self,
+        contexts: impl IntoIterator<Item = PaintStackingContext>,
+    ) {
+        for context in contexts {
+            self.display_list.bands.push_context(context);
+        }
+        self.display_list.bands.sort_stacking_contexts();
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -342,7 +378,7 @@ impl PaintFragment {
     /// <https://www.w3.org/TR/css-overflow-3/#overflow-clip-edge> and
     /// <https://www.w3.org/TR/CSS22/zindex.html>.
     pub(crate) fn with_contents_effect_scoped_to_rect(self, clip: PaintClip) -> Self {
-        self.with_contents_effect_scoped_to_clip(clip, false, None, None)
+        self.with_contents_effect_scoped_to_clip(clip, false, None, None, false)
     }
 
     /// Scope non-decoration contents with an axis-selective CSS overflow
@@ -351,7 +387,27 @@ impl PaintFragment {
         self,
         clip: AxisSelectivePaintClip,
     ) -> Self {
-        self.with_contents_effect_scoped_to_clip(clip.bounds(), false, Some(clip), None)
+        self.with_contents_effect_scoped_to_clip(clip.bounds(), false, Some(clip), None, false)
+    }
+
+    /// Scope every paint band in a fragment with an overflow clip.
+    ///
+    /// This is for a descendant-only fragment captured before its owner's
+    /// background, border, and outline are appended. In that situation a
+    /// descendant's background belongs to `BackgroundBorder` and must be
+    /// clipped, unlike the owner's decoration.
+    /// <https://drafts.csswg.org/css-overflow-3/#overflow-clipping>
+    pub(crate) fn with_descendant_paint_effect_scoped_to_rect(self, clip: PaintClip) -> Self {
+        self.with_contents_effect_scoped_to_clip(clip, false, None, None, true)
+    }
+
+    /// Axis-selective form of
+    /// [`Self::with_descendant_paint_effect_scoped_to_rect`].
+    pub(crate) fn with_descendant_paint_effect_scoped_to_axis_selective_rect(
+        self,
+        clip: AxisSelectivePaintClip,
+    ) -> Self {
+        self.with_contents_effect_scoped_to_clip(clip.bounds(), false, Some(clip), None, true)
     }
 
     /// Clip only recorded ink that can reach the overflow edge.
@@ -379,7 +435,7 @@ impl PaintFragment {
         self,
         clip: PaintClip,
     ) -> Self {
-        self.with_contents_effect_scoped_to_clip(clip, true, None, None)
+        self.with_contents_effect_scoped_to_clip(clip, true, None, None, false)
     }
 
     /// Inserts captured positioned descendants into their normal paint bands,
@@ -427,7 +483,16 @@ impl PaintFragment {
         self,
         contour: ResolvedBoxContentClip,
     ) -> Self {
-        self.with_contents_effect_scoped_to_clip(contour.bounds, false, None, Some(contour))
+        self.with_contents_effect_scoped_to_clip(contour.bounds, false, None, Some(contour), false)
+    }
+
+    /// Contoured form of
+    /// [`Self::with_descendant_paint_effect_scoped_to_rect`].
+    pub(crate) fn with_descendant_paint_effect_scoped_to_box_content_contour(
+        self,
+        contour: ResolvedBoxContentClip,
+    ) -> Self {
+        self.with_contents_effect_scoped_to_clip(contour.bounds, false, None, Some(contour), true)
     }
 
     /// Include captured positioned descendants in the same retained box
@@ -452,6 +517,7 @@ impl PaintFragment {
         elide_covered_rectangular_clip: bool,
         axis_selective_clip: Option<AxisSelectivePaintClip>,
         contoured_overflow_clip: Option<ResolvedBoxContentClip>,
+        include_decoration_bands: bool,
     ) -> Self {
         let mut bands = self.display_list.bands;
         let overflow_clip_effect = contoured_overflow_clip
@@ -464,13 +530,16 @@ impl PaintFragment {
         let mut emitted_scope = false;
 
         for band in PaintBand::ORDER {
-            if matches!(
-                band,
-                PaintBand::BackgroundBorder
-                    | PaintBand::TableCellBorder
-                    | PaintBand::TableCollapsedBorder
-                    | PaintBand::Outline
-            ) {
+            if !include_decoration_bands
+                && matches!(
+                    band,
+                    PaintBand::BackgroundBorder
+                        | PaintBand::TableCellBorder
+                        | PaintBand::TableCollapsedBorder
+                        | PaintBand::InFlowOutline
+                        | PaintBand::Outline
+                )
+            {
                 continue;
             }
             let items = std::mem::take(&mut bands.bands[band.index()]);
@@ -560,6 +629,7 @@ impl PaintFragment {
                 PaintBand::BackgroundBorder
                     | PaintBand::TableCellBorder
                     | PaintBand::TableCollapsedBorder
+                    | PaintBand::InFlowOutline
                     | PaintBand::Outline
             ) {
                 continue;
@@ -655,6 +725,7 @@ impl PaintFragment {
                     PaintBand::BackgroundBorder
                         | PaintBand::TableCellBorder
                         | PaintBand::TableCollapsedBorder
+                        | PaintBand::InFlowOutline
                         | PaintBand::Outline
                 )
             })
@@ -836,6 +907,8 @@ impl PaintFragment {
             std::mem::take(&mut content_bands.bands[PaintBand::TableCellBorder.index()]);
         decoration_bands.bands[PaintBand::TableCollapsedBorder.index()] =
             std::mem::take(&mut content_bands.bands[PaintBand::TableCollapsedBorder.index()]);
+        decoration_bands.bands[PaintBand::InFlowOutline.index()] =
+            std::mem::take(&mut content_bands.bands[PaintBand::InFlowOutline.index()]);
         decoration_bands.bands[PaintBand::Outline.index()] =
             std::mem::take(&mut content_bands.bands[PaintBand::Outline.index()]);
 
@@ -925,6 +998,108 @@ mod tests {
         RenderedTextRun,
     };
 
+    fn test_rect(x: f32) -> PaintPrimitive {
+        PaintPrimitive::Rect(RenderedRect::from_paint_rect(
+            PaintRect::new(PaintPoint::new(x, 0.0), PaintSize::new(1.0, 1.0)),
+            Some(CssColor::BLACK),
+        ))
+    }
+
+    fn rect_x(primitive: &PaintPrimitive) -> f32 {
+        let PaintPrimitive::Rect(rect) = primitive else {
+            panic!("expected test rectangle");
+        };
+        rect.paint_rect().min_x()
+    }
+
+    #[test]
+    fn promoted_in_flow_outline_precedes_auto_zero_positioned_paint() {
+        let mut fragment = PaintFragment::from_primitives(Vec::new(), Vec::new());
+        fragment.append_primitives_in_band(PaintBand::Inline, [test_rect(1.0)]);
+        fragment.append_primitives_in_band(PaintBand::Outline, [test_rect(2.0)]);
+        fragment.append_primitives_in_band(PaintBand::AutoZeroZ, [test_rect(3.0)]);
+
+        fragment.promote_outline_to_in_flow_outline();
+
+        assert!(fragment.display_list.bands.bands[PaintBand::Outline.index()].is_empty());
+        assert_eq!(
+            fragment
+                .flattened_primitives()
+                .iter()
+                .map(rect_x)
+                .collect::<Vec<_>>(),
+            vec![1.0, 2.0, 3.0]
+        );
+    }
+
+    #[test]
+    fn promotion_does_not_move_an_atomic_contexts_final_outline() {
+        let mut local_bands = PaintBandList::default();
+        local_bands.extend_band(
+            PaintBand::Outline,
+            [PaintDisplayItem::Primitive(test_rect(3.0))],
+        );
+        let local_context = PaintStackingContext::with_bands(StackLevel::Auto, local_bands);
+
+        let mut fragment = PaintFragment::from_primitives(Vec::new(), Vec::new());
+        fragment.append_primitives_in_band(PaintBand::Outline, [test_rect(2.0)]);
+        fragment
+            .display_list
+            .bands
+            .push_context_in_band(PaintBand::AutoZeroZ, local_context);
+        fragment.promote_outline_to_in_flow_outline();
+
+        let [PaintDisplayItem::StackingContext(context)] =
+            fragment.display_list.bands.bands[PaintBand::AutoZeroZ.index()].as_slice()
+        else {
+            panic!("expected positioned local context");
+        };
+        assert!(context.bands.bands[PaintBand::InFlowOutline.index()].is_empty());
+        assert!(matches!(
+            context.bands.bands[PaintBand::Outline.index()].as_slice(),
+            [PaintDisplayItem::Primitive(_)]
+        ));
+        assert_eq!(
+            fragment
+                .flattened_primitives()
+                .iter()
+                .map(rect_x)
+                .collect::<Vec<_>>(),
+            vec![2.0, 3.0]
+        );
+    }
+
+    #[test]
+    fn overflow_and_fragmentation_keep_both_outline_phases_as_decorations() {
+        let mut fragment = PaintFragment::from_primitives(Vec::new(), Vec::new());
+        fragment.append_primitives_in_band(PaintBand::InFlowBlock, [test_rect(1.0)]);
+        fragment.append_primitives_in_band(PaintBand::InFlowOutline, [test_rect(2.0)]);
+        fragment.append_primitives_in_band(PaintBand::Outline, [test_rect(3.0)]);
+
+        let clipped = fragment
+            .clone()
+            .with_contents_clipped_to_rect(PaintClip::new(0.0, 0.0, 10.0, 10.0), Vec::new());
+        assert!(matches!(
+            clipped.display_list.bands.bands[PaintBand::InFlowOutline.index()].as_slice(),
+            [PaintDisplayItem::Primitive(_)]
+        ));
+        assert!(matches!(
+            clipped.display_list.bands.bands[PaintBand::Outline.index()].as_slice(),
+            [PaintDisplayItem::Primitive(_)]
+        ));
+
+        let fragmented =
+            fragment.with_monolithic_fragmentation_scope(PaintClip::new(0.0, 0.0, 10.0, 10.0));
+        assert!(matches!(
+            fragmented.display_list.bands.bands[PaintBand::InFlowOutline.index()].as_slice(),
+            [PaintDisplayItem::EffectScope(_)]
+        ));
+        assert!(matches!(
+            fragmented.display_list.bands.bands[PaintBand::Outline.index()].as_slice(),
+            [PaintDisplayItem::EffectScope(_)]
+        ));
+    }
+
     #[test]
     fn translated_paint_fragment_preserves_shared_rendered_glyph_storage() {
         let glyphs: RenderedGlyphs = vec![RenderedGlyph {
@@ -950,7 +1125,9 @@ mod tests {
                 text_matrix: RenderedTextMatrix::IDENTITY,
                 font_size: 12.0,
                 font_id: Some(0),
+                font_palette: crate::css::FontPalette::Normal,
                 glyphs: Some(glyphs.clone()),
+                glyph_source_ranges: None,
             }],
         );
         let fragment = PaintFragment::from_primitives(vec![PaintPrimitive::Line(line)], Vec::new());
@@ -963,6 +1140,36 @@ mod tests {
 
         assert_eq!(translated_line.origin(), PaintPoint::new(13.0, 16.0));
         assert!(glyphs.ptr_eq(translated_line.runs[0].glyphs.as_ref().unwrap()));
+    }
+
+    #[test]
+    fn descendant_overflow_scope_keeps_parent_owned_dotted_border_unclipped() {
+        let clip = PaintClip::new(0.0, 0.0, 20.0, 20.0);
+        let dotted_border = PaintPrimitive::Rect(RenderedRect::from_paint_rect(
+            PaintRect::new(PaintPoint::new(-1.0, -1.0), PaintSize::new(22.0, 22.0)),
+            Some(CssColor::BLACK),
+        ));
+        let descendant = PaintPrimitive::Rect(RenderedRect::from_paint_rect(
+            PaintRect::new(PaintPoint::new(10.0, 10.0), PaintSize::new(30.0, 30.0)),
+            Some(CssColor::BLACK),
+        ));
+        let mut principal = PaintFragment::from_primitives(Vec::new(), Vec::new());
+        principal.append_primitives_in_band(PaintBand::BackgroundBorder, [dotted_border]);
+        let mut descendants = PaintFragment::from_primitives(Vec::new(), Vec::new());
+        descendants.append_primitives_in_band(PaintBand::BackgroundBorder, [descendant]);
+        let clipped_descendants = descendants.with_descendant_paint_effect_scoped_to_rect(clip);
+
+        let decoration = &principal.display_list.bands.bands[PaintBand::BackgroundBorder.index()];
+        let clipped_descendant_background =
+            &clipped_descendants.display_list.bands.bands[PaintBand::BackgroundBorder.index()];
+
+        assert!(matches!(
+            decoration.as_slice(),
+            [PaintDisplayItem::Primitive(_)]
+        ));
+        assert!(
+            matches!(clipped_descendant_background.as_slice(), [PaintDisplayItem::EffectScope(scope)] if scope.effects.overflow_clip_effect.is_some())
+        );
     }
 
     #[test]

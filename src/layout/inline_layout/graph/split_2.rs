@@ -337,13 +337,11 @@ fn text_discretionary_break_availability(
     text: &str,
     byte_offset: usize,
 ) -> BreakAvailability {
-    if matches!(style.word_break, css::WordBreak::AutoPhrase)
-        && text[..byte_offset].ends_with('\u{00ad}')
-    {
-        BreakAvailability::RelaxedWordBreak(WordBreakRelaxation::AutoPhraseHyphenation)
-    } else {
-        BreakAvailability::Ordinary
+    if !text[..byte_offset].ends_with('\u{00ad}') {
+        return BreakAvailability::Ordinary;
     }
+    discretionary_hyphenation_availability(style.authored_discretionary_hyphenation_policy())
+        .expect("disabled discretionary hyphens must be removed before graph construction")
 }
 
 pub(in crate::layout) fn inline_text_break_opportunity(

@@ -1,6 +1,7 @@
 use super::*;
+use crate::layout::assets::FragmentainerOrdinal;
 
-const GRID_FRAGMENT_EPSILON: f32 = 0.01;
+pub(super) const GRID_FRAGMENT_EPSILON: f32 = 0.01;
 
 /// A physical block-axis offset within the unfragmented grid container.
 ///
@@ -43,6 +44,32 @@ impl GridFragmentBlockSize {
     /// fragment cursor advances through the same physical CSS length.
     pub(in crate::layout::grid) fn layout_length(self) -> LayoutLength {
         layout_pt(self.0)
+    }
+}
+
+/// Usable grid-content capacity in the originating and continuation
+/// fragmentainers.
+///
+/// Grid source slices advance through the container's content box, never
+/// through cloned border or padding. The two capacities remain separate
+/// because the initial fragment has already crossed its owned block-start
+/// decoration while a continuation has not.
+/// <https://www.w3.org/TR/css-break-3/#box-model-for-breaking>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout::grid) struct GridFragmentContentCapacity {
+    initial: GridFragmentBlockSize,
+    continuation: GridFragmentBlockSize,
+}
+
+impl GridFragmentContentCapacity {
+    pub(in crate::layout::grid) const fn new(
+        initial: GridFragmentBlockSize,
+        continuation: GridFragmentBlockSize,
+    ) -> Self {
+        Self {
+            initial,
+            continuation,
+        }
     }
 }
 
@@ -211,15 +238,22 @@ impl GridFragmentPlan {
     ) -> Self {
         Self::from_break_boundaries(
             fragmentainer_kind,
-            current_fragmentainer,
+            GridFragmentContentCapacity::new(
+                GridFragmentBlockSize::new(current_fragmentainer.available_block_size().points()),
+                GridFragmentBlockSize::new(
+                    current_fragmentainer.fragmentainer_block_size().points(),
+                ),
+            ),
             content_block_size,
             &GridRowBreakBoundary::neutral_boundaries(row_line_offsets),
         )
     }
 
-    pub(in crate::layout::grid) fn from_grid_item_boundaries(
+    /// Build a plan from the content capacity that remains after the grid
+    /// container's fragment decoration has reserved its owned edges.
+    pub(in crate::layout::grid) fn from_grid_item_boundaries_with_content_capacity(
         fragmentainer_kind: FragmentainerKind,
-        current_fragmentainer: Fragmentainer,
+        content_capacity: GridFragmentContentCapacity,
         content_block_size: f32,
         row_line_offsets: &[f32],
         items: &[GridItemLayout],
@@ -227,7 +261,7 @@ impl GridFragmentPlan {
     ) -> Self {
         Self::from_break_boundaries(
             fragmentainer_kind,
-            current_fragmentainer,
+            content_capacity,
             content_block_size,
             &GridRowBreakBoundary::from_grid_items(
                 fragmentainer_kind,
@@ -240,7 +274,7 @@ impl GridFragmentPlan {
 
     fn from_break_boundaries(
         fragmentainer_kind: FragmentainerKind,
-        current_fragmentainer: Fragmentainer,
+        content_capacity: GridFragmentContentCapacity,
         content_block_size: f32,
         row_boundaries: &[GridRowBreakBoundary],
     ) -> Self {
@@ -255,10 +289,8 @@ impl GridFragmentPlan {
 
         let mut slices = Vec::new();
         let mut source_block_start = GridFragmentBlockOffset::new(0.0);
-        let mut available_block_end = source_block_start
-            + GridFragmentBlockSize::new(current_fragmentainer.available_block_size().points());
-        let empty_fragmentainer_block_size =
-            GridFragmentBlockSize::new(current_fragmentainer.fragmentainer_block_size().points());
+        let mut available_block_end = source_block_start + content_capacity.initial;
+        let empty_fragmentainer_block_size = content_capacity.continuation;
         let mut starts_after_fragmentainer_break = false;
         let break_opportunities = row_boundaries
             .iter()
@@ -307,6 +339,26 @@ impl GridFragmentPlan {
                         content_block_end: content_block_end.points(),
                     },
                 )
+                // A preferred row boundary may not manufacture a tiny
+                // principal fragment immediately before a row that is itself
+                // larger than a fresh fragmentainer. That would add an extra
+                // cloned border/padding pair without avoiding an inside-row
+                // break. In that case Grid must slice the row band at normal
+                // fragmentainer capacity instead.
+                // <https://www.w3.org/TR/css-grid-1/#pagination>
+                // <https://www.w3.org/TR/css-break-3/#unforced-breaks>
+                .filter(|row_boundary| {
+                    let next_boundary = row_boundaries
+                        .iter()
+                        .map(|boundary| boundary.source_block_offset.points())
+                        .filter(|&offset| {
+                            offset > row_boundary.source_block_offset + GRID_FRAGMENT_EPSILON
+                        })
+                        .min_by(f32::total_cmp)
+                        .unwrap_or(content_block_end.points());
+                    next_boundary - row_boundary.source_block_offset
+                        <= empty_fragmentainer_block_size.points() + GRID_FRAGMENT_EPSILON
+                })
             {
                 slices.push(GridFragmentSlice {
                     source_block_start,
@@ -410,6 +462,23 @@ impl GridFragmentPlan {
 }
 
 impl GridFragmentRecord {
+    /// Materialize this committed source range as a principal container-box
+    /// fragment. Grid replay owns the source slice; the caller supplies the
+    /// page-local border box after resolving the destination cursor.
+    pub(in crate::layout::grid) fn principal_box_fragment(
+        self,
+        destination_fragmentainer: FragmentainerOrdinal,
+        border_box: PaintClip,
+        decoration: FragmentDecoration,
+    ) -> CommittedContainerFragment<GridFragmentSlice> {
+        CommittedContainerFragment::principal(
+            destination_fragmentainer,
+            self.slice,
+            border_box,
+            decoration,
+        )
+    }
+
     pub(in crate::layout::grid) fn cursor(
         self,
         content_top: PageTopBlockPosition,
@@ -516,6 +585,35 @@ impl GridFragmentCursor {
             slice_height.points(),
         ))
     }
+
+    /// Project a content-source slice to its destination border box after
+    /// reserving the fragment's owned decoration edges.
+    ///
+    /// The cursor is already at the destination content-box start. A cloned
+    /// continuation therefore grows upward by its owned start edge and
+    /// downward by its owned end edge, while source progress remains exactly
+    /// the slice's content extent.
+    /// <https://www.w3.org/TR/css-break-3/#box-model-for-breaking>
+    pub(in crate::layout::grid) fn decorated_paint_clip(
+        self,
+        slice: GridFragmentSlice,
+        border_box_inline_span: PageInlineSpan,
+        reservation: FragmentDecorationReservation,
+    ) -> PaintClip {
+        let content_height = (slice.source_block_end - slice.source_block_start)
+            .layout_length()
+            .points();
+        let border_height =
+            content_height + reservation.block_start().points() + reservation.block_end().points();
+        let border_bottom =
+            self.source_block_y(slice.source_block_end).points() - reservation.block_end().points();
+        PaintClip::new(
+            border_box_inline_span.left_x(),
+            border_bottom,
+            border_box_inline_span.width(),
+            border_height,
+        )
+    }
 }
 
 impl GridItemFragment {
@@ -528,7 +626,7 @@ impl GridItemFragment {
     pub(in crate::layout::grid) fn requires_split_replay(&self) -> bool {
         self.content_slice.block_start.points() > GRID_FRAGMENT_EPSILON
             || self.content_slice.block_end.points()
-                < self.original.height().max(0.0) - GRID_FRAGMENT_EPSILON
+                < self.original.fragmentation_source_height().max(0.0) - GRID_FRAGMENT_EPSILON
     }
 }
 
@@ -543,7 +641,13 @@ impl GridFragmentSlice {
 
     fn item_fragment(self, item_index: usize, item: &GridItemLayout) -> Option<GridItemFragment> {
         let item_block_start = item.y();
-        let item_block_end = item.y() + item.height().max(0.0);
+        // The grid track retains source placement geometry, but a cloned grid
+        // item consumes a larger destination extent because each occupied
+        // fragmentainer owns its border and padding. Intersect the committed
+        // grid slice in destination space, then map only that interval back
+        // to the item's continuous source content for replay.
+        // <https://www.w3.org/TR/css-break-3/#box-model-for-breaking>
+        let item_block_end = item.y() + item.fragmentation_height().max(0.0);
         let slice_block_start = item_block_start.max(self.source_block_start.points());
         let slice_block_end = item_block_end.min(self.source_block_end.points());
         if slice_block_end <= slice_block_start + GRID_FRAGMENT_EPSILON {
@@ -551,18 +655,22 @@ impl GridFragmentSlice {
         }
 
         let visible = item.with_block_slice(slice_block_start, slice_block_end);
+        let destination_slice = GridFragmentItemContentSlice {
+            block_start: GridFragmentBlockOffset::new(
+                (slice_block_start - item_block_start).max(0.0),
+            ),
+            block_end: GridFragmentBlockOffset::new(
+                (slice_block_end - item_block_start).min(item.fragmentation_height().max(0.0)),
+            ),
+        };
+        let content_slice = item
+            .source_slice_for_destination_slice(destination_slice)
+            .unwrap_or(destination_slice);
         Some(GridItemFragment {
             item_index,
             original: item.clone(),
             visible,
-            content_slice: GridFragmentItemContentSlice {
-                block_start: GridFragmentBlockOffset::new(
-                    (slice_block_start - item_block_start).max(0.0),
-                ),
-                block_end: GridFragmentBlockOffset::new(
-                    (slice_block_end - item_block_start).min(item.height().max(0.0)),
-                ),
-            },
+            content_slice,
             metadata: FragmentPageMetadata::empty(0),
         })
     }
@@ -655,6 +763,13 @@ mod tests {
         GridFragmentBlockOffset::new(points)
     }
 
+    fn content_capacity(initial: f32, continuation: f32) -> GridFragmentContentCapacity {
+        GridFragmentContentCapacity::new(
+            GridFragmentBlockSize::new(initial),
+            GridFragmentBlockSize::new(continuation),
+        )
+    }
+
     #[test]
     fn grid_fragment_plan_prefers_row_boundaries() {
         let plan = GridFragmentPlan::from_row_boundaries(
@@ -713,7 +828,7 @@ mod tests {
         boundaries[1].break_before = PageBreak::Page;
         let plan = GridFragmentPlan::from_break_boundaries(
             FragmentainerKind::Page,
-            fragmentainer(300.0, 300.0),
+            content_capacity(300.0, 300.0),
             240.0,
             &boundaries,
         );
@@ -742,13 +857,13 @@ mod tests {
 
         let page_plan = GridFragmentPlan::from_break_boundaries(
             FragmentainerKind::Page,
-            fragmentainer(300.0, 300.0),
+            content_capacity(300.0, 300.0),
             240.0,
             &boundaries,
         );
         let column_plan = GridFragmentPlan::from_break_boundaries(
             FragmentainerKind::Column,
-            fragmentainer(300.0, 300.0),
+            content_capacity(300.0, 300.0),
             240.0,
             &boundaries,
         );
@@ -785,7 +900,7 @@ mod tests {
         boundaries[1].break_inside_avoid = true;
         let plan = GridFragmentPlan::from_break_boundaries(
             FragmentainerKind::Page,
-            fragmentainer(300.0, 150.0),
+            content_capacity(150.0, 300.0),
             300.0,
             &boundaries,
         );

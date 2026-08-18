@@ -61,7 +61,8 @@ serialization representation.
   `/FlateDecode`.
 - Page content, Form XObjects, tiling patterns, embedded font programs,
   ToUnicode CMaps, CIDSets, XMP metadata, and decoded raster-image streams use
-  `/FlateDecode` by default. Eligible unchanged 8-bit RGB JPEG sources retain
+  `/FlateDecode` by default. Decoded raster image and soft-mask streams retain
+  their source 8- or 16-bpc integer precision. Eligible unchanged 8-bit RGB JPEG sources retain
   their original `/DCTDecode` streams instead; PDF/A limits passthrough to
   untagged sRGB sources. Cropped, oriented, generated, and tagged or
   color-converted images remain decoded samples. `PdfCompression::Uncompressed`

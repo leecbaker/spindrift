@@ -1,6 +1,9 @@
-use super::declarations::{CascadedDeclaration, affected_longhands, expand_modeled_shorthands};
+use super::declarations::{
+    CascadedDeclaration, affected_longhands, expand_modeled_shorthands, same_cascade_layer,
+    same_or_stronger_reverted_origin,
+};
 use super::*;
-use crate::css::component_values::CssComponentValueList;
+use crate::css::component_values::{CssComponentValueList, parse_var_function_arguments};
 use crate::css::{custom_property_value_is_valid, is_custom_property_name};
 use cssparser::{Parser, ParserInput};
 use std::borrow::Cow;
@@ -10,6 +13,25 @@ pub(super) fn apply_cascaded_custom_property_declarations(
     declarations: &[CascadedDeclaration<'_>],
     inheritance_source: &ComputedStyle,
 ) {
+    initialize_custom_property_inheritance(style);
+    let inherited_values = style.custom_properties.clone();
+
+    // First form a complete, raw custom-property environment. It lets a
+    // rollback produced by `var()` observe the same substituted value as the
+    // declaration that ultimately wins the ordinary cascade.
+    apply_custom_property_declarations(style, declarations, inheritance_source);
+    let candidates =
+        declarations_after_custom_property_rollbacks(declarations, &style.custom_properties);
+
+    // Rollback keywords discard candidates, rather than becoming a stored
+    // custom-property value. Reapply the surviving candidates to the inherited
+    // and registered-initial terminal values.
+    style.custom_properties = inherited_values;
+    apply_custom_property_declarations(style, &candidates, inheritance_source);
+    resolve_custom_properties_at_computed_value_time(style, inheritance_source);
+}
+
+fn initialize_custom_property_inheritance(style: &mut ComputedStyle) {
     style.custom_properties.retain(|name, _| {
         style
             .registered_custom_properties
@@ -23,6 +45,13 @@ pub(super) fn apply_cascaded_custom_property_declarations(
             .entry(name.clone())
             .or_insert_with(|| ComputedCustomPropertyValue::Color(registration.initial_color));
     }
+}
+
+fn apply_custom_property_declarations(
+    style: &mut ComputedStyle,
+    declarations: &[CascadedDeclaration<'_>],
+    inheritance_source: &ComputedStyle,
+) {
     for declaration in declarations {
         if let Some(name) = declaration.property.custom_name() {
             let value = trim_css_value(&declaration.value);
@@ -77,7 +106,54 @@ pub(super) fn apply_cascaded_custom_property_declarations(
             }
         }
     }
-    resolve_custom_properties_at_computed_value_time(style);
+}
+
+/// Selects custom-property candidates after resolving rollback values that
+/// arise through `var()` substitution. CSS Cascade uses the same candidate
+/// removal for direct and post-substitution `revert` / `revert-layer`.
+/// <https://drafts.csswg.org/css-cascade-5/#revert>
+/// <https://drafts.csswg.org/css-cascade-5/#revert-layer>
+fn declarations_after_custom_property_rollbacks<'a>(
+    declarations: &[CascadedDeclaration<'a>],
+    custom_properties: &std::collections::HashMap<String, ComputedCustomPropertyValue>,
+) -> Vec<CascadedDeclaration<'a>> {
+    let mut output = Vec::with_capacity(declarations.len());
+    for declaration in declarations {
+        let Some(name) = declaration.property.custom_name() else {
+            output.push(declaration.clone());
+            continue;
+        };
+        match custom_property_rollback_keyword(declaration, custom_properties) {
+            Some(CssWideKeyword::Revert) => output.retain(|candidate| {
+                candidate.property.custom_name() != Some(name)
+                    || !same_or_stronger_reverted_origin(candidate, declaration)
+            }),
+            Some(CssWideKeyword::RevertLayer) => output.retain(|candidate| {
+                candidate.property.custom_name() != Some(name)
+                    || !same_cascade_layer(candidate, declaration)
+            }),
+            _ => output.push(declaration.clone()),
+        }
+    }
+    output
+}
+
+fn custom_property_rollback_keyword(
+    declaration: &CascadedDeclaration<'_>,
+    custom_properties: &std::collections::HashMap<String, ComputedCustomPropertyValue>,
+) -> Option<CssWideKeyword> {
+    let value = trim_css_value(&declaration.value);
+    let value = if contains_css_variable_reference(value) {
+        resolve_css_variables(value, custom_properties)?
+    } else {
+        value.to_string()
+    };
+    match ResolvedCustomProperty::from_value(&value) {
+        ResolvedCustomProperty::CssWide(
+            keyword @ (CssWideKeyword::Revert | CssWideKeyword::RevertLayer),
+        ) => Some(keyword),
+        _ => None,
+    }
 }
 
 /// Applies `<color>` registration syntax after the owning element's used color
@@ -164,7 +240,10 @@ pub(super) fn apply_cascaded_color_scheme_declarations(
 /// own custom-property environment.
 /// <https://www.w3.org/TR/css-variables-1/#cycles>
 /// <https://www.w3.org/TR/css-variables-1/#computed-value>
-fn resolve_custom_properties_at_computed_value_time(style: &mut ComputedStyle) {
+fn resolve_custom_properties_at_computed_value_time(
+    style: &mut ComputedStyle,
+    inheritance_source: &ComputedStyle,
+) {
     let mut custom_properties = std::mem::take(&mut style.custom_properties);
     let cycles = cyclic_custom_properties(&custom_properties);
     for name in cycles {
@@ -182,13 +261,109 @@ fn resolve_custom_properties_at_computed_value_time(style: &mut ComputedStyle) {
                 Some((name.clone(), ComputedCustomPropertyValue::Color(*color)))
             }
             ComputedCustomPropertyValue::Tokens(value) => {
-                resolve_css_variables(value.as_css(), &custom_properties)
-                    .and_then(|value| CssComponentValueList::parse(&value))
-                    .map(|value| (name.clone(), ComputedCustomPropertyValue::Tokens(value)))
+                let outcome = resolve_css_variables(value.as_css(), &custom_properties)
+                    .map(|value| ResolvedCustomProperty::from_value(trim_css_value(&value)))
+                    .unwrap_or(ResolvedCustomProperty::GuaranteedInvalid);
+                match outcome {
+                    ResolvedCustomProperty::CssWide(CssWideKeyword::Initial) => style
+                        .registered_custom_properties
+                        .by_name
+                        .get(name)
+                        .map(|registration| {
+                            (
+                                name.clone(),
+                                ComputedCustomPropertyValue::Color(registration.initial_color),
+                            )
+                        }),
+                    ResolvedCustomProperty::CssWide(CssWideKeyword::Inherit) => {
+                        inherited_custom_property_value(name, style, inheritance_source)
+                    }
+                    ResolvedCustomProperty::CssWide(CssWideKeyword::Unset) => {
+                        let registration = style.registered_custom_properties.by_name.get(name);
+                        if registration.is_some_and(|registration| !registration.inherits) {
+                            Some((
+                                name.clone(),
+                                ComputedCustomPropertyValue::Color(
+                                    registration.expect("checked").initial_color,
+                                ),
+                            ))
+                        } else {
+                            inherited_custom_property_value(name, style, inheritance_source)
+                        }
+                    }
+                    // `revert` and `revert-layer` are handled from their
+                    // cascaded declaration candidates before this final token
+                    // normalization pass. Keeping them out of stored custom
+                    // property tokens prevents a consumer from observing an
+                    // invalid literal keyword.
+                    ResolvedCustomProperty::CssWide(CssWideKeyword::Revert)
+                    | ResolvedCustomProperty::CssWide(CssWideKeyword::RevertLayer) => None,
+                    ResolvedCustomProperty::Tokens(value) => CssComponentValueList::parse(&value)
+                        .map(|value| (name.clone(), ComputedCustomPropertyValue::Tokens(value))),
+                    ResolvedCustomProperty::GuaranteedInvalid => None,
+                }
             }
         })
         .collect();
     style.custom_properties = resolved;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CssWideKeyword {
+    Initial,
+    Inherit,
+    Unset,
+    Revert,
+    RevertLayer,
+}
+
+impl CssWideKeyword {
+    fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "initial" => Some(Self::Initial),
+            "inherit" => Some(Self::Inherit),
+            "unset" => Some(Self::Unset),
+            "revert" => Some(Self::Revert),
+            "revert-layer" => Some(Self::RevertLayer),
+            _ => None,
+        }
+    }
+}
+
+/// The computed-value outcome of a custom-property token stream. CSS-wide
+/// keywords remain distinct from ordinary tokens so they cannot leak through
+/// as a custom property value after substitution.
+enum ResolvedCustomProperty {
+    Tokens(String),
+    GuaranteedInvalid,
+    CssWide(CssWideKeyword),
+}
+
+impl ResolvedCustomProperty {
+    fn from_value(value: &str) -> Self {
+        if let Some(keyword) = CssWideKeyword::parse(value) {
+            Self::CssWide(keyword)
+        } else {
+            Self::Tokens(value.to_string())
+        }
+    }
+}
+
+fn inherited_custom_property_value(
+    name: &str,
+    style: &ComputedStyle,
+    inheritance_source: &ComputedStyle,
+) -> Option<(String, ComputedCustomPropertyValue)> {
+    let registration = style.registered_custom_properties.by_name.get(name);
+    inheritance_source
+        .custom_properties
+        .get(name)
+        .cloned()
+        .or_else(|| {
+            registration
+                .map(|registration| ComputedCustomPropertyValue::Color(registration.initial_color))
+        })
+        .map(|value| (name.to_string(), value))
 }
 
 fn cyclic_custom_properties(
@@ -253,7 +428,10 @@ fn cyclic_custom_properties(
 fn custom_property_dependencies(value: &str) -> Vec<String> {
     // A fallback can participate in a cycle if it is selected, so the token
     // walker intentionally returns references from both arguments.
-    css_variable_references(value).unwrap_or_default()
+    let mut references = Vec::new();
+    visit_css_variable_references(value, |name| references.push(name.to_string()))
+        .map(|()| references)
+        .unwrap_or_default()
 }
 
 pub(super) fn apply_cascaded_font_size_declarations_with_parent_ch_advance(
@@ -496,7 +674,48 @@ pub(super) fn resolve_css_variables(
 /// Returns whether a token stream contains a `var()` function. CSS function
 /// names are ASCII case-insensitive, unlike custom-property names.
 pub(in crate::css) fn contains_css_variable_reference(value: &str) -> bool {
-    css_variable_references(value).is_some_and(|references| !references.is_empty())
+    let mut input = ParserInput::new(value);
+    let mut parser = Parser::new(&mut input);
+    contains_var_function_from_parser(&mut parser).unwrap_or(false)
+}
+
+fn contains_var_function_from_parser(parser: &mut Parser<'_, '_>) -> Option<bool> {
+    let mut contains = false;
+    while !parser.is_exhausted() {
+        let token = parser
+            .next_including_whitespace_and_comments()
+            .ok()?
+            .clone();
+        if token.is_parse_error() {
+            return None;
+        }
+        let is_var = matches!(token, cssparser::Token::Function(ref name) if name.eq_ignore_ascii_case("var"));
+        let is_block = is_var
+            || matches!(
+                token,
+                cssparser::Token::Function(_)
+                    | cssparser::Token::ParenthesisBlock
+                    | cssparser::Token::SquareBracketBlock
+                    | cssparser::Token::CurlyBracketBlock
+            );
+        if !is_block {
+            continue;
+        }
+        let nested_contains = parser
+            .parse_nested_block(|nested| {
+                if is_var {
+                    parse_var_function_arguments(nested)
+                        .map(|_| true)
+                        .ok_or_else(|| nested.new_custom_error::<(), ()>(()))
+                } else {
+                    contains_var_function_from_parser(nested)
+                        .ok_or_else(|| nested.new_custom_error::<(), ()>(()))
+                }
+            })
+            .ok()?;
+        contains |= nested_contains;
+    }
+    Some(contains)
 }
 
 fn resolve_css_variables_inner(
@@ -589,21 +808,10 @@ fn resolve_var_function(
     custom_properties: &std::collections::HashMap<String, ComputedCustomPropertyValue>,
     stack: &mut Vec<String>,
 ) -> Option<String> {
-    let name = parser.expect_ident().ok()?.to_string();
-    if !is_custom_property_name(&name) {
-        return None;
-    }
-    let fallback = if parser.is_exhausted() {
-        None
-    } else {
-        if !matches!(parser.next().ok()?, cssparser::Token::Comma) {
-            return None;
-        }
-        let start = parser.position();
-        consume_component_values(parser).ok()?;
-        let fallback = parser.slice(start..parser.position()).to_string();
-        Some(fallback)
-    };
+    let arguments = parse_var_function_arguments(parser)?;
+    let name =
+        resolve_css_variables_inner(arguments.name_argument.as_css(), custom_properties, stack)
+            .and_then(|value| resolved_custom_property_name(&value));
 
     // CSS Variables substitutes the fallback only when the referenced
     // property is guaranteed-invalid. Resolving it eagerly would make an
@@ -611,64 +819,53 @@ fn resolve_var_function(
     // The complete value has already passed specified-value-time validation in
     // `resolve_css_variables`, so consuming the fallback above only preserves
     // this function's component-value boundary for the enclosing parser.
-    let replacement = if stack.iter().any(|item| item == &name) {
-        None
-    } else if let Some(replacement) = custom_properties.get(&name) {
-        stack.push(name);
-        let replacement = replacement.substitution_tokens();
-        let replacement = resolve_css_variables_inner(&replacement, custom_properties, stack);
-        stack.pop();
-        replacement
-    } else {
-        None
-    };
+    let replacement = name.as_ref().and_then(|name| {
+        if stack.iter().any(|item| item == name) {
+            None
+        } else if let Some(replacement) = custom_properties.get(name) {
+            stack.push(name.clone());
+            let replacement = replacement.substitution_tokens();
+            let replacement = resolve_css_variables_inner(&replacement, custom_properties, stack);
+            stack.pop();
+            replacement
+        } else {
+            None
+        }
+    });
     replacement.or_else(|| {
-        fallback
-            .and_then(|fallback| resolve_css_variables_inner(&fallback, custom_properties, stack))
+        arguments.fallback.as_ref().and_then(|fallback| {
+            resolve_css_variables_inner(fallback.as_css(), custom_properties, stack)
+        })
     })
 }
 
-/// Consumes a component-value stream without performing variable substitution.
-///
-/// `var()` fallbacks must be parsed immediately so the enclosing function has
-/// a well-defined boundary, but their substitutions are conditional on the
-/// primary custom property's validity.
-fn consume_component_values(parser: &mut Parser<'_, '_>) -> Result<(), ()> {
-    while !parser.is_exhausted() {
-        let token = parser
-            .next_including_whitespace_and_comments()
-            .map_err(|_| ())?;
-        if matches!(
-            token,
-            cssparser::Token::Function(_)
-                | cssparser::Token::ParenthesisBlock
-                | cssparser::Token::SquareBracketBlock
-                | cssparser::Token::CurlyBracketBlock
-        ) {
-            parser
-                .parse_nested_block(|nested| {
-                    consume_component_values(nested)
-                        .map_err(|_| nested.new_custom_error::<(), ()>(()))
-                })
-                .map_err(|_| ())?;
-        }
-    }
-    Ok(())
-}
-
-/// Returns decoded custom-property references found in a valid CSS component
-/// value. Names are CSS token values, not source substrings.
-fn css_variable_references(value: &str) -> Option<Vec<String>> {
+fn resolved_custom_property_name(value: &str) -> Option<String> {
     let mut input = ParserInput::new(value);
     let mut parser = Parser::new(&mut input);
-    let mut references = Vec::new();
-    collect_css_variable_references(&mut parser, &mut references)?;
-    Some(references)
+    let name = parser.expect_ident().ok()?.to_string();
+    parser.expect_exhausted().ok()?;
+    is_custom_property_name(&name).then_some(name)
 }
 
-fn collect_css_variable_references(
+/// Visits decoded custom-property references found in a valid CSS component
+/// value. Names are CSS token values, not source substrings.
+///
+/// Callers that only need to know whether a reference exists can inspect the
+/// borrowed name without allocating. Dependency collection is the sole caller
+/// that retains names for use after parsing.
+fn visit_css_variable_references(value: &str, mut visit: impl FnMut(&str)) -> Option<()> {
+    visit_css_variable_references_with(value, &mut visit)
+}
+
+fn visit_css_variable_references_with(value: &str, visit: &mut dyn FnMut(&str)) -> Option<()> {
+    let mut input = ParserInput::new(value);
+    let mut parser = Parser::new(&mut input);
+    visit_css_variable_references_from_parser(&mut parser, visit)
+}
+
+fn visit_css_variable_references_from_parser(
     parser: &mut Parser<'_, '_>,
-    references: &mut Vec<String>,
+    visit: &mut dyn FnMut(&str),
 ) -> Option<()> {
     while let Ok(token) = parser.next_including_whitespace_and_comments() {
         if token.is_parse_error() {
@@ -690,22 +887,105 @@ fn collect_css_variable_references(
         parser
             .parse_nested_block(|nested| {
                 if is_var {
-                    let name = nested.expect_ident()?.to_string();
-                    if !is_custom_property_name(&name) {
-                        return Err(nested.new_custom_error(()));
+                    let arguments = parse_var_function_arguments(nested)
+                        .ok_or_else(|| nested.new_custom_error(()))?;
+                    if let Some(name) =
+                        resolved_custom_property_name(arguments.name_argument.as_css())
+                    {
+                        visit(&name);
+                    } else {
+                        visit_css_variable_references_with(arguments.name_argument.as_css(), visit)
+                            .ok_or_else(|| nested.new_custom_error(()))?;
                     }
-                    references.push(name);
-                    if nested.is_exhausted() {
-                        return Ok::<_, cssparser::ParseError<'_, ()>>(());
+                    if let Some(fallback) = arguments.fallback {
+                        visit_css_variable_references_with(fallback.as_css(), visit)
+                            .ok_or_else(|| nested.new_custom_error(()))?;
                     }
-                    if !matches!(nested.next()?, cssparser::Token::Comma) {
-                        return Err(nested.new_custom_error(()));
-                    }
+                    return Ok::<_, cssparser::ParseError<'_, ()>>(());
                 }
-                collect_css_variable_references(nested, references)
+                visit_css_variable_references_from_parser(nested, visit)
                     .ok_or_else(|| nested.new_custom_error(()))
             })
             .ok()?;
     }
     Some(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn css_variable_reference_detection_uses_css_syntax() {
+        for value in ["red", r#""var(--tone)""#] {
+            assert!(!contains_css_variable_reference(value), "{value}");
+        }
+        for value in [
+            "calc(1px + var(--nested, var(--fallback)))",
+            "[var(--one)] function(var(--two))",
+            r"var(--\74 one)",
+        ] {
+            assert!(contains_css_variable_reference(value), "{value}");
+        }
+    }
+
+    #[test]
+    fn css_variable_reference_detection_rejects_malformed_functions_and_tokens() {
+        for value in ["var()", "var(--tone) \"\n"] {
+            assert!(!contains_css_variable_reference(value), "{value}");
+        }
+        for value in ["var(theme)", "var(--tone invalid)"] {
+            assert!(contains_css_variable_reference(value), "{value}");
+        }
+    }
+
+    #[test]
+    fn custom_property_dependencies_collect_primary_and_fallback_references() {
+        assert_eq!(
+            custom_property_dependencies("var(--primary, calc(var(--fallback)))"),
+            vec!["--primary", "--fallback"],
+        );
+    }
+
+    #[test]
+    fn var_name_argument_is_substituted_before_custom_property_lookup() {
+        let properties = std::collections::HashMap::from([
+            (
+                "--name".to_string(),
+                ComputedCustomPropertyValue::Tokens(
+                    CssComponentValueList::parse("--color").expect("token stream"),
+                ),
+            ),
+            (
+                "--color".to_string(),
+                ComputedCustomPropertyValue::Tokens(
+                    CssComponentValueList::parse("green").expect("token stream"),
+                ),
+            ),
+        ]);
+        assert_eq!(
+            resolve_css_variables("var(var(--name), red)", &properties),
+            Some("green".to_string()),
+        );
+        assert_eq!(
+            resolve_css_variables("var(1px, red)", &properties),
+            Some("red".to_string()),
+        );
+        assert_eq!(
+            resolve_css_variables("var(--, green)", &properties),
+            Some("green".to_string()),
+        );
+        assert_eq!(
+            resolve_css_variables("var(--missing,)", &properties),
+            Some("".to_string()),
+        );
+    }
+
+    #[test]
+    fn custom_property_dependencies_visit_substituted_names_and_fallbacks() {
+        assert_eq!(
+            custom_property_dependencies("var(var(--name), var(--fallback))"),
+            vec!["--name", "--fallback"],
+        );
+    }
 }

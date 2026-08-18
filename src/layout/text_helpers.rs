@@ -13,5 +13,6 @@ pub(in crate::layout) use self::indent::*;
 mod text_transform;
 pub(in crate::layout) use self::text_transform::*;
 mod vertical_align;
+pub(in crate::layout) use self::vertical_align::*;
 mod whitespace;
 pub(in crate::layout) use self::whitespace::*;

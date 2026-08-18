@@ -78,6 +78,21 @@ fn benchmark_weasyprint_samples(c: &mut Criterion) {
         });
     });
 
+    let fragmented_grid_document = format!(
+        "<!doctype html><meta charset=\"utf-8\"><style>@page {{ size: 120pt 100pt; margin: 10pt }} body, div {{ margin: 0 }} .grid {{ display: grid; grid-template-columns: 100pt; grid-auto-rows: 70pt }} .item {{ height: 210pt; background: #ddd; font: 10pt/10pt sans-serif }}</style><div class=\"grid\">{}</div>",
+        "<div class=\"item\">fragmented grid replay</div>".repeat(48),
+    );
+    group.bench_function("fragmented_grid_replay", |b| {
+        b.iter(|| {
+            let bytes = runtime.block_on(render_inline_html_pdf(
+                &fragmented_grid_document,
+                &options,
+                &pdf_options,
+            ));
+            black_box(bytes.len())
+        });
+    });
+
     for sample in SAMPLES {
         let benchmark_id = BenchmarkId::from_parameter(format!("sample_{}", sample.name));
         group.bench_with_input(benchmark_id, sample, |b, sample| {
@@ -110,6 +125,19 @@ async fn render_inline_break_all_pdf(
         .write_pdf(&mut bytes, options, pdf_options)
         .await
         .expect("render long break-all benchmark document to PDF");
+    bytes
+}
+
+async fn render_inline_html_pdf(
+    source: &str,
+    options: &RenderOptions,
+    pdf_options: &PdfOptions,
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    Html::from_string(source)
+        .write_pdf(&mut bytes, options, pdf_options)
+        .await
+        .expect("render inline benchmark document to PDF");
     bytes
 }
 

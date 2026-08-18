@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::document::paint::geometry::{PaintRect, PaintSize, PaintTransform};
 use crate::document::paint::images::RenderedImage;
 use std::rc::Rc;
 
@@ -19,6 +20,9 @@ impl FontSystem {
             let Ok(face) = ttf_parser::Face::parse(&font.data, font.face_index) else {
                 continue;
             };
+            if !face_has_raster_glyphs(&face) {
+                continue;
+            }
             let Some(glyphs) = run.glyphs.as_ref() else {
                 continue;
             };
@@ -29,15 +33,19 @@ impl FontSystem {
                 .round()
                 .clamp(1.0, u16::MAX as f32) as u16;
             let mut cursor = run.x_offset;
-            let mut retained = Vec::with_capacity(glyphs.len());
-            for glyph in glyphs.iter() {
+            let mut retained: Option<Vec<RenderedGlyph>> = None;
+            for (glyph_index, glyph) in glyphs.iter().enumerate() {
                 let Some(glyph_id) = glyph.painted_id().map(ttf_parser::GlyphId) else {
-                    retained.push(glyph.clone());
+                    if let Some(retained) = &mut retained {
+                        retained.push(glyph.clone());
+                    }
                     cursor += glyph.x_advance;
                     continue;
                 };
                 let Some(raster) = face.glyph_raster_image(glyph_id, requested_ppem) else {
-                    retained.push(glyph.clone());
+                    if let Some(retained) = &mut retained {
+                        retained.push(glyph.clone());
+                    }
                     cursor += glyph.x_advance;
                     continue;
                 };
@@ -47,7 +55,9 @@ impl FontSystem {
                         glyph_id.0,
                         font.post_script_name
                     );
-                    retained.push(glyph.clone());
+                    if let Some(retained) = &mut retained {
+                        retained.push(glyph.clone());
+                    }
                     cursor += glyph.x_advance;
                     continue;
                 };
@@ -57,7 +67,9 @@ impl FontSystem {
                         glyph_id.0,
                         font.post_script_name
                     );
-                    retained.push(glyph.clone());
+                    if let Some(retained) = &mut retained {
+                        retained.push(glyph.clone());
+                    }
                     cursor += glyph.x_advance;
                     continue;
                 }
@@ -93,7 +105,8 @@ impl FontSystem {
                     decoded.rgb,
                     decoded.alpha,
                     None,
-                );
+                )
+                .with_raster_sample_depth(decoded.sample_depth);
                 if !glyph.unicode.is_empty() {
                     image = image.with_actual_text(Rc::from(glyph.unicode.as_str()));
                 }
@@ -102,18 +115,27 @@ impl FontSystem {
                     image =
                         image.with_transform(PaintTransform::new(a, b, c, d, origin.x, origin.y));
                 }
+                retained.get_or_insert_with(|| glyphs[..glyph_index].to_vec());
                 images.push(image);
                 cursor += glyph.x_advance;
             }
-            run.glyphs = (!retained.is_empty()).then(|| retained.into());
+            if let Some(retained) = retained {
+                run.glyphs = (!retained.is_empty()).then(|| retained.into());
+            }
         }
         images
     }
 }
 
+fn face_has_raster_glyphs(face: &ttf_parser::Face<'_>) -> bool {
+    let tables = face.tables();
+    tables.sbix.is_some() || tables.bdat.is_some() || tables.ebdt.is_some() || tables.cbdt.is_some()
+}
+
 pub(super) struct DecodedRasterGlyph {
     pub(super) width: u32,
     pub(super) height: u32,
+    pub(super) sample_depth: crate::image_store::RasterSampleDepth,
     pub(super) rgb: Rc<[u8]>,
     pub(super) alpha: Option<Rc<[u8]>>,
 }
@@ -127,29 +149,51 @@ pub(super) fn decode_raster_glyph_image(
     if pixel_count == 0 {
         return None;
     }
-    let (rgb, alpha) = match image.format {
-        ttf_parser::RasterImageFormat::PNG => decode_png_raster_glyph(image.data, pixel_count)?,
+    let (sample_depth, rgb, alpha) = match image.format {
+        ttf_parser::RasterImageFormat::PNG => decode_png_raster_glyph(image.data, width, height)?,
         ttf_parser::RasterImageFormat::BitmapPremulBgra32 => {
-            decode_premultiplied_bgra(image.data, pixel_count)?
+            let (rgb, alpha) = decode_premultiplied_bgra(image.data, pixel_count)?;
+            (crate::image_store::RasterSampleDepth::Eight, rgb, alpha)
         }
-        format => decode_grayscale_raster(image.data, width, height, format)?,
+        format => {
+            let (rgb, alpha) = decode_grayscale_raster(image.data, width, height, format)?;
+            (crate::image_store::RasterSampleDepth::Eight, rgb, alpha)
+        }
     };
     Some(DecodedRasterGlyph {
         width,
         height,
+        sample_depth,
         rgb: Rc::from(rgb.into_boxed_slice()),
         alpha: alpha.map(|alpha| Rc::from(alpha.into_boxed_slice())),
     })
 }
 
-fn decode_png_raster_glyph(data: &[u8], pixel_count: usize) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
-    let decoded = image::load_from_memory_with_format(data, image::ImageFormat::Png)
+fn decode_png_raster_glyph(
+    data: &[u8],
+    expected_width: u32,
+    expected_height: u32,
+) -> Option<(
+    crate::image_store::RasterSampleDepth,
+    Vec<u8>,
+    Option<Vec<u8>>,
+)> {
+    // PNG's largest source representation has four 16-bit components. Bound
+    // decoder intermediates to the declared strike while retaining a small
+    // metadata allowance for valid ICC and text chunks, and never exceed
+    // Quire's document-image ceiling for malformed font data.
+    const MAX_PNG_GLYPH_DECODER_BYTES: usize = 512 * 1024 * 1024;
+    const PNG_GLYPH_METADATA_ALLOWANCE: usize = 1024 * 1024;
+    let allocation_limit = usize::try_from(expected_width)
         .ok()?
-        .to_rgba8();
-    if decoded.len() / 4 != pixel_count {
+        .checked_mul(usize::try_from(expected_height).ok()?)?
+        .checked_mul(8)?
+        .clamp(PNG_GLYPH_METADATA_ALLOWANCE, MAX_PNG_GLYPH_DECODER_BYTES);
+    let decoded = crate::image_store::decode_png_samples(data, allocation_limit)?;
+    if decoded.width != expected_width || decoded.height != expected_height {
         return None;
     }
-    rgba_to_rgb_alpha(decoded.as_raw())
+    Some((decoded.sample_depth, decoded.rgb, decoded.alpha))
 }
 
 fn decode_premultiplied_bgra(
@@ -235,25 +279,22 @@ fn decode_grayscale_raster(
     Some((rgb, Some(alpha)))
 }
 
-fn rgba_to_rgb_alpha(rgba: &[u8]) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
-    if !rgba.len().is_multiple_of(4) {
-        return None;
-    }
-    let mut rgb = Vec::with_capacity(rgba.len() / 4 * 3);
-    let mut alpha = Vec::with_capacity(rgba.len() / 4);
-    let mut has_alpha = false;
-    for pixel in rgba.as_chunks::<4>().0 {
-        rgb.extend_from_slice(&pixel[..3]);
-        alpha.push(pixel[3]);
-        has_alpha |= pixel[3] < 255;
-    }
-    Some((rgb, has_alpha.then_some(alpha)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+
+    fn rgba_png(width: u32, height: u32, pixels: &[u8]) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        let mut encoder = png::Encoder::new(&mut encoded, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder
+            .write_header()
+            .unwrap()
+            .write_image_data(pixels)
+            .unwrap();
+        encoded
+    }
     #[test]
     fn decodes_padded_monochrome_and_grayscale_bitmap_glyphs_as_alpha_masks() {
         let monochrome = decode_raster_glyph_image(ttf_parser::RasterGlyphImage {
@@ -300,11 +341,7 @@ mod tests {
 
     #[test]
     fn decodes_png_bitmap_glyphs() {
-        let source = image::RgbaImage::from_raw(1, 1, vec![10, 20, 30, 128]).unwrap();
-        let mut encoded = Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgba8(source)
-            .write_to(&mut encoded, image::ImageFormat::Png)
-            .unwrap();
+        let encoded = rgba_png(1, 1, &[10, 20, 30, 128]);
         let decoded = decode_raster_glyph_image(ttf_parser::RasterGlyphImage {
             x: 0,
             y: 0,
@@ -312,10 +349,43 @@ mod tests {
             height: 1,
             pixels_per_em: 16,
             format: ttf_parser::RasterImageFormat::PNG,
-            data: encoded.get_ref(),
+            data: &encoded,
         })
         .unwrap();
         assert_eq!(decoded.rgb.as_ref(), &[10, 20, 30]);
         assert_eq!(decoded.alpha.as_deref().unwrap(), &[128]);
+    }
+
+    #[test]
+    fn rejects_png_bitmap_glyphs_with_transposed_dimensions() {
+        let encoded = rgba_png(2, 1, &[10, 20, 30, 255, 40, 50, 60, 255]);
+
+        // Both the PNG and strike record contain two pixels, but accepting
+        // only the pixel count would paint them at the wrong aspect ratio.
+        let decoded = decode_raster_glyph_image(ttf_parser::RasterGlyphImage {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 2,
+            pixels_per_em: 16,
+            format: ttf_parser::RasterImageFormat::PNG,
+            data: &encoded,
+        });
+
+        assert!(decoded.is_none());
+    }
+
+    #[test]
+    fn rejects_malformed_png_bitmap_glyphs() {
+        let decoded = decode_raster_glyph_image(ttf_parser::RasterGlyphImage {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+            pixels_per_em: 16,
+            format: ttf_parser::RasterImageFormat::PNG,
+            data: b"\x89PNG\r\n\x1a\n",
+        });
+        assert!(decoded.is_none());
     }
 }

@@ -221,14 +221,19 @@ ol, ul { break-before: avoid }
 
 /* Form fields */
 
-button, input, select { border: 1px solid black; box-sizing: border-box; font-size: .85em; padding: .2em; white-space: pre }
+button, input:not([type=image i]), select { border: 1px solid black; box-sizing: border-box; font-size: .85em; padding: .2em; white-space: pre }
 textarea { border: 1px solid black; font-size: .85em; padding: .2em; white-space: pre }
-input, select, textarea { height: 1.2em; width: 20em }
+input:not([type=image i]), select, textarea { height: 1.2em; width: 20em }
+/* Range controls have an intrinsic track/thumb size.  Their CSS preferred
+   size remains automatic, so Flexbox can resolve `align-items: normal` as
+   stretch in its cross axis instead of treating the generic text-input
+   control height as an authored definite size. */
+input[type=range i] { height: auto; width: auto }
 input:is([type=button i], [type=reset i], [type=submit i]), button { background: lightgrey; border-radius: .25em; text-align: center }
 input:is([type=button i], [type=reset i], [type=submit i])[value], button[value] { max-width: 100%; width: auto }
 input:is([type=checkbox i], [type=radio i]) { height: .7em; vertical-align: -.2em; width: .7em }
 input[type=radio i] { border-radius: 50% }
-:is(input, input[value=""], input[type=checkbox i], input[type=radio i]) { content: ""; display: block }
+:is(input:not([type=image i]), input[type=checkbox i], input[type=radio i]) { content: ""; display: block }
 select { background: lightgrey; border-radius: .25em .25em; overflow: hidden; position: relative; white-space: normal }
 select[multiple] { height: 3.6em }
 select:not([multiple]):is(:not([size]), [size="1"])::before { content: "˅"; position: absolute; right: 0; text-align: center; width: 1.5em }

@@ -52,7 +52,27 @@ fn style_for_layout_element_with_signature_transform(
     parent_ch_advance: Option<LayoutLength>,
 ) -> ComputedStyle {
     let signature = layout_element_signature(element, signature, parent);
-    let inline_style = element.attrs.get("style").map(String::as_str);
+    style_for_layout_signature_with_parent_ch_advance(
+        signature,
+        element.attrs.get("style").map(String::as_str),
+        stylesheets,
+        parent,
+        ancestors,
+        parent_ch_advance,
+    )
+}
+
+/// Cascade a signature that has already received its layout-time direction
+/// state.  Reusing this signature lets the primary cascade and pseudo cascade
+/// share one immutable selector snapshot.
+pub(super) fn style_for_layout_signature_with_parent_ch_advance(
+    signature: ElementSignature,
+    inline_style: Option<&str>,
+    stylesheets: &Stylesheets<'_>,
+    parent: Option<&ComputedStyle>,
+    ancestors: &[ElementSignature],
+    parent_ch_advance: Option<LayoutLength>,
+) -> ComputedStyle {
     if let Some(parent_ch_advance) = parent_ch_advance {
         css::style_for_element_with_signature_and_parent_ch_advance(
             signature,
@@ -78,14 +98,8 @@ pub(super) fn layout_element_signature(
     mut signature: ElementSignature,
     parent: Option<&ComputedStyle>,
 ) -> ElementSignature {
-    let selector_signature = element_selector_signature(element);
-    signature.namespace_url = selector_signature.namespace_url.clone();
-    signature.namespace_attrs = selector_signature.namespace_attrs.clone();
-    signature.is_target = selector_signature.is_target;
-    signature = signature.with_child_list(
-        selector_signature.children,
-        selector_signature.has_text_child,
-    );
+    // The supplied signature is derived from the immutable selector snapshot.
+    // Only layout-time directionality belongs in this enrichment step.
     if let Some(direction) = element_document_direction(element) {
         signature = signature.with_document_direction(direction);
     }

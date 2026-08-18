@@ -358,7 +358,19 @@ pub(in crate::css) fn parse_math_function(
             MathValue::Number(value) | MathValue::Resolution(value) => {
                 Some(MathValue::Number(value.signum()))
             }
-            MathValue::LengthPercentage(_) => None,
+            MathValue::LengthPercentage(mut value) => {
+                // `sign()` returns a number even when its argument is a
+                // length. Resolve the font-relative terms against this
+                // expression's supplied computation context before comparing
+                // it; percentages and layout-dependent terms remain
+                // incomparable at this stage.
+                // <https://drafts.csswg.org/css-values-4/#sign-func>
+                value.resolve_em_relative_lengths(crate::units::layout_pt(font_size));
+                value.resolve_root_font_relative_lengths(root_font_size);
+                value
+                    .length_if_no_percent()
+                    .map(|value| MathValue::Number(value.signum()))
+            }
         };
     }
     None

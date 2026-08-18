@@ -1,4 +1,5 @@
 use super::*;
+use crate::css::TextDecorationLayer;
 use std::rc::Rc;
 
 /// A non-empty logical inline range in page-local paint coordinates.
@@ -126,16 +127,44 @@ pub(in crate::layout) struct TextDecorationLineGlyphSequence {
 /// <https://drafts.csswg.org/css-text-decor-4/#text-decoration-line-uniformity>
 #[derive(Debug, Clone)]
 pub(in crate::layout) struct TextDecorationOriginLineGeometry {
-    /// Identity of the box which declared this decoration.  Pointer identity,
-    /// rather than declaration equality, keeps nested equal-looking origins
-    /// independent as required by the propagation model.
-    pub(in crate::layout) origin_style: Rc<ComputedStyle>,
+    /// The declaration this job paints.  Its `origin_style` `Rc` is the
+    /// identity of the box which declared the line; declaration equality is
+    /// deliberately not an origin test, because nested equal-looking origins
+    /// remain independent in the propagation model.
+    pub(in crate::layout) layer: TextDecorationLayer,
     pub(in crate::layout) geometry: TextDecorationLineGeometry,
     /// Complete physical selected-line coverage across eligible contributors.
     pub(in crate::layout) selected_inline_span: Option<TextInlineSpan>,
+    /// Receiver spans in inline paint order.  A span is contributed only by a
+    /// text group eligible to receive this origin; gaps consequently preserve
+    /// atomic-inline boundaries and `text-decoration-skip-self`.
+    pub(in crate::layout) receiver_spans: Vec<TextInlineSpan>,
     pub(in crate::layout) glyph_sequence: TextDecorationLineGlyphSequence,
     /// The physical baseline/reference point shared by every selected span.
     pub(in crate::layout) line_reference: PaintPoint,
+    /// The decorating box fragment that owns endpoint percentage resolution.
+    /// Receiver spans identify descendant text; this owner geometry identifies
+    /// the box whose `text-decoration-inset` percentages are resolved.
+    pub(in crate::layout) origin_fragment: TextDecorationOriginFragmentGeometry,
+}
+
+/// Used inline geometry for one decorating-box fragment.
+///
+/// CSS Text Decoration resolves `text-decoration-inset` percentages against
+/// the complete decorating box for `slice`, or against this fragment for
+/// `clone`; the outer fragment edges also determine which endpoints exist.
+/// <https://drafts.csswg.org/css-text-decor-4/#text-decoration-inset-property>
+#[derive(Debug, Clone)]
+pub(in crate::layout) struct TextDecorationOriginFragmentGeometry {
+    pub(in crate::layout) origin_style: Rc<ComputedStyle>,
+    pub(in crate::layout) total_inline_extent: LayoutLength,
+    pub(in crate::layout) fragment_inline_extent: LayoutLength,
+    /// Inline extent in earlier fragments of this decorating box.
+    pub(in crate::layout) preceding_inline_extent: LayoutLength,
+    /// Inline extent in later fragments of this decorating box.
+    pub(in crate::layout) following_inline_extent: LayoutLength,
+    pub(in crate::layout) is_first_fragment: bool,
+    pub(in crate::layout) is_last_fragment: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,13 +191,19 @@ pub(in crate::layout) struct PreparedTextEmphasisMark {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::layout) enum TextDecorationPaintPhase {
     BeforeText,
+    Underlines,
+    Overlines,
     AfterText,
     All,
 }
 
 impl TextDecorationPaintPhase {
-    pub(in crate::layout) fn paints_before_text(self) -> bool {
-        matches!(self, Self::BeforeText | Self::All)
+    pub(in crate::layout) fn paints_underlines(self) -> bool {
+        matches!(self, Self::BeforeText | Self::Underlines | Self::All)
+    }
+
+    pub(in crate::layout) fn paints_overlines(self) -> bool {
+        matches!(self, Self::BeforeText | Self::Overlines | Self::All)
     }
 
     pub(in crate::layout) fn paints_after_text(self) -> bool {

@@ -1,57 +1,71 @@
+use super::super::values::{
+    canonical_predefined_counter_style_name, is_counter_name, parse_counter_style_integer,
+    parse_counter_style_reference_name,
+};
 use super::*;
-pub(super) fn parse_counter_style_rule(name: &str, body: &str) -> Option<CounterStyleRule> {
-    if name.is_empty() || name.eq_ignore_ascii_case("none") {
-        return None;
-    }
-    let declarations = parse_declarations(body);
-    let system = declarations
-        .get("system")
-        .and_then(|value| parse_counter_style_system(value))
-        .unwrap_or(CounterStyleSystem::Symbolic);
-    let symbols = declarations
-        .get("symbols")
-        .map(|value| parse_counter_symbols(value))
-        .unwrap_or_default();
-    let additive_symbols = declarations
-        .get("additive-symbols")
-        .map(|value| parse_additive_symbols(value))
-        .unwrap_or_default();
-    let prefix = declarations
-        .get("prefix")
-        .and_then(|value| parse_counter_string(value));
-    let suffix = declarations
-        .get("suffix")
-        .and_then(|value| parse_counter_string(value));
-    let negative = declarations
-        .get("negative")
-        .and_then(|value| parse_counter_negative(value));
-    let pad = declarations
-        .get("pad")
-        .and_then(|value| parse_counter_pad(value));
-    let range = declarations
-        .get("range")
-        .and_then(|value| parse_counter_range(value));
-    let fallback = declarations
-        .get("fallback")
-        .map(|value| value.trim().to_ascii_lowercase())
-        .filter(|value| !value.is_empty());
-    let speak_as = declarations
-        .get("speak-as")
-        .map(|value| value.trim().to_ascii_lowercase())
-        .filter(|value| !value.is_empty());
+use crate::css::component_values::{split_css_top_level_delimiter, try_split_css_component_values};
+use cssparser::{Parser, ParserInput, Token};
 
-    let valid_symbols = match system {
+/// Parse an `@counter-style` rule.
+///
+/// Counter style descriptors do not cascade with ordinary declaration
+/// semantics: for each descriptor, the final *valid* declaration wins and an
+/// invalid declaration is ignored.  Keep that rule local instead of using
+/// `Declarations::get()`, which intentionally returns the final declaration
+/// without knowing the descriptor grammar.
+/// <https://drafts.csswg.org/css-counter-styles-3/#counter-style-rule>
+pub(super) fn parse_counter_style_rule(
+    name: &str,
+    body: &str,
+    origin: StylesheetOrigin,
+) -> Option<CounterStyleRule> {
+    let name = parse_counter_style_definition_name(name, origin)?;
+    let declarations = parse_declarations(body);
+
+    let mut system = None;
+    let mut symbols = None;
+    let mut additive_symbols = None;
+    let mut prefix = None;
+    let mut suffix = None;
+    let mut negative = None;
+    let mut pad = None;
+    let mut range = None;
+    let mut fallback = None;
+    let mut speak_as = None;
+
+    for (descriptor, value) in declarations.iter() {
+        match descriptor.as_str() {
+            "system" => set_if_valid(&mut system, parse_counter_style_system(value)),
+            "symbols" => set_if_valid(&mut symbols, parse_counter_symbols(value)),
+            "additive-symbols" => {
+                set_if_valid(&mut additive_symbols, parse_additive_symbols(value))
+            }
+            "prefix" => set_if_valid(&mut prefix, parse_single_counter_symbol(value)),
+            "suffix" => set_if_valid(&mut suffix, parse_single_counter_symbol(value)),
+            "negative" => set_if_valid(&mut negative, parse_counter_negative(value)),
+            "pad" => set_if_valid(&mut pad, parse_counter_pad(value)),
+            "range" => set_if_valid(&mut range, parse_counter_range(value)),
+            "fallback" => set_if_valid(&mut fallback, parse_counter_style_reference(value)),
+            "speak-as" => set_if_valid(&mut speak_as, parse_speak_as(value)),
+            _ => {}
+        }
+    }
+
+    let system = system.unwrap_or(CounterStyleSystem::Symbolic);
+    let symbols = symbols.unwrap_or_default();
+    let additive_symbols = additive_symbols.unwrap_or_default();
+    let valid_symbols = match &system {
         CounterStyleSystem::Cyclic
         | CounterStyleSystem::Symbolic
         | CounterStyleSystem::Fixed(_) => !symbols.is_empty(),
         CounterStyleSystem::Numeric | CounterStyleSystem::Alphabetic => symbols.len() >= 2,
         CounterStyleSystem::Additive => !additive_symbols.is_empty(),
-        CounterStyleSystem::Extends(ref extended) => {
-            !extended.eq_ignore_ascii_case(name) && !extended.is_empty()
-        }
+        // `symbols` and `additive-symbols` make an extends rule undefined;
+        // they are not merely ignored descriptors.
+        CounterStyleSystem::Extends(_) => symbols.is_empty() && additive_symbols.is_empty(),
     };
     valid_symbols.then_some(CounterStyleRule {
-        name: name.to_string(),
+        name,
         system,
         symbols,
         additive_symbols,
@@ -65,89 +79,157 @@ pub(super) fn parse_counter_style_rule(name: &str, body: &str) -> Option<Counter
     })
 }
 
+fn set_if_valid<T>(target: &mut Option<T>, value: Option<T>) {
+    if let Some(value) = value {
+        *target = Some(value);
+    }
+}
+
+/// The names whose counter definitions are supplied by the UA and cannot be
+/// redefined by an author `@counter-style` rule.
+/// <https://drafts.csswg.org/css-counter-styles-3/#counter-style-name>
+fn is_non_overridable_counter_style_name(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "decimal" | "disc" | "square" | "circle" | "disclosure-open" | "disclosure-closed"
+    )
+}
+
+fn parse_counter_style_definition_name(value: &str, origin: StylesheetOrigin) -> Option<String> {
+    let name = parse_single_custom_ident(value)?;
+    (is_counter_style_custom_ident(&name)
+        && (origin == StylesheetOrigin::UserAgent || !is_non_overridable_counter_style_name(&name)))
+    .then(|| {
+        canonical_predefined_counter_style_name(&name)
+            .map(str::to_string)
+            .unwrap_or(name)
+    })
+}
+
+/// References may name predefined styles, including non-overridable ones, but
+/// retain the author spelling so custom styles remain case-sensitive.
+fn parse_counter_style_reference(value: &str) -> Option<String> {
+    parse_counter_style_reference_name(value)
+}
+
+/// CSS Values' `<custom-ident>` adds `default` to the CSS-wide exclusions.
+/// <https://drafts.csswg.org/css-values-4/#custom-idents>
+fn is_counter_style_custom_ident(value: &str) -> bool {
+    is_counter_name(value) && !value.eq_ignore_ascii_case("default")
+}
+
+fn parse_single_custom_ident(value: &str) -> Option<String> {
+    let mut input = ParserInput::new(value.trim());
+    let mut parser = Parser::new(&mut input);
+    let name = parser.expect_ident_cloned().ok()?.to_string();
+    parser.is_exhausted().then_some(name)
+}
+
+/// Parse the `system` descriptor's exact grammar.
+/// <https://drafts.csswg.org/css-counter-styles-3/#counter-style-system>
 pub(super) fn parse_counter_style_system(value: &str) -> Option<CounterStyleSystem> {
-    let lower = value.trim().to_ascii_lowercase();
-    if lower == "cyclic" {
-        Some(CounterStyleSystem::Cyclic)
-    } else if lower == "numeric" {
-        Some(CounterStyleSystem::Numeric)
-    } else if lower == "alphabetic" {
-        Some(CounterStyleSystem::Alphabetic)
-    } else if lower == "symbolic" {
-        Some(CounterStyleSystem::Symbolic)
-    } else if lower == "additive" {
-        Some(CounterStyleSystem::Additive)
-    } else if let Some(rest) = lower.strip_prefix("extends") {
-        let name = rest.split_whitespace().next()?.to_string();
-        Some(CounterStyleSystem::Extends(name))
-    } else if let Some(rest) = lower.strip_prefix("fixed") {
-        let first = rest
-            .split_whitespace()
-            .next()
-            .and_then(|value| value.parse::<i32>().ok())
-            .unwrap_or(1);
-        Some(CounterStyleSystem::Fixed(first))
-    } else {
-        None
-    }
-}
-
-pub(super) fn parse_counter_negative(value: &str) -> Option<(String, String)> {
-    let mut symbols = parse_counter_symbols(value);
-    let first = symbols.drain(..1).next()?;
-    let second = symbols.into_iter().next().unwrap_or_default();
-    Some((first, second))
-}
-
-pub(super) fn parse_counter_pad(value: &str) -> Option<(usize, String)> {
-    let value = value.trim();
-    let (width, symbol) = value.split_once(char::is_whitespace)?;
-    let width = width.trim().parse::<usize>().ok()?;
-    let symbol = parse_counter_symbols(symbol).into_iter().next()?;
-    Some((width, symbol))
-}
-
-pub(super) fn parse_counter_symbols(value: &str) -> Vec<String> {
-    let mut symbols = Vec::new();
-    let mut rest = value.trim();
-    while !rest.is_empty() {
-        if let Some((string, tail)) = parse_css_string_token(rest) {
-            symbols.push(string);
-            rest = tail.trim_start();
-        } else {
-            let (ident, tail) = split_counter_token(rest);
-            if ident.is_empty() {
-                break;
-            }
-            symbols.push(unescape_counter_symbol(ident));
-            rest = tail.trim_start();
+    let parts = try_split_css_component_values(value)?;
+    let (system, arguments) = parts.split_first()?;
+    let system = parse_single_custom_ident(system)?;
+    match system.to_ascii_lowercase().as_str() {
+        "cyclic" if arguments.is_empty() => Some(CounterStyleSystem::Cyclic),
+        "numeric" if arguments.is_empty() => Some(CounterStyleSystem::Numeric),
+        "alphabetic" if arguments.is_empty() => Some(CounterStyleSystem::Alphabetic),
+        "symbolic" if arguments.is_empty() => Some(CounterStyleSystem::Symbolic),
+        "additive" if arguments.is_empty() => Some(CounterStyleSystem::Additive),
+        "fixed" if arguments.is_empty() => Some(CounterStyleSystem::Fixed(1)),
+        "fixed" if arguments.len() == 1 => {
+            parse_counter_style_integer(arguments[0]).map(CounterStyleSystem::Fixed)
         }
+        "extends" if arguments.len() == 1 => {
+            parse_counter_style_reference(arguments[0]).map(CounterStyleSystem::Extends)
+        }
+        _ => None,
     }
-    symbols
 }
 
-pub(super) fn parse_additive_symbols(value: &str) -> Vec<(i32, String)> {
-    let symbols = value
-        .split(',')
-        .filter_map(|part| {
-            let part = part.trim();
-            let (weight, symbol) = part.split_once(char::is_whitespace)?;
-            let weight = weight.trim().parse::<i32>().ok()?;
-            let symbol = parse_counter_symbols(symbol).into_iter().next()?;
-            Some((weight, symbol))
-        })
-        .collect::<Vec<_>>();
-    if valid_additive_symbols(&symbols) {
-        symbols
-    } else {
-        Vec::new()
+fn parse_counter_negative(value: &str) -> Option<(String, String)> {
+    let symbols = parse_counter_symbol_list(value)?;
+    match symbols.as_slice() {
+        [prefix] => Some((prefix.clone(), String::new())),
+        [prefix, suffix] => Some((prefix.clone(), suffix.clone())),
+        _ => None,
     }
+}
+
+fn parse_counter_pad(value: &str) -> Option<(usize, String)> {
+    let parts = try_split_css_component_values(value)?;
+    let [first, second] = parts.as_slice() else {
+        return None;
+    };
+    // `<integer> && <symbol>` permits either component order.
+    // <https://drafts.csswg.org/css-counter-styles-3/#pad>
+    [(first, second), (second, first)]
+        .into_iter()
+        .find_map(|(width, symbol)| {
+            let width = usize::try_from(parse_counter_style_integer(width)?).ok()?;
+            let symbol = parse_single_counter_symbol(symbol)?;
+            Some((width, symbol))
+        })
+}
+
+fn parse_counter_symbols(value: &str) -> Option<Vec<String>> {
+    let symbols = parse_counter_symbol_list(value)?;
+    (!symbols.is_empty()).then_some(symbols)
+}
+
+fn parse_counter_symbol_list(value: &str) -> Option<Vec<String>> {
+    try_split_css_component_values(value)?
+        .into_iter()
+        .map(parse_single_counter_symbol)
+        .collect()
+}
+
+/// Parse the currently text-only part of `<symbol>`.
+///
+/// Images deliberately return `None` until marker and generated-content image
+/// symbols have a typed paint representation.
+/// <https://drafts.csswg.org/css-counter-styles-3/#counter-style-symbols>
+fn parse_single_counter_symbol(value: &str) -> Option<String> {
+    let mut input = ParserInput::new(value.trim());
+    let mut parser = Parser::new(&mut input);
+    let token = parser.next().ok()?.clone();
+    let symbol = match token {
+        Token::QuotedString(value) => value.to_string(),
+        Token::Ident(value) if is_counter_style_custom_ident(&value) => value.to_string(),
+        _ => return None,
+    };
+    parser.is_exhausted().then_some(symbol)
+}
+
+fn parse_additive_symbols(value: &str) -> Option<Vec<(i32, String)>> {
+    let entries = split_css_top_level_delimiter(value, ',');
+    if entries.is_empty() || entries.iter().any(|entry| entry.is_empty()) {
+        return None;
+    }
+    let symbols = entries
+        .into_iter()
+        .map(|entry| {
+            let parts = try_split_css_component_values(entry)?;
+            let [first, second] = parts.as_slice() else {
+                return None;
+            };
+            // `<integer> && <symbol>` permits either component order.
+            // <https://drafts.csswg.org/css-counter-styles-3/#additive-symbols>
+            [(first, second), (second, first)]
+                .into_iter()
+                .find_map(|(weight, symbol)| {
+                    Some((
+                        parse_counter_style_integer(weight)?,
+                        parse_single_counter_symbol(symbol)?,
+                    ))
+                })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    valid_additive_symbols(&symbols).then_some(symbols)
 }
 
 fn valid_additive_symbols(symbols: &[(i32, String)]) -> bool {
-    if symbols.is_empty() {
-        return false;
-    }
     let mut previous = i32::MAX;
     for (index, (weight, _)) in symbols.iter().enumerate() {
         if *weight < 0 || *weight >= previous {
@@ -158,58 +240,158 @@ fn valid_additive_symbols(symbols: &[(i32, String)]) -> bool {
         }
         previous = *weight;
     }
-    true
+    !symbols.is_empty()
 }
 
 pub(super) fn parse_counter_range(value: &str) -> Option<CounterStyleRange> {
-    let value = value.trim();
-    if value.eq_ignore_ascii_case("auto") {
+    if value.trim().eq_ignore_ascii_case("auto") {
         return Some(CounterStyleRange::Auto);
     }
-
-    let intervals = value
-        .split(',')
-        .map(|part| {
-            let mut parts = part.split_whitespace();
-            let start = parse_counter_range_bound(parts.next()?)?;
-            let end = parse_counter_range_bound(parts.next()?)?;
-            if parts.next().is_some() || start > end {
+    let ranges = split_css_top_level_delimiter(value, ',');
+    if ranges.is_empty() || ranges.iter().any(|range| range.is_empty()) {
+        return None;
+    }
+    let intervals = ranges
+        .into_iter()
+        .map(|range| {
+            let parts = try_split_css_component_values(range)?;
+            let [start, end] = parts.as_slice() else {
                 return None;
-            }
-            Some(CounterStyleRangeInterval { start, end })
+            };
+            let start = parse_counter_range_bound(start, true)?;
+            let end = parse_counter_range_bound(end, false)?;
+            (start <= end).then_some(CounterStyleRangeInterval { start, end })
         })
         .collect::<Option<Vec<_>>>()?;
-    (!intervals.is_empty()).then_some(CounterStyleRange::Intervals(intervals))
+    Some(CounterStyleRange::Intervals(intervals))
 }
 
-fn parse_counter_range_bound(value: &str) -> Option<i64> {
+fn parse_counter_range_bound(value: &str, is_start: bool) -> Option<i64> {
     if value.eq_ignore_ascii_case("infinite") {
-        Some(i64::MAX)
-    } else if value.eq_ignore_ascii_case("-infinite") {
-        Some(i64::MIN)
-    } else {
-        value.parse::<i32>().ok().map(i64::from)
+        return Some(if is_start { i64::MIN } else { i64::MAX });
+    }
+    parse_counter_style_integer(value).map(i64::from)
+}
+
+fn parse_speak_as(value: &str) -> Option<String> {
+    let value = parse_single_custom_ident(value)?;
+    match value.to_ascii_lowercase().as_str() {
+        "auto" | "bullets" | "numbers" | "words" | "spell-out" => Some(value.to_ascii_lowercase()),
+        _ if is_counter_style_custom_ident(&value) => Some(value),
+        _ => None,
     }
 }
 
-pub(super) fn parse_counter_string(value: &str) -> Option<String> {
-    parse_counter_symbols(value).into_iter().next()
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-pub(super) fn split_counter_token(value: &str) -> (&str, &str) {
-    let end = value
-        .char_indices()
-        .find_map(|(index, character)| character.is_whitespace().then_some(index))
-        .unwrap_or(value.len());
-    (&value[..end], &value[end..])
-}
+    #[test]
+    fn invalid_descriptors_do_not_replace_the_last_valid_value() {
+        let rule = parse_counter_style_rule(
+            "example",
+            r##"
+                system: extends decimal;
+                prefix: "#";
+                prefix: *;
+                suffix: ",";
+                suffix: '$' '$';
+                negative: "(" ")";
+                negative: "(" "x" ")";
+                pad: 3 "0";
+                pad: -1 "X";
+                range: 1 2;
+                range: 3 1;
+                fallback: decimal-leading-zero;
+                fallback: decimal cjk-decimal;
+            "##,
+            StylesheetOrigin::Author,
+        )
+        .expect("a valid extends rule");
 
-pub(super) fn unescape_counter_symbol(value: &str) -> String {
-    if let Some(hex) = value.strip_prefix('\\')
-        && let Ok(codepoint) = u32::from_str_radix(hex, 16)
-        && let Some(character) = char::from_u32(codepoint)
-    {
-        return character.to_string();
+        assert_eq!(rule.prefix.as_deref(), Some("#"));
+        assert_eq!(rule.suffix.as_deref(), Some(","));
+        assert_eq!(rule.negative, Some(("(".into(), ")".into())));
+        assert_eq!(rule.pad, Some((3, "0".into())));
+        assert_eq!(
+            rule.range,
+            Some(CounterStyleRange::Intervals(vec![
+                CounterStyleRangeInterval { start: 1, end: 2 }
+            ]))
+        );
+        assert_eq!(rule.fallback.as_deref(), Some("decimal-leading-zero"));
     }
-    value.to_string()
+
+    #[test]
+    fn descriptors_accept_calculated_integers_after_dimension_safe_evaluation() {
+        let fixed = parse_counter_style_system("fixed calc(1 + sign(100em - 1px))");
+        assert_eq!(fixed, Some(CounterStyleSystem::Fixed(2)));
+        assert_eq!(
+            parse_counter_range("calc(2 - sign(100em - 1px)) calc(5 + sign(100em - 1px))"),
+            Some(CounterStyleRange::Intervals(vec![
+                CounterStyleRangeInterval { start: 1, end: 6 }
+            ]))
+        );
+        assert_eq!(
+            parse_counter_pad("calc(3 + sign(100em - 1px)) '*'"),
+            Some((4, "*".into()))
+        );
+        assert_eq!(parse_counter_pad("'0' 3"), Some((3, "0".into())));
+        assert_eq!(
+            parse_additive_symbols("calc(2 + sign(100em - 1px)) c, 2 b, 1 a"),
+            Some(vec![(3, "c".into()), (2, "b".into()), (1, "a".into())])
+        );
+        assert_eq!(
+            parse_additive_symbols("c 3, 2 b, a 1"),
+            Some(vec![(3, "c".into()), (2, "b".into()), (1, "a".into())])
+        );
+    }
+
+    #[test]
+    fn range_list_preserves_top_level_comma_entries() {
+        assert_eq!(
+            split_css_top_level_delimiter("1 10, 20 infinite", ','),
+            ["1 10", "20 infinite"]
+        );
+        assert_eq!(
+            parse_counter_range("1 10, 20 infinite"),
+            Some(CounterStyleRange::Intervals(vec![
+                CounterStyleRangeInterval { start: 1, end: 10 },
+                CounterStyleRangeInterval {
+                    start: 20,
+                    end: i64::MAX,
+                },
+            ]))
+        );
+    }
+
+    #[test]
+    fn names_preserve_custom_case_but_normalize_predefined_names() {
+        assert_eq!(
+            parse_counter_style_definition_name("Custom-Style", StylesheetOrigin::Author),
+            Some("Custom-Style".into())
+        );
+        assert_eq!(
+            parse_counter_style_definition_name("HiRaGaNa", StylesheetOrigin::Author),
+            Some("hiragana".into())
+        );
+        for name in ["none", "inherit", "initial", "default", "decimal", "DISC"] {
+            assert_eq!(
+                parse_counter_style_definition_name(name, StylesheetOrigin::Author),
+                None,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn symbols_reject_css_wide_keywords_and_non_symbol_tokens() {
+        assert_eq!(parse_counter_symbols("a inherit"), None);
+        assert_eq!(parse_counter_symbols("a 0"), None);
+        assert_eq!(parse_counter_symbols("a *"), None);
+        assert_eq!(
+            parse_counter_symbols("a b"),
+            Some(vec!["a".into(), "b".into()])
+        );
+    }
 }

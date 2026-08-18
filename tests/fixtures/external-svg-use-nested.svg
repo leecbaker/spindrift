@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg">
+  <symbol id="nested-green">
+    <use href="external-svg-use-sprites.svg#green"/>
+  </symbol>
+</svg>

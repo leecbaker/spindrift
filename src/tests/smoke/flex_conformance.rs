@@ -18,6 +18,11 @@ body { color: red }\
 .c10 { color: black }\
 .b { background: inherit }";
 
+const RTL_JUSTIFY_CONTENT_LEFT_WPT: &str =
+    include_str!("../../../tests/fixtures/wpt/css/css-flexbox/justify-content-left-rtl.html");
+const RTL_JUSTIFY_CONTENT_LEFT_REFERENCE: &str =
+    include_str!("../../../tests/fixtures/wpt/css/css-flexbox/justify-content-left-rtl-ref.html");
+
 fn rects_overlap_y(
     a: &crate::document::paint::shapes::RenderedRect,
     b: &crate::document::paint::shapes::RenderedRect,
@@ -59,6 +64,141 @@ fn page_rect_with_fill(
         .iter()
         .find(|rect| rect.fill == Some(color))
         .unwrap_or_else(|| panic!("expected {color:?} background: {:?}", page.rects()))
+}
+
+#[tokio::test]
+async fn rtl_row_justify_content_left_uses_the_physical_left_edge() {
+    let document = Html::from_string(RTL_JUSTIFY_CONTENT_LEFT_WPT)
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+    let reference = Html::from_string(RTL_JUSTIFY_CONTENT_LEFT_REFERENCE)
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+
+    let page = &document.pages[0];
+    let reference_page = &reference.pages[0];
+    let container = page_rect_with_fill(page, CssColor::new(255, 0, 0));
+    let item = page_rect_with_fill(page, CssColor::new(0, 128, 0));
+    assert!(
+        (item.x() - container.x()).abs() < 0.01,
+        "`justify-content:left` must remain physical left in an RTL row: container={container:?}, item={item:?}"
+    );
+    assert_eq!(page.rects(), reference_page.rects());
+}
+
+#[tokio::test]
+async fn static_flex_and_grid_items_paint_after_container_decorations() {
+    for layout in ["flex", "grid"] {
+        let document = Html::from_string(format!(
+            "<style>@page {{ size: 160pt 100pt; margin: 0 }} body {{ margin: 0 }}\
+             .container {{ display: {layout}; width: 40pt; height: 20pt }}\
+             .first {{ background: rgb(255 0 0) }} .second {{ background: rgb(0 0 255) }}\
+             .item {{ width: 20pt; height: 20pt }}\
+             .green {{ background: rgb(0 128 0); order: 1 }}\
+             .yellow {{ background: rgb(255 255 0); order: 0 }}\
+             </style>\
+             <div class=\"container first\"><div class=\"item green\"></div><div class=\"item yellow\"></div></div>\
+             <div class=\"container second\"></div>"
+        ))
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+
+        let page = &document.pages[0];
+        let red = first_rect_paint_operation_index(page, CssColor::new(255, 0, 0));
+        let blue = first_rect_paint_operation_index(page, CssColor::new(0, 0, 255));
+        let green = first_rect_paint_operation_index(page, CssColor::new(0, 128, 0));
+        let yellow = first_rect_paint_operation_index(page, CssColor::new(255, 255, 0));
+        assert!(
+            red < green && red < yellow && blue < green && blue < yellow,
+            "{layout} container decorations must paint before their static items: {:?}",
+            page.paint_operations()
+        );
+        assert!(
+            yellow < green,
+            "{layout} items must retain order-modified document order: {:?}",
+            page.paint_operations()
+        );
+    }
+}
+
+#[tokio::test]
+async fn static_flex_item_positioned_descendants_interleave_in_parent_stacking_context() {
+    let document = Html::from_string(
+        "<style>@page { size: 160pt 100pt; margin: 0 } body { margin: 0 }\
+         .flex { display: flex; width: 90pt; height: 20pt }\
+         .first { flex: 0 0 45pt; min-width: 0; height: 20pt; background: lightblue }\
+         .second { flex: 0 0 45pt; min-width: 0; height: 20pt; background: yellow }\
+         .a, .b { position: relative; width: 70pt; height: 6pt }\
+         .a { z-index: 10; background: purple }\
+         .b { z-index: 20; background: teal }\
+         .c { position: relative; z-index: 15; width: 20pt; height: 20pt; background: lime }\
+         </style><div class=\"flex\"><div class=\"first\"><div class=\"a\"></div><div class=\"b\"></div></div><div class=\"second\"><div class=\"c\"></div></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    assert_eq!(
+        final_rect_fill_at(page, 50.0, 97.0),
+        Some(CssColor::new(0, 255, 0)),
+        "the second item's z-index:15 descendant must paint above the first item's z-index:10 descendant: {:?}",
+        page.rects()
+    );
+    assert_eq!(
+        final_rect_fill_at(page, 50.0, 90.0),
+        Some(CssColor::new(0, 128, 128)),
+        "the first item's z-index:20 descendant must paint above the second item's z-index:15 descendant: {:?}",
+        page.rects()
+    );
+}
+
+#[tokio::test]
+async fn relative_auto_flex_item_paints_in_auto_positioned_phase() {
+    let document = Html::from_string(
+        "<style>@page { size: 160pt 100pt; margin: 0 } body { margin: 0 }\
+         .flex { display: flex; width: 90pt; height: 20pt }\
+         .relative { position: relative; flex: 0 0 60pt; height: 20pt; background: red }\
+         .static { flex: 0 0 60pt; height: 20pt; margin-left: -30pt; background: blue }\
+         </style><div class=\"flex\"><div class=\"relative\"></div><div class=\"static\"></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    assert_eq!(
+        final_rect_fill_at(page, 45.0, 90.0),
+        Some(CssColor::new(255, 0, 0)),
+        "a relatively positioned flex item with z-index:auto must paint above in-flow siblings: {:?}",
+        page.rects()
+    );
+}
+
+#[tokio::test]
+async fn non_auto_z_index_flex_item_captures_positioned_descendants() {
+    let document = Html::from_string(
+        "<style>@page { size: 160pt 100pt; margin: 0 } body { margin: 0 }\
+         .flex { display: flex; width: 90pt; height: 20pt }\
+         .lower { z-index: 1; flex: 0 0 60pt; height: 20pt; background: red }\
+         .lower > div { position: relative; z-index: 999; width: 60pt; height: 20pt; background: purple }\
+         .upper { z-index: 2; flex: 0 0 60pt; height: 20pt; margin-left: -30pt; background: blue }\
+         </style><div class=\"flex\"><div class=\"lower\"><div></div></div><div class=\"upper\"></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    assert_eq!(
+        final_rect_fill_at(page, 45.0, 90.0),
+        Some(CssColor::new(0, 0, 255)),
+        "a positive-z descendant must remain below the later real flex-item stacking context: {:?}",
+        page.rects()
+    );
 }
 
 #[tokio::test]
@@ -645,6 +785,82 @@ async fn flex_blockified_inline_item_paints_source_background_once() {
         painted.len(),
         1,
         "blockified inline flex item should not also paint inline text-fragment background: {painted:?}"
+    );
+}
+
+#[tokio::test]
+async fn flex_replay_keeps_a_grid_item_descendant_visible_without_root_decoration() {
+    let document = Html::from_string(
+        "<!DOCTYPE html><style>\
+         @page { size: 200pt 200pt; margin: 0 } body { margin: 0 }\
+         .flex { display: flex; width: 100pt; height: 100pt }\
+         .item { display: grid; width: 100pt; height: 100pt }\
+         .child { background: rgb(0, 128, 0) }\
+         </style><div class=\"flex\"><div class=\"item\"><div class=\"child\"></div></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let painted = document.pages[0]
+        .rects()
+        .iter()
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        painted.len(),
+        1,
+        "grid descendant must paint once: {painted:?}"
+    );
+    assert!(
+        (painted[0].width() - 100.0).abs() < 0.01 && (painted[0].height() - 100.0).abs() < 0.01,
+        "grid descendant must retain the flex item's placed geometry: {:?}",
+        painted[0]
+    );
+}
+
+#[tokio::test]
+async fn flex_replay_paints_grid_root_decoration_and_child_once_each() {
+    let document = Html::from_string(
+        "<!DOCTYPE html><style>\
+         @page { size: 200pt 200pt; margin: 0 } body { margin: 0 }\
+         .flex { display: flex; width: 100pt; height: 100pt }\
+         .item { display: grid; box-sizing: border-box; width: 100pt; height: 100pt;\
+                 background: rgb(255, 0, 0); border: 5pt solid rgb(0, 0, 0) }\
+         .child { background: rgb(0, 0, 255) }\
+         </style><div class=\"flex\"><div class=\"item\"><div class=\"child\"></div></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let rects = document.pages[0].rects();
+    let red = rects
+        .iter()
+        .filter(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
+        .collect::<Vec<_>>();
+    let blue = rects
+        .iter()
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
+        .collect::<Vec<_>>();
+    let black = rects
+        .iter()
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 0, 0)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        red.len(),
+        1,
+        "grid root background must paint once: {red:?}"
+    );
+    assert_eq!(
+        blue.len(),
+        1,
+        "grid child background must paint once: {blue:?}"
+    );
+    assert_eq!(
+        black.len(),
+        4,
+        "grid root border edges must paint once: {black:?}"
     );
 }
 
@@ -1541,6 +1757,46 @@ async fn floated_row_flex_min_content_caps_non_growing_item_by_flex_base() {
 }
 
 #[tokio::test]
+async fn intrinsic_row_flex_automatic_minimum_clamps_after_inflexible_basis() {
+    let document = Html::from_string(
+        "<style>@page { size: 300px 180px; margin: 0 } body { margin: 0 }\
+         .flex { display: flex; width: max-content; height: 100px; background: green }\
+         .item { flex: 0 0 0px; border: 10px solid transparent }\
+         .child { width: 80px }\
+         </style><div class=\"flex\"><div class=\"item\"><div class=\"child\"></div></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let green = page_rect_with_fill(&document.pages[0], CssColor::new(0, 128, 0));
+    assert!(
+        (green.width() - 75.0).abs() < 0.01 && (green.height() - 75.0).abs() < 0.01,
+        "the automatic minimum must floor the capped 0px flex basis at 80px content plus 20px border: {green:?}"
+    );
+}
+
+#[tokio::test]
+async fn intrinsic_row_flex_automatic_minimum_honors_preferred_size_suggestion() {
+    let document = Html::from_string(
+        "<style>@page { size: 300px 180px; margin: 0 } body { margin: 0 }\
+         .flex { display: flex; width: max-content; height: 100px; background: green }\
+         .item { width: 10px; flex: 0 0 0px; border: 10px solid transparent }\
+         .child { width: 80px }\
+         </style><div class=\"flex\"><div class=\"item\"><div class=\"child\"></div></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let green = page_rect_with_fill(&document.pages[0], CssColor::new(0, 128, 0));
+    assert!(
+        (green.width() - 22.5).abs() < 0.01 && (green.height() - 75.0).abs() < 0.01,
+        "the automatic minimum must use the 10px preferred-size suggestion before adding its 20px border: {green:?}"
+    );
+}
+
+#[tokio::test]
 async fn nowrap_row_flex_min_content_width_keeps_all_items_on_one_line() {
     let document = Html::from_string(
         "<style>@page { size: 180pt 120pt; margin: 10pt } body { margin: 0 }\
@@ -2013,8 +2269,8 @@ async fn baseline_fallback_preserves_specified_cross_size_with_negative_margin()
         "the background paints the specified content box and its two border edges: {item:?}"
     );
     assert!(
-        ((item.y() + item.height()) - (flex.y() + flex.height())).abs() < 0.01,
-        "the negative cross-start margin must leave the item's border edge at the flex cross start: flex={flex:?}, item={item:?}"
+        ((item.y() + item.height()) - (flex.y() + flex.height()) - 4.0 * px).abs() < 0.01,
+        "baseline fallback aligns the item's margin edge at flex cross-start, so its negative cross-start margin lets the border edge extend before that edge: flex={flex:?}, item={item:?}"
     );
 }
 
@@ -3793,6 +4049,120 @@ async fn fragmented_row_flex_clones_container_background() {
     }
 }
 
+/// An overflowing descendant of a stretched flex item keeps the inline size
+/// established in its first multicolumn fragment. The two inputs correspond to
+/// WPT `flex-item-content-overflow-001a` and `-001b`; the latter reaches the
+/// same used geometry through content-box sizing.
+/// <https://drafts.csswg.org/css-flexbox-1/#pagination>
+async fn assert_multicol_flex_item_overflow_matches_block_reference(
+    case_name: &str,
+    box_sizing: &str,
+    multicol_inline_size: u16,
+    multicol_block_size: u16,
+    flexbox_inline_size: u16,
+    flexbox_block_size: u16,
+    grandchild_block_size: u16,
+) {
+    let actual = Html::from_string(format!(
+        "<style>{box_sizing}\
+         .multicol {{ columns: 2; column-gap: 0; column-fill: auto; inline-size: {multicol_inline_size}px; block-size: {multicol_block_size}px; border: 10px solid purple }}\
+         .flexbox {{ display: flex; inline-size: {flexbox_inline_size}px; block-size: {flexbox_block_size}px; border: 10px solid black }}\
+         .item {{ flex: 1; border: 10px solid teal }}\
+         .grandchild {{ border: 10px solid orange; block-size: {grandchild_block_size}px }}\
+         </style><div class=\"multicol\"><div class=\"flexbox\"><div class=\"item\"><div class=\"grandchild\"></div></div></div></div>"
+    ))
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    // This is the local equivalent of the WPT reference: an ordinary block
+    // with the flex item's resolved 50px border-box block size. It makes the
+    // expected second-column continuation explicit without depending on a WPT
+    // checkout or another renderer.
+    let reference = Html::from_string(
+        "<style>div { box-sizing: border-box }\
+         .multicol { columns: 2; column-gap: 0; column-fill: auto; inline-size: 300px; block-size: 100px; border: 10px solid purple }\
+         .flexbox { display: block; inline-size: 130px; block-size: 70px; border: 10px solid black }\
+         .item { block-size: 50px; border: 10px solid teal }\
+         .grandchild { border: 10px solid orange; block-size: 140px }\
+         </style><div class=\"multicol\"><div class=\"flexbox\"><div class=\"item\"><div class=\"grandchild\"></div></div></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(actual.pages.len(), 1, "{case_name}: unexpected pagination");
+    assert_eq!(
+        reference.pages.len(),
+        1,
+        "{case_name}: invalid local reference"
+    );
+
+    let border_colors = [
+        CssColor::new(128, 0, 128),
+        CssColor::BLACK,
+        CssColor::new(0, 128, 128),
+        CssColor::new(255, 165, 0),
+    ];
+    let actual_borders = actual.pages[0]
+        .rects()
+        .iter()
+        .filter(|rect| rect.fill.is_some_and(|fill| border_colors.contains(&fill)))
+        .collect::<Vec<_>>();
+    let reference_borders = reference.pages[0]
+        .rects()
+        .iter()
+        .filter(|rect| rect.fill.is_some_and(|fill| border_colors.contains(&fill)))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        actual_borders, reference_borders,
+        "{case_name}: flex overflow must preserve the complete colored border sequence across the column break"
+    );
+    assert_eq!(
+        actual.pages[0].rects(),
+        reference.pages[0].rects(),
+        "{case_name}: the continuation must retain the first fragment's inline geometry"
+    );
+}
+
+/// Regression for CSS Break's multicolumn fragmentation of overflowing flex
+/// item content, under both border-box and content-box input sizing.
+#[tokio::test]
+async fn multicol_flex_item_overflow_preserves_first_fragment_inline_size() {
+    for (
+        case_name,
+        box_sizing,
+        multicol_inline_size,
+        multicol_block_size,
+        flexbox_inline_size,
+        flexbox_block_size,
+        grandchild_block_size,
+    ) in [
+        (
+            "border-box",
+            "div { box-sizing: border-box }",
+            300,
+            100,
+            130,
+            70,
+            140,
+        ),
+        ("content-box", "", 280, 80, 110, 50, 120),
+    ] {
+        assert_multicol_flex_item_overflow_matches_block_reference(
+            case_name,
+            box_sizing,
+            multicol_inline_size,
+            multicol_block_size,
+            flexbox_inline_size,
+            flexbox_block_size,
+            grandchild_block_size,
+        )
+        .await;
+    }
+}
+
 #[tokio::test]
 async fn flex_item_break_before_is_consumed_at_container_layer() {
     let document = Html::from_string(
@@ -3996,6 +4366,48 @@ async fn oversized_column_flex_item_splits_across_pages() {
         (first.height() - 60.0).abs() < 0.5 && (second.height() - 40.0).abs() < 0.5,
         "item slices should match fragmentainer remainder: first={first:?}, second={second:?}"
     );
+}
+
+#[tokio::test]
+async fn split_flex_grid_item_keeps_selected_root_decoration_and_grid_child_paint() {
+    let document = Html::from_string(
+        "<style>@page { size: 100pt 80pt; margin: 10pt } body { margin: 0 }\
+         .flex { display: flex; flex-direction: column; width: 40pt }\
+         .item { display: grid; width: 40pt; height: 100pt; background: rgb(255, 0, 0) }\
+         .child { height: 100pt; background: rgb(0, 128, 0) }</style>\
+         <div class=\"flex\"><div class=\"item\"><div class=\"child\"></div></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(
+        document.pages.len(),
+        2,
+        "the flex item must split across pages"
+    );
+    for (page_index, page) in document.pages.iter().enumerate() {
+        let red = page
+            .rects()
+            .iter()
+            .filter(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
+            .collect::<Vec<_>>();
+        let green = page
+            .rects()
+            .iter()
+            .filter(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            red.len(),
+            1,
+            "page {page_index} must paint one item root slice: {red:?}"
+        );
+        assert_eq!(
+            green.len(),
+            1,
+            "page {page_index} must retain its grid child slice: {green:?}"
+        );
+    }
 }
 
 #[tokio::test]

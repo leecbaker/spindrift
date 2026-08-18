@@ -226,7 +226,7 @@ pub(in crate::layout) fn first_letter_byte_range(text: &str) -> Option<std::ops:
         })
     }
 
-    let units = typographic_unit_ranges(text);
+    let units = CursiveProtectedUnitRanges::new(text);
     let mut prefix_start = None;
     let mut selected_start = None;
     let mut selected_end = None;

@@ -126,7 +126,8 @@ pub(in crate::layout::table) struct TableBodyRowsInput<'table, 'ctx> {
     pub(in crate::layout::table) row_group_break_after: &'ctx [PageBreak],
 }
 
-/// A table wrapper's physical X offset within its active content column.
+/// A horizontal table wrapper's physical inline offset within its active
+/// content column.
 ///
 /// Page-area origins are stable across synthetic multicolumn fragmentainers,
 /// whereas the content-column origin changes. Retaining only this signed local
@@ -134,15 +135,71 @@ pub(in crate::layout::table) struct TableBodyRowsInput<'table, 'ctx> {
 /// page area instead of its destination column.
 /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(in crate::layout::table) struct TableContinuationInlineOffset(f32);
+pub(in crate::layout::table) struct HorizontalTableContinuationInlineOffset(f32);
 
-impl TableContinuationInlineOffset {
+impl HorizontalTableContinuationInlineOffset {
     pub(in crate::layout::table) fn capture(table_x: f32, content_left: f32) -> Self {
         Self(table_x - content_left)
     }
 
     pub(in crate::layout::table) fn resolve(self, content_left: f32) -> f32 {
         content_left + self.0
+    }
+}
+
+/// The physical page origin selected for a complete destination cell grid.
+///
+/// Unlike a fragmentainer edge, this is the top-left corner of the grid's
+/// whole projected rectangle.  In particular, a `vertical-rl` continuation
+/// must subtract the complete grid block extent from its logical block-start
+/// edge before it can be handed to [`TableGridPlacement`].  Keeping this
+/// conversion in one named adapter prevents row paint, structural paint, and
+/// wrapper decoration from independently treating `content_left` as a table
+/// origin.
+/// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+/// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout::table) struct TableFragmentainerGridOrigin(PageTopPoint);
+
+impl TableFragmentainerGridOrigin {
+    /// Construct the first grid frame from the wrapper position resolved by
+    /// normal flow. Subsequent frames use [`Self::for_continuation`], whose
+    /// fragmentainer-edge projection is intentionally different for vertical
+    /// tables.
+    ///
+    /// <https://www.w3.org/TR/css-tables-3/#table-layout>
+    /// <https://www.w3.org/TR/css-writing-modes-4/#block-flow>
+    pub(in crate::layout::table) fn for_initial(
+        table_x: f32,
+        inline_top: PageTopBlockPosition,
+    ) -> Self {
+        Self(PageTopPoint::new(table_x, inline_top.points()))
+    }
+
+    fn for_continuation(
+        style: &ComputedStyle,
+        content_left: f32,
+        content_right: f32,
+        horizontal_inline_offset: HorizontalTableContinuationInlineOffset,
+        cell_grid_block_extent: TableGridLength,
+        inline_top: PageTopBlockPosition,
+    ) -> Self {
+        let x = match style.writing_mode {
+            WritingMode::VerticalRl | WritingMode::SidewaysRl => {
+                content_right - cell_grid_block_extent.get()
+            }
+            WritingMode::VerticalLr | WritingMode::SidewaysLr => content_left,
+            WritingMode::HorizontalTb => horizontal_inline_offset.resolve(content_left),
+        };
+        Self(PageTopPoint::new(x, inline_top.points()))
+    }
+
+    pub(in crate::layout::table) fn x(self) -> f32 {
+        self.0.x()
+    }
+
+    pub(in crate::layout::table) fn page_top_point(self) -> PageTopPoint {
+        self.0
     }
 }
 
@@ -157,7 +214,8 @@ pub(in crate::layout::table) struct TableBodyFragmentCommitContext<'table, 'ctx>
     /// Physical inline origin of the table wrapper, retained when later body
     /// slices rebase their logical block coordinate into another fragmentainer.
     pub(in crate::layout::table) table_inline_origin: PageTopBlockPosition,
-    pub(in crate::layout::table) continuation_inline_offset: TableContinuationInlineOffset,
+    pub(in crate::layout::table) continuation_inline_offset:
+        HorizontalTableContinuationInlineOffset,
     pub(in crate::layout::table) logical_inline_extent: LogicalInlineContentSize,
     pub(in crate::layout::table) physical_grid_width: PhysicalContentWidth,
     pub(in crate::layout::table) table_cellpadding: Option<f32>,
@@ -173,23 +231,96 @@ pub(in crate::layout::table) struct TableBodyFragmentCommitContext<'table, 'ctx>
 }
 
 impl TableBodyFragmentCommitContext<'_, '_> {
-    pub(in crate::layout::table) fn rebase_to_content_left(&mut self, content_left: f32) {
-        self.table_x = self.continuation_inline_offset.resolve(content_left);
+    pub(in crate::layout::table) fn rebase_destination_grid_to_fragmentainer(
+        &mut self,
+        style: &ComputedStyle,
+        content_left: f32,
+        content_right: f32,
+    ) {
+        // A continuation owns the entire destination cell grid, not merely
+        // the physical X coordinate of its fragmentainer. In a vertical-RL
+        // root `TableGridPlacement::origin` is the physical *left* edge of
+        // that complete grid, while logical block-start is the fragmentainer
+        // content-right edge. Reusing `content_left` here makes every row
+        // project to the right of its new column. Vertical-LR begins at the
+        // physical left edge; horizontal roots retain their inline offset.
+        let cell_grid_block_extent = TableGridLength::new(table_grid_height(
+            self.planned_row_heights,
+            self.planned_row_occupancy,
+            self.table_metrics.clone(),
+        ));
+        self.table_x = TableFragmentainerGridOrigin::for_continuation(
+            style,
+            content_left,
+            content_right,
+            self.continuation_inline_offset,
+            cell_grid_block_extent,
+            self.table_inline_origin,
+        )
+        .x();
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::TableContinuationInlineOffset;
+    use super::*;
 
     #[test]
     fn table_continuation_offset_preserves_local_inline_placement() {
-        let offset = TableContinuationInlineOffset::capture(28.0, 20.0);
+        let offset = HorizontalTableContinuationInlineOffset::capture(28.0, 20.0);
 
         // A page continuation can retain the same active content origin.
         let same_page_x = offset.resolve(20.0);
         assert_eq!(same_page_x, 28.0);
         // A multicolumn continuation must use its new column origin.
         assert_eq!(offset.resolve(120.0), 128.0);
+    }
+
+    #[test]
+    fn continuation_grid_origin_uses_the_logical_block_start_edge() {
+        let offset = HorizontalTableContinuationInlineOffset::capture(28.0, 20.0);
+        let extent = TableGridLength::new(255.0);
+        let inline_top = PageTopBlockPosition::new(400.0);
+        let style = |writing_mode| ComputedStyle {
+            writing_mode,
+            ..ComputedStyle::initial()
+        };
+
+        assert_eq!(
+            TableFragmentainerGridOrigin::for_continuation(
+                &style(WritingMode::HorizontalTb),
+                120.0,
+                220.0,
+                offset,
+                extent,
+                inline_top,
+            )
+            .x(),
+            128.0
+        );
+        assert_eq!(
+            TableFragmentainerGridOrigin::for_continuation(
+                &style(WritingMode::VerticalLr),
+                120.0,
+                220.0,
+                offset,
+                extent,
+                inline_top,
+            )
+            .x(),
+            120.0
+        );
+        assert_eq!(
+            TableFragmentainerGridOrigin::for_continuation(
+                &style(WritingMode::VerticalRl),
+                120.0,
+                220.0,
+                offset,
+                extent,
+                inline_top,
+            )
+            .x(),
+            -35.0
+        );
     }
 }

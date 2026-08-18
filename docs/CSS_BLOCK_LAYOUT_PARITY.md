@@ -11,8 +11,9 @@ where block sizing interacts with margin collapse.
   pending in-flow sibling margin set, so they cannot separate two adjoining
   normal-flow blocks.
 - First-child top margins and last-child bottom margins can collapse through
-  auto-height block containers when no border, padding, clearance, line box, or
-  formatting-context boundary separates the margins.
+  auto-height block containers, including preferred block sizes that behave as
+  auto under an indefinite percentage basis, when no border, padding,
+  clearance, line box, or formatting-context boundary separates the margins.
 - Document-canvas start-margin collapse carries the complete adjoining set
   through transparent block wrappers. The body's canvas inset remains an
   inline-axis offset and is not reapplied when a wrapped first descendant
@@ -102,6 +103,12 @@ where block sizing interacts with margin collapse.
   circular `border-shape` contours. A circular `border-shape` clips
   descendants at the inner stroke edge while keeping the box's own border and
   background outside that overflow scope.
+- A fixed normal-flow block in a paged vertical root retains its own logical
+  block range while visible in-flow overflow continues through later page
+  fragmentainers. Deferred paint is sliced in the root block direction, so a
+  `vertical-rl` root progresses right-to-left and a `vertical-lr` root
+  left-to-right without advancing following normal-flow siblings by the
+  overflow extent.
 - Normal-flow block formatting context roots next to active floats avoid by
   border box, not margin box. Auto-width roots can narrow to the float-free
   band without horizontal margins forcing placement below the float, and
@@ -110,9 +117,13 @@ where block sizing interacts with margin collapse.
 - Inline-block shrink-to-fit sizing resolves percentage-height replaced
   descendants against the inline-block's own definite content height, including
   inline runs wrapped in anonymous blocks.
-- Raster image natural dimensions are converted from source image pixels to CSS
-  px, then into Quire's PDF-point layout unit, before block replaced-element
-  sizing uses them.
+- Shared atomic-inline placement preserves signed logical block-start margins
+  for baseline-participating inline-blocks. This keeps an all-negative margin
+  set effective when the parent inline context normalizes its line paint
+  anchor.
+- Raster image natural dimensions are represented as CSS pixels (including
+  HTML-validated EXIF density correction) before conversion to Quire's
+  PDF-point layout unit for block replaced-element sizing.
 
 ## Remaining Gaps
 

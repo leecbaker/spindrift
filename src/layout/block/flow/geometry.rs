@@ -1,6 +1,12 @@
 use super::*;
 use crate::layout::block::float::FLOAT_EPSILON;
 
+/// A physical content height that CSS Sizing established as definite.
+///
+/// The physical axis is retained for block-flow geometry, while the wrapper
+/// prevents an auto height from being used as a definite-size capability.
+pub(in crate::layout) type DefinitePhysicalContentHeight = Definite<PhysicalContentHeight>;
+
 pub(in crate::layout) fn writing_modes_are_orthogonal(a: WritingMode, b: WritingMode) -> bool {
     WritingModeAxes::new(a, Direction::Ltr).swaps_physical_axes()
         != WritingModeAxes::new(b, Direction::Ltr).swaps_physical_axes()
@@ -17,7 +23,7 @@ pub(in crate::layout) fn writing_modes_are_orthogonal(a: WritingMode, b: Writing
 pub(in crate::layout) fn child_available_space_for_formatting_context(
     style: &ComputedStyle,
     content_width: PhysicalContentWidth,
-    definite_content_height: Option<PhysicalContentHeight>,
+    definite_content_height: Option<DefinitePhysicalContentHeight>,
     inherited_orthogonal_available_height: OrthogonalAvailableHeight,
     initial_fallback_height: PhysicalContentHeight,
 ) -> ChildAvailableSpace {
@@ -34,7 +40,7 @@ pub(in crate::layout) fn child_available_space_for_formatting_context(
         style.writing_mode,
         content_width,
         !style.writing_mode.has_vertical_lines() || !style.box_values.width.is_auto(),
-        definite_content_height,
+        definite_content_height.map(DefinitePhysicalContentHeight::value),
         inherited_orthogonal_available_height.value(),
     )
     // Preserve the tagged nearest-scroll-container policy through a
@@ -72,6 +78,7 @@ pub(in crate::layout) fn child_available_space_for_formatting_context(
         )
         .is_some();
         let constrained_height = definite_content_height
+            .map(DefinitePhysicalContentHeight::value)
             .or(has_max_height
                 .then_some(local_orthogonal_constraint)
                 .flatten())
@@ -96,7 +103,7 @@ pub(in crate::layout) fn child_available_space_for_formatting_context(
 pub(in crate::layout) fn child_available_space_for_block(
     style: &ComputedStyle,
     content_width: PhysicalContentWidth,
-    definite_content_height: Option<PhysicalContentHeight>,
+    definite_content_height: Option<DefinitePhysicalContentHeight>,
     inherited_orthogonal_available_height: OrthogonalAvailableHeight,
     initial_fallback_height: PhysicalContentHeight,
 ) -> ChildAvailableSpace {
@@ -277,7 +284,9 @@ pub(in crate::layout) fn block_end_margin_collapse_survives_height_constraints(
 /// <https://www.w3.org/TR/CSS22/visuren.html#block-formatting> and
 /// <https://www.w3.org/TR/CSS22/box.html>.
 pub(in crate::layout) struct BlockLayoutGeometry {
-    pub(in crate::layout) style: ComputedStyle,
+    /// Used style for this laid-out box. Its computed source remains in the
+    /// frozen formatting tree and is the only value eligible for cascading.
+    pub(in crate::layout) style: css::ZoomedLayoutStyle,
     pub(in crate::layout) relative_offset: RelativeOffset,
     pub(in crate::layout) border_edges: UsedEdges,
     pub(in crate::layout) vertical_non_content: NonContentLength,
@@ -285,10 +294,29 @@ pub(in crate::layout) struct BlockLayoutGeometry {
     /// Definite physical content height exported for descendant percentage
     /// resolution. This remains physical even for a vertical block, whose
     /// logical inline size is the same axis.
-    pub(in crate::layout) definite_content_height: Option<PhysicalContentHeight>,
+    pub(in crate::layout) definite_content_height: Option<DefinitePhysicalContentHeight>,
     pub(in crate::layout) content_logical_inline_size: LogicalInlineContentSize,
+    /// A replay-safe vertical inline sequence selected while resolving this
+    /// orthogonal block's automatic physical width.
+    pub(in crate::layout) selected_orthogonal_inline_layout: Option<SelectedOrthogonalInlineLayout>,
     pub(in crate::layout) outer_inline: BlockBorderBoxInlineBounds,
     pub(in crate::layout) content_inline: BlockContentBoxInlineBounds,
+}
+
+/// The one selected line layout consumed by a vertical orthogonal block's
+/// automatic physical-width sizing and final inline painting.
+///
+/// CSS Writing Modes selects an orthogonal flow's available inline measure
+/// during sizing, then maps the selected logical block stack to physical
+/// width. Retaining the selected sequence makes that sizing result and final
+/// paint one operation rather than two independently collected inline flows.
+/// <https://drafts.csswg.org/css-writing-modes-4/#orthogonal-flows>
+#[derive(Clone)]
+pub(in crate::layout) struct SelectedOrthogonalInlineLayout {
+    pub(in crate::layout) logical_inline_measure: LogicalInlineContentSize,
+    pub(in crate::layout) line_sequence: inline_layout::InlineLineSequence,
+    pub(in crate::layout) logical_block_contribution: LogicalBlockContentSize,
+    pub(in crate::layout) frozen_replay_input: inline_collect::FrozenInlineReplayInput,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -312,6 +340,35 @@ pub(in crate::layout) struct BlockLayoutInlineConstraint {
     /// Keeping that space explicit prevents accidental comparison with the
     /// content-box physical width percentage basis above.
     pub(in crate::layout) auto_border_box_width: Option<BorderBoxLength>,
+}
+
+/// A one-child override exported by a principal vertical flow.
+///
+/// The legacy block traversal keeps its current child constraint in physical
+/// page coordinates.  A propagated vertical principal flow instead supplies
+/// a logical-inline percentage basis and a horizontal logical-block track to
+/// exactly its direct child.  Keeping the source element with the constraint
+/// makes the scope explicit: descendants establish their normal containing
+/// block contexts and must not inherit this projection.
+///
+/// <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct DirectBlockLayoutConstraint {
+    element: ElementId,
+    inline: BlockLayoutInlineConstraint,
+}
+
+impl DirectBlockLayoutConstraint {
+    pub(in crate::layout) fn new(element: ElementId, inline: BlockLayoutInlineConstraint) -> Self {
+        Self { element, inline }
+    }
+
+    pub(in crate::layout) fn for_element(
+        self,
+        element: &Element,
+    ) -> Option<BlockLayoutInlineConstraint> {
+        (self.element == element.id).then_some(self.inline)
+    }
 }
 
 impl BlockLayoutGeometry {

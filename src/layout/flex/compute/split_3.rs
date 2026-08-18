@@ -167,6 +167,18 @@ pub(in crate::layout::flex) fn apply_baseline_self_alignment_fallback_offset(
     let (cross_start, cross_end) = cross_bounds.unwrap_or((line.cross_start, line.cross_end));
     let cross_size = (cross_end - cross_start).non_negative_size();
     let subject_side = match baseline_set {
+        // `wrap-reverse` reverses the flex cross axis, including the
+        // first-baseline fallback edge. A non-participating singleton must
+        // therefore remain attached to that reversed cross-start rather than
+        // reverting to its unreversed logical self-start.
+        // <https://www.w3.org/TR/css-flexbox-1/#flex-wrap-property>
+        // <https://www.w3.org/TR/css-align-3/#baseline-align-self>
+        FlexBaselineSet::First
+            if container_style.flex_wrap.reverses_cross_axis()
+                && container_style.writing_mode.has_vertical_lines() =>
+        {
+            flex_cross_start_side(container_style)
+        }
         FlexBaselineSet::First => child_self_start_side(child_style, container_style),
         FlexBaselineSet::Last => child_self_end_side(child_style, container_style),
     };
@@ -186,26 +198,6 @@ pub(in crate::layout::flex) fn apply_baseline_self_alignment_fallback_offset(
         &fallback_line,
         target_side,
     );
-    // A negative cross-start margin participates in the baseline fallback's
-    // overflow calculation, but it must not pull the fallback border box
-    // through the line's safe start edge. The fallback is an alignment of the
-    // item itself (there is no compatible baseline-sharing group), so retain
-    // the specified cross size at that edge.
-    // <https://drafts.csswg.org/css-align-3/#baseline-align-self>
-    let negative_start_margin = if physical_direction.is_row_axis() {
-        child_style.margin.top < 0.0
-    } else {
-        child_style.margin.left < 0.0
-    };
-    if target_side.is_start_edge() && negative_start_margin {
-        let axes =
-            FlexAxes::from_physical_direction(PhysicalFlexDirection::new(physical_direction));
-        item.set_cross_start(axes, cross_start);
-        // `cross_start` is the margin-box alignment coordinate.  Moving the
-        // border edge back to it must not consume the negative margin from
-        // the resolved border-box cross size: a specified cross size remains
-        // specified after baseline fallback alignment.
-    }
 }
 
 /// Return the cross-axis slot used by baseline fallback.
@@ -268,7 +260,11 @@ pub(in crate::layout::flex) fn align_baseline_sharing_group_to_line(
     baseline_set: FlexBaselineSet,
     physical_direction: FlexDirection,
 ) {
-    let side = flex_baseline_alignment_side(container_style, baseline_set);
+    let side = flex_baseline_sharing_group_alignment_side(
+        container_style,
+        baseline_set,
+        participants.len(),
+    );
     let target_distance = participants
         .iter()
         .map(|participant| {
@@ -306,18 +302,48 @@ pub(in crate::layout::flex) fn align_baseline_sharing_group_to_line(
         // Resolve their difference into the item's new absolute cross start:
         // <https://www.w3.org/TR/css-flexbox-1/#algo-cross-line>.
         items[index].set_cross_start(
-            FlexAxes::from_physical_direction(PhysicalFlexDirection::new(physical_direction)),
-            FlexCrossOffset::new(0.0) + (target_baseline - baseline),
+            PhysicalFlexDirection::new(physical_direction),
+            FlexItemBorderBoxCrossStart::from_border_box_offset(
+                FlexCrossOffset::new(0.0) + (target_baseline - baseline),
+            ),
         );
     }
 }
+
+/// Return the edge used to place one baseline-sharing group.
+///
+/// `wrap-reverse` changes the cross-start attachment of a compatible
+/// singleton, whose baseline fallback would otherwise select the item's
+/// self-start edge. A multi-item sharing group instead retains the
+/// unreversed first/last baseline edge while the line stack itself is
+/// reversed. Keeping this decision at the group boundary prevents the
+/// singleton correction from changing the shared baseline coordinate of an
+/// ordinary line.
+/// <https://www.w3.org/TR/css-flexbox-1/#valdef-align-items-baseline>
+pub(in crate::layout::flex) fn flex_baseline_sharing_group_alignment_side(
+    container_style: &ComputedStyle,
+    baseline_set: FlexBaselineSet,
+    participant_count: usize,
+) -> PhysicalSide {
+    let first_baseline_side =
+        if participant_count == 1 && container_style.flex_wrap.reverses_cross_axis() {
+            flex_cross_start_side(container_style)
+        } else {
+            flex_unreversed_cross_start_side(container_style)
+        };
+    match baseline_set {
+        FlexBaselineSet::First => first_baseline_side,
+        FlexBaselineSet::Last => opposite_physical_side(first_baseline_side),
+    }
+}
+
 pub(in crate::layout::flex) fn shift_flex_line_cross_axis(
     line: &mut FlexLineLayout,
     items: &mut [FlexItemLayout],
     physical_direction: FlexDirection,
     delta: FlexCrossLength,
 ) {
-    let axes = FlexAxes::from_physical_direction(PhysicalFlexDirection::new(physical_direction));
+    let axes = PhysicalFlexDirection::new(physical_direction);
     line.cross_start = line.cross_start + delta;
     line.cross_end = line.cross_end + delta;
     for &item_index in &line.item_indices {
@@ -339,10 +365,8 @@ pub(in crate::layout::flex) fn item_outer_main_bounds(
     style: &ComputedStyle,
     physical_direction: FlexDirection,
 ) -> (FlexMainOffset, FlexMainOffset) {
-    let (start, end) = item.outer_main_bounds(
-        FlexAxes::from_physical_direction(PhysicalFlexDirection::new(physical_direction)),
-        style,
-    );
+    let (start, end) =
+        item.outer_main_bounds(PhysicalFlexDirection::new(physical_direction), style);
     (start, end)
 }
 
@@ -482,30 +506,40 @@ pub(in crate::layout::flex) fn align_item_cross_side(
             PhysicalAxis::Horizontal
         }
     );
-    let axes = FlexAxes::from_physical_direction(PhysicalFlexDirection::new(physical_direction));
-    let cross_start = match (
+    let axes = PhysicalFlexDirection::new(physical_direction);
+    let border_box_cross_start = match (
         physical_direction.is_row_axis(),
         side.is_start_edge(),
         side.is_end_edge(),
     ) {
-        (true, true, false) => Some(line.cross_start + FlexCrossLength::new(style.margin.top)),
-        (true, false, true) => {
-            Some(line.cross_end - FlexCrossLength::new(style.margin.bottom) - item.cross_size(axes))
-        }
-        (false, true, false) => Some(line.cross_start + FlexCrossLength::new(style.margin.left)),
-        (false, false, true) => {
-            Some(line.cross_end - FlexCrossLength::new(style.margin.right) - item.cross_size(axes))
-        }
+        (true, true, false) => Some(FlexItemBorderBoxCrossStart::from_line_cross_start_margin(
+            line.cross_start,
+            FlexCrossLength::new(style.margin.top),
+        )),
+        (true, false, true) => Some(FlexItemBorderBoxCrossStart::from_line_cross_end_margin(
+            line.cross_end,
+            FlexCrossLength::new(style.margin.bottom),
+            item.cross_size(axes),
+        )),
+        (false, true, false) => Some(FlexItemBorderBoxCrossStart::from_line_cross_start_margin(
+            line.cross_start,
+            FlexCrossLength::new(style.margin.left),
+        )),
+        (false, false, true) => Some(FlexItemBorderBoxCrossStart::from_line_cross_end_margin(
+            line.cross_end,
+            FlexCrossLength::new(style.margin.right),
+            item.cross_size(axes),
+        )),
         _ => None,
     };
-    if let Some(cross_start) = cross_start {
-        item.set_cross_start(axes, cross_start);
+    if let Some(border_box_cross_start) = border_box_cross_start {
+        item.set_cross_start(axes, border_box_cross_start);
     }
 }
 
 pub(in crate::layout::flex) fn taffy_justify_content(
     justify_content: JustifyContent,
-    flex_direction: FlexDirection,
+    axes: FlexAxes,
 ) -> Option<taffy_layout::JustifyContent> {
     let safety = taffy_safety(justify_content.safety);
     match justify_content.keyword {
@@ -527,44 +561,43 @@ pub(in crate::layout::flex) fn taffy_justify_content(
             keyword: taffy_layout::AlignContentKeyword::End,
             safety,
         }),
-        // `left` and `right` only have a physical meaning when the main axis
-        // is parallel to the inline axis. On a column main axis they compute
-        // to `start`, including for reverse flex directions.
+        // `left` and `right` are physical horizontal alignment keywords. They
+        // are positional whenever the flex main axis is physical horizontal,
+        // including a column flex container in vertical or sideways writing
+        // modes; otherwise they compute to `start`.
         // <https://drafts.csswg.org/css-align-3/#justify-content-property>
         ContentAlignmentKeyword::Left | ContentAlignmentKeyword::Right
-            if flex_direction.is_column_axis() =>
+            if !axes.is_main_row_axis() =>
         {
             Some(taffy_layout::JustifyContent {
                 keyword: taffy_layout::AlignContentKeyword::Start,
                 safety,
             })
         }
-        ContentAlignmentKeyword::Left => {
-            Some(if matches!(flex_direction, FlexDirection::RowReverse) {
-                taffy_layout::JustifyContent {
-                    keyword: taffy_layout::AlignContentKeyword::FlexEnd,
-                    safety,
-                }
-            } else {
-                taffy_layout::JustifyContent {
-                    keyword: taffy_layout::AlignContentKeyword::FlexStart,
-                    safety,
-                }
-            })
-        }
-        ContentAlignmentKeyword::Right => {
-            Some(if matches!(flex_direction, FlexDirection::RowReverse) {
-                taffy_layout::JustifyContent {
-                    keyword: taffy_layout::AlignContentKeyword::FlexStart,
-                    safety,
-                }
-            } else {
-                taffy_layout::JustifyContent {
-                    keyword: taffy_layout::AlignContentKeyword::FlexEnd,
-                    safety,
-                }
-            })
-        }
+        ContentAlignmentKeyword::Left => Some(if PhysicalSide::Left == axes.main_start_side() {
+            taffy_layout::JustifyContent {
+                keyword: taffy_layout::AlignContentKeyword::FlexStart,
+                safety,
+            }
+        } else {
+            debug_assert_eq!(PhysicalSide::Left, axes.main_end_side());
+            taffy_layout::JustifyContent {
+                keyword: taffy_layout::AlignContentKeyword::FlexEnd,
+                safety,
+            }
+        }),
+        ContentAlignmentKeyword::Right => Some(if PhysicalSide::Right == axes.main_start_side() {
+            taffy_layout::JustifyContent {
+                keyword: taffy_layout::AlignContentKeyword::FlexStart,
+                safety,
+            }
+        } else {
+            debug_assert_eq!(PhysicalSide::Right, axes.main_end_side());
+            taffy_layout::JustifyContent {
+                keyword: taffy_layout::AlignContentKeyword::FlexEnd,
+                safety,
+            }
+        }),
         ContentAlignmentKeyword::Center => Some(taffy_layout::JustifyContent {
             keyword: taffy_layout::AlignContentKeyword::Center,
             safety,
@@ -578,102 +611,36 @@ pub(in crate::layout::flex) fn taffy_justify_content(
     }
 }
 
-/// Maps a CSS flex container's physical axes to Taffy's writing direction.
-///
-/// Taffy has physical row/column flex directions plus an LTR/RTL switch. For
-/// horizontal writing modes that switch is CSS `direction`. For vertical
-/// writing modes whose CSS row axis becomes Taffy's physical column axis, the
-/// switch must instead represent the horizontal cross-axis start side, so
-/// `vertical-rl` row flex lines start at the physical right edge. Vertical
-/// writing modes whose CSS column axis becomes Taffy's physical row axis have
-/// their right-to-left or left-to-right block flow already encoded in
-/// `physical_flex_direction`, so they use LTR here.
-/// <https://www.w3.org/TR/css-flexbox-1/#flex-direction-property>,
-/// <https://www.w3.org/TR/css-flexbox-1/#flex-wrap-property>, and
-/// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>.
-pub(in crate::layout::flex) fn taffy_flex_layout_direction(
-    style: &ComputedStyle,
-    physical_direction: FlexDirection,
-) -> ::taffy::Direction {
-    if style.writing_mode == WritingMode::HorizontalTb {
-        return taffy_direction(style.direction);
-    }
-    // Taffy applies `wrap-reverse` itself. Its horizontal direction must
-    // therefore express the unreversed cross-start side; using
-    // `flex_cross_start_side` here applies the CSS reversal once before Taffy
-    // applies it again.
-    // <https://www.w3.org/TR/css-flexbox-1/#flex-wrap-property>
-    let base_cross_start = if style.flex_wrap.reverses_cross_axis() {
-        flex_cross_start_side(style).opposite()
-    } else {
-        flex_cross_start_side(style)
-    };
-    if physical_direction.is_column_axis() && base_cross_start == PhysicalSide::Right {
-        ::taffy::Direction::Rtl
-    } else {
-        ::taffy::Direction::Ltr
-    }
-}
-
-/// Mirror final flex cross-axis geometry when CSS's cross-start is the
-/// physical bottom edge.
+/// Reproject Taffy's flex-item cross-axis rectangles when CSS cross-start is
+/// the physical bottom edge.
 ///
 /// Taffy's `Direction` can express a horizontal start side, but it has no
 /// top-to-bottom/bottom-to-top equivalent. A vertical-writing column flex
-/// container therefore needs a final coordinate conversion when its inline
-/// axis is RTL. Taffy still forms and sizes the lines; this maps its top-origin
-/// cross coordinates to CSS's bottom-origin inline axis for both items and
-/// line metadata.
+/// container therefore needs a coordinate conversion when its inline axis is
+/// RTL. Taffy still forms and sizes the lines; this maps its top-origin cross
+/// coordinates to CSS's bottom-origin inline axis before Quire constructs line
+/// metadata or performs any CSS Align placement.
 /// <https://www.w3.org/TR/css-flexbox-1/#flex-direction-property>
 /// <https://www.w3.org/TR/css-writing-modes-4/#inline-flow>
-pub(in crate::layout::flex) fn mirror_vertical_cross_axis_for_rtl_inline_flow(
+pub(in crate::layout::flex) fn reproject_taffy_item_cross_axis_coordinates(
     items: &mut [FlexItemLayout],
-    lines: &mut [FlexLineLayout],
-    style: &ComputedStyle,
-    physical_direction: FlexDirection,
+    axes: FlexAxes,
     container_cross_size: FlexCrossSize,
 ) {
-    // This is a physical-coordinate conversion for the container's inline
-    // flow. `wrap-reverse` is applied by Taffy before this conversion, so it
-    // must not suppress the mirror by changing the effective cross-start.
-    let base_cross_start = if style.flex_wrap.reverses_cross_axis() {
-        flex_cross_start_side(style).opposite()
-    } else {
-        flex_cross_start_side(style)
-    };
-    if !matches!(style.writing_mode, WritingMode::VerticalRl | WritingMode::VerticalLr | WritingMode::SidewaysRl | WritingMode::SidewaysLr)
-        || !physical_direction.is_row_axis()
-        || base_cross_start != PhysicalSide::Bottom
-        // Baseline line packing has its own physical-edge conversion. Leave
-        // that specialized path intact until it can mirror both baseline
-        // sharing groups and their fallback alignment together.
-        || matches!(
-            style.align_items.keyword,
-            SelfAlignmentKeyword::Baseline | SelfAlignmentKeyword::LastBaseline
-        )
-    {
+    if axes.taffy_cross_axis_projection() != TaffyCrossAxisProjection::Reflect {
         return;
     }
     let cross_origin = FlexCrossOffset::new(0.0);
     let container_cross_end = cross_origin + container_cross_size;
-    let axes = FlexAxes::from_physical_direction(PhysicalFlexDirection::new(physical_direction));
     for item in items {
         item.set_cross_start(
             axes,
-            container_cross_end - (item.cross_start(axes) - cross_origin) - item.cross_size(axes),
+            FlexItemBorderBoxCrossStart::from_border_box_offset(
+                container_cross_end
+                    - (item.cross_start(axes) - cross_origin)
+                    - item.cross_size(axes),
+            ),
         );
-    }
-    for line in lines {
-        let cross_start = line.cross_start;
-        let cross_end = line.cross_end;
-        line.cross_start = container_cross_end - (cross_end - cross_origin);
-        line.cross_end = container_cross_end - (cross_start - cross_origin);
-        line.first_baseline = line
-            .first_baseline
-            .map(|baseline| container_cross_end - (baseline - cross_origin));
-        line.last_baseline = line
-            .last_baseline
-            .map(|baseline| container_cross_end - (baseline - cross_origin));
     }
 }
 
@@ -844,7 +811,15 @@ pub(in crate::layout::flex) fn finalize_flex_cross_axis_placement(
             let alignment = alignments[index];
             let child_style = &children[index].style;
             match alignment.mode {
-                FlexCrossPlacementMode::AutoCrossMargin | FlexCrossPlacementMode::Stretch => {}
+                FlexCrossPlacementMode::AutoCrossMargin => {
+                    place_item_with_final_auto_cross_margins(
+                        &mut items[index],
+                        child_style,
+                        physical_direction,
+                        line,
+                    );
+                }
+                FlexCrossPlacementMode::Stretch => {}
                 FlexCrossPlacementMode::Side(side) => {
                     let outer_size =
                         item_outer_cross_size(&items[index], child_style, physical_direction);
@@ -896,7 +871,7 @@ pub(in crate::layout::flex) fn finalize_flex_cross_axis_placement(
                 continue;
             }
 
-            let mut sharing_participants = participants
+            let sharing_participants = participants
                 .iter()
                 .filter(|participant| {
                     participant.participation == FlexBaselineParticipation::Shares
@@ -911,17 +886,16 @@ pub(in crate::layout::flex) fn finalize_flex_cross_axis_placement(
                 .map(|participant| participant.index)
                 .collect::<Vec<_>>();
 
-            // CSS Align requires at least two compatible participants for a
-            // baseline-sharing group. A sole otherwise-compatible item uses
-            // the same safe self-alignment fallback as an incompatible item.
-            // <https://drafts.csswg.org/css-align-3/#baseline-alignment>
-            if sharing_participants.len() <= 1 {
-                fallback_indices.extend(
-                    sharing_participants
-                        .drain(..)
-                        .map(|participant| participant.index),
-                );
-            } else {
+            // CSS Align's ordinary singleton fallback is retained for an
+            // unreversed line. With `wrap-reverse`, however, a compatible
+            // sole participant remains attached to the line's reversed Flex
+            // cross-start edge; applying the generic self-alignment fallback
+            // incorrectly moves it to self-start.
+            // <https://www.w3.org/TR/css-flexbox-1/#valdef-align-items-baseline>
+            if sharing_participants.len() > 1
+                || (sharing_participants.len() == 1
+                    && container_style.flex_wrap.reverses_cross_axis())
+            {
                 align_baseline_sharing_group_to_line(
                     items,
                     line,
@@ -931,6 +905,12 @@ pub(in crate::layout::flex) fn finalize_flex_cross_axis_placement(
                     container_style,
                     baseline_set,
                     physical_direction,
+                );
+            } else {
+                fallback_indices.extend(
+                    sharing_participants
+                        .iter()
+                        .map(|participant| participant.index),
                 );
             }
 
@@ -971,6 +951,62 @@ pub(in crate::layout::flex) fn finalize_flex_cross_axis_placement(
     );
 }
 
+/// Resolve automatic cross-axis margins from a flex line's final slot.
+///
+/// Taffy distributes automatic margins while initially allocating a line, but
+/// Flex can subsequently replace that provisional cross slot after final
+/// normal-flow measurement and `align-content` distribution.  CSS Flexbox
+/// resolves an item's auto cross margins against that final line size; leaving
+/// the provisional location in place makes `margin-inline:auto` behave like
+/// cross-start in stretched wrapped columns.
+/// <https://www.w3.org/TR/css-flexbox-1/#algo-cross-margins>
+fn place_item_with_final_auto_cross_margins(
+    item: &mut FlexItemLayout,
+    style: &ComputedStyle,
+    physical_direction: FlexDirection,
+    line: &FlexLineLayout,
+) {
+    let (before_is_auto, after_is_auto, before_margin, after_margin) =
+        if physical_direction.is_row_axis() {
+            (
+                style.box_values.margin.top.is_auto(),
+                style.box_values.margin.bottom.is_auto(),
+                FlexCrossLength::new(style.margin.top),
+                FlexCrossLength::new(style.margin.bottom),
+            )
+        } else {
+            (
+                style.box_values.margin.left.is_auto(),
+                style.box_values.margin.right.is_auto(),
+                FlexCrossLength::new(style.margin.left),
+                FlexCrossLength::new(style.margin.right),
+            )
+        };
+    let auto_count = before_is_auto as usize + after_is_auto as usize;
+    debug_assert!(auto_count > 0);
+
+    let axes = PhysicalFlexDirection::new(physical_direction);
+    let zero = FlexCrossLength::new(0.0);
+    let fixed_outer_size = item.cross_size(axes)
+        + if before_is_auto { zero } else { before_margin }
+        + if after_is_auto { zero } else { after_margin };
+    let free_space = (line.cross_size() - fixed_outer_size).max(zero);
+    let auto_margin = free_space.divide(
+        std::num::NonZeroUsize::new(auto_count)
+            .expect("a cross-axis auto margin selected this placement"),
+    );
+    let border_box_cross_start = line.cross_start
+        + if before_is_auto {
+            auto_margin
+        } else {
+            before_margin
+        };
+    item.set_cross_start(
+        axes,
+        FlexItemBorderBoxCrossStart::from_border_box_offset(border_box_cross_start),
+    );
+}
+
 /// Align a margin box to the center of one final flex-line slot.
 fn align_item_cross_center(
     item: &mut FlexItemLayout,
@@ -990,14 +1026,17 @@ fn align_item_cross_center(
         );
         return;
     }
-    let axes = FlexAxes::from_physical_direction(PhysicalFlexDirection::new(physical_direction));
+    let axes = PhysicalFlexDirection::new(physical_direction);
     let free_space = line.cross_size() - outer_size;
-    let cross_start = if physical_direction.is_row_axis() {
+    let border_box_cross_start = if physical_direction.is_row_axis() {
         line.cross_start + free_space.half() + FlexCrossLength::new(child_style.margin.top)
     } else {
         line.cross_start + free_space.half() + FlexCrossLength::new(child_style.margin.left)
     };
-    item.set_cross_start(axes, cross_start);
+    item.set_cross_start(
+        axes,
+        FlexItemBorderBoxCrossStart::from_border_box_offset(border_box_cross_start),
+    );
 }
 
 pub(in crate::layout::flex) fn flex_item_baseline_source(
@@ -1046,15 +1085,11 @@ pub(in crate::layout::flex) fn flex_baseline_alignment_side(
     container_style: &ComputedStyle,
     baseline_set: FlexBaselineSet,
 ) -> PhysicalSide {
-    // `wrap-reverse` reverses flex-line placement, but it does not reverse
-    // the baseline set inside each line. First-baseline sharing is therefore
-    // anchored to the container's ordinary cross-start side; the line's
-    // already-final physical position supplies the wrap-reversed coordinate.
-    // Reversing this side pulled a padded first-baseline group toward the
-    // opposite edge of its packed line and made its exported baseline differ
-    // from the equivalent nested single-line flex construction.
+    // Flexbox uses its cross-start edge for first-baseline placement. That
+    // edge is reversed by `wrap-reverse`; a compatible baseline group must
+    // use the same edge as the final flex-line slot.
     // <https://www.w3.org/TR/css-flexbox-1/#valdef-align-items-baseline>
-    let first_baseline_side = flex_unreversed_cross_start_side(container_style);
+    let first_baseline_side = flex_cross_start_side(container_style);
     match baseline_set {
         FlexBaselineSet::First => first_baseline_side,
         FlexBaselineSet::Last => opposite_physical_side(first_baseline_side),
@@ -1101,9 +1136,7 @@ pub(in crate::layout::flex) fn item_baseline_distance_to_cross_side(
         )
         .points(),
     );
-    let size = item.cross_size(FlexAxes::from_physical_direction(
-        PhysicalFlexDirection::new(physical_direction),
-    ));
+    let size = item.cross_size(PhysicalFlexDirection::new(physical_direction));
     let distance = match side {
         PhysicalSide::Top => FlexCrossLength::new(child_style.margin.top) + baseline,
         PhysicalSide::Right => FlexCrossLength::new(child_style.margin.right) + (size - baseline),
@@ -1405,17 +1438,33 @@ mod tests {
     }
 
     #[test]
-    fn wrap_reverse_does_not_reverse_the_first_baseline_edge() {
+    fn wrap_reverse_reverses_the_singleton_baseline_edge() {
         let mut style = ComputedStyle::initial();
         style.flex_direction = FlexDirection::Row;
         style.flex_wrap = FlexWrap::WrapReverse;
 
         assert_eq!(
             flex_baseline_alignment_side(&style, FlexBaselineSet::First),
-            PhysicalSide::Top,
+            PhysicalSide::Bottom,
         );
         assert_eq!(
             flex_baseline_alignment_side(&style, FlexBaselineSet::Last),
+            PhysicalSide::Top,
+        );
+        assert_eq!(
+            flex_baseline_sharing_group_alignment_side(&style, FlexBaselineSet::First, 1),
+            PhysicalSide::Bottom,
+        );
+        assert_eq!(
+            flex_baseline_sharing_group_alignment_side(&style, FlexBaselineSet::Last, 1),
+            PhysicalSide::Top,
+        );
+        assert_eq!(
+            flex_baseline_sharing_group_alignment_side(&style, FlexBaselineSet::First, 2),
+            PhysicalSide::Top,
+        );
+        assert_eq!(
+            flex_baseline_sharing_group_alignment_side(&style, FlexBaselineSet::Last, 2),
             PhysicalSide::Bottom,
         );
     }
@@ -1599,6 +1648,93 @@ mod tests {
     }
 
     #[test]
+    fn final_line_slot_redistributes_auto_cross_margins_for_a_column_item() {
+        let mut child_style = ComputedStyle::initial();
+        child_style.box_values.margin.left = css::ComputedLengthPercentageOrAuto::Auto;
+        child_style.box_values.margin.right = css::ComputedLengthPercentageOrAuto::Auto;
+        let line = FlexLineLayout {
+            item_indices: vec![0],
+            logical_cross_start_rank: 0,
+            source_start: 0,
+            source_end: 1,
+            main_start: FlexMainOffset::new(0.0),
+            main_end: FlexMainOffset::new(10.0),
+            cross_start: FlexCrossOffset::new(10.0),
+            cross_end: FlexCrossOffset::new(110.0),
+            first_baseline: None,
+            last_baseline: None,
+            collapsed_struts: Vec::new(),
+        };
+        let mut item = FlexItemLayout::new(ContainerRect::new(
+            ContainerPoint::new(10.0, 0.0),
+            ContainerSize::new(20.0, 10.0),
+        ));
+
+        place_item_with_final_auto_cross_margins(
+            &mut item,
+            &child_style,
+            FlexDirection::Column,
+            &line,
+        );
+
+        assert_eq!(item.x(), FlexPhysicalHorizontalOffset::new(50.0));
+    }
+
+    #[test]
+    fn baseline_fallback_preserves_negative_cross_start_margins() {
+        let line = FlexLineLayout {
+            item_indices: vec![0],
+            logical_cross_start_rank: 0,
+            source_start: 0,
+            source_end: 1,
+            main_start: FlexMainOffset::new(0.0),
+            main_end: FlexMainOffset::new(10.0),
+            cross_start: FlexCrossOffset::new(10.0),
+            cross_end: FlexCrossOffset::new(50.0),
+            first_baseline: None,
+            last_baseline: None,
+            collapsed_struts: Vec::new(),
+        };
+        let row_container = ComputedStyle::initial();
+
+        let mut row_style = ComputedStyle::initial();
+        row_style.margin.top = -4.0;
+        let mut row_item = FlexItemLayout::new(ContainerRect::new(
+            ContainerPoint::new(0.0, 10.0),
+            ContainerSize::new(10.0, 10.0),
+        ));
+        apply_baseline_self_alignment_fallback_offset(
+            &mut row_item,
+            &row_style,
+            &line,
+            &row_container,
+            FlexBaselineSet::First,
+            FlexDirection::Row,
+            None,
+        );
+        assert_eq!(row_item.y(), FlexPhysicalVerticalOffset::new(6.0));
+
+        let mut column_style = ComputedStyle::initial();
+        column_style.margin.left = -4.0;
+        let mut column_container = ComputedStyle::initial();
+        column_container.flex_direction = FlexDirection::Column;
+        let mut column_item = FlexItemLayout::new(ContainerRect::new(
+            ContainerPoint::new(10.0, 0.0),
+            ContainerSize::new(10.0, 10.0),
+        ));
+        apply_baseline_self_alignment_fallback_offset(
+            &mut column_item,
+            &column_style,
+            &line,
+            &column_container,
+            FlexBaselineSet::First,
+            FlexDirection::Column,
+            None,
+        );
+        assert_eq!(column_item.x(), FlexPhysicalHorizontalOffset::new(6.0));
+    }
+
+    #[test]
     fn baseline_sharing_resolves_absolute_cross_starts_from_line_baseline() {
         let line = FlexLineLayout {
             item_indices: vec![0, 1],
@@ -1671,5 +1807,83 @@ mod tests {
 
         assert_eq!(items[0].y(), FlexPhysicalVerticalOffset::new(54.0));
         assert_eq!(items[1].y(), FlexPhysicalVerticalOffset::new(50.0));
+    }
+
+    #[test]
+    fn taffy_cross_projection_precedes_line_reconciliation_for_vertical_rtl_columns() {
+        for flex_wrap in [FlexWrap::Wrap, FlexWrap::WrapReverse] {
+            let mut style = ComputedStyle::initial();
+            style.writing_mode = WritingMode::VerticalLr;
+            style.direction = Direction::Rtl;
+            style.flex_direction = FlexDirection::Column;
+            style.flex_wrap = flex_wrap;
+            let axes = FlexAxes::for_style(&style);
+            assert_eq!(
+                axes.taffy_cross_axis_projection(),
+                TaffyCrossAxisProjection::Reflect
+            );
+
+            let mut items = vec![
+                FlexItemLayout::new(ContainerRect::new(
+                    ContainerPoint::new(0.0, 0.0),
+                    ContainerSize::new(20.0, 30.0),
+                )),
+                FlexItemLayout::new(ContainerRect::new(
+                    ContainerPoint::new(20.0, 0.0),
+                    ContainerSize::new(20.0, 30.0),
+                )),
+                FlexItemLayout::new(ContainerRect::new(
+                    ContainerPoint::new(0.0, 30.0),
+                    ContainerSize::new(20.0, 30.0),
+                )),
+                FlexItemLayout::new(ContainerRect::new(
+                    ContainerPoint::new(20.0, 30.0),
+                    ContainerSize::new(20.0, 30.0),
+                )),
+            ];
+            reproject_taffy_item_cross_axis_coordinates(&mut items, axes, FlexCrossSize::new(60.0));
+
+            // The physical row main axis leaves Y as the cross coordinate.
+            // Taffy's first top-origin line is therefore the CSS
+            // bottom-origin line, independently of wrap-reverse. This is the
+            // four-item wrapped geometry that later Flex line reconciliation
+            // receives.
+            assert_eq!(items[0].x(), FlexPhysicalHorizontalOffset::new(0.0));
+            assert_eq!(items[1].x(), FlexPhysicalHorizontalOffset::new(20.0));
+            assert_eq!(
+                items.iter().map(|item| item.y()).collect::<Vec<_>>(),
+                vec![
+                    FlexPhysicalVerticalOffset::new(30.0),
+                    FlexPhysicalVerticalOffset::new(30.0),
+                    FlexPhysicalVerticalOffset::new(0.0),
+                    FlexPhysicalVerticalOffset::new(0.0),
+                ],
+            );
+            assert!(
+                items
+                    .iter()
+                    .all(|item| item.height() == FlexPhysicalVerticalSize::new(30.0))
+            );
+        }
+    }
+
+    #[test]
+    fn physical_right_justifies_a_sideways_column_on_its_horizontal_main_axis() {
+        let mut style = ComputedStyle::initial();
+        style.writing_mode = WritingMode::SidewaysLr;
+        style.direction = Direction::Ltr;
+        style.flex_direction = FlexDirection::Column;
+        let axes = FlexAxes::for_style(&style);
+        assert!(axes.is_main_row_axis());
+        assert_eq!(axes.main_start_side(), PhysicalSide::Left);
+
+        let right =
+            taffy_justify_content(JustifyContent::new(ContentAlignmentKeyword::Right), axes)
+                .expect("justify-content always has a Taffy fallback");
+        let left = taffy_justify_content(JustifyContent::new(ContentAlignmentKeyword::Left), axes)
+            .expect("justify-content always has a Taffy fallback");
+
+        assert_eq!(right.keyword, taffy_layout::AlignContentKeyword::FlexEnd);
+        assert_eq!(left.keyword, taffy_layout::AlignContentKeyword::FlexStart);
     }
 }

@@ -2,22 +2,21 @@ use super::*;
 
 impl ElementSignature {
     pub fn new(tag: impl Into<String>, attrs: HashMap<String, String>) -> Self {
-        let namespace_attrs = local_attribute_signatures(&attrs);
         Self {
-            tag: tag.into(),
-            namespace_url: String::new(),
-            document_is_html: true,
-            attrs,
-            namespace_attrs,
-            opaque_id: next_element_signature_opaque_id(),
-            source_element_id: None,
+            selector: ElementSiblingSignature::new(tag, attrs),
             sibling_index: None,
             sibling_signatures: ElementSiblingSignatureList::empty(),
-            child_signatures: ElementSiblingSignatureList::empty(),
-            has_text_child: false,
-            is_target: false,
-            has_target_descendant: false,
-            document_direction: None,
+            html_direction: None,
+            resolved_direction: None,
+            resolved_language: ResolvedLanguage::Unresolved,
+        }
+    }
+
+    pub(crate) fn from_selector_snapshot(selector: ElementSiblingSignature) -> Self {
+        Self {
+            selector,
+            sibling_index: None,
+            sibling_signatures: ElementSiblingSignatureList::empty(),
             html_direction: None,
             resolved_direction: None,
             resolved_language: ResolvedLanguage::Unresolved,
@@ -60,7 +59,9 @@ impl ElementSignature {
             tag,
             attrs,
             sibling_index,
-            ElementSiblingSignatureList::from_vec(sibling_signatures),
+            ElementSiblingSignatureList::from_vec(
+                sibling_signatures.into_iter().map(Into::into).collect(),
+            ),
         )
     }
 
@@ -70,63 +71,72 @@ impl ElementSignature {
         sibling_index: usize,
         sibling_signatures: ElementSiblingSignatureList,
     ) -> Self {
-        let fallback_namespace_attrs = local_attribute_signatures(&attrs);
         let selected_sibling = sibling_signatures.get(sibling_index);
         // A signature reconstructed from a sibling list can itself later be
         // an ancestor in a selector chain. Preserve its complete selector
         // snapshot, including children, so relational selectors such as
         // `:has(> .match)` inspect the source DOM rather than an empty shell.
         // <https://drafts.csswg.org/selectors-4/#relational>
-        let opaque_id = selected_sibling
-            .map(|sibling| Rc::clone(&sibling.opaque_id))
-            .unwrap_or_else(next_element_signature_opaque_id);
-        let child_signatures = selected_sibling
-            .map(|sibling| sibling.children.clone())
-            .unwrap_or_else(ElementSiblingSignatureList::empty);
-        let has_text_child = selected_sibling.is_some_and(|sibling| sibling.has_text_child);
-        let is_target = selected_sibling.is_some_and(|sibling| sibling.is_target);
-        let has_target_descendant =
-            selected_sibling.is_some_and(|sibling| sibling.has_target_descendant);
-        let document_direction = selected_sibling.and_then(|sibling| sibling.document_direction);
-        let source_element_id = selected_sibling.and_then(|sibling| sibling.source_element_id);
+        let mut selector = ElementSiblingSignature::new(tag, attrs);
+        if let Some(selected_sibling) = selected_sibling {
+            // Callers can intentionally supply selector-local tag/attribute
+            // data that differs from a sibling template.  Retain that public
+            // construction behavior while sharing the template's recursive
+            // source metadata.
+            selector.namespace_url = selected_sibling.namespace_url.clone();
+            selector.document_is_html = selected_sibling.document_is_html;
+            selector.namespace_attrs = selected_sibling.namespace_attrs.clone();
+            selector.opaque_id = Rc::clone(&selected_sibling.opaque_id);
+            selector.source_element_id = selected_sibling.source_element_id;
+            selector.children = selected_sibling.children.clone();
+            selector.has_text_child = selected_sibling.has_text_child;
+            selector.is_target = selected_sibling.is_target;
+            selector.has_target_descendant = selected_sibling.has_target_descendant;
+            selector.link_state = selected_sibling.link_state;
+            selector.document_direction = selected_sibling.document_direction;
+        }
         Self {
-            tag: tag.into(),
-            namespace_url: selected_sibling
-                .map(|sibling| sibling.namespace_url.clone())
-                .unwrap_or_default(),
-            document_is_html: selected_sibling
-                .map(|sibling| sibling.document_is_html)
-                .unwrap_or(true),
-            attrs,
-            namespace_attrs: selected_sibling
-                .map(|sibling| sibling.namespace_attrs.clone())
-                .unwrap_or(fallback_namespace_attrs),
-            opaque_id,
-            source_element_id,
+            selector,
             sibling_index: Some(sibling_index),
             sibling_signatures,
-            child_signatures,
-            has_text_child,
-            is_target,
-            has_target_descendant,
-            document_direction,
             html_direction: None,
             resolved_direction: None,
             resolved_language: ResolvedLanguage::Unresolved,
         }
     }
 
+    /// Reconstruct an element solely from a cached sibling snapshot.
+    ///
+    /// Source-DOM layout always has an entry for its sibling index, so this
+    /// path avoids cloning tag, attribute, namespace, and child metadata.
+    pub(crate) fn from_sibling_snapshot(
+        sibling_index: usize,
+        sibling_signatures: ElementSiblingSignatureList,
+    ) -> Option<Self> {
+        let selector = sibling_signatures.get(sibling_index)?.clone();
+        Some(Self {
+            selector,
+            sibling_index: Some(sibling_index),
+            sibling_signatures,
+            html_direction: None,
+            resolved_direction: None,
+            resolved_language: ResolvedLanguage::Unresolved,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_link_state(mut self, link_state: LinkState) -> Self {
+        self.selector = self.selector.with_link_state(link_state);
+        self
+    }
+
+    #[cfg(test)]
     pub(crate) fn with_child_list(
         mut self,
         children: ElementSiblingSignatureList,
         has_text_child: bool,
     ) -> Self {
-        self.child_signatures = children;
-        self.has_text_child = has_text_child;
-        self.has_target_descendant = self
-            .child_signatures
-            .iter()
-            .any(|child| child.is_target || child.has_target_descendant);
+        self.selector = self.selector.with_child_list(children, has_text_child);
         self
     }
 
@@ -136,23 +146,24 @@ impl ElementSignature {
         Sibling: Into<ElementSiblingSignature>,
     {
         self.with_child_list(
-            ElementSiblingSignatureList::from_vec(children),
+            ElementSiblingSignatureList::from_vec(children.into_iter().map(Into::into).collect()),
             has_text_child,
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn with_namespace(
         mut self,
         namespace_url: impl Into<String>,
         namespace_attrs: Vec<ElementAttributeSignature>,
     ) -> Self {
-        self.namespace_url = namespace_url.into();
-        self.namespace_attrs = namespace_attrs;
+        self.selector = self.selector.with_namespace(namespace_url, namespace_attrs);
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn with_document_is_html(mut self, document_is_html: bool) -> Self {
-        self.document_is_html = document_is_html;
+        self.selector = self.selector.with_document_is_html(document_is_html);
         self
     }
 
@@ -163,7 +174,7 @@ impl ElementSignature {
     /// <https://drafts.csswg.org/selectors/#the-dir-pseudo> and
     /// <https://html.spec.whatwg.org/multipage/dom.html#the-directionality>.
     pub(crate) fn with_document_direction(mut self, direction: Direction) -> Self {
-        self.document_direction = Some(direction);
+        self.selector = self.selector.with_document_direction(direction);
         self
     }
 
@@ -206,20 +217,9 @@ impl ElementSignature {
     pub(crate) fn sibling_at(&self, index: usize) -> Option<Self> {
         let sibling = self.sibling_signatures.get(index)?.clone();
         Some(Self {
-            tag: sibling.tag,
-            namespace_url: sibling.namespace_url,
-            document_is_html: sibling.document_is_html,
-            attrs: sibling.attrs,
-            namespace_attrs: sibling.namespace_attrs,
-            opaque_id: sibling.opaque_id,
-            source_element_id: sibling.source_element_id,
+            selector: sibling,
             sibling_index: Some(index),
             sibling_signatures: self.sibling_signatures.clone(),
-            child_signatures: sibling.children,
-            has_text_child: sibling.has_text_child,
-            is_target: sibling.is_target,
-            has_target_descendant: sibling.has_target_descendant,
-            document_direction: sibling.document_direction,
             html_direction: None,
             resolved_direction: None,
             resolved_language: ResolvedLanguage::Unresolved,
@@ -227,22 +227,11 @@ impl ElementSignature {
     }
 
     pub(crate) fn child_at(&self, index: usize) -> Option<Self> {
-        let child = self.child_signatures.get(index)?.clone();
+        let child = self.children.get(index)?.clone();
         Some(Self {
-            tag: child.tag,
-            namespace_url: child.namespace_url,
-            document_is_html: child.document_is_html,
-            attrs: child.attrs,
-            namespace_attrs: child.namespace_attrs,
-            opaque_id: child.opaque_id,
-            source_element_id: child.source_element_id,
+            selector: child,
             sibling_index: Some(index),
-            sibling_signatures: self.child_signatures.clone(),
-            child_signatures: child.children,
-            has_text_child: child.has_text_child,
-            is_target: child.is_target,
-            has_target_descendant: child.has_target_descendant,
-            document_direction: child.document_direction,
+            sibling_signatures: self.children.clone(),
             html_direction: None,
             resolved_direction: None,
             resolved_language: ResolvedLanguage::Unresolved,
@@ -290,10 +279,23 @@ impl TextDecoration {
         self.inset.resolve_font_metric_lengths(ch_advance);
     }
 
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        self.thickness.resolve_root_font_metric_lengths(basis);
+        self.underline_offset
+            .resolve_root_font_metric_lengths(basis);
+        self.inset.resolve_root_font_metric_lengths(basis);
+    }
+
     pub(crate) fn requires_ch_advance(&self) -> bool {
         self.thickness.requires_ch_advance()
             || self.underline_offset.requires_ch_advance()
             || self.inset.requires_ch_advance()
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        self.thickness.requires_root_font_metrics()
+            || self.underline_offset.requires_root_font_metrics()
+            || self.inset.requires_root_font_metrics()
     }
 }
 
@@ -330,8 +332,18 @@ impl TextDecorationThickness {
         }
     }
 
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        if let Self::LengthPercentage(value) = self {
+            value.resolve_root_font_metric_lengths(basis);
+        }
+    }
+
     pub(crate) fn requires_ch_advance(&self) -> bool {
         matches!(self, Self::LengthPercentage(value) if value.requires_ch_advance())
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        matches!(self, Self::LengthPercentage(value) if value.requires_root_font_metrics())
     }
 }
 
@@ -362,25 +374,39 @@ impl TextDecorationInset {
         }
     }
 
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        if let Self::Lengths { start, end } = self {
+            start.resolve_root_font_metric_lengths(basis);
+            end.resolve_root_font_metric_lengths(basis);
+        }
+    }
+
     pub(crate) fn requires_ch_advance(&self) -> bool {
         matches!(self, Self::Lengths { start, end } if start.requires_ch_advance() || end.requires_ch_advance())
     }
 
-    pub(crate) fn used(self, font_size: f32) -> (f32, f32) {
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        matches!(self, Self::Lengths { start, end } if start.requires_root_font_metrics() || end.requires_root_font_metrics())
+    }
+
+    /// Resolve `text-decoration-inset` after the decorating box has supplied
+    /// its logical inline-size percentage basis.
+    ///
+    /// Percentages do not refer to the font size: CSS Text Decoration uses
+    /// the decorating box's total inline size for `slice`, or an individual
+    /// box fragment's inline size for `clone`.
+    /// <https://drafts.csswg.org/css-text-decor-4/#text-decoration-inset-property>
+    pub(crate) fn used(self, percentage_basis: LayoutLength, auto_font_size: f32) -> (f32, f32) {
         match self {
-            Self::Auto => (font_size * 0.125, font_size * 0.125),
+            Self::Auto => (auto_font_size * 0.125, auto_font_size * 0.125),
             Self::Lengths { start, end } => (
                 start
-                    .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(
-                        font_size,
-                    )))
+                    .used_length_with_percentage_basis(PercentageBasis::definite(percentage_basis))
                     .map(layout_points)
                     .unwrap_or(start.length_points()),
-                end.used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(
-                    font_size,
-                )))
-                .map(layout_points)
-                .unwrap_or(end.length_points()),
+                end.used_length_with_percentage_basis(PercentageBasis::definite(percentage_basis))
+                    .map(layout_points)
+                    .unwrap_or(end.length_points()),
             ),
         }
     }
@@ -578,6 +604,19 @@ pub(crate) struct BoxShadow {
 }
 
 impl BoxShadow {
+    /// Apply CSS `zoom` to the fixed components of one shadow layer.
+    ///
+    /// Percentages remain relative to the already zoomed box, while the
+    /// length component of each shadow metric is multiplied at the used-value
+    /// boundary.
+    /// <https://drafts.csswg.org/css-viewport/#zoom-property>
+    pub(crate) fn scale_fixed_length_components(&mut self, factor: f32) {
+        self.offset_x.scale_fixed_length_components(factor);
+        self.offset_y.scale_fixed_length_components(factor);
+        self.blur_radius.scale_fixed_length_components(factor);
+        self.spread.scale_fixed_length_components(factor);
+    }
+
     pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         self.offset_x.resolve_font_metric_lengths(ch_advance);
         self.offset_y.resolve_font_metric_lengths(ch_advance);
@@ -585,11 +624,25 @@ impl BoxShadow {
         self.spread.resolve_font_metric_lengths(ch_advance);
     }
 
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        self.offset_x.resolve_root_font_metric_lengths(basis);
+        self.offset_y.resolve_root_font_metric_lengths(basis);
+        self.blur_radius.resolve_root_font_metric_lengths(basis);
+        self.spread.resolve_root_font_metric_lengths(basis);
+    }
+
     pub(crate) fn requires_ch_advance(&self) -> bool {
         self.offset_x.requires_ch_advance()
             || self.offset_y.requires_ch_advance()
             || self.blur_radius.requires_ch_advance()
             || self.spread.requires_ch_advance()
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        self.offset_x.requires_root_font_metrics()
+            || self.offset_y.requires_root_font_metrics()
+            || self.blur_radius.requires_root_font_metrics()
+            || self.spread.requires_root_font_metrics()
     }
 }
 
@@ -630,6 +683,19 @@ pub(crate) struct TextShadow {
 }
 
 impl TextShadow {
+    /// Apply CSS `zoom` to the fixed components of one shadow layer.
+    ///
+    /// Percentages remain relative to the already zoomed text metrics, while
+    /// the length component of each shadow metric is multiplied at the
+    /// used-value boundary.
+    /// <https://drafts.csswg.org/css-viewport/#zoom-property>
+    pub(crate) fn scale_fixed_length_components(&mut self, factor: f32) {
+        self.offset_x.scale_fixed_length_components(factor);
+        self.offset_y.scale_fixed_length_components(factor);
+        self.blur_radius.scale_fixed_length_components(factor);
+        self.spread.scale_fixed_length_components(factor);
+    }
+
     pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         self.offset_x.resolve_font_metric_lengths(ch_advance);
         self.offset_y.resolve_font_metric_lengths(ch_advance);
@@ -637,11 +703,25 @@ impl TextShadow {
         self.spread.resolve_font_metric_lengths(ch_advance);
     }
 
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        self.offset_x.resolve_root_font_metric_lengths(basis);
+        self.offset_y.resolve_root_font_metric_lengths(basis);
+        self.blur_radius.resolve_root_font_metric_lengths(basis);
+        self.spread.resolve_root_font_metric_lengths(basis);
+    }
+
     pub(crate) fn requires_ch_advance(&self) -> bool {
         self.offset_x.requires_ch_advance()
             || self.offset_y.requires_ch_advance()
             || self.blur_radius.requires_ch_advance()
             || self.spread.requires_ch_advance()
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        self.offset_x.requires_root_font_metrics()
+            || self.offset_y.requires_root_font_metrics()
+            || self.blur_radius.requires_root_font_metrics()
+            || self.spread.requires_root_font_metrics()
     }
 }
 
@@ -684,8 +764,18 @@ impl TextUnderlineOffset {
         }
     }
 
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        if let Self::LengthPercentage(value) = self {
+            value.resolve_root_font_metric_lengths(basis);
+        }
+    }
+
     pub(crate) fn requires_ch_advance(&self) -> bool {
         matches!(self, Self::LengthPercentage(value) if value.requires_ch_advance())
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        matches!(self, Self::LengthPercentage(value) if value.requires_root_font_metrics())
     }
 }
 

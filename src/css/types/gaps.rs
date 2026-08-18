@@ -1,4 +1,5 @@
 use super::*;
+use std::num::NonZeroUsize;
 use std::rc::Rc;
 
 /// Computed CSS value for `row-gap` and `column-gap`.
@@ -33,6 +34,16 @@ impl ComputedGap {
         if let Self::LengthPercentage(value) = self {
             value.resolve_font_metric_lengths(ch_advance);
         }
+    }
+
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        if let Self::LengthPercentage(value) = self {
+            value.resolve_root_font_metric_lengths(basis);
+        }
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        matches!(self, Self::LengthPercentage(value) if value.requires_root_font_metrics())
     }
 
     /// Reduces CSS Math comparisons whose percentage basis is non-negative.
@@ -172,6 +183,18 @@ impl<T: Clone> GapRuleList<T> {
         gap_rule_components_value_at(trailing, trailing_index)
     }
 
+    /// Resolve a rule-list position whose sequence bounds were established by
+    /// layout topology.  Callers that only have scalar indices must continue
+    /// to use [`Self::value_for_index`]; this adapter deliberately requires a
+    /// non-zero count so a paintable gap cannot be paired with an empty rule
+    /// sequence.
+    pub(crate) fn value_for_valid_index(&self, index: usize, count: NonZeroUsize) -> T {
+        match self.value_for_index(index, count.get()) {
+            Some(value) => value,
+            None => unreachable!("validated gap-rule slot must resolve a list value"),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn values_for_count(&self, count: usize) -> Vec<T> {
         (0..count)
@@ -269,6 +292,16 @@ impl GapRuleInsetValue {
         }
     }
 
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        if let Self::LengthPercentage(value) = self {
+            value.resolve_root_font_metric_lengths(basis);
+        }
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        matches!(self, Self::LengthPercentage(value) if value.requires_root_font_metrics())
+    }
+
     pub(crate) fn requires_ch_advance(&self) -> bool {
         matches!(self, Self::LengthPercentage(value) if value.requires_ch_advance())
     }
@@ -284,7 +317,10 @@ impl GapRuleInsetValue {
 pub(crate) struct GapRuleAxis {
     pub(crate) widths: GapRuleList<ComputedLengthPercentage>,
     pub(crate) styles: GapRuleList<BorderStyle>,
+    /// The unvisited list owns alpha. A visited list is resolved at the same
+    /// rule slot during paint so privacy clamping works for patterned lists.
     pub(crate) colors: GapRuleList<CssColor>,
+    pub(crate) visited_colors: Option<GapRuleList<CssColor>>,
     pub(crate) rule_break: GapRuleBreak,
     pub(crate) visibility_items: GapRuleVisibilityItems,
     pub(crate) inset_cap_start: GapRuleInsetValue,
@@ -299,6 +335,7 @@ impl GapRuleAxis {
             widths: GapRuleList::single(ComputedLengthPercentage::from_points(3.0 * CSS_PX_TO_PT)),
             styles: GapRuleList::single(BorderStyle::None),
             colors: GapRuleList::single(CssColor::BLACK),
+            visited_colors: None,
             rule_break: GapRuleBreak::Normal,
             visibility_items: GapRuleVisibilityItems::Normal,
             inset_cap_start: GapRuleInsetValue::ZERO,
@@ -316,6 +353,26 @@ impl GapRuleAxis {
             .resolve_font_metric_lengths(ch_advance);
         self.inset_junction_end
             .resolve_font_metric_lengths(ch_advance);
+    }
+
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        for_each_gap_rule_width_mut(&mut self.widths, |value| {
+            value.resolve_root_font_metric_lengths(basis)
+        });
+        self.inset_cap_start.resolve_root_font_metric_lengths(basis);
+        self.inset_cap_end.resolve_root_font_metric_lengths(basis);
+        self.inset_junction_start
+            .resolve_root_font_metric_lengths(basis);
+        self.inset_junction_end
+            .resolve_root_font_metric_lengths(basis);
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        gap_rule_width_list_requires_root_font_metrics(&self.widths)
+            || self.inset_cap_start.requires_root_font_metrics()
+            || self.inset_cap_end.requires_root_font_metrics()
+            || self.inset_junction_start.requires_root_font_metrics()
+            || self.inset_junction_end.requires_root_font_metrics()
     }
 
     /// Scale rule widths and fixed endpoint insets at the CSS `zoom`
@@ -378,6 +435,30 @@ fn gap_rule_width_list_requires_ch_advance(list: &GapRuleList<ComputedLengthPerc
     }
 }
 
+fn gap_rule_width_list_requires_root_font_metrics(
+    list: &GapRuleList<ComputedLengthPercentage>,
+) -> bool {
+    match list {
+        GapRuleList::Single(value) => value.requires_root_font_metrics(),
+        GapRuleList::Pattern {
+            leading,
+            auto,
+            trailing,
+        } => {
+            leading
+                .iter()
+                .flat_map(|components| components.iter())
+                .chain(trailing.iter().flat_map(|components| components.iter()))
+                .any(gap_rule_component_requires_root_font_metrics)
+                || auto.as_deref().is_some_and(|values| {
+                    values
+                        .iter()
+                        .any(ComputedLengthPercentage::requires_root_font_metrics)
+                })
+        }
+    }
+}
+
 fn gap_rule_component_requires_ch_advance(
     component: &GapRuleListComponent<ComputedLengthPercentage>,
 ) -> bool {
@@ -386,6 +467,17 @@ fn gap_rule_component_requires_ch_advance(
         GapRuleListComponent::Repeat { values, .. } => values
             .iter()
             .any(ComputedLengthPercentage::requires_ch_advance),
+    }
+}
+
+fn gap_rule_component_requires_root_font_metrics(
+    component: &GapRuleListComponent<ComputedLengthPercentage>,
+) -> bool {
+    match component {
+        GapRuleListComponent::Value(value) => value.requires_root_font_metrics(),
+        GapRuleListComponent::Repeat { values, .. } => values
+            .iter()
+            .any(ComputedLengthPercentage::requires_root_font_metrics),
     }
 }
 

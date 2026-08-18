@@ -1,21 +1,18 @@
 use super::super::*;
 use super::outline::{GlyphOutlineToPaint, append_colr_outline};
 use crate::CssColor;
-use crate::css::FontPalette;
-use crate::document::paint::geometry::{PaintPoint, PaintRect, PaintSize, PaintTransform};
-use crate::document::paint::paths::{RenderedPath, RenderedPathCommand, RenderedPathFillRule};
-use std::borrow::Cow;
+use crate::document::paint::geometry::PaintPoint;
+use crate::document::paint::paths::RenderedPath;
 
 impl FontSystem {
     pub(crate) fn take_color_glyph_paths(
         &self,
         origin: PaintPoint,
         runs: &mut [RenderedTextRun],
-        palettes: &[FontPalette],
         style: &ComputedStyle,
     ) -> Vec<RenderedPath> {
         let mut paths = Vec::new();
-        for (index, run) in runs.iter_mut().enumerate() {
+        for run in runs {
             if !run.text_matrix.is_identity() {
                 continue;
             }
@@ -28,22 +25,28 @@ impl FontSystem {
             let Ok(face) = ttf_parser::Face::parse(&font.data, font.face_index) else {
                 continue;
             };
-            let selection = palettes.get(index).unwrap_or(&style.font_palette);
+            if !face_has_colr_glyphs(&face) {
+                continue;
+            }
             let (palette, overrides) =
-                self.color_palette_selection(&face, selection, font_id, style);
+                self.color_palette_selection(&face, &run.font_palette, font_id, style);
             let Some(glyphs) = run.glyphs.as_ref() else {
                 continue;
             };
             let mut cursor = run.x_offset;
-            let mut retained = Vec::with_capacity(glyphs.len());
-            for glyph in glyphs.iter() {
+            let mut retained: Option<Vec<RenderedGlyph>> = None;
+            for (glyph_index, glyph) in glyphs.iter().enumerate() {
                 let Some(glyph_id) = glyph.painted_id().map(ttf_parser::GlyphId) else {
-                    retained.push(glyph.clone());
+                    if let Some(retained) = &mut retained {
+                        retained.push(glyph.clone());
+                    }
                     cursor += glyph.x_advance;
                     continue;
                 };
                 if !face.is_color_glyph(glyph_id) {
-                    retained.push(glyph.clone());
+                    if let Some(retained) = &mut retained {
+                        retained.push(glyph.clone());
+                    }
                     cursor += glyph.x_advance;
                     continue;
                 }
@@ -82,16 +85,25 @@ impl FontSystem {
                         .paint_color_glyph(glyph_id, palette, foreground, &mut painter)
                         .is_some()
                 {
+                    retained.get_or_insert_with(|| glyphs[..glyph_index].to_vec());
                     paths.append(&mut painter.paths);
                 } else {
-                    retained.push(glyph.clone());
+                    if let Some(retained) = &mut retained {
+                        retained.push(glyph.clone());
+                    }
                 }
                 cursor += glyph.x_advance;
             }
-            run.glyphs = (!retained.is_empty()).then(|| retained.into());
+            if let Some(retained) = retained {
+                run.glyphs = (!retained.is_empty()).then(|| retained.into());
+            }
         }
         paths
     }
+}
+
+fn face_has_colr_glyphs(face: &ttf_parser::Face<'_>) -> bool {
+    face.tables().colr.is_some()
 }
 
 impl FontSystem {

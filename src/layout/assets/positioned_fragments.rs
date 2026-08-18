@@ -1,7 +1,7 @@
 use super::*;
 use crate::layout::block::suppress_fragmented_box_edges;
 use crate::layout::builder::page_for_context;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 /// A page index in the document's final page sequence.
 ///
@@ -51,6 +51,66 @@ impl FragmentainerCount {
 
     pub(in crate::layout) const fn get(self) -> usize {
         self.0
+    }
+}
+
+/// Physical margin-box geometry interpreted along a fragmentainer's logical
+/// block axis.
+///
+/// CSS Positioned Layout resolves the physical inset properties against the
+/// continuous containing block. CSS Fragmentation subsequently assigns that
+/// already-resolved physical box to fragmentainers using the principal
+/// flow's block direction. Keeping those two steps separate prevents a
+/// vertical principal flow from treating the physical Y axis as its page
+/// progression axis.
+/// <https://drafts.csswg.org/css-position-3/#abspos-insets>
+/// <https://drafts.csswg.org/css-break-4/#fragmentation-model>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct FragmentainerBlockMarginBox {
+    physical: PageTopRect,
+}
+
+impl FragmentainerBlockMarginBox {
+    pub(in crate::layout) fn new(physical: PageTopRect) -> Self {
+        Self { physical }
+    }
+
+    /// Distance from a fragmentainer block-start edge to this margin box's
+    /// block-start edge, measured in the direction of block progression.
+    pub(in crate::layout) fn start_distance_from(
+        self,
+        fragmentainer_block_start: f32,
+        block_start_side: PhysicalSide,
+    ) -> f32 {
+        match block_start_side {
+            PhysicalSide::Top => fragmentainer_block_start - self.physical.top_y(),
+            PhysicalSide::Bottom => self.physical.bottom_y() - fragmentainer_block_start,
+            PhysicalSide::Left => self.physical.x() - fragmentainer_block_start,
+            PhysicalSide::Right => {
+                fragmentainer_block_start - (self.physical.x() + self.physical.width())
+            }
+        }
+    }
+
+    pub(in crate::layout) fn block_extent(self, block_start_side: PhysicalSide) -> LayoutLength {
+        match block_start_side {
+            PhysicalSide::Top | PhysicalSide::Bottom => layout_pt(self.physical.height()),
+            PhysicalSide::Left | PhysicalSide::Right => layout_pt(self.physical.width()),
+        }
+    }
+}
+
+/// Physical page-area edge corresponding to the fragmentainer block start.
+///
+/// This maps only the fragmentainer coordinate system; physical inset
+/// properties and overflow rectangles keep their CSS physical meaning.
+/// <https://drafts.csswg.org/css-writing-modes-4/#logical-to-physical>
+fn fragmentainer_block_start_for_page(context: PageContext, side: PhysicalSide) -> f32 {
+    match side {
+        PhysicalSide::Top => context.top(),
+        PhysicalSide::Bottom => context.bottom(),
+        PhysicalSide::Left => context.left(),
+        PhysicalSide::Right => context.right(),
     }
 }
 
@@ -128,14 +188,46 @@ pub(in crate::layout) enum PositionedPaintReach {
 }
 
 impl PositionedPaintReach {
-    pub(in crate::layout) fn from_overflow_clips(clips: &[OverflowClip]) -> Self {
-        // PDF pages advance in physical Y. Keep vertical-writing-mode cases
-        // conservative until their fragmentainer projection supplies an
-        // equivalent physical block-axis proof.
+    /// Determine whether a non-scrollable overflow clip proves that later
+    /// positioned fragments cannot contribute to static output.
+    ///
+    /// The relevant clip edge is selected in the destination fragmentainer's
+    /// logical block direction. Overflow rectangles themselves remain
+    /// physical, as required by CSS Overflow and CSS Writing Modes.
+    /// <https://drafts.csswg.org/css-overflow-3/#overflow-areas>
+    /// <https://drafts.csswg.org/css-writing-modes-4/#physical-mapping>
+    pub(in crate::layout) fn from_overflow_clips(
+        clips: &[OverflowClip],
+        fragmentainer_axes: FlowAxes,
+    ) -> Self {
+        let block_start = fragmentainer_axes.block_start_side();
         clips
             .iter()
-            .filter(|clip| clip.clips_y && clip.non_scrollable_y)
-            .max_by(|left, right| left.rect.origin.y.total_cmp(&right.rect.origin.y))
+            .filter(|clip| match block_start {
+                PhysicalSide::Top | PhysicalSide::Bottom => clip.clips_y && clip.non_scrollable_y,
+                PhysicalSide::Left | PhysicalSide::Right => clip.clips_x && clip.non_scrollable_x,
+            })
+            .reduce(|nearest, candidate| {
+                let candidate_is_nearer = match block_start {
+                    // Paint-space Y grows upward, whereas logical block
+                    // progress from a top edge grows downward.
+                    PhysicalSide::Top => candidate.rect.origin.y > nearest.rect.origin.y,
+                    PhysicalSide::Bottom => {
+                        candidate.rect.origin.y + candidate.rect.size.height
+                            < nearest.rect.origin.y + nearest.rect.size.height
+                    }
+                    PhysicalSide::Left => {
+                        candidate.rect.origin.x + candidate.rect.size.width
+                            < nearest.rect.origin.x + nearest.rect.size.width
+                    }
+                    PhysicalSide::Right => candidate.rect.origin.x > nearest.rect.origin.x,
+                };
+                if candidate_is_nearer {
+                    candidate
+                } else {
+                    nearest
+                }
+            })
             .map(|clip| Self::Clipped {
                 clip: PaintClip::from_paint_rect(clip.paint_rect()),
             })
@@ -172,7 +264,8 @@ impl PositionedFragmentationPlan {
     pub(in crate::layout) fn for_absolute_box(
         destination_start: usize,
         logical_destination_end: Option<usize>,
-        page_top: f32,
+        fragmentainer_block_start: f32,
+        fragmentainer_block_start_side: PhysicalSide,
         page_block_size: LayoutLength,
         paint_reach: PositionedPaintReach,
     ) -> Self {
@@ -188,7 +281,15 @@ impl PositionedFragmentationPlan {
             let clipped_end = match paint_reach {
                 PositionedPaintReach::PotentiallyVisible => end,
                 PositionedPaintReach::Clipped { clip } => {
-                    let visible_distance = (page_top - clip.y()).max(0.0);
+                    let visible_distance = match fragmentainer_block_start_side {
+                        PhysicalSide::Top => fragmentainer_block_start - clip.y(),
+                        PhysicalSide::Bottom => {
+                            clip.y() + clip.height() - fragmentainer_block_start
+                        }
+                        PhysicalSide::Left => clip.x() + clip.width() - fragmentainer_block_start,
+                        PhysicalSide::Right => fragmentainer_block_start - clip.x(),
+                    }
+                    .max(0.0);
                     let visible_offset = ((visible_distance - 0.01).max(0.0)
                         / page_block_size.points().max(1.0))
                     .floor() as usize;
@@ -632,44 +733,202 @@ impl AbsoluteFragmentPlacement {
 #[must_use]
 pub(in crate::layout) struct CapturedPositionedPaint {
     fragments: MaterializedFragmentPrefix<ScratchPositionedFragment>,
+    effects: CapturedPositionedSideEffects,
     source_page_start: DocumentPageIndex,
     pub(in crate::layout) initial_page_context: PageContext,
+}
+
+/// Observable output emitted while a positioned subtree owns scratch pages.
+///
+/// The page indices are deliberately scratch-local until this value is
+/// consumed by one of [`CapturedPositionedPaint`]'s projection methods.
+/// Scratch effects can therefore never be committed directly to the document.
+#[derive(Debug, Default)]
+pub(in crate::layout) struct CapturedPositionedSideEffects {
+    bookmarks: Vec<Bookmark>,
+    anchors: Vec<(String, ScratchPageIndex)>,
+    anchor_source_positions: Vec<(String, PaintPoint)>,
+    anchor_text: Vec<(String, AnchorText)>,
+    anchor_counters: Vec<(String, HashMap<String, Vec<i32>>)>,
+    page_effects: Vec<(ScratchPageIndex, PendingPageSideEffects)>,
+}
+
+/// Paint and semantic output whose page ownership has been resolved together.
+#[must_use]
+pub(in crate::layout) struct FinalPositionedReplay {
+    pub(in crate::layout) fragments: Vec<FinalPositionedFragment>,
+    effects: CommittedPositionedSideEffects,
+}
+
+/// Semantic output after scratch ownership has been resolved. This stays
+/// strongly typed until the final builder-facing application boundary.
+#[derive(Debug, Default)]
+struct CommittedPositionedSideEffects {
+    bookmarks: Vec<(DocumentPageIndex, Bookmark)>,
+    anchors: Vec<(String, DocumentPageIndex)>,
+    anchor_source_positions: Vec<(String, PaintPoint)>,
+    anchor_text: Vec<(String, AnchorText)>,
+    anchor_counters: Vec<(String, HashMap<String, Vec<i32>>)>,
+    page_effects: Vec<(DocumentPageIndex, PendingPageSideEffects)>,
+}
+
+impl FinalPositionedReplay {
+    pub(in crate::layout) fn effect_pages(&self) -> impl Iterator<Item = DocumentPageIndex> + '_ {
+        self.effects
+            .bookmarks
+            .iter()
+            .map(|(page, _)| *page)
+            .chain(self.effects.anchors.iter().map(|(_, page)| *page))
+            .chain(self.effects.page_effects.iter().map(|(page, _)| *page))
+    }
+
+    pub(in crate::layout) fn retain_effects_through(&mut self, last_page: DocumentPageIndex) {
+        self.effects
+            .bookmarks
+            .retain(|(page, _)| *page <= last_page);
+        self.effects.anchors.retain(|(_, page)| *page <= last_page);
+        // Anchor text and counter snapshots are paired with an anchor and are
+        // only observable when that anchor survived the destination clip.
+        let retained_targets: HashSet<_> = self
+            .effects
+            .anchors
+            .iter()
+            .map(|(target, _)| target.as_str())
+            .collect();
+        self.effects
+            .anchor_source_positions
+            .retain(|(target, _)| retained_targets.contains(target.as_str()));
+        self.effects
+            .anchor_text
+            .retain(|(target, _)| retained_targets.contains(target.as_str()));
+        self.effects
+            .anchor_counters
+            .retain(|(target, _)| retained_targets.contains(target.as_str()));
+        self.effects
+            .page_effects
+            .retain(|(page, _)| *page <= last_page);
+    }
+
+    pub(in crate::layout) fn has_effects(&self) -> bool {
+        !self.effects.bookmarks.is_empty()
+            || !self.effects.anchors.is_empty()
+            || !self.effects.page_effects.is_empty()
+    }
+
+    pub(in crate::layout) fn into_deferred_layout_side_effects(self) -> DeferredLayoutSideEffects {
+        self.effects.into_deferred_layout_side_effects()
+    }
+}
+
+impl CommittedPositionedSideEffects {
+    fn into_deferred_layout_side_effects(self) -> DeferredLayoutSideEffects {
+        DeferredLayoutSideEffects {
+            bookmarks: self
+                .bookmarks
+                .into_iter()
+                .map(|(page, mut bookmark)| {
+                    bookmark.page_index = page.get();
+                    bookmark
+                })
+                .collect(),
+            anchors: self
+                .anchors
+                .into_iter()
+                .map(|(target, page)| (target, page.get()))
+                .collect(),
+            anchor_source_positions: self.anchor_source_positions,
+            anchor_text: self.anchor_text,
+            anchor_counters: self.anchor_counters,
+            page_effects: self
+                .page_effects
+                .into_iter()
+                .map(|(page, mut effects)| {
+                    effects.page_index = page.get();
+                    effects
+                })
+                .collect(),
+        }
+    }
 }
 
 impl CapturedPositionedPaint {
     pub(in crate::layout) fn into_final_absolute(
         self,
         placement: AbsoluteFragmentPlacement,
-    ) -> Vec<FinalPositionedFragment> {
-        self.fragments
-            .into_fragments()
-            .into_iter()
-            .map(|fragment| {
-                let relative_page = fragment
-                    .scratch_page
-                    .get()
-                    .saturating_sub(placement.scratch_start.get());
-                FinalPositionedFragment::new(
-                    DocumentPageIndex::new(placement.destination_start.get() + relative_page),
-                    fragment.fragment,
-                )
-            })
-            .collect()
+    ) -> FinalPositionedReplay {
+        let map_page = |scratch_page: ScratchPageIndex| {
+            let relative_page = scratch_page
+                .get()
+                .saturating_sub(placement.scratch_start.get());
+            DocumentPageIndex::new(placement.destination_start.get() + relative_page)
+        };
+        FinalPositionedReplay {
+            fragments: self
+                .fragments
+                .into_fragments()
+                .into_iter()
+                .map(|fragment| {
+                    FinalPositionedFragment::new(map_page(fragment.scratch_page), fragment.fragment)
+                })
+                .collect(),
+            effects: self.effects.into_document_effects(map_page),
+        }
     }
 
-    pub(in crate::layout) fn into_final_same_pages(self) -> Vec<FinalPositionedFragment> {
-        self.fragments
-            .into_fragments()
-            .into_iter()
-            .map(|fragment| {
-                FinalPositionedFragment::new(
-                    DocumentPageIndex::new(
-                        self.source_page_start.get() + fragment.scratch_page.get(),
-                    ),
-                    fragment.fragment,
-                )
-            })
-            .collect()
+    pub(in crate::layout) fn into_final_same_pages(self) -> FinalPositionedReplay {
+        let map_page = |scratch_page: ScratchPageIndex| {
+            DocumentPageIndex::new(self.source_page_start.get() + scratch_page.get())
+        };
+        FinalPositionedReplay {
+            fragments: self
+                .fragments
+                .into_fragments()
+                .into_iter()
+                .map(|fragment| {
+                    FinalPositionedFragment::new(map_page(fragment.scratch_page), fragment.fragment)
+                })
+                .collect(),
+            effects: self.effects.into_document_effects(map_page),
+        }
+    }
+}
+
+impl CapturedPositionedSideEffects {
+    /// Convert scratch-local effects into a continuous source artifact. This
+    /// is only for an isolated replay whose caller retains the scratch
+    /// geometry; normal positioned replay must use a document-page mapping.
+    pub(in crate::layout) fn into_continuous_source_effects(self) -> DeferredLayoutSideEffects {
+        self.into_document_effects(|page| DocumentPageIndex::new(page.get()))
+            .into_deferred_layout_side_effects()
+    }
+
+    fn into_document_effects(
+        self,
+        map_page: impl Fn(ScratchPageIndex) -> DocumentPageIndex,
+    ) -> CommittedPositionedSideEffects {
+        CommittedPositionedSideEffects {
+            bookmarks: self
+                .bookmarks
+                .into_iter()
+                .map(|bookmark| {
+                    let page = map_page(ScratchPageIndex::new(bookmark.page_index));
+                    (page, bookmark)
+                })
+                .collect(),
+            anchors: self
+                .anchors
+                .into_iter()
+                .map(|(target, page)| (target, map_page(page)))
+                .collect(),
+            anchor_source_positions: self.anchor_source_positions,
+            anchor_text: self.anchor_text,
+            anchor_counters: self.anchor_counters,
+            page_effects: self
+                .page_effects
+                .into_iter()
+                .map(|(page, effects)| (map_page(page), effects))
+                .collect(),
+        }
     }
 }
 
@@ -681,6 +940,8 @@ pub(in crate::layout) struct PositionedPaintTransaction {
     scratch_start: ScratchPageIndex,
     source_page_start: DocumentPageIndex,
     checkpoint: PaintCheckpoint,
+    page_value_scope_depth: usize,
+    assignment_capture_depth: usize,
 }
 
 pub(in crate::layout) struct PositionedPaginationState {
@@ -693,20 +954,27 @@ pub(in crate::layout) struct PositionedPaginationState {
     current_page_has_flow_content: bool,
     current_page_has_named_page_flow_content: bool,
     current_page_selected_name: Option<String>,
+    current_page_name: Option<String>,
     pub(in crate::layout) current_page_context: PageContext,
     current_page_named_strings: HashMap<String, Vec<NamedStringAssignment>>,
     current_page_running_elements: HashMap<String, Vec<NamedStringAssignment>>,
     cursor_y: f32,
     content_left: f32,
     content_right: f32,
-    fragment_top_offsets: Vec<f32>,
+    fragment_top_offsets: Vec<FragmentTopOffset>,
     truncate_page_start_margins: bool,
     pending_paint_fragments: Vec<PendingPaintFragment>,
     pending_page_side_effects: Vec<PendingPageSideEffects>,
     positioned_paint_transaction_depth: usize,
     positioned_scratch_page_limit: Option<usize>,
+    positioned_scratch_page_origin: Option<DocumentPageIndex>,
     absolute_positioned_page_span_target: Option<usize>,
     pending_positioned_fragmentation: PendingPositionedFragmentation,
+    bookmarks: Vec<Bookmark>,
+    page_anchors: HashMap<String, usize>,
+    page_anchor_source_positions: HashMap<String, PaintPoint>,
+    page_anchor_text: HashMap<String, AnchorText>,
+    page_anchor_counters: HashMap<String, HashMap<String, Vec<i32>>>,
 }
 
 /// Retain page fragments established by nested out-of-flow layout when its
@@ -733,19 +1001,34 @@ impl PositionedPaintTransaction {
         layout: &mut LayoutBuilder<'_>,
         scratch_page_limit: Option<usize>,
     ) -> Self {
+        debug_assert!(
+            !layout.is_positioned_auto_size_measurement(),
+            "positioned paint transactions belong only to final positioned layout"
+        );
         // Positioned paint is speculative output. Move the parent output out
         // of the builder instead of cloning a growing page vector, then give
         // the surrogate a fresh local page sequence. CSS layout state stays
         // continuous while paint ownership is explicitly transactional.
-        let source_page_start = DocumentPageIndex::new(layout.pages.len());
+        let source_page_start = DocumentPageIndex::new(
+            layout
+                .positioned_scratch_page_origin
+                .map_or(layout.pages.len(), |origin| {
+                    origin.get() + layout.pages.len()
+                }),
+        );
+        let page_value_scope_depth = layout.page_value_scope_stack.len();
+        let assignment_capture_depth = layout.assignment_capture_stack.len();
         let pagination = layout.take_positioned_pagination_state();
         let transaction = Self {
             scratch_start: ScratchPageIndex::new(0),
             source_page_start,
             checkpoint: layout.current_page.paint_checkpoint(),
             pagination,
+            page_value_scope_depth,
+            assignment_capture_depth,
         };
         layout.positioned_paint_transaction_depth += 1;
+        layout.positioned_scratch_page_origin = Some(source_page_start);
         layout.positioned_scratch_page_limit =
             match (layout.positioned_scratch_page_limit, scratch_page_limit) {
                 (Some(enclosing), Some(descendant)) => Some(enclosing.min(descendant)),
@@ -762,6 +1045,10 @@ impl PositionedPaintTransaction {
         layout: &mut LayoutBuilder<'_>,
     ) -> CapturedPositionedPaint {
         debug_assert!(
+            !layout.is_positioned_auto_size_measurement(),
+            "positioned paint capture belongs only to final positioned layout"
+        );
+        debug_assert!(
             layout.positioned_paint_transaction_depth > 0,
             "positioned paint transaction must own scratch layout before capture"
         );
@@ -776,8 +1063,19 @@ impl PositionedPaintTransaction {
                 fragment,
             })
             .collect();
+        let effects = layout.take_positioned_scratch_side_effects();
         let initial_page_context = self.pagination.current_page_context;
         layout.restore_positioned_pagination_state(self.pagination);
+        debug_assert_eq!(
+            layout.page_value_scope_stack.len(),
+            self.page_value_scope_depth,
+            "positioned scratch replay must restore page-value scopes"
+        );
+        debug_assert_eq!(
+            layout.assignment_capture_stack.len(),
+            self.assignment_capture_depth,
+            "positioned scratch replay must restore assignment-capture scopes"
+        );
         layout
             .pending_positioned_fragmentation
             .merge(nested_positioned_fragmentation);
@@ -787,6 +1085,7 @@ impl PositionedPaintTransaction {
         );
         CapturedPositionedPaint {
             fragments: MaterializedFragmentPrefix::new(fragments),
+            effects,
             source_page_start: self.source_page_start,
             initial_page_context,
         }
@@ -899,22 +1198,17 @@ impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn absolute_positioned_page_span_target(
         &mut self,
         style: &ComputedStyle,
-        containing_block: ContainingBlock,
-        positioned_y: PositionedAxis,
-        vertical_border_width: f32,
-        containing_block_origin_page_index: usize,
+        margin_box: FragmentainerBlockMarginBox,
+        fragmentainer_axes: FlowAxes,
+        destination_start_page_index: usize,
+        destination_start_progress: f32,
     ) -> Option<usize> {
         if style.position != Position::Absolute {
             return None;
         }
-        let margin_box_top = containing_block.top_y() - positioned_y.start;
-        let margin_box_height = positioned_y.margin_start
-            + positioned_y.size
-            + style.padding.top
-            + style.padding.bottom
-            + vertical_border_width
-            + positioned_y.margin_end;
-        if margin_box_height <= 0.0 {
+        let block_start_side = fragmentainer_axes.block_start_side();
+        let margin_box_block_size = margin_box.block_extent(block_start_side);
+        if margin_box_block_size.points() <= 0.0 {
             return None;
         }
         // Size containment makes the principal box monolithic, but it does
@@ -923,30 +1217,70 @@ impl<'a> LayoutBuilder<'a> {
         // still bounds every potential decoration slice.
         // <https://www.w3.org/TR/css-contain-1/#containment-size>
         // <https://www.w3.org/TR/css-break-3/#monolithic>
-        let page_height = self.page_area_height().max(1.0);
-        let margin_box_bottom = margin_box_top - margin_box_height.max(0.0);
-        let distance_from_page_top = (self.page_top() - margin_box_bottom).max(0.0);
-        if distance_from_page_top <= 0.0 {
+        // `destination_start_progress` is source-flow progress within the
+        // resolved first destination fragmentainer. The containing box's
+        // physical position can include earlier source fragmentainers, which
+        // must not be consumed again after the start page has been selected.
+        let mut remaining_distance =
+            (destination_start_progress + margin_box_block_size.points()).max(0.0);
+        if remaining_distance <= 0.0 {
             return None;
         }
-        Some(
-            containing_block_origin_page_index
-                + ((distance_from_page_top - 0.01).max(0.0) / page_height).floor() as usize,
-        )
+
+        // The resolved absolute margin box is continuous, but each
+        // destination fragmentainer can have a different logical block
+        // extent. Advance through the actual destination contexts instead of
+        // dividing the source extent by the first page's capacity.
+        // <https://drafts.csswg.org/css-break-4/#varying-size-fragmentainers>
+        let mut destination_page_index = destination_start_page_index;
+        let current_document_page_index = self
+            .positioned_scratch_page_origin
+            .map_or(self.pages.len(), |origin| origin.get() + self.pages.len());
+        let mut destination_context = if destination_page_index == current_document_page_index {
+            self.current_page_context
+        } else {
+            self.resolved_page_context(destination_page_index + 1, false)
+        };
+        loop {
+            let capacity = destination_context
+                .logical_block_size(fragmentainer_axes.writing_mode())
+                .max(1.0);
+            if remaining_distance <= capacity + 0.01 {
+                return Some(destination_page_index);
+            }
+            remaining_distance -= capacity;
+            destination_page_index += 1;
+            destination_context = self.resolved_page_context(destination_page_index + 1, false);
+        }
     }
 
     pub(in crate::layout) fn absolute_positioned_page_start_offset(
         &self,
-        containing_block: ContainingBlock,
-        positioned_y: PositionedAxis,
+        margin_box: FragmentainerBlockMarginBox,
+        fragmentainer_axes: FlowAxes,
     ) -> (usize, f32) {
-        let page_height = self.page_area_height().max(1.0);
-        let margin_box_top = containing_block.top_y() - positioned_y.start;
-        let start_distance = (self.page_top() - margin_box_top).max(0.0);
-        let page_offset = (start_distance / page_height).floor() as usize;
+        let block_start_side = fragmentainer_axes.block_start_side();
+        let fragmentainer_block_size = self
+            .current_page_context
+            .logical_block_size(fragmentainer_axes.writing_mode())
+            .max(1.0);
+        let start_distance = margin_box
+            .start_distance_from(
+                fragmentainer_block_start_for_page(self.current_page_context, block_start_side),
+                block_start_side,
+            )
+            .max(0.0);
+        // Treat a position at a fragmentainer end as the next
+        // fragmentainer's block start. Floating-point layout arithmetic can
+        // otherwise turn an exact boundary into `N - ε`, retaining a zero-use
+        // source fragment and adding a spurious continuation page.
+        // <https://drafts.csswg.org/css-break-4/#breaking-rules>
+        let page_offset = ((start_distance + 0.01) / fragmentainer_block_size).floor() as usize;
         (
             page_offset,
-            (start_distance - page_offset as f32 * page_height).max(0.0),
+            (start_distance - page_offset as f32 * fragmentainer_block_size)
+                .max(0.0)
+                .min(fragmentainer_block_size),
         )
     }
 
@@ -999,6 +1333,13 @@ impl<'a> LayoutBuilder<'a> {
     }
 
     pub(in crate::layout) fn materialize_pending_positioned_page_span(&mut self) {
+        debug_assert!(
+            !self.is_positioned_auto_size_measurement(),
+            "positioned auto-size measurement must not request document pages"
+        );
+        if self.is_positioned_auto_size_measurement() {
+            return;
+        }
         if self.out_of_flow_prebreak_suppression_depth == 0 {
             let target_page_index = self
                 .pending_positioned_fragmentation
@@ -1040,7 +1381,12 @@ impl<'a> LayoutBuilder<'a> {
         let next_context = self
             .fragmentainer_override
             .map(|override_| override_.context_for_fragmentainer(self.pages.len() + 1))
-            .unwrap_or_else(|| self.resolved_page_context(self.pages.len() + 2, false));
+            .unwrap_or_else(|| {
+                self.resolved_page_context(
+                    self.destination_document_page_number(self.pages.len() + 2),
+                    false,
+                )
+            });
         let next_page = page_for_context(next_context);
         let page = std::mem::replace(&mut self.current_page, next_page);
         self.current_page_has_flow_content = false;
@@ -1058,7 +1404,9 @@ impl<'a> LayoutBuilder<'a> {
         self.apply_pending_fragments_for_current_page();
     }
 
-    fn take_positioned_pagination_state(&mut self) -> PositionedPaginationState {
+    pub(in crate::layout) fn take_positioned_pagination_state(
+        &mut self,
+    ) -> PositionedPaginationState {
         let current_page_context = self.current_page_context;
         let state = PositionedPaginationState {
             pages: std::mem::take(&mut self.pages),
@@ -1073,6 +1421,7 @@ impl<'a> LayoutBuilder<'a> {
             current_page_has_flow_content: self.current_page_has_flow_content,
             current_page_has_named_page_flow_content: self.current_page_has_named_page_flow_content,
             current_page_selected_name: std::mem::take(&mut self.current_page_selected_name),
+            current_page_name: std::mem::take(&mut self.current_page_name),
             current_page_context: self.current_page_context,
             current_page_named_strings: std::mem::take(&mut self.current_page_named_strings),
             current_page_running_elements: std::mem::take(&mut self.current_page_running_elements),
@@ -1085,13 +1434,20 @@ impl<'a> LayoutBuilder<'a> {
             pending_page_side_effects: std::mem::take(&mut self.pending_page_side_effects),
             positioned_paint_transaction_depth: self.positioned_paint_transaction_depth,
             positioned_scratch_page_limit: self.positioned_scratch_page_limit,
+            positioned_scratch_page_origin: self.positioned_scratch_page_origin,
             absolute_positioned_page_span_target: self.absolute_positioned_page_span_target,
             pending_positioned_fragmentation: self.pending_positioned_fragmentation,
+            bookmarks: std::mem::take(&mut self.bookmarks),
+            page_anchors: std::mem::take(&mut self.page_anchors),
+            page_anchor_source_positions: std::mem::take(&mut self.page_anchor_source_positions),
+            page_anchor_text: std::mem::take(&mut self.page_anchor_text),
+            page_anchor_counters: std::mem::take(&mut self.page_anchor_counters),
         };
         self.current_page_has_flow_content = false;
         self.current_page_has_named_page_flow_content = false;
         self.truncate_page_start_margins = false;
         self.positioned_scratch_page_limit = None;
+        self.positioned_scratch_page_origin = None;
         self.pending_positioned_fragmentation = PendingPositionedFragmentation::default();
         state
     }
@@ -1110,6 +1466,7 @@ impl<'a> LayoutBuilder<'a> {
         self.current_page_has_named_page_flow_content =
             state.current_page_has_named_page_flow_content;
         self.current_page_selected_name = state.current_page_selected_name;
+        self.current_page_name = state.current_page_name;
         self.current_page_context = state.current_page_context;
         self.current_page_named_strings = state.current_page_named_strings;
         self.current_page_running_elements = state.current_page_running_elements;
@@ -1122,8 +1479,70 @@ impl<'a> LayoutBuilder<'a> {
         self.pending_page_side_effects = state.pending_page_side_effects;
         self.positioned_paint_transaction_depth = state.positioned_paint_transaction_depth;
         self.positioned_scratch_page_limit = state.positioned_scratch_page_limit;
+        self.positioned_scratch_page_origin = state.positioned_scratch_page_origin;
         self.absolute_positioned_page_span_target = state.absolute_positioned_page_span_target;
         self.pending_positioned_fragmentation = state.pending_positioned_fragmentation;
+        self.bookmarks = state.bookmarks;
+        self.page_anchors = state.page_anchors;
+        self.page_anchor_source_positions = state.page_anchor_source_positions;
+        self.page_anchor_text = state.page_anchor_text;
+        self.page_anchor_counters = state.page_anchor_counters;
+    }
+
+    pub(in crate::layout) fn take_positioned_scratch_side_effects(
+        &mut self,
+    ) -> CapturedPositionedSideEffects {
+        let scratch_page_count = self.pages.len();
+        let mut named_strings = std::mem::take(&mut self.page_named_strings);
+        let mut running_elements = std::mem::take(&mut self.page_running_elements);
+        named_strings.resize_with(scratch_page_count, HashMap::new);
+        running_elements.resize_with(scratch_page_count, HashMap::new);
+        let mut page_effects = named_strings
+            .into_iter()
+            .zip(running_elements)
+            .enumerate()
+            .filter_map(|(page_index, (named_strings, running_elements))| {
+                (!named_strings.is_empty() || !running_elements.is_empty()).then_some((
+                    ScratchPageIndex::new(page_index),
+                    PendingPageSideEffects {
+                        page_index,
+                        named_strings,
+                        running_elements,
+                        links: Vec::new(),
+                    },
+                ))
+            })
+            .collect::<Vec<_>>();
+        let current_named_strings = std::mem::take(&mut self.current_page_named_strings);
+        let current_running_elements = std::mem::take(&mut self.current_page_running_elements);
+        if !current_named_strings.is_empty() || !current_running_elements.is_empty() {
+            page_effects.push((
+                ScratchPageIndex::new(scratch_page_count),
+                PendingPageSideEffects {
+                    page_index: scratch_page_count,
+                    named_strings: current_named_strings,
+                    running_elements: current_running_elements,
+                    links: Vec::new(),
+                },
+            ));
+        }
+        CapturedPositionedSideEffects {
+            bookmarks: std::mem::take(&mut self.bookmarks),
+            anchors: std::mem::take(&mut self.page_anchors)
+                .into_iter()
+                .map(|(target, page)| (target, ScratchPageIndex::new(page)))
+                .collect(),
+            anchor_source_positions: std::mem::take(&mut self.page_anchor_source_positions)
+                .into_iter()
+                .collect(),
+            anchor_text: std::mem::take(&mut self.page_anchor_text)
+                .into_iter()
+                .collect(),
+            anchor_counters: std::mem::take(&mut self.page_anchor_counters)
+                .into_iter()
+                .collect(),
+            page_effects,
+        }
     }
 
     /// Captures out-of-flow positioned paint fragments from every page touched by layout.
@@ -1169,11 +1588,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn margin_box_progress_uses_the_fragmentainer_block_axis() {
+        let margin_box =
+            FragmentainerBlockMarginBox::new(PageTopRect::new(40.0, 180.0, 30.0, 60.0));
+
+        assert_eq!(
+            margin_box.start_distance_from(200.0, PhysicalSide::Top),
+            20.0
+        );
+        assert_eq!(
+            margin_box.start_distance_from(10.0, PhysicalSide::Left),
+            30.0
+        );
+        assert_eq!(
+            margin_box.start_distance_from(100.0, PhysicalSide::Right),
+            30.0
+        );
+        assert_eq!(margin_box.block_extent(PhysicalSide::Top), layout_pt(60.0));
+        assert_eq!(
+            margin_box.block_extent(PhysicalSide::Right),
+            layout_pt(30.0)
+        );
+    }
+
+    #[test]
     fn clipped_positioned_span_retains_only_the_reachable_prefix() {
         let plan = PositionedFragmentationPlan::for_absolute_box(
             0,
             Some(1_000_000),
             100.0,
+            PhysicalSide::Top,
             layout_pt(100.0),
             PositionedPaintReach::Clipped {
                 clip: PaintClip::new(0.0, 0.0, 100.0, 100.0),
@@ -1198,6 +1642,7 @@ mod tests {
             3,
             Some(12),
             100.0,
+            PhysicalSide::Top,
             layout_pt(100.0),
             PositionedPaintReach::PotentiallyVisible,
         );
@@ -1207,12 +1652,65 @@ mod tests {
     }
 
     #[test]
+    fn vertical_fragmentainers_use_the_horizontal_overflow_clip_axis() {
+        let clip = OverflowClip::from_paint_rect_with_axes_and_non_scrollable(
+            paint_space_rect(0.0, 0.0, 150.0, 100.0),
+            true,
+            false,
+            true,
+            false,
+        );
+        let reach = PositionedPaintReach::from_overflow_clips(
+            &[clip],
+            FlowAxes::new(WritingMode::VerticalLr, Direction::Ltr),
+        );
+        assert!(matches!(reach, PositionedPaintReach::Clipped { .. }));
+
+        let plan = PositionedFragmentationPlan::for_absolute_box(
+            0,
+            Some(1_000_000),
+            0.0,
+            PhysicalSide::Left,
+            layout_pt(100.0),
+            reach,
+        );
+        assert_eq!(plan.materialized_destination_end(), Some(1));
+    }
+
+    #[test]
+    fn right_to_left_vertical_fragmentainers_measure_clipping_from_the_right_edge() {
+        let clip = OverflowClip::from_paint_rect_with_axes_and_non_scrollable(
+            paint_space_rect(150.0, 0.0, 150.0, 100.0),
+            true,
+            false,
+            true,
+            false,
+        );
+        let reach = PositionedPaintReach::from_overflow_clips(
+            &[clip],
+            FlowAxes::new(WritingMode::VerticalRl, Direction::Ltr),
+        );
+        assert!(matches!(reach, PositionedPaintReach::Clipped { .. }));
+
+        let plan = PositionedFragmentationPlan::for_absolute_box(
+            0,
+            Some(1_000_000),
+            300.0,
+            PhysicalSide::Right,
+            layout_pt(100.0),
+            reach,
+        );
+        assert_eq!(plan.materialized_destination_end(), Some(1));
+    }
+
+    #[test]
     fn pending_positioned_fragmentation_never_materializes_a_clipped_tail() {
         let mut pending = PendingPositionedFragmentation::default();
         pending.record(PositionedFragmentationPlan::for_absolute_box(
             0,
             Some(50_000),
             100.0,
+            PhysicalSide::Top,
             layout_pt(100.0),
             PositionedPaintReach::Clipped {
                 clip: PaintClip::new(0.0, 0.0, 100.0, 100.0),
@@ -1228,5 +1726,56 @@ mod tests {
                 .count,
             FragmentainerCount::new(50_000)
         );
+    }
+
+    #[test]
+    fn scratch_effects_map_once_and_clipped_tail_effects_are_omitted() {
+        let source = CapturedPositionedPaint {
+            fragments: MaterializedFragmentPrefix::new(Vec::new()),
+            effects: CapturedPositionedSideEffects {
+                anchors: vec![
+                    ("first".to_owned(), ScratchPageIndex::new(0)),
+                    ("clipped-tail".to_owned(), ScratchPageIndex::new(2)),
+                ],
+                anchor_text: vec![
+                    (
+                        "first".to_owned(),
+                        AnchorText {
+                            content: "first".to_owned(),
+                            before: String::new(),
+                            after: String::new(),
+                        },
+                    ),
+                    (
+                        "clipped-tail".to_owned(),
+                        AnchorText {
+                            content: "tail".to_owned(),
+                            before: String::new(),
+                            after: String::new(),
+                        },
+                    ),
+                ],
+                ..CapturedPositionedSideEffects::default()
+            },
+            source_page_start: DocumentPageIndex::new(4),
+            initial_page_context: PageContext::from_options(&RenderOptions::default()),
+        };
+
+        let mut replay = source.into_final_same_pages();
+        assert_eq!(
+            replay.effects.anchors,
+            vec![
+                ("first".to_owned(), DocumentPageIndex::new(4)),
+                ("clipped-tail".to_owned(), DocumentPageIndex::new(6)),
+            ]
+        );
+
+        replay.retain_effects_through(DocumentPageIndex::new(4));
+        assert_eq!(
+            replay.effects.anchors,
+            vec![("first".to_owned(), DocumentPageIndex::new(4))]
+        );
+        assert_eq!(replay.effects.anchor_text.len(), 1);
+        assert_eq!(replay.effects.anchor_text[0].0, "first");
     }
 }

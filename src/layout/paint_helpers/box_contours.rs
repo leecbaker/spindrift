@@ -16,8 +16,9 @@ pub(in crate::layout) enum BoxContentContourRequest {
         reference_box: css::BackgroundBox,
         outset: f32,
     },
-    /// Replaced content is clipped to the shaped content edge even when
-    /// overflow is visible.
+    /// Replaced content is clipped to the shaped content edge after its
+    /// caller has selected an applicable CSS Overflow or `border-shape`
+    /// constraint.
     /// <https://drafts.csswg.org/css-borders-4/#corner-clipping>
     ReplacedContent,
 }

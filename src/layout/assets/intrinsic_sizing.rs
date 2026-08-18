@@ -296,6 +296,7 @@ impl<'a> LayoutBuilder<'a> {
         // the enclosing intrinsic percentage basis is indefinite.
         // <https://www.w3.org/TR/css-values-4/#font-relative-lengths>
         // <https://www.w3.org/TR/css-sizing-3/#intrinsic-sizes>
+        let source_style = style;
         let used_style = self.style_with_current_used_lengths(style);
         let style = &used_style;
         let containment = used_property_containment(element, style);
@@ -305,8 +306,11 @@ impl<'a> LayoutBuilder<'a> {
                 || matches!(style.column_width, css::ComputedColumnWidth::Length(_))
                 || matches!(style.column_height, css::ComputedColumnHeight::Length(_)))
         {
-            built_multicol_child_boxes =
-                self.build_frozen_child_boxes_with_current_ancestors(element, stylesheets, style);
+            built_multicol_child_boxes = self.build_frozen_child_boxes_with_current_ancestors(
+                element,
+                stylesheets,
+                source_style,
+            );
             Some(built_multicol_child_boxes.as_slice())
         } else {
             child_boxes
@@ -425,7 +429,7 @@ impl<'a> LayoutBuilder<'a> {
                     built_child_boxes = self.build_frozen_child_boxes_with_current_ancestors(
                         element,
                         stylesheets,
-                        style,
+                        source_style,
                     );
                     &built_child_boxes
                 };

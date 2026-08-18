@@ -112,12 +112,63 @@ pub(super) struct TableAxes {
     pub(super) direction: Direction,
 }
 
+/// An edge of the table root's logical cell grid.
+///
+/// A collapsed-border candidate originates from a physical CSS border side,
+/// but conflict resolution happens on this root-owned grid.  Keeping this
+/// distinct from [`LogicalSide`] prevents a cell with an orthogonal writing
+/// mode from selecting a different table boundary than its table root:
+/// <https://drafts.csswg.org/css-tables-3/#collapsing-borders> and
+/// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TableGridEdge {
+    InlineStart,
+    InlineEnd,
+    BlockStart,
+    BlockEnd,
+}
+
 impl TableAxes {
     pub(super) fn for_style(style: &ComputedStyle) -> Self {
         Self {
             flow: FlowAxes::for_style(style),
             direction: style.used_direction(),
         }
+    }
+
+    /// Map a physical CSS border side onto the table root's logical grid.
+    ///
+    /// Collapsed-border declarations use physical CSS sides, while rows and
+    /// columns are indexed in the table root's logical block and inline axes.
+    /// This is deliberately rooted at the table, rather than the originating
+    /// cell or table part:
+    /// <https://drafts.csswg.org/css-tables-3/#collapsing-borders> and
+    /// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>.
+    pub(super) fn grid_edge_for_physical_side(self, side: PhysicalSide) -> TableGridEdge {
+        let axes = WritingModeAxes::new(self.flow.writing_mode(), self.direction);
+        for (logical_side, grid_edge) in [
+            (LogicalSide::InlineStart, TableGridEdge::InlineStart),
+            (LogicalSide::InlineEnd, TableGridEdge::InlineEnd),
+            (LogicalSide::BlockStart, TableGridEdge::BlockStart),
+            (LogicalSide::BlockEnd, TableGridEdge::BlockEnd),
+        ] {
+            if axes.physical_side(logical_side) == side {
+                return grid_edge;
+            }
+        }
+        unreachable!("writing-mode side mapping must be bijective")
+    }
+
+    /// Map a table root logical grid edge to the corresponding physical CSS
+    /// border side. See [`Self::grid_edge_for_physical_side`].
+    pub(super) fn physical_side_for_grid_edge(self, edge: TableGridEdge) -> PhysicalSide {
+        let logical_side = match edge {
+            TableGridEdge::InlineStart => LogicalSide::InlineStart,
+            TableGridEdge::InlineEnd => LogicalSide::InlineEnd,
+            TableGridEdge::BlockStart => LogicalSide::BlockStart,
+            TableGridEdge::BlockEnd => LogicalSide::BlockEnd,
+        };
+        WritingModeAxes::new(self.flow.writing_mode(), self.direction).physical_side(logical_side)
     }
 
     #[cfg(test)]
@@ -207,6 +258,73 @@ impl TableAxes {
 pub(super) enum TableRootTrackAxis {
     Inline,
     Block,
+}
+
+/// Selects the physical CSS sizing dimension for a table root inline track.
+///
+/// CSS 2.2's fixed table algorithm describes column sizing in terms of
+/// `width`, while CSS Writing Modes maps the table root's logical inline axis
+/// to physical width in horizontal writing and physical height in vertical or
+/// sideways writing. This adapter deliberately has no cell flow or
+/// `text-orientation` input: cells do not own the table grid axes, and text
+/// orientation only controls glyph orientation.
+/// <https://www.w3.org/TR/CSS22/tables.html#width-layout>
+/// <https://www.w3.org/TR/css-writing-modes-4/#logical-to-physical>
+/// <https://www.w3.org/TR/css-writing-modes-4/#text-orientation>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct TableInlineTrackSizing {
+    physical_axis: PhysicalAxis,
+}
+
+impl TableInlineTrackSizing {
+    pub(super) fn for_table(table_style: &ComputedStyle) -> Self {
+        Self {
+            physical_axis: TableCellAxisAdapter::for_table(table_style)
+                .root_track_physical_axis(TableRootTrackAxis::Inline),
+        }
+    }
+
+    pub(super) fn uses_physical_width(self) -> bool {
+        self.physical_axis == PhysicalAxis::Horizontal
+    }
+
+    /// Select the physical `width` or `height` declaration that supplies a
+    /// table root inline-track size.
+    pub(super) fn declared_size(
+        self,
+        style: &ComputedStyle,
+    ) -> css::ComputedLengthPercentageOrAuto {
+        if self.uses_physical_width() {
+            style.box_values.width.clone()
+        } else {
+            style.box_values.height.value().clone()
+        }
+    }
+
+    /// Sum the two physical padding or border sides parallel to the table
+    /// root inline axis.
+    pub(super) fn parallel_insets(self, edges: css::Edges) -> NonContentLength {
+        if self.uses_physical_width() {
+            non_content_pt(edges.left + edges.right)
+        } else {
+            non_content_pt(edges.top + edges.bottom)
+        }
+    }
+
+    /// Apply min/max constraints from the same physical axis as the selected
+    /// declared track size.
+    pub(super) fn constrain_content_box_size(
+        self,
+        style: &ComputedStyle,
+        value: ContentBoxLength,
+        percentage_basis: PercentageBasis<LayoutLength>,
+    ) -> ContentBoxLength {
+        if self.uses_physical_width() {
+            constrain_content_width(style, value, percentage_basis)
+        } else {
+            constrain_content_height(style, value, percentage_basis)
+        }
+    }
 }
 
 /// Maps the table root's track axes and a cell's own flow to physical axes.
@@ -587,6 +705,202 @@ pub(super) struct TableGridPlacement {
     logical_size: TableGridLogicalSize,
 }
 
+/// The two grid coordinate frames owned by a separated-border table wrapper.
+///
+/// The wrapper grid includes the two outer block-axis `border-spacing` strips
+/// that contribute to the table's wrapper size. Cell, row, and column
+/// structural painting instead uses the cell grid, whose origin and extent
+/// exclude exactly those strips. Keeping both frames together prevents a
+/// caller from removing an edge spacing twice (or from the wrong physical
+/// side in vertical writing modes).
+/// <https://www.w3.org/TR/CSS22/tables.html#separated-borders>
+/// <https://drafts.csswg.org/css-writing-modes-4/#abstract-box>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct TableGridFrames {
+    wrapper_grid: TableGridPlacement,
+    cell_grid: TableGridPlacement,
+}
+
+/// The immutable complete source grid retained for fragmented table paint.
+///
+/// Source coordinates resolve CSS table backgrounds and borders before a row
+/// piece is assigned to a page or column.  It is deliberately not
+/// interchangeable with [`TableDestinationCellGridFrame`]: sharing their
+/// underlying page-space representation previously made it possible to use a
+/// continuation origin as a repeating-gradient positioning area.
+/// <https://drafts.csswg.org/css-tables-3/#drawing-backgrounds>
+/// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout::table) struct TableSourceGridFrame {
+    grid: TableGridPlacement,
+}
+
+impl TableSourceGridFrame {
+    pub(super) fn new(grid: TableGridPlacement) -> Self {
+        Self { grid }
+    }
+
+    pub(super) fn grid(self) -> TableGridPlacement {
+        self.grid
+    }
+}
+
+/// The cell-paint viewport of one destination table fragmentainer.
+///
+/// This wrapper has no constructor accepting a raw page origin.  The only
+/// route to one is [`TableFragmentainerFrame`], which constructs wrapper and
+/// cell frames together and removes separated-border edge spacing exactly
+/// once.
+/// <https://www.w3.org/TR/CSS22/tables.html#separated-borders>
+/// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout::table) struct TableDestinationCellGridFrame {
+    grid: TableGridPlacement,
+}
+
+impl TableDestinationCellGridFrame {
+    fn new(grid: TableGridPlacement) -> Self {
+        Self { grid }
+    }
+
+    pub(super) fn grid(self) -> TableGridPlacement {
+        self.grid
+    }
+
+    /// Test-only fixture constructor. Production destination frames must be
+    /// created by [`TableFragmentainerFrame`] so their origin and separated
+    /// border-spacing relation cannot be independently reconstructed.
+    #[cfg(test)]
+    pub(in crate::layout::table) fn fixture(grid: TableGridPlacement) -> Self {
+        Self::new(grid)
+    }
+}
+
+impl TableGridFrames {
+    /// Construct the complete wrapper grid and its cell-paint subgrid from
+    /// one authoritative placement.
+    pub(super) fn new(
+        wrapper_grid: TableGridPlacement,
+        block_edge_spacing: TableGridLength,
+    ) -> Self {
+        let edge = block_edge_spacing.get().max(0.0);
+        let cell_grid = if edge == 0.0 {
+            wrapper_grid
+        } else {
+            let origin = if wrapper_grid.writing_mode().has_vertical_lines() {
+                PageTopPoint::new(wrapper_grid.origin.x() + edge, wrapper_grid.origin.top_y())
+            } else {
+                PageTopPoint::new(wrapper_grid.origin.x(), wrapper_grid.origin.top_y() - edge)
+            };
+            let block = (wrapper_grid.logical_block_grid_extent().get() - edge * 2.0).max(0.0);
+            TableGridPlacement::with_axes(
+                origin,
+                wrapper_grid.axes,
+                TableGridLogicalSize::new(
+                    wrapper_grid.logical_size.inline(),
+                    LogicalBlockContentSize::new(content_box_pt(block)),
+                ),
+            )
+        };
+        Self {
+            wrapper_grid,
+            cell_grid,
+        }
+    }
+
+    /// Reconstruct the complete wrapper grid from a cell-paint grid.
+    ///
+    /// Fragmented row layout receives a destination cell grid because rows
+    /// and structural backgrounds must never include outer separated-border
+    /// strips. Wrapper decoration, captions, and collapsed-border paint still
+    /// need that complete grid. Keeping the inverse beside [`Self::new`]
+    /// prevents continuation code from independently adding spacing on a
+    /// physical side.
+    pub(super) fn from_cell_grid(
+        cell_grid: TableGridPlacement,
+        block_edge_spacing: TableGridLength,
+    ) -> Self {
+        let edge = block_edge_spacing.get().max(0.0);
+        if edge == 0.0 {
+            return Self {
+                wrapper_grid: cell_grid,
+                cell_grid,
+            };
+        }
+        let origin = if cell_grid.writing_mode().has_vertical_lines() {
+            PageTopPoint::new(cell_grid.origin.x() - edge, cell_grid.origin.top_y())
+        } else {
+            PageTopPoint::new(cell_grid.origin.x(), cell_grid.origin.top_y() + edge)
+        };
+        let block = cell_grid.logical_block_grid_extent().get() + edge * 2.0;
+        let wrapper_grid = TableGridPlacement::with_axes(
+            origin,
+            cell_grid.axes,
+            TableGridLogicalSize::new(
+                cell_grid.logical_size.inline(),
+                LogicalBlockContentSize::new(content_box_pt(block)),
+            ),
+        );
+        Self {
+            wrapper_grid,
+            cell_grid,
+        }
+    }
+
+    pub(super) fn wrapper_grid(self) -> TableGridPlacement {
+        self.wrapper_grid
+    }
+
+    pub(super) fn cell_grid(self) -> TableGridPlacement {
+        self.cell_grid
+    }
+}
+
+/// Immutable geometry of a table in one destination fragmentainer.
+///
+/// The table's source grid is deliberately absent: a fragmented table must
+/// derive source-to-destination translation from two distinct frames, rather
+/// than rebasing a source-local coordinate onto a physical `table_x`.  The
+/// wrapper grid owns decoration and caption placement; the cell grid owns
+/// rows, columns, and structural backgrounds.
+/// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+/// <https://www.w3.org/TR/CSS22/tables.html#separated-borders>
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout::table) struct TableFragmentainerFrame {
+    placement: super::layout::TableFragmentainerPlacement,
+    grids: TableGridFrames,
+}
+
+impl TableFragmentainerFrame {
+    /// Build the complete frame from the destination cell grid.  The inverse
+    /// construction is intentionally private to table geometry: continuation
+    /// code cannot independently add the outer separated-border spacing.
+    pub(super) fn from_cell_grid(
+        placement: super::layout::TableFragmentainerPlacement,
+        cell_grid: TableGridPlacement,
+        block_edge_spacing: TableGridLength,
+    ) -> Self {
+        Self {
+            placement,
+            grids: TableGridFrames::from_cell_grid(cell_grid, block_edge_spacing),
+        }
+    }
+
+    pub(super) fn placement(self) -> super::layout::TableFragmentainerPlacement {
+        self.placement
+    }
+
+    /// The complete wrapper grid used for captions and table-root decoration.
+    pub(super) fn wrapper_grid(self) -> TableGridPlacement {
+        self.grids.wrapper_grid()
+    }
+
+    /// Typed destination frame for row, cell, and structural paint.
+    pub(super) fn cell_grid_frame(self) -> TableDestinationCellGridFrame {
+        TableDestinationCellGridFrame::new(self.grids.cell_grid())
+    }
+}
+
 impl TableGridPlacement {
     pub(super) fn new(origin: PageTopPoint) -> Self {
         Self::with_axes(
@@ -619,6 +933,15 @@ impl TableGridPlacement {
             axes,
             logical_size,
         }
+    }
+
+    /// Return this immutable frame's physical page origin.
+    ///
+    /// Fragmentation may rebase a destination frame, but row and structural
+    /// paint must take that origin from the frame rather than retain a second
+    /// mutable `table_x` coordinate beside it.
+    pub(super) fn origin(self) -> PageTopPoint {
+        self.origin
     }
 
     pub(super) fn overflow_clip_for(self, rect: TableGridRect) -> OverflowClip {
@@ -713,69 +1036,6 @@ impl TableGridPlacement {
         self.axes.flow.writing_mode()
     }
 
-    /// Return the table content box including separated-border block-edge
-    /// spacing around the row grid.
-    ///
-    /// The row grid begins after its block-start edge spacing, whereas a
-    /// table wrapper's padding box encloses both edge spacings. Project the
-    /// expansion here so vertical roots extend on physical X rather than
-    /// incorrectly treating the block axis as physical Y.
-    /// <https://www.w3.org/TR/CSS22/tables.html#separated-borders>
-    /// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
-    pub(super) fn page_top_rect_with_block_edge_spacing(
-        self,
-        edge_spacing: TableGridLength,
-    ) -> PageTopRect {
-        let rect = self.full_page_top_rect();
-        let edge = edge_spacing.get().max(0.0);
-        if self.axes.flow.writing_mode().has_vertical_lines() {
-            PageTopRect::new(
-                rect.x() - edge,
-                rect.top_y(),
-                rect.width() + edge * 2.0,
-                rect.height(),
-            )
-        } else {
-            PageTopRect::new(
-                rect.x(),
-                rect.top_y() + edge,
-                rect.width(),
-                rect.height() + edge * 2.0,
-            )
-        }
-    }
-
-    /// Return the logical row grid after removing the wrapper-owned outer
-    /// block-axis border-spacing edges.
-    ///
-    /// `table_content_height` includes the two outer separated-border edges
-    /// because they contribute to the table wrapper's block size. Structural
-    /// row, column, and cell backgrounds, however, are positioned against the
-    /// grid of originating cells. Keep that grid as the retained source
-    /// placement and let table-root painting add the wrapper edges explicitly:
-    /// <https://www.w3.org/TR/CSS22/tables.html#separated-borders> and
-    /// <https://drafts.csswg.org/css-tables-3/#drawing-cell-backgrounds>.
-    pub(super) fn without_block_edge_spacing(self, edge_spacing: TableGridLength) -> Self {
-        let edge = edge_spacing.get().max(0.0);
-        if edge == 0.0 {
-            return self;
-        }
-        let origin = if self.writing_mode().has_vertical_lines() {
-            PageTopPoint::new(self.origin.x() + edge, self.origin.top_y())
-        } else {
-            PageTopPoint::new(self.origin.x(), self.origin.top_y() - edge)
-        };
-        let block = (self.logical_block_grid_extent().get() - edge * 2.0).max(0.0);
-        Self::with_axes(
-            origin,
-            self.axes,
-            TableGridLogicalSize::new(
-                self.logical_size.inline(),
-                LogicalBlockContentSize::new(content_box_pt(block)),
-            ),
-        )
-    }
-
     pub(super) fn containing_block_for(
         self,
         border_box: TableCellBorderBox,
@@ -827,6 +1087,33 @@ mod tests {
             axes.span_start_x(grid_length(100.0), grid_length(10.0), grid_length(45.0)),
             grid_length(55.0)
         );
+    }
+
+    #[test]
+    fn table_grid_edges_round_trip_through_every_root_writing_mode() {
+        for writing_mode in [
+            WritingMode::HorizontalTb,
+            WritingMode::VerticalRl,
+            WritingMode::VerticalLr,
+            WritingMode::SidewaysRl,
+            WritingMode::SidewaysLr,
+        ] {
+            for direction in [Direction::Ltr, Direction::Rtl] {
+                let axes = TableAxes {
+                    flow: FlowAxes::new(writing_mode, direction),
+                    direction,
+                };
+                for edge in [
+                    TableGridEdge::InlineStart,
+                    TableGridEdge::InlineEnd,
+                    TableGridEdge::BlockStart,
+                    TableGridEdge::BlockEnd,
+                ] {
+                    let physical = axes.physical_side_for_grid_edge(edge);
+                    assert_eq!(axes.grid_edge_for_physical_side(physical), edge);
+                }
+            }
+        }
     }
 
     #[test]
@@ -1031,27 +1318,72 @@ mod tests {
     }
 
     #[test]
-    fn vertical_block_edge_spacing_expands_physical_x_only() {
-        let placement = TableGridPlacement::with_axes(
-            PageTopPoint::new(20.0, 200.0),
-            TableAxes {
-                flow: FlowAxes::new(WritingMode::VerticalRl, Direction::Rtl),
-                direction: Direction::Rtl,
-            },
-            TableGridLogicalSize::new(
-                LogicalInlineContentSize::new(content_box_pt(100.0)),
-                LogicalBlockContentSize::new(content_box_pt(300.0)),
-            ),
-        );
+    fn grid_frames_remove_block_edge_spacing_once_in_every_root_flow() {
+        for writing_mode in [
+            WritingMode::HorizontalTb,
+            WritingMode::VerticalRl,
+            WritingMode::VerticalLr,
+            WritingMode::SidewaysRl,
+            WritingMode::SidewaysLr,
+        ] {
+            for direction in [Direction::Ltr, Direction::Rtl] {
+                let placement = TableGridPlacement::with_axes(
+                    PageTopPoint::new(20.0, 200.0),
+                    TableAxes {
+                        flow: FlowAxes::new(writing_mode, direction),
+                        direction,
+                    },
+                    TableGridLogicalSize::new(
+                        LogicalInlineContentSize::new(content_box_pt(100.0)),
+                        LogicalBlockContentSize::new(content_box_pt(300.0)),
+                    ),
+                );
+                let frames = TableGridFrames::new(placement, grid_length(10.0));
 
-        assert_eq!(
-            placement.page_top_rect_with_block_edge_spacing(grid_length(10.0)),
-            PageTopRect::new(10.0, 200.0, 320.0, 100.0)
-        );
-        let grid = placement.without_block_edge_spacing(grid_length(10.0));
-        assert_eq!(
-            grid.full_page_top_rect(),
-            PageTopRect::new(30.0, 200.0, 280.0, 100.0)
-        );
+                assert_eq!(frames.wrapper_grid(), placement);
+                assert_eq!(
+                    frames.cell_grid().logical_size.inline(),
+                    placement.logical_size.inline()
+                );
+                assert_eq!(frames.cell_grid().logical_size.block().points(), 280.0);
+                let expected_origin = if writing_mode.has_vertical_lines() {
+                    PageTopPoint::new(30.0, 200.0)
+                } else {
+                    PageTopPoint::new(20.0, 190.0)
+                };
+                assert_eq!(frames.cell_grid().origin(), expected_origin);
+            }
+        }
+    }
+
+    #[test]
+    fn cell_grid_reconstructs_its_wrapper_frame_without_a_second_rebase() {
+        for writing_mode in [
+            WritingMode::HorizontalTb,
+            WritingMode::VerticalRl,
+            WritingMode::VerticalLr,
+            WritingMode::SidewaysRl,
+            WritingMode::SidewaysLr,
+        ] {
+            for direction in [Direction::Ltr, Direction::Rtl] {
+                let wrapper = TableGridPlacement::with_axes(
+                    PageTopPoint::new(20.0, 200.0),
+                    TableAxes {
+                        flow: FlowAxes::new(writing_mode, direction),
+                        direction,
+                    },
+                    TableGridLogicalSize::new(
+                        LogicalInlineContentSize::new(content_box_pt(100.0)),
+                        LogicalBlockContentSize::new(content_box_pt(300.0)),
+                    ),
+                );
+                let initial = TableGridFrames::new(wrapper, grid_length(10.0));
+                let reconstructed =
+                    TableGridFrames::from_cell_grid(initial.cell_grid(), grid_length(10.0));
+
+                assert_eq!(reconstructed.wrapper_grid(), wrapper);
+                assert_eq!(reconstructed.cell_grid(), initial.cell_grid());
+            }
+        }
     }
 }

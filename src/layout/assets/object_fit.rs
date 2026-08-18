@@ -1,11 +1,39 @@
 use super::*;
 use crate::css::ObjectFit;
 use crate::layout::asset_helpers::{
-    CssImageNaturalDimensions, ResolvedObjectViewBox, resolved_object_view_box,
-    resolved_object_view_box_for_svg,
+    CssImageNaturalDimensions, NormalizedObjectSourceRect, ResolvedObjectViewBox,
+    resolved_object_view_box, resolved_object_view_box_for_svg,
 };
 use crate::svg::{SharedSvgAsset, SvgSourcePoint, SvgSourceRect, SvgSourceSize};
 use crate::units::LayoutSize;
+
+/// Whether CSS Overflow clips a replaced object's concrete content paint to
+/// its content box.
+///
+/// This is distinct from `object-view-box`: a view box always selects a source
+/// crop, whereas `overflow: visible` permits the selected object to extend
+/// beyond its CSS content box.
+/// <https://drafts.csswg.org/css-overflow-4/#overflow-replaced>
+/// <https://drafts.csswg.org/css-images-3/#the-object-fit>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) enum ReplacedObjectOverflow {
+    ClipToContentBox,
+    Visible,
+}
+
+impl ReplacedObjectOverflow {
+    pub(in crate::layout) fn from_style(style: &ComputedStyle) -> Self {
+        if style_clips_overflow(style) {
+            Self::ClipToContentBox
+        } else {
+            Self::Visible
+        }
+    }
+
+    const fn clips_to_content_box(self) -> bool {
+        matches!(self, Self::ClipToContentBox)
+    }
+}
 
 fn rectangular_object_view_box_clip(rect: PaintRect) -> RenderedPathClip {
     RenderedPathClip::new(
@@ -25,18 +53,26 @@ fn object_view_box_clip(
     view_box: &ResolvedObjectViewBox,
     natural_size: LayoutSize,
     geometry: ConcreteObjectGeometry,
+    overflow: ReplacedObjectOverflow,
 ) -> Option<RenderedPathClip> {
-    // Every concrete object is clipped to the visible portion of its content
-    // box. This is independent of `object-view-box`: an ineffective view box
-    // leaves source selection alone, but must not remove the object-fit clip.
-    // Keeping this as an image-local clip also gives the raster resource the
-    // same edge coverage as an equivalent clipped background image.
+    let overflow_clip = if overflow.clips_to_content_box() {
+        geometry.visible
+    } else {
+        None
+    };
+    // An ineffective `object-view-box` does not itself crop a concrete
+    // object.  CSS Overflow alone determines whether it is bounded by its
+    // content box.
     if !view_box.applies() {
-        return Some(rectangular_object_view_box_clip(geometry.visible));
+        return overflow_clip.map(rectangular_object_view_box_clip);
     }
+    // An effective view box always retains its selected source crop. When
+    // overflow is visible, that crop follows the concrete object rather than
+    // its content-box intersection.
+    let crop_rect = overflow_clip.unwrap_or(geometry.concrete);
     let source = view_box.source_rect();
     let Some(radii) = view_box.radii().filter(|radii| !(*radii).clone().is_zero()) else {
-        return Some(rectangular_object_view_box_clip(geometry.visible));
+        return Some(rectangular_object_view_box_clip(crop_rect));
     };
     let source_width = natural_size.width * source.size.width;
     let source_height = natural_size.height * source.size.height;
@@ -62,26 +98,31 @@ fn object_view_box_clip(
         RenderedPathFillRule::NonZero,
         Vec::new(),
     );
-    let rectangular = rectangular_object_view_box_clip(geometry.visible);
-    clip.additional_clips.push(RenderedPathClipPath::new(
-        rectangular.commands,
-        rectangular.fill_rule,
-    ));
+    if let Some(overflow_clip) = overflow_clip {
+        let rectangular = rectangular_object_view_box_clip(overflow_clip);
+        clip.additional_clips.push(RenderedPathClipPath::new(
+            rectangular.commands,
+            rectangular.fill_rule,
+        ));
+    }
     Some(clip)
 }
 
 /// Resolve the concrete object size and position for a raster replaced element.
 ///
-/// The concrete object is positioned in the element's content box and, when it
-/// overflows, cropped through the shared raster paint-area operation. This
+/// The concrete object is positioned in the element's content box. CSS
+/// Overflow decides whether an oversized object is cropped to that box; this
 /// keeps `object-fit` and `background-size` on one source-to-destination
 /// mapping model, including the PDF image resource's pixel coordinate system.
 /// <https://www.w3.org/TR/css-images-3/#the-object-fit>
 pub(in crate::layout) fn apply_object_fit(
     image: &mut RenderedImage,
+    natural_size: LayoutSize,
     object_fit: ObjectFit,
     object_position: css::BackgroundPosition,
     object_view_box: css::ObjectViewBox,
+    overflow: ReplacedObjectOverflow,
+    effective_zoom: css::EffectiveZoom,
 ) -> bool {
     if image.width() <= 0.0 || image.height() <= 0.0 {
         return false;
@@ -92,8 +133,8 @@ pub(in crate::layout) fn apply_object_fit(
         return false;
     }
     let natural_size = LayoutSize::new(
-        source_width as f32 * css::CSS_PX_TO_PT,
-        source_height as f32 * css::CSS_PX_TO_PT,
+        natural_size.width * effective_zoom.factor(),
+        natural_size.height * effective_zoom.factor(),
     );
     let view_box = resolved_object_view_box(object_view_box, Some(natural_size));
     let source = view_box.source_rect();
@@ -106,6 +147,9 @@ pub(in crate::layout) fn apply_object_fit(
     ) else {
         return false;
     };
+    if overflow.clips_to_content_box() && geometry.visible.is_none() {
+        return false;
+    }
     let full_width = geometry.concrete.size.width / source.size.width;
     let full_height = geometry.concrete.size.height / source.size.height;
     image.set_paint_rect(paint_space_rect(
@@ -114,13 +158,16 @@ pub(in crate::layout) fn apply_object_fit(
         full_width,
         full_height,
     ));
-    if let Some(clip) = object_view_box_clip(&view_box, natural_size, geometry) {
+    if let Some(clip) = object_view_box_clip(&view_box, natural_size, geometry, overflow) {
         // `fill` maps the complete source directly to the destination. Its
         // visible-area rectangle is therefore already the paint primitive's
         // own boundary. Appending it to an existing shaped content contour
         // creates a second raster edge in the same graphics state without
         // changing the CSS intersection.
-        if !view_box.applies() && matches!(object_fit, ObjectFit::Fill) {
+        if !view_box.applies()
+            && overflow.clips_to_content_box()
+            && matches!(object_fit, ObjectFit::Fill)
+        {
             if image.clip().is_none() {
                 *image = image.clone().with_destination_rect_clip(clip);
             }
@@ -155,7 +202,62 @@ pub(in crate::layout) fn apply_object_fit(
 #[derive(Clone, Copy)]
 struct ConcreteObjectGeometry {
     concrete: crate::document::paint::geometry::PaintRect,
-    visible: crate::document::paint::geometry::PaintRect,
+    visible: Option<crate::document::paint::geometry::PaintRect>,
+}
+
+/// The source viewport and destination selected for an SVG concrete object.
+///
+/// CSS Images positions the concrete object in bottom-left-origin paint space,
+/// while SVG viewport source coordinates are top-left-origin. Keeping the
+/// conversion in this composite makes that coordinate-system boundary
+/// explicit and prevents individual callers from treating a paint-space
+/// bottom offset as an SVG source Y offset.
+/// <https://drafts.csswg.org/css-images-3/#the-object-fit>
+/// <https://svgwg.org/svg2-draft/coords.html#InitialCoordinateSystem>
+#[derive(Clone, Copy)]
+struct SvgConcreteObjectMapping {
+    destination: PaintRect,
+    source: SvgSourceRect,
+}
+
+impl SvgConcreteObjectMapping {
+    fn from_geometry(
+        geometry: ConcreteObjectGeometry,
+        overflow: ReplacedObjectOverflow,
+        source_view_box: NormalizedObjectSourceRect,
+        source_size: SvgSourceSize,
+    ) -> Option<Self> {
+        let destination = match overflow {
+            ReplacedObjectOverflow::ClipToContentBox => geometry.visible?,
+            ReplacedObjectOverflow::Visible => geometry.concrete,
+        };
+        debug_assert!(geometry.concrete.size.width > 0.0);
+        debug_assert!(geometry.concrete.size.height > 0.0);
+
+        let source_left =
+            (destination.min_x() - geometry.concrete.min_x()) / geometry.concrete.size.width;
+        // SVG's source viewport starts at its top edge, whereas a PaintRect
+        // starts at its bottom edge. Convert exactly once at this boundary.
+        let source_top =
+            (geometry.concrete.max_y() - destination.max_y()) / geometry.concrete.size.height;
+        let source_width = destination.size.width / geometry.concrete.size.width;
+        let source_height = destination.size.height / geometry.concrete.size.height;
+        Some(Self {
+            destination,
+            source: SvgSourceRect::new(
+                SvgSourcePoint::new(
+                    source_size.width
+                        * (source_view_box.origin.x + source_view_box.size.width * source_left),
+                    source_size.height
+                        * (source_view_box.origin.y + source_view_box.size.height * source_top),
+                ),
+                SvgSourceSize::new(
+                    source_size.width * source_view_box.size.width * source_width,
+                    source_size.height * source_view_box.size.height * source_height,
+                ),
+            ),
+        })
+    }
 }
 
 fn concrete_object_geometry(
@@ -207,7 +309,7 @@ fn concrete_object_geometry(
         concrete_size.width,
         concrete_size.height,
     );
-    let visible = concrete.intersection(&destination)?;
+    let visible = concrete.intersection(&destination);
     Some(ConcreteObjectGeometry { concrete, visible })
 }
 
@@ -222,24 +324,49 @@ pub(in crate::layout) fn svg_replaced_group(
     object_fit: ObjectFit,
     object_position: css::BackgroundPosition,
     object_view_box: css::ObjectViewBox,
+    overflow: ReplacedObjectOverflow,
 ) -> crate::svg::SvgPaintGroup {
-    svg_replaced_group_with_viewport_clip(
+    svg_replaced_group_with_overflow(
         asset,
         destination,
         object_fit,
         object_position,
         object_view_box,
-        true,
+        overflow,
     )
 }
 
-/// Paint an SVG replaced object while preserving the root viewport's CSS
-/// overflow policy.
+/// Paint an external SVG replaced object while preserving the CSS overflow
+/// policy of its containing replaced element.
 ///
-/// CSS Images consumers always select a finite source rectangle and therefore
-/// use [`svg_replaced_group`]'s clipping behavior. An embedded SVG root is a
-/// CSS box in its own right: `overflow: visible` lets its SVG descendants
-/// extend beyond that viewport.
+/// `overflow: visible` lets the selected source extend beyond the CSS content
+/// box, while an effective `object-view-box` remains a source crop.
+/// <https://www.w3.org/TR/SVG2/render.html#OverflowAndClipProperties>
+fn svg_replaced_group_with_overflow(
+    asset: &SharedSvgAsset,
+    destination: PaintRect,
+    object_fit: ObjectFit,
+    object_position: css::BackgroundPosition,
+    object_view_box: css::ObjectViewBox,
+    overflow: ReplacedObjectOverflow,
+) -> crate::svg::SvgPaintGroup {
+    svg_replaced_group_with_geometry_policy(
+        asset,
+        destination,
+        object_fit,
+        object_position,
+        object_view_box,
+        overflow,
+        overflow.clips_to_content_box(),
+    )
+}
+
+/// Paint an embedded SVG root with its established SVG viewport policy.
+///
+/// This path intentionally keeps the pre-existing source-selection behavior:
+/// even when the SVG root's viewport is visible, object-fit continues to map
+/// the content-box intersection. External SVG image overflow is handled by
+/// [`svg_replaced_group`] instead.
 /// <https://www.w3.org/TR/SVG2/render.html#OverflowAndClipProperties>
 pub(in crate::layout) fn svg_replaced_group_with_viewport_clip(
     asset: &SharedSvgAsset,
@@ -247,6 +374,26 @@ pub(in crate::layout) fn svg_replaced_group_with_viewport_clip(
     object_fit: ObjectFit,
     object_position: css::BackgroundPosition,
     object_view_box: css::ObjectViewBox,
+    clip_viewport: bool,
+) -> crate::svg::SvgPaintGroup {
+    svg_replaced_group_with_geometry_policy(
+        asset,
+        destination,
+        object_fit,
+        object_position,
+        object_view_box,
+        ReplacedObjectOverflow::ClipToContentBox,
+        clip_viewport,
+    )
+}
+
+fn svg_replaced_group_with_geometry_policy(
+    asset: &SharedSvgAsset,
+    destination: PaintRect,
+    object_fit: ObjectFit,
+    object_position: css::BackgroundPosition,
+    object_view_box: css::ObjectViewBox,
+    overflow: ReplacedObjectOverflow,
     clip_viewport: bool,
 ) -> crate::svg::SvgPaintGroup {
     let natural_size = asset.replaced_intrinsic_size();
@@ -272,39 +419,25 @@ pub(in crate::layout) fn svg_replaced_group_with_viewport_clip(
         geometry.concrete.size.height / source_view_box.size.height,
     ));
     let source_size = viewport_asset.source_viewport_size();
-    let left =
-        (geometry.visible.min_x() - geometry.concrete.min_x()) / geometry.concrete.size.width;
-    let bottom =
-        (geometry.visible.min_y() - geometry.concrete.min_y()) / geometry.concrete.size.height;
-    let visible_width = geometry.visible.size.width / geometry.concrete.size.width;
-    let visible_height = geometry.visible.size.height / geometry.concrete.size.height;
-    let source = SvgSourceRect::new(
-        SvgSourcePoint::new(
-            source_size.width * (source_view_box.origin.x + source_view_box.size.width * left),
-            source_size.height
-                * (source_view_box.origin.y
-                    + source_view_box.size.height * (1.0 - bottom - visible_height)),
-        ),
-        SvgSourceSize::new(
-            source_size.width * source_view_box.size.width * visible_width,
-            source_size.height * source_view_box.size.height * visible_height,
-        ),
-    );
+    let Some(mapping) =
+        SvgConcreteObjectMapping::from_geometry(geometry, overflow, source_view_box, source_size)
+    else {
+        return crate::svg::SvgPaintGroup::empty();
+    };
     let group = viewport_asset.paint_group_for_source_rect_with_viewport_clip(
-        geometry.visible,
-        source,
+        mapping.destination,
+        mapping.source,
         clip_viewport,
     );
-    // `paint_group_for_source_rect` already clips the SVG root viewport to
-    // `geometry.visible`. Re-applying that same rectangular clip is
-    // redundant and can introduce an additional antialiased edge. An effective
-    // `object-view-box` is different: it can add a source-crop contour (and
-    // rounded corners) that the SVG viewport does not express.
+    // The SVG painter owns the CSS-overflow viewport clip. Re-applying that
+    // same rectangular edge would introduce an additional antialiased edge.
+    // An effective `object-view-box` is different: it can add a source-crop
+    // contour (and rounded corners) that the SVG viewport does not express.
     // <https://www.w3.org/TR/css-images-3/#the-object-fit>
     // <https://drafts.csswg.org/css-images-4/#object-view-box>
     if view_box.applies() {
         group.with_clip(
-            object_view_box_clip(&view_box, natural_size, geometry)
+            object_view_box_clip(&view_box, natural_size, geometry, overflow)
                 .expect("an effective object-view-box has a destination clip"),
         )
     } else {
@@ -314,16 +447,19 @@ pub(in crate::layout) fn svg_replaced_group_with_viewport_clip(
 
 /// Resolve the CSS Borders content edge for an atomic replaced primitive.
 ///
-/// This is intentionally independent of `overflow`: CSS Borders requires a
-/// replaced element's content to follow the curved/shaped content edge even
-/// when ordinary descendant overflow remains visible.
+/// Ordinary rounded borders do not clip a replaced object's content when CSS
+/// Overflow permits it to remain visible. `border-shape` retains its explicit
+/// inner-content contour independently of that overflow policy.
 pub(in crate::layout) fn replaced_content_contour(
     border_rect: PaintRect,
     style: &ComputedStyle,
     border_insets: css::Edges,
 ) -> Option<ResolvedBoxContentClip> {
-    if style.border_radius.clone().is_zero() && matches!(style.border_shape, css::BorderShape::None)
-    {
+    let shaped_border = !matches!(style.border_shape, css::BorderShape::None);
+    if !style_clips_overflow(style) && !shaped_border {
+        return None;
+    }
+    if style.border_radius.clone().is_zero() && !shaped_border {
         return None;
     }
     resolve_box_content_contour(
@@ -343,11 +479,11 @@ pub(in crate::layout) fn push_svg_border_image_tiles(
     primitives: &mut Vec<PaintPrimitive>,
     asset: &SharedSvgAsset,
     destination: RenderedImageTileRect,
-    source: RenderedImageSourceRect,
+    source: BorderImageSourceRect,
+    tile_size: PaintSize,
     repeat_x: css::BorderImageRepeatKeyword,
     repeat_y: css::BorderImageRepeatKeyword,
 ) {
-    let tile_size = border_image_base_tile_size(destination, source, repeat_x, repeat_y);
     let x_segments =
         border_image_tile_segments(repeat_x, destination.width(), tile_size.width, source.width);
     let y_segments = border_image_tile_segments(
@@ -360,17 +496,17 @@ pub(in crate::layout) fn push_svg_border_image_tiles(
         for x_segment in &x_segments {
             if x_segment.destination_size <= 0.0
                 || y_segment.destination_size <= 0.0
-                || x_segment.source_size == 0
-                || y_segment.source_size == 0
+                || x_segment.source_size <= 0.0
+                || y_segment.source_size <= 0.0
             {
                 continue;
             }
             let source = SvgSourceRect::new(
                 SvgSourcePoint::new(
-                    (source.x + x_segment.source_offset) as f32,
-                    (source.y + y_segment.source_offset) as f32,
+                    source.x + x_segment.source_offset,
+                    source.y + y_segment.source_offset,
                 ),
-                SvgSourceSize::new(x_segment.source_size as f32, y_segment.source_size as f32),
+                SvgSourceSize::new(x_segment.source_size, y_segment.source_size),
             );
             primitives.extend(
                 asset
@@ -393,13 +529,23 @@ pub(in crate::layout) fn push_svg_border_image_tiles(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn source_pixel_natural_size(image: &RenderedImage) -> LayoutSize {
+        LayoutSize::new(
+            image.pixel_width() as f32 * css::CSS_PX_TO_PT,
+            image.pixel_height() as f32 * css::CSS_PX_TO_PT,
+        )
+    }
     use crate::css::{ComputedLengthPercentage, ObjectViewBox};
     use std::rc::Rc;
 
     fn first_svg_path(group: &crate::svg::SvgPaintGroup) -> Option<&RenderedPath> {
         group.items.iter().find_map(|item| match item {
             crate::svg::SvgPaintItem::Path(path) => Some(path.as_ref()),
-            crate::svg::SvgPaintItem::Group(group) => first_svg_path(group),
+            crate::svg::SvgPaintItem::Group(group) | crate::svg::SvgPaintItem::NestedSvg(group) => {
+                first_svg_path(group)
+            }
+            crate::svg::SvgPaintItem::RasterImage(_) => None,
         })
     }
 
@@ -418,7 +564,7 @@ mod tests {
             geometry.concrete,
             paint_space_rect(10.0, 20.0, 200.0, 100.0)
         );
-        assert_eq!(geometry.visible, destination);
+        assert_eq!(geometry.visible, Some(destination));
     }
 
     #[test]
@@ -473,8 +619,13 @@ mod tests {
         .expect("positive replaced geometry should be paintable");
         let no_effect = ResolvedObjectViewBox::NoEffect;
 
-        let clip = object_view_box_clip(&no_effect, LayoutSize::new(100.0, 100.0), geometry)
-            .expect("the concrete object must remain clipped");
+        let clip = object_view_box_clip(
+            &no_effect,
+            LayoutSize::new(100.0, 100.0),
+            geometry,
+            ReplacedObjectOverflow::ClipToContentBox,
+        )
+        .expect("the concrete object must remain clipped");
 
         assert_eq!(
             clip.commands,
@@ -497,11 +648,15 @@ mod tests {
             None,
         );
 
+        let natural_size = source_pixel_natural_size(&image);
         assert!(apply_object_fit(
             &mut image,
+            natural_size,
             ObjectFit::Fill,
             css::BackgroundPosition::INITIAL,
             css::ObjectViewBox::NONE,
+            ReplacedObjectOverflow::ClipToContentBox,
+            css::EffectiveZoom::NORMAL,
         ));
         assert!(image.has_destination_rect_clip());
     }
@@ -520,14 +675,170 @@ mod tests {
             None,
         );
 
+        let natural_size = source_pixel_natural_size(&image);
         assert!(apply_object_fit(
             &mut image,
+            natural_size,
             ObjectFit::Cover,
             css::BackgroundPosition::INITIAL,
             ObjectViewBox::NONE,
+            ReplacedObjectOverflow::ClipToContentBox,
+            css::EffectiveZoom::NORMAL,
         ));
         assert!(image.clip().is_some());
         assert!(!image.has_destination_rect_clip());
+    }
+
+    #[test]
+    fn visible_overflow_keeps_an_oversized_concrete_raster_object_unclipped() {
+        let destination = paint_space_rect(10.0, 20.0, 80.0, 40.0);
+        let mut image = RenderedImage::from_paint_rect(
+            destination,
+            false,
+            200,
+            100,
+            None,
+            true,
+            vec![0; 200 * 100 * 3].into(),
+            None,
+            None,
+        );
+
+        let natural_size = source_pixel_natural_size(&image);
+        assert!(apply_object_fit(
+            &mut image,
+            natural_size,
+            ObjectFit::None,
+            css::BackgroundPosition::INITIAL,
+            ObjectViewBox::NONE,
+            ReplacedObjectOverflow::Visible,
+            css::EffectiveZoom::NORMAL,
+        ));
+        assert_eq!(
+            image.paint_rect(),
+            paint_space_rect(10.0, -15.0, 150.0, 75.0)
+        );
+        assert!(image.clip().is_none());
+    }
+
+    #[test]
+    fn object_fit_none_uses_css_natural_size_not_raster_sample_dimensions() {
+        let mut image = RenderedImage::from_paint_rect(
+            paint_space_rect(10.0, 20.0, 80.0, 40.0),
+            false,
+            100,
+            50,
+            None,
+            true,
+            vec![0; 100 * 50 * 3].into(),
+            None,
+            None,
+        );
+
+        // A 100×50 sample grid with validated 36dpi EXIF metadata has a
+        // 200×100 CSS-pixel natural size, or 150×75 layout points.
+        assert!(apply_object_fit(
+            &mut image,
+            LayoutSize::new(150.0, 75.0),
+            ObjectFit::None,
+            css::BackgroundPosition::INITIAL,
+            ObjectViewBox::NONE,
+            ReplacedObjectOverflow::Visible,
+            css::EffectiveZoom::NORMAL,
+        ));
+        assert_eq!(
+            image.paint_rect(),
+            paint_space_rect(10.0, -15.0, 150.0, 75.0)
+        );
+    }
+
+    #[test]
+    fn object_fit_none_scales_raster_natural_size_with_effective_zoom() {
+        let mut image = RenderedImage::from_paint_rect(
+            paint_space_rect(10.0, 20.0, 80.0, 40.0),
+            false,
+            200,
+            100,
+            None,
+            true,
+            vec![0; 200 * 100 * 3].into(),
+            None,
+            None,
+        );
+
+        let natural_size = source_pixel_natural_size(&image);
+        assert!(apply_object_fit(
+            &mut image,
+            natural_size,
+            ObjectFit::None,
+            css::BackgroundPosition::INITIAL,
+            ObjectViewBox::NONE,
+            ReplacedObjectOverflow::Visible,
+            css::EffectiveZoom::from_parent_and_local(
+                css::EffectiveZoom::NORMAL,
+                css::CssZoom::parse("2").unwrap(),
+            ),
+        ));
+        assert_eq!(
+            image.paint_rect(),
+            paint_space_rect(10.0, -90.0, 300.0, 150.0)
+        );
+    }
+
+    #[test]
+    fn visible_overflow_keeps_an_oversized_svg_concrete_object_unclipped() {
+        let asset = Rc::new(
+            crate::svg::parse_svg_bytes(
+                br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 100 100" preserveAspectRatio="none"><rect width="100" height="100" fill="red"/></svg>"#,
+            )
+            .expect("simple SVG source"),
+        );
+
+        let group = svg_replaced_group(
+            &asset,
+            paint_space_rect(10.0, 20.0, 25.0, 25.0),
+            ObjectFit::None,
+            css::BackgroundPosition::INITIAL,
+            css::ObjectViewBox::NONE,
+            ReplacedObjectOverflow::Visible,
+        );
+
+        let path = first_svg_path(&group).expect("visible SVG produces a vector path");
+        let bounds = path.paint_bounds().expect("SVG path has paint bounds");
+        assert_eq!(bounds, paint_space_rect(10.0, -30.0, 75.0, 75.0));
+        assert!(path.clip.is_none(), "path={path:?}");
+    }
+
+    #[test]
+    fn visible_overflow_retains_an_explicit_svg_object_view_box_crop() {
+        let asset = Rc::new(
+            crate::svg::parse_svg_bytes(
+                br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 100 100" preserveAspectRatio="none"><rect width="100" height="100" fill="red"/></svg>"#,
+            )
+            .expect("simple SVG source"),
+        );
+        let view_box = css::ObjectViewBox::Xywh {
+            x: ComputedLengthPercentage::ZERO,
+            y: ComputedLengthPercentage::ZERO,
+            width: ComputedLengthPercentage::from_percent(0.5),
+            height: ComputedLengthPercentage::from_percent(1.0),
+            radii: None,
+        };
+
+        let group = svg_replaced_group(
+            &asset,
+            paint_space_rect(10.0, 20.0, 25.0, 25.0),
+            ObjectFit::None,
+            css::BackgroundPosition::INITIAL,
+            view_box,
+            ReplacedObjectOverflow::Visible,
+        );
+
+        let path = first_svg_path(&group).expect("cropped SVG produces a vector path");
+        assert!(
+            path.clip.is_some(),
+            "object-view-box crop must remain attached"
+        );
     }
 
     #[test]
@@ -554,11 +865,15 @@ mod tests {
             radii: None,
         };
 
+        let natural_size = source_pixel_natural_size(&image);
         assert!(apply_object_fit(
             &mut image,
+            natural_size,
             ObjectFit::Fill,
             css::BackgroundPosition::INITIAL,
             view_box,
+            ReplacedObjectOverflow::ClipToContentBox,
+            css::EffectiveZoom::NORMAL,
         ));
         assert_eq!(
             image.paint_rect(),
@@ -598,11 +913,15 @@ mod tests {
             radii: None,
         };
 
+        let natural_size = source_pixel_natural_size(&image);
         assert!(apply_object_fit(
             &mut image,
+            natural_size,
             ObjectFit::Fill,
             css::BackgroundPosition::INITIAL,
             view_box,
+            ReplacedObjectOverflow::ClipToContentBox,
+            css::EffectiveZoom::NORMAL,
         ));
         let clip = image.clip().expect("both clips remain attached");
         assert_eq!(clip.commands, border_shape_clip.commands);
@@ -630,8 +949,13 @@ mod tests {
         )
         .unwrap();
 
-        let clip = object_view_box_clip(&source, natural, geometry)
-            .expect("applied object-view-box creates a clip");
+        let clip = object_view_box_clip(
+            &source,
+            natural,
+            geometry,
+            ReplacedObjectOverflow::ClipToContentBox,
+        )
+        .expect("applied object-view-box creates a clip");
 
         assert!(
             clip.commands.len() > 5,
@@ -654,7 +978,7 @@ mod tests {
         .expect("ratio-only image has a concrete object size");
 
         assert_eq!(geometry.concrete, paint_space_rect(10.0, 70.0, 100.0, 50.0));
-        assert_eq!(geometry.visible, geometry.concrete);
+        assert_eq!(geometry.visible, Some(geometry.concrete));
     }
 
     #[test]
@@ -687,6 +1011,173 @@ mod tests {
     }
 
     #[test]
+    fn svg_concrete_object_mapping_uses_the_paint_top_for_svg_source_y() {
+        let destination = paint_space_rect(0.0, 0.0, 8.0, 8.0);
+        let natural = CssImageNaturalDimensions::from_layout_size(LayoutSize::new(8.0, 16.0));
+        let source_view_box = NormalizedObjectSourceRect::new(
+            crate::layout::asset_helpers::NormalizedObjectSourcePoint::new(0.0, 0.0),
+            crate::layout::asset_helpers::NormalizedObjectSourceSize::new(1.0, 1.0),
+        );
+        let source_size = SvgSourceSize::new(8.0, 16.0);
+        let position = |origin, offset| css::BackgroundPosition {
+            x: css::BackgroundPositionAxis::LEFT,
+            y: css::BackgroundPositionAxis { origin, offset },
+        };
+        let mapping_for = |position, overflow| {
+            let geometry =
+                concrete_object_geometry(destination, natural, ObjectFit::None, position)
+                    .expect("the concrete object is paintable");
+            SvgConcreteObjectMapping::from_geometry(
+                geometry,
+                overflow,
+                source_view_box,
+                source_size,
+            )
+            .expect("the selected concrete-object area is paintable")
+        };
+
+        let top = mapping_for(
+            position(
+                css::BackgroundPositionOrigin::Start,
+                ComputedLengthPercentage::ZERO,
+            ),
+            ReplacedObjectOverflow::ClipToContentBox,
+        );
+        assert_eq!(
+            top.source,
+            SvgSourceRect::new(SvgSourcePoint::new(0.0, 0.0), SvgSourceSize::new(8.0, 8.0))
+        );
+
+        let bottom = mapping_for(
+            position(
+                css::BackgroundPositionOrigin::End,
+                ComputedLengthPercentage::ZERO,
+            ),
+            ReplacedObjectOverflow::ClipToContentBox,
+        );
+        assert_eq!(
+            bottom.source,
+            SvgSourceRect::new(SvgSourcePoint::new(0.0, 8.0), SvgSourceSize::new(8.0, 8.0))
+        );
+
+        let centered = mapping_for(
+            position(
+                css::BackgroundPositionOrigin::Center,
+                ComputedLengthPercentage::ZERO,
+            ),
+            ReplacedObjectOverflow::ClipToContentBox,
+        );
+        assert_eq!(
+            centered.source,
+            SvgSourceRect::new(SvgSourcePoint::new(0.0, 4.0), SvgSourceSize::new(8.0, 8.0))
+        );
+
+        let bottom_offset = mapping_for(
+            position(
+                css::BackgroundPositionOrigin::End,
+                ComputedLengthPercentage::from_points(2.0),
+            ),
+            ReplacedObjectOverflow::ClipToContentBox,
+        );
+        assert_eq!(
+            bottom_offset.source,
+            SvgSourceRect::new(SvgSourcePoint::new(0.0, 10.0), SvgSourceSize::new(8.0, 6.0))
+        );
+
+        let visible = mapping_for(
+            position(
+                css::BackgroundPositionOrigin::Start,
+                ComputedLengthPercentage::ZERO,
+            ),
+            ReplacedObjectOverflow::Visible,
+        );
+        assert_eq!(visible.destination, paint_space_rect(0.0, -8.0, 8.0, 16.0));
+        assert_eq!(
+            visible.source,
+            SvgSourceRect::new(SvgSourcePoint::new(0.0, 0.0), SvgSourceSize::new(8.0, 16.0))
+        );
+
+        // `cover` overflows vertically when this tall source fills a wide
+        // destination. Its top-aligned clipped quarter must still select the
+        // source's top quarter rather than treating paint-space bottom as SVG
+        // source Y.
+        let cover_destination = paint_space_rect(0.0, 0.0, 16.0, 8.0);
+        let cover_geometry = concrete_object_geometry(
+            cover_destination,
+            natural,
+            ObjectFit::Cover,
+            position(
+                css::BackgroundPositionOrigin::Start,
+                ComputedLengthPercentage::ZERO,
+            ),
+        )
+        .expect("covered object is paintable");
+        let cover = SvgConcreteObjectMapping::from_geometry(
+            cover_geometry,
+            ReplacedObjectOverflow::ClipToContentBox,
+            source_view_box,
+            SvgSourceSize::new(16.0, 32.0),
+        )
+        .expect("covered selected area is paintable");
+        assert_eq!(cover.destination, cover_destination);
+        assert_eq!(
+            cover.source,
+            SvgSourceRect::new(SvgSourcePoint::new(0.0, 0.0), SvgSourceSize::new(16.0, 8.0))
+        );
+    }
+
+    #[test]
+    fn clipped_svg_object_fit_top_position_exposes_the_svg_top_band() {
+        let asset = Rc::new(
+            crate::svg::parse_svg_bytes(
+                br#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="16" viewBox="0 0 8 16" preserveAspectRatio="none">
+                    <rect x="0" y="0" width="4" height="8" fill="blue"/>
+                    <rect x="4" y="0" width="4" height="8" fill="black"/>
+                    <rect x="0" y="8" width="4" height="8" fill="pink"/>
+                    <rect x="4" y="8" width="4" height="8" fill="lime"/>
+                </svg>"#,
+            )
+            .expect("four-band SVG source"),
+        );
+        let destination = paint_space_rect(0.0, 0.0, 6.0, 6.0);
+        let position = css::BackgroundPosition {
+            x: css::BackgroundPositionAxis {
+                origin: css::BackgroundPositionOrigin::End,
+                offset: ComputedLengthPercentage::ZERO,
+            },
+            y: css::BackgroundPositionAxis::TOP,
+        };
+
+        let group = svg_replaced_group(
+            &asset,
+            destination,
+            ObjectFit::None,
+            position,
+            ObjectViewBox::NONE,
+            ReplacedObjectOverflow::ClipToContentBox,
+        );
+        let visible_fills = group
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                crate::svg::SvgPaintItem::Path(path) => path
+                    .paint_bounds()
+                    .and_then(|bounds| bounds.intersection(&destination))
+                    .filter(|bounds| !bounds.is_empty())
+                    .and(path.fill),
+                crate::svg::SvgPaintItem::Group(_)
+                | crate::svg::SvgPaintItem::NestedSvg(_)
+                | crate::svg::SvgPaintItem::RasterImage(_) => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            visible_fills,
+            vec![CssColor::new(0, 0, 255), CssColor::BLACK]
+        );
+    }
+
+    #[test]
     fn contain_geometry_keeps_object_position_when_only_one_axis_has_free_space() {
         let top_right = css::BackgroundPosition {
             x: css::BackgroundPositionAxis {
@@ -707,7 +1198,7 @@ mod tests {
         .expect("positive contained object is paintable");
 
         assert_eq!(geometry.concrete, paint_space_rect(60.0, 20.0, 50.0, 100.0));
-        assert_eq!(geometry.visible, geometry.concrete);
+        assert_eq!(geometry.visible, Some(geometry.concrete));
     }
 
     #[test]
@@ -725,6 +1216,7 @@ mod tests {
             ObjectFit::Contain,
             css::BackgroundPosition::INITIAL,
             css::ObjectViewBox::NONE,
+            ReplacedObjectOverflow::ClipToContentBox,
         );
 
         let path = first_svg_path(&group).expect("contained SVG produces a vector path");
@@ -776,6 +1268,7 @@ mod tests {
             ObjectFit::Fill,
             css::BackgroundPosition::INITIAL,
             view_box,
+            ReplacedObjectOverflow::ClipToContentBox,
         );
 
         let path = first_svg_path(&group).expect("cropped SVG produces a vector path");

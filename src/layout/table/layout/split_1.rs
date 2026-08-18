@@ -24,6 +24,161 @@ impl TableCaptionOuterWidth {
     }
 }
 
+/// The table-wrapper frame projected into the legacy caption block-layout
+/// boundary.
+///
+/// Captions are wrapper siblings, not table-grid children.  This composite
+/// keeps their physical containing span and the table root's logical axes
+/// together so a caller cannot pass an unrelated grid X coordinate to a
+/// vertical caption layout entry point.
+/// <https://www.w3.org/TR/CSS22/tables.html#model>
+/// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout::table) struct TableCaptionContainingBlock {
+    physical_span: PageInlineSpan,
+    outer_width: TableCaptionOuterWidth,
+    axes: TableAxes,
+    wrapper_table_x: PageInlinePosition,
+}
+
+impl TableCaptionContainingBlock {
+    pub(in crate::layout::table) fn new(
+        physical_span: PageInlineSpan,
+        outer_width: TableCaptionOuterWidth,
+        axes: TableAxes,
+        wrapper_table_x: PageInlinePosition,
+    ) -> Self {
+        Self {
+            physical_span,
+            outer_width,
+            axes,
+            wrapper_table_x,
+        }
+    }
+
+    pub(in crate::layout::table) fn physical_span(self) -> PageInlineSpan {
+        self.physical_span
+    }
+
+    pub(in crate::layout::table) fn outer_width(self) -> TableCaptionOuterWidth {
+        self.outer_width
+    }
+
+    pub(in crate::layout::table) fn axes(self) -> TableAxes {
+        self.axes
+    }
+
+    pub(in crate::layout::table) fn wrapper_table_x(self) -> PageInlinePosition {
+        self.wrapper_table_x
+    }
+
+    /// Return the physical span which the legacy generic block entry may use
+    /// as its horizontal containing-block coordinate.
+    ///
+    /// A horizontal table wrapper owns that span directly. A vertical table
+    /// instead fragments along physical X, so replacing the active
+    /// fragmentainer span with the wrapper's complete block extent would
+    /// silently make a split caption fit in one column. The caller must keep
+    /// the active fragmentainer bounds in that case; the table wrapper's
+    /// logical inline measure is resolved independently by the caption style.
+    /// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+    /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+    pub(in crate::layout::table) fn legacy_horizontal_span(self) -> Option<PageInlineSpan> {
+        (!self.axes.flow.writing_mode().has_vertical_lines()).then_some(self.physical_span)
+    }
+}
+
+/// The committed destination state of a table-caption layout pass.
+///
+/// Generic block layout remains responsible for laying out caption contents,
+/// but a table wrapper owns the transition which follows it.
+/// `final_destination` is the authoritative post-caption destination,
+/// including its remaining logical block capacity. Returning it prevents the
+/// wrapper from synthesizing its grid start later from a stale `table_x` and
+/// a cursor that belongs to an earlier fragmentainer.
+/// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+#[derive(Debug, Clone)]
+pub(in crate::layout::table) struct TableCaptionLayoutOutcome {
+    final_destination: TableFragmentainerPlacement,
+    /// Retained source-local slices for caption paint.  They deliberately use
+    /// wrapper-local intervals rather than table-grid offsets.
+    caption_paint_slices: Vec<TableCaptionPaintSlice>,
+    consumed_wrapper_interval: TableWrapperBlockInterval,
+    /// The final caption exactly consumed its destination block track.  The
+    /// following wrapper part must select a successor rather than inheriting
+    /// an exhausted zero-width track.
+    next_part_requires_successor: bool,
+    /// Actual wrapper-flow block progress committed by vertical captions.
+    /// Horizontal callers retain their established physical block estimate;
+    /// vertical callers must never substitute that physical-Y quantity for
+    /// the root's logical block extent.
+    vertical_block_progress: TableGridLength,
+}
+
+/// One retained caption slice in caption-local source coordinates.
+///
+/// The parent multicolumn formatter sees only the completed temporary
+/// fragment to which this slice was appended.  This record remains table
+/// local, preventing parent replay from interpreting caption progress as
+/// table-grid source geometry.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout::table) struct TableCaptionPaintSlice {
+    pub(in crate::layout::table) page_index: usize,
+    pub(in crate::layout::table) source_block_start: LayoutLength,
+    pub(in crate::layout::table) block_size: LayoutLength,
+    /// Table-wrapper destination selected while this source interval was
+    /// consumed.  Parent multicolumn replay never reads this table-local
+    /// record; it is solely the wrapper ledger's placement contract.
+    pub(in crate::layout::table) destination: TableFragmentainerPlacement,
+    pub(in crate::layout::table) destination_context: PageContext,
+    pub(in crate::layout::table) destination_origin: PageTopPoint,
+    pub(in crate::layout::table) destination_extent: LogicalSize,
+    pub(in crate::layout::table) destination_block_start: LayoutLength,
+}
+
+impl TableCaptionLayoutOutcome {
+    pub(in crate::layout::table) fn new(
+        final_destination: TableFragmentainerPlacement,
+        caption_paint_slices: Vec<TableCaptionPaintSlice>,
+        consumed_wrapper_interval: TableWrapperBlockInterval,
+        vertical_block_progress: TableGridLength,
+        next_part_requires_successor: bool,
+    ) -> Self {
+        Self {
+            final_destination,
+            caption_paint_slices,
+            consumed_wrapper_interval,
+            vertical_block_progress,
+            next_part_requires_successor,
+        }
+    }
+
+    pub(in crate::layout::table) fn final_destination(&self) -> TableFragmentainerPlacement {
+        self.final_destination
+    }
+
+    pub(in crate::layout::table) fn caption_paint_slices(&self) -> &[TableCaptionPaintSlice] {
+        &self.caption_paint_slices
+    }
+
+    pub(in crate::layout::table) fn consumed_wrapper_interval(&self) -> TableWrapperBlockInterval {
+        self.consumed_wrapper_interval
+    }
+
+    /// The logical block extent actually consumed by vertical caption boxes.
+    /// This is measured at the generic layout boundary, after CSS sizing and
+    /// borders resolve, and can therefore seed the table-wrapper timeline
+    /// without rebuilding progress from a physical cursor.
+    pub(in crate::layout::table) fn vertical_block_progress(&self) -> TableGridLength {
+        self.vertical_block_progress
+    }
+
+    /// Whether the next wrapper-flow part needs a fresh fragmentainer.
+    pub(in crate::layout::table) fn next_part_requires_successor(&self) -> bool {
+        self.next_part_requires_successor
+    }
+}
+
 /// Used geometry for painting a CSS table wrapper box.
 ///
 /// CSS 2.2's separated-border model gives the table-root a wrapper border box
@@ -31,36 +186,35 @@ impl TableCaptionOuterWidth {
 /// <https://www.w3.org/TR/CSS22/tables.html#separated-borders>.
 #[derive(Debug, Clone)]
 pub(in crate::layout::table) struct TableWrapperPaintBox {
-    pub(in crate::layout::table) table_x: f32,
-    pub(in crate::layout::table) top: f32,
+    /// The complete grid's physical page origin. This is established once at
+    /// the wrapper-to-grid boundary; callers must not rebase it for padding,
+    /// borders, or separated-border spacing.
+    pub(in crate::layout::table) grid_origin: PageTopPoint,
     /// The root table flow used to project the logical grid before adding the
     /// wrapper's physical padding and border edges.
     pub(in crate::layout::table) axes: TableAxes,
     pub(in crate::layout::table) grid_size: TableGridLogicalSize,
     pub(in crate::layout::table) table_width: UsedTableWidth,
     pub(in crate::layout::table) table_metrics: TableMetrics,
+    pub(in crate::layout::table) block_edge_spacing: TableGridLength,
 }
 
 impl TableWrapperPaintBox {
+    pub(in crate::layout::table) fn grid_frames(self) -> TableGridFrames {
+        TableGridFrames::new(
+            TableGridPlacement::with_axes(self.grid_origin, self.axes, self.grid_size),
+            self.block_edge_spacing,
+        )
+    }
+
     pub(in crate::layout::table) fn grid_placement(self) -> TableGridPlacement {
-        let inline_start_inset = self.table_width.border_widths.top + self.table_width.padding.top;
-        // `top` is the wrapper's committed physical inline edge. Horizontal
-        // grids consume that edge once while entering their content box. In a
-        // vertical root, the table grid is projected through a separate
-        // logical inline axis, so it must also retain that wrapper edge before
-        // the source grid is captured; otherwise later fragmentainer slices
-        // start underneath the wrapper's top border.
-        // <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
-        // <https://www.w3.org/TR/CSS22/tables.html#separated-borders>
-        let grid_top = self.top
-            - inline_start_inset
-            - if self.axes.flow.writing_mode().has_vertical_lines() {
-                inline_start_inset
-            } else {
-                0.0
-            };
-        let grid_origin = PageTopPoint::new(self.table_x, grid_top);
-        TableGridPlacement::with_axes(grid_origin, self.axes, self.grid_size)
+        self.grid_frames().wrapper_grid()
+    }
+
+    /// Return the cell-paint grid after removing the wrapper-owned outer
+    /// separated-border block edges exactly once.
+    pub(in crate::layout::table) fn cell_grid_placement(self) -> TableGridPlacement {
+        self.grid_frames().cell_grid()
     }
 
     pub(in crate::layout::table) fn grid_content_box(self) -> PageTopRect {
@@ -112,32 +266,134 @@ impl TableWrapperPaintBox {
 /// <https://www.w3.org/TR/css-tables-3/#table-structure>
 /// <https://www.w3.org/TR/css-break-3/#break-decoration>
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
-struct TableWrapperBlockOffset(TableGridLength);
+pub(in crate::layout::table) struct TableWrapperBlockOffset(TableGridLength);
 
 impl TableWrapperBlockOffset {
-    fn zero() -> Self {
+    pub(in crate::layout::table) fn zero() -> Self {
         Self(TableGridLength::new(0.0))
     }
 
     fn add(self, size: TableGridLength) -> Self {
         Self(self.0 + size)
     }
+
+    fn points(self) -> f32 {
+        self.0.get()
+    }
+}
+
+/// Block-start border, padding, and separated-border spacing between a table
+/// wrapper's border edge and its grid content.
+///
+/// This must remain distinct from a grid offset: it is consumed once when the
+/// wrapper timeline enters the grid, while a root decoration source frame
+/// begins before it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout::table) struct TableRootBlockStartChrome(TableGridLength);
+
+impl TableRootBlockStartChrome {
+    pub(in crate::layout::table) fn new(length: TableGridLength) -> Self {
+        Self(length)
+    }
+
+    fn length(self) -> TableGridLength {
+        self.0
+    }
+}
+
+/// The two wrapper-flow origins at the table-grid boundary.
+///
+/// The wrapper border box begins after any top caption. Grid content begins
+/// after the wrapper's block-start chrome. Keeping both origins together
+/// prevents root decoration replay from using the latter with the former's
+/// border-box span.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TableWrapperGridStart {
+    wrapper_border_start: TableWrapperBlockOffset,
+    grid_content_start: TableWrapperBlockOffset,
+}
+
+impl TableWrapperGridStart {
+    fn new(
+        wrapper_border_start: TableWrapperBlockOffset,
+        block_start_chrome: TableRootBlockStartChrome,
+    ) -> Self {
+        Self {
+            wrapper_border_start,
+            grid_content_start: wrapper_border_start.add(block_start_chrome.length()),
+        }
+    }
+
+    fn grid_body_start(self, grid_block_start: TableGridBlockOffset) -> TableWrapperBlockOffset {
+        self.grid_content_start.add(grid_block_start.length())
+    }
+
+    fn root_source_frame(self, root_rect: TableGridRect) -> TableWrapperLocalRootSourceFrame {
+        TableWrapperLocalRootSourceFrame::new(self.wrapper_border_start, root_rect)
+    }
 }
 
 /// One source interval in wrapper block-flow order.
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct TableWrapperBlockInterval {
+pub(in crate::layout::table) struct TableWrapperBlockInterval {
     start: TableWrapperBlockOffset,
     size: TableGridLength,
 }
 
 impl TableWrapperBlockInterval {
-    fn new(start: TableWrapperBlockOffset, size: TableGridLength) -> Self {
+    pub(in crate::layout::table) fn new(
+        start: TableWrapperBlockOffset,
+        size: TableGridLength,
+    ) -> Self {
         Self { start, size }
     }
 
-    fn size(self) -> TableGridLength {
+    pub(in crate::layout::table) fn size(self) -> TableGridLength {
         self.size
+    }
+
+    fn start(self) -> TableWrapperBlockOffset {
+        self.start
+    }
+}
+
+/// The complete table-root source rectangle paired with its wrapper-flow
+/// source interval.
+///
+/// A root `TableGridRect` is grid-local, but fragmentation traverses wrapper
+/// flow, including captions and block-start chrome. Keeping them in one
+/// record prevents grid content from becoming the root border-box origin.
+/// This local frame deliberately has no conversion to a multicolumn
+/// continuous-source coordinate; enclosing projection owns that boundary.
+/// <https://drafts.csswg.org/css-tables-3/#table-root>
+/// <https://www.w3.org/TR/css-break-3/#break-decoration>
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TableWrapperLocalRootSourceFrame {
+    root_rect: TableGridRect,
+    wrapper_interval: TableWrapperBlockInterval,
+}
+
+impl TableWrapperLocalRootSourceFrame {
+    fn new(wrapper_border_start: TableWrapperBlockOffset, root_rect: TableGridRect) -> Self {
+        Self {
+            root_rect,
+            wrapper_interval: TableWrapperBlockInterval::new(
+                wrapper_border_start,
+                TableGridLength::new(root_rect.size.height),
+            ),
+        }
+    }
+
+    fn root_rect(self) -> TableGridRect {
+        self.root_rect
+    }
+
+    fn local_block_start(self) -> TableWrapperBlockOffset {
+        self.wrapper_interval.start()
+    }
+
+    fn block_span(self) -> TableGridLength {
+        self.wrapper_interval.size()
     }
 }
 
@@ -172,15 +428,23 @@ struct TableWrapperFragmentSlice {
 #[derive(Debug, Default)]
 struct TableWrapperFragmentTimelineState {
     slices: Vec<TableWrapperFragmentSlice>,
-    grid_wrapper_start: TableWrapperBlockOffset,
+    grid_start: Option<TableWrapperGridStart>,
     initial_destination_grid_placement: Option<TableGridPlacement>,
-    initial_destination_grid_progress: Option<TableGridBlockOffset>,
 }
 
 #[derive(Debug, Clone)]
 pub(in crate::layout::table) struct TableWrapperFragmentTimeline {
     state: Rc<RefCell<TableWrapperFragmentTimelineState>>,
 }
+
+/// A rollback boundary in the table wrapper's committed paint timeline.
+///
+/// Break-avoid selection may restore the layout builder to an earlier row
+/// boundary. The wrapper timeline is reference-counted across the candidate
+/// fragment and the active fragment, so it needs an explicit transactional
+/// boundary rather than relying on a clone to undo later row records.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout::table) struct TableWrapperTimelineCheckpoint(usize);
 
 impl TableWrapperFragmentTimeline {
     /// Start a wrapper-local recorder before caption layout.  Its first grid
@@ -190,6 +454,14 @@ impl TableWrapperFragmentTimeline {
         Self {
             state: Rc::new(RefCell::new(TableWrapperFragmentTimelineState::default())),
         }
+    }
+
+    pub(in crate::layout::table) fn checkpoint(&self) -> TableWrapperTimelineCheckpoint {
+        TableWrapperTimelineCheckpoint(self.state.borrow().slices.len())
+    }
+
+    pub(in crate::layout::table) fn rewind(&self, checkpoint: TableWrapperTimelineCheckpoint) {
+        self.state.borrow_mut().slices.truncate(checkpoint.0);
     }
 
     /// The grid's actual starting placement in the fragmentainer which
@@ -203,16 +475,46 @@ impl TableWrapperFragmentTimeline {
             .expect("table wrapper recorder must commit its grid start before row layout")
     }
 
+    fn root_source_frame(&self, root_rect: TableGridRect) -> TableWrapperLocalRootSourceFrame {
+        self.state
+            .borrow()
+            .grid_start
+            .expect("table wrapper root source requires a committed grid start")
+            .root_source_frame(root_rect)
+    }
+
     /// Commit the wrapper progress consumed by top captions and the actual
     /// placement at which the grid starts.  The progress is measured through
     /// the fragmentainer/table placement adapter, rather than reconstructed
     /// from a page-Y cursor in table-root paint.
+    #[allow(dead_code)] // Test shorthand for one unsplit caption interval.
     pub(in crate::layout::table) fn record_top_caption_progress(
         &self,
         source_size: TableGridLength,
         destination: TableFragmentainerPlacement,
         destination_grid_placement: TableGridPlacement,
-        root_block_start_chrome: TableGridLength,
+        root_block_start_chrome: TableRootBlockStartChrome,
+    ) {
+        self.record_top_caption_slices(
+            &[],
+            source_size,
+            destination,
+            destination_grid_placement,
+            root_block_start_chrome,
+        );
+    }
+
+    /// Record the table wrapper's top-caption source intervals before the
+    /// grid starts.  A vertically fragmented caption can have multiple
+    /// table-local destinations; retaining every interval prevents the final
+    /// grid placement from retroactively becoming the caption's destination.
+    pub(in crate::layout::table) fn record_top_caption_slices(
+        &self,
+        caption_slices: &[TableCaptionPaintSlice],
+        source_size: TableGridLength,
+        destination: TableFragmentainerPlacement,
+        destination_grid_placement: TableGridPlacement,
+        root_block_start_chrome: TableRootBlockStartChrome,
     ) {
         // The destination grid placement starts after table-root block-start
         // border/padding/edge spacing. The wrapper composite starts at the
@@ -223,25 +525,68 @@ impl TableWrapperFragmentTimeline {
                 .grid_block_progress(destination_grid_placement)
                 .length()
                 .get()
-                - root_block_start_chrome.get())
+                - root_block_start_chrome.length().get())
             .max(0.0),
         ));
         let mut state = self.state.borrow_mut();
         if source_size.get() > 0.0 {
-            state.slices.push(TableWrapperFragmentSlice {
-                kind: TableWrapperTimelineKind::TopCaption,
-                source: TableWrapperBlockInterval::new(
-                    TableWrapperBlockOffset::zero(),
-                    source_size,
-                ),
-                grid_source_start: None,
-                destination,
-                destination_grid_start,
-            });
+            if caption_slices.is_empty() {
+                Self::push_slice(
+                    &mut state,
+                    TableWrapperFragmentSlice {
+                        kind: TableWrapperTimelineKind::TopCaption,
+                        source: TableWrapperBlockInterval::new(
+                            TableWrapperBlockOffset::zero(),
+                            source_size,
+                        ),
+                        grid_source_start: None,
+                        destination,
+                        destination_grid_start,
+                    },
+                );
+            } else {
+                for caption in caption_slices {
+                    let source_start = TableWrapperBlockOffset::zero()
+                        .add(TableGridLength::new(caption.source_block_start.points()));
+                    Self::push_slice(
+                        &mut state,
+                        TableWrapperFragmentSlice {
+                            kind: TableWrapperTimelineKind::TopCaption,
+                            source: TableWrapperBlockInterval::new(
+                                source_start,
+                                TableGridLength::new(caption.block_size.points()),
+                            ),
+                            grid_source_start: None,
+                            destination: caption.destination,
+                            destination_grid_start: TableGridBlockOffset::new(
+                                TableGridLength::new(0.0),
+                            ),
+                        },
+                    );
+                }
+            }
         }
-        state.grid_wrapper_start = TableWrapperBlockOffset::zero().add(source_size);
+        let caption_end = TableWrapperBlockOffset::zero().add(source_size);
+        if root_block_start_chrome.length().get() > 0.0 {
+            Self::push_slice(
+                &mut state,
+                TableWrapperFragmentSlice {
+                    kind: TableWrapperTimelineKind::GridStartChrome,
+                    source: TableWrapperBlockInterval::new(
+                        caption_end,
+                        root_block_start_chrome.length(),
+                    ),
+                    grid_source_start: None,
+                    destination,
+                    destination_grid_start,
+                },
+            );
+        }
+        state.grid_start = Some(TableWrapperGridStart::new(
+            caption_end,
+            root_block_start_chrome,
+        ));
         state.initial_destination_grid_placement = Some(destination_grid_placement);
-        state.initial_destination_grid_progress = Some(destination_grid_start);
     }
 
     /// Record an already-committed body slice. The body owns its source-grid
@@ -261,15 +606,150 @@ impl TableWrapperFragmentTimeline {
             source: TableWrapperBlockInterval::new(
                 self.state
                     .borrow()
-                    .grid_wrapper_start
-                    .add(source_start.length()),
+                    .grid_start
+                    .expect("table wrapper grid start must be committed before body slices")
+                    .grid_body_start(source_start),
                 source_size,
             ),
             grid_source_start: Some(source_start),
             destination,
             destination_grid_start,
         };
-        self.state.borrow_mut().slices.push(slice);
+        Self::push_slice(&mut self.state.borrow_mut(), slice);
+    }
+
+    /// Record table-root block-end chrome after all grid source content.
+    ///
+    /// Captions remain outside the grid source, but their wrapper interval
+    /// follows this chrome in the same destination sequence.
+    pub(in crate::layout::table) fn record_grid_end_chrome(
+        &self,
+        grid_source_extent: TableGridLength,
+        source_size: TableGridLength,
+        destination: TableFragmentainerPlacement,
+        destination_grid_start: TableGridBlockOffset,
+    ) {
+        if source_size.get() <= 0.0 {
+            return;
+        }
+        let state = &mut *self.state.borrow_mut();
+        let grid_start = state
+            .grid_start
+            .expect("table wrapper grid start must be committed before trailing chrome");
+        let source = TableWrapperBlockInterval::new(
+            grid_start.grid_content_start.add(grid_source_extent),
+            source_size,
+        );
+        Self::push_slice(
+            state,
+            TableWrapperFragmentSlice {
+                kind: TableWrapperTimelineKind::GridEndChrome,
+                source,
+                grid_source_start: None,
+                destination,
+                destination_grid_start,
+            },
+        );
+    }
+
+    /// Record a bottom-caption wrapper interval after table grid and trailing
+    /// chrome. Captions deliberately have no table-grid source offset.
+    #[allow(dead_code)] // Test shorthand for one unsplit caption interval.
+    pub(in crate::layout::table) fn record_bottom_caption_progress(
+        &self,
+        grid_source_extent: TableGridLength,
+        trailing_chrome: TableGridLength,
+        source_size: TableGridLength,
+        destination: TableFragmentainerPlacement,
+        destination_grid_start: TableGridBlockOffset,
+    ) {
+        self.record_bottom_caption_slices(
+            &[],
+            grid_source_extent,
+            trailing_chrome,
+            source_size,
+            destination,
+            destination_grid_start,
+        );
+    }
+
+    /// Record bottom-caption slices after the grid's immutable source range
+    /// and trailing chrome.  Their source intervals are wrapper-local, so no
+    /// caption entry can acquire a grid-source offset.
+    pub(in crate::layout::table) fn record_bottom_caption_slices(
+        &self,
+        caption_slices: &[TableCaptionPaintSlice],
+        grid_source_extent: TableGridLength,
+        trailing_chrome: TableGridLength,
+        source_size: TableGridLength,
+        destination: TableFragmentainerPlacement,
+        destination_grid_start: TableGridBlockOffset,
+    ) {
+        if source_size.get() <= 0.0 {
+            return;
+        }
+        let state = &mut *self.state.borrow_mut();
+        let grid_start = state
+            .grid_start
+            .expect("table wrapper grid start must be committed before bottom captions");
+        let caption_start = grid_start
+            .grid_content_start
+            .add(grid_source_extent)
+            .add(trailing_chrome);
+        if caption_slices.is_empty() {
+            Self::push_slice(
+                state,
+                TableWrapperFragmentSlice {
+                    kind: TableWrapperTimelineKind::BottomCaption,
+                    source: TableWrapperBlockInterval::new(caption_start, source_size),
+                    grid_source_start: None,
+                    destination,
+                    destination_grid_start,
+                },
+            );
+        } else {
+            for caption in caption_slices {
+                Self::push_slice(
+                    state,
+                    TableWrapperFragmentSlice {
+                        kind: TableWrapperTimelineKind::BottomCaption,
+                        source: TableWrapperBlockInterval::new(
+                            caption_start
+                                .add(TableGridLength::new(caption.source_block_start.points())),
+                            TableGridLength::new(caption.block_size.points()),
+                        ),
+                        grid_source_start: None,
+                        destination: caption.destination,
+                        destination_grid_start: TableGridBlockOffset::new(TableGridLength::new(
+                            0.0,
+                        )),
+                    },
+                );
+            }
+        }
+    }
+
+    fn push_slice(state: &mut TableWrapperFragmentTimelineState, slice: TableWrapperFragmentSlice) {
+        if let Some(previous) = state.slices.last() {
+            // A table layout may revisit the current row while resolving a
+            // deferred fragment boundary. It has not advanced either source
+            // or destination in that case, so retain one committed slice
+            // rather than treating the idempotent replay as an overlap.
+            if previous.kind == slice.kind
+                && previous.source == slice.source
+                && previous.grid_source_start == slice.grid_source_start
+                && previous.destination == slice.destination
+                && previous.destination_grid_start == slice.destination_grid_start
+            {
+                return;
+            }
+            debug_assert!(
+                slice.source.start.0.get()
+                    >= previous.source.start.0.get() + previous.source.size().get() - 0.01,
+                "table-wrapper source slices must remain ordered and non-overlapping"
+            );
+        }
+        state.slices.push(slice);
     }
 
     /// Return the grid-body intersections committed in one destination
@@ -290,37 +770,16 @@ impl TableWrapperFragmentTimeline {
             .copied()
     }
 
-    /// The initial grid's offset in the destination fragmentainer is a
-    /// property of the wrapper composite.  It must stay part of every later
-    /// grid decoration slice under `box-decoration-break: slice`.
-    fn initial_destination_grid_progress(&self) -> TableGridBlockOffset {
+    /// Whether this wrapper has committed any grid-body source interval.
+    /// A later table fragment with no matching local ledger entry must not
+    /// fall back to painting the complete root rectangle: that was only valid
+    /// before table-local structural slices were committed.
+    fn has_grid_body_slices(&self) -> bool {
         self.state
             .borrow()
-            .initial_destination_grid_progress
-            .expect("table wrapper recorder must commit its grid start before paint")
-    }
-
-    fn decoration_phase_translation(
-        &self,
-        placement: TableGridPlacement,
-        source_grid_start: TableGridBlockOffset,
-    ) -> PaintTranslation {
-        // The first visible grid slice is already positioned after the tail
-        // of a split caption. Only later source-grid slices carry that
-        // wrapper-composite progress into a successor fragmentainer.
-        if source_grid_start.length().get() <= 0.01 {
-            return PaintTranslation::identity();
-        }
-        let progress = self.initial_destination_grid_progress().length().get();
-        match placement.writing_mode() {
-            WritingMode::HorizontalTb => PaintTranslation::new(0.0, -progress),
-            WritingMode::VerticalLr | WritingMode::SidewaysLr => {
-                PaintTranslation::new(progress, 0.0)
-            }
-            WritingMode::VerticalRl | WritingMode::SidewaysRl => {
-                PaintTranslation::new(-progress, 0.0)
-            }
-        }
+            .slices
+            .iter()
+            .any(|slice| slice.kind == TableWrapperTimelineKind::GridBody)
     }
 }
 
@@ -356,13 +815,13 @@ impl TableFragmentainerBlockStart {
 /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::layout::table) struct TableFragmentainerPlacement {
-    /// Fragment-local physical origin used by the destination grid and row
-    /// boxes. This rebases as a table crosses columns/pages.
-    table_x: PageInlinePosition,
+    /// Fragment-local page origin of the destination grid and row boxes.
+    /// This is one typed coordinate rather than independently-maintained X
+    /// and top values; it rebases as a table crosses columns/pages.
+    destination_grid_origin: PageTopPoint,
     /// Capture origin for wrapper siblings before their committed replay.
     /// It remains typed and is never reconstructed from a source row.
     wrapper_table_x: PageInlinePosition,
-    paint_top: PageTopBlockPosition,
     block_start: TableFragmentainerBlockStart,
     block_span: LogicalBlockContentSize,
     writing_mode: WritingMode,
@@ -375,9 +834,11 @@ impl TableFragmentainerPlacement {
         block_span: LogicalBlockContentSize,
     ) -> Self {
         Self {
-            table_x,
+            destination_grid_origin: PageTopPoint::from_inline_x_and_block_position(
+                table_x.points(),
+                top,
+            ),
             wrapper_table_x: table_x,
-            paint_top: top,
             block_start: TableFragmentainerBlockStart::new(top.points()),
             block_span,
             writing_mode: WritingMode::HorizontalTb,
@@ -391,9 +852,11 @@ impl TableFragmentainerPlacement {
         block_span: LogicalBlockContentSize,
     ) -> Self {
         Self {
-            table_x,
+            destination_grid_origin: PageTopPoint::from_inline_x_and_block_position(
+                table_x.points(),
+                paint_top,
+            ),
             wrapper_table_x: table_x,
-            paint_top,
             block_start,
             block_span,
             writing_mode: WritingMode::VerticalLr,
@@ -407,17 +870,20 @@ impl TableFragmentainerPlacement {
         block_span: LogicalBlockContentSize,
     ) -> Self {
         Self {
-            table_x,
+            destination_grid_origin: PageTopPoint::from_inline_x_and_block_position(
+                table_x.points(),
+                paint_top,
+            ),
             wrapper_table_x: table_x,
-            paint_top,
             block_start,
             block_span,
             writing_mode: WritingMode::VerticalRl,
         }
     }
 
-    pub(in crate::layout::table) fn table_x(self) -> PageInlinePosition {
-        self.table_x
+    /// The immutable page origin of this fragment's destination cell grid.
+    pub(in crate::layout::table) fn destination_grid_origin(self) -> PageTopPoint {
+        self.destination_grid_origin
     }
 
     pub(in crate::layout::table) fn with_wrapper_table_x(
@@ -433,48 +899,11 @@ impl TableFragmentainerPlacement {
     }
 
     pub(in crate::layout::table) fn paint_top(self) -> PageTopBlockPosition {
-        self.paint_top
+        PageTopBlockPosition::new(self.destination_grid_origin.top_y())
     }
 
     pub(in crate::layout::table) fn block_start(self) -> TableFragmentainerBlockStart {
         self.block_start
-    }
-
-    /// Rebind a wrapper-local paint placement to the containing
-    /// fragmentainer's logical block start.  Opening table fragments paint at
-    /// their in-flow position, which can be after a split caption; the
-    /// fragmentainer boundary remains a separate semantic coordinate.
-    pub(in crate::layout::table) fn with_fragmentainer_block_start(
-        mut self,
-        block_start: TableFragmentainerBlockStart,
-    ) -> Self {
-        self.block_start = block_start;
-        self
-    }
-
-    /// Inset the destination grid from its fragmentainer edge without
-    /// changing the fragmentainer's logical block coordinate. Separated
-    /// tables own this inset as grid edge spacing; retaining the original
-    /// `block_start` keeps break-capacity and source-progress calculations in
-    /// the containing fragmentainer's coordinate system.
-    /// <https://www.w3.org/TR/CSS22/tables.html#separated-borders>
-    pub(in crate::layout::table) fn inset_destination_grid_block_start(
-        mut self,
-        inset: NonContentLength,
-    ) -> Self {
-        match self.writing_mode {
-            WritingMode::HorizontalTb => {
-                self.paint_top =
-                    PageTopBlockPosition::new(self.paint_top.points() - inset.points());
-            }
-            WritingMode::VerticalLr | WritingMode::SidewaysLr => {
-                self.table_x = PageInlinePosition::new(self.table_x.points() + inset.points());
-            }
-            WritingMode::VerticalRl | WritingMode::SidewaysRl => {
-                self.table_x = PageInlinePosition::new(self.table_x.points() - inset.points());
-            }
-        }
-        self
     }
 
     /// Return how far a committed destination grid begins after this
@@ -517,7 +946,7 @@ impl TableFragmentainerPlacement {
             | WritingMode::SidewaysLr
             | WritingMode::VerticalRl
             | WritingMode::SidewaysRl => {
-                PageTopBlockPosition::new(self.paint_top.points() - table_inline_span.points())
+                PageTopBlockPosition::new(self.paint_top().points() - table_inline_span.points())
             }
         }
     }
@@ -534,27 +963,8 @@ impl TableFragmentainerPlacement {
         axes: TableAxes,
         logical_size: TableGridLogicalSize,
     ) -> TableGridPlacement {
-        let origin = match self.writing_mode {
-            WritingMode::HorizontalTb => PageTopPoint::from_inline_x_and_block_position(
-                self.table_x.points(),
-                self.paint_top,
-            ),
-            WritingMode::VerticalLr
-            | WritingMode::SidewaysLr
-            | WritingMode::VerticalRl
-            | WritingMode::SidewaysRl => PageTopPoint::new(
-                // `table_x` is the committed table-content edge in this
-                // destination fragmentainer. Reconstructing this from the
-                // fragmentainer's block start drops the wrapper's leading
-                // padding/border offset, which makes structural paint escape
-                // the parent multicolumn slice before its own border can
-                // cover it.
-                self.table_x.points(),
-                self.paint_top.points(),
-            ),
-        };
         TableGridPlacement::with_axes(
-            origin,
+            self.destination_grid_origin,
             axes,
             // The destination placement supplies a fragment-local origin;
             // it does not change the table grid's logical extent.  Retaining
@@ -781,12 +1191,20 @@ impl TableCellClipRegion {
             max_x = max_x.max(rect.max_x());
             max_y = max_y.max(rect.max_y());
         }
-        Some(OverflowClip::from_paint_rect(paint_space_rect(
-            min_x,
-            min_y,
-            max_x - min_x,
-            max_y - min_y,
-        )))
+        Some(
+            OverflowClip::from_paint_rect(paint_space_rect(
+                min_x,
+                min_y,
+                max_x - min_x,
+                max_y - min_y,
+            ))
+            .with_axes_and_non_scrollable(
+                self.regions.iter().any(|clip| clip.clips_x),
+                self.regions.iter().any(|clip| clip.clips_y),
+                self.regions.iter().any(|clip| clip.non_scrollable_x),
+                self.regions.iter().any(|clip| clip.non_scrollable_y),
+            ),
+        )
     }
 
     pub(in crate::layout::table) fn paint_clips(&self) -> Vec<PaintClip> {
@@ -968,6 +1386,8 @@ pub(in crate::layout::table) enum TableCellChildFragmentKind {
 pub(in crate::layout::table) struct TableBreakCandidateMeta {
     pub(in crate::layout::table) row_index: usize,
     pub(in crate::layout::table) table_body_fragment: Option<TableBodyPaintFragment>,
+    pub(in crate::layout::table) wrapper_timeline_checkpoint:
+        Option<TableWrapperTimelineCheckpoint>,
     pub(in crate::layout::table) repeat_policy: TableFragmentRepeatPolicy,
     pub(in crate::layout::table) height: f32,
 }
@@ -2356,27 +2776,6 @@ pub(in crate::layout::table) struct TableGridSourceRowSlice {
     pub(in crate::layout::table) destination_block_start: TableGridBlockOffset,
 }
 
-/// Separately typed physical viewport receiving a source-grid projection.
-///
-/// A destination placement has the same logical axes and extent as the source
-/// grid, but its physical origin belongs to the committed page/column piece.
-/// Keeping the wrapper private prevents callers from mistaking it for the
-/// stable source-grid placement.
-#[derive(Debug, Clone, Copy)]
-pub(in crate::layout::table) struct TableGridDestinationPaintViewport {
-    placement: TableGridPlacement,
-}
-
-impl TableGridDestinationPaintViewport {
-    fn new(placement: TableGridPlacement) -> Self {
-        Self { placement }
-    }
-
-    pub(in crate::layout::table) fn placement(self) -> TableGridPlacement {
-        self.placement
-    }
-}
-
 /// The complete mapping from one retained table grid to one committed
 /// destination fragmentainer.
 ///
@@ -2389,29 +2788,37 @@ impl TableGridDestinationPaintViewport {
 /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
 #[derive(Debug, Clone)]
 pub(in crate::layout::table) struct TableGridFragmentProjection {
-    source_placement: TableGridPlacement,
-    destination_viewport: TableGridDestinationPaintViewport,
+    source_frame: TableSourceGridFrame,
+    destination_frame: TableDestinationCellGridFrame,
     source_row_slices: Vec<TableGridSourceRowSlice>,
 }
 
 impl TableGridFragmentProjection {
     fn new(
         source_placement: TableGridPlacement,
-        destination_placement: TableGridPlacement,
+        destination_frame: TableDestinationCellGridFrame,
     ) -> Self {
         Self {
-            source_placement,
-            destination_viewport: TableGridDestinationPaintViewport::new(destination_placement),
+            source_frame: TableSourceGridFrame::new(source_placement),
+            destination_frame,
             source_row_slices: Vec::new(),
         }
     }
 
+    #[cfg(test)]
+    fn fixture(source_placement: TableGridPlacement, destination: TableGridPlacement) -> Self {
+        Self::new(
+            source_placement,
+            TableDestinationCellGridFrame::fixture(destination),
+        )
+    }
+
     pub(in crate::layout::table) fn source_placement(&self) -> TableGridPlacement {
-        self.source_placement
+        self.source_frame.grid()
     }
 
     pub(in crate::layout::table) fn destination_placement(&self) -> TableGridPlacement {
-        self.destination_viewport.placement()
+        self.destination_frame.grid()
     }
 
     fn record_source_row_slice(&mut self, row: TableRowBounds, decision: TableRowFragmentDecision) {
@@ -2467,7 +2874,7 @@ impl TableGridFragmentProjection {
         source_inline_edge: TableGridLength,
     ) -> TableStructuralPaintProjection {
         TableStructuralPaintProjection::from_grid_slices(
-            self.source_placement,
+            self.source_placement(),
             self.destination_placement(),
             source_slice,
             destination_slice,
@@ -2489,7 +2896,7 @@ impl TableGridFragmentProjection {
 #[derive(Debug, Clone)]
 pub(in crate::layout::table) struct TableGridFragmentViewport {
     projection: TableGridFragmentProjection,
-    fragmentainer_placement: TableFragmentainerPlacement,
+    destination_frame: TableFragmentainerFrame,
     root_background_source_placement: TableGridPlacement,
     wrapper_timeline: TableWrapperFragmentTimeline,
     source_row_bounds: Vec<TableRowBounds>,
@@ -2815,6 +3222,14 @@ impl TableWrapperDecorationViewport {
                 grid_block + insets.block_start + insets.block_end,
             ),
         );
+        // Root decoration replay consumes the wrapper-root source frame,
+        // never a grid-content source offset with the full border-box span.
+        let root_source_frame = wrapper_timeline.root_source_frame(root_rect);
+        debug_assert!(root_source_frame.local_block_start().points() >= 0.0);
+        debug_assert!(
+            (root_source_frame.block_span().get() - root_rect.size.height).abs() <= f32::EPSILON
+        );
+        let root_rect = root_source_frame.root_rect();
         // `root_rect` already includes both wrapper block insets. Its source
         // geometry is the complete unfragmented border box used for
         // `box-decoration-break: slice`; adding the trailing inset again
@@ -2844,6 +3259,7 @@ impl TableWrapperDecorationViewport {
                 .grid_source_start
                 .expect("grid-body timeline entries retain their grid source interval")
                 .length();
+            let destination_placement = projection.destination_placement();
             let block_end = block_start + TableGridLength::new(row_height);
             let before = if block_start.get() <= 0.0 {
                 insets.block_start
@@ -2873,7 +3289,6 @@ impl TableWrapperDecorationViewport {
                     TableGridLength::new(row_height) + before + after,
                 ),
             );
-            let destination_placement = projection.destination_placement();
             let projection = TableStructuralPaintProjection::from_grid_slices(
                 source_placement,
                 destination_placement,
@@ -2885,14 +3300,6 @@ impl TableWrapperDecorationViewport {
             let owns_block_end = block_end.get() >= grid_block.get() - 0.01;
             let destination_clip_border_area =
                 PaintBackgroundArea::from_paint_rect(projection.destination_clip());
-            let phase_translation = wrapper_timeline.decoration_phase_translation(
-                source_placement,
-                TableGridBlockOffset::new(block_start),
-            );
-            let source_to_destination = PaintTranslation::new(
-                projection.source_to_destination.x + phase_translation.x,
-                projection.source_to_destination.y + phase_translation.y,
-            );
             fragments.push(TableWrapperDecorationSlice {
                 destination_clip_border_area: PaintBackgroundArea::from_paint_rect(
                     projection.destination_clip(),
@@ -2900,13 +3307,16 @@ impl TableWrapperDecorationViewport {
                 decoration: FragmentedDecorationSlice::new(
                     source_positioning_border_area.paint_rect(),
                     destination_clip_border_area.paint_rect(),
-                    source_to_destination,
+                    table_grid_source_progress_translation(
+                        source_placement.writing_mode(),
+                        TableGridBlockOffset::new(block_start),
+                    ),
                     owns_block_start,
                     owns_block_end,
                 ),
             });
         }
-        if fragments.is_empty() {
+        if fragments.is_empty() && !wrapper_timeline.has_grid_body_slices() {
             let projection = TableStructuralPaintProjection::from_grid_slices(
                 source_placement,
                 projection.destination_placement(),
@@ -2923,16 +3333,7 @@ impl TableWrapperDecorationViewport {
                 decoration: FragmentedDecorationSlice::new(
                     source_positioning_border_area.paint_rect(),
                     destination_clip_border_area.paint_rect(),
-                    {
-                        let phase_translation = wrapper_timeline.decoration_phase_translation(
-                            source_placement,
-                            TableGridBlockOffset::new(TableGridLength::new(0.0)),
-                        );
-                        PaintTranslation::new(
-                            projection.source_to_destination.x + phase_translation.x,
-                            projection.source_to_destination.y + phase_translation.y,
-                        )
-                    },
+                    projection.source_to_destination,
                     true,
                     true,
                 ),
@@ -3016,6 +3417,26 @@ impl TableWrapperDecorationViewport {
     }
 }
 
+/// Map a table-grid source interval into the table-local replay canvas.
+///
+/// The enclosing fragmentation context later maps completed temporary parent
+/// fragments to columns/pages.  A table-root decoration must therefore carry
+/// only the immutable grid-source progress here: using the difference between
+/// temporary-page origins leaks the parent replay translation into the table
+/// background phase, and makes captions affect `box-decoration-break: slice`.
+/// <https://www.w3.org/TR/css-break-3/#break-decoration>
+fn table_grid_source_progress_translation(
+    writing_mode: WritingMode,
+    source_block_start: TableGridBlockOffset,
+) -> PaintTranslation {
+    let progress = source_block_start.length().get();
+    match writing_mode {
+        WritingMode::HorizontalTb => PaintTranslation::new(0.0, progress),
+        WritingMode::VerticalLr | WritingMode::SidewaysLr => PaintTranslation::new(progress, 0.0),
+        WritingMode::VerticalRl | WritingMode::SidewaysRl => PaintTranslation::new(-progress, 0.0),
+    }
+}
+
 pub(in crate::layout::table) fn table_root_background_logical_insets(
     placement: TableGridPlacement,
     style: &ComputedStyle,
@@ -3047,15 +3468,17 @@ pub(in crate::layout::table) fn table_root_background_logical_insets(
 impl TableGridFragmentViewport {
     fn new(
         source_placement: TableGridPlacement,
-        destination_placement: TableGridPlacement,
-        fragmentainer_placement: TableFragmentainerPlacement,
+        destination_frame: TableFragmentainerFrame,
         root_background_source_placement: TableGridPlacement,
         wrapper_timeline: TableWrapperFragmentTimeline,
         source_row_bounds: Vec<TableRowBounds>,
     ) -> Self {
         Self {
-            projection: TableGridFragmentProjection::new(source_placement, destination_placement),
-            fragmentainer_placement,
+            projection: TableGridFragmentProjection::new(
+                source_placement,
+                destination_frame.cell_grid_frame(),
+            ),
+            destination_frame,
             root_background_source_placement,
             wrapper_timeline,
             source_row_bounds,
@@ -3070,7 +3493,11 @@ impl TableGridFragmentViewport {
     }
 
     pub(in crate::layout::table) fn fragmentainer_placement(&self) -> TableFragmentainerPlacement {
-        self.fragmentainer_placement
+        self.destination_frame.placement()
+    }
+
+    pub(in crate::layout::table) fn destination_frame(&self) -> TableFragmentainerFrame {
+        self.destination_frame
     }
 
     /// The retained unfragmented grid used to resolve `slice` backgrounds and
@@ -3105,7 +3532,7 @@ impl TableGridFragmentViewport {
         self.projection.record_source_row_slice(row, decision);
         if let Some(slice) = self.projection.source_row_slices().last().copied() {
             self.wrapper_timeline.record_grid_body_slice(
-                self.fragmentainer_placement,
+                self.destination_frame.placement(),
                 slice.block_start,
                 slice.block_size,
                 slice.destination_block_start,
@@ -3165,6 +3592,25 @@ pub(in crate::layout::table) struct TableBodyPaintFragment {
     pub(in crate::layout::table) grid_viewport: Option<TableGridFragmentViewport>,
 }
 
+impl TableBodyPaintFragment {
+    pub(in crate::layout::table) fn wrapper_timeline_checkpoint(
+        &self,
+    ) -> Option<TableWrapperTimelineCheckpoint> {
+        self.grid_viewport
+            .as_ref()
+            .map(|viewport| viewport.wrapper_timeline().checkpoint())
+    }
+
+    pub(in crate::layout::table) fn rewind_wrapper_timeline(
+        &self,
+        checkpoint: TableWrapperTimelineCheckpoint,
+    ) {
+        if let Some(viewport) = &self.grid_viewport {
+            viewport.wrapper_timeline().rewind(checkpoint);
+        }
+    }
+}
+
 /// Structural table paint owned by a relatively positioned row or row group.
 ///
 /// Table layout creates row and row-group backgrounds after row content has
@@ -3174,7 +3620,11 @@ pub(in crate::layout::table) struct TableBodyPaintFragment {
 /// <https://drafts.csswg.org/css-position-3/#relative-positioning>
 #[derive(Debug, Clone)]
 pub(in crate::layout::table) struct RelativeTablePartStructuralPaint {
-    pub(in crate::layout::table) style: ComputedStyle,
+    /// Unscaled source retained for paint identity and any deferred cascade
+    /// reconstruction.
+    pub(in crate::layout::table) source_style: ComputedStyle,
+    /// Used style that selected the captured paint geometry.
+    pub(in crate::layout::table) style: css::ZoomedLayoutStyle,
     pub(in crate::layout::table) bounds: PaintClip,
     pub(in crate::layout::table) primitives: Vec<PaintPrimitive>,
 }
@@ -3187,7 +3637,7 @@ pub(in crate::layout::table) struct TableCellLayoutMetrics {
 }
 
 pub(in crate::layout::table) struct PreparedTableCell {
-    pub(in crate::layout::table) style: ComputedStyle,
+    pub(in crate::layout::table) style: css::ZoomedLayoutStyle,
     pub(in crate::layout::table) row_sizing_style: ComputedStyle,
     pub(in crate::layout::table) area: TableGridArea,
     pub(in crate::layout::table) inline_bounds: TableInlineBounds,
@@ -3214,6 +3664,12 @@ pub(in crate::layout) struct TableCellContentCoordinateContext {
     pub(in crate::layout) origin: PageTopPoint,
     pub(in crate::layout) writing_mode: WritingMode,
     pub(in crate::layout) direction: Direction,
+    /// The resolved cell-descendant clip visible to nested layout decisions.
+    ///
+    /// Table layout retains the actual PDF clip after child paint collection,
+    /// but a nested formatting context still needs to know whether its source
+    /// overflow is bounded in the table cell's physical block axis.
+    pub(in crate::layout) overflow_clip: Option<OverflowClip>,
 }
 
 pub(in crate::layout::table) struct TableCellContentScope {
@@ -3281,13 +3737,68 @@ pub(in crate::layout::table) enum TableCellBaselineSet {
 ///
 /// Spec: <https://drafts.csswg.org/css-tables-3/#row-layout> and
 /// <https://drafts.csswg.org/css-tables-3/#height-distribution-algorithm>.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) enum TableHeightDistributionTarget {
+    /// No definite table content-box height constrains row distribution.
+    Intrinsic,
+    /// A resolved table content-box height constrains row distribution.
+    Definite(ContentBoxLength),
+}
+
+impl TableHeightDistributionTarget {
+    /// The definite content-box height needed by legacy sizing interfaces.
+    pub(in crate::layout::table) fn definite_content_height(self) -> Option<ContentBoxLength> {
+        match self {
+            Self::Intrinsic => None,
+            Self::Definite(height) => Some(height),
+        }
+    }
+}
+
+/// Cache representation of [`TableHeightDistributionTarget`].
+///
+/// This is the only boundary that reduces a semantic content-box length to
+/// its scalar bit representation for hashing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(in crate::layout) enum TableHeightDistributionTargetKey {
+    Intrinsic,
+    Definite(u32),
+}
+
+impl From<TableHeightDistributionTarget> for TableHeightDistributionTargetKey {
+    fn from(target: TableHeightDistributionTarget) -> Self {
+        match target {
+            TableHeightDistributionTarget::Intrinsic => Self::Intrinsic,
+            TableHeightDistributionTarget::Definite(height) => {
+                Self::Definite(height.points().to_bits())
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod table_height_distribution_target_tests {
+    use super::*;
+
+    #[test]
+    fn cache_key_distinguishes_intrinsic_and_definite_distribution_targets() {
+        assert_ne!(
+            TableHeightDistributionTargetKey::from(TableHeightDistributionTarget::Intrinsic),
+            TableHeightDistributionTargetKey::from(TableHeightDistributionTarget::Definite(
+                content_box_pt(75.0),
+            )),
+        );
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(in crate::layout) struct TableHeightPlan {
     pub(in crate::layout::table) rows: Vec<TableRowHeightPlan>,
-    /// Definite table grid block-size target resolved before row distribution.
+    /// Resolved constraint for distributing the table grid's rows.
+    ///
     /// This is distinct from the resulting intrinsic grid height: percentage
-    /// descendants only become definite through an explicit, resolved target.
-    pub(in crate::layout::table) target_content_height: Option<ContentBoxLength>,
+    /// descendants become definite only for the `Definite` variant.
+    pub(in crate::layout::table) target: TableHeightDistributionTarget,
 }
 
 /// Per-row state used by `TableHeightPlan`.
@@ -3456,18 +3967,26 @@ impl TableBodyPaintFragment {
                     planned_row_occupancy,
                     table_metrics.clone(),
                 );
+                let destination_cell_grid = self.plan.placement.destination_grid_placement(
+                    &table_metrics,
+                    planned_row_occupancy,
+                    TableAxes::for_style(table_style),
+                    TableGridLogicalSize::new(
+                        column_plan.total_width(),
+                        LogicalBlockContentSize::new(content_box_pt(table_block_extent)),
+                    ),
+                );
+                let destination_frame = TableFragmentainerFrame::from_cell_grid(
+                    self.plan.placement,
+                    destination_cell_grid,
+                    TableGridLength::new(table_vertical_edge_spacing(
+                        planned_row_occupancy,
+                        table_metrics.clone(),
+                    )),
+                );
                 TableGridFragmentViewport::new(
                     source_grid_placement,
-                    self.plan.placement.destination_grid_placement(
-                        &table_metrics,
-                        planned_row_occupancy,
-                        TableAxes::for_style(table_style),
-                        TableGridLogicalSize::new(
-                            column_plan.total_width(),
-                            LogicalBlockContentSize::new(content_box_pt(table_block_extent)),
-                        ),
-                    ),
-                    self.plan.placement,
+                    destination_frame,
                     root_background_source_grid_placement,
                     wrapper_timeline,
                     source_row_bounds,
@@ -3707,10 +4226,27 @@ pub(in crate::layout::table) fn table_atomic_stacking_policy(
     policy
 }
 
+/// Whether this table fragment's structural outlines join the enclosing
+/// normal-flow outline phase.
+///
+/// A static table is an atomic table-paint unit, but not an atomic *stacking*
+/// context. Its row-group outlines therefore follow Quire's normal-flow
+/// compatibility phase. Positioned and effect-owning tables retain a final
+/// local outline phase instead.
+pub(in crate::layout::table) fn table_outlines_use_in_flow_phase(
+    style: &ComputedStyle,
+    table_is_document_canvas: bool,
+    policy: &StackingContextPolicy,
+) -> bool {
+    !table_is_document_canvas
+        && !style.position.is_in_flow_positioned()
+        && !policy.is_real_stacking_context
+}
+
 pub(in crate::layout::table) fn table_horizontal_non_content_width(
     table_width: UsedTableWidth,
 ) -> f32 {
-    table_width.horizontal_non_content().points()
+    table_width.inline_non_content().points()
 }
 
 pub(in crate::layout::table) fn table_content_width_clamped_to_min_content(
@@ -3718,7 +4254,12 @@ pub(in crate::layout::table) fn table_content_width_clamped_to_min_content(
     content_width: LogicalInlineContentSize,
     min_content: LogicalInlineContentSize,
 ) -> LogicalInlineContentSize {
-    if style.table_layout == TableLayout::Auto {
+    // CSS 2.2 permits the fixed layout algorithm only when the table has a
+    // non-auto width. An auto-width `table-layout: fixed` table therefore
+    // still needs the automatic table's intrinsic floor before the fixed
+    // planner consumes its used grid width.
+    // <https://www.w3.org/TR/CSS22/tables.html#fixed-table-layout>
+    if style.table_layout == TableLayout::Auto || table_root_inline_size(style).is_auto() {
         LogicalInlineContentSize::new(content_box_pt(
             content_width.points().max(min_content.points()),
         ))
@@ -4898,6 +5439,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn auto_width_fixed_table_keeps_its_intrinsic_grid_floor() {
+        let mut style = ComputedStyle::initial();
+        style.table_layout = TableLayout::Fixed;
+
+        assert_eq!(
+            table_content_width_clamped_to_min_content(
+                &style,
+                LogicalInlineContentSize::new(content_box_pt(0.0)),
+                LogicalInlineContentSize::new(content_box_pt(75.0)),
+            )
+            .points(),
+            75.0,
+        );
+    }
+
+    #[test]
     fn block_table_uses_the_in_flow_block_paint_band() {
         let mut style = ComputedStyle::initial();
         style.display = css::Display::TABLE;
@@ -5018,7 +5575,7 @@ mod tests {
             TableGridPoint::from_lengths(TableGridLength::new(10.0), TableGridLength::new(0.0)),
             source_slice.size,
         );
-        let fragment_projection = TableGridFragmentProjection::new(source, destination);
+        let fragment_projection = TableGridFragmentProjection::fixture(source, destination);
         let projection = fragment_projection.project_slice(
             source_slice,
             destination_slice,
@@ -5071,7 +5628,7 @@ mod tests {
             TableGridPoint::from_lengths(TableGridLength::new(0.0), TableGridLength::new(0.0)),
             source_slice.size,
         );
-        let fragment_projection = TableGridFragmentProjection::new(source, destination);
+        let fragment_projection = TableGridFragmentProjection::fixture(source, destination);
         let projection = fragment_projection.project_slice(
             source_slice,
             destination_slice,
@@ -5120,7 +5677,7 @@ mod tests {
             }]],
             column_count: 2,
         };
-        let projection = TableGridFragmentProjection::new(source, source);
+        let projection = TableGridFragmentProjection::fixture(source, source);
         let clips = table_column_grid_cell_clips(
             &projection,
             &column_plan,
@@ -5168,7 +5725,7 @@ mod tests {
             ],
             column_count: 1,
         };
-        let projection = TableGridFragmentProjection::new(source, source);
+        let projection = TableGridFragmentProjection::fixture(source, source);
         let projections = table_structural_originating_cell_projections(
             &projection,
             &[
@@ -5223,7 +5780,7 @@ mod tests {
             ],
             column_count: 2,
         };
-        let projection = TableGridFragmentProjection::new(source, source);
+        let projection = TableGridFragmentProjection::fixture(source, source);
         let projections = table_structural_originating_cell_projections(
             &projection,
             &[
@@ -5277,7 +5834,7 @@ mod tests {
             ]],
             column_count: 2,
         };
-        let projection = TableGridFragmentProjection::new(source, source);
+        let projection = TableGridFragmentProjection::fixture(source, source);
         let projections = table_structural_originating_cell_projections(
             &projection,
             &[TableRowBounds::new(0.0, 20.0)],
@@ -5330,7 +5887,7 @@ mod tests {
             ]],
             column_count: 2,
         };
-        let projection = TableGridFragmentProjection::new(source, source);
+        let projection = TableGridFragmentProjection::fixture(source, source);
         let projections = table_structural_originating_cell_projections(
             &projection,
             &[TableRowBounds::new(0.0, 20.0)],
@@ -5386,7 +5943,7 @@ mod tests {
             }]],
             column_count: 1,
         };
-        let fragment_projection = TableGridFragmentProjection::new(source, destination);
+        let fragment_projection = TableGridFragmentProjection::fixture(source, destination);
         let projections = table_structural_originating_cell_projections(
             &fragment_projection,
             &[TableRowBounds::new(0.0, 40.0)],
@@ -5653,9 +6210,12 @@ mod tests {
             PageTopBlockPosition::new(648.0),
             LogicalBlockContentSize::new(content_box_pt(100.0)),
         );
-        assert_eq!(horizontal.table_x().points(), 72.0);
+        assert_eq!(horizontal.destination_grid_origin().x(), 72.0);
         assert_eq!(horizontal.block_start().points(), 648.0);
-        assert_eq!(horizontal_second_column.table_x().points(), 306.0);
+        assert_eq!(
+            horizontal_second_column.destination_grid_origin().x(),
+            306.0
+        );
         assert_eq!(
             horizontal.trailing_paint_top(
                 PageTopBlockPosition::new(512.0),
@@ -5679,7 +6239,10 @@ mod tests {
         .with_wrapper_table_x(PageInlinePosition::new(72.0));
         assert_eq!(vertical_lr.block_start().points(), -72.0);
         assert_eq!(vertical_lr_second_column.block_start().points(), -306.0);
-        assert_eq!(vertical_lr_second_column.table_x().points(), 306.0);
+        assert_eq!(
+            vertical_lr_second_column.destination_grid_origin().x(),
+            306.0
+        );
         assert_eq!(vertical_lr_second_column.wrapper_table_x().points(), 72.0);
         assert_eq!(
             vertical_lr.trailing_paint_top(
@@ -5704,7 +6267,10 @@ mod tests {
         .with_wrapper_table_x(PageInlinePosition::new(72.0));
         assert_eq!(vertical_rl.block_start().points(), 540.0);
         assert_eq!(vertical_rl_second_column.block_start().points(), 306.0);
-        assert_eq!(vertical_rl_second_column.table_x().points(), 306.0);
+        assert_eq!(
+            vertical_rl_second_column.destination_grid_origin().x(),
+            306.0
+        );
         assert_eq!(vertical_rl_second_column.wrapper_table_x().points(), 72.0);
         assert_eq!(
             vertical_rl.trailing_paint_top(
@@ -6127,8 +6693,7 @@ mod tests {
         top: f32,
     ) -> TableWrapperPaintBox {
         TableWrapperPaintBox {
-            table_x,
-            top,
+            grid_origin: PageTopPoint::new(table_x, top),
             axes: TableAxes {
                 flow: FlowAxes::new(writing_mode, direction),
                 direction,
@@ -6138,6 +6703,11 @@ mod tests {
                 LogicalBlockContentSize::new(content_box_pt(120.0)),
             ),
             table_width: UsedTableWidth {
+                grid_inline: LogicalInlineContentSize::new(content_box_pt(80.0)),
+                axes: TableAxes {
+                    flow: FlowAxes::new(writing_mode, direction),
+                    direction,
+                },
                 content_width: content_box_pt(80.0),
                 border_widths: css::Edges::ZERO,
                 padding: css::Edges::ZERO,
@@ -6146,6 +6716,7 @@ mod tests {
                 border_collapse: css::BorderCollapse::Separate,
                 spacing: css::BorderSpacing::ZERO,
             },
+            block_edge_spacing: TableGridLength::new(0.0),
         }
     }
 
@@ -6162,7 +6733,7 @@ mod tests {
             TableGridLength::new(0.0),
             destination,
             wrapper.grid_placement(),
-            TableGridLength::new(0.0),
+            TableRootBlockStartChrome::new(TableGridLength::new(0.0)),
         );
 
         assert_eq!(
@@ -6202,7 +6773,7 @@ mod tests {
             TableGridLength::new(0.0),
             destination,
             wrapper.grid_placement(),
-            TableGridLength::new(0.0),
+            TableRootBlockStartChrome::new(TableGridLength::new(0.0)),
         );
 
         assert_eq!(
@@ -6215,36 +6786,317 @@ mod tests {
     }
 
     #[test]
-    fn wrapper_timeline_carries_split_caption_progress_only_after_first_grid_slice() {
-        let wrapper = wrapper_viewport_box(WritingMode::HorizontalTb, Direction::Ltr, 120.0, 160.0);
-        let timeline = TableWrapperFragmentTimeline::new();
-        let destination = TableFragmentainerPlacement::horizontal(
-            PageInlinePosition::new(120.0),
-            PageTopBlockPosition::new(160.0),
-            LogicalBlockContentSize::new(content_box_pt(100.0)),
-        )
-        .with_fragmentainer_block_start(TableFragmentainerBlockStart::new(200.0));
-        timeline.record_top_caption_progress(
-            TableGridLength::new(105.0),
-            destination,
-            wrapper.clone().grid_placement(),
-            TableGridLength::new(10.0),
-        );
+    fn caption_outcome_preserves_authoritative_vertical_destination_tracks() {
+        // A table grid must receive the exact destination selected by the
+        // caption consumer. These cover a remaining track, an exhausted
+        // track requiring a successor, and a post-break track in both
+        // vertical block directions.
+        for (destination, requires_successor) in [
+            (
+                TableFragmentainerPlacement::vertical_rl(
+                    PageInlinePosition::new(120.0),
+                    PageTopBlockPosition::new(80.0),
+                    TableFragmentainerBlockStart::new(170.0),
+                    LogicalBlockContentSize::new(content_box_pt(50.0)),
+                ),
+                false,
+            ),
+            (
+                TableFragmentainerPlacement::vertical_rl(
+                    PageInlinePosition::new(120.0),
+                    PageTopBlockPosition::new(80.0),
+                    TableFragmentainerBlockStart::new(120.0),
+                    LogicalBlockContentSize::new(content_box_pt(0.0)),
+                ),
+                true,
+            ),
+            (
+                TableFragmentainerPlacement::vertical_lr(
+                    PageInlinePosition::new(35.0),
+                    PageTopBlockPosition::new(80.0),
+                    TableFragmentainerBlockStart::new(-35.0),
+                    LogicalBlockContentSize::new(content_box_pt(50.0)),
+                ),
+                false,
+            ),
+        ] {
+            let outcome = TableCaptionLayoutOutcome::new(
+                destination,
+                Vec::new(),
+                TableWrapperBlockInterval::new(
+                    TableWrapperBlockOffset::zero(),
+                    TableGridLength::new(50.0),
+                ),
+                TableGridLength::new(50.0),
+                requires_successor,
+            );
+
+            assert_eq!(outcome.final_destination(), destination);
+            assert_eq!(outcome.next_part_requires_successor(), requires_successor);
+        }
+    }
+
+    #[test]
+    fn table_root_decoration_translation_uses_grid_source_progress_only() {
+        let progress = TableGridBlockOffset::new(TableGridLength::new(37.5));
 
         assert_eq!(
-            timeline.decoration_phase_translation(
-                wrapper.clone().grid_placement(),
-                TableGridBlockOffset::new(TableGridLength::new(0.0)),
-            ),
-            PaintTranslation::identity(),
+            table_grid_source_progress_translation(WritingMode::HorizontalTb, progress),
+            PaintTranslation::new(0.0, 37.5),
         );
         assert_eq!(
-            timeline.decoration_phase_translation(
-                wrapper.grid_placement(),
-                TableGridBlockOffset::new(TableGridLength::new(45.0)),
-            ),
-            PaintTranslation::new(0.0, -30.0),
+            table_grid_source_progress_translation(WritingMode::VerticalLr, progress),
+            PaintTranslation::new(37.5, 0.0),
         );
+        assert_eq!(
+            table_grid_source_progress_translation(WritingMode::VerticalRl, progress),
+            PaintTranslation::new(-37.5, 0.0),
+        );
+    }
+
+    #[test]
+    fn wrapper_timeline_keeps_caption_and_grid_source_offsets_distinct() {
+        let wrapper = wrapper_viewport_box(WritingMode::VerticalLr, Direction::Rtl, 120.0, 80.0);
+        let timeline = TableWrapperFragmentTimeline::new();
+        let destination = TableFragmentainerPlacement::vertical_lr(
+            PageInlinePosition::new(120.0),
+            PageTopBlockPosition::new(80.0),
+            TableFragmentainerBlockStart::new(-220.0),
+            LogicalBlockContentSize::new(content_box_pt(100.0)),
+        );
+        timeline.record_top_caption_progress(
+            TableGridLength::new(140.0),
+            destination,
+            wrapper.grid_placement(),
+            TableRootBlockStartChrome::new(TableGridLength::new(10.0)),
+        );
+        timeline.record_grid_body_slice(
+            destination,
+            TableGridBlockOffset::new(TableGridLength::new(0.0)),
+            TableGridLength::new(225.0),
+            TableGridBlockOffset::new(TableGridLength::new(0.0)),
+        );
+        timeline.record_grid_end_chrome(
+            TableGridLength::new(225.0),
+            TableGridLength::new(10.0),
+            destination,
+            TableGridBlockOffset::new(TableGridLength::new(0.0)),
+        );
+        timeline.record_bottom_caption_progress(
+            TableGridLength::new(225.0),
+            TableGridLength::new(10.0),
+            TableGridLength::new(15.0),
+            destination,
+            TableGridBlockOffset::new(TableGridLength::new(0.0)),
+        );
+
+        let state = timeline.state.borrow();
+        assert_eq!(state.slices.len(), 5);
+        assert_eq!(state.slices[0].kind, TableWrapperTimelineKind::TopCaption);
+        assert_eq!(
+            state.slices[1].kind,
+            TableWrapperTimelineKind::GridStartChrome
+        );
+        assert_eq!(state.slices[2].kind, TableWrapperTimelineKind::GridBody);
+        assert_eq!(
+            state.slices[3].kind,
+            TableWrapperTimelineKind::GridEndChrome
+        );
+        assert_eq!(
+            state.slices[4].kind,
+            TableWrapperTimelineKind::BottomCaption
+        );
+        assert_eq!(state.slices[0].grid_source_start, None);
+        assert_eq!(
+            state.slices[2]
+                .grid_source_start
+                .map(|offset| offset.length().get()),
+            Some(0.0)
+        );
+        assert_eq!(state.slices[4].grid_source_start, None);
+        assert_eq!(state.slices[4].source.start.0.get(), 385.0);
+    }
+
+    #[test]
+    fn wrapper_timeline_keeps_each_vertical_caption_destination_before_grid_source() {
+        let timeline = TableWrapperFragmentTimeline::new();
+        let wrapper = wrapper_viewport_box(WritingMode::VerticalLr, Direction::Rtl, 20.0, 300.0);
+        let first_destination = TableFragmentainerPlacement::vertical_lr(
+            PageInlinePosition::new(20.0),
+            PageTopBlockPosition::new(300.0),
+            TableFragmentainerBlockStart::new(-20.0),
+            LogicalBlockContentSize::new(content_box_pt(25.0)),
+        );
+        let second_destination = TableFragmentainerPlacement::vertical_rl(
+            PageInlinePosition::new(45.0),
+            PageTopBlockPosition::new(300.0),
+            TableFragmentainerBlockStart::new(45.0),
+            LogicalBlockContentSize::new(content_box_pt(25.0)),
+        );
+        let context = PageContext {
+            size: PageSize::from_points(400.0, 400.0),
+            margins: PageMargins::all_points(0.0),
+            edges: PageBoxEdges::ZERO,
+            rotation: 0,
+        };
+        let caption_slices = [
+            TableCaptionPaintSlice {
+                page_index: 0,
+                source_block_start: layout_pt(0.0),
+                block_size: layout_pt(25.0),
+                destination: first_destination,
+                destination_context: context,
+                destination_origin: PageTopPoint::new(context.left(), context.top()),
+                destination_extent: LogicalSize {
+                    inline: 100.0,
+                    block: 25.0,
+                },
+                destination_block_start: layout_pt(0.0),
+            },
+            TableCaptionPaintSlice {
+                page_index: 1,
+                source_block_start: layout_pt(25.0),
+                block_size: layout_pt(25.0),
+                destination: second_destination,
+                destination_context: context,
+                destination_origin: PageTopPoint::new(context.left(), context.top()),
+                destination_extent: LogicalSize {
+                    inline: 100.0,
+                    block: 25.0,
+                },
+                destination_block_start: layout_pt(0.0),
+            },
+        ];
+        timeline.record_top_caption_slices(
+            &caption_slices,
+            TableGridLength::new(50.0),
+            second_destination,
+            wrapper.grid_placement(),
+            TableRootBlockStartChrome::new(TableGridLength::new(10.0)),
+        );
+        timeline.record_grid_body_slice(
+            second_destination,
+            TableGridBlockOffset::new(TableGridLength::new(0.0)),
+            TableGridLength::new(20.0),
+            TableGridBlockOffset::new(TableGridLength::new(0.0)),
+        );
+
+        let state = timeline.state.borrow();
+        assert_eq!(state.slices.len(), 4);
+        assert_eq!(state.slices[0].destination, first_destination);
+        assert_eq!(state.slices[1].destination, second_destination);
+        assert_eq!(state.slices[0].source.start().points(), 0.0);
+        assert_eq!(state.slices[1].source.start().points(), 25.0);
+        assert_eq!(
+            state.slices[2].kind,
+            TableWrapperTimelineKind::GridStartChrome
+        );
+        assert_eq!(state.slices[3].kind, TableWrapperTimelineKind::GridBody);
+        assert_eq!(
+            state.slices[3].grid_source_start,
+            Some(TableGridBlockOffset::new(TableGridLength::new(0.0)))
+        );
+    }
+
+    fn wrapper_root_source_rect(block_start: f32, block_span: f32) -> TableGridRect {
+        TableGridRect::new(
+            TableGridPoint::from_lengths(
+                TableGridLength::new(0.0),
+                TableGridLength::new(block_start),
+            ),
+            TableGridSize::from_lengths(
+                TableGridLength::new(100.0),
+                TableGridLength::new(block_span),
+            ),
+        )
+    }
+
+    #[test]
+    fn wrapper_root_source_frame_starts_before_block_start_chrome() {
+        let timeline = TableWrapperFragmentTimeline::new();
+        let destination = TableFragmentainerPlacement::horizontal(
+            PageInlinePosition::new(0.0),
+            PageTopBlockPosition::new(100.0),
+            LogicalBlockContentSize::new(content_box_pt(100.0)),
+        );
+        timeline.record_top_caption_progress(
+            TableGridLength::new(0.0),
+            destination,
+            projection_placement(
+                WritingMode::HorizontalTb,
+                Direction::Ltr,
+                PageTopPoint::new(0.0, 100.0),
+            ),
+            TableRootBlockStartChrome::new(TableGridLength::new(10.0)),
+        );
+
+        let root = timeline.root_source_frame(wrapper_root_source_rect(-10.0, 400.0));
+        let grid_start = timeline
+            .state
+            .borrow()
+            .grid_start
+            .expect("grid start is committed");
+
+        assert_eq!(root.local_block_start().points(), 0.0);
+        assert_eq!(root.block_span().get(), 400.0);
+        assert_eq!(grid_start.grid_content_start.points(), 10.0);
+    }
+
+    #[test]
+    fn wrapper_root_source_frame_keeps_caption_progress_outside_start_chrome() {
+        let timeline = TableWrapperFragmentTimeline::new();
+        let destination = TableFragmentainerPlacement::horizontal(
+            PageInlinePosition::new(0.0),
+            PageTopBlockPosition::new(100.0),
+            LogicalBlockContentSize::new(content_box_pt(100.0)),
+        );
+        timeline.record_top_caption_progress(
+            TableGridLength::new(140.0),
+            destination,
+            projection_placement(
+                WritingMode::HorizontalTb,
+                Direction::Ltr,
+                PageTopPoint::new(0.0, 100.0),
+            ),
+            TableRootBlockStartChrome::new(TableGridLength::new(10.0)),
+        );
+
+        let root = timeline.root_source_frame(wrapper_root_source_rect(-10.0, 245.0));
+        let grid_start = timeline
+            .state
+            .borrow()
+            .grid_start
+            .expect("grid start is committed");
+
+        assert_eq!(root.local_block_start().points(), 140.0);
+        assert_eq!(root.block_span().get(), 245.0);
+        assert_eq!(grid_start.grid_content_start.points(), 150.0);
+    }
+
+    #[test]
+    fn wrapper_root_source_frame_uses_logical_progress_for_vertical_tables() {
+        let timeline = TableWrapperFragmentTimeline::new();
+        let destination = TableFragmentainerPlacement::vertical_rl(
+            PageInlinePosition::new(120.0),
+            PageTopBlockPosition::new(80.0),
+            TableFragmentainerBlockStart::new(-220.0),
+            LogicalBlockContentSize::new(content_box_pt(100.0)),
+        );
+        timeline.record_top_caption_progress(
+            TableGridLength::new(140.0),
+            destination,
+            projection_placement(
+                WritingMode::VerticalRl,
+                Direction::Rtl,
+                PageTopPoint::new(120.0, 80.0),
+            ),
+            TableRootBlockStartChrome::new(TableGridLength::new(10.0)),
+        );
+
+        let root = timeline.root_source_frame(wrapper_root_source_rect(-10.0, 245.0));
+
+        assert_eq!(root.local_block_start().points(), 140.0);
+        assert_eq!(root.block_span().get(), 245.0);
     }
 
     #[test]

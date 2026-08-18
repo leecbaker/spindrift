@@ -9,11 +9,9 @@ pub(crate) fn apply_cascaded_marker_declarations_with_inheritance_source_and_par
 ) {
     let (direction, writing_mode) =
         logical_mapping_context(style, declarations, inheritance_source);
-    let declarations = declarations_after_css_wide_rollbacks(declarations, direction, writing_mode);
-    let declarations = declarations
-        .into_iter()
-        .filter_map(canonical_cascaded_declaration)
-        .collect::<Vec<_>>();
+    let mut declarations =
+        declarations_after_css_wide_rollbacks(declarations, direction, writing_mode);
+    declarations.retain(cascaded_declaration_is_canonical);
     apply_cascaded_custom_property_declarations(style, &declarations, inheritance_source);
     apply_cascaded_color_scheme_declarations(
         style,
@@ -86,6 +84,7 @@ pub(crate) fn apply_cascaded_marker_declarations_with_inheritance_source_and_par
                     parent_ch_advance,
                     style.font_weight,
                     Some(style.font_size),
+                    layout_pt(inheritance_source.line_height),
                 )
                 .map(|font| (source, font));
             }
@@ -95,6 +94,16 @@ pub(crate) fn apply_cascaded_marker_declarations_with_inheritance_source_and_par
             continue;
         }
         parsed_font_component = None;
+        if apply_cascaded_marker_text_property(
+            style,
+            name,
+            value,
+            declaration,
+            inheritance_source,
+            parent_ch_advance,
+        ) {
+            continue;
+        }
         match name {
             "-webkit-text-fill-color" => {
                 if value.eq_ignore_ascii_case("currentcolor") {
@@ -236,6 +245,20 @@ pub(crate) fn apply_cascaded_marker_declarations_with_inheritance_source_and_par
                 if let Some((white_space, text_wrap_mode)) = parsed {
                     style.white_space = white_space;
                     style.text_wrap_mode = text_wrap_mode;
+                }
+            }
+            "line-height" => {
+                // Markers accept font and line-height properties. Resolve
+                // `lh` against the originating list item's inherited line
+                // height just as the ordinary declaration path does.
+                // <https://drafts.csswg.org/css-lists-3/#marker-properties>
+                // <https://drafts.csswg.org/css-values-4/#lh>
+                if let Some(mut line_height) = parse_computed_line_height(value, style.font_size) {
+                    line_height.resolve_inherited_line_height_relative_lengths(layout_pt(
+                        inheritance_source.line_height,
+                    ));
+                    style.line_height_value = line_height;
+                    project_line_height(style);
                 }
             }
             "text-wrap" => {

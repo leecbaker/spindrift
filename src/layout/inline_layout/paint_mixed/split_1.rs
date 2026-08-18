@@ -1,12 +1,13 @@
+use super::super::items::InlineLineSequenceSlice;
 use super::*;
 use crate::layout::assets::{
-    apply_object_fit, native_generated_gradient_primitive, raster_image_interpolation,
-    replaced_content_contour, svg_replaced_group_with_viewport_clip,
+    ReplacedObjectOverflow, apply_object_fit, native_generated_gradient_primitive,
+    raster_image_sampling, replaced_content_contour, svg_replaced_group_with_viewport_clip,
 };
 use crate::layout::text_paint::{
     TextDecorationLineGeometry, TextDecorationLineGlyphCoverage, TextDecorationLineGlyphSequence,
-    TextDecorationLineKind, TextDecorationOriginLineGeometry, TextDecorationStrokeAxis,
-    TextInlineSpan, active_text_decoration_layers, positioned_rendered_runs_for_writing_mode,
+    TextDecorationLineKind, TextDecorationOriginFragmentGeometry, TextDecorationOriginLineGeometry,
+    TextDecorationStrokeAxis, TextInlineSpan, positioned_rendered_runs_for_writing_mode,
     text_decoration_positioned_glyphs, text_decoration_skip_self_suppresses,
 };
 use std::rc::Rc;
@@ -41,6 +42,8 @@ impl<'a> LayoutBuilder<'a> {
             && !matches!(block_style.text_justify, TextJustify::None);
         let split_for_inter_character =
             should_justify_line && matches!(block_style.text_justify, TextJustify::InterCharacter);
+        let split_for_auto_justification =
+            should_justify_line && matches!(block_style.text_justify, TextJustify::Auto);
         let first_letter_is_initial = block_style
             .first_letter_style
             .as_deref()
@@ -64,6 +67,8 @@ impl<'a> LayoutBuilder<'a> {
             apply_first_line_pseudos_to_line_items(&mut source_items, block_style, true);
             let source_items = if split_for_inter_character {
                 split_mixed_line_into_inter_character_units(&source_items)
+            } else if split_for_auto_justification {
+                split_mixed_line_into_auto_justification_units(&source_items)
             } else {
                 source_items
             };
@@ -98,38 +103,44 @@ impl<'a> LayoutBuilder<'a> {
                     }
                 })
                 .collect::<Vec<_>>()
-        } else if split_for_inter_character {
-            split_mixed_line_into_inter_character_units(&measured_inline_items(
-                line_fragment.items(),
-            ))
-            .into_iter()
-            .map(|item| {
-                let shaped = match &item {
-                    InlineLineItem::Fragment(fragment) => self.font_system.shape_unwrapped_line(
-                        fragment.text(),
-                        fragment.style(),
-                        fragment.style().line_height,
-                    ),
-                    InlineLineItem::Atom(_) | InlineLineItem::Float(_) => None,
-                };
-                let width = match &item {
-                    InlineLineItem::Fragment(_) => shaped
-                        .as_ref()
-                        .map(ShapedInlineLine::advance_width)
-                        .unwrap_or(0.0),
-                    InlineLineItem::Atom(atom) => {
-                        inline_atom_logical_inline_size(atom, block_style)
+        } else if split_for_inter_character || split_for_auto_justification {
+            let source_items = measured_inline_items(line_fragment.items());
+            let source_items = if split_for_inter_character {
+                split_mixed_line_into_inter_character_units(&source_items)
+            } else {
+                split_mixed_line_into_auto_justification_units(&source_items)
+            };
+            source_items
+                .into_iter()
+                .map(|item| {
+                    let shaped = match &item {
+                        InlineLineItem::Fragment(fragment) => {
+                            self.font_system.shape_unwrapped_line(
+                                fragment.text(),
+                                fragment.style(),
+                                fragment.style().line_height,
+                            )
+                        }
+                        InlineLineItem::Atom(_) | InlineLineItem::Float(_) => None,
+                    };
+                    let width = match &item {
+                        InlineLineItem::Fragment(_) => shaped
+                            .as_ref()
+                            .map(ShapedInlineLine::advance_width)
+                            .unwrap_or(0.0),
+                        InlineLineItem::Atom(atom) => {
+                            inline_atom_logical_inline_size(atom, block_style)
+                        }
+                        InlineLineItem::Float(_) => 0.0,
+                    };
+                    let shaped = shaped.map(Rc::new);
+                    MeasuredInlineItem {
+                        item,
+                        width,
+                        shaped,
                     }
-                    InlineLineItem::Float(_) => 0.0,
-                };
-                let shaped = shaped.map(Rc::new);
-                MeasuredInlineItem {
-                    item,
-                    width,
-                    shaped,
-                }
-            })
-            .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
         } else {
             line_fragment.items().to_vec()
         };
@@ -179,16 +190,7 @@ impl<'a> LayoutBuilder<'a> {
         // and inline-table wrappers opt out in the shared helper because
         // their placement owns the margin at a different boundary.
         // <https://drafts.csswg.org/css-inline-3/#line-layout>
-        let line_block_start_margin = line
-            .iter()
-            .filter_map(|item| match item.as_ref() {
-                InlineLineItem::Atom(atom) => Some(inline_atom_line_anchor_block_start_margin(
-                    atom,
-                    block_style,
-                )),
-                InlineLineItem::Fragment(_) | InlineLineItem::Float(_) => None,
-            })
-            .fold(0.0, f32::max);
+        let line_block_start_margin = inline_line_anchor_block_start_margin(&line, block_style);
         let line_top = if block_style.writing_mode == WritingMode::HorizontalTb {
             self.cursor_y - line_block_start_margin
         } else {
@@ -201,6 +203,7 @@ impl<'a> LayoutBuilder<'a> {
             context.line_block_size,
             context,
         );
+        line_geometry.text_box_line_trim = line_fragment.text_box_trim;
         if block_style.writing_mode.has_vertical_lines() {
             line_geometry.apply_logical_block_start_margin(line_block_start_margin);
         }
@@ -210,14 +213,12 @@ impl<'a> LayoutBuilder<'a> {
         // edge. Conditional `pre-wrap` document-space hanging has separate
         // Phase II rules and is deliberately not folded into this effect.
         // <https://drafts.csswg.org/css-text-3/#white-space-phase-2>
-        let line_alignment_width = (line_metrics.width
-            - visual_leading_inline_end_box_edge_width(&line, line_geometry))
-        .max(0.0);
+        let line_alignment_width = line_metrics.width;
         let hanging_widths = line_fragment.hanging_widths;
         let line_available_width = line_geometry.inline_size;
         let line_align = context.text_align;
         let line_baseline_offset = line_metrics.baseline_offset;
-        let parent_fragment_metrics = self.inline_text_box_metrics(block_style, None, 0.0);
+        let parent_fragment_metrics = self.inline_text_box_metrics(block_style, 0.0);
         let line_layout_baseline_y = line_top - line_baseline_offset;
         // Text groups are positioned explicitly on `line_layout_baseline_y`
         // below. Atomic boxes must use that same CSS baseline; do not infer a
@@ -304,8 +305,7 @@ impl<'a> LayoutBuilder<'a> {
                     let out_of_flow_paint_block_size = fragment
                         .out_of_flow_paint_block_size()
                         .map(|size| size.points());
-                    let fragment =
-                        PendingInlineFragment::new(fragment, measured_item.shaped.as_deref());
+                    let fragment = PendingInlineFragment::new(fragment);
                     if inline_fragment_is_join_control_only(&fragment) {
                         if pending_fragments.is_empty() {
                             pending_inline_position = inline_position;
@@ -316,11 +316,8 @@ impl<'a> LayoutBuilder<'a> {
                         pending_fragments.push(fragment);
                         continue;
                     }
-                    let fragment_metrics = self.inline_text_box_metrics(
-                        fragment.style(),
-                        measured_item.shaped.as_deref(),
-                        fragment.baseline_shift(),
-                    );
+                    let fragment_metrics =
+                        self.inline_text_box_metrics(fragment.style(), fragment.baseline_shift());
                     let fragment_content_block_size =
                         out_of_flow_paint_block_size.unwrap_or(fragment_metrics.content_block_size);
                     let fragment_content_trim = self
@@ -363,11 +360,8 @@ impl<'a> LayoutBuilder<'a> {
                         if !decoration.paints_background_or_border {
                             continue;
                         }
-                        let decoration_metrics = self.inline_text_box_metrics(
-                            &decoration.style,
-                            measured_item.shaped.as_deref(),
-                            fragment.baseline_shift(),
-                        );
+                        let decoration_metrics = self
+                            .inline_text_box_metrics(&decoration.style, fragment.baseline_shift());
                         let decoration_trim = self.inline_text_box_content_trim_for_style(
                             &decoration.style,
                             decoration_metrics,
@@ -491,8 +485,10 @@ impl<'a> LayoutBuilder<'a> {
                         pending_fragments.push(fragment);
                     }
                     inline_position += width;
+                    let inter_character_expansion_count =
+                        justification_plan.inter_character_expansion_count_after_item(item_index);
                     let add_inter_character_gap = justification_plan.justifies_inter_character()
-                        && fragment_expansion_count > 0;
+                        && inter_character_expansion_count > 0;
                     if extra_space_width > 0.0
                         && (add_inter_character_gap || fragment_expansion_count > 0)
                     {
@@ -522,7 +518,7 @@ impl<'a> LayoutBuilder<'a> {
                             pending_preserve_leading_summary_space = false;
                         }
                         inline_position += if add_inter_character_gap {
-                            extra_space_width
+                            extra_space_width * inter_character_expansion_count as f32
                         } else {
                             extra_space_width * fragment_expansion_count as f32
                         };
@@ -595,7 +591,7 @@ impl<'a> LayoutBuilder<'a> {
                         atom.content()
                     {
                         let atom_metrics =
-                            self.inline_text_box_metrics(atom.style(), None, atom.baseline_shift);
+                            self.inline_text_box_metrics(atom.style(), atom.baseline_shift);
                         let content_block_size = atom_metrics.content_block_size;
                         let content_trim =
                             self.inline_text_box_content_trim_for_style(atom.style(), atom_metrics);
@@ -815,6 +811,7 @@ impl<'a> LayoutBuilder<'a> {
         Some(PreparedInlineLine {
             metrics: line_metrics,
             paint_items,
+            decoration_origin_fragments: Rc::default(),
         })
     }
 
@@ -842,7 +839,7 @@ impl<'a> LayoutBuilder<'a> {
     /// ownership policy afterwards.
     /// <https://www.w3.org/TR/css-text-3/#boundary-shaping> and
     /// <https://www.w3.org/TR/css-text-3/#text-align-property>
-    fn final_painted_inline_width(
+    pub(in crate::layout) fn final_painted_inline_width(
         &mut self,
         line: &[MeasuredInlineItem],
         block_style: &ComputedStyle,
@@ -892,8 +889,7 @@ impl<'a> LayoutBuilder<'a> {
                     let out_of_flow_paint_inline_advance = fragment
                         .out_of_flow_paint_inline_advance()
                         .map(|advance| advance.points());
-                    let fragment =
-                        PendingInlineFragment::new(fragment, measured_item.shaped.as_deref());
+                    let fragment = PendingInlineFragment::new(fragment);
                     if inline_fragment_is_join_control_only(&fragment) {
                         if pending_fragments.is_empty() {
                             pending_inline_position = inline_position;
@@ -1058,8 +1054,7 @@ impl<'a> LayoutBuilder<'a> {
                     let out_of_flow_paint_inline_advance = fragment
                         .out_of_flow_paint_inline_advance()
                         .map(|advance| advance.points());
-                    let fragment =
-                        PendingInlineFragment::new(fragment, measured_item.shaped.as_deref());
+                    let fragment = PendingInlineFragment::new(fragment);
                     if inline_fragment_is_join_control_only(&fragment) {
                         if pending_fragments.is_empty() {
                             pending_inline_position = inline_position;
@@ -1223,7 +1218,7 @@ impl<'a> LayoutBuilder<'a> {
             tab_metric_style,
         )?;
         if let Some(content_bottom_y) = horizontal_content_bottom_y {
-            let metrics = self.inline_text_box_metrics(&group.style, Some(&group.shaped), 0.0);
+            let metrics = self.inline_text_box_metrics(&group.style, 0.0);
             position_horizontal_text_group_at_content_bottom(&mut group, content_bottom_y, metrics);
         } else if !first_inline_fragment_is_initial_letter(fragments) {
             // An initial letter contributes an exclusion but not its oversized
@@ -1288,7 +1283,7 @@ impl<'a> LayoutBuilder<'a> {
             tab_metric_style,
         )?;
         if let Some(content_bottom_y) = horizontal_content_bottom_y {
-            let metrics = self.inline_text_box_metrics(&group.style, Some(&group.shaped), 0.0);
+            let metrics = self.inline_text_box_metrics(&group.style, 0.0);
             position_horizontal_text_group_at_content_bottom(&mut group, content_bottom_y, metrics);
         } else if !first_inline_fragment_is_initial_letter(fragments) {
             group.set_y(
@@ -1317,8 +1312,15 @@ impl<'a> LayoutBuilder<'a> {
         group: &mut PreparedInlineTextGroup,
         line_geometry: InlineLineGeometry,
     ) {
-        let metrics = self.inline_text_box_metrics(&group.style, Some(&group.shaped), 0.0);
-        let trim = self.inline_text_box_content_trim_for_style(&group.style, metrics);
+        let metrics = self.inline_text_box_metrics(&group.style, 0.0);
+        let style_trim = self.inline_text_box_content_trim_for_style(&group.style, metrics);
+        let trim = if !group.text_box_trim.is_empty() {
+            group.text_box_trim
+        } else if style_trim.block_start > 0.0 || style_trim.block_end > 0.0 {
+            style_trim
+        } else {
+            line_geometry.text_box_line_trim
+        };
         if trim.block_start <= 0.0 && trim.block_end <= 0.0 {
             return;
         }
@@ -1365,6 +1367,7 @@ impl<'a> LayoutBuilder<'a> {
     ) {
         debug_assert!(line.metrics.height.is_finite());
         let decoration_geometries = self.prepared_line_text_decoration_geometries(line);
+        let mut phaseable_text_groups = Vec::new();
         for item in &line.paint_items {
             match item {
                 PreparedInlinePaintItem::FragmentBackground(fragment) => {
@@ -1374,23 +1377,55 @@ impl<'a> LayoutBuilder<'a> {
                     );
                 }
                 PreparedInlinePaintItem::TextGroup(group) => {
-                    if let Some(source) = text_source {
-                        self.paint_prepared_inline_text_group_with_source_and_decoration_geometries(
-                            group,
-                            source,
-                            &decoration_geometries,
-                        );
+                    let has_paint_effect = if group.paint_scope_ancestry.is_empty() {
+                        group.style.opacity.value() < 1.0
                     } else {
-                        self.paint_prepared_inline_text_group_with_decoration_geometries(
-                            group,
-                            &decoration_geometries,
-                        );
+                        group.paint_opacity < 1.0
+                    };
+                    if has_paint_effect {
+                        if !phaseable_text_groups.is_empty() {
+                            self.paint_prepared_inline_text_groups_in_phases(
+                                &phaseable_text_groups,
+                                text_source,
+                                &decoration_geometries,
+                            );
+                            phaseable_text_groups.clear();
+                        }
+                        if let Some(source) = text_source {
+                            self.paint_prepared_inline_text_group_with_source_and_decoration_geometries(
+                                group,
+                                source,
+                                &decoration_geometries,
+                            );
+                        } else {
+                            self.paint_prepared_inline_text_group_with_decoration_geometries(
+                                group,
+                                &decoration_geometries,
+                            );
+                        }
+                    } else {
+                        phaseable_text_groups.push(group);
                     }
                 }
                 PreparedInlinePaintItem::Atom(atom) => {
+                    if !phaseable_text_groups.is_empty() {
+                        self.paint_prepared_inline_text_groups_in_phases(
+                            &phaseable_text_groups,
+                            text_source,
+                            &decoration_geometries,
+                        );
+                        phaseable_text_groups.clear();
+                    }
                     self.paint_prepared_inline_atom(atom);
                 }
             }
+        }
+        if !phaseable_text_groups.is_empty() {
+            self.paint_prepared_inline_text_groups_in_phases(
+                &phaseable_text_groups,
+                text_source,
+                &decoration_geometries,
+            );
         }
     }
 
@@ -1415,38 +1450,20 @@ impl<'a> LayoutBuilder<'a> {
             let PreparedInlinePaintItem::TextGroup(group) = item else {
                 continue;
             };
-            if group.style.visibility != Visibility::Visible || group.width() <= 0.0 {
+            // A group can retain its shaped glyph advance while its fitted
+            // paint bounds collapse at an inline-fragment boundary. Line
+            // decorations still cover that text, so use the shaped advance
+            // as the non-empty geometry criterion and coverage span.
+            if group.width().max(group.shaped.advance_width()) <= 0.0 {
                 continue;
             }
-            let decorations = active_text_decoration_layers(&group.style);
-            if decorations.is_empty() {
+            if group.decoration_provenance.is_empty() {
                 continue;
             }
-            let font_id = self.font_system.resolve_style(&group.style);
-            let metrics = self
-                .font_system
-                .text_decoration_metrics(font_id, &group.style);
             let reference = group
                 .decoration_paint_rect
                 .map(|rect| rect.origin)
                 .unwrap_or_else(|| PaintPoint::new(group.x(), group.y()));
-            let coverage = match group.style.writing_mode {
-                WritingMode::HorizontalTb => TextDecorationLineGlyphCoverage {
-                    span: TextInlineSpan::from_start_and_length(
-                        reference.x,
-                        group.width().max(group.shaped.advance_width()),
-                    ),
-                },
-                WritingMode::VerticalRl
-                | WritingMode::VerticalLr
-                | WritingMode::SidewaysRl
-                | WritingMode::SidewaysLr => TextDecorationLineGlyphCoverage {
-                    span: TextInlineSpan::from_start_and_length(
-                        reference.y,
-                        group.width().max(group.shaped.advance_width()),
-                    ),
-                },
-            };
             let axis = if group.style.writing_mode == WritingMode::HorizontalTb {
                 TextDecorationStrokeAxis::Horizontal
             } else {
@@ -1459,89 +1476,138 @@ impl<'a> LayoutBuilder<'a> {
                 &group.shaped,
                 &group.style,
             );
-            let positioned_glyphs = text_decoration_positioned_glyphs(
-                axis,
-                reference.x,
-                reference.y,
-                coverage.span.start,
-                coverage.span.length(),
-                &glyph_runs,
-            );
-            for decoration in decorations {
-                let participates = (decoration.decoration.underline
-                    && !text_decoration_skip_self_suppresses(
-                        &group.style,
-                        TextDecorationLineKind::Underline,
-                    ))
-                    || (decoration.decoration.overline
-                        && !text_decoration_skip_self_suppresses(
-                            &group.style,
-                            TextDecorationLineKind::Overline,
-                        ))
-                    || (decoration.decoration.line_through
-                        && !text_decoration_skip_self_suppresses(
-                            &group.style,
-                            TextDecorationLineKind::LineThrough,
-                        ));
-                if !participates {
-                    continue;
-                }
-                if let Some(existing) = geometries
-                    .iter_mut()
-                    .find(|existing| Rc::ptr_eq(&existing.origin_style, &decoration.origin_style))
-                {
-                    // The selected text with the largest em box is the
-                    // conservative shared metric source: it keeps automatic
-                    // decorations clear of every eligible descendant rather
-                    // than letting a later, smaller receiver pull the common
-                    // line through it.  The physical outside reference is
-                    // likewise the furthest text-under edge of the selected
-                    // line in each writing-axis projection.
-                    if group.style.font_size > existing.geometry.considered_font_size {
-                        existing.geometry.considered_font_size = group.style.font_size;
-                        existing.geometry.considered_metrics = metrics;
+            for provenance in &group.decoration_provenance {
+                for receiver in &provenance.receivers {
+                    if receiver.style.visibility != Visibility::Visible {
+                        continue;
                     }
-                    existing.selected_inline_span = Some(
-                        existing
-                            .selected_inline_span
-                            .map(|span| {
-                                TextInlineSpan::new(
-                                    span.start.min(coverage.span.start),
-                                    span.end.max(coverage.span.end),
-                                )
-                            })
-                            .unwrap_or(coverage.span),
+                    let coverage = TextDecorationLineGlyphCoverage {
+                        span: match receiver.style.writing_mode {
+                            WritingMode::HorizontalTb => TextInlineSpan::new(
+                                reference.x + receiver.inline_span.start,
+                                reference.x + receiver.inline_span.end,
+                            ),
+                            WritingMode::VerticalRl
+                            | WritingMode::VerticalLr
+                            | WritingMode::SidewaysRl
+                            | WritingMode::SidewaysLr => TextInlineSpan::new(
+                                reference.y + receiver.inline_span.start,
+                                reference.y + receiver.inline_span.end,
+                            ),
+                        },
+                    };
+                    let positioned_glyphs = text_decoration_positioned_glyphs(
+                        axis,
+                        reference.x,
+                        reference.y,
+                        coverage.span.start,
+                        coverage.span.length(),
+                        &glyph_runs,
                     );
-                    existing
-                        .glyph_sequence
-                        .glyphs
-                        .extend(positioned_glyphs.iter().cloned());
-                    match group.style.writing_mode {
-                        WritingMode::HorizontalTb => {
-                            existing.line_reference.y = existing.line_reference.y.min(reference.y);
+                    let font_id = self.font_system.resolve_style(&receiver.style);
+                    let metrics = self
+                        .font_system
+                        .text_decoration_metrics(font_id, &receiver.style);
+                    for decoration in &provenance.layers {
+                        let participates = (decoration.decoration.underline
+                            && !text_decoration_skip_self_suppresses(
+                                &receiver.style,
+                                TextDecorationLineKind::Underline,
+                            ))
+                            || (decoration.decoration.overline
+                                && !text_decoration_skip_self_suppresses(
+                                    &receiver.style,
+                                    TextDecorationLineKind::Overline,
+                                ))
+                            || (decoration.decoration.line_through
+                                && !text_decoration_skip_self_suppresses(
+                                    &receiver.style,
+                                    TextDecorationLineKind::LineThrough,
+                                ));
+                        if !participates {
+                            continue;
                         }
-                        WritingMode::VerticalRl
-                        | WritingMode::VerticalLr
-                        | WritingMode::SidewaysRl
-                        | WritingMode::SidewaysLr => {
-                            existing.line_reference.x = existing.line_reference.x.min(reference.x);
+                        if let Some(existing) = geometries.iter_mut().find(|existing| {
+                            Rc::ptr_eq(&existing.layer.origin_style, &decoration.origin_style)
+                        }) {
+                            // The selected text with the largest em box is the
+                            // conservative shared metric source: it keeps automatic
+                            // decorations clear of every eligible descendant rather
+                            // than letting a later, smaller receiver pull the common
+                            // line through it.  The physical outside reference is
+                            // likewise the furthest text-under edge of the selected
+                            // line in each writing-axis projection.
+                            if receiver.style.font_size > existing.geometry.considered_font_size {
+                                existing.geometry.considered_font_size = receiver.style.font_size;
+                                existing.geometry.considered_metrics = metrics;
+                            }
+                            existing.selected_inline_span = Some(
+                                existing
+                                    .selected_inline_span
+                                    .map(|span| {
+                                        TextInlineSpan::new(
+                                            span.start.min(coverage.span.start),
+                                            span.end.max(coverage.span.end),
+                                        )
+                                    })
+                                    .unwrap_or(coverage.span),
+                            );
+                            existing.receiver_spans.push(coverage.span);
+                            existing
+                                .glyph_sequence
+                                .glyphs
+                                .extend(positioned_glyphs.iter().cloned());
+                            match receiver.style.writing_mode {
+                                WritingMode::HorizontalTb => {
+                                    existing.line_reference.y =
+                                        existing.line_reference.y.min(reference.y);
+                                }
+                                WritingMode::VerticalRl
+                                | WritingMode::VerticalLr
+                                | WritingMode::SidewaysRl
+                                | WritingMode::SidewaysLr => {
+                                    existing.line_reference.x =
+                                        existing.line_reference.x.min(reference.x);
+                                }
+                            }
+                            continue;
                         }
+                        geometries.push(TextDecorationOriginLineGeometry {
+                            layer: decoration.clone(),
+                            geometry: TextDecorationLineGeometry::from_origin_and_considered_text(
+                                decoration.origin_style.as_ref(),
+                                &receiver.style,
+                                metrics,
+                            ),
+                            selected_inline_span: Some(coverage.span),
+                            receiver_spans: vec![coverage.span],
+                            glyph_sequence: TextDecorationLineGlyphSequence {
+                                glyphs: positioned_glyphs.clone(),
+                            },
+                            line_reference: reference,
+                            origin_fragment: line
+                                .decoration_origin_fragments
+                                .iter()
+                                .find(|fragment| {
+                                    Rc::ptr_eq(&fragment.origin_style, &decoration.origin_style)
+                                })
+                                .cloned()
+                                // Direct record preparation is also used by a
+                                // few isolated layout tests. Those records do
+                                // not have an enclosing line sequence from
+                                // which to derive fragment geometry.
+                                .unwrap_or_else(|| TextDecorationOriginFragmentGeometry {
+                                    origin_style: Rc::clone(&decoration.origin_style),
+                                    total_inline_extent: layout_pt(coverage.span.length()),
+                                    fragment_inline_extent: layout_pt(coverage.span.length()),
+                                    preceding_inline_extent: layout_pt(0.0),
+                                    following_inline_extent: layout_pt(0.0),
+                                    is_first_fragment: true,
+                                    is_last_fragment: true,
+                                }),
+                        });
                     }
-                    continue;
                 }
-                geometries.push(TextDecorationOriginLineGeometry {
-                    origin_style: Rc::clone(&decoration.origin_style),
-                    geometry: TextDecorationLineGeometry::from_origin_and_considered_text(
-                        decoration.origin_style.as_ref(),
-                        &group.style,
-                        metrics,
-                    ),
-                    selected_inline_span: Some(coverage.span),
-                    glyph_sequence: TextDecorationLineGlyphSequence {
-                        glyphs: positioned_glyphs.clone(),
-                    },
-                    line_reference: reference,
-                });
             }
         }
         for geometry in &mut geometries {
@@ -1592,7 +1658,7 @@ impl<'a> LayoutBuilder<'a> {
                 marker,
                 atom.style(),
                 OutsideMarkerAnchor {
-                    content_inline_span: PageInlineSpan::from_edges(
+                    principal_line_inline_span: PageInlineSpan::from_edges(
                         prepared.border_box.x() + borders.left,
                         prepared.border_box.x() + prepared.border_box.width() - borders.right,
                     ),
@@ -1682,6 +1748,15 @@ impl<'a> LayoutBuilder<'a> {
                 layer.page_index = layer
                     .escaped_atom_translation
                     .replay_page_index(self.pages.len(), layer.page_index);
+                // The atomic inline was measured on a scratch page, so a
+                // descendant's original source order predates the atom's
+                // final normal-flow paint.  Its containing block is a
+                // `z-index:auto` positioned inline-block, which means the
+                // descendant belongs in the enclosing stacking context's
+                // auto/zero phase after that normal-flow paint.  Reserve its
+                // order at replay, rather than retaining the scratch cursor.
+                // <https://www.w3.org/TR/CSS22/zindex.html>
+                layer.context.source_order = self.next_paint_source_order();
                 self.positioned_layers.push(layer);
             }
         }
@@ -1763,6 +1838,7 @@ impl<'a> LayoutBuilder<'a> {
                 ));
                 fragment.promote_page_background_to_in_flow_block();
                 fragment.promote_background_border_to_in_flow_block();
+                fragment.promote_outline_to_in_flow_outline();
                 // An embedded page background is still child browsing-context
                 // paint. Keep it in the iframe viewport along with the
                 // translated child scroll contents.
@@ -1773,6 +1849,7 @@ impl<'a> LayoutBuilder<'a> {
             }
             InlineAtomContent::Image(decoded) => {
                 let borders = used_border_widths(atom.style());
+                let overflow = ReplacedObjectOverflow::from_style(atom.style());
                 let content_contour = replaced_content_contour(
                     paint_space_rect(content_x, y, content_width, content_height),
                     atom.style(),
@@ -1795,10 +1872,10 @@ impl<'a> LayoutBuilder<'a> {
                 let mut image = RenderedImage::from_paint_rect(
                     paint_space_rect(image_x, image_y, image_width, image_height),
                     false,
-                    decoded.pixel_width,
-                    decoded.pixel_height,
-                    None,
-                    raster_image_interpolation(atom.style()),
+                    decoded.pixel_size.width,
+                    decoded.pixel_size.height,
+                    decoded.source_rect,
+                    raster_image_sampling(atom.style()),
                     decoded.rgb.shared(),
                     decoded.alpha.clone(),
                     atom.alt_text().map(Rc::from),
@@ -1813,15 +1890,19 @@ impl<'a> LayoutBuilder<'a> {
                 }
                 if apply_object_fit(
                     &mut image,
+                    decoded.natural_layout_size(),
                     atom.style().object_fit,
                     atom.style().object_position.clone(),
                     atom.style().object_view_box.clone(),
+                    overflow,
+                    atom.style().effective_zoom,
                 ) {
                     self.push_image_in_band(PaintBand::Inline, image);
                 }
             }
             InlineAtomContent::Gradient { image, fallback } => {
                 let borders = used_border_widths(atom.style());
+                let overflow = ReplacedObjectOverflow::from_style(atom.style());
                 let image_x = content_x + borders.left + atom.style().padding.left;
                 let image_y = y + borders.bottom + atom.style().padding.bottom;
                 let image_width = (content_width
@@ -1851,10 +1932,10 @@ impl<'a> LayoutBuilder<'a> {
                     let mut rendered = RenderedImage::from_paint_rect(
                         paint_rect,
                         false,
-                        fallback.pixel_width,
-                        fallback.pixel_height,
-                        None,
-                        raster_image_interpolation(atom.style()),
+                        fallback.pixel_size.width,
+                        fallback.pixel_size.height,
+                        fallback.source_rect,
+                        raster_image_sampling(atom.style()),
                         fallback.rgb.shared(),
                         fallback.alpha.clone(),
                         atom.alt_text().map(Rc::from),
@@ -1863,9 +1944,12 @@ impl<'a> LayoutBuilder<'a> {
                     .with_image_id(fallback.image_id);
                     if apply_object_fit(
                         &mut rendered,
+                        fallback.natural_layout_size(),
                         atom.style().object_fit,
                         atom.style().object_position.clone(),
                         atom.style().object_view_box.clone(),
+                        overflow,
+                        atom.style().effective_zoom,
                     ) {
                         self.push_image_in_band(PaintBand::Inline, rendered);
                     }
@@ -2116,7 +2200,7 @@ impl<'a> LayoutBuilder<'a> {
             paint_space_rect(content_x, y, content_width, content_height),
             atom.style(),
         ) {
-            self.push_primitive_in_band(PaintBand::Outline, primitive);
+            self.push_primitive_in_band(PaintBand::InFlowOutline, primitive);
         }
         if let Some(target) = atom.link_target() {
             self.current_page.push_link(RenderedLink::from_paint_rect(
@@ -2180,6 +2264,25 @@ impl<'a> LayoutBuilder<'a> {
         available_width: f32,
         block_top: f32,
     ) {
+        self.paint_inline_box_sequence_with_float_policy(
+            sequence,
+            style,
+            content_left,
+            available_width,
+            block_top,
+            NestedInlinePaintFloatPolicy::ReapplyActiveFloatBands,
+        );
+    }
+
+    pub(in crate::layout) fn paint_inline_box_sequence_with_float_policy(
+        &mut self,
+        sequence: &InlineLineSequence,
+        style: &ComputedStyle,
+        content_left: f32,
+        available_width: f32,
+        block_top: f32,
+        float_policy: NestedInlinePaintFloatPolicy,
+    ) {
         // This is a nested paint replay. Its selected lines may establish an
         // internal baseline (for example a ruby base or annotation), but
         // that baseline is not a line of the enclosing formatting context
@@ -2196,10 +2299,13 @@ impl<'a> LayoutBuilder<'a> {
         self.paint_inline_line_sequence_slice_with_text_source(
             sequence,
             style,
-            block_top,
-            block_top,
-            f32::NEG_INFINITY,
+            InlineLineSequenceSlice {
+                block_top,
+                top: block_top,
+                bottom: f32::NEG_INFINITY,
+            },
             RenderedLineSource::InlineAtom,
+            float_policy,
         );
         self.content_left = saved_content_left;
         self.content_right = saved_content_right;

@@ -170,6 +170,7 @@ define_modeled_longhands! {
     BackgroundPositionX => "background-position-x",
     BackgroundPositionY => "background-position-y",
     BackgroundRepeat => "background-repeat",
+    BackgroundAttachment => "background-attachment",
     BackgroundOrigin => "background-origin",
     BackgroundClip => "background-clip",
     ObjectFit => "object-fit",
@@ -188,6 +189,8 @@ define_modeled_longhands! {
     Fill => "fill",
     Stroke => "stroke",
     StrokeWidth => "stroke-width",
+    FloodColor => "flood-color",
+    LightingColor => "lighting-color",
     WebkitTextFillColor => "-webkit-text-fill-color",
     Direction => "direction",
     UnicodeBidi => "unicode-bidi",
@@ -674,6 +677,8 @@ impl ModeledLonghand {
                 | "fill"
                 | "stroke"
                 | "stroke-width"
+                | "flood-color"
+                | "lighting-color"
                 | "-webkit-text-fill-color"
                 | "direction"
                 | "dominant-baseline"
@@ -770,6 +775,11 @@ impl ModeledLonghand {
 /// <https://www.w3.org/TR/css-cascade-5/#inheritance>.
 pub(super) fn inherited_base_style(parent: &ComputedStyle) -> ComputedStyle {
     let mut style = ComputedStyle::initial();
+    // `zoom` itself is non-inherited, but layout carries its accumulated used
+    // scale through each flat-tree descendant. Preserve that layout-only
+    // context while the computed longhand remains its initial value.
+    // <https://drafts.csswg.org/css-viewport/#zoom-property>
+    style.effective_zoom = parent.effective_zoom;
     style.root_font_size = parent.root_font_size;
     style.custom_properties = parent.custom_properties.clone();
     style.used_color_scheme = parent.used_color_scheme;
@@ -1106,6 +1116,18 @@ fn copy_modeled_longhand_by_css_name(
                     .unwrap_or(source.background.background_repeat);
             }
         }
+        "background-attachment" => {
+            style.background.background_attachment = source.background.background_attachment;
+            let source_layer_count = source.background.background_layers.len().max(1);
+            for (index, layer) in style.background.background_layers.iter_mut().enumerate() {
+                layer.attachment = source
+                    .background
+                    .background_layers
+                    .get(index % source_layer_count)
+                    .map(|layer| layer.attachment)
+                    .unwrap_or(source.background.background_attachment);
+            }
+        }
         "background-origin" => {
             style.background.background_origin = source.background.background_origin;
             let source_layer_count = source.background.background_layers.len().max(1);
@@ -1141,6 +1163,8 @@ fn copy_modeled_longhand_by_css_name(
         "stroke-width" => {
             style.svg_stroke_width = source.svg_stroke_width.clone();
         }
+        "flood-color" => style.svg_flood_color = source.svg_flood_color,
+        "lighting-color" => style.svg_lighting_color = source.svg_lighting_color,
         "-webkit-text-fill-color" => style.text_fill_color = source.text_fill_color,
         "direction" => style.direction = source.direction,
         "unicode-bidi" => style.unicode_bidi = source.unicode_bidi,

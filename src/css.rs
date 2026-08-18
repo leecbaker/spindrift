@@ -9,7 +9,8 @@ mod types;
 mod ua;
 mod values;
 
-pub(crate) use html_form_state::auto_directionality_input_value;
+pub(crate) use html_form_state::{auto_directionality_input_value, input_type};
+pub(crate) use values::color_depends_on_currentcolor;
 pub(crate) use values::parse_css_url_token;
 pub(crate) use values::{CrossOriginRequestMode, RequestUrlModifiers};
 
@@ -17,6 +18,7 @@ pub(crate) use cascade::SvgPresentationAttributeDeclarations;
 pub(crate) use cascade::anonymous_block_style;
 pub(crate) use cascade::anonymous_text_style;
 pub(crate) use cascade::apply_declarations;
+pub(crate) use cascade::apply_declarations_with_inheritance_source;
 pub(crate) use cascade::apply_pseudo_rules_with_parent_ch_advance;
 pub(crate) use cascade::declarations_affect_same_property;
 pub(crate) use cascade::default_display_is_block_level_for_tag;
@@ -37,13 +39,16 @@ pub(crate) use page::page_margins_from;
 #[cfg(test)]
 pub(crate) use page::page_margins_from_for_size;
 pub(crate) use page::{
-    apply_stylesheet_options, page_margins_from_for_size_and_edges_with_ch_advance,
-    page_margins_from_for_size_and_edges_with_ch_advance_and_page_context_style,
-    page_padding_from_for_size_with_ch_advance, page_rotation_from, page_size_from_with_ch_advance,
+    PageMarginResolutionContext, apply_stylesheet_options,
+    page_margins_from_for_size_and_edges_with_ch_advance_and_page_context_style_and_root_metrics,
+    page_padding_from_for_size_with_ch_advance_and_root_metrics, page_rotation_from,
+    page_size_from_with_ch_advance_and_root_metrics,
 };
 #[cfg(test)]
 pub(crate) use page::{
-    page_margins_from_for_size_and_edges, page_padding_from_for_size, page_size_from,
+    page_margins_from_for_size_and_edges,
+    page_margins_from_for_size_and_edges_with_ch_advance_and_page_context_style,
+    page_padding_from_for_size, page_size_from,
 };
 #[cfg(test)]
 pub(crate) use parse::cascade_page_declarations;
@@ -68,9 +73,9 @@ pub(crate) use ua::html5_presentational_hints_stylesheet_with_urls;
 pub(crate) use ua::html5_user_agent_source;
 pub(crate) use ua::html5_user_agent_stylesheet;
 pub(crate) use values::{
-    CSS_PX_TO_PT, fallback_ch_advance_for_style, parse_color_from_currentcolor_in_scheme,
-    parse_font_palette, parse_font_synthesis, parse_font_synthesis_subproperty,
-    parse_list_style_type,
+    CSS_PX_TO_PT, canonical_predefined_counter_style_name, fallback_ch_advance_for_style,
+    parse_color_from_currentcolor_in_scheme, parse_font_palette, parse_font_synthesis,
+    parse_font_synthesis_subproperty, parse_list_style_type,
 };
 pub(crate) use values::{color_to_predefined_rgb, color_to_xyz_d50, parse_color_from_currentcolor};
 pub(in crate::css) use values::{parse_border_image_source, parse_mask_border_source};

@@ -44,7 +44,7 @@ impl TableUsedStyle {
         &self.source
     }
 
-    pub(super) fn as_computed(&self) -> &ComputedStyle {
+    pub(super) fn used_style(&self) -> &css::ZoomedLayoutStyle {
         &self.used
     }
 }
@@ -81,11 +81,11 @@ pub(super) enum TablePartBoxModel {
 /// conflict resolution. It cannot be constructed for separated tables.
 #[derive(Debug, Clone)]
 pub(super) struct CollapsedBorderParticipant {
-    style: ComputedStyle,
+    style: css::ZoomedLayoutStyle,
 }
 
 impl CollapsedBorderParticipant {
-    pub(super) fn style(&self) -> &ComputedStyle {
+    pub(super) fn style(&self) -> &css::ZoomedLayoutStyle {
         &self.style
     }
 }
@@ -100,7 +100,7 @@ impl CollapsedBorderParticipant {
 #[derive(Debug, Clone)]
 pub(super) struct TablePartUsedStyle {
     source: TableUsedStyle,
-    layout: ComputedStyle,
+    layout: css::ZoomedLayoutStyle,
     collapsed_border_participant: Option<CollapsedBorderParticipant>,
 }
 
@@ -113,20 +113,22 @@ impl TablePartUsedStyle {
         };
         let collapsed_border_participant =
             matches!(box_model, TablePartBoxModel::Collapsed).then(|| {
-                let mut style = source.as_computed().clone();
-                // The conflict resolver needs an authored border candidate,
-                // not an ordinary row box. Keep border declarations intact
-                // while making the ignored padding and margin unavailable to
-                // that separate layout path as well.
-                strip_table_part_margin_and_padding(&mut style);
+                let style = source.used_style().clone().map_used_values(|style| {
+                    // The conflict resolver needs an authored border candidate,
+                    // not an ordinary row box. Keep border declarations intact
+                    // while making the ignored padding and margin unavailable to
+                    // that separate layout path as well.
+                    strip_table_part_margin_and_padding(style);
+                });
                 CollapsedBorderParticipant { style }
             });
-        let mut layout = source.as_computed().clone();
-        strip_table_part_margin_and_padding(&mut layout);
-        layout.border_width = 0.0;
-        layout.border_widths = css::Edges::ZERO;
-        layout.border_width_values = css::CssEdges::all(css::ComputedLengthPercentage::ZERO);
-        layout.border_styles = css::BorderStyles::NONE;
+        let layout = source.used_style().clone().map_used_values(|layout| {
+            strip_table_part_margin_and_padding(layout);
+            layout.border_width = 0.0;
+            layout.border_widths = css::Edges::ZERO;
+            layout.border_width_values = css::CssEdges::all(css::ComputedLengthPercentage::ZERO);
+            layout.border_styles = css::BorderStyles::NONE;
+        });
         Self {
             source,
             layout,
@@ -134,7 +136,7 @@ impl TablePartUsedStyle {
         }
     }
 
-    pub(super) fn layout(&self) -> &ComputedStyle {
+    pub(super) fn layout(&self) -> &css::ZoomedLayoutStyle {
         &self.layout
     }
 
@@ -155,8 +157,16 @@ impl TableStyleSource for TablePartUsedStyle {
     }
 }
 
+/// A declared size contribution to a table root grid track.
+///
+/// CSS 2.2 names the fixed-table inputs "width", but CSS Writing Modes maps
+/// the root table's inline tracks to physical width or height. Keeping this
+/// declaration track-neutral prevents a vertical table from accidentally
+/// treating a physical cell width as a column constraint.
+/// <https://www.w3.org/TR/CSS22/tables.html#width-layout>
+/// <https://www.w3.org/TR/css-writing-modes-4/#logical-to-physical>
 #[derive(Debug, Clone)]
-pub(super) enum DeclaredTableWidth {
+pub(super) enum DeclaredTableTrackSize {
     Fixed(f32),
     Percent(f32),
 }
@@ -170,6 +180,21 @@ pub(super) struct TableRow<'a> {
     pub(super) style: Option<box_tree::SharedStyle>,
     pub(super) cells: Vec<TableCell<'a>>,
     pub(super) running_cells: Vec<TableCell<'a>>,
+}
+
+/// The table's source rows after CSS visual ordering, together with the rows
+/// eligible for optional repeated table chrome.
+///
+/// CSS 2.2 gives special visual and print-repeat treatment only to the first
+/// source `table-header-group` and `table-footer-group`. Their source identity
+/// must survive moving those groups to their visual positions.
+/// https://www.w3.org/TR/CSS22/tables.html#value-def-table-header-group
+/// https://www.w3.org/TR/CSS22/tables.html#value-def-table-footer-group
+#[derive(Debug, Clone)]
+pub(super) struct TableRowOrdering<'a> {
+    pub(super) rows: Vec<TableRow<'a>>,
+    pub(super) repeating_header_rows: Vec<usize>,
+    pub(super) repeating_footer_rows: Vec<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -472,7 +497,7 @@ pub(super) struct TableMetrics {
 }
 
 pub(super) struct TableLayoutInput<'a> {
-    pub(super) rows: Vec<TableRow<'a>>,
+    pub(super) row_ordering: TableRowOrdering<'a>,
     pub(super) captions: Vec<TableCaption<'a>>,
     pub(super) columns: Vec<TableColumn<'a>>,
 }
@@ -480,7 +505,7 @@ pub(super) struct TableLayoutInput<'a> {
 impl<'a> TableLayoutInput<'a> {
     pub(super) fn from_fragment(fragment: &box_tree::TableFragment<'a>) -> Self {
         Self {
-            rows: table_rows_from_fragment(fragment),
+            row_ordering: table_row_ordering_from_fragment(fragment),
             captions: table_captions_from_fragment(fragment),
             columns: table_columns_from_fragment(fragment),
         }

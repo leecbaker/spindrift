@@ -221,7 +221,13 @@ fn flush_anonymous_item_run<'a>(
     if anonymous_run.is_empty() {
         return;
     }
-    if anonymous_run.iter().all(formatting_box_is_document_space) {
+    // Keep this defensive check for callers that supply child boxes outside
+    // normal box-tree construction. The canonical predicate matches the
+    // structural Flexbox/Grid whitespace rule, independently of `white-space`.
+    if anonymous_run
+        .iter()
+        .all(box_tree::formatting_box_is_document_whitespace)
+    {
         anonymous_run.clear();
         return;
     }
@@ -235,13 +241,6 @@ fn flush_anonymous_item_run<'a>(
         },
         style,
     });
-}
-
-fn formatting_box_is_document_space(box_: &box_tree::FormattingBox<'_>) -> bool {
-    matches!(
-        box_,
-        box_tree::FormattingBox::Text(text) if text.text.chars().all(is_css_collapsible_whitespace)
-    )
 }
 
 fn anonymous_item_style(tag: &'static str, source: &box_tree::FormattingBox<'_>) -> ComputedStyle {

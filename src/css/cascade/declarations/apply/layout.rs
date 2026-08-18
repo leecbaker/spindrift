@@ -87,7 +87,7 @@ pub(in crate::css) fn apply_cascaded_layout_declaration(
             style.legacy_webkit_box = LegacyWebkitBox::from_specified_display(value);
             if style.legacy_webkit_box.is_present() {
                 style.flex_wrap = FlexWrap::NoWrap;
-                style.flex_line_count = FlexLineCount::Auto;
+                style.flex_line_count = FlexLineCount::ONE;
             }
         }
         "-webkit-box-orient" => {
@@ -166,9 +166,8 @@ pub(in crate::css) fn apply_cascaded_layout_declaration(
             if let Ok(value) = value.parse::<usize>()
                 && value > 0
             {
-                style.flex_line_count = FlexLineCount::Count(
-                    NonZeroUsize::new(value).expect("positive flex line count"),
-                );
+                style.flex_line_count =
+                    FlexLineCount::new(NonZeroUsize::new(value).expect("positive flex line count"));
             }
         }
         "flex-grow" => {

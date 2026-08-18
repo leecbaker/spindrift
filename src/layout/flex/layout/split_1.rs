@@ -275,7 +275,10 @@ pub(in crate::layout::flex) struct FlexUnitPrebreakDecisionInput {
     pub(in crate::layout::flex) cursor: FlexFragmentCursor,
     pub(in crate::layout::flex) unit_block_start: FlexFragmentBlockOffset,
     pub(in crate::layout::flex) unit_block_end: FlexFragmentBlockOffset,
-    pub(in crate::layout::flex) current_fragmentainer: Fragmentainer,
+    /// Usable flex-content capacity remaining in the current fragmentainer.
+    /// This is distinct from raw fragmentainer geometry when the container
+    /// reserves cloned border and padding at its broken edges.
+    pub(in crate::layout::flex) available_content_block_size: LayoutLength,
     pub(in crate::layout::flex) break_opportunity: FragmentBreakOpportunity,
     pub(in crate::layout::flex) can_advance: bool,
 }
@@ -314,6 +317,10 @@ pub(in crate::layout::flex) struct SplitFlexItemPaintContext {
     pub(in crate::layout::flex) item_height: BorderBoxLength,
     pub(in crate::layout::flex) percentage_height_basis: FlexPercentageBasis,
     pub(in crate::layout::flex) slice_border_box: PaintClip,
+    /// The committed flex-content span for this destination fragment. Visible
+    /// descendant overflow is clipped here rather than at the item's own
+    /// border box, which may be narrower than its relative/ink overflow.
+    pub(in crate::layout::flex) fragment_content_clip: PaintClip,
     pub(in crate::layout::flex) source_item_top: PageTopBlockPosition,
     /// Committed source range and item-local ordinal for this replay. This is
     /// produced by the materialized flex fragment plan, rather than guessed
@@ -430,10 +437,16 @@ impl<'a> LayoutBuilder<'a> {
         placed_style: &ComputedStyle,
         stylesheets: &Stylesheets<'_>,
         percentage_height_basis: FlexPercentageBasis,
+        principal_box_paint_mode: PrincipalBoxPaintMode,
     ) -> Option<InFlowFragmentEnd> {
         self.with_replayed_flex_item_percentage_height_basis(percentage_height_basis, |layout| {
             if child.style.display.is_table() {
-                layout.layout_formatting_context_item_contents(child, placed_style, stylesheets);
+                layout.layout_formatting_context_item_contents(
+                    child,
+                    placed_style,
+                    stylesheets,
+                    principal_box_paint_mode,
+                );
                 return layout.last_block_layout_outcome.in_flow_child_fragment_end;
             }
             let fragmentainer_kind = layout.active_fragmentainer_kind();
@@ -456,7 +469,12 @@ impl<'a> LayoutBuilder<'a> {
             if !child_has_forced_fragment_break {
                 layout.fragmentation_suppression_depth += 1;
             }
-            layout.layout_formatting_context_item_contents(child, placed_style, stylesheets);
+            layout.layout_formatting_context_item_contents(
+                child,
+                placed_style,
+                stylesheets,
+                principal_box_paint_mode,
+            );
             if !child_has_forced_fragment_break {
                 layout.fragmentation_suppression_depth -= 1;
             }
@@ -478,9 +496,15 @@ impl<'a> LayoutBuilder<'a> {
         placed_style: &ComputedStyle,
         stylesheets: &Stylesheets<'_>,
         percentage_height_basis: FlexPercentageBasis,
+        principal_box_paint_mode: PrincipalBoxPaintMode,
     ) {
         self.with_replayed_flex_item_percentage_height_basis(percentage_height_basis, |layout| {
-            layout.layout_formatting_context_item_contents(child, placed_style, stylesheets);
+            layout.layout_formatting_context_item_contents(
+                child,
+                placed_style,
+                stylesheets,
+                principal_box_paint_mode,
+            );
         });
     }
 }
@@ -501,9 +525,9 @@ impl FlexFragmentCursor {
 /// source block-offset coordinate system.
 pub(in crate::layout::flex) fn flex_source_block_end_after_available_capacity(
     source_block_offset: FlexFragmentBlockOffset,
-    fragmentainer: Fragmentainer,
+    available_content_block_size: LayoutLength,
 ) -> FlexFragmentBlockOffset {
-    source_block_offset + FlexFragmentBlockSize::new(fragmentainer.available_block_size().points())
+    source_block_offset + FlexFragmentBlockSize::new(available_content_block_size.points())
 }
 
 impl FlexFragmentTransitionDecision {
@@ -557,9 +581,8 @@ impl FlexUnitPrebreakDecision {
     pub(in crate::layout::flex) fn choose(input: FlexUnitPrebreakDecisionInput) -> Self {
         let required_block_size =
             (input.unit_block_end - input.cursor.block_offset).non_negative_size();
-        let unit_overflows = input
-            .current_fragmentainer
-            .required_block_size_overflows(layout_pt(required_block_size.points()));
+        let unit_overflows =
+            required_block_size.points() > input.available_content_block_size.points() + 0.01;
         // An oversized unit within a sequence cannot be kept together in a
         // fresh fragmentainer. Moving it before its first slice would leave
         // usable remainder space empty, so CSS Fragmentation must slice it at
@@ -596,14 +619,14 @@ impl FlexUnitPrebreakDecision {
                 && (avoid_break
                     || input.has_prior_unit
                     || input.has_later_unit
-                    || input.current_fragmentainer.available_block_size().points() <= 0.01
+                    || input.available_content_block_size.points() <= 0.01
                     // Fragmentainers use one CSS-pixel of numerical slack to
                     // avoid zero-sized arithmetic. In a column that slack is
                     // not usable layout capacity: an atomic flex line must
                     // advance rather than be micro-sliced into many 0.75pt
                     // source fragments.
                     || (input.fragmentainer_kind == FragmentainerKind::Column
-                        && input.current_fragmentainer.available_block_size().points()
+                        && input.available_content_block_size.points()
                             <= css::CSS_PX_TO_PT + 0.01)),
             can_advance: input.can_advance,
         })
@@ -621,7 +644,7 @@ impl FlexUnitPrebreakDecision {
                 input.unit_block_start.points().min(
                     flex_source_block_end_after_available_capacity(
                         input.cursor.block_offset,
-                        input.current_fragmentainer,
+                        input.available_content_block_size,
                     )
                     .points(),
                 ),
@@ -731,8 +754,7 @@ fn flex_container_shrink_to_fit_max_content_width(
         || !style.box_values.width.is_auto()
         || style.flex_wrap == FlexWrap::NoWrap
         || !physical_flex_direction(style).is_column_axis()
-        || (style.flex_wrap.balances_lines()
-            && matches!(style.flex_line_count, css::FlexLineCount::Count(_)))
+        || (style.flex_wrap.balances_lines() && style.flex_line_count.get() > 1)
     {
         return max_content;
     }

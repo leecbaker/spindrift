@@ -21,7 +21,8 @@ pub(crate) fn parse_list_style_type(value: &str) -> Option<ListStyleType> {
     {
         return Some(ListStyleType::String(text));
     }
-    let lower = value.to_ascii_lowercase();
+    let name = css_single_ident(value)?;
+    let lower = name.to_ascii_lowercase();
     match lower.as_str() {
         "disc" => Some(ListStyleType::Disc),
         "circle" => Some(ListStyleType::Circle),
@@ -31,8 +32,11 @@ pub(crate) fn parse_list_style_type(value: &str) -> Option<ListStyleType> {
         "decimal" => Some(ListStyleType::Decimal),
         "none" => Some(ListStyleType::None),
         "inside" | "outside" => None,
-        _ if is_counter_style_ident(value) => Some(ListStyleType::Named(lower)),
-        _ => None,
+        // Counter style names are case-sensitive except for the predefined
+        // names defined by CSS Counter Styles. Preserve an author-defined
+        // spelling so lookup cannot accidentally select `foo` for `Foo`.
+        // <https://drafts.csswg.org/css-counter-styles-3/#counter-style-name>
+        _ => parse_counter_style_reference_name(value).map(ListStyleType::Named),
     }
 }
 
@@ -122,19 +126,123 @@ pub(crate) fn parse_symbols_function_symbols(mut value: &str) -> Vec<String> {
     symbols
 }
 
-pub(crate) fn is_counter_style_ident(value: &str) -> bool {
-    let mut chars = value.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    (first == '_' || first == '-' || first.is_ascii_alphabetic())
-        && chars.all(|character| {
-            character == '_' || character == '-' || character.is_ascii_alphanumeric()
-        })
-        && !matches!(
-            value.to_ascii_lowercase().as_str(),
-            "inherit" | "initial" | "unset" | "revert" | "default" | "url"
-        )
+/// Parse a counter-style reference that is syntactically a CSS `<custom-ident>`.
+///
+/// The CSS tokenizer, rather than an ASCII-only character check, decodes
+/// escapes and accepts non-ASCII identifiers. Predefined counter style names
+/// are canonicalized at each reference site; author-defined names retain their
+/// exact decoded spelling and are therefore case-sensitive.
+/// <https://drafts.csswg.org/css-values-4/#custom-idents>
+/// <https://drafts.csswg.org/css-counter-styles-3/#counter-style-name>
+pub(crate) fn parse_counter_style_reference_name(value: &str) -> Option<String> {
+    let name = css_single_ident(value.trim())?;
+    (is_counter_name(&name) && !name.eq_ignore_ascii_case("default")).then(|| {
+        canonical_predefined_counter_style_name(&name)
+            .map(str::to_string)
+            .unwrap_or(name)
+    })
+}
+
+/// Return the canonical spelling of a predefined counter-style name.
+///
+/// CSS Counter Styles parses every predefined name ASCII-case-insensitively,
+/// while author-defined names retain their spelling and remain case-sensitive.
+/// This deliberately lives next to list-style parsing so all counter-style
+/// reference sites share one classification.
+/// <https://drafts.csswg.org/css-counter-styles-3/#counter-style-name>
+pub(crate) fn canonical_predefined_counter_style_name(value: &str) -> Option<&'static str> {
+    const NAMES: &[&str] = &[
+        "decimal",
+        "disc",
+        "square",
+        "circle",
+        "disclosure-open",
+        "disclosure-closed",
+        "decimal-leading-zero",
+        "arabic-indic",
+        "armenian",
+        "upper-armenian",
+        "lower-armenian",
+        "bengali",
+        "cambodian",
+        "khmer",
+        "cjk-decimal",
+        "devanagari",
+        "georgian",
+        "gujarati",
+        "gurmukhi",
+        "hebrew",
+        "kannada",
+        "lao",
+        "malayalam",
+        "mongolian",
+        "myanmar",
+        "oriya",
+        "persian",
+        "lower-roman",
+        "upper-roman",
+        "tamil",
+        "telugu",
+        "thai",
+        "tibetan",
+        "lower-alpha",
+        "lower-latin",
+        "upper-alpha",
+        "upper-latin",
+        "cjk-earthly-branch",
+        "cjk-heavenly-stem",
+        "lower-greek",
+        "hiragana",
+        "hiragana-iroha",
+        "katakana",
+        "katakana-iroha",
+        "japanese-informal",
+        "japanese-formal",
+        "korean-hangul-formal",
+        "korean-hanja-informal",
+        "korean-hanja-formal",
+        "simp-chinese-informal",
+        "simp-chinese-formal",
+        "trad-chinese-informal",
+        "trad-chinese-formal",
+        "cjk-ideographic",
+        "ethiopic-numeric",
+    ];
+    let lower = value.to_ascii_lowercase();
+    NAMES.iter().copied().find(|name| *name == lower)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn font_shorthand_slash_is_independent_of_comment_boundaries() {
+        let attached = parse_font_shorthand("150px/1 Ahem", 12.0, FontWeight::NORMAL)
+            .expect("attached slash form");
+        let spaced = parse_font_shorthand("150px / 1 Ahem", 12.0, FontWeight::NORMAL)
+            .expect("spaced slash form");
+        let commented =
+            parse_font_shorthand("150px/**/ / /**/1 Ahem/**/", 12.0, FontWeight::NORMAL)
+                .expect("comment-separated slash form");
+        assert_eq!(attached, spaced);
+        assert_eq!(attached, commented);
+    }
+
+    #[test]
+    fn counter_style_references_use_css_custom_identifier_tokenization() {
+        assert_eq!(
+            parse_list_style_type(r"\3BB \3B1 "),
+            Some(ListStyleType::Named("λα".to_string()))
+        );
+        assert_eq!(
+            parse_list_style_type("Hiragana"),
+            Some(ListStyleType::Named("hiragana".to_string()))
+        );
+        for value in ["inherit", "initial", "unset", "revert", "default"] {
+            assert_eq!(parse_list_style_type(value), None, "{value}");
+        }
+    }
 }
 
 pub(crate) fn parse_font_family_names(value: &str) -> Vec<String> {
@@ -309,6 +417,7 @@ pub(crate) fn parse_font_shorthand_with_parent_ch_advance(
         inherited_ch_advance,
         inherited_font_weight,
         None,
+        layout_pt(inherited_font_size * 1.2),
     )
 }
 
@@ -327,16 +436,21 @@ pub(crate) fn parse_font_shorthand_with_line_height_font_size(
     inherited_ch_advance: LayoutLength,
     inherited_font_weight: FontWeight,
     line_height_font_size: Option<f32>,
+    inherited_line_height: LayoutLength,
 ) -> Option<ParsedFontShorthand> {
-    let tokens = split_css_component_values(value);
+    let tokens = split_font_shorthand_components(value)?;
     let size_index = tokens.iter().position(|token| {
-        split_font_size_and_line_height(token, inherited_font_size, inherited_ch_advance).is_some()
+        matches!(token, FontShorthandComponent::Value(token)
+            if split_font_size_and_line_height(token, inherited_font_size, inherited_ch_advance).is_some())
     })?;
     let mut style = FontStyle::Normal;
     let mut weight = FontWeight::NORMAL;
     let mut width = FontWidth::NORMAL;
     let mut variant_caps = FontVariantCaps::Normal;
     for token in &tokens[..size_index] {
+        let FontShorthandComponent::Value(token) = token else {
+            return None;
+        };
         if token.eq_ignore_ascii_case("normal") {
             continue;
         }
@@ -355,27 +469,50 @@ pub(crate) fn parse_font_shorthand_with_line_height_font_size(
         }
     }
 
+    let FontShorthandComponent::Value(size_value) = tokens[size_index] else {
+        return None;
+    };
     let (size, mut line_height) = split_font_size_and_line_height_with_line_height_font_size(
-        tokens[size_index],
+        size_value,
         inherited_font_size,
         inherited_ch_advance,
         line_height_font_size,
     )?;
-    let size_token = split_font_token_on_slash(tokens[size_index])
+    let size_token = split_font_token_on_slash(size_value)
         .map(|(size, _)| size)
-        .unwrap_or(tokens[size_index]);
+        .unwrap_or(size_value);
     let deferred_size = parse_deferred_font_size(size_token)?;
     let mut family_start = size_index + 1;
-    if line_height.is_none() && tokens.get(family_start).is_some_and(|token| *token == "/") {
+    if line_height.is_none()
+        && matches!(
+            tokens.get(family_start),
+            Some(FontShorthandComponent::Slash)
+        )
+    {
         let line_height_font_size = line_height_font_size.unwrap_or(size);
-        line_height = tokens
-            .get(family_start + 1)
-            .and_then(|token| parse_computed_line_height(token, line_height_font_size));
+        line_height = tokens.get(family_start + 1).and_then(|token| match token {
+            FontShorthandComponent::Value(token) => {
+                parse_computed_line_height(token, line_height_font_size)
+            }
+            FontShorthandComponent::Slash => None,
+        });
         line_height.clone()?;
         family_start += 2;
     }
-    let family = tokens.get(family_start..)?.join(" ");
+    let family = tokens
+        .get(family_start..)?
+        .iter()
+        .map(|token| match token {
+            FontShorthandComponent::Value(token) => Some(*token),
+            FontShorthandComponent::Slash => None,
+        })
+        .collect::<Option<Vec<_>>>()?
+        .join(" ");
     let family = parse_font_family(&family)?;
+
+    if let Some(line_height) = &mut line_height {
+        line_height.resolve_inherited_line_height_relative_lengths(inherited_line_height);
+    }
 
     Some(ParsedFontShorthand {
         style,
@@ -387,6 +524,78 @@ pub(crate) fn parse_font_shorthand_with_line_height_font_size(
         line_height,
         family,
     })
+}
+
+/// Top-level tokens relevant to CSS Fonts' `font` shorthand.
+///
+/// The shorthand's slash is a delimiter token, not a character attached to
+/// either neighboring component. In particular, `var()` substitution can put
+/// a comment token between `/` and the line-height value.
+/// <https://drafts.csswg.org/css-fonts-4/#font-prop>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FontShorthandComponent<'a> {
+    Value(&'a str),
+    Slash,
+}
+
+fn split_font_shorthand_components(value: &str) -> Option<Vec<FontShorthandComponent<'_>>> {
+    let mut input = ParserInput::new(value);
+    let mut parser = Parser::new(&mut input);
+    let mut components = Vec::new();
+    let mut start = None;
+    while !parser.is_exhausted() {
+        let token_start = parser.position();
+        let token = parser
+            .next_including_whitespace_and_comments()
+            .ok()?
+            .clone();
+        if token.is_parse_error() {
+            return None;
+        }
+        if matches!(token, Token::WhiteSpace(_) | Token::Comment(_)) {
+            if let Some(start) = start.take() {
+                let value = parser.slice(start..token_start).trim();
+                if !value.is_empty() {
+                    components.push(FontShorthandComponent::Value(value));
+                }
+            }
+            continue;
+        }
+        if matches!(token, Token::Delim('/')) {
+            if let Some(start) = start.take() {
+                let value = parser.slice(start..token_start).trim();
+                if !value.is_empty() {
+                    components.push(FontShorthandComponent::Value(value));
+                }
+            }
+            components.push(FontShorthandComponent::Slash);
+            continue;
+        }
+        start.get_or_insert(token_start);
+        if matches!(
+            token,
+            Token::Function(_)
+                | Token::ParenthesisBlock
+                | Token::SquareBracketBlock
+                | Token::CurlyBracketBlock
+        ) && parser
+            .parse_nested_block(|nested| {
+                crate::css::component_values::validate_component_value_list_from_parser(nested)
+                    .then_some(())
+                    .ok_or_else(|| nested.new_custom_error::<(), ()>(()))
+            })
+            .is_err()
+        {
+            return None;
+        }
+    }
+    if let Some(start) = start {
+        let value = parser.slice_from(start).trim();
+        if !value.is_empty() {
+            components.push(FontShorthandComponent::Value(value));
+        }
+    }
+    Some(components)
 }
 
 fn split_font_size_and_line_height(
@@ -854,9 +1063,9 @@ pub(crate) fn parse_font_variant_position(value: &str) -> Option<FontVariantPosi
 /// Parse the CSS `font-language-override` longhand.
 ///
 /// The serialized CSS form uses three-letter tags such as `"TRK"`; OpenType
-/// represents those as a space-padded four-byte tag.  Four printable ASCII
-/// bytes are accepted as-is, while an invalid string invalidates the
-/// declaration.
+/// represents those as a space-padded four-byte tag. Tags are case-sensitive,
+/// so four printable ASCII bytes are retained exactly while an invalid string
+/// invalidates the declaration.
 /// <https://drafts.csswg.org/css-fonts-4/#font-language-override-prop>
 pub(crate) fn parse_font_language_override(value: &str) -> Option<FontLanguageOverride> {
     let value = trim_css_value(value);
@@ -867,14 +1076,14 @@ pub(crate) fn parse_font_language_override(value: &str) -> Option<FontLanguageOv
     if !tail.trim().is_empty() || !(3..=4).contains(&tag.len()) || !tag.is_ascii() {
         return None;
     }
-    let mut normalized = [b' '; 4];
-    for (slot, byte) in normalized.iter_mut().zip(tag.bytes()) {
+    let mut padded = [b' '; 4];
+    for (slot, byte) in padded.iter_mut().zip(tag.bytes()) {
         if !byte.is_ascii_graphic() {
             return None;
         }
-        *slot = byte.to_ascii_uppercase();
+        *slot = byte;
     }
-    Some(FontLanguageOverride::OpenType(normalized))
+    Some(FontLanguageOverride::OpenType(padded))
 }
 
 pub(crate) fn parse_font_variant_caps(value: &str) -> Option<FontVariantCaps> {

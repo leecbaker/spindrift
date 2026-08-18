@@ -172,6 +172,102 @@ fn inline_trim_decoration_rect(document: &quire::Document) -> (f32, f32, f32, f3
     (rect.x(), rect.y(), rect.width(), rect.height())
 }
 
+async fn render_inline_decoration_break_case(
+    box_decoration_break: &str,
+    content: &str,
+) -> quire::Document {
+    Html::from_string(format!(
+        r#"<!DOCTYPE html>
+<style>
+  @page {{ size: 220px 160px; margin: 0 }}
+  html, body {{ margin: 0; padding: 0 }}
+  .target {{
+    width: 88px;
+    color: rgb(255, 0, 0);
+    font: 20px/24px sans-serif;
+  }}
+  .target::first-line {{ color: rgb(0, 128, 0) }}
+  .decorated {{
+    background: currentcolor;
+    border-left: 4px solid currentcolor;
+    border-right: 4px solid currentcolor;
+    padding-left: 3px;
+    padding-right: 3px;
+    box-decoration-break: {box_decoration_break};
+  }}
+</style>
+<div class="target"><span class="decorated">{content}</span></div>"#,
+    ))
+    .render(&RenderOptions::default())
+    .await
+    .unwrap()
+}
+
+fn inline_decoration_rects(
+    document: &quire::Document,
+    color: CssColor,
+) -> Vec<(f32, f32, f32, f32)> {
+    document.pages[0]
+        .rects()
+        .iter()
+        .filter(|rect| rect.fill == Some(color))
+        .map(|rect| (rect.x(), rect.y(), rect.width(), rect.height()))
+        .collect()
+}
+
+#[tokio::test]
+async fn inline_box_decoration_clone_repeats_edges_across_forced_and_soft_breaks() {
+    let green = CssColor::new(0, 128, 0);
+    let red = CssColor::new(255, 0, 0);
+    for content in ["A<br>B", "A A A A A"] {
+        let cloned = render_inline_decoration_break_case("clone", content).await;
+        let sliced = render_inline_decoration_break_case("slice", content).await;
+
+        assert!(
+            rendered_text_lines(&cloned).len() >= 2,
+            "fixture must select more than one line: {:?}",
+            rendered_text_lines(&cloned)
+        );
+        assert_eq!(
+            rendered_text_lines(&cloned),
+            rendered_text_lines(&sliced),
+            "box-decoration-break must not change text selection"
+        );
+
+        let red_line = cloned.pages[0]
+            .lines()
+            .iter()
+            .filter(|line| !line.text.trim().is_empty())
+            .nth(1)
+            .expect("second formatted line should paint");
+        let red_text_left = first_visible_glyph_x(red_line);
+        let continuation_has_left_border = |document: &quire::Document| {
+            inline_decoration_rects(document, red)
+                .iter()
+                .any(|(x, _, width, _)| {
+                    // CSS px → PDF pt turns the authored 4px border into 3pt.
+                    // A sliced fragment still paints its background from the
+                    // content edge, so test the distinct border primitive rather
+                    // than treating the background's left edge as a border edge.
+                    *x < red_text_left - 0.1 && *width <= 3.1
+                })
+        };
+
+        assert!(
+            continuation_has_left_border(&cloned),
+            "clone continuation must paint a fragment-local inline start border"
+        );
+        assert!(
+            !continuation_has_left_border(&sliced),
+            "slice continuation must not gain an inline start border"
+        );
+        assert!(
+            !inline_decoration_rects(&cloned, green).is_empty(),
+            "first-line currentcolor must resolve cloned source decoration"
+        );
+    }
+}
+
 #[tokio::test]
 async fn text_box_trim_end_shortens_last_line_after_block_in_inline() {
     let body = "<span><div>A<br>B</div></span>C";
@@ -1763,6 +1859,49 @@ async fn grid_template_areas_place_named_items() {
     assert!((red.width() - 30.0).abs() < 0.01, "left item: {red:?}");
     assert!((blue.x() - 40.0).abs() < 0.01, "right item: {blue:?}");
     assert!((blue.width() - 20.0).abs() < 0.01, "right item: {blue:?}");
+}
+
+#[tokio::test]
+async fn all_unnamed_grid_template_areas_extend_the_explicit_grid() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 160pt 100pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; grid-template-areas: \". . .\"; grid-template-columns: 20pt; grid-template-rows: 10pt; grid-auto-columns: 30pt; width: 80pt }\
+         .item { height: 10pt }\
+         .red { background: red }\
+         .green { background: green }\
+         .blue { background: blue }\
+         </style>\
+         <div class=\"grid\"><div class=\"item red\"></div><div class=\"item green\"></div><div class=\"item blue\"></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let rect = |color| {
+        page.rects()
+            .iter()
+            .find(|rect| rect.fill == Some(color))
+            .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
+    };
+    let red = rect(CssColor::new(255, 0, 0));
+    let green = rect(CssColor::new(0, 128, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
+
+    assert!(
+        (red.x() - 10.0).abs() < 0.01,
+        "first explicit template track: {red:?}"
+    );
+    assert!(
+        (green.x() - 30.0).abs() < 0.01,
+        "second explicit template track: {green:?}"
+    );
+    assert!(
+        (blue.x() - 60.0).abs() < 0.01,
+        "third explicit template track: {blue:?}"
+    );
 }
 
 #[tokio::test]
@@ -4907,6 +5046,42 @@ async fn grid_layout_places_backward_named_implicit_span_before_end_aligned_auto
 }
 
 #[tokio::test]
+async fn grid_layout_places_backward_named_implicit_span_before_distributed_auto_fit_grid() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 280pt 120pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; width: 70pt; grid-template-columns: repeat(auto-fit, 20pt); grid-template-rows: 10pt; grid-auto-columns: 30pt 40pt; column-gap: 5pt; justify-content: space-evenly; background: yellow }\
+         .span { grid-column: span slot / 2; height: 10pt; background: red }\
+         .second { grid-column: 2; height: 10pt; background: blue }\
+         </style>\
+         <div class=\"grid\"><div class=\"span\"></div><div class=\"second\"></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let rect = |color| {
+        page.rects()
+            .iter()
+            .find(|rect| rect.fill == Some(color))
+            .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
+    };
+    let red = rect(CssColor::new(255, 0, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
+
+    assert!(
+        (red.x() - 14.25).abs() < 0.01 && (red.width() - 65.0).abs() < 0.01,
+        "startward implicit span should use distribution after trailing empty auto-fit tracks collapse: {red:?}"
+    );
+    assert!(
+        (blue.x() - 66.25).abs() < 0.01 && (blue.width() - 20.0).abs() < 0.01,
+        "occupied auto-fit track should use the distributed collapsed-track geometry: {blue:?}"
+    );
+}
+
+#[tokio::test]
 async fn grid_layout_places_negative_named_implicit_row_before_auto_fit_grid() {
     let document = Html::from_string(
         "<style>\
@@ -5393,7 +5568,7 @@ async fn grid_container_min_content_width_uses_one_fixed_auto_fill_repetition() 
 }
 
 #[tokio::test]
-async fn grid_container_min_content_width_uses_implicit_auto_columns() {
+async fn grid_container_min_content_width_uses_one_implicit_auto_column() {
     let document = Html::from_string(
         "<style>\
          @page { size: 200pt 100pt; margin: 10pt }\
@@ -5420,8 +5595,8 @@ async fn grid_container_min_content_width_uses_implicit_auto_columns() {
     let red = rect(CssColor::new(255, 0, 0));
 
     assert!(
-        (grid.width() - 80.0).abs() < 0.01,
-        "min-content grid should include cycled implicit auto columns and gaps: {grid:?}"
+        (grid.width() - 20.0).abs() < 0.01,
+        "row auto-flow should create rows rather than extra implicit columns: {grid:?}"
     );
     assert!((red.width() - 20.0).abs() < 0.01, "first item: {red:?}");
 }
@@ -8041,6 +8216,63 @@ async fn clear_both_moves_block_below_active_float() {
 }
 
 #[tokio::test]
+async fn first_cleared_child_after_float_uses_parent_start_clearance_hypothesis() {
+    let document = Html::from_string(
+        "<!DOCTYPE html><style>@page{size:140px 140px;margin:0}body{margin:0}p{display:none}</style>\
+         <p>Test passes if there is a filled green square and no red.</p>\
+         <div style=\"width:100px;background:red\">\
+           <div style=\"float:left;width:100px;height:50px;background:green\"></div>\
+           <div style=\"clear:left;margin-top:200px\"></div>\
+         </div>\
+         <div style=\"width:100px;height:50px;background:green\"></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let green = CssColor::new(0, 128, 0);
+    let green_rects = page
+        .rects()
+        .iter()
+        .filter(|rect| rect.fill == Some(green))
+        .collect::<Vec<_>>();
+    let left = green_rects
+        .iter()
+        .map(|rect| rect.x())
+        .min_by(f32::total_cmp)
+        .expect("the floated green region should paint");
+    let top = green_rects
+        .iter()
+        .map(|rect| rect.y())
+        .min_by(f32::total_cmp)
+        .expect("the green square should have a top edge");
+    let right = green_rects
+        .iter()
+        .map(|rect| rect.x() + rect.width())
+        .max_by(f32::total_cmp)
+        .expect("the green square should have a right edge");
+    let bottom = green_rects
+        .iter()
+        .map(|rect| rect.y() + rect.height())
+        .max_by(f32::total_cmp)
+        .expect("the green square should have a bottom edge");
+    assert!((right - left - 75.0).abs() < 0.01, "green={green_rects:?}");
+    assert!((bottom - top - 75.0).abs() < 0.01, "green={green_rects:?}");
+    for y in [top + 18.75, top + 56.25] {
+        assert_eq!(
+            final_rect_fill_at(page, left + 37.5, y),
+            Some(green),
+            "the two 50px green regions should form one visible 100px square at y={y}"
+        );
+    }
+    assert_ne!(
+        final_rect_fill_at(page, left + 37.5, bottom + 18.75),
+        Some(green)
+    );
+}
+
+#[tokio::test]
 async fn following_text_wraps_around_left_float() {
     let document = Html::from_string(
         "<style>@page { size: 160pt 120pt; margin: 10pt } body { margin: 0; font: 10pt/10pt monospace }\
@@ -9770,7 +10002,7 @@ async fn flex_last_baseline_alignment_uses_last_text_baseline() {
 }
 
 #[tokio::test]
-async fn baseline_aligned_vertical_column_flex_item_falls_back_to_inline_start() {
+async fn baseline_aligned_vertical_column_flex_item_and_abspos_bottom_inset_use_physical_edges() {
     let document = Html::from_string(
         "<style>@page { size: 100pt 100pt; margin: 0 } body { margin: 0 }\
          .flexbox { display:flex; width:100pt; height:100pt; align-items:baseline;\
@@ -9783,7 +10015,6 @@ async fn baseline_aligned_vertical_column_flex_item_falls_back_to_inline_start()
     .render(&RenderOptions::default())
     .await
     .unwrap();
-
     let mut green_rects = document.pages[0]
         .rects()
         .iter()
@@ -9793,16 +10024,16 @@ async fn baseline_aligned_vertical_column_flex_item_falls_back_to_inline_start()
     green_rects.sort_by(|a, b| a.y().partial_cmp(&b.y()).unwrap());
 
     assert_eq!(green_rects.len(), 2, "{green_rects:?}");
-    let lower = &green_rects[0];
-    let upper = &green_rects[1];
+    let positioned = &green_rects[0];
+    let in_flow = &green_rects[1];
     assert!(
-        (lower.x() - upper.x()).abs() < 0.01
-            && (lower.width() - 100.0).abs() < 0.01
-            && (upper.width() - 100.0).abs() < 0.01
-            && (lower.height() - 50.0).abs() < 0.01
-            && (upper.height() - 50.0).abs() < 0.01
-            && (lower.y() + lower.height() - upper.y()).abs() < 0.01,
-        "baseline fallback should stack the green halves into one square: {green_rects:?}"
+        (positioned.x() - in_flow.x()).abs() < 0.01
+            && (positioned.y() - in_flow.y()).abs() < 0.01
+            && (positioned.width() - 100.0).abs() < 0.01
+            && (in_flow.width() - 100.0).abs() < 0.01
+            && (positioned.height() - 50.0).abs() < 0.01
+            && (in_flow.height() - 50.0).abs() < 0.01,
+        "the wrap-reverse baseline fallback and physical bottom inset should both select the physical top half: {green_rects:?}"
     );
 }
 
@@ -12756,6 +12987,7 @@ async fn inline_block_absolute_child_static_position_uses_atom_origin_after_text
             red.y() + red.height() / 2.0
         ),
         Some(CssColor::new(0, 128, 0)),
+        "an auto-inset descendant of a static inline-block must replay at the atom origin: red={red:?}, green={green:?}",
     );
     assert!((green.x() - red.x()).abs() < 0.01);
     assert!((green.y() - red.y()).abs() < 0.01);
@@ -13229,6 +13461,68 @@ async fn block_outline_paints_after_child_content() {
         outline_operation > child_operation,
         "outline should paint after descendant content: child={child_operation}, outline={outline_operation}"
     );
+}
+
+/// Quire's CSS-UI-permitted compatibility policy paints an ordinary in-flow
+/// outline before an auto/zero-z positioned sibling, regardless of whether
+/// the in-flow formatting context is block, Grid, Flex, or a table.
+#[tokio::test]
+async fn normal_flow_outlines_precede_auto_positioned_siblings() {
+    for (name, normal) in [
+        ("block", "<div class=\"normal\"></div>"),
+        (
+            "grid",
+            "<div class=\"normal grid\"><div class=\"item\"></div></div>",
+        ),
+        (
+            "flex",
+            "<div class=\"normal flex\"><div class=\"item\"></div></div>",
+        ),
+        (
+            "table",
+            "<table class=\"table\"><tbody class=\"normal\"><tr><td></td></tr></tbody></table>",
+        ),
+    ] {
+        let document = Html::from_string(format!(
+            "<style>@page {{ size: 120pt 120pt; margin: 0 }} body {{ margin: 0 }}\
+             .outer {{ position: relative; width: 60pt; height: 60pt }}\
+             .normal {{ width: 40pt; height: 40pt; outline: 2pt solid red }}\
+             .grid {{ display: grid }} .flex {{ display: flex }} .table {{ border-spacing: 0; width: 40pt }}\
+             .item, td {{ width: 40pt; height: 40pt }}\
+             .absolute {{ position: absolute; inset: 0; width: 40pt; height: 40pt; background: rgb(0 128 0) }}\
+             </style><div class=\"outer\">{normal}<div class=\"absolute\"></div></div>"
+        ))
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+        let page = &document.pages[0];
+        let first_rect_operation = |color| {
+            page.paint_operations().iter().position(|operation| {
+                matches!(
+                    operation,
+                    crate::document::paint::page::PaintOperation::Rect(index)
+                        if page.rects().get(*index).is_some_and(|rect| rect.fill == Some(color))
+                )
+            })
+        };
+        let outline = first_rect_operation(CssColor::new(255, 0, 0)).unwrap_or_else(|| {
+            panic!(
+                "{name} outline did not emit a red rectangle: {:?}",
+                page.rects()
+            )
+        });
+        let positioned = first_rect_operation(CssColor::new(0, 128, 0)).unwrap_or_else(|| {
+            panic!(
+                "{name} positioned box did not emit a green rectangle: {:?}",
+                page.rects()
+            )
+        });
+        assert!(
+            outline < positioned,
+            "{name} normal-flow outline must precede auto positioned paint: {:?}",
+            page.paint_operations()
+        );
+    }
 }
 
 #[tokio::test]

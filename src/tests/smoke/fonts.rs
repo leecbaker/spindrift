@@ -328,6 +328,31 @@ async fn supports_font_face_data_uri_fonts() {
 }
 
 #[tokio::test]
+async fn font_face_data_uri_falls_back_after_a_malformed_data_source() {
+    let font_data = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
+    let font_data = base64::engine::general_purpose::STANDARD.encode(font_data);
+    let html = format!(
+        "<style>@font-face {{ font-family: DataFallback; src: url(data:font/ttf;base64,%%%) format('truetype'), url(data:font/ttf;base64,{font_data}) format('truetype') }} p {{ font-family: DataFallback }}</style><p>Font face</p>"
+    );
+
+    let document = Html::from_string(html)
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+
+    assert!(
+        document
+            .fonts
+            .iter()
+            .any(|font| font.family == "DataFallback")
+    );
+    assert_eq!(
+        line_font(&document, &document.pages[0].lines()[0]).family,
+        "DataFallback"
+    );
+}
+
+#[tokio::test]
 async fn supports_font_face_data_uri_woff1_fonts() {
     let font_data = woff1_from_sfnt(
         &std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap(),
@@ -1245,6 +1270,73 @@ async fn explicit_line_height_baseline_ignores_fallback_font_runs() {
         first_rect_paint_operation_index(page, CssColor::WHITE)
             > first_rect_paint_operation_index(page, CssColor::new(255, 0, 0)),
         "white reference should paint over the red fallback-baseline probe"
+    );
+}
+
+/// A fallback glyph selected through `unicode-range` must not change an
+/// auto-height inline-block's normal line box or its inline background.
+/// <https://www.w3.org/TR/CSS22/visudet.html#line-height>
+#[tokio::test]
+async fn normal_line_height_inline_block_ignores_fallback_font_metrics() {
+    let primary = "weasyprint-samples/invoice/SourceSans3-Regular.ttf";
+    let fallback = "weasyprint-samples/letter/fonts/Pacifico-Regular.ttf";
+    let html = format!(
+        r#"
+        <style>
+          @page {{ size: 240pt 160pt; margin: 0 }}
+          body {{ margin: 0 }}
+          @font-face {{
+            font-family: PrimaryAOnly;
+            src: url("{primary}") format("truetype");
+            unicode-range: U+0020, U+0061;
+          }}
+          @font-face {{
+            font-family: FallbackBOnly;
+            src: url("{fallback}") format("truetype");
+            unicode-range: U+0062;
+          }}
+          .probe {{
+            position: absolute;
+            top: 20pt;
+            left: 0;
+            display: inline-block;
+            width: 225pt;
+            font-size: 75pt;
+            text-align: right;
+            color: transparent;
+          }}
+          #mixed {{ font-family: PrimaryAOnly, FallbackBOnly; background: red; }}
+          #primary {{ font-family: PrimaryAOnly; background: white; }}
+        </style>
+        <div id="mixed" class="probe"><span>ab</span></div>
+        <div id="primary" class="probe"><span>aa</span></div>
+        "#
+    );
+    let document = Html::from_string(html)
+        .with_base_path(".")
+        .unwrap()
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+    let page = &document.pages[0];
+    let red = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
+        .expect("mixed-fallback inline background should paint");
+    let white = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::WHITE))
+        .expect("primary-only inline background should paint");
+
+    assert!(
+        (red.y() - white.y()).abs() < 0.01,
+        "fallback glyph metrics must not shift the inline background: red={red:?} white={white:?}"
+    );
+    assert!(
+        (red.height() - white.height()).abs() < 0.01,
+        "fallback glyph metrics must not change the inline background height: red={red:?} white={white:?}"
     );
 }
 

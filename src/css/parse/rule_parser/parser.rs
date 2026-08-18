@@ -2,7 +2,8 @@ use super::at_rules::collect_container_style_rules;
 use super::*;
 use crate::css::PropertyRegistrationRule;
 use crate::css::{
-    FontPaletteDefinition, LayerName, LayerOrder, LayerSegment, StylesheetScopeAnchor,
+    FontPaletteDefinition, LayerName, LayerOrder, LayerSegment, StylesheetOrigin,
+    StylesheetScopeAnchor,
 };
 use cssparser::{AtRuleParser, DeclarationParser, ToCss};
 
@@ -54,6 +55,7 @@ pub(in crate::css) struct CssRuleParser<'a> {
     pub(in crate::css) current_layer: Option<LayerName>,
     pub(in crate::css) current_scopes: Vec<ScopeRule>,
     pub(in crate::css) scope_anchor: StylesheetScopeAnchor,
+    pub(in crate::css) origin: StylesheetOrigin,
     pub(in crate::css) media_environment: MediaEnvironment,
     /// The nearest style rule while parsing a CSS Nesting block.  It is kept
     /// as parsed selectors so `&` replacement follows Selectors' `:is()`
@@ -216,6 +218,7 @@ impl<'a> CssRuleParser<'a> {
             current_layer: self.current_layer.clone(),
             current_scopes: self.current_scopes.clone(),
             scope_anchor: self.scope_anchor,
+            origin: self.origin,
             media_environment: self.media_environment,
             nesting: Some(nesting),
             namespace_prelude_open: false,
@@ -676,6 +679,7 @@ impl<'a, 'i> cssparser::AtRuleParser<'i> for CssRuleParser<'a> {
                     current_layer: self.current_layer.clone(),
                     current_scopes: self.current_scopes.clone(),
                     scope_anchor: self.scope_anchor,
+                    origin: self.origin,
                     media_environment: self.media_environment,
                     nesting: self.nesting.clone(),
                     namespace_prelude_open: false,
@@ -692,6 +696,7 @@ impl<'a, 'i> cssparser::AtRuleParser<'i> for CssRuleParser<'a> {
                     current_layer: self.current_layer.clone(),
                     current_scopes: self.current_scopes.clone(),
                     scope_anchor: self.scope_anchor,
+                    origin: self.origin,
                     media_environment: self.media_environment,
                     nesting: self.nesting.clone(),
                     namespace_prelude_open: false,
@@ -721,6 +726,7 @@ impl<'a, 'i> cssparser::AtRuleParser<'i> for CssRuleParser<'a> {
                     current_layer: Some(layer_name),
                     current_scopes: self.current_scopes.clone(),
                     scope_anchor: self.scope_anchor,
+                    origin: self.origin,
                     media_environment: self.media_environment,
                     nesting: self.nesting.clone(),
                     namespace_prelude_open: false,
@@ -739,6 +745,7 @@ impl<'a, 'i> cssparser::AtRuleParser<'i> for CssRuleParser<'a> {
                     current_layer: self.current_layer.clone(),
                     current_scopes,
                     scope_anchor: self.scope_anchor,
+                    origin: self.origin,
                     media_environment: self.media_environment,
                     nesting: self.nesting.clone(),
                     namespace_prelude_open: false,
@@ -768,7 +775,7 @@ impl<'a, 'i> cssparser::AtRuleParser<'i> for CssRuleParser<'a> {
             }
             AtRulePrelude::CounterStyle(name) => {
                 let body = consume_remaining_input(input);
-                Ok(parse_counter_style_rule(&name, &body)
+                Ok(parse_counter_style_rule(&name, &body, self.origin)
                     .map(ParsedCssRule::CounterStyle)
                     .unwrap_or(ParsedCssRule::Ignored))
             }
@@ -796,6 +803,7 @@ impl<'a, 'i> cssparser::AtRuleParser<'i> for CssRuleParser<'a> {
                     current_layer: self.current_layer.clone(),
                     current_scopes: self.current_scopes.clone(),
                     scope_anchor: self.scope_anchor,
+                    origin: self.origin,
                     media_environment: self.media_environment,
                     nesting: self.nesting.clone(),
                     namespace_prelude_open: false,

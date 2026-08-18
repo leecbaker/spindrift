@@ -123,7 +123,7 @@ impl<'a> LayoutBuilder<'a> {
             || needs_intrinsic_width_contribution(style.box_values.min_width.clone())
             || needs_intrinsic_width_contribution(style.box_values.max_width.clone()))
         .then(|| {
-            self.block_intrinsic_content_sizes(
+            self.block_intrinsic_physical_widths(
                 element,
                 style,
                 stylesheets,
@@ -132,8 +132,7 @@ impl<'a> LayoutBuilder<'a> {
             )
         });
         let requested_content_width = if let Some(intrinsic_sizes) = intrinsic_sizes {
-            let (min_content, max_content) =
-                intrinsic_sizes.physical_width_min_max(FlowAxes::for_style(style));
+            let (min_content, max_content) = intrinsic_sizes;
             PhysicalContentWidth::new(intrinsic::content_box_width_from_intrinsic(
                 style,
                 layout_pt(available_outer_width),
@@ -152,13 +151,14 @@ impl<'a> LayoutBuilder<'a> {
                     available_outer_width: layout_pt(available_outer_width),
                     percentage_basis: PercentageBasis::definite(layout_pt(available_outer_width)),
                     horizontal_non_content: horizontal_extras,
-                    definite_content_height: None,
+                    definite_content_height: definite_content_height
+                        .map(PhysicalContentHeight::new),
+                    auto_width_role: BlockAutoWidthRole::NormalFlow,
                 },
             )
         };
         let content_width = if let Some(intrinsic_sizes) = intrinsic_sizes {
-            let (min_content, max_content) =
-                intrinsic_sizes.physical_width_min_max(FlowAxes::for_style(style));
+            let (min_content, max_content) = intrinsic_sizes;
             constrain_width_with_intrinsic(
                 style,
                 requested_content_width.content_box_length(),
@@ -355,7 +355,12 @@ impl<'a> LayoutBuilder<'a> {
                 }
             }
             if has_direct_inline_replaced_row {
-                let (_, row_height) = self.measure_direct_inline_row(element, style, stylesheets);
+                let (_, row_height) = self.measure_direct_inline_row(
+                    element,
+                    style,
+                    stylesheets,
+                    IntrinsicBlockBasis::Indefinite,
+                );
                 content_height += row_height;
             }
 
@@ -609,6 +614,7 @@ impl<'a> LayoutBuilder<'a> {
                 .last()
                 .cloned()
                 .unwrap_or_else(PercentageBasis::indefinite),
+            element.document_compatibility_mode == dom::DocumentCompatibilityMode::Quirks,
         );
         let inline_size = self.resolved_float_inline_size(
             element,
@@ -680,13 +686,16 @@ impl<'a> LayoutBuilder<'a> {
             .attrs
             .get("src")
             .and_then(|src| {
-                load_resolved_image_source(
+                load_resolved_image_source_with_request(
                     src,
                     self.base_url,
                     self.root_url,
                     self.resource_cache,
-                    style.image_orientation == css::ImageOrientation::FromImage,
+                    crate::layout::asset_helpers::raster_orientation_policy(
+                        style.image_orientation,
+                    ),
                     crate::svg::SvgImageContext::from_used_color_scheme(style.used_color_scheme),
+                    &crate::layout::asset_helpers::html_image_request_modifiers(element),
                 )
             })
             .map(|asset| asset.intrinsic_size());

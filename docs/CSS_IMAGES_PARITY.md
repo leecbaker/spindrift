@@ -31,7 +31,14 @@ part of this parity measure rather than a separate raster-only baseline.
   the content box's default-size contain fit rather than SVG's 300×150 parser
   viewport fallback. Their viewport coverage remains SVG scene geometry until
   painting, rather than being replaced with a CSS solid rectangle; this
-  preserves source-coordinate extent, clipping, and edge coverage.
+  preserves source-coordinate extent, clipping, and edge coverage. The
+  clipped concrete-object intersection is converted once from Quire's
+  bottom-left paint coordinates to SVG's top-left source viewport, preserving
+  the same `object-position` source selection as raster images.
+- The UA stylesheet defaults HTML image-like replaced elements to
+  `overflow: clip` with a `content-box` clip margin. This preserves CSS
+  Images' default object-fit crop while allowing an author to opt into
+  concrete-object overflow with `overflow: visible`.
 - URL SVG background paths receive the CSS `background-clip` even when their
   own redundant root-viewport clip has been elided. Fully non-repeating tiles
   instead crop the root SVG source viewport to their resolved visible
@@ -52,6 +59,12 @@ part of this parity measure rather than a separate raster-only baseline.
   backgrounds; conic gradients, non-native interpolation methods, and
   object-fit/view-box mappings that cannot yet be represented exactly retain a
   tile-bounded raster fallback.
+- A sole image in generated `::before` or `::after` content retains the
+  pseudo-element's own box and decorations while its anonymous image payload
+  paints at its zoomed intrinsic size. This deliberately follows the
+  interoperable legacy pseudo-content behavior; ordinary element-level
+  `content: <image>` remains a replaced element and continues to use its
+  declared sizing and `object-fit` behavior.
 - HTML `width` and `height` presentation attributes for image-like replaced
   elements are emitted as zero-specificity author-origin cascade hints. This
   preserves author-CSS precedence for `img`, `embed`, `iframe`, `object`,
@@ -66,15 +79,19 @@ part of this parity measure rather than a separate raster-only baseline.
   emitted as native PDF Type 1 tiling patterns. Their SVG user-space placement
   is materialized in page paint space independently of the target path, so
   transformed inline SVG shapes retain their pattern alignment without
-  expanding a repeated cell into page primitives.
+  expanding a repeated cell into page primitives. Inline SVG serialization
+  preserves the SVG 2 null-namespace `href` independently of legacy
+  `xlink:href`, so the modern reference wins when both are specified.
 - Inline SVG descendants receive the host document's cascaded, resolvable CSS
   `transform`, `fill`, `stroke`, and non-percentage `stroke-width` values
   before SVG parsing, so document rules correctly override SVG presentation
   attributes without modifying the source HTML DOM.
-- `image-rendering: pixelated` / `crisp-edges` is propagated to ordinary
-  background-image tiles as well as repeated patterns and replaced raster
-  images, so all of those PDF image consumers request non-interpolated
-  sampling consistently.
+- `image-rendering` retains all CSS Images keywords through cascade and into
+  PDF resource preparation for raster backgrounds, border images, replaced
+  and generated content, and list markers. `pixelated` uses its required
+  nearest-integer-plus-smooth sequence, while `crisp-edges` is nearest
+  neighbor; sampling is materialized on the configured static device grid
+  rather than delegated to a PDF viewer's optional interpolation hint.
 - `image-set()` retains typed candidates through cascade and chooses a
   quality-first option for `RenderOptions`' configured device density (1dppx
   by default). It supports the standard and `-webkit-` spellings, URL/string
@@ -83,12 +100,21 @@ part of this parity measure rather than a separate raster-only baseline.
   scaling, and dimension-aware `calc()` arithmetic. An exhausted valid set is
   retained as an invalid image, allowing property-specific fallback such as
   normal border painting.
-- The image store keeps raw and EXIF-oriented versions of a raster source as
-  distinct resources, preserving both correct intrinsic dimensions and PDF
-  image deduplication. `image-orientation: from-image` is the initial,
-  inherited behavior; `none` can select the raw source for replaced images,
-  ordinary backgrounds, border images, list markers, and generated-content
-  URL images. Legacy PNG `zTXt` `Raw profile type exif` metadata is ignored.
+- Raster metadata keeps encoded sample dimensions distinct from preferred CSS
+  natural dimensions. JPEG EXIF density corrects the latter only when all
+  fields pass HTML's complete inch-unit, positive-value, exact-consistency
+  predicate; invalid, incomplete, centimetre-unit, and JFIF-only metadata use
+  the source-pixel-count fallback. PDF image resources retain their original
+  sample dimensions.
+- The image store keeps encoded and metadata-oriented versions of a raster
+  source as distinct resources, preserving natural dimensions, border-image
+  slicing, pixels, and PDF deduplication. `image-orientation: from-image` is
+  the initial, inherited behavior. `none` selects encoded pixels only for
+  origin-clean sources; opaque no-CORS cross-origin images remain
+  metadata-oriented. PNG `eXIf` metadata found after `IDAT` affects neither
+  orientation nor preferred natural dimensions, while indeterminate placement
+  retains decoder metadata as CSS Images requires. Legacy PNG `zTXt` `Raw
+  profile type exif` metadata is ignored.
 - GIF raster images are supported by every existing raster-image consumer.
   Animated GIFs render their first frame on the logical screen as a static
   PDF image; animation timing, looping, disposal, and later frames are not
@@ -99,7 +125,9 @@ part of this parity measure rather than a separate raster-only baseline.
   frames are not evaluated.
 - JPEG XL raster images are supported by every existing raster-image consumer.
   Their intrinsic dimensions, rendered RGB/RGBA samples, ICC profile, and EXIF
-  orientation are decoded through `jxl-oxide`.
+  orientation are decoded through `jxl-oxide`. Integer 8-bit sources remain
+  8-bpc; integer 9--16-bit PNG/JPEG XL sources retain 16-bpc RGB and alpha
+  samples through PDF emission. Floating-point/HDR JPEG XL is not supported.
   The JPEG XL WPT reftest subset currently passes 20 of 30 renderable tests;
   the remaining parity gaps are tracked in `SPEC_DIVERGENCES.md`.
 - CSS Images one-stop linear/radial gradients now use the specified two-end
@@ -111,6 +139,27 @@ part of this parity measure rather than a separate raster-only baseline.
   At paint time it uses the common background geometry (size, position,
   repetition, and clipping) and emits a vector fill; `currentcolor` remains
   symbolic until that used-value stage.
+- CSS Images Level 5 `image()` accepts one optional string/`url()` source,
+  one optional fallback color, and an optional leading `ltr`/`rtl` source
+  tag. URL request modifiers and document/page URL rebasing are retained in
+  the shared `ImageUrl` value. The source is resolved once at layout time;
+  a failed source selects its color fallback, while a source-only failure
+  retains the consumer's existing invalid-image behavior. Generated content,
+  backgrounds (including page backgrounds), border images, and list markers
+  all use that shared source/fallback selection.
+- `image()` raster sources support the required integer
+  `#xywh=x,y,width,height` Media Fragments form. Partially overlapping source
+  rectangles clamp to the raster grid, change natural image dimensions, and
+  are retained as PDF source rectangles for both ordinary and repeated
+  background paint. Invalid fragments select the `image()` fallback color.
+  Existing SVG view fragments continue to use the SVG asset path. The legacy
+  WPT fallback-chain cases `003` and `004` are invalid under the current
+  CSS Images 5 grammar; `005` also has an incorrect opaque-green reference
+  for its alpha-blue-over-green composition.
+- CSS Color 5 `light-dark()` image values retain typed light and dark branches
+  through parsing, then select the owning element's used-scheme image before
+  `image-set()` negotiation, layout, resource loading, and paint. A `none`
+  branch is represented as the transparent generated image required by CSS.
 - Spatially uniform linear and radial CSS background gradients are emitted as
   clipped PDF solid paths. Fully repeating uniform layers cover their resolved
   positioning area with one clipped path, so near-zero background sizes do not
@@ -167,9 +216,6 @@ part of this parity measure rather than a separate raster-only baseline.
 - `contain-intrinsic-width` and `contain-intrinsic-height` fallback sizing
   for size-contained replaced elements.
 - Complete image-orientation plumbing for masks, SVG, and image documents.
-- A nearest-neighbor raster fallback for `image-rendering: pixelated` where a
-  PDF reader does not honor `/Interpolate false`; the PDF sampling hint alone
-  does not satisfy the mixed-scale WPT.
 - CSS Values Math functions beyond `calc()`, `min()`, `max()`, `clamp()`,
   and statically computable `sign()` expressions in `image-set()` resolution
   descriptors.

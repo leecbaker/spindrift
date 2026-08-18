@@ -1,4 +1,5 @@
 use super::*;
+use crate::css::DiscretionaryHyphenationPolicy;
 use icu_locale_core::LanguageIdentifier;
 
 pub(super) const SOFT_HYPHEN: char = '\u{00ad}';
@@ -74,12 +75,15 @@ pub(crate) fn text_with_hyphenation_controls<'a>(
     text: &'a str,
     style: &ComputedStyle,
 ) -> Cow<'a, str> {
-    let mut output =
-        if style.hyphenation_is_unconditionally_suppressed() && text.contains(SOFT_HYPHEN) {
-            Cow::Owned(text.replace(SOFT_HYPHEN, ""))
-        } else {
-            Cow::Borrowed(text)
-        };
+    let mut output = if matches!(
+        style.authored_discretionary_hyphenation_policy(),
+        DiscretionaryHyphenationPolicy::Disabled
+    ) && text.contains(SOFT_HYPHEN)
+    {
+        Cow::Owned(text.replace(SOFT_HYPHEN, ""))
+    } else {
+        Cow::Borrowed(text)
+    };
     if style.allows_soft_wrap()
         && line_break_strictness(style.line_break).is_some()
         && !matches!(style.line_break, CssLineBreak::Anywhere)
@@ -588,21 +592,17 @@ pub(crate) fn collect_measured_break_opportunities(
         // a zero-width control on its own line.
         // <https://drafts.csswg.org/css-text-3/#typographic-character-unit>
         // <https://drafts.csswg.org/css-text-3/#valdef-line-break-anywhere>
-        let mut unit_ends = typographic_unit_ranges(text)
-            .into_iter()
-            .map(|range| range.end)
-            .collect::<Vec<_>>();
-        attach_line_break_anywhere_controls_to_following_unit(text, &mut unit_ends);
+        let unit_ranges = LineBreakAnywhereUnitRanges::new(text);
         // ICU can report a boundary around a format control even though the
         // control belongs to one neighboring typographic unit. Replace those
         // ordinary UAX candidates instead of merely adding more `anywhere`
         // candidates beside them.
-        breaks.retain(|position| unit_ends.binary_search(position).is_ok());
-        breaks.extend(unit_ends.into_iter().filter(|position| {
-            *position > 0
-                && *position < text.len()
-                && pre_wrap_anywhere_break_allowed(text, policy, *position)
-        }));
+        breaks.retain(|position| unit_ranges.contains_boundary(*position));
+        breaks.extend(
+            unit_ranges
+                .internal_boundaries()
+                .filter(|position| pre_wrap_anywhere_break_allowed(text, policy, *position)),
+        );
     }
     if matches!(policy.overflow_wrap, CssOverflowWrap::Anywhere) {
         // Unlike `line-break:anywhere`, overflow wrapping is an emergency
@@ -714,36 +714,6 @@ fn move_breaks_after_bidi_format_controls(text: &str, breaks: &mut [usize]) {
     }
 }
 
-/// Make default-ignorable and join-control runs part of their following
-/// `line-break:anywhere` typographic unit.
-///
-/// A terminal control has no following visible unit and consequently remains
-/// with its preceding unit. This preserves a useful soft edge without ever
-/// offering a control-only line. The direction is intentionally local to
-/// `line-break:anywhere`: general typographic-unit consumers retain their
-/// existing preceding-control ownership for shaping and tracking.
-///
-/// <https://drafts.csswg.org/css-text-3/#typographic-character-unit>
-/// <https://drafts.csswg.org/css-text-3/#valdef-line-break-anywhere>
-fn attach_line_break_anywhere_controls_to_following_unit(text: &str, unit_ends: &mut Vec<usize>) {
-    let mut control_run_start = None;
-    for (offset, character) in text.char_indices() {
-        if character_is_default_ignorable_code_point(character)
-            || character_is_join_control(character)
-        {
-            control_run_start.get_or_insert(offset);
-            continue;
-        }
-        let Some(start) = control_run_start.take() else {
-            continue;
-        };
-        unit_ends.retain(|position| *position <= start || *position > offset);
-        unit_ends.push(start);
-    }
-    unit_ends.sort_unstable();
-    unit_ends.dedup();
-}
-
 /// Return whether an emergency-style grapheme opportunity preserves a
 /// `pre-wrap` document-space sequence.
 ///
@@ -844,15 +814,19 @@ pub(crate) fn collect_grapheme_cluster_inner_boundaries(text: &str, boundaries: 
 /// preserved space from displacing the legal after-space opportunity.
 /// <https://drafts.csswg.org/css-text-3/#word-break-property>
 pub(crate) fn word_break_all_inner_boundaries(text: &str) -> Vec<usize> {
-    let units = typographic_unit_ranges(text);
+    let mut units = CursiveProtectedUnitRanges::new(text).into_iter();
+    let Some(mut previous_range) = units.next() else {
+        return Vec::new();
+    };
     units
-        .windows(2)
-        .filter_map(|units| {
-            let previous = &text[units[0].clone()];
-            let next = &text[units[1].clone()];
+        .filter_map(|next_range| {
+            let previous = &text[previous_range.clone()];
+            let next = &text[next_range.clone()];
+            let boundary = previous_range.end;
+            previous_range = next_range;
             (previous.chars().any(character_is_unicode_alphanumeric)
                 && next.chars().any(character_is_unicode_alphanumeric))
-            .then_some(units[0].end)
+            .then_some(boundary)
         })
         .collect()
 }
@@ -1255,6 +1229,17 @@ mod tests {
             breaks.contains(&after_control),
             "the visible CJK boundary remains available after its control: {breaks:?}"
         );
+    }
+
+    #[test]
+    fn ordinary_cjk_breaks_remain_available_inside_an_isolate() {
+        let style = ComputedStyle::initial();
+        let text = "東\u{2066}京都東京\u{2069}都";
+        let breaks = measured_break_opportunities(text, &style);
+
+        assert!(breaks.contains(&"東\u{2066}京".len()), "{breaks:?}");
+        assert!(breaks.contains(&"東\u{2066}京都".len()), "{breaks:?}");
+        assert!(breaks.contains(&"東\u{2066}京都東".len()), "{breaks:?}");
     }
 
     #[test]

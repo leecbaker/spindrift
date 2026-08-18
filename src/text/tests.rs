@@ -2,14 +2,17 @@ use super::system::span_boundary_needs_join_control;
 use crate::CssColor;
 use crate::css::{ComputedLineHeight, ContentLanguage, WritingMode};
 use crate::document::paint::geometry::PaintDisplacement;
+use crate::document::paint::geometry::PaintPoint;
 use crate::document::paint::text::{RenderedGlyph, RenderedGlyphKind, RenderedLine};
 
 #[test]
 fn css_text_classifies_controls_before_whitespace_processing() {
-    assert_eq!(
-        classify_css_text_scalar('\u{000c}'),
-        CssTextScalar::VisibleControl(VisibleControlCharacter('\u{000c}'))
-    );
+    for character in ['\u{000b}', '\u{000c}', '\u{0085}', '\u{2028}', '\u{2029}'] {
+        assert_eq!(
+            classify_css_text_scalar(character),
+            CssTextScalar::MandatoryLineBreak(character)
+        );
+    }
     assert_eq!(
         classify_css_text_scalar('\r'),
         CssTextScalar::CarriageReturn
@@ -21,14 +24,15 @@ fn css_text_classifies_controls_before_whitespace_processing() {
         CssTextScalar::VisibleControl(VisibleControlCharacter('\u{0080}'))
     );
     assert!(is_css_collapsible_whitespace('\r'));
-    assert!(!is_css_collapsible_whitespace('\u{000c}'));
+    assert!(!is_css_collapsible_whitespace('\u{0085}'));
 }
 
 #[test]
-fn css_text_materializes_controls_as_visible_common_symbols() {
+fn css_text_materializes_only_non_mandatory_controls_as_visible_common_symbols() {
+    let mandatory_breaks = "\u{000b}\u{000c}\u{0085}\u{2028}\u{2029}";
     assert_eq!(
-        css_text_rendering_text("A\u{000b}\u{000c}\u{007f}\u{009f}B"),
-        "A\u{25a0}\u{25a0}\u{25a0}\u{25a0}B"
+        css_text_rendering_text(&format!("A{mandatory_breaks}\u{0080}B")),
+        format!("A{mandatory_breaks}\u{25a0}B")
     );
     assert_eq!(css_text_rendering_text("A\rB\tC\nD"), "A B\tC\nD");
 }
@@ -50,6 +54,42 @@ fn rendered_line_alignment_reverses_the_stored_glyph_origin_adjustment() {
     .with_glyph_origin_adjustment(PaintDisplacement::new(0.0, 3.5));
 
     assert!((FontSystem::new().rendered_line_alignment_y(&line).points() - 28.5).abs() < 0.01);
+}
+
+#[test]
+fn outline_text_keeps_shared_glyph_storage_through_non_outline_extraction() {
+    let mut system = FontSystem::new();
+    let mut style = ComputedStyle::initial();
+    style.font_family = FontFamily::SansSerif;
+    style.font_size = 12.0;
+    style.line_height = 14.4;
+    let shaped = system
+        .shape_unwrapped_line("ordinary outline text", &style, style.line_height)
+        .expect("ordinary text should shape");
+    let mut runs = shaped.rendered_runs();
+    assert!(runs.iter().all(|run| run.font_id.is_some()));
+    let original_glyphs = runs
+        .iter()
+        .map(|run| run.glyphs.clone())
+        .collect::<Vec<_>>();
+
+    assert!(
+        system
+            .take_raster_glyph_images(PaintPoint::new(0.0, 0.0), &mut runs)
+            .is_empty()
+    );
+    assert!(
+        system
+            .take_color_glyph_paths(PaintPoint::new(0.0, 0.0), &mut runs, &style)
+            .is_empty()
+    );
+    for (before, after) in original_glyphs.iter().zip(&runs) {
+        match (before, &after.glyphs) {
+            (Some(before), Some(after)) => assert!(before.ptr_eq(after)),
+            (None, None) => {}
+            _ => panic!("outline extraction changed glyph storage"),
+        }
+    }
 }
 
 #[test]
@@ -534,6 +574,74 @@ fn isolate_override_resolves_the_full_line_before_visual_paint_shaping() {
 }
 
 #[test]
+fn bidi_isolate_controls_preserve_partial_source_slice_ownership() {
+    let mut system = FontSystem::new();
+    let mut style = ComputedStyle::initial();
+    style.font_family = FontFamily::SansSerif;
+    style.font_size = 12.0;
+    style.line_height = 14.4;
+    let text = "東\u{2066}京都東京\u{2069}都東京都";
+    let first_three_visible = "東\u{2066}京都".len();
+
+    let shaped = system
+        .shape_untracked_inline_line(text, &style, style.line_height)
+        .expect("bidi source should shape");
+
+    assert!(
+        shaped.source_slice(0..first_three_visible).is_some(),
+        "a selected line may end inside an isolate without losing its source-shaped slice"
+    );
+}
+
+#[test]
+fn arabic_anywhere_boundary_preserves_a_full_word_source_slice() {
+    let mut system = FontSystem::new();
+    let mut style = ComputedStyle::initial();
+    style.font_family = FontFamily::SansSerif;
+    style.font_size = 12.0;
+    style.line_height = 14.4;
+    let text = "عائلة";
+    let break_after_lam = "عائل".len();
+
+    let shaped = system
+        .shape_untracked_inline_line(text, &style, style.line_height)
+        .expect("Arabic source should shape");
+
+    assert!(
+        shaped.source_slice(0..break_after_lam).is_some(),
+        "line-break:anywhere must retain the full-word Arabic source shape"
+    );
+}
+
+#[test]
+fn guarded_ltr_visual_shape_keeps_adlam_glyphs_in_source_order() {
+    let mut system = FontSystem::new();
+    let mut style = ComputedStyle::initial();
+    style.font_family = FontFamily::SansSerif;
+    style.font_size = 12.0;
+    style.line_height = 14.4;
+    let text = "\u{1e900}\u{1e901}\u{1e902}\u{1e901}\u{1e904}";
+    assert!(
+        resolve_bidi_visual_ranges(text, Direction::Ltr)
+            .iter()
+            .any(|range| range.direction == ResolvedBidiDirection::Rtl)
+    );
+
+    let shaped = system
+        .shape_visual_ordered_line(text, &style, style.line_height, ResolvedBidiDirection::Ltr)
+        .expect("guarded Adlam text should shape");
+    let glyph_text = shaped
+        .runs
+        .iter()
+        .flat_map(|run| run.glyphs.iter())
+        .filter(|glyph| glyph.paints)
+        .map(|glyph| glyph.source_text())
+        .collect::<String>();
+
+    assert_eq!(glyph_text, text);
+}
+
+#[test]
 fn cached_rtl_visual_slice_mirrors_glyph_without_rewriting_source_text() {
     let mut system = FontSystem::new();
     let mut style = ComputedStyle::initial();
@@ -568,6 +676,70 @@ fn cached_rtl_visual_slice_mirrors_glyph_without_rewriting_source_text() {
         mirrored_glyph.rendered.painted_id()
     );
     assert_eq!(cached_glyph.source_text(), ">");
+}
+
+fn assert_visual_guard_provenance_is_authored(line: &ShapedInlineLine, text: &str) {
+    assert_eq!(line.text.as_ref(), text);
+    for range in line
+        .runs
+        .iter()
+        .flat_map(|run| &run.glyphs)
+        .filter_map(|glyph| glyph.source_range.as_ref())
+    {
+        assert!(range.start < range.end);
+        assert!(range.end <= text.len());
+        assert!(text.is_char_boundary(range.start));
+        assert!(text.is_char_boundary(range.end));
+    }
+    assert!(
+        line.source_slice(0..text.len()).is_some(),
+        "a complete guarded visual slice must retain reusable provenance"
+    );
+    assert!(line.source_range_advance_width(0..text.len()).is_some());
+}
+
+#[test]
+fn visual_bidi_guard_remaps_plain_shaping_provenance_to_authored_text() {
+    let mut system = FontSystem::new();
+    let mut style = ComputedStyle::initial();
+    style.font_family = FontFamily::SansSerif;
+    style.font_size = 12.0;
+    style.line_height = 14.4;
+    let text = "a>b";
+
+    let line = system
+        .shape_visual_ordered_line(text, &style, style.line_height, ResolvedBidiDirection::Ltr)
+        .expect("guarded visual shaping should produce a line");
+
+    assert_visual_guard_provenance_is_authored(&line, text);
+}
+
+#[test]
+fn visual_bidi_guard_remaps_styled_shaping_provenance_to_authored_text() {
+    let mut system = FontSystem::new();
+    let mut style = ComputedStyle::initial();
+    style.font_family = FontFamily::SansSerif;
+    style.font_size = 12.0;
+    style.line_height = 14.4;
+    let text = "a>b";
+    let spans = [StyledTextSpan {
+        text,
+        style: &style,
+    }];
+
+    let line = system
+        .shape_visually_ordered_inline_fragments(
+            &spans,
+            text.to_string(),
+            0.0,
+            style.line_height,
+            0.0,
+            &style,
+            ResolvedBidiDirection::Ltr,
+        )
+        .expect("guarded styled visual shaping should produce a line");
+
+    assert_visual_guard_provenance_is_authored(&line, text);
 }
 
 #[test]
@@ -775,26 +947,56 @@ async fn font_face_variation_descriptor_is_merged_into_the_selected_shaping_styl
     );
     let mut style = ComputedStyle::initial();
     style.font_family = FontFamily::Names(vec!["VariationFaceDefaults".to_string()]);
+    style.font_variation_settings = FontVariationSettings(vec![
+        FontVariationSetting {
+            tag: *b"opsz",
+            value: 14.0_f32.to_bits(),
+        },
+        FontVariationSetting {
+            tag: *b"wght",
+            value: 700.0_f32.to_bits(),
+        },
+    ]);
     let mut system = FontSystem::start_loading()
         .load_stylesheet_fonts(&[stylesheet])
         .finish()
         .await;
 
-    let resolved = system.style_with_selected_face_variations(&style);
+    let resolved = system.shaping_style_for_selected_face(&style);
 
     assert_eq!(
-        resolved.font_variation_settings,
-        FontVariationSettings(vec![
+        resolved.font_variation_settings(),
+        &FontVariationSettings(vec![
+            FontVariationSetting {
+                tag: *b"opsz",
+                value: 14.0_f32.to_bits(),
+            },
             FontVariationSetting {
                 tag: *b"wdth",
                 value: 125.0_f32.to_bits(),
             },
             FontVariationSetting {
                 tag: *b"wght",
-                value: 600.7_f32.to_bits(),
+                value: 700.0_f32.to_bits(),
             },
         ])
     );
+}
+
+#[test]
+fn ordinary_shaping_style_borrows_the_authored_style_without_overrides() {
+    let mut system = FontSystem::new();
+    let style = ComputedStyle::initial();
+
+    let shaping_style = system.shaping_style_for_selected_face(&style);
+
+    assert!(std::ptr::eq(shaping_style.authored(), &style));
+    assert!(std::ptr::eq(
+        shaping_style.font_variation_settings(),
+        &style.font_variation_settings,
+    ));
+    assert_eq!(shaping_style.font_weight(), style.font_weight);
+    assert_eq!(shaping_style.font_style(), style.font_style);
 }
 
 #[tokio::test]
@@ -945,6 +1147,49 @@ async fn font_size_adjust_from_font_keeps_its_primary_metric_across_unicode_rang
 }
 
 #[tokio::test]
+async fn unicode_range_selection_keeps_authored_style_and_shapes_both_parley_paths() {
+    let stylesheet = parse_stylesheet(
+        &Css::from_string(
+            r#"@font-face {
+                font-family: RangeSelectedAhem;
+                src: url("tests/fixtures/wpt/css/css-fonts/Ahem.ttf");
+                unicode-range: U+0041;
+            }"#,
+        )
+        .with_base_path(".")
+        .expect("current directory should be a valid file URL"),
+    );
+    let mut system = FontSystem::start_loading()
+        .load_stylesheet_fonts(&[stylesheet])
+        .finish()
+        .await;
+    let mut style = ComputedStyle::initial();
+    style.font_family = FontFamily::List(vec![
+        FontFamily::Names(vec!["RangeSelectedAhem".to_string()]),
+        FontFamily::Serif,
+    ]);
+
+    let resolved = system
+        .unicode_range_resolved_text_spans("A", &style)
+        .expect("unicode-range face should select a shaping family");
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(
+        resolved[0].selected_family.as_ref(),
+        Some(&FontFamily::Names(vec!["RangeSelectedAhem".to_string()]))
+    );
+
+    assert!(!system.shape_text_runs_with_parley("A", &style).is_empty());
+    assert!(
+        !system
+            .shape_styled_text_runs_with_parley(&[StyledTextSpan {
+                text: "A",
+                style: &style
+            }])
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn font_size_adjust_keeps_explicit_line_height_computed_size() {
     let (mut system, mut style) = feature_probe_font_system().await;
     style.line_height = 20.0;
@@ -1048,6 +1293,7 @@ fn source_slice_preserves_metadata_and_leaves_the_source_runs_unchanged() {
         aligned_by_parley: true,
         line_height: 18.0,
         baseline_adjustment: 3.0,
+        typesetting_plan: TextTypesettingPlan::Horizontal,
         runs: vec![
             ShapedInlineRun {
                 text: Rc::from("ab"),
@@ -1283,9 +1529,83 @@ async fn letter_spacing_uses_unicode_joining_properties() {
     assert!(!character_can_join_following('ا'));
     assert!(character_is_arabic_tatweel('\u{0640}'));
     assert!(character_has_joining_behavior('\u{0640}'));
+    assert!(
+        !character_has_joining_behavior('\u{fedf}') && !character_has_joining_behavior('\u{fe8e}'),
+        "Arabic presentation forms remain non-joining Unicode scalars"
+    );
     assert!(character_is_join_control('\u{200c}'));
     assert!(character_is_join_control('\u{200d}'));
     assert!(!character_is_join_control('\u{200e}'));
+}
+
+#[tokio::test]
+async fn zwnj_presentation_forms_keep_resolved_rtl_shaping_order() {
+    let stylesheet = parse_stylesheet(
+        &Css::from_string(
+            r#"@font-face {
+                font-family: AlreqNaskh;
+                src: url("tests/resources/fonts/NotoNaskhArabic-regular.woff2");
+            }"#,
+        )
+        .with_base_path(".")
+        .expect("current directory should be a valid file URL"),
+    );
+    let mut style = ComputedStyle::initial();
+    style.font_family = FontFamily::Names(vec!["AlreqNaskh".to_string()]);
+    style.font_size = 20.0;
+    style.line_height = 24.0;
+    style.direction = Direction::Ltr;
+    let mut system = FontSystem::start_loading()
+        .load_stylesheet_fonts(&[stylesheet])
+        .finish()
+        .await;
+    let text = "\u{fedf}\u{200c}\u{fe8e}";
+    let mut rtl_style = style.clone();
+    rtl_style.direction = Direction::Rtl;
+    let expected = system
+        .shape_unwrapped_line(text, &rtl_style, rtl_style.line_height)
+        .expect("presentation-form reference should shape");
+    let direct = system
+        .shape_visual_ordered_line(text, &style, style.line_height, ResolvedBidiDirection::Rtl)
+        .expect("visual bidi slice should shape");
+    let styled = system
+        .shape_visually_ordered_inline_fragments(
+            &[StyledTextSpan {
+                text,
+                style: &style,
+            }],
+            text.to_string(),
+            0.0,
+            style.line_height,
+            0.0,
+            &style,
+            ResolvedBidiDirection::Rtl,
+        )
+        .expect("styled visual bidi slice should shape");
+    let visible_glyphs = |shaped: &ShapedInlineLine| {
+        shaped
+            .runs
+            .iter()
+            .flat_map(|run| run.glyphs.iter())
+            .filter_map(|glyph| {
+                glyph
+                    .rendered
+                    .painted_id()
+                    .map(|id| (id, glyph.rendered.unicode.clone()))
+            })
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        visible_glyphs(&expected)
+            .iter()
+            .map(|(_, unicode)| unicode.as_str())
+            .collect::<String>(),
+        "\u{fe8e}\u{fedf}",
+        "logical RTL shaping must paint the presentation forms in visual order"
+    );
+    assert_eq!(visible_glyphs(&direct), visible_glyphs(&expected));
+    assert_eq!(visible_glyphs(&styled), visible_glyphs(&expected));
 }
 
 #[tokio::test]
@@ -1770,6 +2090,58 @@ async fn styled_zwnj_fragment_suppresses_arabic_joining_with_a_different_font() 
         actual, expected,
         "explicit ZWNJ must preserve no-join shaping"
     );
+
+    let expected = shaped_glyph_ids(&mut system, "\u{0640}\u{fe90}\u{0640}", &arabic);
+    let shaped = system.shape_styled_text_runs_with_parley(&[
+        StyledTextSpan {
+            text: "\u{0640}\u{0628}",
+            style: &arabic,
+        },
+        StyledTextSpan {
+            text: "\u{200c}",
+            style: &join_control,
+        },
+        StyledTextSpan {
+            text: "\u{0640}",
+            style: &arabic,
+        },
+    ]);
+    let actual = shaped
+        .into_iter()
+        .flat_map(|run| run.glyphs)
+        .filter(|glyph| glyph.x_advance != 0.0)
+        .map(|glyph| glyph.painted_id().expect("paintable glyph"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual, expected,
+        "an explicit ZWNJ must retain its preceding Arabic joining context"
+    );
+
+    let expected = shaped_glyph_ids(&mut system, "\u{0640}\u{fe91}\u{0640}", &arabic);
+    let shaped = system.shape_styled_text_runs_with_parley(&[
+        StyledTextSpan {
+            text: "\u{0640}",
+            style: &arabic,
+        },
+        StyledTextSpan {
+            text: "\u{200c}",
+            style: &join_control,
+        },
+        StyledTextSpan {
+            text: "\u{0628}\u{0640}",
+            style: &arabic,
+        },
+    ]);
+    let actual = shaped
+        .into_iter()
+        .flat_map(|run| run.glyphs)
+        .filter(|glyph| glyph.x_advance != 0.0)
+        .map(|glyph| glyph.painted_id().expect("paintable glyph"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual, expected,
+        "an explicit ZWNJ must retain its following Arabic joining context"
+    );
 }
 
 #[tokio::test]
@@ -2148,16 +2520,34 @@ async fn auto_phrase_keeps_gl_wj_and_zwj_boundaries_protected() {
 }
 
 #[tokio::test]
-async fn auto_phrase_suppresses_authored_soft_hyphens() {
+async fn auto_phrase_preserves_authored_soft_hyphens_for_deferred_fitting() {
     let mut style = ComputedStyle::initial();
     style.word_break = CssWordBreak::AutoPhrase;
     style.language = ContentLanguage::from_html_attribute("en");
     let text = "con\u{00ad}sid\u{00ad}eration";
 
+    assert_eq!(text_with_hyphenation_controls(text, &style), text);
     assert_eq!(
-        text_with_hyphenation_controls(text, &style),
-        "consideration"
+        style.authored_discretionary_hyphenation_policy(),
+        crate::css::DiscretionaryHyphenationPolicy::DeferredForAutoPhrase
     );
+}
+
+#[test]
+fn disabled_discretionary_hyphenation_removes_authored_soft_hyphens() {
+    let text = "con\u{00ad}sid\u{00ad}eration";
+    let mut hyphens_none = ComputedStyle::initial();
+    hyphens_none.hyphens = crate::css::Hyphens::None;
+    let mut break_all = ComputedStyle::initial();
+    break_all.word_break = CssWordBreak::BreakAll;
+
+    for style in [&hyphens_none, &break_all] {
+        assert_eq!(
+            style.authored_discretionary_hyphenation_policy(),
+            crate::css::DiscretionaryHyphenationPolicy::Disabled
+        );
+        assert_eq!(text_with_hyphenation_controls(text, style), "consideration");
+    }
 }
 
 #[tokio::test]

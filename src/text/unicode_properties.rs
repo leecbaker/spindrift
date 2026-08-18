@@ -404,36 +404,42 @@ pub(crate) fn character_vertical_orientation(character: char) -> VerticalOrienta
         .get(character)
 }
 
-/// Return whether one typographic unit is upright under `text-orientation: mixed`.
+/// Return whether a character belongs to a script with an intrinsic vertical
+/// presentation.
 ///
-/// Unicode `Vertical_Orientation=U` and `Tu` are treated as upright for
-/// placement. `R` and `Tr` are emitted sideways in this pass; OpenType vertical
-/// alternates and transformed glyph substitution are tracked separately.
-/// Combining marks and default-ignorable controls inherit the first visible
-/// base character in the unit instead of deciding orientation on their own.
-pub(crate) fn typographic_unit_is_upright_in_mixed_orientation(text: &str) -> bool {
-    text.chars()
-        .find(|character| !character_inherits_vertical_orientation(*character))
-        .is_some_and(|character| {
-            matches!(
-                character_vertical_orientation(character),
-                VerticalOrientation::Upright | VerticalOrientation::TransformedUpright
-            )
-        })
+/// UAX #50 assigns Mongolian and Phags Pa letters the default `R` value
+/// because their code-chart glyphs are shown in their horizontal-text form.
+/// CSS Writing Modes separately classifies both scripts as vertical scripts.
+/// The resolved vertical-unit plan uses this only to select the coherent
+/// horizontal-composition/sideways path needed for their intrinsic form.
+/// <https://drafts.csswg.org/css-writing-modes-4/#vertical-orientations>
+/// <https://www.unicode.org/reports/tr50/>
+pub(crate) fn character_is_native_vertical_script(character: char) -> bool {
+    let script = CodePointMapData::<IcuScript>::new().get(character);
+    PropertyNamesShort::<IcuScript>::new()
+        .get_locale_script(script)
+        .is_some_and(|script| script.into_raw() == *b"Mong" || script.into_raw() == *b"Phag")
 }
 
-/// Return whether one typographic unit selects OpenType vertical glyph forms
-/// under `text-orientation: mixed`.
+/// The orientation selected for one typographic unit by `text-orientation: mixed`.
 ///
-/// CSS Writing Modes keeps `Vertical_Orientation=Tr` units sideways, but they
-/// are *transformed rotated*: their vertical glyph form is selected before
-/// the sideways rotation. `U` and `Tu` units likewise select vertical forms
-/// while remaining upright. `R` units use their ordinary horizontal glyphs.
+/// CSS Writing Modes maps Unicode `U`, `Tu`, and `Tr` units to upright
+/// typesetting; only `R` units are typeset sideways. Keep this as one policy rather
+/// than allowing shaping and paint to classify transformed units differently:
+/// <https://www.w3.org/TR/css-writing-modes-4/#text-orientation>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MixedTextOrientation {
+    Upright,
+    Sideways,
+}
+
+/// Return the `text-orientation: mixed` policy for one typographic unit.
+///
 /// Combining marks and default-ignorable controls inherit the first visible
-/// base character in the unit.
-/// <https://www.w3.org/TR/css-writing-modes-4/#text-orientation>
-pub(crate) fn typographic_unit_uses_vertical_forms_in_mixed_orientation(text: &str) -> bool {
-    text.chars()
+/// base character in the unit instead of deciding orientation on their own.
+pub(crate) fn typographic_unit_mixed_orientation(text: &str) -> MixedTextOrientation {
+    if text
+        .chars()
         .find(|character| !character_inherits_vertical_orientation(*character))
         .is_some_and(|character| {
             matches!(
@@ -443,8 +449,21 @@ pub(crate) fn typographic_unit_uses_vertical_forms_in_mixed_orientation(text: &s
                     | VerticalOrientation::TransformedRotated
             )
         })
+    {
+        MixedTextOrientation::Upright
+    } else {
+        MixedTextOrientation::Sideways
+    }
 }
 
+/// Return whether one typographic unit is upright under `text-orientation: mixed`.
+pub(crate) fn typographic_unit_is_upright_in_mixed_orientation(text: &str) -> bool {
+    typographic_unit_mixed_orientation(text) == MixedTextOrientation::Upright
+}
+
+/// Return whether one typographic unit selects OpenType vertical glyph forms
+/// under `text-orientation: mixed`.
+///
 pub(crate) fn character_inherits_vertical_orientation(character: char) -> bool {
     character_is_default_ignorable_code_point(character)
         || GeneralCategoryGroup::Mark.contains(general_category(character))
@@ -945,10 +964,37 @@ mod tests {
     }
 
     #[test]
+    fn native_vertical_script_classification_identifies_mongolian_and_phags_pa() {
+        assert!(character_is_native_vertical_script('\u{1828}'));
+        assert!(character_is_native_vertical_script('\u{a840}'));
+        assert!(!typographic_unit_is_upright_in_mixed_orientation(
+            "\u{1828}"
+        ));
+        assert!(!character_is_native_vertical_script('a'));
+    }
+
+    #[test]
     fn mixed_orientation_policy_uses_visible_base_character() {
-        assert!(!typographic_unit_is_upright_in_mixed_orientation("a"));
-        assert!(typographic_unit_is_upright_in_mixed_orientation("§"));
-        assert!(typographic_unit_is_upright_in_mixed_orientation("、"));
+        assert_eq!(
+            typographic_unit_mixed_orientation("a"),
+            MixedTextOrientation::Sideways,
+            "Unicode Vertical_Orientation=R remains sideways"
+        );
+        assert_eq!(
+            typographic_unit_mixed_orientation("§"),
+            MixedTextOrientation::Upright,
+            "Unicode Vertical_Orientation=U is upright"
+        );
+        assert_eq!(
+            typographic_unit_mixed_orientation("、"),
+            MixedTextOrientation::Upright,
+            "Unicode Vertical_Orientation=Tu is upright"
+        );
+        assert_eq!(
+            typographic_unit_mixed_orientation("\u{2329}"),
+            MixedTextOrientation::Upright,
+            "Unicode Vertical_Orientation=Tr is upright"
+        );
         assert!(!typographic_unit_is_upright_in_mixed_orientation(
             "\u{0301}"
         ));
@@ -959,18 +1005,15 @@ mod tests {
             "\u{200d}中"
         ));
 
-        assert!(!typographic_unit_uses_vertical_forms_in_mixed_orientation(
-            "a"
-        ));
-        assert!(typographic_unit_uses_vertical_forms_in_mixed_orientation(
-            "§"
-        ));
-        assert!(typographic_unit_uses_vertical_forms_in_mixed_orientation(
-            "、"
-        ));
-        assert!(typographic_unit_uses_vertical_forms_in_mixed_orientation(
-            "\u{2329}"
-        ));
+        assert_eq!(
+            typographic_unit_mixed_orientation("\u{0301}\u{2329}"),
+            MixedTextOrientation::Upright
+        );
+        assert_eq!(
+            typographic_unit_mixed_orientation("a\u{0301}"),
+            MixedTextOrientation::Sideways,
+            "a combining mark inherits the preceding base typographic unit"
+        );
     }
 
     #[test]

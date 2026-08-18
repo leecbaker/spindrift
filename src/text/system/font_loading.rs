@@ -463,18 +463,12 @@ async fn load_font_url(
     resource_fetcher: &crate::resource::ResourceFetcher,
     cache: &FontProgramCache,
 ) -> crate::Result<Option<FontiqueBlob<u8>>> {
-    if value.starts_with("data:") {
+    if is_data_url(value)? {
         let value = value.to_string();
         let blob = cache
             .load_source(
                 FontSourceCacheKey::Data(value.clone()),
-                move || async move {
-                    decode_data_url(&value).ok_or_else(|| {
-                        crate::Error::InvalidInput(format!(
-                            "failed to decode @font-face data URL {value:?}"
-                        ))
-                    })
-                },
+                move || async move { decode_font_data_url(&value) },
             )
             .await?;
         log::trace!("decoded @font-face data URL ({} byte(s))", blob.len());
@@ -502,6 +496,38 @@ async fn load_font_url(
         })
         .await?;
     Ok(Some(blob))
+}
+
+/// Recognize authored `data:` sources with Fetch's data-URL parser.
+///
+/// A malformed data URL is still a data source and must fail this source,
+/// rather than be resolved as a relative URL. CSS Fonts then permits a later
+/// `src` candidate to load.
+fn is_data_url(value: &str) -> crate::Result<bool> {
+    match data_url::DataUrl::process(value) {
+        Ok(_) => Ok(true),
+        Err(data_url::DataUrlError::NotADataUrl) => Ok(false),
+        Err(error) => Err(invalid_font_data_url(value, error)),
+    }
+}
+
+/// Decode an `@font-face` data URL according to Fetch's data-URL processor.
+///
+/// The decoded MIME type is deliberately not used for font selection: font
+/// registration validates the program bytes after this source loader returns.
+fn decode_font_data_url(value: &str) -> crate::Result<Vec<u8>> {
+    let data_url =
+        data_url::DataUrl::process(value).map_err(|error| invalid_font_data_url(value, error))?;
+    let (bytes, _) = data_url
+        .decode_to_vec()
+        .map_err(|error| invalid_font_data_url(value, error))?;
+    Ok(bytes)
+}
+
+fn invalid_font_data_url(error_value: &str, error: impl std::fmt::Display) -> crate::Error {
+    crate::Error::InvalidInput(format!(
+        "failed to decode @font-face data URL {error_value:?}: {error}"
+    ))
 }
 
 fn display_optional_url(url: Option<&url::Url>) -> String {
@@ -780,8 +806,23 @@ impl FontSystem {
         style: &ComputedStyle,
         fallback_character: char,
     ) -> Option<usize> {
-        let request = FontRequest::from_family(
+        self.document_font_from_parley_font_data_for_family(
+            font_data,
+            style,
             &style.font_family,
+            fallback_character,
+        )
+    }
+
+    pub(super) fn document_font_from_parley_font_data_for_family(
+        &mut self,
+        font_data: &parley::FontData,
+        style: &ComputedStyle,
+        family: &FontFamily,
+        fallback_character: char,
+    ) -> Option<usize> {
+        let request = FontRequest::from_family(
+            family,
             style.font_weight,
             style.font_style,
             style.font_width,
@@ -794,7 +835,7 @@ impl FontSystem {
             return Some(font_id);
         }
 
-        let families = font_families_for_style(&style.font_family, style.font_weight);
+        let families = font_families_for_style(family, style.font_weight);
         if let Some(font) = self.match_parley_font_data(
             font_data,
             &families,
@@ -961,6 +1002,38 @@ fn font_label_has_italic(label: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn font_data_urls_decode_percent_encoded_bodies() {
+        assert_eq!(
+            decode_font_data_url("data:font/ttf,%00%01%00%00").unwrap(),
+            [0, 1, 0, 0]
+        );
+    }
+
+    #[test]
+    fn font_data_urls_use_fetch_scheme_and_base64_rules() {
+        assert!(is_data_url("\nDaTa:font/ttf;base64,S G V s b G8\r").unwrap());
+        assert_eq!(
+            decode_font_data_url("\nDaTa:font/ttf;base64,S G V s b G8\r").unwrap(),
+            b"Hello"
+        );
+    }
+
+    #[test]
+    fn font_data_url_fragments_are_not_part_of_the_font_program() {
+        assert_eq!(
+            decode_font_data_url("data:font/ttf,%00%01%00%00#not-a-font-byte").unwrap(),
+            [0, 1, 0, 0]
+        );
+    }
+
+    #[test]
+    fn malformed_data_urls_fail_as_data_sources() {
+        assert!(is_data_url("data:font/ttf;base64,%%% ").unwrap());
+        assert!(decode_font_data_url("data:font/ttf;base64,%%% ").is_err());
+        assert!(is_data_url("data:font/ttf;base64").is_err());
+    }
 
     #[test]
     fn font_program_cache_reuses_byte_identical_programs() {

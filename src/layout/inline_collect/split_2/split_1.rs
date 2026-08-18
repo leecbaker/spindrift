@@ -297,7 +297,11 @@ impl<'a> LayoutBuilder<'a> {
     ) -> inline_layout::InlineIntrinsicMeasurement {
         normalize_inline_whitespace_items(&mut items);
         self.form_text_combine_upright_atoms(&mut items);
-        insert_text_autospace_items(&mut self.font_system, &mut items);
+        insert_text_autospace_items(
+            &mut self.font_system,
+            &mut self.autospace_items_scratch,
+            &mut items,
+        );
         trim_inline_item_edges(&mut items);
         let context = InlineParagraphContext {
             block_style,
@@ -437,6 +441,7 @@ impl<'a> LayoutBuilder<'a> {
                         ),
                         available_width: context.available_width,
                         line_height: context.block_style.line_height,
+                        decoration_origin_fragments: Default::default(),
                     });
                 return true;
             }
@@ -520,6 +525,7 @@ impl<'a> LayoutBuilder<'a> {
                     ),
                     available_width: context.available_width,
                     line_height: context.block_style.line_height,
+                    decoration_origin_fragments: Default::default(),
                 });
             output
                 .paragraphs
@@ -569,6 +575,7 @@ impl<'a> LayoutBuilder<'a> {
                         used_indent: 0.0,
                         available_width: context.available_width,
                         line_height: context.block_style.line_height,
+                        decoration_origin_fragments: Default::default(),
                     });
                 next_record_line_index += 1;
             }
@@ -610,6 +617,7 @@ impl<'a> LayoutBuilder<'a> {
                                 .fold(0.0_f32, f32::max),
                         ),
                     fragment: Some(line.fragment),
+                    decoration_origin_fragments: Default::default(),
                 });
             next_record_line_index = line_index + 1;
         }
@@ -821,8 +829,10 @@ impl<'a> LayoutBuilder<'a> {
         let column_width = ((available_width - total_gap) / column_count as f32).max(1.0);
         let (padding_left, padding_right) = padding;
         let available_column_width = (column_width - padding_left - padding_right).max(1.0);
-        let mut sequence_style = style.as_computed().clone();
-        sequence_style.box_decoration_break = css::BoxDecorationBreak::Clone;
+        let sequence_style = style
+            .used_style()
+            .clone()
+            .map_used_values(|style| style.box_decoration_break = css::BoxDecorationBreak::Clone);
         let sequence = self.collect_inline_line_sequence_with_text_box_trim(
             items,
             &sequence_style,
@@ -986,19 +996,18 @@ impl<'a> LayoutBuilder<'a> {
         if items.is_empty() {
             return None;
         }
-        // A vertical list item's marker (when present) and principal inline
-        // content occupy one first-line sequence. Retain that committed
-        // sequence so the enclosing list item can derive its logical-inline
-        // extent without replaying generated marker content and text.
+        // A simple vertical inline stream can supply both final paint and its
+        // enclosing block's logical-inline extent. Retain that committed
+        // sequence so final block geometry does not recollect and reselect
+        // the same text after orthogonal auto sizing has chosen its measure.
         // <https://drafts.csswg.org/css-lists-3/#marker-position>
         // <https://drafts.csswg.org/css-writing-modes-4/#vertical-layout>
         if matches!(
             style.writing_mode,
             WritingMode::VerticalRl | WritingMode::VerticalLr
-        ) && style.display.is_list_item()
-            && items
-                .iter()
-                .all(|item| matches!(item, InlineItem::Word(_) | InlineItem::Atom(_)))
+        ) && items
+            .iter()
+            .all(|item| matches!(item, InlineItem::Word(_) | InlineItem::Atom(_)))
             && let Some(sequence) = self.try_layout_committed_vertical_inline_sequence(
                 &mut items,
                 style,
@@ -1142,7 +1151,7 @@ impl<'a> LayoutBuilder<'a> {
                         text,
                         style,
                         inherited_link.clone(),
-                        placement.baseline_shift,
+                        placement.baseline_shift(),
                         placement.visual_offset,
                         output,
                     );
@@ -1153,12 +1162,11 @@ impl<'a> LayoutBuilder<'a> {
                     {
                         continue;
                     }
-                    let child_signature = ElementSignature::with_sibling_list(
-                        child_element.tag.clone(),
-                        child_element.attrs.clone(),
+                    let child_signature = ElementSignature::from_sibling_snapshot(
                         element_index,
                         sibling_tags.clone(),
-                    );
+                    )
+                    .expect("source child must have a cached sibling signature");
                     element_index += 1;
                     let mut child_style = self.style_for_layout_element_with_parent_font_metrics(
                         child_element,
@@ -1187,7 +1195,7 @@ impl<'a> LayoutBuilder<'a> {
                             .cloned()
                             .or_else(|| inherited_link.clone());
                         let child_placement = placement
-                            .with_added_baseline_shift(
+                            .with_added_baseline_placement(
                                 layout.vertical_align_baseline_shift_for_inline_style(
                                     &child_style,
                                     style,
@@ -1204,15 +1212,17 @@ impl<'a> LayoutBuilder<'a> {
                             &[],
                             None,
                             stylesheets,
-                            placement.baseline_shift,
+                            placement.baseline_shift(),
                             child_placement.visual_offset,
                             link.clone(),
                         );
                         layout.end_counter_scope(counter_scope);
                         layout.counter_set = counter_snapshot;
                         if let Some(mut atom) = atom {
-                            atom.baseline_shift +=
-                                layout.vertical_align_baseline_shift_for_atom(&atom, style);
+                            atom.baseline_shift += layout
+                                .vertical_align_baseline_shift_for_atom(&atom, style)
+                                .glyph_displacement()
+                                .get();
                             output.push(InlineItem::Atom(Box::new(atom)));
                             return;
                         }
@@ -1229,7 +1239,7 @@ impl<'a> LayoutBuilder<'a> {
                             &child_style,
                             child_style.before_style.as_deref(),
                             link.clone(),
-                            child_placement.baseline_shift,
+                            child_placement.baseline_shift(),
                             child_placement.visual_offset,
                             GeneratedPseudoCounterMode::Rollback,
                             output,
@@ -1247,7 +1257,7 @@ impl<'a> LayoutBuilder<'a> {
                             &child_style,
                             child_style.after_style.as_deref(),
                             link,
-                            child_placement.baseline_shift,
+                            child_placement.baseline_shift(),
                             child_placement.visual_offset,
                             GeneratedPseudoCounterMode::Rollback,
                             output,
@@ -1324,7 +1334,7 @@ impl<'a> LayoutBuilder<'a> {
                 style,
                 box_tree::CounterEventSource::Principal,
                 inherited_link.clone(),
-                placement.baseline_shift,
+                placement.baseline_shift(),
                 placement.visual_offset,
                 alt_text.clone(),
                 output,
@@ -1620,11 +1630,26 @@ impl<'a> LayoutBuilder<'a> {
             &mut edge_style,
             PercentageBasis::definite(edge_percentage_basis),
         );
+        // CSS 2.2's block-in-inline fixup records which logical outer-inline
+        // fragment owns the original start/end edge.  That ownership remains
+        // the source of truth for `box-decoration-break: slice`, whereas
+        // `clone` turns *every* generated inline fragment into a complete
+        // decorated box.  Apply the distinction before emitting edge atoms:
+        // after collection, the inline graph cannot recover a suppressed
+        // source start edge for a trailing outer-inline fragment.
+        //
+        // <https://www.w3.org/TR/CSS22/visuren.html#anonymous-block-level>
+        // <https://www.w3.org/TR/css-break-3/#break-decoration>
+        let fragment_edges = if edge_style.box_decoration_break == css::BoxDecorationBreak::Clone {
+            box_tree::InlineBoxFragmentEdges::ALL
+        } else {
+            options.fragment_edges
+        };
         let positioning_containing_block_source =
             inline_scope_establishes_positioning_containing_block(&edge_style).then(|| {
                 InlinePositioningContainingBlockSource {
                     id: InlinePositioningContainingBlockId(inline_box_start),
-                    style: edge_style.as_computed().clone(),
+                    style: edge_style.clone(),
                 }
             });
         // CSS Paged Media applies `page` only to boxes that establish a
@@ -1644,12 +1669,12 @@ impl<'a> LayoutBuilder<'a> {
         self.push_inline_scope_start_items(
             &edge_style,
             link_target.clone(),
-            placement.baseline_shift,
+            placement.baseline_shift(),
             placement.visual_offset,
             positioning_containing_block_source
                 .as_ref()
                 .map(|source| source.id),
-            options.fragment_edges.owns_start,
+            fragment_edges.owns_start,
             output,
         );
         if options.push_inside_marker
@@ -1664,13 +1689,13 @@ impl<'a> LayoutBuilder<'a> {
         InlineElementScopeState {
             inline_box_start,
             link_target,
-            baseline_shift: placement.baseline_shift,
+            baseline_shift: placement.baseline_shift(),
             visual_offset: placement.visual_offset,
-            edge_style: edge_style.into_computed(),
+            edge_style: edge_style.clone(),
             positioning_containing_block_source,
             pushed_page_scope,
             mark_hanging_edges: options.mark_hanging_edges,
-            fragment_edges: options.fragment_edges,
+            fragment_edges,
             counter_scope,
             counter_snapshot,
         }

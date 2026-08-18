@@ -10,7 +10,10 @@ remain ordinary legacy flex boxes.
 Clamp accounting is scoped to descendant in-flow line boxes in the same block
 formatting context. Flow roots, scroll containers, flex and table formatting
 contexts, and fieldsets neither receive nor debit their ancestor's line
-budget. Reaching a clamp boundary suppresses later in-flow source and floats
+budget. For an automatic block-size clamp, those independent normal-flow
+children still debit their actual parent block-axis contribution, so they
+remain legal boundaries even though their descendant line boxes are outside
+the ancestor's `max-lines` stream. Reaching a clamp boundary suppresses later in-flow source and floats
 whose source occurs after that boundary. Positioned descendants retain their
 containing-block layout path; floats encountered before the boundary still
 participate in normal float placement.
@@ -38,10 +41,22 @@ The following focused static WPTs pass with the current debug Quire binary:
 - `line-clamp-with-fixed-pos-001.html`
 - `line-clamp-with-fixed-pos-002.html`
 
-The static sweep also exposes existing visual differences in several
-ellipsis-fitting and line-clamp reference fixtures. Script-driven mutation
-fixtures (017–023, 026, 048, and `dynamic-001`) are intentionally excluded:
-Quire does not implement JavaScript or CSSOM mutation.
+The 2026-08-15 static sweep executed 256 tests (19 script-driven tests
+excluded) and passed 198 (77.3%). In addition to
+`line-clamp-auto-034.html`, the automatic nested-marker cases 023–025 and
+036 now pass: a cached inline sequence carries the terminal block-boundary
+continuation into marker fitting. Line-clamp containers now establish an
+independent formatting context, as `continue: collapse` requires; this
+prevents their child margins from collapsing through the container and makes
+the automatic margin cases 027–029 pass. A shared traversal now retains its
+remaining line budget through ordinary nested block flow and recognizes
+trailing inline source after a block sibling; this makes
+`block-ellipsis-003.html` and the nested legacy line-clamp cases 009–013 pass.
+The sweep remains below the 90% target because it still lacks replay of an
+earlier source endpoint after a later fixed-size or nested block proves not to
+fit. Script-driven mutation fixtures (017–023, 026, 048, and `dynamic-001`)
+are intentionally excluded: Quire does not implement JavaScript or CSSOM
+mutation.
 
 Quire cascades `max-lines`, inherited `block-ellipsis`, and `continue`
 independently. The line-clamp shorthands expand into those longhands, and a
@@ -61,11 +76,16 @@ fragmentainer. A direct multicolumn child traversal captures a non-empty opaque
 source prefix at its first local region break, replays only that prefix for
 balancing and box sizing, and suppresses later spanners and column sets.
 
-Remaining CSS Overflow Level 4 gaps are automatic constraints which depend on
-the enclosing block's final percentage basis through mixed or nested block
-flow, reevaluation through multicol balancing, and full Category-3 region
-fragmentation through mixed or nested formatting contexts. Those cases still
-need a block-flow-local region remainder controller rather than the
-direct-inline and direct-child multicol cutoff paths.
+Remaining CSS Overflow Level 4 gaps are automatic constraints which need to
+replay an earlier inline or block-sibling candidate after later mixed/nested
+block flow changes the used size, including constraints that depend on the
+enclosing block's final percentage basis. Direct inline balancing now first
+selects stable wrapping, then clamps, balances the retained source, and
+monotonically reclamps to an earlier endpoint if required. Cross-block
+balancing, complete block-ellipsis fitting and bidi isolation, and full
+Category-3 region fragmentation through mixed or nested formatting contexts
+remain incomplete. Those cases need a block-flow-local candidate and remainder
+controller rather than the direct-inline and direct-child multicol cutoff
+paths.
 
 <https://drafts.csswg.org/css-overflow-4/#line-clamp>

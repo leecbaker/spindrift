@@ -42,9 +42,12 @@ except where existing code already implements draft properties.
   declaration says otherwise.
 - Typographic character-unit policy is shared by graph break eligibility,
   min-content metadata, `word-break: keep-all` suppression, CJK unit-boundary
-  handling, and prepared-line `text-justify: inter-character` gaps. The policy
-  uses ICU grapheme clusters as the base unit and suppresses expansion inside
-  joining/control sequences.
+  handling, and prepared-line justification gaps. `text-justify:auto` uses
+  word separators plus eligible ideographic boundaries, while controls remain
+  zero-width and cannot own an expansion opportunity. Its paint preparation
+  materializes only the eligible ideographic units; ordinary inter-word text
+  remains a single shaping run. The policy uses ICU grapheme clusters as the
+  base unit and suppresses expansion inside joining/control sequences.
 - Regular inline box edges are transparent to graph-backed CSS Text break
   discovery, so margin/border/padding edge atoms remain materialized for
   painting while line breaking sees the surrounding text.
@@ -60,6 +63,11 @@ except where existing code already implements draft properties.
   and never create U+FFFC-style opportunities. Whitespace normalization keeps
   `box-decoration-break: slice` start/end ownership only on source-adjacent
   visible text, so a soft-wrapped continuation cannot repaint either side.
+  `box-decoration-break: clone` instead materializes fragment-local start and
+  end edge atoms for decorated inline scopes crossed by selected soft or
+  forced line breaks. Those atoms participate in fitting, preserve lexical
+  bidi/positioning metadata, and resolve `currentcolor` after `::first-line`
+  selection.
 - Paint-only inline style changes such as `color` retain a shared cursive
   shaping group across a transparent inline boundary. The resulting glyph runs
   preserve Arabic joining while their independent paint state remains separate
@@ -122,9 +130,10 @@ except where existing code already implements draft properties.
   so preceding source spaces cannot mask CJK or U+200B removal context. When a
   break is removed, same-metadata runs are rejoined before shaping, preventing
   source formatting from changing kerning, wrapping, paint, or PDF extraction.
-  UAX #14 `BK` and `NL` controls enter the same forced-break representation as
-  explicit generated breaks, while LF and CR remain in CSS Text's separate
-  segment-break transformation path.
+  UAX #14 `BK` and `NL` scalars are classified before visible-control
+  substitution and enter the same forced-break representation as explicit
+  generated breaks, while LF and CR remain in CSS Text's separate segment-break
+  transformation path.
 - Explicit CSS Text 4 expandable separators (authored U+200B and HTML
   `<wbr>`) become layout-only transformed words after their transparent-edge
   and forced-break context is known. Their replacement space participates in
@@ -292,6 +301,9 @@ except where existing code already implements draft properties.
   style is owned by the generated dictionary boundary or by the authored
   U+00AD fragment itself, so a styled control retains its `hyphenate-character`
   and advance through fitting, vertical writing, and shaping.
+- Selected authored U+00AD controls use the same resolved marker text as
+  dictionary hyphenation. In vertical writing, `hyphenate-character: auto`
+  therefore materializes U+2010 while an explicit author string is retained.
 - Graph-backed `letter-spacing` retains shaper glyph selection while resolving
   all advances at final visual typographic boundaries. Terminal backend
   advances are removed from both fitting and durable glyph data; nested inline
@@ -389,6 +401,17 @@ except where existing code already implements draft properties.
   and atomic inline boxes, so positive shifts increase the line-over extent and
   negative shifts increase the line-under extent while paint origins and line
   metrics stay in sync.
+- OpenType `BASE` data is retained per document font for horizontal and
+  vertical axes, script records, and BaseCoord formats 1–3. Layout selects the
+  matching language/script record (or `DFLT`), resolves Format 3 through the
+  selected CSS variation instance, derives central and ideographic metrics
+  from the selected BASE coordinates, and resolves named CSS baseline metrics
+  from the CSS inline content area's layout-ascent origin. Canvas-only
+  em-over/em-under synthesis does not re-anchor CSS line layout or painting.
+  Content-exported atomic first baselines derive the remaining named metrics
+  from that same style baseline set; descendant-exported baseline sets remain
+  tracked in `SPEC_DIVERGENCES.md`. `dominant-baseline:auto` selects central
+  in vertical mixed/upright typography.
 - Paint-time CSS Text adjustments are prepared through one inline line model
   for text-only, mixed, generated, page-margin, and fragmented sequence
   consumers. Alignment, `unicode-bidi: plaintext` direction state,
@@ -479,18 +502,22 @@ except where existing code already implements draft properties.
   solid/double/dotted/dashed/wavy emission for normal, generated, page-margin,
   inline-block, horizontal, and vertical text. Text decoration length fields
   such as thickness, underline offset, and inset preserve `ch` until selected
-  font metric resolution.
+  font metric resolution, after which each decoration-origin snapshot is
+  rebuilt from the resolved owning style before propagation.
 - Decoration propagation retains each decorating box's identity through
   in-flow descendant collection. Consequently, equal nested declarations
   remain independent origins. Each prepared line groups eligible text by that
   identity and resolves one shared considered-text geometry before its spans
-  paint; automatic metrics use that selected line text without converting
-  origin-relative values to a descendant percentage basis.
+  paint. The phase scheduler emits those origin-owned jobs directly, so a
+  propagated line is not suppressed merely because a receiving text group's
+  non-inherited `text-decoration-line` is initial; automatic metrics use that
+  selected line text without converting origin-relative values to a descendant
+  percentage basis.
 - Text and box shadow geometry preserves metric-dependent lengths through
   computed style resolution, so `ch` offsets, blur radii, and spread distances
   use the selected font's zero advance before paint consumes absolute lengths.
-- Background gradient stops, radii, and positions preserve `em`/`rem`, selected
-  font metrics, and viewport-unit components until the owning style's computed
+- Background gradient stops, radii, and positions preserve local and
+  root-relative font units, selected font metrics, and viewport-unit components until the owning style's computed
   font, metric, and page viewport resolution passes, leaving only percentages
   to resolve against the concrete gradient geometry.
 - Inline `vertical-align` and `baseline-shift` length-percentage values preserve
@@ -521,8 +548,10 @@ except where existing code already implements draft properties.
   visible joining text, including tatweel-only inline fragments that cross
   style/font boundaries. Registered `@font-face unicode-range` descriptors
   participate in font matching for scalar, interval, and wildcard ranges while
-  treating ZWJ/ZWNJ as font-neutral shaping controls. Already resolved visual
-  bidi order never overrides the logical shaping direction for cursive scripts.
+  treating ZWJ/ZWNJ as font-neutral shaping controls. A resolved RTL visual
+  bidi slice retains logical shaping direction for cursive scripts or for a
+  ZWJ/ZWNJ-controlled slice whose visible Arabic Presentation Forms are
+  themselves Unicode non-joining scalars.
 - Selected soft-wrap ranges retain private source-cluster provenance from the
   unbroken shaped run. Styled shapers map clusters from their synthetic
   join-context buffer back to authored source coordinates before this is
@@ -570,9 +599,12 @@ except where existing code already implements draft properties.
   min-content policy, emergency wrapping, hyphenation contributions, and
   sequence-backed block/flex/table estimate consumers.
 - The locally evaluated non-script `line-break:anywhere` family is **41/41
-  passing**. Typographic-character-unit opportunities, automatic-hyphen
-  suppression, and opaque PDF coverage serialization match the renderable
-  family while retained text remains extractable.
+  passing**. Script-sensitive `line-break-shaping-001` separately covers a
+  cursive Arabic wrap at an internal CSS Text unit boundary while retaining
+  glyphs sourced from the full shaped word. Typographic-character-unit
+  opportunities, automatic-hyphen suppression, and opaque PDF coverage
+  serialization match the renderable family while retained text remains
+  extractable.
 - Finish fallback transformed vertical glyph forms beyond font-provided
   `vert`/`vrt2` alternates, text-emphasis collision/line-box expansion,
   full `text-decoration-skip-box`/`text-decoration-skip-self` edge cases,

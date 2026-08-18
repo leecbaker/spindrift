@@ -1,11 +1,10 @@
-use super::colors::{PdfColorPlan, PdfPaintColor};
+use super::colors::{
+    PdfBlendColorSpace, PdfColorPlan, PdfColorRequirements, PdfLoweringColorPolicy, PdfPaintColor,
+};
 use super::*;
 use crate::timing::DebugTimer;
-use pdf_writer::types::{
-    ActionType, AnnotationType, CidFontType, ColorSpaceOperand, FontFlags, FunctionShadingType,
-    MaskType, PaintType, SystemInfo, TilingType,
-};
-use pdf_writer::{Content, Filter, Name, Pdf, Rect, Ref, Settings, Str, TextStr};
+use pdf_writer::types::{FunctionShadingType, MaskType, PaintType, TilingType};
+use pdf_writer::{Content, Filter, Pdf, Rect, Settings};
 use std::io::Write;
 use std::time::Duration;
 
@@ -20,25 +19,26 @@ pub(crate) fn write_document<W: Write>(
     let total_timer = DebugTimer::start("serializing PDF document");
     let mut timings = PdfTimingSummary::new();
     let page_count = document.pages.len();
-    let mut allocator = PdfObjectAllocator::new();
+    let mut planner = PdfResourcePlanner::new();
 
-    let catalog_id = allocator.alloc_id();
-    let pages_id = allocator.alloc_id();
-    let font_id = allocator.alloc_id();
-    let page_ids = allocator.alloc_ids(page_count);
-    let content_ids = allocator.alloc_ids(page_count);
+    let catalog_id = planner.alloc_id();
+    let pages_id = planner.alloc_id();
+    let page_ids = planner.alloc_ids(page_count);
     let image_plan = timings.measure("deduplicating and preparing PDF image resources", || {
         deduplicate_images(document)
     });
-    let vector_paint_colors = document.pages.iter().flat_map(Page::vector_paint_colors);
-    let color_plan = PdfColorPlan::new(
-        profile,
-        allocator.peek_id(),
-        vector_paint_colors,
+    // Colour requirements are semantic program inputs, not writer-time
+    // fallbacks.  In particular, a colourless isolated Form still needs its
+    // explicitly selected sRGB blending space.
+    let mut color_requirements = PdfColorRequirements::from_paint_and_image_sources(
+        document.pages.iter().flat_map(Page::vector_paint_colors),
         image_plan.built_in_color_spaces(&document.image_store),
         image_plan.embedded_rgb_profiles(&document.image_store),
-    )?;
-    allocator.reserve_ids(color_plan.object_count());
+    );
+    if document.pages.iter().any(Page::has_transparency_group) {
+        color_requirements.require_blending_space(PdfBlendColorSpace::Srgb);
+    }
+    let lowering_color_policy = PdfLoweringColorPolicy::new(profile, &color_requirements);
     let solid_fill_eligibility = image_plan.solid_fill_eligibility(document);
     let prepared_images = timings.measure("materializing PDF image paint representations", || {
         image_plan
@@ -46,33 +46,33 @@ pub(crate) fn write_document<W: Write>(
             .iter()
             .zip(solid_fill_eligibility)
             .map(|(source, eligible)| {
-                prepare_image_resource(&document.image_store, source, color_plan.mode(), eligible)
+                prepare_image_resource(
+                    &document.image_store,
+                    source,
+                    lowering_color_policy.mode(),
+                    eligible,
+                )
             })
             .collect::<Vec<_>>()
     });
 
-    let (embedded_font_plans, font_timings) = timings.measure(
+    let font_validation_profile = if profile.is_pdfa() {
+        PdfFontValidationProfile::PdfA
+    } else {
+        PdfFontValidationProfile::Default
+    };
+    let (mut embedded_font_plans, font_timings) = timings.measure(
         format!(
             "planning PDF font embedding for {} document font(s)",
             document.fonts.len()
         ),
         || {
-            let first_embedded_font_id = allocator.peek_id();
-            let font_validation_profile = if profile.is_pdfa() {
-                PdfFontValidationProfile::PdfA
-            } else {
-                PdfFontValidationProfile::Default
-            };
             let (plans, font_timings) = timed_embedded_font_plans_with_profile(
                 document,
-                first_embedded_font_id,
+                0,
                 font_validation_profile,
                 font_embedding,
             )?;
-            allocator.advance_to(
-                first_embedded_font_id
-                    + plans.fonts.len() * font_validation_profile.embedded_font_object_count(),
-            );
             Ok::<_, crate::Error>((plans, font_timings))
         },
     )?;
@@ -88,40 +88,66 @@ pub(crate) fn write_document<W: Write>(
         "PDF font embedding: audit and planning",
         font_timings.font_audit_embedding,
     );
-
-    let (unique_image_ids, page_image_ids) =
-        timings.measure("assigning PDF image object IDs", || {
-            let unique_image_ids = prepared_images
+    let mut dynamic_resources = PdfResourceRegistry::default();
+    let page_renders = timings.measure(
+        format!("building {page_count} page content stream(s)"),
+        || {
+            document
+                .pages
                 .iter()
-                .map(|image| match image {
-                    PreparedImageResource::Transparent | PreparedImageResource::SolidFill(_) => {
-                        None
-                    }
-                    PreparedImageResource::Raster(_) => {
-                        let image_id = PdfImageObjectId(allocator.alloc_id());
-                        // Alpha is only known after decoding encoded sources. Reserve
-                        // a mask object ID so object planning remains lightweight;
-                        // the ID is simply unused for opaque images.
-                        let alpha_mask_id = Some(PdfImageObjectId(allocator.alloc_id()));
-                        Some(ImageObjectIds {
-                            image_id,
-                            alpha_mask_id,
-                        })
-                    }
+                .enumerate()
+                .map(|(page_index, page)| {
+                    page_content_render(
+                        page,
+                        &embedded_font_plans,
+                        super::content::PageContentRenderInputs {
+                            resources: &mut dynamic_resources,
+                            color_policy: &lowering_color_policy,
+                            image_resources: &prepared_images,
+                            page_image_sources: &image_plan.page_image_unique_indexes[page_index],
+                            page_svg_pattern_image_sources: &image_plan
+                                .page_svg_pattern_image_unique_indexes[page_index],
+                            page_image_pattern_sources: &image_plan
+                                .page_pattern_tile_unique_indexes[page_index],
+                            raster_resolution_dppx: document.image_store.output_resolution_dppx(),
+                        },
+                    )
                 })
-                .collect::<Vec<_>>();
-            let page_image_ids = image_plan
-                .page_image_unique_indexes
-                .iter()
-                .map(|page_images| {
-                    page_images
-                        .iter()
-                        .map(|index| unique_image_ids[index.0].map(|ids| ids.image_id))
-                        .collect::<Vec<_>>()
-                })
-                .collect::<Vec<_>>();
-            (unique_image_ids, page_image_ids)
-        });
+                .collect::<Vec<_>>()
+        },
+    );
+    let lowered_program = PdfLoweredDocumentProgram {
+        pages: page_renders,
+        dynamic_resources,
+    };
+    lowered_program.debug_assert_well_formed();
+    let color_requirements = final_color_requirements_from_lowering(
+        &lowering_color_policy,
+        &lowered_program.pages,
+        &image_plan,
+        &document.image_store,
+    );
+    let color_plan = PdfColorPlan::new(profile, planner.peek_id(), color_requirements)?;
+    planner.reserve_ids(color_plan.object_count());
+    let first_embedded_font_id = planner.peek_id();
+    embedded_font_plans.resolve_object_ids(first_embedded_font_id, font_validation_profile);
+    planner.advance_to(
+        first_embedded_font_id
+            + embedded_font_plans.fonts.len()
+                * font_validation_profile.embedded_font_object_count(),
+    );
+    let unique_image_ids = timings.measure("assigning PDF image object IDs", || {
+        prepared_images
+            .iter()
+            .map(|image| match image {
+                PreparedImageResource::Transparent | PreparedImageResource::SolidFill(_) => None,
+                PreparedImageResource::Raster(_) => Some(ImageObjectIds {
+                    image_id: PdfImageObjectId(planner.alloc_id()),
+                    alpha_mask_id: Some(PdfImageObjectId(planner.alloc_id())),
+                }),
+            })
+            .collect::<Vec<_>>()
+    });
     let page_image_pattern_plans = timings.measure("planning PDF image pattern objects", || {
         image_plan
             .page_pattern_tile_unique_indexes
@@ -138,11 +164,47 @@ pub(crate) fn write_document<W: Write>(
                         match (&prepared_images[tile_index.0], tile_image_id) {
                             (PreparedImageResource::Transparent, None) => None,
                             (PreparedImageResource::Raster(_), Some(tile_image_id)) => {
+                                let mut content = Content::new();
+                                content
+                                    .transform([
+                                        pattern.tiling.tile_size.width,
+                                        0.0,
+                                        0.0,
+                                        pattern.tiling.tile_size.height,
+                                        0.0,
+                                        0.0,
+                                    ])
+                                    .x_object(pdf_name("Im1"));
                                 Some(PageImagePatternPlan {
-                                    id: allocator.alloc_id(),
+                                    handle: PdfImagePatternHandle {
+                                        page_index,
+                                        pattern_index,
+                                    },
+                                    id: planner.alloc_id(),
                                     name: format!("P{}", pattern_index + 1),
                                     tile_image_id,
                                     pattern: pattern.clone(),
+                                    stream: PdfStreamProgram {
+                                        bytes: content.finish().into_vec(),
+                                        resource_uses: PdfStreamResourceUses {
+                                            xobjects: [(
+                                                "Im1".into(),
+                                                PdfXObjectHandle::Image(PdfImageHandle(
+                                                    tile_index.0,
+                                                )),
+                                            )]
+                                            .into(),
+                                            ..PdfStreamResourceUses::default()
+                                        },
+                                        resolved_resources: Some(PdfResolvedStreamResources {
+                                            xobjects: [(
+                                                "Im1".into(),
+                                                PdfResolvedReference(tile_image_id.0),
+                                            )]
+                                            .into(),
+                                            ..PdfResolvedStreamResources::default()
+                                        }),
+                                    },
                                 })
                             }
                             (PreparedImageResource::SolidFill(_), None) => {
@@ -157,31 +219,14 @@ pub(crate) fn write_document<W: Write>(
             })
             .collect::<Vec<_>>()
     });
-
-    let page_renders = timings.measure(
-        format!("building {page_count} page content stream(s)"),
-        || {
-            document
-                .pages
-                .iter()
-                .enumerate()
-                .map(|(page_index, page)| {
-                    let mut next_dynamic_object_id = allocator.peek_id();
-                    let render = page_content_render(
-                        page,
-                        &embedded_font_plans,
-                        &mut next_dynamic_object_id,
-                        &color_plan,
-                        &prepared_images,
-                        &image_plan.page_image_unique_indexes[page_index],
-                        &image_plan.page_pattern_tile_unique_indexes[page_index],
-                    );
-                    allocator.advance_to(next_dynamic_object_id);
-                    render
-                })
-                .collect::<Vec<_>>()
-        },
-    );
+    // Lowering has now completed.  Resolve symbolic handles in their stable
+    // encounter order; no content writer can allocate an indirect object.
+    planner.plan_dynamic_resources(&lowered_program.dynamic_resources);
+    let mut page_renders = lowered_program.pages;
+    let content_ids = page_renders
+        .iter()
+        .map(|render| (!render.stream.bytes.is_empty()).then(|| planner.alloc_id()))
+        .collect::<Vec<_>>();
     let page_ext_gstate_plans = timings.measure("planning PDF page ExtGState resources", || {
         document
             .pages
@@ -190,21 +235,205 @@ pub(crate) fn write_document<W: Write>(
                 page_ext_gstate_resources(page)
                     .into_iter()
                     .map(|resource| ExtGStateObjectPlan {
-                        id: allocator.alloc_id(),
+                        id: planner.alloc_id(),
                         resource,
                     })
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>()
     });
+    timings.measure("recording exact PDF stream resource uses", || {
+        for (page_index, page_render) in page_renders.iter_mut().enumerate() {
+            let bindings = PdfPageResourceBindings {
+                xobjects: page_render
+                    .form_xobjects
+                    .iter()
+                    .map(|form| (form.name.clone(), PdfXObjectHandle::Form(form.id)))
+                    .chain(
+                        image_plan.page_image_unique_indexes[page_index]
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, image)| unique_image_ids[image.0].is_some())
+                            .map(|(index, image)| {
+                                (
+                                    format!("Im{}", index + 1),
+                                    PdfXObjectHandle::Image(PdfImageHandle(image.0)),
+                                )
+                            }),
+                    )
+                    .chain(
+                        image_plan.page_svg_pattern_image_unique_indexes[page_index]
+                            .iter()
+                            .filter(|image| unique_image_ids[image.0].is_some())
+                            .map(|image| {
+                                (
+                                    format!("Im{}", image.0 + 1),
+                                    PdfXObjectHandle::Image(PdfImageHandle(image.0)),
+                                )
+                            }),
+                    )
+                    .collect(),
+                fonts: embedded_font_plans
+                    .fonts
+                    .iter()
+                    .enumerate()
+                    .map(|(index, font)| (font.resource_name.clone(), PdfFontHandle(index)))
+                    .collect(),
+                patterns: page_image_pattern_plans[page_index]
+                    .iter()
+                    .map(|plan| {
+                        (
+                            plan.name.clone(),
+                            PdfPatternResourceHandle::Image(plan.handle),
+                        )
+                    })
+                    .chain(page_render.gradient_patterns.iter().flat_map(|plan| {
+                        std::iter::once((
+                            plan.name.clone(),
+                            PdfPatternResourceHandle::Dynamic(plan.id),
+                        ))
+                        .chain(plan.alpha.iter().map(|alpha| {
+                            (
+                                alpha.pattern_name.clone(),
+                                PdfPatternResourceHandle::Dynamic(alpha.pattern_id),
+                            )
+                        }))
+                    }))
+                    .chain(page_render.gradient_tiling_patterns.iter().map(|plan| {
+                        (
+                            plan.name.clone(),
+                            PdfPatternResourceHandle::Dynamic(plan.id),
+                        )
+                    }))
+                    .chain(page_render.svg_tiling_patterns.iter().map(|plan| {
+                        (
+                            plan.name.clone(),
+                            PdfPatternResourceHandle::Dynamic(plan.id),
+                        )
+                    }))
+                    .chain(page_render.svg_path_tiling_patterns.iter().map(|plan| {
+                        (
+                            plan.name.clone(),
+                            PdfPatternResourceHandle::Dynamic(plan.id),
+                        )
+                    }))
+                    .collect(),
+                ext_gstates: page_ext_gstate_plans[page_index]
+                    .iter()
+                    .enumerate()
+                    .map(|(resource_index, plan)| {
+                        (
+                            plan.resource.name().to_owned(),
+                            PdfExtGStateResourceHandle::Page(PdfPageExtGStateHandle {
+                                page_index,
+                                resource_index,
+                            }),
+                        )
+                    })
+                    .chain(
+                        page_render
+                            .gradient_patterns
+                            .iter()
+                            .filter_map(|plan| plan.alpha.as_ref())
+                            .map(|alpha| {
+                                (
+                                    alpha.ext_gstate_name.clone(),
+                                    PdfExtGStateResourceHandle::Dynamic(alpha.ext_gstate_id),
+                                )
+                            }),
+                    )
+                    .collect(),
+                color_spaces: color_plan.resource_handles().into_iter().collect(),
+            };
+            bindings.record_uses(&mut page_render.stream);
+            for form in &mut page_render.form_xobjects {
+                bindings.record_uses(&mut form.stream);
+            }
+            for plan in &mut page_render.gradient_tiling_patterns {
+                bindings.record_uses(&mut plan.stream);
+            }
+            for plan in &mut page_render.svg_tiling_patterns {
+                bindings.record_uses(&mut plan.stream);
+            }
+            for plan in &mut page_render.svg_path_tiling_patterns {
+                bindings.record_uses(&mut plan.stream);
+            }
+            for plan in &mut page_render.gradient_patterns {
+                if let Some(alpha) = &mut plan.alpha {
+                    bindings.record_uses(&mut alpha.stream);
+                }
+            }
+            planner.resolve_stream_bindings(
+                &mut page_render.stream,
+                &embedded_font_plans.fonts,
+                &unique_image_ids,
+                &page_image_pattern_plans,
+                &page_ext_gstate_plans,
+                &color_plan,
+            );
+            for form in &mut page_render.form_xobjects {
+                planner.resolve_stream_bindings(
+                    &mut form.stream,
+                    &embedded_font_plans.fonts,
+                    &unique_image_ids,
+                    &page_image_pattern_plans,
+                    &page_ext_gstate_plans,
+                    &color_plan,
+                );
+            }
+            for plan in &mut page_render.gradient_tiling_patterns {
+                planner.resolve_stream_bindings(
+                    &mut plan.stream,
+                    &embedded_font_plans.fonts,
+                    &unique_image_ids,
+                    &page_image_pattern_plans,
+                    &page_ext_gstate_plans,
+                    &color_plan,
+                );
+            }
+            for plan in &mut page_render.svg_tiling_patterns {
+                planner.resolve_stream_bindings(
+                    &mut plan.stream,
+                    &embedded_font_plans.fonts,
+                    &unique_image_ids,
+                    &page_image_pattern_plans,
+                    &page_ext_gstate_plans,
+                    &color_plan,
+                );
+            }
+            for plan in &mut page_render.svg_path_tiling_patterns {
+                planner.resolve_stream_bindings(
+                    &mut plan.stream,
+                    &embedded_font_plans.fonts,
+                    &unique_image_ids,
+                    &page_image_pattern_plans,
+                    &page_ext_gstate_plans,
+                    &color_plan,
+                );
+            }
+            for plan in &mut page_render.gradient_patterns {
+                if let Some(alpha) = &mut plan.alpha {
+                    planner.resolve_stream_bindings(
+                        &mut alpha.stream,
+                        &embedded_font_plans.fonts,
+                        &unique_image_ids,
+                        &page_image_pattern_plans,
+                        &page_ext_gstate_plans,
+                        &color_plan,
+                    );
+                }
+            }
+        }
+    });
 
-    let info_id = allocator.alloc_id();
-    let metadata_id = allocator.alloc_id();
+    let info_id = planner.alloc_id();
+    let metadata_id =
+        (profile.is_pdfa() || document.metadata.has_source_metadata()).then(|| planner.alloc_id());
     let page_annotation_ids = timings.measure("planning PDF annotation IDs", || {
         document
             .pages
             .iter()
-            .map(|page| page.links.iter().map(|_| allocator.alloc_id()).collect())
+            .map(|page| page.links.iter().map(|_| planner.alloc_id()).collect())
             .collect::<Vec<Vec<_>>>()
     });
     let outline_plan = timings.measure(
@@ -213,14 +442,115 @@ pub(crate) fn write_document<W: Write>(
             document.bookmarks.len()
         ),
         || {
-            let plan = outline_plan(document, allocator.peek_id());
+            let plan = outline_plan(document, planner.peek_id());
             if let Some(plan) = &plan {
-                allocator.reserve_ids(1 + plan.nodes.len());
+                planner.reserve_ids(1 + plan.nodes.len());
             }
             plan
         },
     );
+    let page_annotations = document
+        .pages
+        .iter()
+        .zip(&page_annotation_ids)
+        .map(|(page, ids)| {
+            page.links
+                .iter()
+                .zip(ids)
+                .map(|(link, id)| PdfAnnotationProgram {
+                    id: *id,
+                    rect: link.paint_rect(),
+                    target: link.target.to_string(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let file_id = pdf_file_identifier(
+        document,
+        &page_renders,
+        &embedded_font_plans.fonts,
+        &image_plan.unique_images,
+        &page_image_pattern_plans,
+        &page_ext_gstate_plans,
+    );
+    let pages = document
+        .pages
+        .iter()
+        .zip(page_ids)
+        .zip(content_ids)
+        .zip(page_annotations)
+        .zip(page_renders)
+        .map(
+            |((((page, id), content_id), annotations), render)| PdfPageProgram {
+                id,
+                content_id,
+                size: page.paint_size(),
+                rotation: page.rotation,
+                annotations,
+                render,
+            },
+        )
+        .collect();
 
+    // The writer receives one complete resolved program.  All remaining
+    // serializers consume these entries rather than allocating or discovering
+    // static resources from the source document.
+    let program = PdfDocumentProgram {
+        catalog_id,
+        pages_id,
+        pages,
+        dynamic_resources: planner,
+        color_plan,
+        fonts: embedded_font_plans.fonts,
+        images: PdfImageProgram {
+            prepared: prepared_images,
+            unique_object_ids: unique_image_ids,
+            page_patterns: page_image_pattern_plans,
+        },
+        page_ext_gstates: page_ext_gstate_plans,
+        metadata: PdfMetadataProgram {
+            info_id,
+            xmp_id: metadata_id,
+            source: document.metadata.clone(),
+            producer: options.producer.clone(),
+        },
+        outline: outline_plan,
+        file_id,
+    };
+    program.debug_assert_resolved_references_are_unique();
+
+    let bytes = serialize_program(
+        &program,
+        PdfSerializationOptions {
+            profile,
+            compression,
+        },
+        &mut timings,
+    );
+    let total = total_timer.finish();
+    timings.log_summary(total);
+    writer.write_all(&bytes)?;
+    Ok(())
+}
+
+/// Pure serialization boundary for the resolved private PDF program.
+///
+/// The source [`Document`] has already been consumed by lowering and planning;
+/// this function can only read resolved object references and serialization
+/// options.
+#[derive(Debug, Clone, Copy)]
+struct PdfSerializationOptions {
+    profile: crate::PdfProfile,
+    compression: crate::PdfCompression,
+}
+
+fn serialize_program(
+    program: &PdfDocumentProgram<'_>,
+    options: PdfSerializationOptions,
+    timings: &mut PdfTimingSummary,
+) -> Vec<u8> {
+    let profile = options.profile;
+    let compression = options.compression;
     let mut pdf = Pdf::with_settings(Settings::default());
     let (major_version, minor_version) = profile.pdf_version();
     pdf.set_version(major_version, minor_version);
@@ -229,110 +559,225 @@ pub(crate) fn write_document<W: Write>(
     timings.measure("writing PDF page tree and content objects", || {
         write_catalog(
             &mut pdf,
-            catalog_id,
-            pages_id,
-            metadata_id,
-            &document.metadata,
-            outline_plan.as_ref(),
-            &color_plan,
+            program.catalog_id,
+            program.pages_id,
+            program.metadata.xmp_id,
+            &program.metadata.source,
+            program.outline.as_ref(),
+            &program.color_plan,
         );
-        write_pages(&mut pdf, pages_id, &page_ids);
-        write_font_resources(&mut pdf, font_id, &embedded_font_plans.fonts);
-        write_pages_and_content(
-            &mut pdf,
-            document,
-            pages_id,
-            font_id,
-            &page_ids,
-            &content_ids,
-            &page_image_ids,
-            &page_image_pattern_plans,
-            &page_annotation_ids,
-            &page_renders,
-            &page_ext_gstate_plans,
-            &color_plan,
-            compression,
-        );
+        write_pages(&mut pdf, program.pages_id, &program.pages);
+        write_pages_and_content(&mut pdf, program.pages_id, &program.pages, compression);
     });
     timings.measure("writing PDF embedded font objects", || {
-        write_embedded_fonts(&mut pdf, &embedded_font_plans.fonts, compression);
+        write_embedded_fonts(&mut pdf, &program.fonts, compression);
     });
     timings.measure("writing PDF image objects", || {
         write_images(
             &mut pdf,
-            &prepared_images,
-            &unique_image_ids,
-            &color_plan,
+            &program.images.prepared,
+            &program.images.unique_object_ids,
+            &program.color_plan,
             compression,
         );
     });
     timings.measure("writing PDF ICC color profiles", || {
-        color_plan.write_profiles(&mut pdf, compression);
+        program.color_plan.write_profiles(&mut pdf, compression);
     });
     timings.measure("writing PDF image pattern objects", || {
-        write_image_patterns(&mut pdf, &page_image_pattern_plans, compression);
+        write_image_patterns(&mut pdf, &program.images.page_patterns, compression);
     });
     timings.measure("writing SVG gradient shading patterns", || {
-        write_gradient_patterns(&mut pdf, &page_renders, &color_plan, compression);
+        write_gradient_patterns(
+            &mut pdf,
+            program.pages.iter().map(|page| &page.render),
+            &program.color_plan,
+            &program.dynamic_resources,
+            compression,
+        );
     });
     timings.measure("writing SVG gradient alpha-mask forms", || {
-        write_gradient_alpha_forms(&mut pdf, &page_renders, compression);
+        write_gradient_alpha_forms(
+            &mut pdf,
+            program.pages.iter().map(|page| &page.render),
+            &program.dynamic_resources,
+            compression,
+        );
     });
     timings.measure("writing PDF form XObjects", || {
         write_form_xobjects(
             &mut pdf,
-            font_id,
-            &page_image_ids,
-            &page_image_pattern_plans,
-            &page_renders,
-            &page_ext_gstate_plans,
-            &color_plan,
+            program.pages.iter().map(|page| &page.render),
+            &program.color_plan,
+            &program.dynamic_resources,
             compression,
         );
     });
     timings.measure("writing PDF ExtGState objects", || {
-        write_ext_gstate_objects(&mut pdf, &page_ext_gstate_plans);
-        write_gradient_alpha_ext_gstates(&mut pdf, &page_renders);
+        write_ext_gstate_objects(&mut pdf, &program.page_ext_gstates);
+        write_gradient_alpha_ext_gstates(
+            &mut pdf,
+            program.pages.iter().map(|page| &page.render),
+            &program.dynamic_resources,
+        );
     });
     timings.measure("writing PDF metadata, annotations, and outlines", || {
         write_document_info(
             &mut pdf,
-            pdf_ref(info_id),
-            &document.metadata,
-            &options.producer,
+            pdf_ref(program.metadata.info_id),
+            &program.metadata.source,
+            &program.metadata.producer,
         );
-        write_document_xmp_metadata(
-            &mut pdf,
-            pdf_ref(metadata_id),
-            &document.metadata,
-            profile,
-            compression,
-            &options.producer,
-        );
-        write_annotations(&mut pdf, document, &page_annotation_ids);
-        if let Some(outline_plan) = &outline_plan {
-            write_outlines(&mut pdf, outline_plan, &page_ids, document);
+        if let Some(metadata_id) = program.metadata.xmp_id {
+            write_document_xmp_metadata(
+                &mut pdf,
+                pdf_ref(metadata_id),
+                &program.metadata.source,
+                profile,
+                compression,
+                &program.metadata.producer,
+            );
+        }
+        write_annotations(&mut pdf, &program.pages);
+        if let Some(outline_plan) = &program.outline {
+            write_outlines(&mut pdf, outline_plan, &program.pages);
         }
     });
     timings.measure("building deterministic PDF file identifier", || {
-        pdf.set_file_id(pdf_file_identifier(
-            document,
-            &page_renders,
-            &embedded_font_plans.fonts,
-            &image_plan.unique_images,
-            &page_image_pattern_plans,
-            &page_ext_gstate_plans,
-        ));
+        pdf.set_file_id(program.file_id.clone());
     });
 
-    let object_count = allocator.peek_id().saturating_sub(1);
-    let bytes = timings.measure(format!("assembling {object_count} PDF object(s)"), || {
+    let object_count = program.dynamic_resources.peek_id().saturating_sub(1);
+    timings.measure(format!("assembling {object_count} PDF object(s)"), || {
         pdf.finish()
-    });
-    let total = total_timer.finish();
-    timings.log_summary(total);
-    writer.write_all(&bytes)?;
-    Ok(())
+    })
+}
+
+/// Derive calibrated PDF colour requirements from final content programs.
+///
+/// This is deliberately after semantic lowering: filter transforms, gradient
+/// normalization, and SVG Form construction have already selected the actual
+/// PDF `cs`/`CS` names. CSS source colours are used only to build the
+/// provisional lowering policy and never to retain the final ICC table.
+fn final_color_requirements_from_lowering(
+    lowering_policy: &PdfLoweringColorPolicy,
+    page_renders: &[PageContentRender],
+    image_plan: &ImageResourcePlan,
+    image_store: &crate::image_store::DocumentImageStore,
+) -> PdfColorRequirements {
+    let used_raster_images = final_raster_image_indexes(page_renders, image_plan);
+    let (built_in_image_spaces, embedded_image_profiles) =
+        image_plan.color_sources_for_indexes(&used_raster_images, image_store);
+    let mut requirements = PdfColorRequirements::from_paint_and_image_sources(
+        std::iter::empty(),
+        built_in_image_spaces,
+        embedded_image_profiles,
+    );
+    let color_names = lowering_policy.resource_names();
+    for page_render in page_renders {
+        for stream in std::iter::once(&page_render.stream)
+            .chain(page_render.form_xobjects.iter().map(|form| &form.stream))
+            .chain(
+                page_render
+                    .gradient_tiling_patterns
+                    .iter()
+                    .map(|pattern| &pattern.stream),
+            )
+            .chain(
+                page_render
+                    .svg_tiling_patterns
+                    .iter()
+                    .map(|pattern| &pattern.stream),
+            )
+            .chain(
+                page_render
+                    .svg_path_tiling_patterns
+                    .iter()
+                    .map(|pattern| &pattern.stream),
+            )
+            .chain(
+                page_render
+                    .gradient_patterns
+                    .iter()
+                    .filter_map(|pattern| pattern.alpha.as_ref().map(|alpha| &alpha.stream)),
+            )
+        {
+            for name in &color_names {
+                if stream_uses_named_operator(&stream.bytes, name, b"cs")
+                    || stream_uses_named_operator(&stream.bytes, name, b"CS")
+                {
+                    if let Some(space) = lowering_policy.output_space_for_resource_name(name) {
+                        requirements.require_final_output_space(space);
+                    } else if let Some(profile) =
+                        lowering_policy.embedded_rgb_profile_for_resource_name(name)
+                    {
+                        requirements.require_embedded_rgb_profile(profile);
+                    }
+                }
+            }
+        }
+        for gradient in &page_render.gradient_patterns {
+            requirements.require_final_output_space(
+                lowering_policy.gradient_output_space(&gradient.gradient),
+            );
+        }
+        for form in &page_render.form_xobjects {
+            if matches!(
+                form.kind,
+                PdfFormKind::TransparencyGroup {
+                    blending_space: PdfBlendColorSpace::Srgb
+                }
+            ) {
+                requirements.require_blending_space(PdfBlendColorSpace::Srgb);
+            }
+        }
+    }
+    requirements
+}
+
+/// Discover raster XObjects selected by the final page and Form streams.
+///
+/// Image source collection happens before lowering so that content painting
+/// has stable `/ImN` and `/PN` names.  This pass deliberately goes the other
+/// direction: it retains a raster source's ICC profile only if a final `Do`
+/// or image-pattern selection can reach the serialized program.  Direct
+/// solid-image fills are covered instead by their emitted colour-space
+/// operators in `final_color_requirements_from_lowering`.
+fn final_raster_image_indexes(
+    page_renders: &[PageContentRender],
+    image_plan: &ImageResourcePlan,
+) -> Vec<PlannedImageIndex> {
+    let mut indexes = Vec::new();
+    for (page_index, page_render) in page_renders.iter().enumerate() {
+        let streams = std::iter::once(&page_render.stream)
+            .chain(page_render.form_xobjects.iter().map(|form| &form.stream));
+        for stream in streams {
+            for (image_index, planned) in image_plan.page_image_unique_indexes[page_index]
+                .iter()
+                .enumerate()
+            {
+                let name = format!("Im{}", image_index + 1);
+                if stream_uses_named_operator(&stream.bytes, &name, b"Do")
+                    && !indexes.contains(planned)
+                {
+                    indexes.push(*planned);
+                }
+            }
+            for (pattern_index, planned) in image_plan.page_pattern_tile_unique_indexes[page_index]
+                .iter()
+                .enumerate()
+            {
+                let name = format!("P{}", pattern_index + 1);
+                if (stream_uses_named_operator(&stream.bytes, &name, b"scn")
+                    || stream_uses_named_operator(&stream.bytes, &name, b"SCN"))
+                    && !indexes.contains(planned)
+                {
+                    indexes.push(*planned);
+                }
+            }
+        }
+    }
+    indexes
 }
 
 #[derive(Debug, Default)]
@@ -390,6 +835,7 @@ impl PdfTimingSummary {
 }
 
 fn deduplicate_images(document: &Document) -> ImageResourcePlan {
+    let raster_resolution_dppx = document.image_store.output_resolution_dppx();
     let image_count = document
         .pages
         .iter()
@@ -405,7 +851,7 @@ fn deduplicate_images(document: &Document) -> ImageResourcePlan {
             page.images
                 .iter()
                 .map(|image| {
-                    let source = image_source(image);
+                    let source = image_source(image, raster_resolution_dppx);
                     if let Some(index) = image_lookup.get(&source) {
                         *index
                     } else {
@@ -425,7 +871,7 @@ fn deduplicate_images(document: &Document) -> ImageResourcePlan {
             page.image_patterns
                 .iter()
                 .map(|pattern| {
-                    let source = image_pattern_source(pattern);
+                    let source = image_pattern_source(pattern, raster_resolution_dppx);
                     if let Some(index) = image_lookup.get(&source) {
                         *index
                     } else {
@@ -438,327 +884,35 @@ fn deduplicate_images(document: &Document) -> ImageResourcePlan {
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
+    let page_svg_pattern_image_unique_indexes = document
+        .pages
+        .iter()
+        .map(|page| {
+            page.svg_pattern_images
+                .iter()
+                .map(|image| {
+                    let source = image_source(image, raster_resolution_dppx);
+                    if let Some(index) = image_lookup.get(&source) {
+                        *index
+                    } else {
+                        let index = PlannedImageIndex(unique_images.len());
+                        image_lookup.insert(source.clone(), index);
+                        unique_images.push(source);
+                        index
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
     ImageResourcePlan {
         unique_images,
         page_image_unique_indexes,
+        page_svg_pattern_image_unique_indexes,
         page_pattern_tile_unique_indexes,
     }
 }
 
-fn write_catalog(
-    pdf: &mut Pdf,
-    catalog_id: usize,
-    pages_id: usize,
-    metadata_id: usize,
-    metadata: &DocumentMetadata,
-    outline_plan: Option<&OutlinePlan>,
-    color_plan: &PdfColorPlan,
-) {
-    let mut catalog = pdf.catalog(pdf_ref(catalog_id));
-    catalog.pages(pdf_ref(pages_id));
-    catalog.metadata(pdf_ref(metadata_id));
-    if let Some(language) = metadata.language.as_deref() {
-        catalog.lang(TextStr(language));
-    }
-    if let Some(plan) = outline_plan {
-        catalog.outlines(pdf_ref(plan.root_id));
-    }
-    if color_plan.mode() == super::colors::PdfColorMode::SrgbOutputIntent {
-        let mut intents = catalog.output_intents();
-        let mut intent = intents.push();
-        intent
-            .subtype(pdf_writer::types::OutputIntentSubtype::PDFA)
-            .output_condition_identifier(TextStr("sRGB"))
-            .info(TextStr("sRGB IEC 61966-2.1"))
-            .dest_output_profile(pdf_ref(color_plan.srgb_profile_object_id()));
-    }
-}
-
-fn write_pages(pdf: &mut Pdf, pages_id: usize, page_ids: &[usize]) {
-    pdf.pages(pdf_ref(pages_id))
-        .kids(page_ids.iter().cloned().map(pdf_ref))
-        .count(i32_from_usize(page_ids.len()));
-}
-
-fn write_font_resources(pdf: &mut Pdf, font_id: usize, embedded_fonts: &[EmbeddedFontPlan<'_>]) {
-    let mut fonts = pdf.indirect(pdf_ref(font_id)).dict();
-    for font in embedded_fonts {
-        fonts.pair(pdf_name(&font.resource_name), pdf_ref(font.type0_id));
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn write_pages_and_content(
-    pdf: &mut Pdf,
-    document: &Document,
-    pages_id: usize,
-    font_id: usize,
-    page_ids: &[usize],
-    content_ids: &[usize],
-    page_image_ids: &[Vec<Option<PdfImageObjectId>>],
-    page_image_pattern_plans: &[Vec<PageImagePatternPlan>],
-    page_annotation_ids: &[Vec<usize>],
-    page_renders: &[PageContentRender],
-    page_ext_gstate_plans: &[Vec<ExtGStateObjectPlan>],
-    color_plan: &PdfColorPlan,
-    compression: crate::PdfCompression,
-) {
-    for (index, page) in document.pages.iter().enumerate() {
-        let media_box = crate::document::paint::geometry::paint_rect_to_pdf(
-            crate::document::paint::geometry::PaintRect::new(
-                crate::document::paint::geometry::PaintPoint::new(0.0, 0.0),
-                page.paint_size(),
-            ),
-        );
-        let mut page_writer = pdf.page(pdf_ref(page_ids[index]));
-        page_writer
-            .parent(pdf_ref(pages_id))
-            .media_box(Rect::new(
-                media_box.origin.x,
-                media_box.origin.y,
-                media_box.origin.x + media_box.size.width,
-                media_box.origin.y + media_box.size.height,
-            ))
-            .contents(pdf_ref(content_ids[index]));
-        if page.rotation != 0 {
-            page_writer.rotate(page.rotation);
-        }
-        if !page_annotation_ids[index].is_empty() {
-            page_writer.annotations(page_annotation_ids[index].iter().cloned().map(pdf_ref));
-        }
-        {
-            let mut resources = page_writer.resources();
-            write_resource_dictionary(
-                &mut resources,
-                font_id,
-                &page_image_ids[index],
-                &page_image_pattern_plans[index],
-                &page_renders[index],
-                &page_ext_gstate_plans[index],
-                page_renders[index]
-                    .form_xobjects
-                    .iter()
-                    .map(|form| (form.name.as_str(), form.id)),
-                color_plan,
-            );
-        }
-    }
-
-    for (index, page_render) in page_renders.iter().enumerate() {
-        let stream = encode_pdf_stream(compression, &page_render.stream);
-        let mut writer = pdf.stream(pdf_ref(content_ids[index]), stream.bytes());
-        if stream.uses_flate() {
-            writer.filter(Filter::FlateDecode);
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn write_resource_dictionary<'a>(
-    resources: &mut pdf_writer::writers::Resources<'_>,
-    font_id: usize,
-    page_image_ids: &[Option<PdfImageObjectId>],
-    page_image_pattern_plans: &[PageImagePatternPlan],
-    page_render: &PageContentRender,
-    ext_gstate_plans: &[ExtGStateObjectPlan],
-    form_xobjects: impl Iterator<Item = (&'a str, usize)>,
-    color_plan: &PdfColorPlan,
-) {
-    resources.pair(Name(b"Font"), pdf_ref(font_id));
-    color_plan.write_page_resources(resources);
-    let form_xobjects = form_xobjects.collect::<Vec<_>>();
-    if !page_image_ids.is_empty() || !form_xobjects.is_empty() {
-        let mut xobjects = resources.x_objects();
-        for (image_index, id) in page_image_ids.iter().enumerate() {
-            let Some(id) = id else {
-                continue;
-            };
-            let name = format!("Im{}", image_index + 1);
-            xobjects.pair(pdf_name(&name), pdf_ref(id.0));
-        }
-        for (name, id) in form_xobjects {
-            xobjects.pair(pdf_name(name), pdf_ref(id));
-        }
-    }
-    if !page_image_pattern_plans.is_empty()
-        || !page_render.gradient_patterns.is_empty()
-        || !page_render.gradient_tiling_patterns.is_empty()
-        || !page_render.svg_tiling_patterns.is_empty()
-        || !page_render.svg_path_tiling_patterns.is_empty()
-    {
-        let mut patterns = resources.patterns();
-        for plan in page_image_pattern_plans {
-            patterns.pair(pdf_name(&plan.name), pdf_ref(plan.id));
-        }
-        for plan in &page_render.gradient_patterns {
-            patterns.pair(pdf_name(&plan.name), pdf_ref(plan.id));
-            if let Some(alpha) = &plan.alpha {
-                patterns.pair(pdf_name(&alpha.pattern_name), pdf_ref(alpha.pattern_id));
-            }
-        }
-        for plan in &page_render.gradient_tiling_patterns {
-            patterns.pair(pdf_name(&plan.name), pdf_ref(plan.id));
-        }
-        for plan in &page_render.svg_tiling_patterns {
-            patterns.pair(pdf_name(&plan.name), pdf_ref(plan.id));
-        }
-        for plan in &page_render.svg_path_tiling_patterns {
-            patterns.pair(pdf_name(&plan.name), pdf_ref(plan.id));
-        }
-    }
-    write_ext_gstate_resources(resources, ext_gstate_plans, &page_render.gradient_patterns);
-}
-
-fn write_ext_gstate_resources(
-    resources: &mut pdf_writer::writers::Resources<'_>,
-    plans: &[ExtGStateObjectPlan],
-    gradients: &[GradientPatternPlan],
-) {
-    if plans.is_empty() && gradients.iter().all(|gradient| gradient.alpha.is_none()) {
-        return;
-    }
-    let mut ext_gstates = resources.ext_g_states();
-    for plan in plans {
-        ext_gstates.pair(pdf_name(plan.resource.name()), pdf_ref(plan.id));
-    }
-    for alpha in gradients
-        .iter()
-        .filter_map(|gradient| gradient.alpha.as_ref())
-    {
-        ext_gstates.pair(
-            pdf_name(&alpha.ext_gstate_name),
-            pdf_ref(alpha.ext_gstate_id),
-        );
-    }
-}
-
-fn write_embedded_fonts(
-    pdf: &mut Pdf,
-    embedded_fonts: &[EmbeddedFontPlan<'_>],
-    compression: crate::PdfCompression,
-) {
-    let _timer = DebugTimer::start(format!(
-        "building {} embedded font object set(s)",
-        embedded_fonts.len()
-    ));
-    for font in embedded_fonts {
-        pdf.type0_font(pdf_ref(font.type0_id))
-            .base_font(pdf_name(&font.base_name))
-            .encoding_predefined(Name(b"Identity-H"))
-            .descendant_font(pdf_ref(font.cid_font_id))
-            .to_unicode(pdf_ref(font.to_unicode_id));
-
-        let subtype = match font.font_program_kind {
-            FontProgramKind::TrueType => CidFontType::Type2,
-            FontProgramKind::OpenTypeCff => CidFontType::Type0,
-        };
-        {
-            let mut cid_font = pdf.cid_font(pdf_ref(font.cid_font_id));
-            cid_font
-                .subtype(subtype)
-                .base_font(pdf_name(&font.base_name))
-                .system_info(SystemInfo {
-                    registry: Str(b"Adobe"),
-                    ordering: Str(b"Identity"),
-                    supplement: 0,
-                })
-                .font_descriptor(pdf_ref(font.descriptor_id))
-                .default_width(font.default_width);
-            // CIDToGIDMap belongs to CIDFontType2 (TrueType) only. OpenType
-            // CFF programs use the CFF character identifiers directly; adding
-            // an Identity map makes PDF consumers address unrelated outlines.
-            // ISO 32000-2:2020, 9.7.4.3, CIDFontType2 dictionaries.
-            if font.font_program_kind == FontProgramKind::TrueType {
-                cid_font.cid_to_gid_map_predefined(Name(b"Identity"));
-            }
-            {
-                let mut widths = cid_font.widths();
-                for (glyph_id, width) in cid_width_entries(font) {
-                    widths.consecutive(glyph_id, [width]);
-                }
-            }
-        }
-
-        let metrics = &font.descriptor_metrics;
-        {
-            let mut descriptor = pdf.font_descriptor(pdf_ref(font.descriptor_id));
-            descriptor
-                .name(pdf_name(&font.base_name))
-                .flags(FontFlags::from_bits_retain(metrics.flags))
-                .bbox(Rect::new(
-                    metrics.bbox[0] as f32,
-                    metrics.bbox[1] as f32,
-                    metrics.bbox[2] as f32,
-                    metrics.bbox[3] as f32,
-                ))
-                .italic_angle(metrics.italic_angle)
-                .ascent(metrics.ascent)
-                .descent(metrics.descent)
-                .cap_height(metrics.cap_height)
-                .stem_v(metrics.stem_v);
-            if let Some(x_height) = metrics.x_height {
-                descriptor.x_height(x_height);
-            }
-            if let Some(avg_width) = metrics.avg_width {
-                descriptor.avg_width(avg_width);
-            }
-            if let Some(max_width) = metrics.max_width {
-                descriptor.max_width(max_width);
-            }
-            if let Some(missing_width) = metrics.missing_width {
-                descriptor.missing_width(missing_width);
-            }
-            if let Some(cid_set_id) = font.cid_set_id {
-                descriptor.cid_set(pdf_ref(cid_set_id));
-            }
-            match font.font_program_kind {
-                FontProgramKind::TrueType => {
-                    descriptor.font_file2(pdf_ref(font.file_id));
-                }
-                FontProgramKind::OpenTypeCff => {
-                    descriptor.font_file3(pdf_ref(font.file_id));
-                }
-            }
-        }
-
-        log_embedded_font_file(font);
-        let data = font.font_file_data.as_slice();
-        let stream = encode_pdf_stream(compression, data);
-        {
-            let mut font_file = pdf.stream(pdf_ref(font.file_id), stream.bytes());
-            if stream.uses_flate() {
-                font_file.filter(Filter::FlateDecode);
-            }
-            match font.font_program_kind {
-                FontProgramKind::TrueType => {
-                    font_file.pair(Name(b"Length1"), i32_from_usize(data.len()));
-                }
-                FontProgramKind::OpenTypeCff => {
-                    font_file.pair(Name(b"Subtype"), Name(b"CIDFontType0C"));
-                }
-            }
-        }
-
-        let cmap = to_unicode_cmap(font);
-        let cmap_stream = encode_pdf_stream(compression, &cmap);
-        {
-            let mut cmap_writer = pdf.cmap(pdf_ref(font.to_unicode_id), cmap_stream.bytes());
-            if cmap_stream.uses_flate() {
-                cmap_writer.filter(Filter::FlateDecode);
-            }
-        }
-        if let (Some(cid_set_id), Some(cid_set_data)) =
-            (font.cid_set_id, font.cid_set_data.as_ref())
-        {
-            let cid_set_stream = encode_pdf_stream(compression, cid_set_data);
-            let mut cid_set_writer = pdf.stream(pdf_ref(cid_set_id), cid_set_stream.bytes());
-            if cid_set_stream.uses_flate() {
-                cid_set_writer.filter(Filter::FlateDecode);
-            }
-        }
-    }
-}
-
+#[cfg(any())]
 fn write_images(
     pdf: &mut Pdf,
     prepared_images: &[PreparedImageResource],
@@ -790,7 +944,7 @@ fn write_images(
             image_writer
                 .width(i32_from_u32(image.pixel_width))
                 .height(i32_from_u32(image.pixel_height))
-                .bits_per_component(8)
+                .bits_per_component(image.sample_depth.bits_per_component())
                 .interpolate(image.interpolate);
             image_writer.color_space().icc_based(pdf_ref(
                 color_plan.image_profile_object_id(&image.color_space),
@@ -823,7 +977,7 @@ fn write_images(
                 .width(i32_from_u32(image.pixel_width))
                 .height(i32_from_u32(image.pixel_height))
                 .color_space_name(Name(b"DeviceGray"))
-                .bits_per_component(8)
+                .bits_per_component(image.sample_depth.bits_per_component())
                 .interpolate(image.interpolate);
             if alpha_stream.uses_flate() {
                 alpha_writer.filter(Filter::FlateDecode);
@@ -838,6 +992,7 @@ fn write_images(
 /// by the PDF consumer. Each Quire pattern cell paints one image XObject at the
 /// used CSS background tile size; the page content stream clips and fills the
 /// background painting area with the pattern color space.
+#[cfg(any())]
 fn write_image_patterns(
     pdf: &mut Pdf,
     page_image_pattern_plans: &[Vec<PageImagePatternPlan>],
@@ -853,19 +1008,7 @@ fn write_image_patterns(
             continue;
         }
 
-        let mut content = Content::new();
-        content
-            .transform([
-                pattern.tiling.tile_size.width,
-                0.0,
-                0.0,
-                pattern.tiling.tile_size.height,
-                0.0,
-                0.0,
-            ])
-            .x_object(pdf_name("Im1"));
-        let stream = content.finish().into_vec();
-        let stream = encode_pdf_stream(compression, &stream);
+        let stream = encode_pdf_stream(compression, &plan.stream.bytes);
         let mut pattern_writer = pdf.tiling_pattern(pdf_ref(plan.id), stream.bytes());
         if stream.uses_flate() {
             pattern_writer.filter(Filter::FlateDecode);
@@ -888,11 +1031,12 @@ fn write_image_patterns(
             .x_step(pattern.tiling.step.width)
             .y_step(pattern.tiling.step.height)
             .matrix(matrix.pdf_components());
-        {
-            let mut resources = pattern_writer.resources();
-            let mut xobjects = resources.x_objects();
-            xobjects.pair(pdf_name("Im1"), pdf_ref(plan.tile_image_id.0));
-        }
+        let bindings = plan
+            .stream
+            .resolved_resources
+            .as_ref()
+            .expect("image-pattern stream is resolved during planning");
+        write_resource_dictionary(&mut pattern_writer.resources(), bindings);
     }
 }
 
@@ -901,12 +1045,14 @@ fn write_image_patterns(
 /// SVG 2, 13.2 maps to PDF axial/radial shadings. Each stop interval is a
 /// Type 2 exponential interpolation; three or more intervals use a Type 3
 /// stitching function as defined by ISO 32000-2:2020, 8.9.1-8.9.3.
-fn write_gradient_patterns(
+fn write_gradient_patterns<'a>(
     pdf: &mut Pdf,
-    page_renders: &[PageContentRender],
+    page_renders: impl IntoIterator<Item = &'a PageContentRender>,
     color_plan: &PdfColorPlan,
+    dynamic_resources: &PdfResourcePlanner,
     compression: crate::PdfCompression,
 ) {
+    let page_renders = page_renders.into_iter().collect::<Vec<_>>();
     for plan in page_renders
         .iter()
         .flat_map(|render| &render.gradient_patterns)
@@ -915,7 +1061,7 @@ fn write_gradient_patterns(
         if let Some(periodic) = &plan.gradient.periodic {
             write_periodic_gradient_color_function(
                 pdf,
-                plan.function_ids[0],
+                dynamic_resources.function(plan.function_ids[0]),
                 periodic,
                 color_plan,
                 output_space,
@@ -924,11 +1070,18 @@ fn write_gradient_patterns(
                 pdf,
                 plan,
                 color_plan,
-                plan.function_ids[0],
+                dynamic_resources.function(plan.function_ids[0]),
                 output_space,
+                dynamic_resources,
             );
             if let Some(alpha) = &plan.alpha {
-                write_periodic_gradient_alpha_pattern(pdf, plan, alpha, periodic);
+                write_periodic_gradient_alpha_pattern(
+                    pdf,
+                    plan,
+                    alpha,
+                    periodic,
+                    dynamic_resources,
+                );
             }
             continue;
         }
@@ -950,13 +1103,13 @@ fn write_gradient_patterns(
             if (from.alpha() - to.alpha()).abs() > 0.0001 {
                 write_premultiplied_gradient_color_function(
                     pdf,
-                    *id,
+                    dynamic_resources.function(*id),
                     from,
                     to,
                     interval[0].interpolation_exponent,
                 );
             } else {
-                pdf.exponential_function(pdf_ref(*id))
+                pdf.exponential_function(pdf_ref(dynamic_resources.function(*id)))
                     .domain([0.0, 1.0])
                     .c0([
                         from.components()[0],
@@ -971,18 +1124,30 @@ fn write_gradient_patterns(
             let bounds = plan.gradient.stops[1..plan.gradient.stops.len() - 1]
                 .iter()
                 .map(|stop| stop.offset);
-            pdf.stitching_function(pdf_ref(stitching_id))
+            pdf.stitching_function(pdf_ref(dynamic_resources.function(stitching_id)))
                 .domain([0.0, 1.0])
-                .functions(interval_ids.iter().cloned().map(pdf_ref))
+                .functions(
+                    interval_ids
+                        .iter()
+                        .copied()
+                        .map(|id| pdf_ref(dynamic_resources.function(id))),
+                )
                 .bounds(bounds)
                 .encode((0..interval_count).flat_map(|_| [0.0, 1.0]));
             stitching_id
         } else {
             interval_ids[0]
         };
-        write_gradient_shading_pattern(pdf, plan, color_plan, function_id, output_space);
+        write_gradient_shading_pattern(
+            pdf,
+            plan,
+            color_plan,
+            dynamic_resources.function(function_id),
+            output_space,
+            dynamic_resources,
+        );
         if let Some(alpha) = &plan.alpha {
-            write_gradient_alpha_pattern(pdf, plan, alpha);
+            write_gradient_alpha_pattern(pdf, plan, alpha, dynamic_resources);
         }
     }
     for plan in page_renders
@@ -990,25 +1155,9 @@ fn write_gradient_patterns(
         .flat_map(|render| &render.gradient_tiling_patterns)
     {
         let pattern = &plan.pattern;
-        let mut content = Content::new();
-        content.save_state();
-        if let Some(name) = &plan.alpha_gstate_name {
-            content.set_parameters(pdf_name(name));
-        }
-        content
-            .set_fill_color_space(ColorSpaceOperand::Pattern)
-            .set_fill_pattern([], pdf_name(&plan.shading_pattern_name))
-            .rect(
-                0.0,
-                0.0,
-                pattern.tiling.tile_size.width,
-                pattern.tiling.tile_size.height,
-            )
-            .fill_nonzero()
-            .restore_state();
-        let stream = content.finish().into_vec();
-        let stream = encode_pdf_stream(compression, &stream);
-        let mut writer = pdf.tiling_pattern(pdf_ref(plan.id), stream.bytes());
+        let stream = encode_pdf_stream(compression, &plan.stream.bytes);
+        let mut writer =
+            pdf.tiling_pattern(pdf_ref(dynamic_resources.pattern(plan.id)), stream.bytes());
         if stream.uses_flate() {
             writer.filter(Filter::FlateDecode);
         }
@@ -1030,34 +1179,21 @@ fn write_gradient_patterns(
             .x_step(pattern.tiling.step.width)
             .y_step(pattern.tiling.step.height)
             .matrix(matrix.pdf_components());
-        let mut resources = writer.resources();
-        resources.patterns().pair(
-            pdf_name(&plan.shading_pattern_name),
-            pdf_ref(find_gradient_pattern_id(
-                page_renders,
-                &plan.shading_pattern_name,
-            )),
-        );
-        if let Some(name) = &plan.alpha_gstate_name {
-            resources.ext_g_states().pair(
-                pdf_name(name),
-                pdf_ref(find_gradient_alpha_gstate_id(
-                    page_renders,
-                    &plan.shading_pattern_name,
-                )),
-            );
-        }
+        let bindings = plan
+            .stream
+            .resolved_resources
+            .as_ref()
+            .expect("gradient tiling stream is resolved during planning");
+        write_resource_dictionary(&mut writer.resources(), bindings);
     }
     for plan in page_renders
         .iter()
         .flat_map(|render| &render.svg_tiling_patterns)
     {
         let pattern = &plan.pattern;
-        let mut content = Content::new();
-        content.x_object(pdf_name(&plan.form_name));
-        let stream = content.finish().into_vec();
-        let stream = encode_pdf_stream(compression, &stream);
-        let mut writer = pdf.tiling_pattern(pdf_ref(plan.id), stream.bytes());
+        let stream = encode_pdf_stream(compression, &plan.stream.bytes);
+        let mut writer =
+            pdf.tiling_pattern(pdf_ref(dynamic_resources.pattern(plan.id)), stream.bytes());
         if stream.uses_flate() {
             writer.filter(Filter::FlateDecode);
         }
@@ -1073,19 +1209,21 @@ fn write_gradient_patterns(
             .x_step(pattern.tiling.step.width)
             .y_step(pattern.tiling.step.height)
             .matrix(plan.transform.pdf_components());
-        writer
-            .resources()
-            .x_objects()
-            .pair(pdf_name(&plan.form_name), pdf_ref(plan.form_id));
+        let bindings = plan
+            .stream
+            .resolved_resources
+            .as_ref()
+            .expect("SVG tiling stream is resolved during planning");
+        write_resource_dictionary(&mut writer.resources(), bindings);
     }
     for plan in page_renders
         .iter()
         .flat_map(|render| &render.svg_path_tiling_patterns)
     {
         let pattern = &plan.pattern;
-        let stream = svg_path_pattern_tile_content(pattern, color_plan.mode());
-        let stream = encode_pdf_stream(compression, &stream);
-        let mut writer = pdf.tiling_pattern(pdf_ref(plan.id), stream.bytes());
+        let stream = encode_pdf_stream(compression, &plan.stream.bytes);
+        let mut writer =
+            pdf.tiling_pattern(pdf_ref(dynamic_resources.pattern(plan.id)), stream.bytes());
         if stream.uses_flate() {
             writer.filter(Filter::FlateDecode);
         }
@@ -1108,20 +1246,13 @@ fn write_gradient_patterns(
             .x_step(pattern.tile_size.width)
             .y_step(pattern.tile_size.height)
             .matrix(matrix.pdf_components());
-        // A tiling pattern has a Resources entry even when its supported
-        // solid-vector cell needs no named resources.  Some PDF consumers
-        // reject an omitted dictionary rather than treating it as empty.
-        color_plan.write_page_resources(&mut writer.resources());
+        let bindings = plan
+            .stream
+            .resolved_resources
+            .as_ref()
+            .expect("SVG path tiling stream is resolved during planning");
+        write_resource_dictionary(&mut writer.resources(), bindings);
     }
-}
-
-fn find_gradient_pattern_id(page_renders: &[PageContentRender], name: &str) -> usize {
-    page_renders
-        .iter()
-        .flat_map(|render| &render.gradient_patterns)
-        .find(|plan| plan.name == name)
-        .map(|plan| plan.id)
-        .expect("tiling gradient must reference a page shading pattern")
 }
 
 fn write_gradient_shading_pattern(
@@ -1130,8 +1261,9 @@ fn write_gradient_shading_pattern(
     color_plan: &PdfColorPlan,
     function_id: usize,
     output_space: crate::css::CssColorSpace,
+    dynamic_resources: &PdfResourcePlanner,
 ) {
-    let mut pattern = pdf.shading_pattern(pdf_ref(plan.id));
+    let mut pattern = pdf.shading_pattern(pdf_ref(dynamic_resources.pattern(plan.id)));
     pattern.matrix(plan.gradient.transform.pdf_components());
     let mut shading = pattern.function_shading();
     shading
@@ -1160,19 +1292,6 @@ fn write_gradient_shading_pattern(
             ]);
         }
     }
-}
-
-/// Find the soft-mask graphics state paired with a shading resource. The
-/// enclosing Type 1 tiling pattern has its own resource dictionary, so it
-/// cannot rely on the page-level ExtGState entry used by a direct path paint.
-fn find_gradient_alpha_gstate_id(page_renders: &[PageContentRender], name: &str) -> usize {
-    page_renders
-        .iter()
-        .flat_map(|render| &render.gradient_patterns)
-        .find(|plan| plan.name == name)
-        .and_then(|plan| plan.alpha.as_ref())
-        .map(|alpha| alpha.ext_gstate_id)
-        .expect("tiling gradient alpha resource must have an ExtGState")
 }
 
 /// Emit a Type 4 function for an interval whose opacity changes.
@@ -1377,17 +1496,21 @@ fn write_periodic_gradient_alpha_pattern(
     plan: &GradientPatternPlan,
     alpha: &GradientAlphaPlan,
     periodic: &crate::document::paint::paths::RenderedPeriodicGradient,
+    dynamic_resources: &PdfResourcePlanner,
 ) {
     let code = periodic_gradient_function_code(periodic, &periodic.stops, true);
-    pdf.post_script_function(pdf_ref(alpha.function_ids[0]), code.as_bytes())
-        .domain([0.0, 1.0])
-        .range([0.0, 1.0]);
-    let mut pattern = pdf.shading_pattern(pdf_ref(alpha.pattern_id));
+    pdf.post_script_function(
+        pdf_ref(dynamic_resources.function(alpha.function_ids[0])),
+        code.as_bytes(),
+    )
+    .domain([0.0, 1.0])
+    .range([0.0, 1.0]);
+    let mut pattern = pdf.shading_pattern(pdf_ref(dynamic_resources.pattern(alpha.pattern_id)));
     pattern.matrix(plan.gradient.transform.pdf_components());
     let mut shading = pattern.function_shading();
     shading.color_space().device_gray();
     shading
-        .function(pdf_ref(alpha.function_ids[0]))
+        .function(pdf_ref(dynamic_resources.function(alpha.function_ids[0])))
         .extend([true, true]);
     match &plan.gradient.kind {
         crate::document::paint::paths::RenderedGradientKind::Linear { start, end } => {
@@ -1417,6 +1540,7 @@ fn write_gradient_alpha_pattern(
     pdf: &mut Pdf,
     plan: &GradientPatternPlan,
     alpha: &GradientAlphaPlan,
+    dynamic_resources: &PdfResourcePlanner,
 ) {
     let interval_count = plan.gradient.stops.len().saturating_sub(1);
     if interval_count == 0 {
@@ -1431,7 +1555,7 @@ fn write_gradient_alpha_pattern(
         )
     };
     for (interval, id) in plan.gradient.stops.windows(2).zip(interval_ids) {
-        pdf.exponential_function(pdf_ref(*id))
+        pdf.exponential_function(pdf_ref(dynamic_resources.function(*id)))
             .domain([0.0, 1.0])
             .c0([interval[0].color.alpha()])
             .c1([interval[1].color.alpha()])
@@ -1441,9 +1565,14 @@ fn write_gradient_alpha_pattern(
         let bounds = plan.gradient.stops[1..plan.gradient.stops.len() - 1]
             .iter()
             .map(|stop| stop.offset);
-        pdf.stitching_function(pdf_ref(stitching_id))
+        pdf.stitching_function(pdf_ref(dynamic_resources.function(stitching_id)))
             .domain([0.0, 1.0])
-            .functions(interval_ids.iter().cloned().map(pdf_ref))
+            .functions(
+                interval_ids
+                    .iter()
+                    .copied()
+                    .map(|id| pdf_ref(dynamic_resources.function(id))),
+            )
             .bounds(bounds)
             .encode((0..interval_count).flat_map(|_| [0.0, 1.0]));
         stitching_id
@@ -1451,11 +1580,13 @@ fn write_gradient_alpha_pattern(
         interval_ids[0]
     };
     let transform = plan.gradient.transform;
-    let mut pattern = pdf.shading_pattern(pdf_ref(alpha.pattern_id));
+    let mut pattern = pdf.shading_pattern(pdf_ref(dynamic_resources.pattern(alpha.pattern_id)));
     pattern.matrix(transform.pdf_components());
     let mut shading = pattern.function_shading();
     shading.color_space().device_gray();
-    shading.function(pdf_ref(function_id)).extend([true, true]);
+    shading
+        .function(pdf_ref(dynamic_resources.function(function_id)))
+        .extend([true, true]);
     match &plan.gradient.kind {
         crate::document::paint::paths::RenderedGradientKind::Linear { start, end } => {
             shading
@@ -1480,11 +1611,13 @@ fn write_gradient_alpha_pattern(
     }
 }
 
-fn write_gradient_alpha_forms(
+fn write_gradient_alpha_forms<'a>(
     pdf: &mut Pdf,
-    page_renders: &[PageContentRender],
+    page_renders: impl IntoIterator<Item = &'a PageContentRender>,
+    dynamic_resources: &PdfResourcePlanner,
     compression: crate::PdfCompression,
 ) {
+    let page_renders = page_renders.into_iter().collect::<Vec<_>>();
     for plan in page_renders
         .iter()
         .flat_map(|render| &render.gradient_patterns)
@@ -1492,15 +1625,11 @@ fn write_gradient_alpha_forms(
         let Some(alpha) = &plan.alpha else {
             continue;
         };
-        let mut content = Content::new();
-        content
-            .set_fill_color_space(ColorSpaceOperand::Pattern)
-            .set_fill_pattern([], pdf_name(&alpha.pattern_name))
-            .rect(0.0, 0.0, alpha.page_size.width, alpha.page_size.height)
-            .fill_nonzero();
-        let stream = content.finish().into_vec();
-        let stream = encode_pdf_stream(compression, &stream);
-        let mut form = pdf.form_xobject(pdf_ref(alpha.form_id), stream.bytes());
+        let stream = encode_pdf_stream(compression, &alpha.stream.bytes);
+        let mut form = pdf.form_xobject(
+            pdf_ref(dynamic_resources.form(alpha.form_id)),
+            stream.bytes(),
+        );
         if stream.uses_flate() {
             form.filter(Filter::FlateDecode);
         }
@@ -1515,41 +1644,49 @@ fn write_gradient_alpha_forms(
             group.transparency();
             group.color_space().device_gray();
         }
-        let mut resources = form.resources();
-        let mut patterns = resources.patterns();
-        patterns.pair(pdf_name(&alpha.pattern_name), pdf_ref(alpha.pattern_id));
+        let bindings = alpha
+            .stream
+            .resolved_resources
+            .as_ref()
+            .expect("gradient alpha stream is resolved during planning");
+        write_resource_dictionary(&mut form.resources(), bindings);
     }
 }
 
-fn write_gradient_alpha_ext_gstates(pdf: &mut Pdf, page_renders: &[PageContentRender]) {
+fn write_gradient_alpha_ext_gstates<'a>(
+    pdf: &mut Pdf,
+    page_renders: impl IntoIterator<Item = &'a PageContentRender>,
+    dynamic_resources: &PdfResourcePlanner,
+) {
+    let page_renders = page_renders.into_iter().collect::<Vec<_>>();
     for alpha in page_renders
         .iter()
         .flat_map(|render| &render.gradient_patterns)
         .filter_map(|gradient| gradient.alpha.as_ref())
     {
-        let mut state = pdf.ext_graphics(pdf_ref(alpha.ext_gstate_id));
+        let mut state =
+            pdf.ext_graphics(pdf_ref(dynamic_resources.ext_gstate(alpha.ext_gstate_id)));
         state
             .soft_mask()
             .subtype(MaskType::Luminosity)
-            .group(pdf_ref(alpha.form_id));
+            .group(pdf_ref(dynamic_resources.form(alpha.form_id)));
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn write_form_xobjects(
+fn write_form_xobjects<'a>(
     pdf: &mut Pdf,
-    font_id: usize,
-    page_image_ids: &[Vec<Option<PdfImageObjectId>>],
-    page_image_pattern_plans: &[Vec<PageImagePatternPlan>],
-    page_renders: &[PageContentRender],
-    page_ext_gstate_plans: &[Vec<ExtGStateObjectPlan>],
+    page_renders: impl IntoIterator<Item = &'a PageContentRender>,
     color_plan: &PdfColorPlan,
+    dynamic_resources: &PdfResourcePlanner,
     compression: crate::PdfCompression,
 ) {
-    for (page_index, page_render) in page_renders.iter().enumerate() {
+    let page_renders = page_renders.into_iter().collect::<Vec<_>>();
+    for page_render in page_renders {
         for form in &page_render.form_xobjects {
-            let stream = encode_pdf_stream(compression, &form.stream);
-            let mut form_writer = pdf.form_xobject(pdf_ref(form.id), stream.bytes());
+            let stream = encode_pdf_stream(compression, &form.stream.bytes);
+            let mut form_writer =
+                pdf.form_xobject(pdf_ref(dynamic_resources.form(form.id)), stream.bytes());
             if stream.uses_flate() {
                 form_writer.filter(Filter::FlateDecode);
             }
@@ -1559,92 +1696,26 @@ fn write_form_xobjects(
                 form.bbox.x() + form.bbox.width(),
                 form.bbox.y() + form.bbox.height(),
             ));
-            if form.transparency_group {
+            if let PdfFormKind::TransparencyGroup { blending_space } = form.kind {
                 let mut group = form_writer.group();
                 group.transparency().isolated(true);
-                group
-                    .color_space()
-                    .icc_based(pdf_ref(color_plan.srgb_profile_object_id()));
+                match blending_space {
+                    PdfBlendColorSpace::Srgb => group.color_space().icc_based(pdf_ref(
+                        color_plan.profile_object_id(crate::css::CssColorSpace::Srgb),
+                    )),
+                };
             }
             {
                 let mut resources = form_writer.resources();
-                if form.transparency_group {
-                    write_resource_dictionary(
-                        &mut resources,
-                        font_id,
-                        &page_image_ids[page_index],
-                        &page_image_pattern_plans[page_index],
-                        page_render,
-                        &page_ext_gstate_plans[page_index],
-                        form.form_dependencies
-                            .iter()
-                            .map(|dependency| (dependency.name.as_str(), dependency.id)),
-                        color_plan,
-                    );
-                } else {
-                    // A tile form is called by its owning tiling pattern.
-                    // Giving it the page's complete XObject dictionary would
-                    // make the form reference itself, which PDF consumers
-                    // correctly treat as a recursive resource. Keep only
-                    // resources that a vector tile path can actually use.
-                    write_svg_tile_resource_dictionary(
-                        &mut resources,
-                        &page_image_ids[page_index],
-                        &page_image_pattern_plans[page_index],
-                        page_render,
-                        &page_ext_gstate_plans[page_index],
-                        color_plan,
-                    );
-                }
+                let bindings = form
+                    .stream
+                    .resolved_resources
+                    .as_ref()
+                    .expect("every Form stream is resolved before serialization");
+                write_resource_dictionary(&mut resources, bindings);
             }
         }
     }
-}
-
-fn write_svg_tile_resource_dictionary(
-    resources: &mut pdf_writer::writers::Resources<'_>,
-    page_image_ids: &[Option<PdfImageObjectId>],
-    page_image_pattern_plans: &[PageImagePatternPlan],
-    page_render: &PageContentRender,
-    ext_gstate_plans: &[ExtGStateObjectPlan],
-    color_plan: &PdfColorPlan,
-) {
-    // SVG text is intentionally unsupported, so a tile Form never needs the
-    // document's text font. Omitting the empty page-font dictionary also
-    // keeps PDF validators from treating it as an invalid font resource.
-    color_plan.write_page_resources(resources);
-    if !page_image_ids.is_empty() {
-        let mut xobjects = resources.x_objects();
-        for (index, image_id) in page_image_ids.iter().enumerate() {
-            let Some(image_id) = image_id else {
-                continue;
-            };
-            xobjects.pair(pdf_name(&format!("Im{}", index + 1)), pdf_ref(image_id.0));
-        }
-    }
-    if !page_image_pattern_plans.is_empty()
-        || !page_render.gradient_patterns.is_empty()
-        || !page_render.gradient_tiling_patterns.is_empty()
-        || !page_render.svg_path_tiling_patterns.is_empty()
-    {
-        let mut patterns = resources.patterns();
-        for plan in page_image_pattern_plans {
-            patterns.pair(pdf_name(&plan.name), pdf_ref(plan.id));
-        }
-        for plan in &page_render.gradient_patterns {
-            patterns.pair(pdf_name(&plan.name), pdf_ref(plan.id));
-            if let Some(alpha) = &plan.alpha {
-                patterns.pair(pdf_name(&alpha.pattern_name), pdf_ref(alpha.pattern_id));
-            }
-        }
-        for plan in &page_render.gradient_tiling_patterns {
-            patterns.pair(pdf_name(&plan.name), pdf_ref(plan.id));
-        }
-        for plan in &page_render.svg_path_tiling_patterns {
-            patterns.pair(pdf_name(&plan.name), pdf_ref(plan.id));
-        }
-    }
-    write_ext_gstate_resources(resources, ext_gstate_plans, &page_render.gradient_patterns);
 }
 
 fn write_ext_gstate_objects(pdf: &mut Pdf, page_ext_gstate_plans: &[Vec<ExtGStateObjectPlan>]) {
@@ -1658,76 +1729,6 @@ fn write_ext_gstate_objects(pdf: &mut Pdf, page_ext_gstate_plans: &[Vec<ExtGStat
                 ext_gstate.blend_mode((*mode).into());
             }
         }
-    }
-}
-
-fn write_annotations(pdf: &mut Pdf, document: &Document, page_annotation_ids: &[Vec<usize>]) {
-    for (page_index, page) in document.pages.iter().enumerate() {
-        for (link_index, link) in page.links.iter().enumerate() {
-            let mut annotation =
-                pdf.annotation(pdf_ref(page_annotation_ids[page_index][link_index]));
-            let rect = crate::document::paint::geometry::paint_rect_to_pdf(link.paint_rect());
-            annotation
-                .subtype(AnnotationType::Link)
-                .rect(Rect::new(
-                    rect.origin.x,
-                    rect.origin.y,
-                    rect.origin.x + rect.size.width,
-                    rect.origin.y + rect.size.height,
-                ))
-                .border(0.0, 0.0, 0.0, None);
-            annotation
-                .action()
-                .action_type(ActionType::Uri)
-                .uri(Str(link.target.as_bytes()));
-        }
-    }
-}
-
-fn write_outlines(pdf: &mut Pdf, plan: &OutlinePlan, page_ids: &[usize], document: &Document) {
-    let top_level_ids = plan
-        .nodes
-        .iter()
-        .filter(|node| node.parent_id == plan.root_id)
-        .map(|node| node.id)
-        .collect::<Vec<_>>();
-    {
-        let mut outline = pdf.outline(pdf_ref(plan.root_id));
-        outline.count(plan.visible_count);
-        if let Some(first) = top_level_ids.iter().min().cloned() {
-            outline.first(pdf_ref(first));
-        }
-        if let Some(last) = top_level_ids.iter().max().cloned() {
-            outline.last(pdf_ref(last));
-        }
-    }
-
-    for node in &plan.nodes {
-        let page_index = node
-            .bookmark
-            .page_index
-            .min(document.pages.len().saturating_sub(1));
-        let page_id = page_ids.get(page_index).cloned().unwrap_or(0);
-        let mut item = pdf.outline_item(pdf_ref(node.id));
-        item.title(TextStr(&node.bookmark.label))
-            .parent(pdf_ref(node.parent_id))
-            .count(node.child_count);
-        if let Some(id) = node.prev_id {
-            item.prev(pdf_ref(id));
-        }
-        if let Some(id) = node.next_id {
-            item.next(pdf_ref(id));
-        }
-        if let Some(id) = node.first_child_id {
-            item.first(pdf_ref(id));
-        }
-        if let Some(id) = node.last_child_id {
-            item.last(pdf_ref(id));
-        }
-        let target = crate::document::paint::geometry::paint_point_to_pdf(node.bookmark.target());
-        item.dest()
-            .page(pdf_ref(page_id))
-            .xyz(target.x, target.y, Some(0.0));
     }
 }
 
@@ -1783,7 +1784,7 @@ fn pdf_file_identifier(
 
     hash.write_usize(page_renders.len());
     for render in page_renders {
-        hash.write_bytes(&render.stream);
+        hash.write_bytes(&render.stream.bytes);
         hash.write_usize(render.form_xobjects.len());
         for form in &render.form_xobjects {
             hash.write_str(&form.name);
@@ -1791,12 +1792,22 @@ fn pdf_file_identifier(
             hash.write_f32(form.bbox.y());
             hash.write_f32(form.bbox.width());
             hash.write_f32(form.bbox.height());
-            hash.write_bytes(&form.stream);
-            hash.write_bool(form.transparency_group);
-            hash.write_usize(form.form_dependencies.len());
-            for dependency in &form.form_dependencies {
-                hash.write_usize(dependency.id);
-                hash.write_str(&dependency.name);
+            hash.write_bytes(&form.stream.bytes);
+            hash.write_bool(matches!(form.kind, PdfFormKind::TransparencyGroup { .. }));
+            let form_dependencies = form
+                .stream
+                .resource_uses
+                .xobjects
+                .iter()
+                .filter_map(|(name, handle)| match handle {
+                    PdfXObjectHandle::Form(handle) => Some((name, handle)),
+                    PdfXObjectHandle::Image(_) => None,
+                })
+                .collect::<Vec<_>>();
+            hash.write_usize(form_dependencies.len());
+            for (name, dependency) in form_dependencies {
+                hash.write_usize(dependency.0.0);
+                hash.write_str(name);
             }
         }
         hash.write_usize(render.gradient_patterns.len());
@@ -1839,10 +1850,13 @@ fn pdf_file_identifier(
             ImageResourceSource::Stored {
                 image_id,
                 source_rect,
-                interpolate,
+                sampling,
+                target_size,
             } => {
                 hash.write_u8(1);
-                hash.write_bool(*interpolate);
+                hash.write_u8(*sampling as u8);
+                hash.write_u32(target_size.width);
+                hash.write_u32(target_size.height);
                 hash.write_source_rect(*source_rect);
                 document
                     .image_store
@@ -1851,15 +1865,31 @@ fn pdf_file_identifier(
             ImageResourceSource::Inline {
                 pixel_width,
                 pixel_height,
-                interpolate,
+                natural_size,
+                source_rect,
+                sampling,
+                target_size,
                 rgb,
                 alpha,
                 color_space,
+                sample_depth,
             } => {
                 hash.write_u8(2);
                 hash.write_u32(*pixel_width);
                 hash.write_u32(*pixel_height);
-                hash.write_bool(*interpolate);
+                hash.write_u32(natural_size.width);
+                hash.write_u32(natural_size.height);
+                match source_rect {
+                    Some(source_rect) => {
+                        hash.write_bool(true);
+                        hash.write_source_rect(*source_rect);
+                    }
+                    None => hash.write_bool(false),
+                }
+                hash.write_u8(*sampling as u8);
+                hash.write_u32(target_size.width);
+                hash.write_u32(target_size.height);
+                hash.write_i32(sample_depth.bits_per_component());
                 match color_space {
                     crate::color::RasterColorSpace::BuiltIn(space) => {
                         hash.write_u8(1);
@@ -1895,7 +1925,7 @@ fn pdf_file_identifier(
             hash.write_f32(pattern.tiling.step.height);
             hash.write_f32(pattern.tiling.origin.x);
             hash.write_f32(pattern.tiling.origin.y);
-            hash.write_bool(pattern.interpolate);
+            hash.write_u8(pattern.sampling as u8);
             hash.write_bool(pattern.clip().is_some());
         }
     }
@@ -2113,58 +2143,4 @@ impl PdfFileIdentifierHash {
         value = value.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
         value ^ (value >> 33)
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct PdfObjectAllocator {
-    next_id: usize,
-}
-
-impl PdfObjectAllocator {
-    fn new() -> Self {
-        Self { next_id: 1 }
-    }
-
-    fn alloc_id(&mut self) -> usize {
-        self.reserve_ids(1)
-    }
-
-    fn alloc_ids(&mut self, count: usize) -> Vec<usize> {
-        let first = self.reserve_ids(count);
-        (first..first + count).collect()
-    }
-
-    fn reserve_ids(&mut self, count: usize) -> usize {
-        let first = self.next_id;
-        self.next_id += count;
-        first
-    }
-
-    fn peek_id(&self) -> usize {
-        self.next_id
-    }
-
-    fn advance_to(&mut self, next_id: usize) {
-        assert!(
-            next_id >= self.next_id,
-            "PDF object allocator cannot move backwards"
-        );
-        self.next_id = next_id;
-    }
-}
-
-fn pdf_ref(id: usize) -> Ref {
-    Ref::new(i32_from_usize(id))
-}
-
-fn pdf_name(name: &str) -> Name<'_> {
-    Name(name.as_bytes())
-}
-
-fn i32_from_usize(value: usize) -> i32 {
-    i32::try_from(value).expect("PDF object value exceeds i32 range")
-}
-
-fn i32_from_u32(value: u32) -> i32 {
-    i32::try_from(value).expect("PDF object value exceeds i32 range")
 }

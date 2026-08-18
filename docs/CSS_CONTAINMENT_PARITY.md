@@ -1,14 +1,15 @@
 # CSS Containment parity
 
-Last updated: 2026-08-04
+Last updated: 2026-08-16
 
 Root/body containment is resolved before layout from the cascaded `html` and
-first eligible `body` styles. A non-`none` used `contain` value (including
-`inline-size` and `style`) on either element disables body property
-propagation to the principal flow, viewport overflow, and canvas background;
-`content-visibility` alone does not. When propagation is disabled, the body
-is an ordinary principal block rather than a document-canvas-flow source;
-root/body principal boxes still receive their normal containment effects.
+first eligible `body` styles. Any active containment (a non-`none` used
+`contain` value, including `inline-size` and `style`, or
+`content-visibility: auto`/`hidden`) on either element disables body property
+propagation to the principal flow, viewport overflow, and canvas background.
+When propagation is disabled, the root supplies the document-canvas flow and
+the body is an ordinary principal block; root/body principal boxes still
+receive their normal containment effects.
 This is not a statement about CSS Container Query evaluation.
 
 ## Implemented value surface
@@ -45,7 +46,8 @@ This is not a statement about CSS Container Query evaluation.
   document-level propagation resolver as background and viewport overflow.
   It preserves computed inherited writing-mode and text-orientation inside
   the subtree while preventing the body's values from becoming root used
-  values.
+  values. Vertical direct-child placement follows the actual document-canvas
+  source, whether that is the root or an eligible propagated body.
 - `contain: inline-size` is parsed separately from `size`; intrinsic inline
   contributions are suppressed by logical axis in normal-flow, Flexbox, Grid,
   and table measurement while orthogonal physical block contributions remain.

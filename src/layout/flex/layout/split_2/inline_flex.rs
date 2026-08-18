@@ -1,6 +1,7 @@
 use super::*;
 use crate::layout::builder::{page_for_context, positioned_layer_fragment};
 use crate::layout::flex::compute::effective_align_self;
+use crate::units::Definite;
 
 /// Convert Flexbox's main-axis content alignment into the equivalent
 /// self-alignment used to retain an abspos child's static-position rectangle.
@@ -104,10 +105,12 @@ mod flex_abspos_static_geometry_tests {
     use super::*;
 
     fn geometry(direction: FlexDirection) -> FlexAbsposStaticGeometry {
+        let mut container_style = ComputedStyle::initial();
+        container_style.flex_direction = direction;
         FlexAbsposStaticGeometry {
             flex_content_box: PageTopRect::new(100.0, 500.0, 200.0, 80.0),
             hypothetical_margin_box: PageTopRect::new(130.0, 470.0, 40.0, 20.0),
-            flex_axes: FlexAxes::from_physical_direction(PhysicalFlexDirection::new(direction)),
+            flex_axes: FlexAxes::for_style(&container_style),
             inline_alignment: css::SelfAlignment::NORMAL,
             block_alignment: css::SelfAlignment::NORMAL,
             container_writing_mode: WritingMode::HorizontalTb,
@@ -384,6 +387,16 @@ impl<'a> LayoutBuilder<'a> {
         let vertical_non_content = box_metrics.vertical_non_content_length();
         let (mut children, mut positioned_children) =
             flex_child_lists_from_boxes(element, signature, style, child_boxes);
+        // Intrinsic sizing of an automatic `inline-flex` must retain cyclic
+        // percentage padding as unresolved. Resolving its items against the
+        // surrounding inline formatting context here would feed that context
+        // width into the flex container's own shrink-to-fit width. Keep a
+        // source-style snapshot for the intrinsic pass; final flex layout
+        // below receives the ordinary used-length children after its content
+        // width is known.
+        // <https://www.w3.org/TR/css-sizing-3/#percentage-sizing>
+        // <https://www.w3.org/TR/css-flexbox-1/#intrinsic-sizes>
+        let intrinsic_children = children.clone();
         self.resolve_styled_children_used_lengths(&mut children);
         self.resolve_styled_children_used_lengths(&mut positioned_children);
 
@@ -404,7 +417,7 @@ impl<'a> LayoutBuilder<'a> {
             )
         } else {
             self.estimate_intrinsic_flex_container_size(
-                &children,
+                &intrinsic_children,
                 style,
                 stylesheets,
                 FlexAvailableSpace {
@@ -497,7 +510,7 @@ impl<'a> LayoutBuilder<'a> {
             };
             return InlineAtom::new(
                 InlineAtomContent::InlineBox { sequence },
-                style.as_computed().clone(),
+                style.clone_used_style(),
                 None,
                 InlineSize::new(
                     content_width_points
@@ -651,6 +664,10 @@ impl<'a> LayoutBuilder<'a> {
                 layout_pt(border_widths.left + style.padding.left),
             )
         });
+        // The off-page atom capture may lay out descendant lines, but they
+        // are not principal lines of an ancestor list item. Keep the
+        // ancestor's marker anchors out of this scratch coordinate space.
+        let pending_outside_marker_anchors = self.pending_outside_marker_anchors.suspend();
         let snapshot = self.snapshot();
         // The scratch page below is only a flex-paint construction space.
         // Retain the real fallback containing block for descendants that are
@@ -665,6 +682,11 @@ impl<'a> LayoutBuilder<'a> {
         self.content_left = inner_x;
         self.content_right = inner_x + inner_width;
         self.cursor_y = content_top;
+        // The scratch flex formatting context owns a fresh hypothetical line.
+        // An enclosing inline static-position rectangle belongs to the parent
+        // line and would be translated again when this atom is replayed.
+        // <https://www.w3.org/TR/css-position-3/#static-position>
+        self.inline_static_position = None;
         self.truncate_page_start_margins = false;
 
         let previous_escaped_atom_containing_block = self.escaped_atom_containing_block;
@@ -708,7 +730,6 @@ impl<'a> LayoutBuilder<'a> {
             }
             let item = &flex_layout.items[index];
             let replay_dimensions = item.replay_dimensions();
-
             let mut replay_child_style = child.style.clone();
             freeze_replayed_item_padding(
                 &mut replay_child_style,
@@ -720,17 +741,39 @@ impl<'a> LayoutBuilder<'a> {
                 replay_dimensions.border_box_height(),
                 PhysicalFlexDirection::new(physical_flex_direction(style)),
             );
+            let replay_content_height = Some(Definite::new(
+                replay_dimensions.available_height_for_replay(),
+            ));
+            let replay_logical_inline_size = child
+                .anonymous_content()
+                .is_some()
+                .then(|| {
+                    replay_dimensions
+                        .logical_inline_size_for_replay(WritingMode::HorizontalTb, None)
+                })
+                .flatten()
+                .or_else(|| {
+                    placed_style
+                        .writing_mode
+                        .has_vertical_lines()
+                        .then(|| {
+                            replay_dimensions.logical_inline_size_for_replay(
+                                placed_style.writing_mode,
+                                replay_content_height,
+                            )
+                        })
+                        .flatten()
+                });
             self.with_placed_formatting_context(
                 PlacedFormattingContext {
                     content_left: inner_x + item.x().points(),
                     content_width: replay_dimensions.available_width_for_replay(),
-                    content_height: Some(replay_dimensions.available_height_for_replay()),
+                    content_height: replay_content_height,
                     table_wrapper_border_box_block_size: auto_table_wrapper_block_size_override(
                         &child.style,
                         replay_dimensions.border_box_height(),
                     ),
-                    writing_mode: placed_style.writing_mode,
-                    scope_content_logical_inline_size: child.anonymous_content().is_some(),
+                    replay_logical_inline_size,
                     cursor_y: content_top - item.y().points(),
                     page_start_margin_policy: PageStartMarginPolicy::Suppress,
                     float_scope: ReplayFloatScope::IsolatedFormattingContext,
@@ -742,6 +785,7 @@ impl<'a> LayoutBuilder<'a> {
                         &placed_style,
                         stylesheets,
                         item.percentage_height_basis,
+                        PrincipalBoxPaintMode::RootPaints,
                     );
                 },
             );
@@ -855,6 +899,8 @@ impl<'a> LayoutBuilder<'a> {
         let escaped_positioned_layers = (!escaped_positioned_layers.is_empty())
             .then(|| escaped_positioned_layers.into_boxed_slice());
         self.restore(snapshot);
+        self.pending_outside_marker_anchors
+            .restore(pending_outside_marker_anchors);
 
         let atom = InlineAtom::new(
             InlineAtomContent::InlineFragment {
@@ -863,7 +909,7 @@ impl<'a> LayoutBuilder<'a> {
                 table_cell_context: None,
                 contents_overflow_clip_applied: false,
             },
-            style.as_computed().clone(),
+            style.clone_used_style(),
             escaped_positioned_layers,
             InlineSize::new(
                 content_width_points
@@ -1102,6 +1148,11 @@ impl<'a> LayoutBuilder<'a> {
             destination_block_end: replay_destination_block_end,
         } = replay;
         let slice_border_box = context.slice_border_box;
+        let replay_clip = if context.has_descendant_source_overflow {
+            context.fragment_content_clip
+        } else {
+            slice_border_box
+        };
         let source_item_top = context.source_item_top.points();
         let table_replay = child.style.display.is_table();
         let child_fragment_replay = !context.has_descendant_source_overflow;
@@ -1193,7 +1244,7 @@ impl<'a> LayoutBuilder<'a> {
                 // overflow effect scope instead.
                 // <https://www.w3.org/TR/css-break-3/#box-splitting>
                 // <https://www.w3.org/TR/css-color-4/#transparency>
-                .with_contents_effect_scoped_to_rect(slice_border_box);
+                .with_contents_effect_scoped_to_rect(replay_clip);
             if table_replay {
                 record_table_replay_fragment_bottom(
                     table_replay_fragment_bottoms,
@@ -1208,7 +1259,7 @@ impl<'a> LayoutBuilder<'a> {
                 *replay_destination_block_end = Some(slice_border_box.y() + *local_block_end);
             }
             if !replay_owns_principal_decoration || replay_has_descendant_paint {
-                self.append_split_flex_item_replay(placed_style, slice_border_box, fragment);
+                self.append_split_flex_item_replay(placed_style, replay_clip, fragment);
             }
             return;
         }
@@ -1293,35 +1344,39 @@ impl<'a> LayoutBuilder<'a> {
             PlacedFormattingContext {
                 content_left: 0.0,
                 content_width: context.available_width_for_replay(),
-                content_height: Some(if child_fragment_replay {
+                content_height: Some(Definite::new(if child_fragment_replay {
                     PhysicalContentHeight::new(content_box_pt(table_first_capacity))
                 } else {
                     context.available_height_for_replay()
-                }),
+                })),
                 table_wrapper_border_box_block_size: (!table_replay)
                     .then(|| {
                         auto_table_wrapper_block_size_override(&child.style, context.item_height)
                     })
                     .flatten(),
-                writing_mode: replay_style.writing_mode,
-                scope_content_logical_inline_size: child.anonymous_content().is_some(),
+                replay_logical_inline_size: child.anonymous_content().is_some().then(|| {
+                    LogicalInlineContentSize::new(
+                        context.available_width_for_replay().content_box_length(),
+                    )
+                }),
                 cursor_y: offpage_top,
                 page_start_margin_policy: PageStartMarginPolicy::Suppress,
                 float_scope: ReplayFloatScope::IsolatedFormattingContext,
             },
             replay_style,
             |layout| {
-                let previous_suppress_principal_box_decoration =
-                    layout.suppress_next_principal_box_decoration;
-                if replay_owns_principal_decoration {
-                    layout.suppress_next_principal_box_decoration = true;
-                }
+                let principal_box_paint_mode = if replay_owns_principal_decoration {
+                    PrincipalBoxPaintMode::ParentPaints
+                } else {
+                    PrincipalBoxPaintMode::RootPaints
+                };
                 if child_fragment_replay {
                     layout.layout_split_flex_item_continuation_contents(
                         child,
                         replay_style,
                         stylesheets,
                         context.percentage_height_basis,
+                        principal_box_paint_mode,
                     );
                 } else {
                     layout.layout_flex_item_contents(
@@ -1329,10 +1384,9 @@ impl<'a> LayoutBuilder<'a> {
                         replay_style,
                         stylesheets,
                         context.percentage_height_basis,
+                        principal_box_paint_mode,
                     );
                 }
-                layout.suppress_next_principal_box_decoration =
-                    previous_suppress_principal_box_decoration;
             },
         );
 
@@ -1404,9 +1458,11 @@ impl<'a> LayoutBuilder<'a> {
         let fragment_translation = if child_fragment_replay {
             PaintTranslation::new(slice_border_box.x(), slice_border_box.y())
         } else {
-            PaintTranslation::new(
-                slice_border_box.x(),
-                source_item_top - offpage_top - source_canvas_slice_start,
+            source_slice_replay_translation(
+                slice_border_box,
+                source_item_top,
+                offpage_top,
+                source_canvas_slice_start,
             )
         };
         let source_fragment = if child_fragment_replay {
@@ -1437,7 +1493,13 @@ impl<'a> LayoutBuilder<'a> {
         // common fragment-span boundary.
         // <https://www.w3.org/TR/css-break-3/#box-splitting>
         let fragment = fragment
-            .with_primitives_sliced_to_fragmentainer_rect_preserving_structure(slice_border_box);
+            .with_primitives_sliced_to_fragmentainer_rect_preserving_structure(replay_clip)
+            // Source-canvas descendants can carry nested stacking contexts
+            // whose primitive descendants are structurally retained above.
+            // Enforce the same committed fragmentainer bound on that retained
+            // tree so visible overflow reaches sibling columns but cannot
+            // escape the flex container's selected destination fragment.
+            .clipped_to_rect(replay_clip);
         // The geometric fragmentainer slice above has already trimmed the
         // captured primitive tree. Do not wrap it in a second PDF overflow
         // clip: applying one around the complete stacking context
@@ -1467,7 +1529,7 @@ impl<'a> LayoutBuilder<'a> {
         // <https://drafts.csswg.org/css-contain-1/#containment-size>
         // <https://drafts.csswg.org/css-break-3/#box-splitting>
         if !replay_owns_principal_decoration || replay_has_descendant_paint {
-            self.append_split_flex_item_replay(placed_style, slice_border_box, fragment);
+            self.append_split_flex_item_replay(placed_style, replay_clip, fragment);
         }
 
         // A layer which escaped the split item belongs to the flex
@@ -1501,7 +1563,8 @@ impl<'a> LayoutBuilder<'a> {
         if fragment.is_empty() {
             return;
         }
-        let policy = StackingContextPolicy::for_flex_item(placed_style, slice_border_box);
+        let policy =
+            StackingContextPolicy::for_fragmented_flex_item(placed_style, slice_border_box);
         let effects = policy.effects;
         let context = PaintStackingContext::from_banded_fragment(fragment, Vec::new())
             .with_source_order(self.next_paint_source_order())
@@ -1520,9 +1583,28 @@ impl<'a> LayoutBuilder<'a> {
         for child in children {
             child.style = self
                 .style_with_current_used_lengths(&child.style)
-                .into_computed();
+                .clone_for_legacy_used_consumer();
         }
     }
+}
+
+/// Translate a frozen descendant source canvas into one flex continuation.
+///
+/// Page-top coordinates decrease in the block direction. Advancing the
+/// source-slice start therefore moves the source canvas toward the page top
+/// relative to the destination item origin, which adds the source offset to
+/// the final paint translation.
+/// <https://www.w3.org/TR/css-break-3/#box-splitting>
+fn source_slice_replay_translation(
+    slice_border_box: PaintClip,
+    source_item_top: f32,
+    offpage_top: f32,
+    source_canvas_slice_start: f32,
+) -> PaintTranslation {
+    PaintTranslation::new(
+        slice_border_box.x(),
+        source_item_top - offpage_top + source_canvas_slice_start,
+    )
 }
 
 #[cfg(test)]
@@ -1555,6 +1637,21 @@ mod inline_flex_baseline_tests {
             ),
             PhysicalContentHeight::new(content_box_pt(32.0)),
         );
+    }
+
+    #[test]
+    fn source_slice_replay_translation_keeps_a_continuation_in_its_destination_clip() {
+        let destination = PaintClip::new(77.25, 320.25, 82.5, 60.0);
+        let translation = source_slice_replay_translation(destination, 380.25, 10_000.0, 52.5);
+
+        // The overflowing descendant occupies source page-top coordinates
+        // 9_880..9_985. Its continuation must intersect the destination
+        // slice 320.25..380.25 after the source offset is applied.
+        let translated_bottom = 9_880.0 + translation.y;
+        let translated_top = 9_985.0 + translation.y;
+        assert_eq!(translation.y, -9_567.25);
+        assert!(translated_bottom < destination.y() + destination.height());
+        assert!(translated_top > destination.y());
     }
 
     #[test]

@@ -6,11 +6,22 @@ pub(crate) fn normalize_block_container_children<'a>(
     parent_style: &ComputedStyle,
 ) -> Vec<MutableFormattingBox<'a>> {
     let children = normalize_orphan_table_internal_boxes(children, parent_style);
+    if parent_style.display.is_flex() || parent_style.display.is_grid() {
+        // Flexbox and Grid do not form anonymous items for a text sequence
+        // consisting only of CSS document whitespace, even in a preserved
+        // `white-space` mode. Suppress it while the direct-child list is
+        // still authoritative so no later sizing, alignment, or replay path
+        // can observe an item for it.
+        // <https://www.w3.org/TR/css-flexbox-1/#flex-items>
+        // <https://www.w3.org/TR/css-grid-1/#grid-items>
+        return children
+            .into_iter()
+            .filter(|child| !formatting_box_is_document_whitespace(child))
+            .collect();
+    }
     if parent_style.display.is_table()
         || parent_style.display.is_table_row_group()
         || parent_style.display.is_table_row()
-        || parent_style.display.is_flex()
-        || parent_style.display.is_grid()
     {
         return children;
     }
@@ -875,12 +886,15 @@ where
     matches!(box_, FormattingBoxWith::Text(text) if text_is_css_collapsible_space(&text.text, text.style.as_ref()))
 }
 
-/// Return whether a formatting box is a whitespace-only anonymous inline box.
+/// Return whether a formatting box is a CSS document-whitespace-only text box.
 ///
-/// CSS Tables removes these boxes while fixing up table-internal children even
-/// when the inherited `white-space` mode preserves their glyphs. This is a
-/// table-structure rule, rather than CSS Text's layout-time collapsing step:
+/// CSS Tables, Flexbox, and Grid remove these boxes while forming their
+/// respective anonymous structural boxes or items even when the inherited
+/// `white-space` mode preserves their glyphs. This is a structural rule,
+/// rather than CSS Text's layout-time collapsing step:
 /// <https://drafts.csswg.org/css-tables-3/#anonymous-boxes>.
+/// <https://www.w3.org/TR/css-flexbox-1/#flex-items>
+/// <https://www.w3.org/TR/css-grid-1/#grid-items>
 pub(crate) fn formatting_box_is_document_whitespace<S>(box_: &FormattingBoxWith<'_, S>) -> bool
 where
     S: AsRef<ComputedStyle>,

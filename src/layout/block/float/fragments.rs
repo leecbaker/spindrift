@@ -125,9 +125,6 @@ impl<'a> LayoutBuilder<'a> {
         shape: FloatShape,
         run: &mut FloatRunState,
     ) {
-        if std::env::var_os("QUIRE_TRACE_FLOATS").is_some() {
-            eprintln!("float shape {shape:?}");
-        }
         self.float_contexts
             .last_mut()
             .expect("root float context exists")
@@ -257,8 +254,16 @@ impl<'a> LayoutBuilder<'a> {
         for (target, page_index) in effects.anchors {
             self.page_anchors.entry(target).or_insert(page_index);
         }
+        for (target, source_position) in effects.anchor_source_positions {
+            self.page_anchor_source_positions
+                .entry(target)
+                .or_insert(source_position);
+        }
         for (target, text) in effects.anchor_text {
             self.page_anchor_text.entry(target).or_insert(text);
+        }
+        for (target, counters) in effects.anchor_counters {
+            self.page_anchor_counters.entry(target).or_insert(counters);
         }
         let current_page_index = self.pages.len();
         for page_effects in effects.page_effects {
@@ -287,11 +292,23 @@ impl<'a> LayoutBuilder<'a> {
                 .filter(|(target, _)| !snapshot.page_anchors.contains_key(*target))
                 .map(|(target, page_index)| (target.clone(), *page_index))
                 .collect(),
+            anchor_source_positions: self
+                .page_anchor_source_positions
+                .iter()
+                .filter(|(target, _)| !snapshot.page_anchor_source_positions.contains_key(*target))
+                .map(|(target, position)| (target.clone(), *position))
+                .collect(),
             anchor_text: self
                 .page_anchor_text
                 .iter()
                 .filter(|(target, _)| !snapshot.page_anchor_text.contains_key(*target))
                 .map(|(target, text)| (target.clone(), text.clone()))
+                .collect(),
+            anchor_counters: self
+                .page_anchor_counters
+                .iter()
+                .filter(|(target, _)| !snapshot.page_anchor_counters.contains_key(*target))
+                .map(|(target, counters)| (target.clone(), counters.clone()))
                 .collect(),
             page_effects: Vec::new(),
         };

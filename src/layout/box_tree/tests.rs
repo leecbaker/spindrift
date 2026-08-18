@@ -1,7 +1,7 @@
 use super::*;
 use crate::css::{
     ComputedLengthPercentage, ComputedLengthPercentageOrAuto, ComputedLineHeight, Css, Edges,
-    FontFamily, Stylesheet, TextOrientation,
+    FontFamily, Stylesheet, TextOrientation, WhiteSpace,
 };
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -41,6 +41,29 @@ async fn build_test_page_with_font_metrics<'a>(
 
 fn test_signature(tag: &str) -> ElementSignature {
     ElementSignature::new(tag, HashMap::new())
+}
+
+#[test]
+fn nested_zoom_keeps_effective_scale_on_frozen_descendant_styles() {
+    let root = dom::parse("<div class=zoom><div class=shadow>text</div></div>");
+    let author = css::parse_stylesheet(&Css::from_string(".zoom { zoom: 2 }"));
+    let page = build_test_page(&root, &[author]);
+    let html = page.children.first().expect("html root");
+    let body = html.children().first().expect("body root");
+    let zoomed = body
+        .children()
+        .iter()
+        .find_map(|child| child.element_parts())
+        .expect("zoomed div");
+    let descendant = zoomed
+        .3
+        .iter()
+        .find_map(|child| child.element_parts())
+        .expect("nested span");
+
+    assert_eq!(zoomed.2.effective_zoom.factor(), 2.0);
+    assert_eq!(descendant.2.effective_zoom.factor(), 2.0);
+    assert_eq!(descendant.2.font_size, 12.0);
 }
 
 fn styled_text_box(text: &str, style: &ComputedStyle) -> MutableFormattingBox<'static> {
@@ -2496,4 +2519,62 @@ fn run_in_prelude_sits_after_marker_and_before_generated_before() {
         &before.core.source,
         BoxSource::GeneratedPseudo(pseudo) if pseudo.kind == GeneratedPseudoKind::Before
     ));
+}
+
+#[test]
+fn flex_and_grid_child_normalization_discards_document_whitespace_before_itemization() {
+    for display in [Display::FLEX, Display::GRID] {
+        let mut container_style = parent_style();
+        container_style.display = display;
+        container_style.white_space = WhiteSpace::Pre;
+
+        let children = normalize_block_container_children(
+            vec![
+                styled_text_box(" \t\r\n", &container_style),
+                styled_text_box("\u{3000}", &container_style),
+            ],
+            &container_style,
+        );
+
+        let [MutableFormattingBox::Text(text)] = children.as_slice() else {
+            panic!("only the non-document whitespace text should remain");
+        };
+        assert_eq!(text.text, "\u{3000}");
+    }
+}
+
+#[test]
+fn preserved_inter_element_whitespace_is_not_a_flex_child() {
+    let stylesheet = css::parse_stylesheet(&Css::from_string(
+        ".flex { display: flex; white-space: pre }",
+    ));
+    let root =
+        dom::parse("<html><body><div class=\"flex\"><b>foo</b> <b>bar</b></div></body></html>");
+    let page = build_test_page(&root, &[stylesheet]);
+    let flex = &page.children[0].children()[0].children()[0];
+    let FormattingBox::Flex(flex) = flex else {
+        panic!("expected flex container");
+    };
+
+    assert_eq!(flex.core.children.len(), 2);
+    assert!(
+        flex.core
+            .children
+            .iter()
+            .all(|child| !matches!(child, FormattingBox::Text(_)))
+    );
+    assert!(formatting_box_contains_text(&flex.core.children[0], "foo"));
+    assert!(formatting_box_contains_text(&flex.core.children[1], "bar"));
+    let FormattingBox::Block(first) = &flex.core.children[0] else {
+        panic!("expected first blockified flex item");
+    };
+    let FormattingBox::Block(second) = &flex.core.children[1] else {
+        panic!("expected second blockified flex item");
+    };
+    assert!(
+        matches!(first.core.children.as_slice(), [FormattingBox::Text(text)] if text.text == "foo")
+    );
+    assert!(
+        matches!(second.core.children.as_slice(), [FormattingBox::Text(text)] if text.text == "bar")
+    );
 }

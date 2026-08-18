@@ -737,6 +737,9 @@ pub(in crate::css) fn parse_scale_factor(value: &str) -> Option<f32> {
 ///
 /// CSS Transforms resolves keyword origins to percentages over the border box:
 /// <https://www.w3.org/TR/css-transforms-1/#transform-origin-property>.
+/// The unordered keyword form assigns one component to each physical axis;
+/// `center` supplies the other axis when it appears alongside an edge:
+/// <https://drafts.csswg.org/css-values-4/#position>.
 pub(crate) fn parse_transform_origin(value: &str, font_size: f32) -> Option<TransformOrigin> {
     let parts = try_split_css_component_values(trim_css_value(value))?;
     if parts.is_empty() || parts.len() > 3 {
@@ -769,6 +772,18 @@ pub(crate) fn parse_transform_origin(value: &str, font_size: f32) -> Option<Tran
             parse_origin_component(first, true, font_size)?,
             z,
         )),
+        // The CSS `&&` grammar permits the horizontal and vertical keyword
+        // components in either order. Here `center` supplies the vertical
+        // component before the horizontal edge, as in `center left`.
+        [first, second]
+            if first.eq_ignore_ascii_case("center") && is_horizontal_origin_keyword(second) =>
+        {
+            Some(TransformOrigin::specified(
+                parse_origin_component(second, false, font_size)?,
+                parse_origin_component(first, true, font_size)?,
+                z,
+            ))
+        }
         [first, second] => Some(TransformOrigin::specified(
             parse_origin_component(first, false, font_size)?,
             parse_origin_component(second, true, font_size)?,
@@ -833,6 +848,10 @@ pub(in crate::css) fn parse_origin_component(
 
 pub(in crate::css) fn is_vertical_origin_keyword(value: &str) -> bool {
     matches!(value.to_ascii_lowercase().as_str(), "top" | "bottom")
+}
+
+fn is_horizontal_origin_keyword(value: &str) -> bool {
+    matches!(value.to_ascii_lowercase().as_str(), "left" | "right")
 }
 
 /// Parse CSS Compositing's `mix-blend-mode` keywords.
@@ -972,6 +991,109 @@ mod tests {
     }
 
     #[test]
+    fn svg_origin_attribute_preserves_unordered_center_and_edge_keywords() {
+        for (value, x) in [("center left", 0.0), ("center right", 1.0)] {
+            let declaration = svg_transform_origin_presentation_declaration(value)
+                .expect("the SVG presentation attribute is valid");
+            let origin = parse_transform_origin(
+                declaration
+                    .strip_prefix("transform-origin: ")
+                    .expect("the declaration has the transform-origin prefix"),
+                12.0,
+            )
+            .expect("the normalized CSS declaration remains valid");
+            assert_eq!(
+                origin,
+                TransformOrigin::specified(
+                    if x == 0.0 {
+                        ComputedLengthPercentage::ZERO
+                    } else {
+                        ComputedLengthPercentage::from_percent(x)
+                    },
+                    ComputedLengthPercentage::from_percent(0.5),
+                    ComputedLengthPercentage::ZERO,
+                ),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn transform_origin_accepts_all_valid_two_keyword_axis_orders() {
+        let keyword_position = |value| {
+            if value == 0.0 {
+                ComputedLengthPercentage::ZERO
+            } else {
+                ComputedLengthPercentage::from_percent(value)
+            }
+        };
+        for (value, x, y) in [
+            ("left top", 0.0, 0.0),
+            ("left center", 0.0, 0.5),
+            ("left bottom", 0.0, 1.0),
+            ("center top", 0.5, 0.0),
+            ("center center", 0.5, 0.5),
+            ("center bottom", 0.5, 1.0),
+            ("right top", 1.0, 0.0),
+            ("right center", 1.0, 0.5),
+            ("right bottom", 1.0, 1.0),
+            ("top left", 0.0, 0.0),
+            ("top center", 0.5, 0.0),
+            ("top right", 1.0, 0.0),
+            ("bottom left", 0.0, 1.0),
+            ("bottom center", 0.5, 1.0),
+            ("bottom right", 1.0, 1.0),
+            ("center left", 0.0, 0.5),
+            ("center right", 1.0, 0.5),
+        ] {
+            assert_eq!(
+                parse_transform_origin(value, 12.0),
+                Some(TransformOrigin::specified(
+                    keyword_position(x),
+                    keyword_position(y),
+                    ComputedLengthPercentage::ZERO,
+                )),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn transform_origin_preserves_z_after_unordered_center_and_edge_keywords() {
+        for (value, x) in [("center left 12px", 0.0), ("center right 12px", 1.0)] {
+            assert_eq!(
+                parse_transform_origin(value, 12.0),
+                Some(TransformOrigin::specified(
+                    if x == 0.0 {
+                        ComputedLengthPercentage::ZERO
+                    } else {
+                        ComputedLengthPercentage::from_percent(x)
+                    },
+                    ComputedLengthPercentage::from_percent(0.5),
+                    ComputedLengthPercentage::from_points(12.0 * crate::css::CSS_PX_TO_PT),
+                )),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn transform_origin_rejects_two_edge_keywords_on_the_same_axis() {
+        for value in [
+            "left left",
+            "left right",
+            "right left",
+            "right right",
+            "top top",
+            "top bottom",
+            "bottom top",
+            "bottom bottom",
+        ] {
+            assert!(parse_transform_origin(value, 12.0).is_none(), "{value}");
+        }
+    }
+
+    #[test]
     fn transform_style_accepts_only_its_two_css_keywords() {
         assert_eq!(parse_transform_style("flat"), Some(TransformStyle::Flat));
         assert_eq!(
@@ -1021,6 +1143,20 @@ mod tests {
                 ComputedLengthPercentage::from_percent(1.0),
             ))
         );
+        for (value, x) in [("center left", 0.0), ("center right", 1.0)] {
+            assert_eq!(
+                parse_perspective_origin(value, 12.0),
+                Some(PerspectiveOrigin::new(
+                    if x == 0.0 {
+                        ComputedLengthPercentage::ZERO
+                    } else {
+                        ComputedLengthPercentage::from_percent(x)
+                    },
+                    ComputedLengthPercentage::from_percent(0.5),
+                )),
+                "{value}"
+            );
+        }
         assert!(parse_perspective_origin("50% 50% 1px", 12.0).is_none());
     }
 

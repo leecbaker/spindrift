@@ -10,16 +10,14 @@ pub(crate) fn apply_cascaded_declarations_with_inheritance_source_and_parent_ch_
 ) {
     let (direction, writing_mode) =
         logical_mapping_context(style, declarations, inheritance_source);
-    let declarations = declarations_after_css_wide_rollbacks(declarations, direction, writing_mode);
+    let mut declarations =
+        declarations_after_css_wide_rollbacks(declarations, direction, writing_mode);
     // A declaration is ignored when its specified value does not match the
     // property's grammar.  Keep this boundary before the font-size/color
     // prepasses: CSS Conditional declaration queries and ordinary cascade
     // application must agree about the same specified-value operation.
     // <https://www.w3.org/TR/css-cascade-5/#filtering>
-    let declarations = declarations
-        .into_iter()
-        .filter_map(canonical_cascaded_declaration)
-        .collect::<Vec<_>>();
+    declarations.retain(cascaded_declaration_is_canonical);
     apply_cascaded_custom_property_declarations(style, &declarations, inheritance_source);
     apply_cascaded_color_scheme_declarations(
         style,
@@ -119,6 +117,7 @@ pub(crate) fn apply_cascaded_declarations_with_inheritance_source_and_parent_ch_
                     parent_ch_advance,
                     style.font_weight,
                     Some(style.font_size),
+                    layout_pt(inheritance_source.line_height),
                 )
                 .map(|font| (source, font));
             }
@@ -240,9 +239,76 @@ fn apply_cascaded_property(
     )
 }
 
-pub(in crate::css) fn canonical_cascaded_declaration<'a>(
-    declaration: CascadedDeclaration<'a>,
-) -> Option<CascadedDeclaration<'a>> {
+/// Applies the modeled text properties that can affect a `::marker`'s text.
+///
+/// Marker boxes do not accept ordinary layout properties, but CSS Lists allows
+/// text properties to cascade to their generated text. Keep the applicability
+/// boundary here and reuse the ordinary declaration dispatcher so marker and
+/// element values cannot drift apart.
+/// <https://drafts.csswg.org/css-lists-3/#marker-properties>
+pub(in crate::css) fn apply_cascaded_marker_text_property(
+    style: &mut ComputedStyle,
+    name: &str,
+    value: &str,
+    declaration: &CascadedDeclaration<'_>,
+    inheritance_source: &ComputedStyle,
+    parent_ch_advance: LayoutLength,
+) -> bool {
+    if !matches!(
+        name,
+        "direction"
+            | "unicode-bidi"
+            | "text-orientation"
+            | "text-combine-upright"
+            | "letter-spacing"
+            | "word-spacing"
+            | "tab-size"
+            | "word-break"
+            | "overflow-wrap"
+            | "word-wrap"
+            | "line-break"
+            | "hyphens"
+            | "text-decoration"
+            | "text-decoration-line"
+            | "text-decoration-style"
+            | "text-decoration-color"
+            | "text-decoration-thickness"
+            | "text-decoration-inset"
+            | "text-decoration-skip"
+            | "text-decoration-skip-ink"
+            | "text-decoration-skip-self"
+            | "text-decoration-skip-box"
+            | "text-decoration-skip-spaces"
+            | "text-underline-offset"
+            | "text-underline-position"
+            | "text-emphasis"
+            | "text-emphasis-style"
+            | "text-emphasis-color"
+            | "text-emphasis-position"
+            | "text-emphasis-skip"
+            | "text-shadow"
+    ) {
+        return false;
+    }
+
+    apply_cascaded_property(
+        style,
+        name,
+        value,
+        declaration,
+        inheritance_source,
+        parent_ch_advance,
+    )
+}
+
+/// Whether a cascaded declaration survives specified-value validation.
+///
+/// Font shorthand components retain the original shorthand token stream until
+/// their font-relative values are resolved, so their component token stream is
+/// intentionally exempt from ordinary property grammar validation here.
+pub(in crate::css) fn cascaded_declaration_is_canonical(
+    declaration: &CascadedDeclaration<'_>,
+) -> bool {
     // `font` is checked at specified-value time before it is split into
     // component declarations. A component retains the original shorthand
     // token stream, which is intentionally not valid as the component's own
@@ -252,17 +318,12 @@ pub(in crate::css) fn canonical_cascaded_declaration<'a>(
         .modeled()
         .is_some_and(|property| property.font_component().is_some())
     {
-        return Some(declaration);
+        return true;
     }
-    let (name, value) = crate::css::parse::declaration_operation(
-        declaration.property.css_name(),
+    crate::css::parse::cascaded_declaration_is_valid(
+        &declaration.property,
         declaration.value.as_ref(),
-    )?;
-    Some(CascadedDeclaration {
-        property: CascadedProperty::from_name(Cow::Owned(name)),
-        value: Cow::Owned(value),
-        ..declaration
-    })
+    )
 }
 
 /// Apply Overflow's cross-axis computed-value adjustment.

@@ -86,8 +86,13 @@ impl<'a> LayoutBuilder<'a> {
         if element.tag.eq_ignore_ascii_case("iframe") {
             self.resource_cache.record_iframe_viewport(
                 element.id,
-                canvas.content_size.width,
-                canvas.content_size.height,
+                IframeEmbeddingContext {
+                    viewport: PageSize::from_points(
+                        canvas.content_size.width,
+                        canvas.content_size.height,
+                    ),
+                    effective_zoom: style.effective_zoom,
+                },
             );
         }
 
@@ -96,27 +101,11 @@ impl<'a> LayoutBuilder<'a> {
         let border_x = border_origin.x;
         let border_y = border_origin.y;
         let paint_checkpoint = self.current_page.paint_checkpoint();
-        if style.visibility == Visibility::Visible
-            && (style.background.background_color.is_potentially_visible()
-                || used_border_width(style) > layout_pt(0.0))
-        {
-            let (rects, rounded_rects, paths, strokes) = block_paint_ops(
-                paint_space_rect(border_x, border_y, border_box_width, border_box_height),
-                style,
-            );
-            for rect in rects {
-                self.push_rect_in_band(PaintBand::InFlowBlock, rect);
-            }
-            for rounded_rect in rounded_rects {
-                self.push_rounded_rect_in_band(PaintBand::InFlowBlock, rounded_rect);
-            }
-            for path in paths {
-                self.push_path_in_band(PaintBand::InFlowBlock, path);
-            }
-            for stroke in strokes {
-                self.push_stroke_in_band(PaintBand::InFlowBlock, stroke);
-            }
-        }
+        self.paint_replaced_box_decoration(
+            paint_space_rect(border_x, border_y, border_box_width, border_box_height),
+            style,
+            PaintBand::BackgroundBorder,
+        );
         if element.tag.eq_ignore_ascii_case("iframe")
             && let Some(document) = self.iframe_documents.get(&element.id)
             && let Some(page) = document.pages.first()
@@ -140,6 +129,7 @@ impl<'a> LayoutBuilder<'a> {
             ));
             fragment.promote_page_background_to_in_flow_block();
             fragment.promote_background_border_to_in_flow_block();
+            fragment.promote_outline_to_in_flow_outline();
             // The embedded page canvas is descendant paint of the iframe,
             // rather than the embedding element's own decoration.  Its
             // background must therefore stay inside the same viewport clip
@@ -199,31 +189,18 @@ impl<'a> LayoutBuilder<'a> {
         let paint_checkpoint = self.current_page.paint_checkpoint();
         let decoration_rect =
             paint_space_rect(border_x, border_y, border_box_width, border_box_height);
+        let overflow = ReplacedObjectOverflow::from_style(style);
         let content_contour = replaced_content_contour(decoration_rect, style, border_widths);
         if style.visibility == Visibility::Visible {
-            if style.background.background_color.is_potentially_visible()
-                || used_border_width(style) > layout_pt(0.0)
-            {
-                // A principal box's complete decoration paints in its
-                // parent block phase before its contents.  Replaced content
-                // is an atomic content layer, not a reason to split the
-                // element's background and border around an image draw.
-                // Its content-edge contour below keeps it out of the border
-                // region without changing that paint order.
-                // <https://www.w3.org/TR/CSS22/zindex.html>
-                let (rects, rounded_rects, paths, strokes) =
-                    block_paint_ops(decoration_rect, style);
-                for rect in rects {
-                    self.push_rect_in_band(PaintBand::BackgroundBorder, rect);
-                }
-                for rounded_rect in rounded_rects {
-                    self.push_rounded_rect_in_band(PaintBand::BackgroundBorder, rounded_rect);
-                }
-                for path in paths {
-                    self.push_path_in_band(PaintBand::BackgroundBorder, path);
-                }
-                self.extend_strokes_in_band(PaintBand::BackgroundBorder, strokes);
-            }
+            // A principal box's complete decoration paints in its parent
+            // block phase before its contents. Replaced content is an atomic
+            // content layer, not a reason to split the element's background
+            // and border around an image draw. Keeping this on the ordinary
+            // box-decoration path also gives replaced elements the complete
+            // `border-image` and background-image algorithms.
+            // <https://www.w3.org/TR/CSS22/zindex.html>
+            // <https://drafts.csswg.org/css-backgrounds-3/#border-images>
+            self.paint_replaced_box_decoration(decoration_rect, style, PaintBand::BackgroundBorder);
             let image_x = border_x + border_widths.left + style.padding.left;
             let image_y = border_y + border_widths.bottom + style.padding.bottom;
             // A size-contained replaced box may retain its padding and
@@ -245,6 +222,7 @@ impl<'a> LayoutBuilder<'a> {
                         style.object_fit,
                         style.object_position.clone(),
                         style.object_view_box.clone(),
+                        overflow,
                     );
                     if let Some(clip) = content_contour
                         .as_ref()
@@ -254,13 +232,14 @@ impl<'a> LayoutBuilder<'a> {
                     }
                     self.push_svg_group_in_band(PaintBand::InFlowBlock, group);
                 } else {
+                    let natural_size = image.decoded.natural_layout_size();
                     let mut rendered = RenderedImage::from_paint_rect(
                         paint_space_rect(image_x, image_y, content_width, content_height),
                         false,
-                        image.decoded.pixel_width,
-                        image.decoded.pixel_height,
+                        image.decoded.pixel_size.width,
+                        image.decoded.pixel_size.height,
                         None,
-                        raster_image_interpolation(style),
+                        raster_image_sampling(style),
                         image.decoded.rgb.shared(),
                         image.decoded.alpha,
                         element.attrs.get("alt").cloned().map(Rc::from),
@@ -275,9 +254,12 @@ impl<'a> LayoutBuilder<'a> {
                     }
                     if apply_object_fit(
                         &mut rendered,
+                        natural_size,
                         style.object_fit,
                         style.object_position.clone(),
                         style.object_view_box.clone(),
+                        overflow,
+                        style.effective_zoom,
                     ) {
                         self.push_image(rendered);
                     }
@@ -341,25 +323,13 @@ impl<'a> LayoutBuilder<'a> {
         let border_x = border_origin.x;
         let border_y = border_origin.y;
         let paint_checkpoint = self.current_page.paint_checkpoint();
+        let overflow = ReplacedObjectOverflow::from_style(style);
         if style.visibility == Visibility::Visible {
-            if style.background.background_color.is_potentially_visible()
-                || used_border_width(style) > layout_pt(0.0)
-            {
-                let (rects, rounded_rects, paths, strokes) = block_paint_ops(
-                    paint_space_rect(border_x, border_y, border_box_width, border_box_height),
-                    style,
-                );
-                for rect in rects {
-                    self.push_rect_in_band(PaintBand::InFlowBlock, rect);
-                }
-                for rounded_rect in rounded_rects {
-                    self.push_rounded_rect_in_band(PaintBand::InFlowBlock, rounded_rect);
-                }
-                for path in paths {
-                    self.push_path_in_band(PaintBand::InFlowBlock, path);
-                }
-                self.extend_strokes_in_band(PaintBand::InFlowBlock, strokes);
-            }
+            self.paint_replaced_box_decoration(
+                paint_space_rect(border_x, border_y, border_box_width, border_box_height),
+                style,
+                PaintBand::BackgroundBorder,
+            );
             let image_x = border_x + border_widths.left + style.padding.left;
             let image_y = border_y + border_widths.bottom + style.padding.bottom;
             if content_width > 0.0 && content_height > 0.0 {
@@ -383,16 +353,18 @@ impl<'a> LayoutBuilder<'a> {
                             style.object_fit,
                             style.object_position.clone(),
                             style.object_view_box.clone(),
+                            overflow,
                         ),
                     );
                 } else {
+                    let natural_size = image.decoded.natural_layout_size();
                     let mut rendered = RenderedImage::from_paint_rect(
                         paint_space_rect(image_x, image_y, content_width, content_height),
                         false,
-                        image.decoded.pixel_width,
-                        image.decoded.pixel_height,
-                        None,
-                        raster_image_interpolation(style),
+                        image.decoded.pixel_size.width,
+                        image.decoded.pixel_size.height,
+                        image.decoded.source_rect,
+                        raster_image_sampling(style),
                         image.decoded.rgb.shared(),
                         image.decoded.alpha,
                         alt_text.map(Rc::from),
@@ -401,9 +373,12 @@ impl<'a> LayoutBuilder<'a> {
                     .with_image_id(image.decoded.image_id);
                     if apply_object_fit(
                         &mut rendered,
+                        natural_size,
                         style.object_fit,
                         style.object_position.clone(),
                         style.object_view_box.clone(),
+                        overflow,
+                        style.effective_zoom,
                     ) {
                         self.push_image(rendered);
                     }
@@ -459,22 +434,7 @@ impl<'a> LayoutBuilder<'a> {
         let border_paint_rect =
             paint_space_rect(border_x, border_y, border_box_width, border_box_height);
         let content_contour = replaced_content_contour(border_paint_rect, style, border_widths);
-        if style.visibility == Visibility::Visible
-            && (style.background.background_color.is_potentially_visible()
-                || used_border_width(style) > layout_pt(0.0))
-        {
-            let (rects, rounded_rects, paths, strokes) = block_paint_ops(border_paint_rect, style);
-            for rect in rects {
-                self.push_rect_in_band(PaintBand::BackgroundBorder, rect);
-            }
-            for rounded_rect in rounded_rects {
-                self.push_rounded_rect_in_band(PaintBand::BackgroundBorder, rounded_rect);
-            }
-            for path in paths {
-                self.push_path_in_band(PaintBand::BackgroundBorder, path);
-            }
-            self.extend_strokes_in_band(PaintBand::BackgroundBorder, strokes);
-        }
+        self.paint_replaced_box_decoration(border_paint_rect, style, PaintBand::BackgroundBorder);
         if style.visibility == Visibility::Visible
             && content_width > 0.0
             && content_height > 0.0
@@ -569,15 +529,9 @@ impl<'a> LayoutBuilder<'a> {
                 )
             })
             .unwrap_or_else(|| {
-                PaintBackgroundArea::new(
-                    PaintPoint::new(
-                        self.current_page_context.left(),
-                        self.current_page_context.bottom(),
-                    ),
-                    PaintSize::new(
-                        self.current_page_context.area_width(),
-                        self.current_page_context.area_height(),
-                    ),
+                fixed_background_page_margin_box(
+                    PaintPoint::new(0.0, 0.0),
+                    self.current_page_context.size,
                 )
             });
         background_image_paint_for_style_with_paint_areas_and_fixed_positioning_area(
@@ -597,6 +551,28 @@ impl<'a> LayoutBuilder<'a> {
         )
     }
 
+    /// Paint the complete principal-box decoration of a replaced element.
+    ///
+    /// Replaced elements participate in the same CSS Backgrounds painting
+    /// order as ordinary boxes. In particular, `border-image` replaces the
+    /// visible normal-border paint without changing the box used for layout;
+    /// bypassing the shared decoration path drops that replacement entirely.
+    /// <https://drafts.csswg.org/css-backgrounds-3/#the-background>
+    /// <https://drafts.csswg.org/css-backgrounds-3/#border-images>
+    fn paint_replaced_box_decoration(
+        &mut self,
+        border_rect: PaintRect,
+        style: &ComputedStyle,
+        band: PaintBand,
+    ) {
+        if style.visibility != Visibility::Visible {
+            return;
+        }
+        for primitive in self.box_background_primitives(border_rect, style) {
+            self.push_primitive_in_band(band, primitive);
+        }
+    }
+
     /// Resolve and paint CSS border-image slices.
     ///
     /// CSS Backgrounds and Borders Level 3 defines `border-image` as a
@@ -612,31 +588,96 @@ impl<'a> LayoutBuilder<'a> {
         let Some(src) = style.border_image.source.as_image() else {
             return BorderPaint::UseNormalBorder;
         };
+        // A generated image's source coordinates address its concrete CSS
+        // object size, while an external raster image's coordinates address
+        // its intrinsic sample grid. The generated image may internally be
+        // supersampled, so retain the distinction through the slice/tiling
+        // stages and map to samples only when emitting PDF image crops.
+        let source_is_generated = !matches!(
+            src.selected_image(),
+            BackgroundImage::Url(_)
+                | BackgroundImage::ImageFunction(css::ImageFunction {
+                    source: Some(_),
+                    ..
+                })
+        );
+        // Numeric `border-image-outset` values use the computed border width,
+        // not the used width that `border-style: none` suppresses for layout.
+        // The resulting area is also the percentage basis for image widths and
+        // the default object size of dimensionless sources.
+        // <https://drafts.csswg.org/css-backgrounds-3/#border-image-outset>
+        // <https://drafts.csswg.org/css-backgrounds-3/#border-image-width>
+        let computed_borders = computed_border_widths(style);
+        let outsets = used_border_image_outsets(style, computed_borders);
+        let area_width = border_rect.size.width + outsets.left + outsets.right;
+        let area_height = border_rect.size.height + outsets.top + outsets.bottom;
         let resolved = match src.selected_image() {
-            BackgroundImage::Url {
-                src,
-                base_url,
-                root_url,
-                request_modifiers,
-            } => load_resolved_image_source_with_request(
-                src,
-                base_url
+            // Preserve the existing direct-URL loading path exactly. Besides
+            // avoiding a second selection boundary, it retains border-image's
+            // established SVG fragment and source-root behavior.
+            BackgroundImage::Url(url) => load_resolved_image_source_with_request(
+                &url.href,
+                url.base_url
                     .as_ref()
                     .or(style.border_image.source_base_url.as_ref())
                     .or(self.base_url),
-                root_url
+                url.root_url
                     .as_ref()
                     .or(style.border_image.source_root_url.as_ref()),
                 self.resource_cache,
-                style.image_orientation == css::ImageOrientation::FromImage,
+                crate::layout::asset_helpers::raster_orientation_policy(style.image_orientation),
                 crate::svg::SvgImageContext::from_used_color_scheme(style.used_color_scheme),
-                request_modifiers,
+                &url.request_modifiers,
             ),
+            BackgroundImage::ImageFunction(_) => {
+                match resolve_css_image_source(
+                    src.selected_image(),
+                    ImageResolutionContext {
+                        base_url: style
+                            .border_image
+                            .source_base_url
+                            .as_ref()
+                            .or(self.base_url),
+                        root_url: style.border_image.source_root_url.as_ref(),
+                        current_color: style.color,
+                        orientation: crate::layout::asset_helpers::raster_orientation_policy(
+                            style.image_orientation,
+                        ),
+                        svg_context: crate::svg::SvgImageContext::from_used_color_scheme(
+                            style.used_color_scheme,
+                        ),
+                        resource_cache: self.resource_cache,
+                    },
+                ) {
+                    ResolvedCssImage::External(asset) => Some(asset),
+                    // Border-image's color fallback is a dimensionless image;
+                    // rasterizing it at the border-image area's concrete size
+                    // gives its slices the same source-space semantics as
+                    // existing generated CSS images.
+                    ResolvedCssImage::SolidColor(_) => rasterize_generated_css_image(
+                        src.selected_image(),
+                        PaintSize::new(
+                            area_width / css::CSS_PX_TO_PT,
+                            area_height / css::CSS_PX_TO_PT,
+                        ),
+                        style.color,
+                        style
+                            .border_image
+                            .source_base_url
+                            .as_ref()
+                            .or(self.base_url),
+                        style.border_image.source_root_url.as_ref(),
+                        self.resource_cache,
+                    )
+                    .map(ResolvedImageAsset::Raster),
+                    ResolvedCssImage::Invalid => None,
+                }
+            }
             image => rasterize_generated_css_image(
                 image,
                 PaintSize::new(
-                    border_rect.size.width / css::CSS_PX_TO_PT,
-                    border_rect.size.height / css::CSS_PX_TO_PT,
+                    area_width / css::CSS_PX_TO_PT,
+                    area_height / css::CSS_PX_TO_PT,
                 ),
                 style.color,
                 style
@@ -653,10 +694,6 @@ impl<'a> LayoutBuilder<'a> {
             Some(asset) => asset,
             None => return BorderPaint::UseNormalBorder,
         };
-        let borders = used_border_widths(style);
-        let outsets = used_border_image_outsets(style, borders);
-        let area_width = border_rect.size.width + outsets.left + outsets.right;
-        let area_height = border_rect.size.height + outsets.top + outsets.bottom;
         let asset = match asset {
             ResolvedImageAsset::Raster(asset) => ResolvedImageAsset::Raster(asset),
             // Resolve the vector source's default concrete object size before
@@ -681,15 +718,26 @@ impl<'a> LayoutBuilder<'a> {
             }
         };
         let (source_width, source_height) = match &asset {
-            ResolvedImageAsset::Raster(decoded) => (decoded.pixel_width, decoded.pixel_height),
+            ResolvedImageAsset::Raster(decoded) => {
+                let (source_width, source_height) = if source_is_generated {
+                    (
+                        (area_width / css::CSS_PX_TO_PT).max(0.0),
+                        (area_height / css::CSS_PX_TO_PT).max(0.0),
+                    )
+                } else {
+                    (
+                        decoded.pixel_size.width as f32,
+                        decoded.pixel_size.height as f32,
+                    )
+                };
+                (source_width, source_height)
+            }
             ResolvedImageAsset::Svg(asset) => {
                 let size = asset.source_viewport_size();
-                (
-                    size.width.ceil().max(1.0) as u32,
-                    size.height.ceil().max(1.0) as u32,
-                )
+                (size.width.max(0.0), size.height.max(0.0))
             }
         };
+        let source_image_bounds = BorderImageSourceRect::new(0.0, 0.0, source_width, source_height);
         let slices = used_border_image_slices(
             style.border_image.slice.offsets,
             source_width,
@@ -698,9 +746,9 @@ impl<'a> LayoutBuilder<'a> {
         let image_widths = fit_border_image_widths_to_area(
             used_border_image_widths(
                 style,
-                borders,
-                border_box_pt(border_rect.size.width),
-                border_box_pt(border_rect.size.height),
+                computed_borders,
+                border_box_pt(area_width),
+                border_box_pt(area_height),
                 slices,
             ),
             area_width,
@@ -729,22 +777,40 @@ impl<'a> LayoutBuilder<'a> {
             (area_height - image_widths.top - image_widths.bottom).max(0.0),
             image_widths.top,
         ];
-        let source_x = [0, slices.left, source_width.saturating_sub(slices.right)];
+        let source_x = [0.0, slices.left, (source_width - slices.right).max(0.0)];
         let source_width = [
             slices.left,
-            source_width
-                .saturating_sub(slices.left)
-                .saturating_sub(slices.right),
+            (source_width - slices.left - slices.right).max(0.0),
             slices.right,
         ];
-        let source_y = [source_height.saturating_sub(slices.bottom), slices.top, 0];
+        let source_y = [(source_height - slices.bottom).max(0.0), slices.top, 0.0];
         let source_height = [
             slices.bottom,
-            source_height
-                .saturating_sub(slices.top)
-                .saturating_sub(slices.bottom),
+            (source_height - slices.top - slices.bottom).max(0.0),
             slices.top,
         ];
+
+        // The border-image process first scales the top/bottom edge images in
+        // their cross axis and the left/right edge images in their cross axis.
+        // The center image inherits those horizontal and vertical factors.
+        // Repeat keywords are applied only afterwards.
+        // <https://drafts.csswg.org/css-backgrounds-3/#border-image-process>
+        let source_to_paint = |value: f32| value * css::CSS_PX_TO_PT;
+        let axis_scale = |destination: f32, source: f32| {
+            (source > 0.0).then_some(destination / source_to_paint(source))
+        };
+        let horizontal_scale = border_image_center_axis_scale(
+            dest_height[2],
+            source_to_paint(source_height[2]),
+            dest_height[0],
+            source_to_paint(source_height[0]),
+        );
+        let vertical_scale = border_image_center_axis_scale(
+            dest_width[0],
+            source_to_paint(source_width[0]),
+            dest_width[2],
+            source_to_paint(source_width[2]),
+        );
 
         let mut primitives = Vec::new();
         for row in 0..3 {
@@ -754,8 +820,8 @@ impl<'a> LayoutBuilder<'a> {
                 }
                 if dest_width[col] <= 0.0
                     || dest_height[row] <= 0.0
-                    || source_width[col] == 0
-                    || source_height[row] == 0
+                    || source_width[col] <= 0.0
+                    || source_height[row] <= 0.0
                 {
                     continue;
                 }
@@ -775,23 +841,53 @@ impl<'a> LayoutBuilder<'a> {
                     dest_width[col],
                     dest_height[row],
                 ));
-                let source = RenderedImageSourceRect {
-                    x: source_x[col],
-                    y: source_y[row],
-                    width: source_width[col],
-                    height: source_height[row],
+                let source = BorderImageSourceRect::new(
+                    source_x[col],
+                    source_y[row],
+                    source_width[col],
+                    source_height[row],
+                );
+                let tile_size = match (row, col) {
+                    // Corners are stretched in both axes.
+                    (0 | 2, 0 | 2) => PaintSize::new(dest_width[col], dest_height[row]),
+                    // Top/bottom regions retain their aspect ratio after the
+                    // cross-axis scale to their destination height.
+                    (0 | 2, 1) => PaintSize::new(
+                        source_to_paint(source.width)
+                            * axis_scale(dest_height[row], source.height).unwrap_or(0.0),
+                        dest_height[row],
+                    ),
+                    // Left/right regions retain their aspect ratio after the
+                    // cross-axis scale to their destination width.
+                    (1, 0 | 2) => PaintSize::new(
+                        dest_width[col],
+                        source_to_paint(source.height)
+                            * axis_scale(dest_width[col], source.width).unwrap_or(0.0),
+                    ),
+                    // The center takes the edge scale factors established in
+                    // the first stage, independently per axis.
+                    (1, 1) => PaintSize::new(
+                        source_to_paint(source.width) * horizontal_scale,
+                        source_to_paint(source.height) * vertical_scale,
+                    ),
+                    _ => unreachable!(),
                 };
                 match &asset {
                     ResolvedImageAsset::Raster(decoded) => {
                         let mut images = Vec::new();
                         push_border_image_tiles(
                             &mut images,
-                            decoded,
-                            destination,
-                            source,
-                            repeat_x,
-                            repeat_y,
-                            raster_image_interpolation(style),
+                            self.resource_cache,
+                            RasterBorderImageTilePaint {
+                                decoded,
+                                destination,
+                                source_image_bounds,
+                                source,
+                                tile_size,
+                                repeat_x,
+                                repeat_y,
+                                sampling: raster_image_sampling(style),
+                            },
                         );
                         primitives.extend(images.into_iter().map(PaintPrimitive::Image));
                     }
@@ -801,6 +897,7 @@ impl<'a> LayoutBuilder<'a> {
                             asset,
                             destination,
                             source,
+                            tile_size,
                             repeat_x,
                             repeat_y,
                         );

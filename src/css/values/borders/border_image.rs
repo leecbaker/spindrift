@@ -369,4 +369,21 @@ mod tests {
         assert!(parse_mask_border_source("alpha luminance", 12.0).is_none());
         assert!(parse_mask_border_source("", 12.0).is_none());
     }
+
+    #[test]
+    fn border_image_shorthand_accepts_generated_image_slice_width_and_outset() {
+        let image = parse_border_image("conic-gradient(green 0 0) 1 fill / 10px / 10px", 16.0)
+            .expect("valid border-image shorthand");
+
+        assert!(image.source.is_image());
+        assert!(image.slice.fill);
+        assert!(matches!(
+            image.width.top,
+            BorderImageWidthValue::LengthPercentage(_)
+        ));
+        assert!(matches!(
+            image.outset.top,
+            BorderImageOutsetValue::Length(_)
+        ));
+    }
 }

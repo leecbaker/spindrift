@@ -2,6 +2,7 @@ use super::lanes::grid_lanes_stacking_axis_is_block;
 use super::lanes::{GridLanesItemPlacement, GridLanesLayoutContext};
 use super::resolved::physical_grid_line_names;
 use super::*;
+use crate::layout::assets::FragmentainerOrdinal;
 use crate::layout::baseline::{BaselinePair, PhysicalBaselineSets, PhysicalTopBaselineOffset};
 use crate::layout::block::{DefiniteBlockBreakContext, should_prebreak_definite_block};
 
@@ -71,6 +72,7 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &Stylesheets<'_>,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         descendant_percentage_height_basis: Option<BlockSizePercentageBasis>,
+        principal_box_paint_mode: PrincipalBoxPaintMode,
     ) {
         let source_style = style;
         if style.position.is_out_of_flow_positioned() {
@@ -83,6 +85,12 @@ impl<'a> LayoutBuilder<'a> {
             );
             return;
         }
+        // An enclosing transform, opacity, containment, or positioned effect
+        // context owns this grid's final local outline phase. Ordinary grid
+        // containers otherwise promote their outline into the parent
+        // normal-flow phase below.
+        let defer_own_decoration_promotion = self.defer_next_block_decoration_promotion;
+        self.defer_next_block_decoration_promotion = false;
 
         let fragmentainer_kind = self.active_fragmentainer_kind();
         self.apply_forced_break_before_box_in(fragmentainer_kind, style);
@@ -133,35 +141,25 @@ impl<'a> LayoutBuilder<'a> {
                     PercentageBasis::definite(layout_pt(available_outer_height)),
                 ))
             });
-        // A normal-flow block-level Grid retains the usual block-width
-        // fill-available behavior even when its writing mode makes physical
-        // width the logical block axis. Its track-derived intrinsic block
-        // contribution is for intrinsic sizing keywords and floated/atomic
-        // participation, not a replacement for `width: auto` here.
-        // <https://drafts.csswg.org/css-grid-2/#grid-container-size>
-        let requested_content_width = if used_style.writing_mode.has_vertical_lines()
-            && used_style.box_values.width.is_auto()
-            && used_style.float == Float::None
-        {
-            PhysicalContentWidth::new(used_normal_flow_block_content_box_width(
-                &used_style,
-                layout_pt(containing_inline_size),
-                non_content_pt(horizontal_extras),
-            ))
-        } else {
-            self.used_block_physical_content_width(
-                element,
-                &used_style,
-                stylesheets,
-                child_boxes,
-                BlockContentWidthInputs {
-                    available_outer_width,
-                    percentage_basis: PercentageBasis::definite(layout_pt(containing_inline_size)),
-                    horizontal_non_content: non_content_pt(horizontal_extras),
-                    definite_content_height: explicit_content_height,
-                },
-            )
-        };
+        // Grid remains a normal-flow block before its tracks are sized. A
+        // vertical grid's physical `width:auto` is its automatic logical
+        // block-size, so it must use the shared content-derived measurement
+        // rather than the horizontal fill-available equation.
+        // <https://www.w3.org/TR/css-writing-modes-4/#dimension-mapping>
+        // <https://www.w3.org/TR/css-grid-2/#grid-container-size>
+        let requested_content_width = self.used_block_physical_content_width(
+            element,
+            &used_style,
+            stylesheets,
+            child_boxes,
+            BlockContentWidthInputs {
+                available_outer_width,
+                percentage_basis: PercentageBasis::definite(layout_pt(containing_inline_size)),
+                horizontal_non_content: non_content_pt(horizontal_extras),
+                definite_content_height: explicit_content_height,
+                auto_width_role: BlockAutoWidthRole::NormalFlow,
+            },
+        );
         // A grid container participates in normal block sizing before its
         // track-sizing algorithm runs.  Thus an automatic physical width can
         // be transferred from a definite physical height through the
@@ -228,7 +226,10 @@ impl<'a> LayoutBuilder<'a> {
         // <https://www.w3.org/TR/css-grid-1/#grid-containers>.
         let empty_destination_fragmentainer = match fragmentainer_kind {
             FragmentainerKind::Page => {
-                let next_context = self.resolved_page_context(self.pages.len() + 2, false);
+                let next_context = self.resolved_page_context(
+                    self.destination_document_page_number(self.pages.len() + 2),
+                    false,
+                );
                 Fragmentainer::new(
                     layout_pt(next_context.area_height()),
                     layout_pt(next_context.area_height()),
@@ -264,6 +265,7 @@ impl<'a> LayoutBuilder<'a> {
                 stylesheets,
                 child_boxes,
                 descendant_percentage_height_basis,
+                principal_box_paint_mode,
             );
             return;
         }
@@ -353,12 +355,13 @@ impl<'a> LayoutBuilder<'a> {
             inner_x = outer_x + border_widths.left + style.padding.left;
         } else {
             self.cursor_y = self
-                .clear_active_floats_top(
+                .resolve_block_clearance(BlockClearanceRequest::coincident_edges(
                     style.clear,
                     style.writing_mode,
                     style.direction,
                     PageTopBlockPosition::new(self.cursor_y),
-                )
+                ))
+                .used_border_edge
                 .points();
         }
 
@@ -368,7 +371,12 @@ impl<'a> LayoutBuilder<'a> {
         let paint_checkpoint = self.current_page.paint_checkpoint();
         self.cursor_y -= border_widths.top + style.padding.top;
         let content_top = self.cursor_y;
-        let Some(grid_layout) = self.compute_grid_layout(
+        let fragment_decoration_reservation = FragmentDecorationReservation::new(
+            FragmentDecoration::for_box_decoration_break(style.box_decoration_break, false, false),
+            non_content_pt(border_widths.top + style.padding.top),
+            non_content_pt(style.padding.bottom + border_widths.bottom),
+        );
+        let Some(mut grid_layout) = self.compute_grid_layout(
             style,
             &children,
             stylesheets,
@@ -382,6 +390,45 @@ impl<'a> LayoutBuilder<'a> {
             self.layout_block(element, &flow_style, stylesheets, &[], Some(child_boxes));
             return;
         };
+        let content_fragmentainer =
+            self.fragmentainer_from_page_cursor(PageTopBlockPosition::new(content_top));
+        let initial_raw_fragmentainer_extent = content_fragmentainer.available_block_size();
+        let continuation_raw_fragmentainer_extent =
+            content_fragmentainer.fragmentainer_block_size();
+        // The container plan owns destination fragmentainers. A cloned grid
+        // item expands its own source span into that destination coordinate
+        // system, but must not reduce the grid container's capacity: doing
+        // both would reserve the item's clone edges twice.
+        // <https://www.w3.org/TR/css-break-3/#box-model-for-breaking>
+        let initial_grid_content_capacity = fragment_decoration_reservation
+            .remaining_content_extent(initial_raw_fragmentainer_extent);
+        let continuation_grid_content_capacity = fragment_decoration_reservation
+            .fresh_content_extent(continuation_raw_fragmentainer_extent);
+        for (item, child) in grid_layout.items.iter_mut().zip(&children) {
+            let decoration = FragmentDecoration::for_box_decoration_break(
+                child.style.box_decoration_break,
+                false,
+                false,
+            );
+            if !decoration.is_clone() {
+                continue;
+            }
+            let borders = used_border_widths(&child.style);
+            let reservation = FragmentDecorationReservation::new(
+                decoration,
+                non_content_pt(borders.top + child.style.padding.top),
+                non_content_pt(child.style.padding.bottom + borders.bottom),
+            );
+            let source_height = (item.height()
+                - reservation.block_start().points()
+                - reservation.block_end().points())
+            .max(0.0);
+            item.configure_cloned_fragment_source(source_height, reservation);
+            item.project_cloned_fragment_destinations(
+                initial_raw_fragmentainer_extent,
+                continuation_raw_fragmentainer_extent,
+            );
+        }
         let total_content_height = size_contained_content_height
             .or_else(|| {
                 Some(PhysicalContentHeight::new(constrain_content_height(
@@ -395,6 +442,11 @@ impl<'a> LayoutBuilder<'a> {
                     .points()
             })
             .expect("the Grid layout always supplies a content height");
+        let fragmentation_content_height = grid_layout
+            .items
+            .iter()
+            .map(|item| item.y() + item.fragmentation_height())
+            .fold(total_content_height, f32::max);
         // Keep curved overflow contours until descendant paint has been
         // captured. An eager padding-box rectangle would irreversibly erase
         // the CSS Borders contour before the shared resolver can retain it.
@@ -420,10 +472,13 @@ impl<'a> LayoutBuilder<'a> {
         let grid_fragment_plan = if suppresses_descendant_fragmentation {
             GridFragmentPlan::unfragmented(fragmentainer_kind, total_content_height)
         } else {
-            GridFragmentPlan::from_grid_item_boundaries(
+            GridFragmentPlan::from_grid_item_boundaries_with_content_capacity(
                 fragmentainer_kind,
-                current_fragmentainer,
-                total_content_height,
+                GridFragmentContentCapacity::new(
+                    GridFragmentBlockSize::new(initial_grid_content_capacity.points()),
+                    GridFragmentBlockSize::new(continuation_grid_content_capacity.points()),
+                ),
+                fragmentation_content_height,
                 &grid_layout.row_line_offsets,
                 &grid_layout.items,
                 &children,
@@ -554,6 +609,13 @@ impl<'a> LayoutBuilder<'a> {
         }
         let mut committed_gap_fragment_paint_bounds = Vec::new();
         let committed_replay_end_cursor = if can_replay_committed_fragment_records {
+            // A sliced item has one continuous source paint tree. Keep it
+            // across committed fragment records so a long grid item is not
+            // repeatedly laid out and does not repeatedly clone document
+            // pages through a rollback snapshot.
+            let mut split_item_replay = std::iter::repeat_with(|| None)
+                .take(grid_layout.items.len())
+                .collect::<Vec<Option<SplitGridItemSourceReplay>>>();
             let mut fragment_cursor = GridFragmentCursor::new(
                 PageTopBlockPosition::new(content_top),
                 GridFragmentBlockOffset::new(0.0),
@@ -566,8 +628,14 @@ impl<'a> LayoutBuilder<'a> {
                         FragmentainerAdvance::Unforced,
                     )
                 {
-                    fragment_cursor = transition
-                        .cursor_after_fragmentainer_advance(PageTopBlockPosition::new(content_top));
+                    // A continuation starts below the grid container's own
+                    // cloned block-start border and padding. Ancestor
+                    // continuation insets are already present in
+                    // `content_top`; subtract only the grid's reservation.
+                    fragment_cursor =
+                        transition.cursor_after_fragmentainer_advance(PageTopBlockPosition::new(
+                            content_top - fragment_decoration_reservation.block_start().points(),
+                        ));
                 }
                 let paint_checkpoint = self.current_page.paint_checkpoint();
                 self.replay_grid_fragment_record_items(
@@ -578,7 +646,9 @@ impl<'a> LayoutBuilder<'a> {
                     &grid_layout.items,
                     stylesheets,
                     inner_x,
+                    PageInlineSpan::new(inner_x, inner_width),
                     fragment_cursor,
+                    &mut split_item_replay,
                 );
                 if let Some(bounds) = self
                     .current_page
@@ -690,7 +760,10 @@ impl<'a> LayoutBuilder<'a> {
             .collect::<Vec<_>>();
         let mut own_background_primitives = Vec::new();
         let mut own_outline_primitives = Vec::new();
-        if style.visibility == Visibility::Visible && block_height > 0.0 {
+        if principal_box_paint_mode.root_paints()
+            && style.visibility == Visibility::Visible
+            && block_height > 0.0
+        {
             own_background_primitives = self.box_background_primitives(
                 paint_space_rect(outer_x, block_bottom, outer_width, block_height),
                 style,
@@ -702,6 +775,7 @@ impl<'a> LayoutBuilder<'a> {
         }
         let fragments = self.take_positioned_fragments_since(paint_page_index, paint_checkpoint);
         let grid_spanned_pages = self.pages.len() != paint_page_index;
+        let mut decorated_grid_fragment_pages = Vec::new();
         for (page_index, mut fragment) in fragments {
             // A grid item establishes an independent formatting context, but
             // its background still paints as in-flow descendant content of
@@ -711,6 +785,7 @@ impl<'a> LayoutBuilder<'a> {
             // <https://www.w3.org/TR/css-grid-1/#grid-items> and
             // <https://www.w3.org/TR/css-overflow-3/#overflow-clipping>.
             fragment.promote_background_border_to_in_flow_block();
+            fragment.promote_outline_to_in_flow_outline();
             if page_index == paint_page_index {
                 if let Some(contour) = contoured_contents_overflow_clip.clone() {
                     fragment = fragment.with_contents_effect_scoped_to_box_content_contour(contour);
@@ -731,13 +806,40 @@ impl<'a> LayoutBuilder<'a> {
                         ))
                     })
                 };
-                if let Some(fragment_bounds) = planned_fragment_record
-                    .map(|fragment_record| {
-                        fragment_record.paint_clip(
+                let committed_principal_fragment = planned_fragment_record.map(|fragment_record| {
+                    let is_first = fragment_record.slice.source_block_start.points() <= 0.01;
+                    let is_last = !matches!(
+                        fragment_record.slice.break_after,
+                        GridFragmentBreak::RowBoundary | GridFragmentBreak::ForcedRowBoundary
+                    );
+                    let decoration = FragmentDecoration::for_box_decoration_break(
+                        style.box_decoration_break,
+                        is_first,
+                        is_last,
+                    );
+                    let cursor = fragment_record.cursor(PageTopBlockPosition::new(content_top));
+                    let border_box = if decoration.is_clone() {
+                        cursor.decorated_paint_clip(
+                            fragment_record.slice,
                             border_box_inline_span,
-                            fragment_record.cursor(PageTopBlockPosition::new(content_top)),
+                            fragment_decoration_reservation,
                         )
-                    })
+                    } else {
+                        fragment_record.paint_clip(border_box_inline_span, cursor)
+                    };
+                    fragment_record.principal_box_fragment(
+                        FragmentainerOrdinal::new(page_index),
+                        border_box,
+                        decoration,
+                    )
+                });
+                if committed_principal_fragment.is_some() {
+                    decorated_grid_fragment_pages.push(page_index);
+                }
+                if let Some(fragment_bounds) = committed_principal_fragment
+                    .as_ref()
+                    .and_then(|fragment| fragment.kind().principal_box())
+                    .map(DecoratedBoxFragment::border_box)
                     .or_else(fallback_fragment_bounds)
                 {
                     let (source_block_start, source_block_end) = planned_fragment_record
@@ -749,7 +851,8 @@ impl<'a> LayoutBuilder<'a> {
                                 total_content_height,
                             )
                         });
-                    if style.visibility == Visibility::Visible
+                    if principal_box_paint_mode.root_paints()
+                        && style.visibility == Visibility::Visible
                         && (style.background.background_color.is_potentially_visible()
                             || style.background.background_image.is_image()
                             || style.border_image.source.is_image()
@@ -769,7 +872,9 @@ impl<'a> LayoutBuilder<'a> {
                             page_background_primitives,
                         );
                     }
-                    if style.visibility == Visibility::Visible {
+                    if principal_box_paint_mode.root_paints()
+                        && style.visibility == Visibility::Visible
+                    {
                         fragment.append_primitives_in_band(
                             PaintBand::BackgroundBorder,
                             grid_gap_decoration_primitives_for_page(GridGapFragmentProjection {
@@ -798,7 +903,9 @@ impl<'a> LayoutBuilder<'a> {
                             }),
                         );
                     }
-                    if style.visibility == Visibility::Visible {
+                    if principal_box_paint_mode.root_paints()
+                        && style.visibility == Visibility::Visible
+                    {
                         let page_outline_primitives = self.box_outline_primitives(
                             paint_space_rect(
                                 outer_x,
@@ -817,7 +924,8 @@ impl<'a> LayoutBuilder<'a> {
                     PaintBand::BackgroundBorder,
                     own_background_primitives.clone(),
                 );
-                if style.visibility == Visibility::Visible {
+                if principal_box_paint_mode.root_paints() && style.visibility == Visibility::Visible
+                {
                     if committed_gap_fragment_paint_bounds.is_empty() {
                         fragment.append_primitives_in_band(
                             PaintBand::BackgroundBorder,
@@ -875,6 +983,9 @@ impl<'a> LayoutBuilder<'a> {
                 fragment
                     .append_primitives_in_band(PaintBand::Outline, own_outline_primitives.clone());
             }
+            if !defer_own_decoration_promotion {
+                fragment.promote_outline_to_in_flow_outline();
+            }
             if !fragment.is_empty() {
                 let fragment = if grid_spanned_pages {
                     let context = PaintStackingContext::from_banded_fragment(fragment, Vec::new())
@@ -889,6 +1000,85 @@ impl<'a> LayoutBuilder<'a> {
                 } else {
                     self.current_page
                         .append_paint_fragment_owned(fragment, PaintTranslation::identity());
+                }
+            }
+        }
+        // Committing a grid source slice creates a principal box fragment even
+        // when that slice has no item ink. In particular, a fixed-size empty
+        // grid and an empty continuation still paint cloned background,
+        // border, shadow, and outline. Descendant capture cannot be the
+        // authority for that ownership: an empty paint tree is not a
+        // descendant-overflow-only continuation.
+        // <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+        // <https://www.w3.org/TR/css-break-3/#break-decoration>
+        if grid_spanned_pages
+            && principal_box_paint_mode.root_paints()
+            && style.visibility == Visibility::Visible
+        {
+            for fragment_record in &grid_fragment_records {
+                let page_index = paint_page_index + fragment_record.fragmentainer_offset;
+                if decorated_grid_fragment_pages.contains(&page_index) {
+                    continue;
+                }
+                let is_first = fragment_record.slice.source_block_start.points() <= 0.01;
+                let is_last = !matches!(
+                    fragment_record.slice.break_after,
+                    GridFragmentBreak::RowBoundary | GridFragmentBreak::ForcedRowBoundary
+                );
+                let decoration = FragmentDecoration::for_box_decoration_break(
+                    style.box_decoration_break,
+                    is_first,
+                    is_last,
+                );
+                let cursor = fragment_record.cursor(PageTopBlockPosition::new(content_top));
+                let border_box = if decoration.is_clone() {
+                    cursor.decorated_paint_clip(
+                        fragment_record.slice,
+                        border_box_inline_span,
+                        fragment_decoration_reservation,
+                    )
+                } else {
+                    fragment_record.paint_clip(border_box_inline_span, cursor)
+                };
+                let committed_fragment = fragment_record.principal_box_fragment(
+                    FragmentainerOrdinal::new(page_index),
+                    border_box,
+                    decoration,
+                );
+                let principal = committed_fragment
+                    .kind()
+                    .principal_box()
+                    .expect("committed grid source slice owns a principal box");
+                let mut fragment = PaintFragment::from_primitives(Vec::new(), Vec::new());
+                let border_rect = principal.border_box().paint_rect();
+                fragment.prepend_primitives_in_band(
+                    PaintBand::BackgroundBorder,
+                    self.box_background_primitives(border_rect, style),
+                );
+                fragment.append_primitives_in_band(
+                    PaintBand::Outline,
+                    self.box_outline_primitives(border_rect, style),
+                );
+                if !defer_own_decoration_promotion {
+                    fragment.promote_outline_to_in_flow_outline();
+                }
+                let fragment = PaintFragment::from_stacking_context_in_band(
+                    PaintBand::InFlowBlock,
+                    PaintStackingContext::from_banded_fragment(fragment, Vec::new())
+                        .with_source_order(self.next_paint_source_order()),
+                );
+                if page_index < self.pages.len() {
+                    self.pages[page_index]
+                        .append_paint_fragment_owned(fragment, PaintTranslation::identity());
+                } else if page_index == self.pages.len() {
+                    self.current_page
+                        .append_paint_fragment_owned(fragment, PaintTranslation::identity());
+                } else {
+                    self.pending_paint_fragments.push(PendingPaintFragment {
+                        page_index,
+                        fragment,
+                        kind: PendingPaintFragmentKind::InFlowOverflow,
+                    });
                 }
             }
         }
@@ -1053,7 +1243,7 @@ impl<'a> LayoutBuilder<'a> {
 
         InlineAtom::new(
             InlineAtomContent::Svg { asset: None },
-            style.as_computed().clone(),
+            style.clone_used_style(),
             None,
             InlineSize::new(
                 content_width + horizontal_extras + style.margin.left + style.margin.right,
@@ -1217,6 +1407,10 @@ impl<'a> LayoutBuilder<'a> {
         )
         .points();
         let border_box_height = total_content_height + vertical_extras;
+        // An inline-grid's off-page atom capture is not an ancestor list
+        // item's principal line layout. Its descendant lines must not consume
+        // an outside marker awaiting the real parent line.
+        let pending_outside_marker_anchors = self.pending_outside_marker_anchors.suspend();
         let snapshot = self.snapshot();
         let positioned_layer_start = self.positioned_layers.len();
         // Inline-grid uses a temporary page while materializing its atom, but
@@ -1378,22 +1572,24 @@ impl<'a> LayoutBuilder<'a> {
                     .map(|line_y| (border_box_height - line_y).max(0.0))
             });
         let baseline_offset = LayoutBuilder::inline_block_baseline_offset_with_containment(
-            style.as_computed(),
+            style.used_style(),
             containment.layout,
             border_box_height,
             descendant_baseline,
         );
         let inline_lanes_overflow_clearance =
-            grid_lanes_inline_overflow_clearance(style.as_computed(), &grid_layout);
+            grid_lanes_inline_overflow_clearance(style.used_style(), &grid_layout);
         let fixed_layers = self.fixed_layers.split_off(fixed_layer_start);
         self.restore(snapshot);
+        self.pending_outside_marker_anchors
+            .restore(pending_outside_marker_anchors);
         self.fixed_layers.extend(fixed_layers);
         // Grid Lanes exports its packed baseline through `grid_layout` just
         // like an ordinary grid container.  Do not rewrite an authored
         // baseline alignment here: doing so changes the line box that owns an
         // inline-grid-lanes atom rather than its exported baseline.
         // <https://drafts.csswg.org/css-grid-3/#grid-lanes-baseline-alignment>
-        let mut atom_style = style.as_computed().clone();
+        let mut atom_style = style.clone_used_style();
         // The clearance is a margin-box contribution, not a larger border
         // box. Keeping those spaces distinct preserves the captured grid
         // fragment's top edge while reserving endward line space for its
@@ -1702,6 +1898,19 @@ pub(in crate::layout::grid) enum GridLayoutPurpose {
     IntrinsicProbe,
 }
 
+/// One cloned grid item fragment's destination interval and continuous
+/// source-content interval.
+///
+/// Grid track geometry remains source geometry. This mapping is the explicit
+/// boundary between that geometry and the destination fragment sequence that
+/// receives repeated `box-decoration-break: clone` edges.
+/// <https://www.w3.org/TR/css-break-3/#box-model-for-breaking>
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GridClonedItemFragmentSlice {
+    destination: GridFragmentItemContentSlice,
+    source: GridFragmentItemContentSlice,
+}
+
 /// Taffy leaves used by one Grid sizing pass.
 ///
 /// A contribution proxy models normal-flow content inside an inherited
@@ -1716,6 +1925,15 @@ enum GridTaffyLeaf {
 #[derive(Debug, Clone)]
 pub(in crate::layout) struct GridItemLayout {
     rect: GridRect,
+    /// The item source height used by Grid's final placement. A cloned item
+    /// keeps this continuous source coordinate system even when its repeated
+    /// block decorations enlarge the destination fragment sequence.
+    fragmentation_source_height: f32,
+    /// Destination-to-source mappings for an item with cloned block edges.
+    /// Grid row fragmentation selects destination intervals; replay selects
+    /// the corresponding continuous source-content range from this record.
+    cloned_fragment_slices: Vec<GridClonedItemFragmentSlice>,
+    cloned_fragment_reservation: Option<FragmentDecorationReservation>,
     pub(in crate::layout::grid) area: Option<GridItemArea>,
     /// Whether a Grid Lanes item was placed from a definite grid-axis line or
     /// by the lanes cursor.  A final numeric area alone cannot preserve this:
@@ -1805,8 +2023,12 @@ fn apply_resolved_subgrid_axis_item_geometry(
 
 impl GridItemLayout {
     pub(in crate::layout::grid) fn new(rect: GridRect, area: Option<GridItemArea>) -> Self {
+        let fragmentation_source_height = rect.size.height;
         Self {
             rect,
+            fragmentation_source_height,
+            cloned_fragment_slices: Vec::new(),
+            cloned_fragment_reservation: None,
             area,
             grid_lanes_placement: None,
             used_box_metrics: None,
@@ -1876,6 +2098,131 @@ impl GridItemLayout {
 
     pub(in crate::layout::grid) fn height(&self) -> f32 {
         self.rect.size.height
+    }
+
+    /// The destination extent consumed by this item in the grid fragment
+    /// plan. It differs from [`Self::height`] only for `clone`, whose border
+    /// and padding occur in every occupied fragmentainer.
+    pub(in crate::layout::grid) fn fragmentation_height(&self) -> f32 {
+        self.cloned_fragment_slices
+            .last()
+            .map(|slice| slice.destination.block_end.points())
+            .unwrap_or_else(|| self.height())
+    }
+
+    pub(in crate::layout::grid) fn fragmentation_source_height(&self) -> f32 {
+        self.fragmentation_source_height
+    }
+
+    pub(in crate::layout::grid) fn has_cloned_fragment_projection(&self) -> bool {
+        self.cloned_fragment_reservation.is_some()
+    }
+
+    /// Record the source content independently from repeated destination
+    /// decoration. CSS Fragmentation applies cloned border and padding per
+    /// box fragment, while the item's descendants remain one source flow.
+    /// <https://www.w3.org/TR/css-break-3/#box-model-for-breaking>
+    pub(in crate::layout::grid) fn configure_cloned_fragment_source(
+        &mut self,
+        source_height: f32,
+        reservation: FragmentDecorationReservation,
+    ) {
+        self.fragmentation_source_height = source_height.max(0.0);
+        self.cloned_fragment_reservation = Some(reservation);
+        self.cloned_fragment_slices.clear();
+    }
+
+    /// Build the item-local projection from source content to destination
+    /// fragment geometry. A fresh cloned fragment owns both block edges.
+    pub(in crate::layout::grid) fn project_cloned_fragment_destinations(
+        &mut self,
+        initial_raw_extent: LayoutLength,
+        continuation_raw_extent: LayoutLength,
+    ) -> bool {
+        let Some(reservation) = self.cloned_fragment_reservation else {
+            return false;
+        };
+        let initial_capacity = reservation.fresh_content_extent(initial_raw_extent);
+        let continuation_capacity = reservation.fresh_content_extent(continuation_raw_extent);
+        if initial_capacity.points() <= GRID_FRAGMENT_EPSILON
+            || continuation_capacity.points() <= GRID_FRAGMENT_EPSILON
+        {
+            return false;
+        }
+        let mut remaining_source = self.fragmentation_source_height;
+        let mut source_offset = 0.0;
+        let mut destination_offset = 0.0;
+        let mut capacity = initial_capacity;
+        let mut slices = Vec::new();
+        while remaining_source > GRID_FRAGMENT_EPSILON {
+            let source_length = remaining_source.min(capacity.points());
+            let destination_length = reservation.block_start().points()
+                + source_length
+                + reservation.block_end().points();
+            slices.push(GridClonedItemFragmentSlice {
+                destination: GridFragmentItemContentSlice {
+                    block_start: GridFragmentBlockOffset::new(destination_offset),
+                    block_end: GridFragmentBlockOffset::new(
+                        destination_offset + destination_length,
+                    ),
+                },
+                source: GridFragmentItemContentSlice {
+                    block_start: GridFragmentBlockOffset::new(source_offset),
+                    block_end: GridFragmentBlockOffset::new(source_offset + source_length),
+                },
+            });
+            remaining_source -= source_length;
+            source_offset += source_length;
+            destination_offset += destination_length;
+            capacity = continuation_capacity;
+        }
+        if slices.is_empty() {
+            return false;
+        }
+        let changed =
+            (self.fragmentation_height() - destination_offset).abs() > GRID_FRAGMENT_EPSILON;
+        self.cloned_fragment_slices = slices;
+        changed
+    }
+
+    /// Map a committed destination slice back into the continuous source
+    /// content coordinate system used by isolated grid-item replay.
+    pub(in crate::layout::grid) fn source_slice_for_destination_slice(
+        &self,
+        destination_slice: GridFragmentItemContentSlice,
+    ) -> Option<GridFragmentItemContentSlice> {
+        let reservation = self.cloned_fragment_reservation?;
+        let mut source_start = None;
+        let mut source_end = None;
+        for fragment in &self.cloned_fragment_slices {
+            let start = destination_slice
+                .block_start
+                .points()
+                .max(fragment.destination.block_start.points());
+            let end = destination_slice
+                .block_end
+                .points()
+                .min(fragment.destination.block_end.points());
+            if end <= start + GRID_FRAGMENT_EPSILON {
+                continue;
+            }
+            let content_start =
+                fragment.destination.block_start.points() + reservation.block_start().points();
+            let source_extent =
+                fragment.source.block_end.points() - fragment.source.block_start.points();
+            let local_start = (start - content_start).clamp(0.0, source_extent);
+            let local_end = (end - content_start).clamp(0.0, source_extent);
+            source_start.get_or_insert(fragment.source.block_start.points() + local_start);
+            source_end = Some(fragment.source.block_start.points() + local_end);
+        }
+        let fallback = destination_slice
+            .block_start
+            .points()
+            .min(self.fragmentation_source_height);
+        Some(GridFragmentItemContentSlice {
+            block_start: GridFragmentBlockOffset::new(source_start.unwrap_or(fallback)),
+            block_end: GridFragmentBlockOffset::new(source_end.unwrap_or(fallback)),
+        })
     }
 
     pub(in crate::layout::grid) fn axis_start(&self, axis: GridAxis) -> f32 {
@@ -2051,6 +2398,7 @@ impl<'a> LayoutBuilder<'a> {
             GridLayoutPassConfig {
                 width,
                 root_height: height,
+                item_width_basis: None,
                 item_height_basis: grid_percentage_basis(
                     height.map(PhysicalContentHeight::content_box_length),
                     GridAvailableSizeSource::ContainerBlockSize,
@@ -2092,6 +2440,7 @@ impl<'a> LayoutBuilder<'a> {
                 GridLayoutPassConfig {
                     width,
                     root_height: height,
+                    item_width_basis: None,
                     item_height_basis: grid_percentage_basis(
                         height.map(PhysicalContentHeight::content_box_length),
                         GridAvailableSizeSource::ContainerBlockSize,
@@ -2137,6 +2486,7 @@ impl<'a> LayoutBuilder<'a> {
                 GridLayoutPassConfig {
                     width,
                     root_height: height,
+                    item_width_basis: None,
                     item_height_basis: grid_percentage_basis(
                         height.map(PhysicalContentHeight::content_box_length),
                         GridAvailableSizeSource::ContainerBlockSize,
@@ -2174,6 +2524,7 @@ impl<'a> LayoutBuilder<'a> {
                 GridLayoutPassConfig {
                     width,
                     root_height: Some(intrinsic_layout.height),
+                    item_width_basis: None,
                     item_height_basis: grid_percentage_basis(
                         Some(intrinsic_layout.height.content_box_length()),
                         GridAvailableSizeSource::ContainerBlockSize,
@@ -2205,6 +2556,7 @@ impl<'a> LayoutBuilder<'a> {
                 GridLayoutPassConfig {
                     width,
                     root_height: Some(intrinsic_layout.height),
+                    item_width_basis: None,
                     item_height_basis: PercentageBasis::indefinite(),
                     row_gap_basis: grid_percentage_basis(
                         Some(intrinsic_layout.height.content_box_length()),
@@ -2357,14 +2709,16 @@ impl<'a> LayoutBuilder<'a> {
         // here would incorrectly make `width: 100%` grow the implicit track.
         // <https://drafts.csswg.org/css-grid-2/#subgrid-listing> and
         // <https://drafts.csswg.org/css-grid-1/#percentage-sizing>
-        let item_width_basis = if contained_subgrid_columns {
-            GridPercentageBasis::indefinite()
-        } else {
-            grid_percentage_basis(
-                Some(content_width.content_box_length()),
-                GridAvailableSizeSource::ContainerInlineSize,
-            )
-        };
+        let item_width_basis = config.item_width_basis.unwrap_or_else(|| {
+            if contained_subgrid_columns {
+                GridPercentageBasis::indefinite()
+            } else {
+                grid_percentage_basis(
+                    Some(content_width.content_box_length()),
+                    GridAvailableSizeSource::ContainerInlineSize,
+                )
+            }
+        });
         let item_available_space = GridPhysicalAvailableSpace {
             width_basis: item_width_basis,
             height_basis: item_height_basis,
@@ -2378,6 +2732,8 @@ impl<'a> LayoutBuilder<'a> {
         // <https://www.w3.org/TR/css-grid-2/#track-sizing>.
         let swaps_physical_grid_axes =
             WritingModeAxes::new(style.writing_mode, style.direction).swaps_physical_axes();
+        let track_percentage_bases =
+            GridTrackPercentageBases::from_grid_content_box(style, content_width, root_height);
         let physical_column_subgrid = subgrid_context
             .and_then(|context| context.physical_axis(GridAxis::Column, swaps_physical_grid_axes));
         let physical_row_subgrid = subgrid_context
@@ -2386,10 +2742,16 @@ impl<'a> LayoutBuilder<'a> {
             .map(|context| context.resolve_item_placements(children, style.grid_auto_flow));
         let mut tree: taffy_layout::TaffyTree<GridTaffyLeaf> = taffy_layout::TaffyTree::new();
         tree.disable_rounding();
-        let row_adjustment =
-            taffy_startward_implicit_row_adjustment(style, children, root_height_points);
-        let column_adjustment =
-            taffy_startward_implicit_column_adjustment(style, children, content_width);
+        let row_adjustment = taffy_startward_implicit_row_adjustment(
+            style,
+            children,
+            track_percentage_bases.for_axis(GridAxis::Row),
+        );
+        let column_adjustment = taffy_startward_implicit_column_adjustment(
+            style,
+            children,
+            track_percentage_bases.for_axis(GridAxis::Column),
+        );
         let mut nodes = Vec::with_capacity(children.len());
         let mut estimates = Vec::with_capacity(children.len());
         let mut item_box_metrics = Vec::with_capacity(children.len());
@@ -2723,11 +3085,13 @@ impl<'a> LayoutBuilder<'a> {
                                 taffy_grid_template_rows_with_startward_adjustment(
                                     style,
                                     &row_adjustment,
+                                    track_percentage_bases.for_axis(GridAxis::Row),
                                 )
                             } else {
                                 taffy_grid_template_columns_with_startward_adjustment(
                                     style,
                                     &column_adjustment,
+                                    track_percentage_bases.for_axis(GridAxis::Column),
                                 )
                             }
                         }),
@@ -2738,11 +3102,13 @@ impl<'a> LayoutBuilder<'a> {
                                 taffy_grid_template_columns_with_startward_adjustment(
                                     style,
                                     &column_adjustment,
+                                    track_percentage_bases.for_axis(GridAxis::Column),
                                 )
                             } else {
                                 taffy_grid_template_rows_with_startward_adjustment(
                                     style,
                                     &row_adjustment,
+                                    track_percentage_bases.for_axis(GridAxis::Row),
                                 )
                             }
                         }),
@@ -3449,6 +3815,10 @@ fn grid_gap_resolves_differently_with_basis(
 pub(super) struct GridLayoutPassConfig {
     pub(super) width: PhysicalContentWidth,
     pub(super) root_height: Option<PhysicalContentHeight>,
+    /// Overrides the physical-width percentage basis for an intrinsic sizing
+    /// pass. Grid Lanes uses this while probing a column auto-repeat so item
+    /// percentages cannot feed the container width back into track sizing.
+    pub(super) item_width_basis: Option<GridPercentageBasis>,
     pub(super) item_height_basis: GridPercentageBasis,
     pub(super) row_gap_basis: GridPercentageBasis,
     pub(super) reported_height: Option<PhysicalContentHeight>,
@@ -3632,7 +4002,25 @@ fn apply_track_layout_correction_axis(
     };
     let original_area_size = (original_end - original_start).max(0.0);
     let corrected_area_size = (corrected_end - corrected_start).max(0.0);
-    let offset_in_area = item.axis_start(axis) - original_start;
+    let original_track_start = correction.original_offsets[start_line];
+    let original_track_area_size =
+        (correction.original_offsets[end_line] - original_track_start).max(0.0);
+    let offset_in_area = if (item.axis_size(axis) - original_track_area_size).abs() >= 0.01
+        && matches!(
+            content_alignment.keyword,
+            css::ContentAlignmentKeyword::SpaceBetween
+                | css::ContentAlignmentKeyword::SpaceAround
+                | css::ContentAlignmentKeyword::SpaceEvenly
+        ) {
+        // Distributed alignment re-centres a fixed-size item when collapsed
+        // tracks shorten its source area. Positional alignment preserves the
+        // Taffy offset, including the negative overflow shift of a span that
+        // fills the area.
+        item.axis_start(axis) - original_track_start
+            + (corrected_area_size - original_track_area_size) / 2.0
+    } else {
+        item.axis_start(axis) - original_start
+    };
     let mut size = item.axis_size(axis);
     if (size - original_area_size).abs() < 0.01 {
         size = corrected_area_size;
@@ -4205,16 +4593,15 @@ struct GridBaselineAlignmentContext<'a, 'box_tree> {
     row_line_offsets: &'a [f32],
 }
 
-/// Correct same-page grid self-alignment values that Taffy cannot model directly.
+/// Correct same-page grid self-alignment values outside Taffy's model.
 ///
-/// Taffy's grid alignment model treats `self-start`/`self-end` like
-/// `start`/`end`, but CSS Box Alignment resolves them from the alignment
-/// subject's own writing mode. In horizontal grid containers this pass maps
-/// justify-axis and align-axis `self-start`/`self-end` to the item's relevant
-/// physical side; `left`/`right` are physical self-position values for
-/// justify-axis alignment and therefore also bypass Taffy's direction-sensitive
-/// flex-start/flex-end mapping. The correction uses effective `justify-self`
-/// and `align-self` values, so container defaults follow the same path:
+/// Taffy 0.13 resolves `self-start`/`self-end` natively for horizontal-tb
+/// alignment subjects. Quire still resolves them for vertical-writing subjects,
+/// whose physical sides cannot be represented by Taffy's horizontal-tb model.
+/// Physical `left`/`right` self-position values likewise bypass Taffy's
+/// direction-sensitive start/end mapping. The correction uses effective
+/// `justify-self` and `align-self` values, so container defaults follow the
+/// same path:
 /// <https://www.w3.org/TR/css-align-3/#self-alignment> and
 /// <https://www.w3.org/TR/css-grid-1/#alignment>.
 fn apply_grid_self_alignment_corrections(
@@ -4275,10 +4662,10 @@ fn horizontal_self_alignment_offset(
     let side = match justify_self.keyword {
         SelfAlignmentKeyword::Left => Some(PhysicalSide::Left),
         SelfAlignmentKeyword::Right => Some(PhysicalSide::Right),
-        SelfAlignmentKeyword::SelfStart => {
+        SelfAlignmentKeyword::SelfStart if child_style.writing_mode.has_vertical_lines() => {
             grid_subject_self_start_side(child_style, PhysicalAxis::Horizontal)
         }
-        SelfAlignmentKeyword::SelfEnd => {
+        SelfAlignmentKeyword::SelfEnd if child_style.writing_mode.has_vertical_lines() => {
             grid_subject_self_end_side(child_style, PhysicalAxis::Horizontal)
         }
         _ => None,
@@ -4307,10 +4694,10 @@ fn vertical_self_alignment_offset(
     item_height: f32,
 ) -> Option<f32> {
     let side = match align_self.keyword {
-        SelfAlignmentKeyword::SelfStart => {
+        SelfAlignmentKeyword::SelfStart if child_style.writing_mode.has_vertical_lines() => {
             grid_subject_self_start_side(child_style, PhysicalAxis::Vertical)
         }
-        SelfAlignmentKeyword::SelfEnd => {
+        SelfAlignmentKeyword::SelfEnd if child_style.writing_mode.has_vertical_lines() => {
             grid_subject_self_end_side(child_style, PhysicalAxis::Vertical)
         }
         _ => None,

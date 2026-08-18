@@ -369,6 +369,7 @@ pub(in crate::css) fn affected_longhand_names(
             "background-position-x",
             "background-position-y",
             "background-repeat",
+            "background-attachment",
             "background-origin",
             "background-clip",
         ],
@@ -383,6 +384,7 @@ pub(in crate::css) fn affected_longhand_names(
         "background-position-x" => &["background-position-x"],
         "background-position-y" => &["background-position-y"],
         "background-repeat" => &["background-repeat"],
+        "background-attachment" => &["background-attachment"],
         "background-origin" => &["background-origin"],
         "background-clip" => &["background-clip"],
         "text-align" => &["text-align-all", "text-align-last"],
@@ -957,6 +959,23 @@ pub(crate) fn apply_declarations(style: &mut ComputedStyle, declarations: &Decla
     apply_declarations_with_origin(style, declarations, StylesheetOrigin::Author);
 }
 
+/// Applies author-origin declarations using an already-retained inheritance
+/// source instead of cloning `style` to preserve its pre-cascade state.
+///
+/// Callers must pass the style that supplies CSS-wide `inherit` and inherited
+/// `unset` values for this cascade operation.
+///
+/// <https://www.w3.org/TR/css-cascade-5/#defaulting-keywords>
+pub(crate) fn apply_declarations_with_inheritance_source(
+    style: &mut ComputedStyle,
+    declarations: &Declarations,
+    inheritance_source: &ComputedStyle,
+) {
+    let mut declarations = cascaded_declarations_from(declarations, StylesheetOrigin::Author);
+    sort_cascaded_declarations(&mut declarations);
+    apply_cascaded_declarations_with_inheritance_source(style, &declarations, inheritance_source);
+}
+
 pub(crate) fn apply_declarations_with_origin(
     style: &mut ComputedStyle,
     declarations: &Declarations,
@@ -994,6 +1013,30 @@ pub(crate) fn apply_cascaded_declarations_with_inheritance_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_inheritance_source_matches_cloned_defaulting_source() {
+        let mut base = ComputedStyle::initial();
+        apply_declarations(
+            &mut base,
+            &parse_declarations(
+                "--page-accent: rebeccapurple; color: teal; font-size: 15pt; margin-left: 9pt",
+            ),
+        );
+        let source_before_cascade = base.clone();
+        let declarations = parse_declarations(
+            "color: inherit; font-size: unset; margin-left: inherit; background-color: var(--page-accent)",
+        );
+
+        let mut generic = base.clone();
+        apply_declarations(&mut generic, &declarations);
+
+        let mut explicit_source = base.clone();
+        apply_declarations_with_inheritance_source(&mut explicit_source, &declarations, &base);
+
+        assert_eq!(explicit_source, generic);
+        assert_eq!(base, source_before_cascade);
+    }
 
     #[test]
     fn zoom_cascade_keeps_local_values_non_inherited_and_composes_effective_scale() {

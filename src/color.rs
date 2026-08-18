@@ -641,57 +641,52 @@ fn matrix(matrix: [[f64; 3]; 3], value: [f64; 3]) -> [f64; 3] {
     matrix.map(|row| row[0] * value[0] + row[1] * value[1] + row[2] * value[2])
 }
 
-/// Convert encoded 8-bit RGB/XYZ samples for a generated image.
-pub(crate) fn convert_samples(
+/// Convert interleaved RGB samples while retaining their integer precision.
+pub(crate) fn convert_samples_at_depth(
     samples: &[u8],
+    sample_depth: crate::image_store::RasterSampleDepth,
     source_space: CssColorSpace,
     target_space: CssColorSpace,
 ) -> Option<Vec<u8>> {
     if source_space == target_space {
         return Some(samples.to_vec());
     }
-    if !samples.len().is_multiple_of(3) {
+    let component_bytes = sample_depth.bytes_per_component();
+    if !samples.len().is_multiple_of(3 * component_bytes) {
         return None;
     }
     if source_space == CssColorSpace::XyzD50 || target_space == CssColorSpace::XyzD50 {
-        return samples
-            .as_chunks::<3>()
-            .0
-            .iter()
-            .map(|sample| {
-                let color = CssColor::in_space(
-                    source_space,
-                    sample[0] as f32 / 255.0,
-                    sample[1] as f32 / 255.0,
-                    sample[2] as f32 / 255.0,
-                    1.0,
-                );
-                let color = convert_color(color, target_space)?;
-                Some(color_components_to_u8(color))
-            })
-            .collect::<Option<Vec<_>>>()
-            .map(|pixels| pixels.into_iter().flatten().collect());
+        let mut converted = Vec::with_capacity(samples.len());
+        for sample in samples.chunks_exact(3 * component_bytes) {
+            let components = sample_components(sample, sample_depth)?;
+            let color = CssColor::in_space(
+                source_space,
+                components[0],
+                components[1],
+                components[2],
+                1.0,
+            );
+            let color = convert_color(color, target_space)?;
+            append_color_components(&mut converted, color, sample_depth);
+        }
+        return Some(converted);
     }
     let source = profile(source_space).ok()?;
     let destination = profile(target_space).ok()?;
-    let transform = source
-        .create_transform_8bit(Layout::Rgb, &destination, Layout::Rgb, transform_options())
-        .ok()?;
-    let mut output = vec![0; samples.len()];
-    transform.transform(samples, &mut output).ok()?;
-    Some(output)
+    transform_samples_at_depth(&source, &destination, samples, sample_depth)
 }
 
-/// Transform decoded RGB image samples from a retained embedded ICC profile.
-///
-/// The source profile is validated when the image enters the document store;
-/// this reopens it only for the short-lived PDF emission transform.
-pub(crate) fn convert_embedded_rgb_samples(
+/// Transform retained embedded-ICC RGB samples without changing sample depth.
+pub(crate) fn convert_embedded_rgb_samples_at_depth(
     samples: &[u8],
+    sample_depth: crate::image_store::RasterSampleDepth,
     embedded_profile: &[u8],
     target_space: CssColorSpace,
 ) -> Option<Vec<u8>> {
-    if !samples.len().is_multiple_of(3) {
+    if !samples
+        .len()
+        .is_multiple_of(3 * sample_depth.bytes_per_component())
+    {
         return None;
     }
     let source = ColorProfile::new_from_slice(embedded_profile).ok()?;
@@ -702,12 +697,74 @@ pub(crate) fn convert_embedded_rgb_samples(
     if target_space == CssColorSpace::XyzD50 {
         return None;
     }
-    let transform = source
-        .create_transform_8bit(Layout::Rgb, &destination, Layout::Rgb, transform_options())
-        .ok()?;
-    let mut output = vec![0; samples.len()];
-    transform.transform(samples, &mut output).ok()?;
-    Some(output)
+    transform_samples_at_depth(&source, &destination, samples, sample_depth)
+}
+
+fn transform_samples_at_depth(
+    source: &ColorProfile,
+    destination: &ColorProfile,
+    samples: &[u8],
+    sample_depth: crate::image_store::RasterSampleDepth,
+) -> Option<Vec<u8>> {
+    match sample_depth {
+        crate::image_store::RasterSampleDepth::Eight => {
+            let transform = source
+                .create_transform_8bit(Layout::Rgb, destination, Layout::Rgb, transform_options())
+                .ok()?;
+            let mut output = vec![0; samples.len()];
+            transform.transform(samples, &mut output).ok()?;
+            Some(output)
+        }
+        crate::image_store::RasterSampleDepth::Sixteen => {
+            let mut input = Vec::with_capacity(samples.len() / 2);
+            for component in samples.chunks_exact(2) {
+                input.push(u16::from_be_bytes([component[0], component[1]]));
+            }
+            let transform = source
+                .create_transform_16bit(Layout::Rgb, destination, Layout::Rgb, transform_options())
+                .ok()?;
+            let mut output = vec![0; input.len()];
+            transform.transform(&input, &mut output).ok()?;
+            Some(output.into_iter().flat_map(u16::to_be_bytes).collect())
+        }
+    }
+}
+
+fn sample_components(
+    sample: &[u8],
+    sample_depth: crate::image_store::RasterSampleDepth,
+) -> Option<[f32; 3]> {
+    match sample_depth {
+        crate::image_store::RasterSampleDepth::Eight => Some([
+            f32::from(*sample.first()?) / 255.0,
+            f32::from(*sample.get(1)?) / 255.0,
+            f32::from(*sample.get(2)?) / 255.0,
+        ]),
+        crate::image_store::RasterSampleDepth::Sixteen => Some([
+            f32::from(u16::from_be_bytes([*sample.first()?, *sample.get(1)?])) / 65535.0,
+            f32::from(u16::from_be_bytes([*sample.get(2)?, *sample.get(3)?])) / 65535.0,
+            f32::from(u16::from_be_bytes([*sample.get(4)?, *sample.get(5)?])) / 65535.0,
+        ]),
+    }
+}
+
+fn append_color_components(
+    output: &mut Vec<u8>,
+    color: CssColor,
+    sample_depth: crate::image_store::RasterSampleDepth,
+) {
+    match sample_depth {
+        crate::image_store::RasterSampleDepth::Eight => {
+            output.extend(color_components_to_u8(color))
+        }
+        crate::image_store::RasterSampleDepth::Sixteen => {
+            for component in color.components() {
+                output.extend_from_slice(
+                    &((component * 65535.0).round().clamp(0.0, 65535.0) as u16).to_be_bytes(),
+                );
+            }
+        }
+    }
 }
 
 /// The ICC's published sRGB v4 profile is used for tagged PDF sRGB output.
@@ -803,9 +860,36 @@ mod tests {
         let samples = [230, 32, 16, 16, 64, 240];
 
         assert_eq!(
-            convert_embedded_rgb_samples(&samples, &profile, CssColorSpace::Srgb),
-            convert_samples(&samples, CssColorSpace::DisplayP3, CssColorSpace::Srgb)
+            convert_embedded_rgb_samples_at_depth(
+                &samples,
+                crate::image_store::RasterSampleDepth::Eight,
+                &profile,
+                CssColorSpace::Srgb,
+            ),
+            convert_samples_at_depth(
+                &samples,
+                crate::image_store::RasterSampleDepth::Eight,
+                CssColorSpace::DisplayP3,
+                CssColorSpace::Srgb,
+            )
         );
+    }
+
+    #[test]
+    fn sixteen_bit_embedded_rgb_samples_keep_their_depth_during_conversion() {
+        let profile = icc_profile_bytes(CssColorSpace::DisplayP3).unwrap();
+        let samples = [0xe6, 0x00, 0x20, 0x00, 0x10, 0x00];
+
+        let converted = convert_embedded_rgb_samples_at_depth(
+            &samples,
+            crate::image_store::RasterSampleDepth::Sixteen,
+            &profile,
+            CssColorSpace::Srgb,
+        )
+        .unwrap();
+
+        assert_eq!(converted.len(), samples.len());
+        assert_ne!(converted, samples);
     }
 
     #[test]

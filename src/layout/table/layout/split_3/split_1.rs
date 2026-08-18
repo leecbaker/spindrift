@@ -40,11 +40,7 @@ impl<'a> LayoutBuilder<'a> {
         ) - style.margin.top
             - style.margin.bottom)
             .max(0.0);
-        let borders = used_border_widths(style);
-        let padding = used_padding_edges(
-            style,
-            PercentageBasis::definite(layout_pt(available_outer_width)),
-        );
+        let geometry = used_table_wrapper_geometry(style, available_outer_width, None);
         TableWrapperFlexSizing {
             grid_min_content_inline: LogicalInlineContentSize::new(content_box_pt(
                 grid_min_content,
@@ -58,12 +54,8 @@ impl<'a> LayoutBuilder<'a> {
             wrapper_intrinsic_block: LogicalBlockContentSize::new(content_box_pt(
                 wrapper_intrinsic_block,
             )),
-            inline_non_content: non_content_pt(
-                borders.left + borders.right + padding.left.points() + padding.right.points(),
-            ),
-            block_non_content: non_content_pt(
-                borders.top + borders.bottom + padding.top.points() + padding.bottom.points(),
-            ),
+            inline_non_content: geometry.inline_non_content(),
+            block_non_content: geometry.block_non_content(),
             margins: style.margin,
         }
     }
@@ -84,7 +76,7 @@ impl<'a> LayoutBuilder<'a> {
         available_outer_width: f32,
     ) -> (f32, f32) {
         let input = TableLayoutInput::from_fragment(fragment);
-        let rows = input.rows.as_slice();
+        let rows = input.row_ordering.rows.as_slice();
         let available_table_width =
             (available_outer_width - style.margin.left - style.margin.right).max(style.font_size);
         if rows.is_empty() {
@@ -114,7 +106,7 @@ impl<'a> LayoutBuilder<'a> {
                     grid.column_count,
                 )
             });
-        let table_width = used_table_width(
+        let table_geometry = used_table_wrapper_geometry(
             style,
             available_table_width,
             collapsed_geometry
@@ -127,7 +119,7 @@ impl<'a> LayoutBuilder<'a> {
             style,
             stylesheets,
             &input.columns,
-            table_width.content_width.points(),
+            table_geometry.grid_inline.points(),
             table_cellpadding,
             table_metrics,
             collapsed_geometry.as_ref(),
@@ -210,7 +202,7 @@ impl<'a> LayoutBuilder<'a> {
         let available_table_width =
             (available_outer_width - style.margin.left - style.margin.right).max(style.font_size);
         let input = TableLayoutInput::from_fragment(fragment);
-        let rows = input.rows.as_slice();
+        let rows = input.row_ordering.rows.as_slice();
         let collapsed_outer_insets =
             if style.border_collapse == css::BorderCollapse::Collapse && !rows.is_empty() {
                 let grid = table_grid(rows);
@@ -228,16 +220,18 @@ impl<'a> LayoutBuilder<'a> {
             } else {
                 None
             };
-        let table_width = used_table_width(style, available_table_width, collapsed_outer_insets);
-        let horizontal_non_content = table_horizontal_non_content_width(table_width);
+        let table_geometry =
+            used_table_wrapper_geometry(style, available_table_width, collapsed_outer_insets);
+        let inline_non_content = table_geometry.inline_non_content();
         let percentage_basis = resolve_percentage
             .then(|| content_box_pt(available_table_width))
             .map(PercentageBasis::definite)
             .unwrap_or_else(PercentageBasis::indefinite);
-        let authored_width = used_content_box_width_or_auto_with_basis(
-            style,
+        let authored_inline = table_root_inline_content_box_size(
+            table_root_inline_size(style),
+            style.box_sizing,
             percentage_basis,
-            non_content_pt(horizontal_non_content),
+            inline_non_content,
         )
         .map(SemanticLengthExt::points);
 
@@ -251,15 +245,18 @@ impl<'a> LayoutBuilder<'a> {
         // accepted for layout.
         // <https://www.w3.org/TR/CSS22/tables.html#fixed-table-layout>
         if style.table_layout == TableLayout::Fixed
-            && let Some(width) = authored_width
+            && let Some(inline) = authored_inline
         {
-            let width = constrain_content_width(
+            let inline = constrain_table_root_inline_size(
                 style,
-                content_box_pt(width),
-                PercentageBasis::definite(layout_pt(available_table_width.max(style.font_size))),
+                content_box_pt(inline),
+                PercentageBasis::definite(content_box_pt(
+                    available_table_width.max(style.font_size),
+                )),
+                inline_non_content,
             )
             .points();
-            return (width, width);
+            return (inline, inline);
         }
 
         let (min_content, max_content) = self.table_intrinsic_widths_from_fragment(
@@ -269,36 +266,37 @@ impl<'a> LayoutBuilder<'a> {
             fragment,
             available_outer_width,
         );
-        let resolved_width = authored_width
+        let resolved_inline = authored_inline
             .or_else(|| {
                 intrinsic::intrinsic_content_box_width_keyword(
                     table_root_inline_size(style),
                     content_box_pt(min_content),
                     content_box_pt(max_content),
                     layout_pt(available_table_width),
-                    non_content_pt(horizontal_non_content),
+                    inline_non_content,
                 )
                 .map(SemanticLengthExt::points)
             })
-            .map(|width| {
-                constrain_content_width(
+            .map(|inline| {
+                constrain_table_root_inline_size(
                     style,
-                    content_box_pt(width),
-                    PercentageBasis::definite(layout_pt(
+                    content_box_pt(inline),
+                    PercentageBasis::definite(content_box_pt(
                         available_table_width.max(style.font_size),
                     )),
+                    inline_non_content,
                 )
                 .points()
             });
 
-        if let Some(width) = resolved_width {
-            let width = table_content_width_clamped_to_min_content(
+        if let Some(inline) = resolved_inline {
+            let inline = table_content_width_clamped_to_min_content(
                 style,
-                LogicalInlineContentSize::new(content_box_pt(width)),
+                LogicalInlineContentSize::new(content_box_pt(inline)),
                 LogicalInlineContentSize::new(content_box_pt(min_content)),
             )
             .points();
-            (width, width)
+            (inline, inline)
         } else {
             (min_content, max_content)
         }
@@ -337,7 +335,7 @@ impl<'a> LayoutBuilder<'a> {
         let available_table_width =
             (available_outer_width - style.margin.left - style.margin.right).max(style.font_size);
         let input = TableLayoutInput::from_fragment(fragment);
-        let rows = input.rows.as_slice();
+        let rows = input.row_ordering.rows.as_slice();
         let collapsed_outer_insets =
             if style.border_collapse == css::BorderCollapse::Collapse && !rows.is_empty() {
                 let grid = table_grid(rows);
@@ -384,15 +382,17 @@ impl<'a> LayoutBuilder<'a> {
         available_outer_width: f32,
     ) -> (f32, f32) {
         let input = TableLayoutInput::from_fragment(fragment);
-        let rows = input.rows.as_slice();
+        let rows = input.row_ordering.rows.as_slice();
         let available_table_width =
             (available_outer_width - style.margin.left - style.margin.right).max(style.font_size);
         let mut table_width = used_table_width(style, available_table_width, None);
         if rows.is_empty() {
-            let content = used_empty_table_grid_width(style, available_table_width, table_width);
-            let physical_width = table_width.wrapper_border_box_width(content).points()
-                + style.margin.left
-                + style.margin.right;
+            let _content = used_empty_table_grid_width(style, available_table_width, table_width);
+            // The empty grid's inline extent projects to physical height for
+            // this vertical wrapper; its physical width is the block-axis
+            // wrapper decoration, not an inline-size border-box conversion.
+            let physical_width =
+                table_width.block_non_content().points() + style.margin.left + style.margin.right;
             return (physical_width, physical_width);
         }
 
@@ -420,7 +420,7 @@ impl<'a> LayoutBuilder<'a> {
                 .as_ref()
                 .map(|geometry| geometry.outer_insets),
         );
-        self.resolve_table_used_content_width(
+        self.resolve_table_used_content_inline_size(
             rows,
             &grid,
             style,
@@ -488,7 +488,7 @@ impl<'a> LayoutBuilder<'a> {
         // CSS Display 3 maps `inline-table` to an inline-level atomic box whose
         // contents establish a table formatting context.
         let input = TableLayoutInput::from_fragment(fragment);
-        let rows = input.rows.as_slice();
+        let rows = input.row_ordering.rows.as_slice();
         if rows.is_empty() {
             return None;
         }
@@ -540,7 +540,7 @@ impl<'a> LayoutBuilder<'a> {
                 .as_ref()
                 .map(|geometry| geometry.outer_insets),
         );
-        self.resolve_table_used_content_width(
+        self.resolve_table_used_content_inline_size(
             rows,
             &grid,
             style,
@@ -651,6 +651,10 @@ impl<'a> LayoutBuilder<'a> {
         // probes. The retained fragment below is the inline-table's only
         // painting contribution to its parent line.
         self.restore(measurement_snapshot);
+        // The inline-table atom is materialized off-page. Its internal lines
+        // cannot anchor an outside marker that belongs to an enclosing list
+        // item's principal flow.
+        let pending_outside_marker_anchors = self.pending_outside_marker_anchors.suspend();
         let snapshot = self.snapshot();
         let mut table_style = style.clone();
         // The outer inline-table wrapper is represented by `atom_style` and
@@ -743,6 +747,8 @@ impl<'a> LayoutBuilder<'a> {
             .translated(PaintTranslation::new(0.0, -fragment_bottom));
         let table_cell_context = self.table_cell_content_coordinate_contexts.last().copied();
         self.restore(snapshot);
+        self.pending_outside_marker_anchors
+            .restore(pending_outside_marker_anchors);
         self.ancestors.truncate(ancestor_depth);
 
         let mut atom_style = style.clone();
@@ -776,8 +782,9 @@ impl<'a> LayoutBuilder<'a> {
         } else {
             // CSS 2.2 performs inline-table baseline alignment against the
             // table box, not the inline-level wrapper box. The outer margins
-            // remain in `InlineSize` for line geometry and replay, but the
-            // first-row baseline must not be shifted through them again.
+            // remain in `InlineSize` for line geometry, where they contribute
+            // to the margin-box baseline. Replay receives the table-box
+            // baseline separately, so it does not apply that margin twice.
             // <https://www.w3.org/TR/CSS22/tables.html#table-display>
             atom.with_exported_table_box_baseline()
         })
@@ -821,7 +828,7 @@ impl<'a> LayoutBuilder<'a> {
             return height;
         }
         let input = TableLayoutInput::from_fragment(fragment);
-        let rows = input.rows.as_slice();
+        let rows = input.row_ordering.rows.as_slice();
         let captions = input.captions.as_slice();
         let columns = input.columns.as_slice();
 
@@ -869,7 +876,7 @@ impl<'a> LayoutBuilder<'a> {
         // accepted table layout. Collapsed outer borders can change the
         // grid's content span.
         // <https://drafts.csswg.org/css-tables-3/#table-layout>
-        self.resolve_table_used_content_width(
+        self.resolve_table_used_content_inline_size(
             rows,
             &grid,
             style,

@@ -660,6 +660,7 @@ impl<'a> LayoutBuilder<'a> {
                     used_indent: 0.0,
                     available_width: context.available_width,
                     line_height: block_style.line_height,
+                    decoration_origin_fragments: Default::default(),
                 });
                 next_record_line_index += 1;
             }
@@ -719,6 +720,7 @@ impl<'a> LayoutBuilder<'a> {
                 used_indent,
                 available_width,
                 line_height,
+                decoration_origin_fragments: Default::default(),
             });
             next_record_line_index = block_line_index + 1;
         }
@@ -1460,12 +1462,6 @@ impl<'a> LayoutBuilder<'a> {
                     .unwrap_or(0.0);
                 let companion_fitting_width =
                     (materialized.fitting_width - initial_source_advance).max(0.0);
-                // A source row that follows an already-committed inline
-                // float must move below that float when no content can fit
-                // in the shortened band.  The source can still overflow the
-                // *full* containing measure (for example one unbreakable
-                // word); cap the float-clearance query at that full measure
-                // instead of treating the word as requiring impossible room.
                 let requires_full_float_band = (committed_preceding_float
                     || replays_committed_preceding_float)
                     && companion_fitting_width > current_available_width + INLINE_FLOAT_EPSILON;
@@ -1494,141 +1490,110 @@ impl<'a> LayoutBuilder<'a> {
                     WritingMode::VerticalRl | WritingMode::SidewaysRl
                 ) && line_identity.is_first_formatted_line
                     && initial_source_advance > INLINE_FLOAT_EPSILON;
-                if needs_band_retry || needs_vertical_initial_handoff {
-                    if context.block_style.writing_mode == WritingMode::HorizontalTb {
-                        let provisional_fragment = self.materialize_inline_line_fragment(
-                            graph,
-                            InlineGraphRange { start, end },
-                            context,
-                            InlineLinePhysicalRow {
-                                line_index,
-                                identity: line_identity,
-                                block_offset: physical_line_block_offset,
-                            },
-                            (end < graph_end)
-                                .then_some(selected_end.break_opportunity)
-                                .flatten(),
-                        );
-                        if let Some(block_advance) = self
-                            .horizontal_float_clearance_retry_block_advance(
-                                &provisional_fragment,
-                                context,
-                                InlineLinePhysicalRow {
-                                    line_index,
-                                    identity: line_identity,
-                                    block_offset: physical_line_block_offset,
-                                },
+                // The used block slab of a horizontal line is not known until
+                // its atomic participants have been materialized. The
+                // committed-fragment retry below is therefore the only place
+                // allowed to advance this source row. Retrying here and then
+                // again after materialization accumulates clearance for one
+                // line.
+                // <https://www.w3.org/TR/CSS22/visuren.html#floats>
+                if context.block_style.writing_mode != WritingMode::HorizontalTb
+                    && (needs_band_retry || needs_vertical_initial_handoff)
+                {
+                    let metrics = self.mixed_inline_line_metrics(
+                        &materialized.items,
+                        context.block_style,
+                        materialized.content_width,
+                    );
+                    let slab_width = used_inline_line_block_size_from_items(
+                        &materialized.items,
+                        metrics.height,
+                        context.block_style,
+                    );
+                    let position = self.inline_line_physical_position_with_block_offset(
+                        line_index,
+                        context.block_style,
+                        physical_line_block_offset,
+                    );
+                    let starting_slab = PageInlineSpan::new(
+                        position.content_left + context.padding_left,
+                        slab_width,
+                    );
+                    let vertical_inline_span = vertical_physical_inline_span(
+                        context.block_style.writing_mode,
+                        context.block_style.used_direction(),
+                        PageTopBlockPosition::new(position.cursor_y),
+                        layout_pt(context.available_width),
+                    );
+                    let required_width = companion_fitting_width + containing_indent;
+                    let next_left = if needs_vertical_initial_handoff {
+                        // The initial's wrapping box occupies its own
+                        // block-start column. Move the companion past the
+                        // physical block-end edge of that box instead of
+                        // asking a width query which can legitimately fit
+                        // beside it in the same column.
+                        self.float_contexts.last().and_then(|float_context| {
+                            float_context
+                                .shapes
+                                .iter()
+                                .filter(|shape| {
+                                    shape.kind == FlowExclusionKind::InitialLetter
+                                        && shape.page_index == self.current_float_page_index()
+                                        && shape.rect.x() + shape.rect.width()
+                                            > starting_slab.left_x() + INLINE_FLOAT_EPSILON
+                                        && shape.rect.x()
+                                            < starting_slab.right_x() - INLINE_FLOAT_EPSILON
+                                })
+                                .map(|shape| match context.block_style.writing_mode {
+                                    WritingMode::VerticalRl | WritingMode::SidewaysRl => {
+                                        PageInlinePosition::new(
+                                            shape.rect.x() - starting_slab.width(),
+                                        )
+                                    }
+                                    WritingMode::VerticalLr | WritingMode::SidewaysLr => {
+                                        PageInlinePosition::new(shape.rect.x() + shape.rect.width())
+                                    }
+                                    WritingMode::HorizontalTb => unreachable!(),
+                                })
+                                .find(|candidate| match context.block_style.writing_mode {
+                                    WritingMode::VerticalRl | WritingMode::SidewaysRl => {
+                                        candidate.points()
+                                            < starting_slab.left_x() - INLINE_FLOAT_EPSILON
+                                    }
+                                    WritingMode::VerticalLr | WritingMode::SidewaysLr => {
+                                        candidate.points()
+                                            > starting_slab.left_x() + INLINE_FLOAT_EPSILON
+                                    }
+                                    WritingMode::HorizontalTb => false,
+                                })
+                        })
+                    } else {
+                        self.float_contexts.last().and_then(|float_context| {
+                            float_context.next_vertical_content_slab_with_width(
+                                context.block_style.writing_mode,
+                                context.block_style.used_direction(),
+                                self.current_float_page_index(),
+                                starting_slab,
+                                vertical_inline_span,
+                                required_width,
                             )
-                        {
-                            // This pre-materialization path cannot safely
-                            // advance the source row: its inherited strut can
-                            // be smaller than an atomic participant and a BFC
-                            // fixed-point replay may select a different used
-                            // slab. The committed-fragment retry below owns
-                            // the physical advance once that slab is known.
+                        })
+                    };
+                    if let Some(next_left) = next_left {
+                        let block_advance = match context.block_style.writing_mode {
+                            WritingMode::VerticalLr | WritingMode::SidewaysLr => {
+                                next_left.points() - starting_slab.left_x()
+                            }
+                            WritingMode::VerticalRl | WritingMode::SidewaysRl => {
+                                starting_slab.left_x() - next_left.points()
+                            }
+                            WritingMode::HorizontalTb => unreachable!(),
+                        };
+                        if block_advance > INLINE_FLOAT_EPSILON {
                             physical_line_block_offset += block_advance;
                             pending_block_before += block_advance;
                             balanced_plan = None;
                             continue;
-                        }
-                    } else {
-                        let metrics = self.mixed_inline_line_metrics(
-                            &materialized.items,
-                            context.block_style,
-                            materialized.content_width,
-                        );
-                        let slab_width = used_inline_line_block_size_from_items(
-                            &materialized.items,
-                            metrics.height,
-                            context.block_style,
-                        );
-                        let position = self.inline_line_physical_position_with_block_offset(
-                            line_index,
-                            context.block_style,
-                            physical_line_block_offset,
-                        );
-                        let starting_slab = PageInlineSpan::new(
-                            position.content_left + context.padding_left,
-                            slab_width,
-                        );
-                        let vertical_inline_span = vertical_physical_inline_span(
-                            context.block_style.writing_mode,
-                            context.block_style.used_direction(),
-                            PageTopBlockPosition::new(position.cursor_y),
-                            layout_pt(context.available_width),
-                        );
-                        let required_width = companion_fitting_width + containing_indent;
-                        let next_left = if needs_vertical_initial_handoff {
-                            // The initial's wrapping box occupies its own
-                            // block-start column. Move the companion past the
-                            // physical block-end edge of that box instead of
-                            // asking a width query which can legitimately fit
-                            // beside it in the same column.
-                            self.float_contexts.last().and_then(|float_context| {
-                                float_context
-                                    .shapes
-                                    .iter()
-                                    .filter(|shape| {
-                                        shape.kind == FlowExclusionKind::InitialLetter
-                                            && shape.page_index == self.current_float_page_index()
-                                            && shape.rect.x() + shape.rect.width()
-                                                > starting_slab.left_x() + INLINE_FLOAT_EPSILON
-                                            && shape.rect.x()
-                                                < starting_slab.right_x() - INLINE_FLOAT_EPSILON
-                                    })
-                                    .map(|shape| match context.block_style.writing_mode {
-                                        WritingMode::VerticalRl | WritingMode::SidewaysRl => {
-                                            PageInlinePosition::new(
-                                                shape.rect.x() - starting_slab.width(),
-                                            )
-                                        }
-                                        WritingMode::VerticalLr | WritingMode::SidewaysLr => {
-                                            PageInlinePosition::new(
-                                                shape.rect.x() + shape.rect.width(),
-                                            )
-                                        }
-                                        WritingMode::HorizontalTb => unreachable!(),
-                                    })
-                                    .find(|candidate| match context.block_style.writing_mode {
-                                        WritingMode::VerticalRl | WritingMode::SidewaysRl => {
-                                            candidate.points()
-                                                < starting_slab.left_x() - INLINE_FLOAT_EPSILON
-                                        }
-                                        WritingMode::VerticalLr | WritingMode::SidewaysLr => {
-                                            candidate.points()
-                                                > starting_slab.left_x() + INLINE_FLOAT_EPSILON
-                                        }
-                                        WritingMode::HorizontalTb => false,
-                                    })
-                            })
-                        } else {
-                            self.float_contexts.last().and_then(|float_context| {
-                                float_context.next_vertical_content_slab_with_width(
-                                    context.block_style.writing_mode,
-                                    context.block_style.used_direction(),
-                                    self.current_float_page_index(),
-                                    starting_slab,
-                                    vertical_inline_span,
-                                    required_width,
-                                )
-                            })
-                        };
-                        if let Some(next_left) = next_left {
-                            let block_advance = match context.block_style.writing_mode {
-                                WritingMode::VerticalLr | WritingMode::SidewaysLr => {
-                                    next_left.points() - starting_slab.left_x()
-                                }
-                                WritingMode::VerticalRl | WritingMode::SidewaysRl => {
-                                    starting_slab.left_x() - next_left.points()
-                                }
-                                WritingMode::HorizontalTb => unreachable!(),
-                            };
-                            if block_advance > INLINE_FLOAT_EPSILON {
-                                physical_line_block_offset += block_advance;
-                                pending_block_before += block_advance;
-                                balanced_plan = None;
-                                continue;
-                            }
                         }
                     }
                     line_index += 1;
@@ -2339,7 +2304,6 @@ impl<'a> LayoutBuilder<'a> {
             source.set_text(std::rc::Rc::<str>::from(
                 &source.text()[..effect.source_range.start],
             ));
-            source.set_preserves_source_shaping(false);
             remeasure_materialized_item(item, &mut self.font_system);
         }
         fragment.edge_effects.source_effects = std::rc::Rc::from(retained_effects);
@@ -4767,11 +4731,9 @@ impl<'a> LayoutBuilder<'a> {
             &mut self.font_system,
             line_available_width,
         );
-        let metrics = self.mixed_inline_line_metrics(
-            &materialized.items,
-            block_style,
-            materialized.content_width,
-        );
+        let content_width = materialized.content_width;
+        let metrics =
+            self.mixed_inline_line_metrics(&materialized.items, block_style, content_width);
         let bidi_scope_continuations = graph.bidi_scope_continuations_for_range(range);
         let used_text = materialized.used_text();
         let edge_effects = materialized.edge_effects.clone();

@@ -383,7 +383,10 @@ async fn renders_and_deduplicates_page_margin_background_images() {
     assert_eq!(document.pages[1].images().len(), 1);
     assert_eq!(document.pages[0].images()[0].width(), 5.0);
     assert_eq!(document.pages[0].images()[0].height(), 5.0);
-    assert!(!document.pages[0].images()[0].interpolate);
+    assert_eq!(
+        document.pages[0].images()[0].sampling,
+        crate::document::paint::images::RasterSampling::Auto
+    );
 
     let pdf = document
         .write_pdf_bytes(&crate::PdfOptions::default())

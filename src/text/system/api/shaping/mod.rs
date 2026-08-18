@@ -32,7 +32,5 @@ impl ShapingLetterSpacing {
 }
 
 pub(crate) use controls::*;
-pub(crate) use lines::*;
-pub(crate) use normalization::*;
-pub(crate) use styled::*;
-pub(crate) use tabs::*;
+pub(in crate::text) use normalization::*;
+pub(in crate::text) use tabs::*;

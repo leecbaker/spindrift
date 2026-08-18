@@ -122,11 +122,6 @@ pub(crate) enum DeferredFontSize {
     /// copied from the pre-font structural phase: it must become the
     /// immediate parent's resolved used size.
     Inherit,
-    /// A font size relative to the parent element's computed line height.
-    /// CSS Values defines `lh` in `font-size` against the parent, rather than
-    /// against the element whose font size is being computed.
-    /// <https://www.w3.org/TR/css-values-4/#lh>
-    ParentLineHeight(f32),
     RelativeToParent(ComputedLengthPercentage),
 }
 
@@ -169,10 +164,6 @@ impl DeferredFontSize {
         layout_pt(match self {
             Self::Absolute(value) => *value,
             Self::Inherit => parent_font_size,
-            // Cascading converts this form to `Absolute` while the inherited
-            // line height is available. Retain a safe fallback for callers
-            // that parse a font size outside that cascade path.
-            Self::ParentLineHeight(multiplier) => parent_font_size * *multiplier,
             Self::RelativeToParent(value) => {
                 let mut value = value.clone();
                 if let Some(basis) = viewport {
@@ -183,6 +174,7 @@ impl DeferredFontSize {
                 value.resolve_ic_relative_lengths(parent.ic_advance());
                 value.resolve_ex_relative_lengths(parent.x_height().points());
                 value.resolve_cap_relative_lengths(parent.cap_height().points());
+                value.resolve_line_height_relative_lengths(parent.line_height());
                 if let Some(root_metrics) = root_metrics {
                     value.resolve_root_font_relative_lengths(root_metrics.font_size.points());
                     value.resolve_root_font_metric_lengths(root_metrics);
@@ -218,7 +210,7 @@ impl DeferredFontSize {
     /// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>.
     pub(crate) fn requires_parent_ch_advance(&self, _parent_font_size: f32) -> bool {
         match self {
-            Self::Absolute(_) | Self::Inherit | Self::ParentLineHeight(_) => false,
+            Self::Absolute(_) | Self::Inherit => false,
             Self::RelativeToParent(value) => value.requires_ch_advance(),
         }
     }
@@ -227,8 +219,20 @@ impl DeferredFontSize {
     /// snapshot after cascade has produced its provisional value.
     pub(crate) fn requires_root_font_metrics(&self) -> bool {
         match self {
-            Self::Absolute(_) | Self::Inherit | Self::ParentLineHeight(_) => false,
+            Self::Absolute(_) | Self::Inherit => false,
             Self::RelativeToParent(value) => value.requires_root_font_metrics(),
+        }
+    }
+
+    /// Whether this deferred value needs the document root's used font size.
+    ///
+    /// This is intentionally separate from [`Self::requires_root_font_metrics`]:
+    /// `rem` depends on the root size but does not require a metric measured
+    /// from the root's selected font.
+    pub(crate) fn requires_document_root_font_size(&self) -> bool {
+        match self {
+            Self::Absolute(_) | Self::Inherit => false,
+            Self::RelativeToParent(value) => value.requires_document_root_font_size(),
         }
     }
 
@@ -353,6 +357,14 @@ impl CalcSizeAffine {
 
     fn requires_ch_advance(&self) -> bool {
         self.additive.requires_ch_advance()
+    }
+
+    fn requires_selected_font_metrics(&self) -> bool {
+        self.additive.requires_selected_font_metrics()
+    }
+
+    fn requires_root_font_metrics(&self) -> bool {
+        self.additive.requires_root_font_metrics()
     }
 }
 
@@ -569,6 +581,32 @@ impl CalcSize {
                 .is_some_and(CalcSizeAffine::requires_ch_advance)
             || matches!(&self.basis, CalcSizeBasis::LengthPercentage(value) if value.requires_ch_advance())
     }
+
+    fn requires_selected_font_metrics(&self) -> bool {
+        self.additive.requires_selected_font_metrics()
+            || self
+                .lower_bound
+                .as_ref()
+                .is_some_and(CalcSizeAffine::requires_selected_font_metrics)
+            || self
+                .upper_bound
+                .as_ref()
+                .is_some_and(CalcSizeAffine::requires_selected_font_metrics)
+            || matches!(&self.basis, CalcSizeBasis::LengthPercentage(value) if value.requires_selected_font_metrics())
+    }
+
+    fn requires_root_font_metrics(&self) -> bool {
+        self.additive.requires_root_font_metrics()
+            || self
+                .lower_bound
+                .as_ref()
+                .is_some_and(CalcSizeAffine::requires_root_font_metrics)
+            || self
+                .upper_bound
+                .as_ref()
+                .is_some_and(CalcSizeAffine::requires_root_font_metrics)
+            || matches!(&self.basis, CalcSizeBasis::LengthPercentage(value) if value.requires_root_font_metrics())
+    }
 }
 
 impl ComputedLengthPercentageOrAuto {
@@ -769,6 +807,39 @@ impl ComputedLengthPercentageOrAuto {
                 value.requires_ch_advance()
             }
             Self::CalcSize(value) => value.requires_ch_advance(),
+            Self::Auto
+            | Self::MinContent
+            | Self::MaxContent
+            | Self::FitContent(None)
+            | Self::Stretch => false,
+        }
+    }
+
+    /// Whether this box-size value needs a metric from its selected font.
+    /// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>
+    pub(crate) fn requires_selected_font_metrics(&self) -> bool {
+        match self {
+            Self::LengthPercentage(value) | Self::FitContent(Some(value)) => {
+                value.requires_selected_font_metrics()
+            }
+            Self::CalcSize(value) => value.requires_selected_font_metrics(),
+            Self::Auto
+            | Self::MinContent
+            | Self::MaxContent
+            | Self::FitContent(None)
+            | Self::Stretch => false,
+        }
+    }
+
+    /// Whether this box-size value needs a metric from the document root's
+    /// selected font.
+    /// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        match self {
+            Self::LengthPercentage(value) | Self::FitContent(Some(value)) => {
+                value.requires_root_font_metrics()
+            }
+            Self::CalcSize(value) => value.requires_root_font_metrics(),
             Self::Auto
             | Self::MinContent
             | Self::MaxContent

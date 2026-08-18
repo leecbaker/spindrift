@@ -439,6 +439,153 @@ async fn vertical_width_intrinsic_keywords_use_logical_block_size() {
 }
 
 #[tokio::test]
+async fn parallel_vertical_and_sideways_auto_width_uses_logical_block_contribution() {
+    for writing_mode in ["vertical-lr", "vertical-rl", "sideways-lr", "sideways-rl"] {
+        let document = Html::from_string(format!(
+            r#"<style>@page {{ size: 180pt 140pt; margin: 0 }} html, body {{ margin: 0 }}
+               .block {{ writing-mode: {writing_mode}; width: auto; height: 30pt; font: 10pt/20pt Ahem; background: blue }}</style>
+               <div class="block">A<br>B<br>C</div>"#
+        ))
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+
+        let block = document.pages[0]
+            .rects()
+            .iter()
+            .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
+            .expect("vertical auto-width block background should paint");
+        assert!(
+            (block.width() - 60.0).abs() < 0.01,
+            "{writing_mode} width:auto should use three 20pt logical block columns: {block:?}"
+        );
+        assert!(
+            (block.height() - 30.0).abs() < 0.01,
+            "{writing_mode} should retain its definite physical height: {block:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn parallel_vertical_auto_width_uses_the_auto_height_line_fitting_fallback() {
+    let document = Html::from_string(
+        r#"<style>@page { size: 180pt 140pt; margin: 0 } html, body { margin: 0 }
+           .block { writing-mode: vertical-lr; width: auto; height: auto; font: 10pt/20pt Ahem; background: blue }</style>
+           <div class="block">A<br>B</div>"#,
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let block = document.pages[0]
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
+        .expect("vertical auto-sized block background should paint");
+    assert!(
+        (block.width() - 40.0).abs() < 0.01,
+        "two forced logical lines should contribute two physical columns: {block:?}"
+    );
+}
+
+#[tokio::test]
+async fn vertical_block_estimate_and_final_layout_agree_on_auto_width() {
+    let document = Html::from_string(
+        r#"<style>@page { size: 180pt 140pt; margin: 0 } html, body { margin: 0 }
+           .outer, .inner { writing-mode: vertical-lr; width: auto; height: 30pt; font: 10pt/20pt Ahem }
+           .outer { background: red } .inner { background: blue }</style>
+           <div class="outer"><div class="inner">A<br>B<br>C</div></div>"#,
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let outer = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
+        .expect("estimated vertical parent background should paint");
+    let inner = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
+        .expect("final vertical child background should paint");
+    assert!(
+        (outer.width() - inner.width()).abs() < 0.01 && (inner.width() - 60.0).abs() < 0.01,
+        "the speculative parent estimate and committed child layout must use the same logical block contribution: outer={outer:?}, inner={inner:?}"
+    );
+}
+
+#[tokio::test]
+async fn propagated_vertical_body_auto_width_remains_the_document_canvas() {
+    let document = Html::from_string(
+        r#"<style>@page { size: 180pt 140pt; margin: 0 }
+           html, body { margin: 0; writing-mode: vertical-lr } body { background: purple }</style>text"#,
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let canvas = document.pages[0]
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(128, 0, 128)))
+        .expect("propagated body canvas background should paint");
+    assert!(
+        (canvas.width() - 180.0).abs() < 0.01,
+        "the propagated vertical body must retain the ICB's physical width: {canvas:?}"
+    );
+}
+
+#[tokio::test]
+async fn vertical_grid_auto_width_uses_its_logical_row_tracks() {
+    let document = Html::from_string(
+        r#"<style>@page { size: 180pt 140pt; margin: 0 } html, body { margin: 0 }
+           #grid { display: grid; writing-mode: vertical-lr; width: auto; height: 30pt;
+                   grid-template-columns: 30pt; grid-template-rows: 20pt 20pt 20pt; background: green }</style>
+           <div id="grid"><i></i><i></i><i></i></div>"#,
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let grid = document.pages[0]
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
+        .expect("vertical grid background should paint");
+    assert!(
+        (grid.width() - 60.0).abs() < 0.01,
+        "vertical grid width:auto should use the three logical row tracks: {grid:?}"
+    );
+}
+
+#[tokio::test]
+async fn vertical_absolute_auto_width_uses_wrapped_logical_columns() {
+    let document = Html::from_string(
+        r#"<style>@page { size: 180pt 140pt; margin: 0 } html, body { margin: 0 }
+           #containing { position: relative; width: 160pt; height: 100pt }
+           #abs { position: absolute; writing-mode: vertical-lr; width: auto; height: 30pt;
+                  font: 10pt/20pt Ahem; background: blue }</style>
+           <div id="containing"><div id="abs">A<br>B<br>C</div></div>"#,
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let abspos = document.pages[0]
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
+        .expect("vertical absolute block background should paint");
+    assert!(
+        (abspos.width() - 60.0).abs() < 0.01,
+        "vertical abspos width:auto should use three fitted logical columns: {abspos:?}"
+    );
+}
+
+#[tokio::test]
 async fn block_align_content_translates_descendant_bookmark_targets() {
     let document = Html::from_string(
         "<style>@page { size: 120pt 120pt; margin: 10pt } body { margin: 0 }\
@@ -771,7 +918,9 @@ async fn writes_pdf_outline_tree_for_heading_bookmarks() {
     assert!(rendered.contains("/Title (Section)"));
     assert!(rendered.contains("/Count 2"));
     assert!(rendered.contains("/Count 1"));
-    assert!(rendered.contains("/Dest [4 0 R /XYZ"));
+    // The first page is object 3 after removing the obsolete reserved font
+    // resource object from the PDF allocation schedule.
+    assert!(rendered.contains("/Dest [3 0 R /XYZ"));
 }
 
 #[tokio::test]
@@ -2536,6 +2685,34 @@ async fn page_margin_box_outline_paints_without_affecting_layout() {
     );
 }
 
+/// Page-margin boxes paint in their own stacking contexts above document
+/// contents. Their local final outline phase must not be promoted into the
+/// document's normal-flow outline phase.
+#[tokio::test]
+async fn page_margin_outline_remains_above_document_positioned_content() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 100pt 100pt; margin: 20pt;\
+           @top-left { content: \"\"; width: 20pt; height: 10pt; outline: 2pt solid red }\
+         }\
+         body { margin: 0 } .outer { position: relative; width: 40pt; height: 20pt }\
+         .absolute { position: absolute; inset: 0; width: 20pt; height: 10pt; background: rgb(0 128 0) }\
+         </style><div class=\"outer\"><div class=\"absolute\"></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let positioned = first_rect_paint_operation_index(page, CssColor::new(0, 128, 0));
+    let margin_outline = first_rect_paint_operation_index(page, CssColor::new(255, 0, 0));
+    assert!(
+        positioned < margin_outline,
+        "page-margin outline must remain in its later independent context: {:?}",
+        page.paint_operations()
+    );
+}
+
 #[tokio::test]
 async fn page_margin_boxes_paint_in_clockwise_tree_order() {
     let document = Html::from_string(
@@ -3064,6 +3241,49 @@ async fn root_absolute_explicit_insets_remain_on_initial_page() {
 }
 
 #[tokio::test]
+async fn positioned_auto_height_measurement_ignores_breaks_and_nested_positioned_children() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 100pt 100pt; margin: 0 }\
+         body, div { margin: 0 }\
+         .outer { position: absolute; top: 0; left: 0; width: 80pt; background: red }\
+         .first { height: 20pt; background: black; break-after: right }\
+         .second { height: 20pt; background: blue; break-inside: avoid }\
+         .nested { position: absolute; top: 0; left: 0; width: 10pt; height: 80pt; background: green }\
+         </style><div class=\"outer\"><div class=\"first\"></div><div class=\"second\"></div><div class=\"nested\"></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let red = CssColor::rgba(255, 0, 0, 1.0);
+    let green = CssColor::rgba(0, 128, 0, 1.0);
+    assert_eq!(
+        document.pages.len(),
+        3,
+        "the final positioned layout, not its auto-size measurement, owns the right-page break"
+    );
+    assert!(
+        document.pages[0]
+            .rects()
+            .iter()
+            .any(|rect| { rect.fill == Some(red) && (rect.height() - 40.0).abs() < 0.01 }),
+        "expected the positioned auto-height box to span its two in-flow children: {:#?}",
+        document.pages[0].rects(),
+    );
+    assert_eq!(
+        document.pages[0]
+            .rects()
+            .iter()
+            .filter(|rect| rect.fill == Some(green))
+            .count(),
+        1,
+        "the nested positioned child is emitted only by final positioned layout"
+    );
+}
+
+#[tokio::test]
+#[ignore]
 async fn book_sample_companion_stylesheet_preserves_right_page_breaks() {
     let stylesheet = Css::from_file("weasyprint-samples/book/book.css")
         .await

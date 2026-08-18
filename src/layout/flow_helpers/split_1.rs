@@ -31,27 +31,41 @@ pub(in crate::layout) fn element_child_signature_list(
 }
 
 pub(in crate::layout) fn element_signature(element: &Element) -> ElementSignature {
-    let signature = element_selector_signature(element);
-    let mut element_signature =
-        ElementSignature::new(signature.tag.clone(), signature.attrs.clone())
-            .with_document_is_html(signature.document_is_html)
-            .with_namespace(signature.namespace_url, signature.namespace_attrs)
-            .with_child_list(signature.children, signature.has_text_child);
-    element_signature.document_direction = signature.document_direction;
-    element_signature.source_element_id = signature.source_element_id;
-    element_signature.is_target = signature.is_target;
-    element_signature.has_target_descendant = signature.has_target_descendant;
-    element_signature
+    ElementSignature::from_selector_snapshot(element_selector_signature(element))
 }
 
 pub(in crate::layout) fn element_selector_signature(element: &Element) -> ElementSiblingSignature {
+    element_selector_signature_with_link_context(element, None, None)
+}
+
+fn element_selector_signature_with_link_context(
+    element: &Element,
+    document_url: Option<&url::Url>,
+    base_url: Option<&url::Url>,
+) -> ElementSiblingSignature {
+    if let Some(signature) = element.selector_snapshot.get() {
+        return signature.clone();
+    }
     let mut has_text_child = false;
     for child in &element.children {
         if let NodeKind::Text(text) = &child.kind {
             has_text_child |= !text.is_empty();
         }
     }
-    let children = element_child_signature_list(element);
+    let children = ElementSiblingSignatureList::from_vec(
+        element
+            .children
+            .iter()
+            .filter_map(|child| match &child.kind {
+                NodeKind::Element(child) => Some(element_selector_signature_with_link_context(
+                    child,
+                    document_url,
+                    base_url,
+                )),
+                NodeKind::Text(_) => None,
+            })
+            .collect(),
+    );
     let namespace_attrs = element
         .namespace_attrs
         .iter()
@@ -67,12 +81,60 @@ pub(in crate::layout) fn element_selector_signature(element: &Element) -> Elemen
         .with_source_element_id(element.id)
         .with_namespace(element.namespace_url.clone(), namespace_attrs)
         .with_document_is_html(element.document_syntax == dom::DocumentSyntax::Html)
+        .with_document_compatibility_mode(element.document_compatibility_mode)
+        .with_link_state(element_link_state(element, document_url, base_url))
         .with_child_list(children, has_text_child);
     if let Some(direction) = element_document_direction(element) {
         signature = signature.with_document_direction(direction);
     }
-    signature.is_target = element.is_target;
-    signature
+    // Snapshot construction happens after target selection.
+    let snapshot = signature.with_target(element.is_target);
+    let _ = element.selector_snapshot.set(snapshot.clone());
+    snapshot
+}
+
+/// Eagerly materialize the immutable selector tree for one prepared DOM.
+///
+/// Layout replays may build the formatting tree repeatedly, so doing this at
+/// the pipeline boundary keeps selector snapshots stable and shared across
+/// every pass.
+pub(in crate::layout) fn prime_selector_snapshots(
+    node: &Node,
+    document_url: Option<&url::Url>,
+    base_url: Option<&url::Url>,
+) {
+    let NodeKind::Element(element) = &node.kind else {
+        return;
+    };
+    let _ = element_selector_signature_with_link_context(element, document_url, base_url);
+}
+
+fn element_link_state(
+    element: &Element,
+    document_url: Option<&url::Url>,
+    base_url: Option<&url::Url>,
+) -> css::LinkState {
+    let is_link =
+        matches!(element.tag.as_str(), "a" | "area" | "link") && element.attrs.contains_key("href");
+    let Some(destination) = is_link
+        .then(|| element.attrs.get("href"))
+        .flatten()
+        .and_then(|href| crate::resource::resolve_url(href, base_url, None))
+    else {
+        return css::LinkState::Unvisited;
+    };
+    let Some(document_url) = document_url.cloned() else {
+        return css::LinkState::Unvisited;
+    };
+    let mut destination = destination;
+    let mut document_url = document_url;
+    destination.set_fragment(None);
+    document_url.set_fragment(None);
+    if destination == document_url {
+        css::LinkState::Visited
+    } else {
+        css::LinkState::Unvisited
+    }
 }
 
 pub(in crate::layout) struct DomStyleResolver<'a> {
@@ -85,6 +147,61 @@ impl<'a> DomStyleResolver<'a> {
     }
 
     pub(in crate::layout) fn style_for_element(
+        &mut self,
+        element: &Element,
+        signature: ElementSignature,
+        stylesheets: &Stylesheets<'_>,
+        parent: Option<&ComputedStyle>,
+        ancestors: &[ElementSignature],
+    ) -> ComputedStyle {
+        let mut style = self.principal_style_for_element(
+            element,
+            signature.clone(),
+            stylesheets,
+            parent,
+            ancestors,
+        );
+        let signature = layout_element_signature(element, signature, parent);
+        let pseudo_parent_ch_advance = css::fallback_ch_advance_for_style(&style);
+        css::apply_pseudo_rules_with_parent_ch_advance(
+            &mut style,
+            &signature,
+            stylesheets,
+            ancestors,
+            pseudo_parent_ch_advance,
+        );
+        if style.pseudo_styles_require_parent_ch_advance() {
+            let pseudo_parent_ch_advance = self.font_system.ch_advance(&style);
+            css::apply_pseudo_rules_with_parent_ch_advance(
+                &mut style,
+                &signature,
+                stylesheets,
+                ancestors,
+                pseudo_parent_ch_advance,
+            );
+        }
+        style
+    }
+
+    /// Resolve only an element's principal computed style for structural DOM
+    /// classification.
+    ///
+    /// The result deliberately omits every pseudo-element style. Callers may
+    /// inspect principal-box properties such as `display`, `float`, and
+    /// `position`, but must not use it to inspect generated content or retain
+    /// it for formatting-tree construction.
+    pub(in crate::layout) fn structural_style_for_element(
+        &mut self,
+        element: &Element,
+        signature: ElementSignature,
+        stylesheets: &Stylesheets<'_>,
+        parent: Option<&ComputedStyle>,
+        ancestors: &[ElementSignature],
+    ) -> ComputedStyle {
+        self.principal_style_for_element(element, signature, stylesheets, parent, ancestors)
+    }
+
+    fn principal_style_for_element(
         &mut self,
         element: &Element,
         signature: ElementSignature,
@@ -109,30 +226,11 @@ impl<'a> DomStyleResolver<'a> {
             parent_ch_advance = self.font_system.ch_advance(&inheritance_source);
             style = style_for_layout_element_with_parent_ch_advance(
                 element,
-                signature.clone(),
+                signature,
                 stylesheets,
                 parent,
                 ancestors,
                 parent_ch_advance,
-            );
-        }
-        let signature = layout_element_signature(element, signature, parent);
-        let pseudo_parent_ch_advance = css::fallback_ch_advance_for_style(&style);
-        css::apply_pseudo_rules_with_parent_ch_advance(
-            &mut style,
-            &signature,
-            stylesheets,
-            ancestors,
-            pseudo_parent_ch_advance,
-        );
-        if style.pseudo_styles_require_parent_ch_advance() {
-            let pseudo_parent_ch_advance = self.font_system.ch_advance(&style);
-            css::apply_pseudo_rules_with_parent_ch_advance(
-                &mut style,
-                &signature,
-                stylesheets,
-                ancestors,
-                pseudo_parent_ch_advance,
             );
         }
         style
@@ -172,12 +270,9 @@ pub(in crate::layout) fn definition_list_column_groups_with_resolver<'a>(
         let NodeKind::Element(child_element) = &child.kind else {
             continue;
         };
-        let signature = ElementSignature::with_sibling_list(
-            child_element.tag.clone(),
-            child_element.attrs.clone(),
-            element_index,
-            sibling_tags.clone(),
-        );
+        let signature =
+            ElementSignature::from_sibling_snapshot(element_index, sibling_tags.clone())
+                .expect("source child must have a cached sibling signature");
         element_index += 1;
         let style = resolver.style_for_element(
             child_element,
@@ -931,12 +1026,9 @@ fn has_styled_inline_descendant_with_inline_flow_scope(
         let NodeKind::Element(child_element) = &child.kind else {
             return false;
         };
-        let signature = ElementSignature::with_sibling_list(
-            child_element.tag.clone(),
-            child_element.attrs.clone(),
-            element_index,
-            sibling_tags.clone(),
-        );
+        let signature =
+            ElementSignature::from_sibling_snapshot(element_index, sibling_tags.clone())
+                .expect("source child must have a cached sibling signature");
         element_index += 1;
         let child_style = resolver.style_for_element(
             child_element,
@@ -1032,6 +1124,7 @@ pub(in crate::layout) fn inline_style_affects_line(
         || child.text_transform != parent.text_transform
         || child.vertical_align != parent.vertical_align
         || child.white_space != parent.white_space
+        || inline_break_policy_differs(parent, child)
         // A non-inherited inline decoration needs the item collector even
         // when its typography is identical to the parent.  The plain-text
         // fast path has no inline box fragments on which to paint these
@@ -1053,6 +1146,27 @@ pub(in crate::layout) fn inline_style_affects_line(
         // text run.
         // <https://www.w3.org/TR/css-color-4/#transparency>
         || child.opacity.value() < 1.0
+}
+
+/// Whether flattening a descendant inline box into its parent text run would
+/// change the available break opportunities or the marker painted at one.
+///
+/// CSS Text defines hyphenation as a language-sensitive soft wrap opportunity
+/// and requires inline element boundaries to be ignored when determining word
+/// boundaries. The scalar text fast path therefore remains valid only when it
+/// retains the same break policy for every descendant text segment.
+/// <https://www.w3.org/TR/css-text-3/#hyphenation>
+/// <https://www.w3.org/TR/css-text-3/#line-break-details>
+fn inline_break_policy_differs(parent: &ComputedStyle, child: &ComputedStyle) -> bool {
+    child.language != parent.language
+        || child.hyphens != parent.hyphens
+        || child.hyphenate_character != parent.hyphenate_character
+        || child.hyphenate_limit_chars != parent.hyphenate_limit_chars
+        || child.word_break != parent.word_break
+        || child.overflow_wrap != parent.overflow_wrap
+        || child.line_break != parent.line_break
+        || child.text_wrap_mode != parent.text_wrap_mode
+        || child.text_wrap_style != parent.text_wrap_style
 }
 
 pub(in crate::layout) fn has_direct_inline_replaced_child(element: &Element) -> bool {
@@ -1090,7 +1204,7 @@ pub(in crate::layout) fn has_direct_flow_child_with_resolver(
             sibling_tags.clone(),
         );
         element_index += 1;
-        let style = resolver.style_for_element(
+        let style = resolver.structural_style_for_element(
             child_element,
             signature,
             stylesheets,
@@ -1196,11 +1310,12 @@ pub(in crate::layout) fn has_unwrapped_table_internal_descendant_with_font_metri
     font_system: &mut FontSystem,
 ) -> bool {
     let mut resolver = DomStyleResolver::with_font_system(font_system);
+    let mut ancestor_stack = ancestors.to_vec();
     has_unwrapped_table_internal_descendant_with_resolver(
         element,
         parent_style,
         stylesheets,
-        ancestors,
+        &mut ancestor_stack,
         &mut resolver,
     )
 }
@@ -1234,7 +1349,7 @@ pub(in crate::layout) fn has_direct_run_in_child_with_font_metrics(
         );
         element_index += 1;
         resolver
-            .style_for_element(
+            .structural_style_for_element(
                 child_element,
                 signature,
                 stylesheets,
@@ -1250,7 +1365,7 @@ fn has_unwrapped_table_internal_descendant_with_resolver(
     element: &Element,
     parent_style: &ComputedStyle,
     stylesheets: &Stylesheets<'_>,
-    ancestors: &[ElementSignature],
+    ancestors: &mut Vec<ElementSignature>,
     resolver: &mut DomStyleResolver<'_>,
 ) -> bool {
     let sibling_tags = element_sibling_signature_list(element);
@@ -1259,14 +1374,11 @@ fn has_unwrapped_table_internal_descendant_with_resolver(
         let NodeKind::Element(child_element) = &child.kind else {
             continue;
         };
-        let signature = ElementSignature::with_sibling_list(
-            child_element.tag.clone(),
-            child_element.attrs.clone(),
-            element_index,
-            sibling_tags.clone(),
-        );
+        let signature =
+            ElementSignature::from_sibling_snapshot(element_index, sibling_tags.clone())
+                .expect("source child must have a cached sibling signature");
         element_index += 1;
-        let child_style = resolver.style_for_element(
+        let child_style = resolver.structural_style_for_element(
             child_element,
             signature.clone(),
             stylesheets,
@@ -1285,15 +1397,20 @@ fn has_unwrapped_table_internal_descendant_with_resolver(
         if child_style.display.is_table() {
             continue;
         }
-        let mut child_ancestors = ancestors.to_vec();
-        child_ancestors.push(signature);
-        if has_unwrapped_table_internal_descendant_with_resolver(
+        ancestors.push(signature);
+        let has_unwrapped_descendant = has_unwrapped_table_internal_descendant_with_resolver(
             child_element,
             &child_style,
             stylesheets,
-            &child_ancestors,
+            ancestors,
             resolver,
-        ) {
+        );
+        let popped = ancestors.pop();
+        debug_assert!(
+            popped.is_some(),
+            "recursive table probe must pop its pushed ancestor"
+        );
+        if has_unwrapped_descendant {
             return true;
         }
     }
@@ -1336,7 +1453,7 @@ fn has_block_in_inline_split_boundary_with_resolver(
             sibling_tags.clone(),
         );
         element_index += 1;
-        let child_style = resolver.style_for_element(
+        let child_style = resolver.structural_style_for_element(
             child_element,
             signature.clone(),
             stylesheets,
@@ -1411,7 +1528,7 @@ fn has_ruby_formatting_descendant_with_resolver(
             sibling_tags.clone(),
         );
         element_index += 1;
-        let child_style = resolver.style_for_element(
+        let child_style = resolver.structural_style_for_element(
             child_element,
             signature.clone(),
             stylesheets,
@@ -1466,12 +1583,14 @@ fn has_ruby_formatting_descendant_with_resolver(
 
 /// Whether a block needs the ordered mixed inline/block child traversal.
 ///
-/// This is a normal-flow classification, not a source-order classification:
-/// absolutely and fixed positioned descendants get their static-position
-/// handling from positioned layout, but cannot establish an auto-height
-/// parent's fragmentainer-local flow end. Letting such a descendant select
-/// this traversal would make its provisional/static geometry participate in
-/// the cursor used to decide whether the next in-flow sibling overflows.
+/// Absolutely and fixed positioned descendants do not establish an
+/// auto-height parent's fragmentainer-local flow end. A block-origin
+/// positioned sibling only makes the sequence source-sensitive when it lies
+/// between an earlier in-flow child and a later CSS float: its static position
+/// is selected after the earlier child, before that float. Route that precise
+/// sequence through the ordered traversal so the generic inline collector
+/// cannot descend into the later float before the block has committed its
+/// cursor.
 ///
 /// <https://www.w3.org/TR/css-position-3/#absolute-positioning>
 /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
@@ -1491,6 +1610,8 @@ pub(in crate::layout) fn has_ordered_mixed_flow_content_with_resolver(
     let mut has_inline = false;
     let mut has_flow = false;
     let mut has_positioned_static_boundary = false;
+    let mut has_block_static_boundary_after_flow = false;
+    let mut has_later_float_after_static_boundary = false;
 
     for child in &element.children {
         match &child.kind {
@@ -1524,7 +1645,9 @@ pub(in crate::layout) fn has_ordered_mixed_flow_content_with_resolver(
                     // static-position rectangle, even though the box itself
                     // has been blockified for layout.
                     // <https://drafts.csswg.org/css-position-3/#static-position>
-                    has_positioned_static_boundary |= child_style.display.is_block_level();
+                    let is_block_static_boundary = child_style.display.is_block_level();
+                    has_positioned_static_boundary |= is_block_static_boundary;
+                    has_block_static_boundary_after_flow |= is_block_static_boundary && has_flow;
                     has_inline |= child_style.display.is_inline_level();
                     continue;
                 }
@@ -1543,6 +1666,11 @@ pub(in crate::layout) fn has_ordered_mixed_flow_content_with_resolver(
                     || (is_replaced_element(child_element)
                         && child_style.display.is_block_level());
                 if is_flow_child {
+                    has_later_float_after_static_boundary |= has_block_static_boundary_after_flow
+                        && matches!(
+                            child_style.float,
+                            Float::Left | Float::Right | Float::InlineStart | Float::InlineEnd
+                        );
                     has_flow = true;
                 } else if child_style.display.is_contents() {
                     let mut child_ancestors = ancestors.to_vec();
@@ -1565,7 +1693,9 @@ pub(in crate::layout) fn has_ordered_mixed_flow_content_with_resolver(
             }
         }
 
-        if has_inline && (has_flow || has_positioned_static_boundary) {
+        if (has_inline && (has_flow || has_positioned_static_boundary))
+            || has_later_float_after_static_boundary
+        {
             return true;
         }
     }
@@ -1687,6 +1817,7 @@ pub(in crate::layout) fn can_collapse_block_start_margin(
     style.display.is_flow()
         && !style.display.establishes_block_formatting_context()
         && !style_establishes_multicol_formatting_context(style)
+        && !style_establishes_line_clamp_formatting_context(style)
         && !property_containment_establishes_independent_formatting_context(element, style)
         && style.float == Float::None
         && !has_direct_inline_content
@@ -1708,6 +1839,7 @@ pub(in crate::layout) fn can_collapse_block_start_margin(
 pub(in crate::layout) fn can_collapse_block_end_margin(
     element: &Element,
     style: &ComputedStyle,
+    containing_block_height_basis: BlockSizePercentageBasis,
     border_edges: UsedEdges,
     has_direct_inline_content: bool,
     used_overflow: css::Overflow,
@@ -1715,13 +1847,46 @@ pub(in crate::layout) fn can_collapse_block_end_margin(
     style.display.is_flow()
         && !style.display.establishes_block_formatting_context()
         && !style_establishes_multicol_formatting_context(style)
+        && !style_establishes_line_clamp_formatting_context(style)
         && !property_containment_establishes_independent_formatting_context(element, style)
         && style.float == Float::None
         && !has_direct_inline_content
         && used_overflow == css::Overflow::Visible
         && style.padding.bottom == 0.0
         && border_edges.bottom == layout_pt(0.0)
-        && has_auto_height(style)
+        && height_behaves_as_auto_for_margin_collapse(style, containing_block_height_basis)
+}
+
+/// Returns whether a preferred physical height behaves as `auto` for CSS 2
+/// margin-collapse eligibility.
+///
+/// CSS Sizing updates legacy CSS 2 conditions on computed `height: auto` to
+/// include values that behave as if `auto` were specified.  Keep this
+/// classification at the margin-collapse used-value boundary: the computed
+/// value remains necessary for ordinary sizing, paint, and fragmentation.
+///
+/// <https://drafts.csswg.org/css-sizing-3/#behave-auto>
+/// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
+pub(in crate::layout) fn height_behaves_as_auto_for_margin_collapse(
+    style: &ComputedStyle,
+    containing_block_height_basis: BlockSizePercentageBasis,
+) -> bool {
+    match &*style.box_values.height {
+        css::ComputedLengthPercentageOrAuto::Auto
+        | css::ComputedLengthPercentageOrAuto::MinContent
+        | css::ComputedLengthPercentageOrAuto::MaxContent
+        | css::ComputedLengthPercentageOrAuto::FitContent(_) => true,
+        css::ComputedLengthPercentageOrAuto::Stretch => {
+            matches!(containing_block_height_basis, PercentageBasis::Indefinite)
+        }
+        css::ComputedLengthPercentageOrAuto::LengthPercentage(value) => {
+            matches!(containing_block_height_basis, PercentageBasis::Indefinite)
+                && value.needs_percentage_basis()
+        }
+        css::ComputedLengthPercentageOrAuto::CalcSize(value) => {
+            matches!(&value.basis, css::CalcSizeBasis::Auto)
+        }
+    }
 }
 
 /// Returns whether the computed column properties establish a multi-column
@@ -1737,6 +1902,21 @@ pub(in crate::layout) fn style_establishes_multicol_formatting_context(
     matches!(style.column_count, css::ColumnCount::Count(_))
         || matches!(style.column_width, css::ComputedColumnWidth::Length(_))
         || matches!(style.column_height, css::ComputedColumnHeight::Length(_))
+}
+
+/// `continue: collapse` and `continue: discard` establish an independent
+/// formatting context when they create a line-clamp container. Multicol
+/// containers are explicitly exempt: their `continue` behavior remains
+/// `auto`.
+/// <https://drafts.csswg.org/css-overflow-4/#continue>
+pub(in crate::layout) fn style_establishes_line_clamp_formatting_context(
+    style: &ComputedStyle,
+) -> bool {
+    !style_establishes_multicol_formatting_context(style)
+        && matches!(
+            style.used_continuation(),
+            css::UsedContinuation::LineClamp(_) | css::UsedContinuation::Discard(_)
+        )
 }
 
 /// Resolve the clamp state consumed by inline layout for this block container.
@@ -1973,4 +2153,59 @@ pub(in crate::layout) fn has_later_normal_block_flow_child_with_font_metrics(
         ancestors,
         &mut resolver,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inline_break_policy_differences_require_inline_item_collection() {
+        let mut parent = ComputedStyle::initial();
+        let mut child = parent.clone();
+
+        assert!(!inline_break_policy_differs(&parent, &child));
+        assert!(!inline_style_affects_line(&parent, &child));
+
+        child.hyphens = css::Hyphens::Auto;
+        child.language = css::ContentLanguage::from_html_attribute("en");
+        assert!(inline_break_policy_differs(&parent, &child));
+        assert!(inline_style_affects_line(&parent, &child));
+
+        parent = child.clone();
+        child.hyphens = css::Hyphens::None;
+        assert!(inline_break_policy_differs(&parent, &child));
+
+        child = parent.clone();
+        child.hyphenate_character = css::HyphenateCharacter::String("=".into());
+        assert!(inline_break_policy_differs(&parent, &child));
+
+        child = parent.clone();
+        child.hyphenate_limit_chars = css::HyphenateLimitChars {
+            total: 6,
+            before: 3,
+            after: 2,
+        };
+        assert!(inline_break_policy_differs(&parent, &child));
+
+        child = parent.clone();
+        child.word_break = css::WordBreak::BreakAll;
+        assert!(inline_break_policy_differs(&parent, &child));
+
+        child = parent.clone();
+        child.overflow_wrap = css::OverflowWrap::Anywhere;
+        assert!(inline_break_policy_differs(&parent, &child));
+
+        child = parent.clone();
+        child.line_break = css::LineBreak::Anywhere;
+        assert!(inline_break_policy_differs(&parent, &child));
+
+        child = parent.clone();
+        child.text_wrap_mode = css::TextWrapMode::NoWrap;
+        assert!(inline_break_policy_differs(&parent, &child));
+
+        child = parent.clone();
+        child.text_wrap_style = css::TextWrapStyle::Balance;
+        assert!(inline_break_policy_differs(&parent, &child));
+    }
 }

@@ -1,5 +1,28 @@
 use super::*;
 
+/// The percentage bases that must stay coupled for one flex item's intrinsic
+/// measurement pass.  A winning block constraint is not a property of only
+/// inline collection: every subsequent intrinsic query must observe it, or a
+/// later content-basis probe can restore a cyclic natural-size contribution.
+/// <https://drafts.csswg.org/css-sizing-3/#intrinsic-sizes>
+#[derive(Debug, Clone, Copy)]
+struct FlexIntrinsicMeasurementContext {
+    inline_percentage_basis: IntrinsicInlinePercentageBasis,
+    block_basis: IntrinsicBlockBasis,
+}
+
+impl FlexIntrinsicMeasurementContext {
+    fn measure<R>(
+        self,
+        layout: &mut LayoutBuilder<'_>,
+        measurement: impl FnOnce(&mut LayoutBuilder<'_>) -> R,
+    ) -> R {
+        layout.with_flex_item_percentage_height_basis(self.block_basis, |layout| {
+            layout.with_intrinsic_inline_percentage_basis(self.inline_percentage_basis, measurement)
+        })
+    }
+}
+
 pub(super) fn flex_estimated_border_box_width(
     style: &ComputedStyle,
     content_width: ContentBoxLength,
@@ -34,8 +57,6 @@ impl<'a> LayoutBuilder<'a> {
             preferred_inline_basis,
             vertical_non_content,
         } = context;
-        let definition_list_column_height =
-            self.estimate_definition_list_column_height(child, stylesheets, containing_inline_size);
         let inline_content_width =
             inline_measurement_space.content_box_inline_width(containing_inline_size_points, style);
         let inline_percentage_basis = if style.box_values.width.is_auto() {
@@ -46,20 +67,69 @@ impl<'a> LayoutBuilder<'a> {
                 IntrinsicInlinePercentageBasisSource::MeasurementAvailableWidth,
             )
         };
-        let mut inline_measurement =
-            self.with_intrinsic_inline_percentage_basis(inline_percentage_basis, |layout| {
+        let initial_measurement_context = FlexIntrinsicMeasurementContext {
+            inline_percentage_basis,
+            block_basis: IntrinsicBlockBasis::Indefinite,
+        };
+        let mut measurement_context = initial_measurement_context;
+        let definition_list_column_height = initial_measurement_context.measure(self, |layout| {
+            layout.estimate_definition_list_column_height(
+                child,
+                stylesheets,
+                containing_inline_size,
+            )
+        });
+        let mut inline_measurement = initial_measurement_context.measure(self, |layout| {
+            layout.estimate_child_inline_measurement(
+                child,
+                stylesheets,
+                LogicalInlineContentSize::new(content_box_pt(inline_content_width)),
+            )
+        });
+        // A definite min/max block constraint can win over an automatic
+        // intrinsic block contribution. Once it does, descendants resolve
+        // percentage heights against that used item height and a replaced
+        // descendant can transfer the result through its preferred ratio.
+        // Keep the first probe indefinite, however: a merely content-based
+        // automatic size is not a percentage basis during intrinsic sizing.
+        // <https://drafts.csswg.org/css-sizing-3/#intrinsic-sizes>
+        // <https://drafts.csswg.org/css-flexbox/#min-size-auto>
+        let winning_block_constraint = matches!(style.writing_mode, WritingMode::HorizontalTb)
+            .then(|| {
+                flex_item_winning_intrinsic_block_constraint(
+                    style,
+                    content_box_pt(inline_measurement.logical_block_span(style)),
+                    containing_height_basis,
+                    vertical_non_content,
+                )
+            })
+            .unwrap_or(IntrinsicBlockBasis::Indefinite);
+        if winning_block_constraint
+            .descendant_percentage_basis()
+            .is_definite()
+        {
+            measurement_context.block_basis = winning_block_constraint;
+            inline_measurement = measurement_context.measure(self, |layout| {
                 layout.estimate_child_inline_measurement(
                     child,
                     stylesheets,
                     LogicalInlineContentSize::new(content_box_pt(inline_content_width)),
                 )
             });
-        let child_intrinsic = self.estimate_child_intrinsic_widths(
-            child,
-            stylesheets,
-            containing_inline_size,
-            inline_measurement.contribution,
-        );
+        }
+        // The same winning constraint governs every intrinsic query for the
+        // item, not just inline collection. Otherwise a subsequent width
+        // contribution query can revive the child's unconstrained natural
+        // width after the first measurement correctly resolved its percent
+        // height.
+        let child_intrinsic = measurement_context.measure(self, |layout| {
+            layout.estimate_child_intrinsic_widths(
+                child,
+                stylesheets,
+                containing_inline_size,
+                inline_measurement.contribution,
+            )
+        });
         let remeasuring_post_flexed_main_size = matches!(
             if physical_direction.is_row_axis() {
                 available.width_basis
@@ -76,28 +146,29 @@ impl<'a> LayoutBuilder<'a> {
                 && !remeasuring_post_flexed_main_size
                 && child_intrinsic.max_content.points() > inline_content_width + 0.01;
         if content_basis_inline_width {
-            inline_measurement =
-                self.with_intrinsic_inline_percentage_basis(inline_percentage_basis, |layout| {
-                    layout.estimate_child_inline_measurement(
-                        child,
-                        stylesheets,
-                        child_intrinsic.max_content,
-                    )
-                });
+            inline_measurement = measurement_context.measure(self, |layout| {
+                layout.estimate_child_inline_measurement(
+                    child,
+                    stylesheets,
+                    child_intrinsic.max_content,
+                )
+            });
         }
         let hypothetical_cross_measure_width = if content_basis_inline_width {
             child_intrinsic.max_content
         } else {
             containing_inline_size
         };
-        let child_preferred_block_height = self.estimate_child_min_content_block_size(
-            child,
-            stylesheets,
-            hypothetical_cross_measure_width,
-            LogicalBlockContentSize::new(content_box_pt(
-                inline_measurement.logical_block_span(style),
-            )),
-        );
+        let child_preferred_block_height = measurement_context.measure(self, |layout| {
+            layout.estimate_child_min_content_block_size(
+                child,
+                stylesheets,
+                hypothetical_cross_measure_width,
+                LogicalBlockContentSize::new(content_box_pt(
+                    inline_measurement.logical_block_span(style),
+                )),
+            )
+        });
 
         let logical_inline_size = child_intrinsic.max_content;
         let logical_min_inline_size = child_intrinsic.min_content;
@@ -263,21 +334,23 @@ impl<'a> LayoutBuilder<'a> {
         } else {
             content_width
         };
-        if let Some(block_height) = self.measure_flex_item_auto_block_height_for_flex_basis(
-            element,
-            style,
-            stylesheets,
-            child_boxes,
-            PhysicalContentWidth::new(content_box_pt(block_height_probe_width)),
-            FlexAutoBlockHeightMeasurement {
-                inline_line_count: inline_measurement.line_count(),
-                purpose: if remeasuring_post_flexed_main_size {
-                    FlexAutoBlockHeightMeasurementPurpose::PostFlexingMainSize
-                } else {
-                    FlexAutoBlockHeightMeasurementPurpose::IntrinsicFlexBase
+        if let Some(block_height) = measurement_context.measure(self, |layout| {
+            layout.measure_flex_item_auto_block_height_for_flex_basis(
+                element,
+                style,
+                stylesheets,
+                child_boxes,
+                PhysicalContentWidth::new(content_box_pt(block_height_probe_width)),
+                FlexAutoBlockHeightMeasurement {
+                    inline_line_count: inline_measurement.line_count(),
+                    purpose: if remeasuring_post_flexed_main_size {
+                        FlexAutoBlockHeightMeasurementPurpose::PostFlexingMainSize
+                    } else {
+                        FlexAutoBlockHeightMeasurementPurpose::IntrinsicFlexBase
+                    },
                 },
-            },
-        ) && matches!(style.writing_mode, WritingMode::HorizontalTb)
+            )
+        }) && matches!(style.writing_mode, WritingMode::HorizontalTb)
         {
             physical_intrinsic.intrinsic_content_height = block_height;
             physical_intrinsic.min_content_height =
@@ -285,15 +358,17 @@ impl<'a> LayoutBuilder<'a> {
         }
         if style.box_values.height.is_auto()
             && matches!(style.writing_mode, WritingMode::HorizontalTb)
-            && let Some(multicol_height) = self.estimate_child_multicol_inline_height(
-                child,
-                stylesheets,
-                LogicalInlineContentSize::new(constrain_content_width(
-                    style,
-                    content_box_pt(content_width),
-                    PercentageBasis::definite(containing_width),
-                )),
-            )
+            && let Some(multicol_height) = measurement_context.measure(self, |layout| {
+                layout.estimate_child_multicol_inline_height(
+                    child,
+                    stylesheets,
+                    LogicalInlineContentSize::new(constrain_content_width(
+                        style,
+                        content_box_pt(content_width),
+                        PercentageBasis::definite(containing_width),
+                    )),
+                )
+            })
         {
             physical_intrinsic.intrinsic_content_height =
                 PhysicalContentHeight::new(multicol_height.content_box_length());

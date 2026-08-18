@@ -38,6 +38,10 @@ pub(in crate::layout::flex) struct FlexLineCrossAxisLayout {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::layout::flex) enum FlexLineCrossConstraint {
     DefiniteInnerSize(FlexCrossSize),
+    /// A final used inner size established by the container's min/max clamp.
+    /// It constrains a single flex line, but does not make cyclic descendant
+    /// percentages definite.
+    ClampedInnerSize(FlexCrossSize),
     /// An explicit balanced line count reserves equal final line slots before
     /// item measurement. These slots are distinct from the container's
     /// percentage basis and must not be regenerated from normal-wrap
@@ -56,12 +60,7 @@ impl FlexLineCrossConstraint {
         physical_direction: FlexDirection,
         used_inner_size: FlexCrossSize,
     ) -> Self {
-        if container_style.flex_wrap.balances_lines()
-            && matches!(
-                container_style.flex_line_count,
-                css::FlexLineCount::Count(line_count) if line_count.get() > 1
-            )
-        {
+        if container_style.flex_wrap.balances_lines() && container_style.flex_line_count.get() > 1 {
             let line_available = balanced_flex_item_measure_available_space(
                 container_style,
                 physical_direction,
@@ -100,14 +99,28 @@ impl FlexLineCrossConstraint {
         };
         if used_cross_size.is_some() {
             Self::DefiniteInnerSize(used_inner_size)
+        } else if if physical_direction.is_row_axis() {
+            !container_style.box_values.min_height.is_auto()
+                || !container_style.box_values.max_height.is_auto()
+        } else {
+            !container_style.box_values.min_width.is_auto()
+                || !container_style.box_values.max_width.is_auto()
+        } {
+            Self::ClampedInnerSize(used_inner_size)
         } else {
             Self::ContentBased
         }
     }
 
-    fn definite_inner_size(self) -> Option<FlexCrossSize> {
+    /// The final slot available to a single flex line.
+    ///
+    /// This intentionally includes a min/max-clamped automatic size. A
+    /// clamp constrains final line placement, but callers resolving
+    /// descendant percentages must consult the separately preserved
+    /// percentage basis instead.
+    fn single_line_slot_size(self) -> Option<FlexCrossSize> {
         match self {
-            Self::DefiniteInnerSize(size) => Some(size),
+            Self::DefiniteInnerSize(size) | Self::ClampedInnerSize(size) => Some(size),
             Self::BalancedLineSlot(_) | Self::ContentBased => None,
         }
     }
@@ -115,7 +128,7 @@ impl FlexLineCrossConstraint {
     pub(in crate::layout::flex) fn reserved_balanced_line_slot(self) -> Option<FlexCrossSize> {
         match self {
             Self::BalancedLineSlot(size) => Some(size),
-            Self::DefiniteInnerSize(_) | Self::ContentBased => None,
+            Self::DefiniteInnerSize(_) | Self::ClampedInnerSize(_) | Self::ContentBased => None,
         }
     }
 }
@@ -277,7 +290,7 @@ pub(in crate::layout::flex) fn refresh_flex_line_cross_bounds(
 ) {
     for line in &mut *lines {
         if container_style.flex_wrap == FlexWrap::NoWrap {
-            if let Some(container_cross_size) = cross_constraint.definite_inner_size() {
+            if let Some(container_cross_size) = cross_constraint.single_line_slot_size() {
                 line.cross_start = FlexCrossOffset::new(0.0);
                 line.cross_end = FlexCrossOffset::new(0.0) + container_cross_size;
             }
@@ -350,7 +363,7 @@ pub(in crate::layout::flex) fn refresh_flex_line_metadata(
         physical_direction,
         cross_axis_layout,
     );
-    if let Some(container_cross_size) = cross_axis_layout.constraint.definite_inner_size() {
+    if let Some(container_cross_size) = cross_axis_layout.constraint.single_line_slot_size() {
         stretch_wrapped_flex_lines_to_container_cross_size(
             lines,
             items,
@@ -408,7 +421,7 @@ fn stretch_wrapped_flex_lines_to_container_cross_size(
 
     let extra_per_line = free_space
         .divide(std::num::NonZeroUsize::new(lines.len()).expect("non-empty flex line collection"));
-    let axes = FlexAxes::from_physical_direction(PhysicalFlexDirection::new(physical_direction));
+    let axes = PhysicalFlexDirection::new(physical_direction);
     let mut physical_order = (0..lines.len()).collect::<Vec<_>>();
     physical_order.sort_by(|&left, &right| {
         lines[left]
@@ -549,12 +562,13 @@ pub(in crate::layout::flex) fn repack_final_flex_line_offsets(
         }
     };
 
-    let (initial, distributed_between) =
-        if free_space.is_negative() && alignment.safety == AlignmentSafety::Safe {
-            (FlexCrossLength::new(0.0), FlexCrossLength::new(0.0))
-        } else {
-            (initial, distributed_between)
-        };
+    let safe_overflow_fallback =
+        free_space.is_negative() && alignment.safety == AlignmentSafety::Safe;
+    let (initial, distributed_between) = if safe_overflow_fallback {
+        (FlexCrossLength::new(0.0), FlexCrossLength::new(0.0))
+    } else {
+        (initial, distributed_between)
+    };
 
     let cross_origin = FlexCrossOffset::new(0.0);
     // `FlexLineLayout` records are collected in Taffy's physical traversal
@@ -564,7 +578,14 @@ pub(in crate::layout::flex) fn repack_final_flex_line_offsets(
     // order is unrelated to the `order`-modified flex sequence.
     let mut logical_order = (0..lines.len()).collect::<Vec<_>>();
     logical_order.sort_by_key(|&index| lines[index].logical_cross_start_rank);
-    if flex_cross_start_side(container_style).is_start_edge() {
+    // `safe` overflow falls back to logical `start`, whereas ordinary
+    // `flex-start` follows the wrap-reversed flex cross start.  The values
+    // coincide without `wrap-reverse`, but using the latter after a safe
+    // fallback moves an overflowing line back onto the unsafe edge.
+    // <https://drafts.csswg.org/css-align-3/#overflow-values>
+    // <https://www.w3.org/TR/css-flexbox-1/#flex-wrap-property>
+    let packing_start_side = final_line_packing_start_side(container_style, safe_overflow_fallback);
+    if packing_start_side.is_start_edge() {
         let mut next_start = cross_origin + initial;
         for line_index in logical_order {
             let line = &mut lines[line_index];
@@ -583,6 +604,24 @@ pub(in crate::layout::flex) fn repack_final_flex_line_offsets(
         }
     }
     true
+}
+
+/// Select the physical edge from which final flex-line slots are repacked.
+///
+/// `flex-start` follows the cross axis after `wrap-reverse`, but the safe
+/// overflow fallback prescribed by CSS Align is logical `start` and therefore
+/// uses the unreversed cross axis.
+/// <https://drafts.csswg.org/css-align-3/#overflow-values>
+/// <https://www.w3.org/TR/css-flexbox-1/#flex-wrap-property>
+fn final_line_packing_start_side(
+    container_style: &ComputedStyle,
+    safe_overflow_fallback: bool,
+) -> PhysicalSide {
+    if safe_overflow_fallback {
+        flex_unreversed_cross_start_side(container_style)
+    } else {
+        flex_cross_start_side(container_style)
+    }
 }
 
 /// Recompute a line's exported baselines without changing its resolved cross
@@ -643,12 +682,12 @@ fn resolve_flex_line_cross_sizes(
         return;
     }
     if let FlexLineCrossConstraint::BalancedLineSlot(reserved_slot) = cross_constraint {
-        // The reserved balanced slot constrains measurement, but it is not a
-        // maximum. A specified cross size (including one resolved from the
-        // container percentage basis) can overflow that slot. The isolated
-        // no-wrap line has already resolved each item's final cross box, so
-        // derive the final line extent from those boxes and retain the slot
-        // only as its lower bound.
+        // The reserved balanced slot constrains measurement and line
+        // formation, but it is not a maximum. A specified cross size
+        // (including one resolved from the container percentage basis) can
+        // overflow that slot. Physical columns re-pack their final used line
+        // widths from the balanced membership, while rows retain their
+        // declared measurement slots for cross-axis placement.
         // <https://drafts.csswg.org/css-flexbox-2/#flex-line-count-property>
         let resolved_sizes = lines
             .iter()
@@ -666,6 +705,67 @@ fn resolve_flex_line_cross_sizes(
                     .max(line.largest_collapsed_strut())
             })
             .collect::<Vec<_>>();
+        if physical_direction.is_row_axis() {
+            // A definite row container retains the slots allocated from its
+            // declared count. Overflowing a slot changes the line's used
+            // cross size but not the next reserved start edge; otherwise a
+            // percentage height would be measured against the container and
+            // then also consume that overflow a second time during packing.
+            for (line, resolved_size) in lines.iter_mut().zip(resolved_sizes) {
+                line.cross_end = line.cross_start + resolved_size;
+            }
+        } else {
+            apply_resolved_flex_line_cross_sizes(
+                lines,
+                items,
+                container_style,
+                physical_direction,
+                cross_axis_layout.gap,
+                resolved_sizes,
+            );
+        }
+        return;
+    }
+    // A single-line flex container uses its inner cross size only when that
+    // size is definite. An automatic row instead derives its line from the
+    // remeasured hypothetical item contributions below.
+    // <https://www.w3.org/TR/css-flexbox-1/#algo-cross-line>
+    if container_style.flex_wrap == FlexWrap::NoWrap
+        && cross_constraint.single_line_slot_size().is_some()
+    {
+        return;
+    }
+
+    // A wrapped physical column with a definite cross constraint has already
+    // resolved each automatic cross size as fit-content before Taffy formed
+    // its lines.  Replacing that used contribution with the estimate's
+    // max-content metric here loses the constraint during final replay: a
+    // 100px-wide column can incorrectly become a 333px-wide item after its
+    // otherwise-correct Taffy allocation.  The current margin-box cross
+    // extents are the final used contributions for this line-sizing step;
+    // later line-slot remeasurement still handles stretch and explicit
+    // intrinsic constraints.
+    // <https://www.w3.org/TR/css-flexbox-1/#algo-cross-line>
+    // <https://www.w3.org/TR/css-sizing-3/#fit-content-sizing>
+    if physical_direction.is_column_axis()
+        && container_style.flex_wrap.wraps()
+        && cross_constraint.single_line_slot_size().is_some()
+    {
+        let resolved_sizes = lines
+            .iter()
+            .map(|line| {
+                line.item_indices
+                    .iter()
+                    .map(|&index| {
+                        item_outer_cross_size(
+                            &items[index],
+                            &children[index].style,
+                            physical_direction,
+                        )
+                    })
+                    .fold(line.largest_collapsed_strut(), FlexCrossSize::max)
+            })
+            .collect::<Vec<_>>();
         apply_resolved_flex_line_cross_sizes(
             lines,
             items,
@@ -674,15 +774,6 @@ fn resolve_flex_line_cross_sizes(
             cross_axis_layout.gap,
             resolved_sizes,
         );
-        return;
-    }
-    // A single-line flex container uses its inner cross size only when that
-    // size is definite. An automatic row instead derives its line from the
-    // remeasured hypothetical item contributions below.
-    // <https://www.w3.org/TR/css-flexbox-1/#algo-cross-line>
-    if container_style.flex_wrap == FlexWrap::NoWrap
-        && cross_constraint.definite_inner_size().is_some()
-    {
         return;
     }
 
@@ -779,7 +870,7 @@ fn apply_resolved_flex_line_cross_sizes(
     cross_gap: FlexCrossSize,
     resolved_sizes: Vec<FlexCrossSize>,
 ) {
-    let axes = FlexAxes::from_physical_direction(PhysicalFlexDirection::new(physical_direction));
+    let axes = PhysicalFlexDirection::new(physical_direction);
     let mut physical_order = (0..lines.len()).collect::<Vec<_>>();
     physical_order.sort_by(|&left, &right| {
         lines[left]
@@ -829,10 +920,8 @@ pub(in crate::layout::flex) fn item_outer_cross_bounds(
     style: &ComputedStyle,
     physical_direction: FlexDirection,
 ) -> (FlexCrossOffset, FlexCrossOffset) {
-    let (start, end) = item.outer_cross_bounds(
-        FlexAxes::from_physical_direction(PhysicalFlexDirection::new(physical_direction)),
-        style,
-    );
+    let (start, end) =
+        item.outer_cross_bounds(PhysicalFlexDirection::new(physical_direction), style);
     (start, end)
 }
 
@@ -973,7 +1062,7 @@ pub(in crate::layout::flex) fn repack_lines_after_collapsed_struts(
         return;
     }
 
-    let axes = FlexAxes::from_physical_direction(PhysicalFlexDirection::new(physical_direction));
+    let axes = PhysicalFlexDirection::new(physical_direction);
     let mut line_order = (0..lines.len()).collect::<Vec<_>>();
     line_order.sort_by(|&a, &b| {
         lines[a]
@@ -1008,7 +1097,7 @@ pub(in crate::layout::flex) fn repack_lines_after_collapsed_struts(
 #[derive(Debug, Clone, Copy)]
 pub(in crate::layout::flex) struct FlexBalanceContext<'a> {
     pub(in crate::layout::flex) physical_direction: FlexDirection,
-    pub(in crate::layout::flex) requested_line_count: Option<usize>,
+    pub(in crate::layout::flex) minimum_line_count: usize,
     pub(in crate::layout::flex) hypothetical_main_sizes: Option<&'a [FlexMainSize]>,
     pub(in crate::layout::flex) main_gap: FlexMainSize,
     pub(in crate::layout::flex) cross_gap: FlexCrossSize,
@@ -1070,9 +1159,10 @@ pub(in crate::layout::flex) fn balanced_flex_line_plan(
         context.main_gap,
         context.available_main_size,
     );
-    let line_count = context
-        .requested_line_count
-        .unwrap_or_else(|| lines.len().max(inferred_line_count))
+    let line_count = lines
+        .len()
+        .max(inferred_line_count)
+        .max(context.minimum_line_count)
         .clamp(1, ordered_items.len());
     let partitions = balanced_flex_line_partitions(
         &ordered_items,
@@ -1171,8 +1261,7 @@ pub(in crate::layout::flex) fn rebalance_flex_line_membership(
         lines.truncate(plan.partitions.len());
     }
 
-    let axes =
-        FlexAxes::from_physical_direction(PhysicalFlexDirection::new(context.physical_direction));
+    let axes = PhysicalFlexDirection::new(context.physical_direction);
     let slots = lines
         .iter()
         .map(|line| (line.cross_start, line.cross_end))
@@ -1286,7 +1375,13 @@ fn balanced_flex_line_partitions(
             + main_gap.scale(end.saturating_sub(start + 1) as f32)
     };
 
-    let mut costs = vec![vec![f32::INFINITY; item_count + 1]; line_count + 1];
+    // Balancing costs are dimensionless ordering scores at the dynamic
+    // programming boundary. Use f64 so equivalent partitions remain tied
+    // after PDF-point layout values have passed through several f32 adapters.
+    // A tiny absolute tolerance then preserves the Level 2 start-biased tie
+    // break instead of letting summation order choose the final line.
+    const COST_TIE_EPSILON: f64 = 1e-8;
+    let mut costs = vec![vec![f64::INFINITY; item_count + 1]; line_count + 1];
     let mut predecessors = vec![vec![None; item_count + 1]; line_count + 1];
     costs[0][0] = 0.0;
     for line in 1..=line_count {
@@ -1305,11 +1400,11 @@ fn balanced_flex_line_partitions(
                 // Dynamic-programming costs are dimensionless ordering
                 // scores. The conversion happens only at this algorithmic
                 // boundary; all line geometry remains typed above.
-                let candidate = costs[line - 1][start] + error.points().powi(2);
+                let candidate = costs[line - 1][start] + f64::from(error.points()).powi(2);
                 // Prefer the later break for equal errors. During reverse
                 // reconstruction, this gives the draft algorithm's start bias:
                 // assign as many items as possible to earlier lines.
-                if candidate <= costs[line][end] {
+                if candidate <= costs[line][end] + COST_TIE_EPSILON {
                     costs[line][end] = candidate;
                     predecessors[line][end] = Some(start);
                 }
@@ -1418,7 +1513,6 @@ pub(in crate::layout::flex) fn repack_lines_after_main_size_adjustment(
                 item_count,
             )
         };
-
         let mut cursor = FlexMainOffset::new(0.0) + justification.initial;
         for (position, &item_index) in physical_order.iter().enumerate() {
             cursor = cursor
@@ -1445,9 +1539,7 @@ pub(in crate::layout::flex) fn item_main_size(
     item: &FlexItemLayout,
     physical_direction: FlexDirection,
 ) -> FlexMainSize {
-    item.main_size(FlexAxes::from_physical_direction(
-        PhysicalFlexDirection::new(physical_direction),
-    ))
+    item.main_size(PhysicalFlexDirection::new(physical_direction))
 }
 
 pub(in crate::layout::flex) fn set_item_main_start(
@@ -1455,10 +1547,7 @@ pub(in crate::layout::flex) fn set_item_main_start(
     physical_direction: FlexDirection,
     main_start: FlexMainOffset,
 ) {
-    item.set_main_start(
-        FlexAxes::from_physical_direction(PhysicalFlexDirection::new(physical_direction)),
-        main_start,
-    );
+    item.set_main_start(PhysicalFlexDirection::new(physical_direction), main_start);
 }
 
 pub(in crate::layout::flex) fn fixed_main_before_margin(
@@ -1583,9 +1672,10 @@ pub(in crate::layout::flex) fn justify_content_offsets(
                 free_space
             }
         }
-        // Physical `left` and `right` fall back to logical `start` when the
-        // main axis is not parallel to the inline axis. In a column flex
-        // container that means both keywords use the same packing offset.
+        // Physical `left` and `right` fall back to logical `start` only when
+        // the physical main axis is vertical. A vertical-writing column
+        // projects to the horizontal physical row axis and keeps distinct
+        // left/right packing offsets.
         // <https://drafts.csswg.org/css-align-3/#justify-content-property>
         ContentAlignmentKeyword::Left | ContentAlignmentKeyword::Right
             if physical_direction.is_column_axis() =>
@@ -1652,9 +1742,11 @@ pub(in crate::layout::flex) fn justify_content_fallback_keyword(
 ) -> ContentAlignmentKeyword {
     let mut keyword = justify_content.keyword;
     let mut safe = justify_content.safety == AlignmentSafety::Safe;
+    let mut distribution_falls_back_to_flex_start = false;
     if item_count <= 1 || free_space.is_non_positive() {
         (keyword, safe) = match keyword {
             ContentAlignmentKeyword::Stretch | ContentAlignmentKeyword::SpaceBetween => {
+                distribution_falls_back_to_flex_start = true;
                 (ContentAlignmentKeyword::FlexStart, true)
             }
             ContentAlignmentKeyword::SpaceAround | ContentAlignmentKeyword::SpaceEvenly => {
@@ -1663,7 +1755,7 @@ pub(in crate::layout::flex) fn justify_content_fallback_keyword(
             other => (other, safe),
         };
     }
-    if free_space.is_non_positive() && safe {
+    if free_space.is_non_positive() && safe && !distribution_falls_back_to_flex_start {
         ContentAlignmentKeyword::Start
     } else {
         keyword
@@ -1830,6 +1922,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn safe_overflow_line_packing_uses_logical_start_after_wrap_reverse() {
+        let mut style = ComputedStyle::initial();
+        style.flex_wrap = FlexWrap::WrapReverse;
+
+        assert_eq!(
+            final_line_packing_start_side(&style, false),
+            PhysicalSide::Bottom,
+            "ordinary flex-start follows the reversed flex cross axis"
+        );
+        assert_eq!(
+            final_line_packing_start_side(&style, true),
+            PhysicalSide::Top,
+            "safe overflow falls back to logical start rather than flex-start"
+        );
+    }
+
+    #[test]
     fn normal_justify_content_uses_main_start_in_a_reverse_column() {
         let justify_content = JustifyContent::new(ContentAlignmentKeyword::Normal);
 
@@ -1842,6 +1951,26 @@ mod tests {
             )
             .initial,
             FlexMainLength::new(14.0)
+        );
+    }
+
+    #[test]
+    fn distributed_overflow_fallback_keeps_reverse_flex_start() {
+        let justify_content = JustifyContent::new(ContentAlignmentKeyword::SpaceBetween);
+
+        assert_eq!(
+            justify_content_fallback_keyword(justify_content, FlexMainLength::new(-250.0), 1),
+            ContentAlignmentKeyword::FlexStart,
+        );
+        assert_eq!(
+            justify_content_offsets(
+                justify_content,
+                FlexDirection::ColumnReverse,
+                FlexMainLength::new(-250.0),
+                1,
+            )
+            .initial,
+            FlexMainLength::new(-250.0),
         );
     }
 
@@ -1895,6 +2024,33 @@ mod tests {
                 FlexCrossSize::new(60.0),
             ),
             FlexLineCrossConstraint::DefiniteInnerSize(FlexCrossSize::new(60.0))
+        );
+    }
+
+    #[test]
+    fn line_cross_constraint_keeps_a_min_max_clamp_distinct_from_definiteness() {
+        let available = FlexAvailableSpace {
+            width: PhysicalContentWidth::new(content_box_pt(80.0)),
+            width_basis: PercentageBasis::definite_from(
+                content_box_pt(80.0),
+                FlexAvailableSizeSource::ContainingBlock,
+            ),
+            height: Some(PhysicalContentHeight::new(content_box_pt(200.0))),
+            height_basis: PercentageBasis::indefinite(),
+        };
+        let mut style = ComputedStyle::initial();
+        style.box_values.max_height = css::ComputedLengthPercentageOrAuto::LengthPercentage(
+            css::ComputedLengthPercentage::from_points(200.0),
+        );
+
+        assert_eq!(
+            FlexLineCrossConstraint::from_container(
+                &style,
+                available,
+                FlexDirection::Row,
+                FlexCrossSize::new(200.0),
+            ),
+            FlexLineCrossConstraint::ClampedInnerSize(FlexCrossSize::new(200.0))
         );
     }
 
@@ -2027,7 +2183,7 @@ mod tests {
             &children,
             FlexBalanceContext {
                 physical_direction: FlexDirection::Row,
-                requested_line_count: Some(2),
+                minimum_line_count: 2,
                 hypothetical_main_sizes: None,
                 main_gap: FlexMainSize::new(0.0),
                 cross_gap: FlexCrossSize::new(15.0),
@@ -2039,6 +2195,90 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[1].cross_start, FlexCrossOffset::new(25.0));
         assert_eq!(lines[1].cross_end, FlexCrossOffset::new(35.0));
+    }
+
+    #[test]
+    fn balance_line_count_is_a_minimum_and_keeps_normal_wrapping() {
+        let lines = (0..3)
+            .map(|line| {
+                test_line(
+                    (line * 3..line * 3 + 3).collect(),
+                    FlexCrossOffset::new(line as f32 * 10.0),
+                    FlexCrossOffset::new((line + 1) as f32 * 10.0),
+                )
+            })
+            .collect::<Vec<_>>();
+        let items = (0..9)
+            .map(|index| {
+                FlexItemLayout::new(ContainerRect::new(
+                    ContainerPoint::new(index as f32 * 20.0, 0.0),
+                    ContainerSize::new(20.0, 10.0),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let children = (0..9).map(|_| test_child()).collect::<Vec<_>>();
+        let context = |minimum_line_count| FlexBalanceContext {
+            physical_direction: FlexDirection::Row,
+            minimum_line_count,
+            hypothetical_main_sizes: None,
+            main_gap: FlexMainSize::new(20.0),
+            cross_gap: FlexCrossSize::new(0.0),
+            reserved_line_cross_size: None,
+            available_main_size: FlexMainSize::new(100.0),
+        };
+
+        let normal = balanced_flex_line_plan(&lines, &items, &children, context(1))
+            .expect("normal wrapping produces a balance plan");
+        assert_eq!(
+            normal.partitions,
+            vec![vec![0, 1, 2], vec![3, 4, 5], vec![6, 7, 8]]
+        );
+
+        let minimum = balanced_flex_line_plan(&lines, &items, &children, context(4))
+            .expect("minimum line count produces a balance plan");
+        assert_eq!(
+            minimum.partitions,
+            vec![vec![0, 1, 2], vec![3, 4], vec![5, 6], vec![7, 8]],
+        );
+
+        let clamped = balanced_flex_line_plan(&lines, &items, &children, context(16))
+            .expect("item count bounds the requested minimum");
+        assert_eq!(clamped.partitions.len(), 9);
+        assert!(clamped.partitions.iter().all(|line| line.len() == 1));
+    }
+
+    #[test]
+    fn balance_start_bias_is_stable_at_css_pixel_to_point_scale() {
+        let item_indices = (0..9).collect::<Vec<_>>();
+        let outer_main_sizes = vec![FlexMainSize::new(15.0); 9];
+
+        assert_eq!(
+            balanced_flex_line_partitions(
+                &item_indices,
+                &outer_main_sizes,
+                4,
+                FlexMainSize::new(15.0),
+                FlexMainSize::new(75.0),
+            ),
+            Some(vec![vec![0, 1, 2], vec![3, 4], vec![5, 6], vec![7, 8]]),
+        );
+    }
+
+    #[test]
+    fn balance_start_bias_survives_an_unrelated_available_main_size() {
+        let item_indices = (0..9).collect::<Vec<_>>();
+        let outer_main_sizes = vec![FlexMainSize::new(15.0); 9];
+
+        assert_eq!(
+            balanced_flex_line_partitions(
+                &item_indices,
+                &outer_main_sizes,
+                4,
+                FlexMainSize::new(15.0),
+                FlexMainSize::new(470.77557),
+            ),
+            Some(vec![vec![0, 1, 2], vec![3, 4], vec![5, 6], vec![7, 8]]),
+        );
     }
 
     #[test]

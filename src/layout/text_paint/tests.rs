@@ -33,7 +33,9 @@ fn rendered_line_with_run(
             text_matrix: matrix,
             font_size: 10.0,
             font_id: None,
+            font_palette: crate::css::FontPalette::Normal,
             glyphs: Some(glyphs.into()),
+            glyph_source_ranges: None,
         }],
     )
 }
@@ -132,6 +134,38 @@ fn prepared_decoration_horizontal_underline_extends_outward_from_zero_edge() {
     assert!((before[0].block_position - 18.375).abs() < 0.01);
     assert!((before[1].block_position - 30.0).abs() < 0.01);
     assert!((after[0].block_position - 23.0).abs() < 0.01);
+}
+
+#[test]
+fn decoration_split_phases_select_underline_overline_and_line_through_independently() {
+    let mut style = ComputedStyle::initial();
+    style.font_size = 10.0;
+    let mut decoration = style.text_decoration.clone();
+    decoration.underline = true;
+    decoration.overline = true;
+    decoration.line_through = true;
+
+    let underlines = prepared_decoration_strokes_for_style(
+        &style,
+        decoration.clone(),
+        TextDecorationPaintPhase::Underlines,
+    );
+    let overlines = prepared_decoration_strokes_for_style(
+        &style,
+        decoration.clone(),
+        TextDecorationPaintPhase::Overlines,
+    );
+    let line_throughs = prepared_decoration_strokes_for_style(
+        &style,
+        decoration,
+        TextDecorationPaintPhase::AfterText,
+    );
+
+    assert_eq!(underlines.len(), 1);
+    assert_eq!(overlines.len(), 1);
+    assert_eq!(line_throughs.len(), 1);
+    assert!(underlines[0].block_position < line_throughs[0].block_position);
+    assert!(line_throughs[0].block_position < overlines[0].block_position);
 }
 
 #[test]
@@ -259,7 +293,9 @@ fn prepared_decoration_skip_spaces_uses_rotated_run_offsets() {
         text_matrix: RenderedTextMatrix::ROTATE_CW,
         font_size: 10.0,
         font_id: None,
+        font_palette: crate::css::FontPalette::Normal,
         glyphs: Some(vec![glyph(" ", 10.0), glyph("A", 10.0)].into()),
+        glyph_source_ranges: None,
     }];
 
     let ranges = text_decoration_space_skip_ranges(

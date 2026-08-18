@@ -1,9 +1,15 @@
 use super::super::*;
 #[cfg(test)]
 use crate::text::trim_trailing_css_hanging_space_separators;
-use crate::units::{LayoutLength, SemanticLengthExt, layout_pt};
+use crate::units::SemanticLengthExt;
+use icu_segmenter::GraphemeClusterSegmenter;
 use std::borrow::Cow;
 use std::rc::Rc;
+
+/// Formatting controls used to preserve an already-resolved visual order while
+/// shaping without starting a second UAX #9 paragraph.
+const VISUAL_ORDER_GUARD_PREFIX: &str = "\u{202d}";
+const VISUAL_ORDER_GUARD_SUFFIX: &str = "\u{202c}";
 
 /// Return the OpenType shaping direction selected by UAX #9 for a visual run.
 ///
@@ -18,6 +24,22 @@ fn resolved_bidi_shaping_direction(direction: ResolvedBidiDirection) -> Directio
         ResolvedBidiDirection::Ltr => Direction::Ltr,
         ResolvedBidiDirection::Rtl => Direction::Rtl,
     }
+}
+
+/// Return whether a visual bidi slice must be shaped from its logical source.
+///
+/// Cursive characters need their resolved UAX #9 direction while shaping to
+/// retain their contextual forms. Join controls have the same requirement:
+/// U+200C/U+200D can carry the only shaping context in a slice whose visible
+/// characters are Arabic Presentation Forms, which are deliberately
+/// `Joining_Type=Non_Joining`. Such a slice must not enter the LRO-guarded
+/// already-visual-order path.
+/// <https://www.w3.org/TR/css-text-3/#boundary-shaping> and
+/// <https://www.unicode.org/reports/tr9/#L2>.
+fn text_requires_logical_bidi_shaping(text: &str) -> bool {
+    text.chars().any(|character| {
+        character_has_joining_behavior(character) || character_is_join_control(character)
+    })
 }
 
 impl FontSystem {
@@ -184,7 +206,8 @@ impl FontSystem {
             style,
             letter_spacing,
         ));
-        self.apply_vertical_upright_advances(&mut runs, style);
+        let typesetting_plan = TextTypesettingPlan::resolve(text, style);
+        self.apply_upright_vertical_metrics(&mut runs, &typesetting_plan);
         let baseline_adjustment = self
             .shaped_runs_baseline_adjustment(&runs, style, line_height)
             .points();
@@ -195,6 +218,7 @@ impl FontSystem {
             aligned_by_parley: false,
             line_height,
             baseline_adjustment,
+            typesetting_plan,
             runs,
         };
         if shaped.runs.is_empty() {
@@ -223,6 +247,47 @@ impl FontSystem {
             line_height,
             ShapingLetterSpacing::Suppressed,
         )
+    }
+
+    /// Shape a logical selected-line slice with its UAX #9 scope restored.
+    ///
+    /// Line breaking may end inside an authored or CSS-generated isolate.
+    /// The selected source alone is then not a valid UBA paragraph: shaping
+    /// it directly can make an unclosed isolate consume the remainder of the
+    /// backend line and corrupt its measured advance. The graph supplies the
+    /// non-painting context needed to balance that slice. Provenance is
+    /// remapped to the authored range before the result is retained as a
+    /// layout artifact.
+    /// <https://www.unicode.org/reports/tr9/#Explicit_Levels_and_Directions>
+    pub(crate) fn shape_bidi_scoped_logical_line(
+        &mut self,
+        text: &str,
+        style: &ComputedStyle,
+        line_height: f32,
+        prefix: &str,
+        suffix: &str,
+    ) -> Option<ShapedInlineLine> {
+        if prefix.is_empty() && suffix.is_empty() {
+            return self.shape_untracked_inline_line(text, style, line_height);
+        }
+        let authored_start = prefix.len();
+        let authored_end = authored_start + text.len();
+        let mut scoped_text = String::with_capacity(prefix.len() + text.len() + suffix.len());
+        scoped_text.push_str(prefix);
+        scoped_text.push_str(text);
+        scoped_text.push_str(suffix);
+        self.shape_untracked_inline_line(&scoped_text, style, line_height)
+            .map(|mut shaped| {
+                shaped.text = Rc::from(text);
+                remap_shaped_source_ranges_to_authored_slice(
+                    &mut shaped.runs,
+                    authored_start,
+                    authored_end,
+                );
+                strip_bidi_format_controls_from_shaped_runs(&mut shaped.runs);
+                shaped.width = shaped.advance_width();
+                shaped
+            })
     }
 
     /// Shape text whose UAX #9 visual order has already been resolved.
@@ -256,28 +321,91 @@ impl FontSystem {
         // direction:
         // <https://www.w3.org/TR/css-text-3/#boundary-shaping> and
         // <https://www.unicode.org/reports/tr9/#reordering-resolved-levels>.
-        if text.chars().any(character_has_joining_behavior) {
+        // Parley's paragraph builder does not retain an LRO as a visual-order
+        // barrier for every astral RTL script. A selected LTR override is
+        // already in display order, so shape its independent typographic
+        // units in that order rather than permitting a second UBA pass to
+        // reverse the full run. This retains cluster integrity while avoiding
+        // a per-scalar fallback for combining sequences.
+        if resolved_direction == ResolvedBidiDirection::Ltr
+            && resolve_bidi_visual_ranges(text, Direction::Ltr)
+                .iter()
+                .any(|range| range.direction == ResolvedBidiDirection::Rtl)
+        {
+            return self.shape_already_ordered_ltr_units(text, style, line_height);
+        }
+        if text_requires_logical_bidi_shaping(text) {
             let logical_paint_style = Self::visual_bidi_paint_style(
                 style,
                 resolved_bidi_shaping_direction(resolved_direction),
             );
             return self.shape_unwrapped_line(text, &logical_paint_style, line_height);
         }
-        let visual_paint_style = Self::visual_bidi_paint_style(
-            style,
-            resolved_bidi_shaping_direction(resolved_direction),
+        let visual_paint_style = Self::visual_bidi_paint_style(style, style.used_direction());
+        let mut guarded_text = String::with_capacity(
+            text.len() + VISUAL_ORDER_GUARD_PREFIX.len() + VISUAL_ORDER_GUARD_SUFFIX.len(),
         );
-        let mut guarded_text = String::with_capacity(text.len() + 2 * '\u{202d}'.len_utf8());
-        guarded_text.push('\u{202d}');
+        guarded_text.push_str(VISUAL_ORDER_GUARD_PREFIX);
         guarded_text.push_str(text);
-        guarded_text.push('\u{202c}');
+        guarded_text.push_str(VISUAL_ORDER_GUARD_SUFFIX);
         self.shape_unwrapped_line(&guarded_text, &visual_paint_style, line_height)
             .map(|mut shaped| {
                 shaped.text = Rc::from(text);
+                remap_visual_order_guard_source_ranges(&mut shaped.runs, text.len());
                 strip_bidi_format_controls_from_shaped_runs(&mut shaped.runs);
                 self.apply_resolved_bidi_glyph_mirroring(&mut shaped, resolved_direction);
                 shaped
             })
+    }
+
+    /// Shape a visual LTR override one typographic unit at a time.
+    ///
+    /// The caller has already applied UAX #9 L2 and requires this order to be
+    /// preserved. Keeping a unit intact preserves combining sequences and
+    /// CSS Text's joining-boundary invariant while avoiding a backend UBA
+    /// pass over the complete preordered RTL sequence.
+    fn shape_already_ordered_ltr_units(
+        &mut self,
+        text: &str,
+        style: &ComputedStyle,
+        line_height: f32,
+    ) -> Option<ShapedInlineLine> {
+        let visual_style = Self::visual_bidi_paint_style(style, Direction::Ltr);
+        let mut runs = Vec::new();
+        let mut width = 0.0;
+        let boundaries = GraphemeClusterSegmenter::new()
+            .segment_str(text)
+            .collect::<Vec<_>>();
+        for range in boundaries.windows(2).map(|pair| pair[0]..pair[1]) {
+            let mut unit =
+                self.shape_unwrapped_line(&text[range.clone()], &visual_style, line_height)?;
+            for run in &mut unit.runs {
+                run.x_offset += width;
+                for glyph in &mut run.glyphs {
+                    if let Some(source_range) = &mut glyph.source_range {
+                        source_range.start += range.start;
+                        source_range.end += range.start;
+                    }
+                }
+            }
+            width += unit.advance_width();
+            runs.extend(unit.runs);
+        }
+        (!runs.is_empty()).then(|| {
+            let baseline_adjustment = self
+                .shaped_runs_baseline_adjustment(&runs, style, line_height)
+                .points();
+            ShapedInlineLine {
+                text: Rc::from(text),
+                width,
+                offset: 0.0,
+                aligned_by_parley: false,
+                line_height,
+                baseline_adjustment,
+                typesetting_plan: TextTypesettingPlan::resolve(text, &visual_style),
+                runs,
+            }
+        })
     }
 
     #[cfg(test)]
@@ -321,7 +449,8 @@ impl FontSystem {
             tab_origin,
             tab_metric_style,
         ));
-        self.apply_vertical_upright_advances(&mut runs, first_style);
+        let typesetting_plan = TextTypesettingPlan::resolve(&text_summary, first_style);
+        self.apply_upright_vertical_metrics(&mut runs, &typesetting_plan);
         let baseline_adjustment = self
             .shaped_runs_baseline_adjustment(&runs, first_style, line_height)
             .points();
@@ -332,6 +461,7 @@ impl FontSystem {
             aligned_by_parley: false,
             line_height,
             baseline_adjustment,
+            typesetting_plan,
             runs,
         })
     }
@@ -355,11 +485,24 @@ impl FontSystem {
         resolved_direction: ResolvedBidiDirection,
     ) -> Option<ShapedInlineLine> {
         spans.first()?;
+        if resolved_direction == ResolvedBidiDirection::Ltr
+            && spans.len() == 1
+            && spans[0].text == text_summary
+            && resolve_bidi_visual_ranges(spans[0].text, Direction::Ltr)
+                .iter()
+                .any(|range| range.direction == ResolvedBidiDirection::Rtl)
+        {
+            return self.shape_visual_ordered_line(
+                spans[0].text,
+                spans[0].style,
+                line_height,
+                resolved_direction,
+            );
+        }
         let visual_direction = resolved_bidi_shaping_direction(resolved_direction);
         if spans
             .iter()
-            .flat_map(|span| span.text.chars())
-            .any(character_has_joining_behavior)
+            .any(|span| text_requires_logical_bidi_shaping(span.text))
         {
             let logical_paint_styles = spans
                 .iter()
@@ -386,7 +529,7 @@ impl FontSystem {
         }
         let visual_paint_styles = spans
             .iter()
-            .map(|span| Self::visual_bidi_paint_style(span.style, visual_direction))
+            .map(|span| Self::visual_bidi_paint_style(span.style, Direction::Ltr))
             .collect::<Vec<_>>();
         let visual_paint_spans = spans
             .iter()
@@ -397,16 +540,16 @@ impl FontSystem {
             })
             .collect::<Vec<_>>();
         let visual_tab_metric_style =
-            Self::visual_bidi_paint_style(tab_metric_style, visual_direction);
+            Self::visual_bidi_paint_style(tab_metric_style, Direction::Ltr);
         let first_style = visual_paint_spans.first()?.style;
         let mut guarded_spans = Vec::with_capacity(spans.len() + 2);
         guarded_spans.push(StyledTextSpan {
-            text: "\u{202d}",
+            text: VISUAL_ORDER_GUARD_PREFIX,
             style: first_style,
         });
         guarded_spans.extend_from_slice(&visual_paint_spans);
         guarded_spans.push(StyledTextSpan {
-            text: "\u{202c}",
+            text: VISUAL_ORDER_GUARD_SUFFIX,
             style: first_style,
         });
         let mut shaped = self.shape_styled_inline_fragments(
@@ -417,19 +560,20 @@ impl FontSystem {
             tab_origin,
             &visual_tab_metric_style,
         )?;
+        remap_visual_order_guard_source_ranges(&mut shaped.runs, shaped.text.len());
         strip_bidi_format_controls_from_shaped_runs(&mut shaped.runs);
         self.apply_resolved_bidi_glyph_mirroring(&mut shaped, resolved_direction);
         Some(shaped)
     }
 
-    /// Return the style used to shape text after the containing line has
-    /// already resolved CSS bidi scopes through UAX #9.
+    /// Build the shaping style for text whose UAX #9 order has already been
+    /// resolved for the enclosing CSS inline sequence.
     ///
-    /// The selected visual fragment must retain font and OpenType inputs, but
-    /// it must not inject `unicode-bidi` controls a second time. Non-joining
-    /// visual slices are guarded with LRO by their caller; joining text keeps
-    /// logical character order but uses its UAX #9-resolved shaping direction
-    /// while remaining unscoped:
+    /// The source style continues to select font, feature, spacing, and metric
+    /// inputs, but its CSS bidi scope must not be introduced a second time.
+    /// Non-joining visual slices are protected by an LRO guard and therefore
+    /// use LTR paragraph inputs; logical joining slices instead use the level
+    /// resolved for their original run.
     /// <https://drafts.csswg.org/css-writing-modes-4/#bidi-algo> and
     /// <https://www.unicode.org/reports/tr9/#L4>.
     fn visual_bidi_paint_style(style: &ComputedStyle, direction: Direction) -> ComputedStyle {
@@ -503,11 +647,44 @@ impl FontSystem {
     }
 }
 
+/// Translate provenance from the temporary LRO/PDF-guarded input to the
+/// unguarded text retained by [`ShapedInlineLine`].
+///
+/// A backend cluster can include an adjacent, zero-source-width formatting
+/// control. Intersecting instead of requiring containment preserves the
+/// authored portion of that cluster. Guard-only artifacts are non-painting and
+/// removed so they cannot make source slicing reject an otherwise complete
+/// selection.
+fn remap_visual_order_guard_source_ranges(runs: &mut [ShapedInlineRun], authored_len: usize) {
+    let authored_start = VISUAL_ORDER_GUARD_PREFIX.len();
+    let authored_end = authored_start + authored_len;
+    remap_shaped_source_ranges_to_authored_slice(runs, authored_start, authored_end);
+}
+
+/// Retain source ownership inside a temporary non-painting bidi wrapper.
+fn remap_shaped_source_ranges_to_authored_slice(
+    runs: &mut [ShapedInlineRun],
+    authored_start: usize,
+    authored_end: usize,
+) {
+    for run in runs {
+        for glyph in &mut run.glyphs {
+            glyph.source_range = glyph.source_range.take().and_then(|range| {
+                let start = range.start.max(authored_start);
+                let end = range.end.min(authored_end);
+                (start < end).then_some(start - authored_start..end - authored_start)
+            });
+        }
+        run.glyphs
+            .retain(|glyph| glyph.source_range.is_some() || glyph.paints);
+    }
+}
+
 fn strip_bidi_format_controls_from_shaped_runs(runs: &mut [ShapedInlineRun]) {
     for run in runs {
-        run.text = text_without_bidi_format_controls(&run.text)
-            .into_owned()
-            .into();
+        if let Cow::Owned(text) = text_without_bidi_format_controls(&run.text) {
+            run.text = text.into();
+        }
     }
 }
 
@@ -593,5 +770,32 @@ mod tests {
             resolved_bidi_shaping_direction(ResolvedBidiDirection::Ltr),
             Direction::Ltr
         );
+    }
+
+    #[test]
+    fn join_controls_keep_presentation_form_slices_in_logical_shaping_order() {
+        assert!(!character_has_joining_behavior('\u{fedf}'));
+        assert!(!character_has_joining_behavior('\u{fe8e}'));
+        assert!(text_requires_logical_bidi_shaping(
+            "\u{fedf}\u{200c}\u{fe8e}"
+        ));
+    }
+
+    #[test]
+    fn stripping_bidi_controls_keeps_control_free_run_text_shared() {
+        let text: Rc<str> = Rc::from("plain text");
+        let mut runs = [ShapedInlineRun {
+            text: Rc::clone(&text),
+            x_offset: 0.0,
+            font_size: 12.0,
+            font_id: None,
+            font_palette: FontPalette::Normal,
+            glyphs: Vec::new(),
+            paints: false,
+        }];
+
+        strip_bidi_format_controls_from_shaped_runs(&mut runs);
+
+        assert!(Rc::ptr_eq(&runs[0].text, &text));
     }
 }

@@ -4,7 +4,7 @@ use super::component_values::{
     try_split_css_top_level_delimiter,
 };
 use super::parse::parse_declarations;
-use super::selector::{selector_chain, selector_matches_with_scope_proximity_in_chain};
+use super::selector::selector_chain;
 use super::types::*;
 use super::values::*;
 use selectors::context::SelectorCaches;
@@ -26,11 +26,11 @@ pub(crate) use declarations::{
     CascadedDeclaration, SvgTransformAttributeValue,
     apply_cascaded_declarations_with_inheritance_source_and_parent_ch_advance,
     apply_cascaded_marker_declarations_with_inheritance_source_and_parent_ch_advance,
-    apply_declarations, declaration_is_important, declarations_affect_same_property,
-    origin_importance_rank, parse_individual_rotate, parse_individual_scale,
-    parse_individual_translate, parse_object_view_box, parse_svg_transform_attribute,
-    parse_transform, parse_transform_box, parse_transform_origin, sort_cascaded_declarations,
-    svg_transform_origin_presentation_declaration,
+    apply_declarations, apply_declarations_with_inheritance_source, declaration_is_important,
+    declarations_affect_same_property, origin_importance_rank, parse_individual_rotate,
+    parse_individual_scale, parse_individual_translate, parse_object_view_box,
+    parse_svg_transform_attribute, parse_transform, parse_transform_box, parse_transform_origin,
+    sort_cascaded_declarations, svg_transform_origin_presentation_declaration,
 };
 pub(in crate::css) use declarations::{
     CascadedProperty, parse_border_shape, parse_initial_letter, parse_initial_letter_align,

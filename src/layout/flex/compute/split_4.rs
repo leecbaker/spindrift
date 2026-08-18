@@ -348,6 +348,41 @@ fn flex_container_baseline_lines<'a>(
     Some((first, last))
 }
 
+/// The coherent result of remeasuring a flex item after its line has resolved
+/// a definite cross size.
+///
+/// Intrinsic measurement and the line-assigned cross border box describe one
+/// post-line sizing transition. The flex-resolved main border box is not part
+/// of this transition: flexible-length resolution has already finalized it.
+/// <https://www.w3.org/TR/css-flexbox-1/#algo-cross-item> and
+/// <https://www.w3.org/TR/css-sizing-4/#aspect-ratio>
+#[derive(Debug, Clone, Copy)]
+struct FlexPostLineRemeasurement {
+    estimate: FlexItemEstimate,
+    cross_border_size: FlexCrossSize,
+}
+
+impl FlexPostLineRemeasurement {
+    fn new(estimate: FlexItemEstimate, cross_border_size: FlexCrossSize) -> Self {
+        Self {
+            estimate,
+            cross_border_size,
+        }
+    }
+
+    /// Commit the final used flex-item geometry from this remeasurement.
+    ///
+    fn apply_to_layout(self, item: &mut FlexItemLayout, axes: PhysicalFlexDirection) -> bool {
+        let cross_size_changed = (item.cross_size(axes) - self.cross_border_size).abs() > 0.01;
+        if cross_size_changed {
+            item.set_cross_size(axes, self.cross_border_size);
+        }
+        // Flexible-length resolution precedes stretch; only a changed cross
+        // size needs another cross-size pass.
+        cross_size_changed
+    }
+}
+
 /// Recompute auto cross-size flex items that depend on their flex line.
 ///
 /// CSS Flexbox uses each item's hypothetical cross size for non-stretch
@@ -369,7 +404,7 @@ pub(in crate::layout::flex) fn apply_line_cross_size_dependent_item_remeasuremen
     context: FlexLineCrossRemeasureContext<'_>,
 ) -> bool {
     let physical_direction = context.physical_direction;
-    let axes = FlexAxes::from_physical_direction(PhysicalFlexDirection::new(physical_direction));
+    let axes = PhysicalFlexDirection::new(physical_direction);
     let mut changed = false;
     for line in lines {
         let line_cross_size =
@@ -378,6 +413,7 @@ pub(in crate::layout::flex) fn apply_line_cross_size_dependent_item_remeasuremen
             let child = &children[index];
             let remeasure_kind = flex_item_line_cross_remeasurement_kind(
                 &child.style,
+                &estimates[index],
                 context.container_style,
                 physical_direction,
             );
@@ -389,7 +425,7 @@ pub(in crate::layout::flex) fn apply_line_cross_size_dependent_item_remeasuremen
                 == FlexLineCrossRemeasureKind::ColumnShrinkToFit
                 && context.container_style.flex_wrap.wraps())
             // A wrapped column item's automatic cross size is remeasured
-            // after the line's cross size has been collected.  The line is
+            // after the line's cross size has been collected. The line is
             // therefore its definite fit-content constraint, even when its
             // resolved size overflows the container's preferred cross size.
             // Using the original container width here leaves an earlier
@@ -398,10 +434,18 @@ pub(in crate::layout::flex) fn apply_line_cross_size_dependent_item_remeasuremen
             // <https://www.w3.org/TR/css-flexbox-1/#algo-cross-line>
             // <https://www.w3.org/TR/css-sizing-3/#fit-content-sizing>
             .then_some(line_cross_size);
+            let cross_sizing_phase = match remeasure_kind {
+                FlexLineCrossRemeasureKind::Stretch => FlexCrossSizingPhase::StretchToLine {
+                    line_outer_cross_size: line_cross_size,
+                },
+                FlexLineCrossRemeasureKind::ColumnShrinkToFit => FlexCrossSizingPhase::Hypothetical,
+                FlexLineCrossRemeasureKind::None => FlexCrossSizingPhase::Hypothetical,
+            };
             let cross_resolution = FlexItemLineCrossSizeResolution::for_item(
                 &child.style,
                 physical_direction,
                 line_cross_size,
+                cross_sizing_phase,
                 wrapped_column_fit_content_slot,
             );
 
@@ -551,37 +595,20 @@ pub(in crate::layout::flex) fn apply_line_cross_size_dependent_item_remeasuremen
                     ),
                     physical_direction,
                 );
-                if remeasure_kind == FlexLineCrossRemeasureKind::Stretch
-                    && matches!(child.style.flex_basis, css::ComputedFlexBasis::Auto)
-                {
-                    let borders = used_border_widths(&child.style);
-                    let automatic_main_size = if physical_direction.is_row_axis() {
-                        child.style.box_values.width.is_auto().then(|| {
-                            remeasured.width.points()
-                                + child.style.padding.left
-                                + child.style.padding.right
-                                + borders.left
-                                + borders.right
-                        })
-                    } else {
-                        child.style.box_values.height.is_auto().then(|| {
-                            remeasured.height.points()
-                                + child.style.padding.top
-                                + child.style.padding.bottom
-                                + borders.top
-                                + borders.bottom
-                        })
-                    };
-                    if let Some(automatic_main_size) = automatic_main_size
-                        && (items[index].main_size(axes) - FlexMainSize::new(automatic_main_size))
-                            .abs()
-                            > 0.01
-                    {
-                        items[index].set_main_size(axes, FlexMainSize::new(automatic_main_size));
-                        changed = true;
-                    }
-                }
             }
+
+            let remeasurement = FlexPostLineRemeasurement::new(
+                remeasured,
+                FlexCrossSize::new(border_cross_size.points()),
+                // Flexible lengths have already resolved the item's main
+                // size. A final cross-size remeasurement may update its
+                // cross contribution, but must never replace that allocation
+                // with an unrelated intrinsic formatting-context span.
+                // <https://www.w3.org/TR/css-flexbox-1/#resolve-flexible-lengths>
+            );
+
+            changed |= remeasurement.apply_to_layout(&mut items[index], axes);
+            remeasured = remeasurement.estimate;
 
             if remeasure_kind == FlexLineCrossRemeasureKind::ColumnShrinkToFit {
                 // Preserve intrinsic min/max contributions for future flex
@@ -591,13 +618,6 @@ pub(in crate::layout::flex) fn apply_line_cross_size_dependent_item_remeasuremen
                 remeasured.width = cross_resolution.used_content_size(border_cross_size);
             }
 
-            if (items[index].cross_size(axes) - FlexCrossSize::new(border_cross_size.points()))
-                .abs()
-                > 0.01
-            {
-                items[index].set_cross_size(axes, FlexCrossSize::new(border_cross_size.points()));
-                changed = true;
-            }
             let stretched_content_based_row = remeasure_kind == FlexLineCrossRemeasureKind::Stretch
                 && physical_direction.is_row_axis()
                 && context.container_style.writing_mode == WritingMode::HorizontalTb
@@ -607,6 +627,29 @@ pub(in crate::layout::flex) fn apply_line_cross_size_dependent_item_remeasuremen
             // remeasurement must not replace that pre-line contribution with
             // the stretched used box: <https://www.w3.org/TR/css-flexbox-1/#algo-cross-item>.
             if !stretched_content_based_row {
+                if remeasure_kind == FlexLineCrossRemeasureKind::Stretch
+                    && physical_direction.is_row_axis()
+                    && child.style.writing_mode.has_vertical_lines()
+                    && matches!(
+                        context.cross_constraint,
+                        FlexLineCrossConstraint::BalancedLineSlot(_)
+                    )
+                {
+                    // A balanced row's reserved cross slot is the vertical
+                    // writing item's logical inline measurement constraint.
+                    // Its inline children wrap into additional physical
+                    // columns, rather than extending the page's physical
+                    // block direction. The max-content probe can retain that
+                    // unwrapped vertical span as fragmentable overflow; cap
+                    // it at the resolved cross box before fragment replay
+                    // turns it into an extra page slice.
+                    //
+                    // <https://drafts.csswg.org/css-flexbox-2/#flex-line-count-property>
+                    // <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
+                    remeasured.set_fragmentable_overflow_height(PhysicalContentHeight::new(
+                        content_box_pt(border_cross_size.points()),
+                    ));
+                }
                 update_flex_item_estimate_cross_axis(
                     &mut estimates[index],
                     remeasured,
@@ -648,15 +691,11 @@ pub(in crate::layout::flex) fn apply_post_flexing_main_size_cross_remeasurements
         physical_direction,
         available,
     } = context;
-    let axes = FlexAxes::from_physical_direction(PhysicalFlexDirection::new(physical_direction));
+    let axes = PhysicalFlexDirection::new(physical_direction);
     let mut changed = false;
     for ((item, estimate), child) in items.iter_mut().zip(estimates).zip(children) {
         let child_style = &child.style;
-        let cross_size_is_auto = if physical_direction.is_row_axis() {
-            child_style.box_values.height.is_auto()
-        } else {
-            child_style.box_values.width.is_auto()
-        };
+        let cross_size_is_auto = flex_item_cross_size_is_auto(child_style, physical_direction);
         let aligns_stretch = matches!(
             effective_align_self(child_style, container_style).keyword,
             SelfAlignmentKeyword::Auto
@@ -759,9 +798,10 @@ pub(in crate::layout::flex) enum FlexLineCrossRemeasureKind {
 struct FlexItemLineCrossSizeResolution {
     /// The cross-axis slot allocated to the line, including item margins.
     line_slot: FlexCrossSize,
+    /// The algorithm phase that selected the item-local cross constraint.
+    cross_sizing_phase: FlexCrossSizingPhase,
     /// The final flex-line cross-size used by wrapped-column fit-content
-    /// sizing. This remains separate from `line_slot` for callers that do
-    /// not need an explicit fit-content constraint.
+    /// sizing. It remains distinct from a line stretch's used outer size.
     fit_content_available_slot: Option<FlexCrossSize>,
     margin_size: FlexCrossLength,
     non_content_size: NonContentLength,
@@ -772,6 +812,7 @@ impl FlexItemLineCrossSizeResolution {
         child_style: &ComputedStyle,
         physical_direction: FlexDirection,
         line_slot: FlexCrossSize,
+        cross_sizing_phase: FlexCrossSizingPhase,
         fit_content_available_slot: Option<FlexCrossSize>,
     ) -> Self {
         let borders = used_border_widths(child_style);
@@ -798,6 +839,7 @@ impl FlexItemLineCrossSizeResolution {
         };
         Self {
             line_slot,
+            cross_sizing_phase,
             fit_content_available_slot,
             margin_size,
             non_content_size,
@@ -812,6 +854,10 @@ impl FlexItemLineCrossSizeResolution {
         min_content: ContentBoxLength,
         max_content: ContentBoxLength,
     ) -> BorderBoxLength {
+        debug_assert!(matches!(
+            self.cross_sizing_phase,
+            FlexCrossSizingPhase::Hypothetical
+        ));
         let available_slot = self.fit_content_available_slot.unwrap_or(self.line_slot);
         let available_content = ((available_slot - self.margin_size)
             .non_negative_size()
@@ -853,7 +899,7 @@ pub(in crate::layout::flex) fn apply_main_size_aspect_ratio_cross_size_correctio
     physical_direction: FlexDirection,
     available: FlexAvailableSpace,
 ) -> bool {
-    let axes = FlexAxes::from_physical_direction(PhysicalFlexDirection::new(physical_direction));
+    let axes = PhysicalFlexDirection::new(physical_direction);
     let mut changed = false;
     for ((item, estimate), child) in items.iter_mut().zip(estimates).zip(children) {
         let child_style = &child.style;
@@ -959,6 +1005,7 @@ pub(in crate::layout::flex) fn apply_main_size_aspect_ratio_cross_size_correctio
 
 pub(in crate::layout::flex) fn flex_item_line_cross_remeasurement_kind(
     child_style: &ComputedStyle,
+    _estimate: &FlexItemEstimate,
     container_style: &ComputedStyle,
     physical_direction: FlexDirection,
 ) -> FlexLineCrossRemeasureKind {
@@ -969,11 +1016,7 @@ pub(in crate::layout::flex) fn flex_item_line_cross_remeasurement_kind(
         effective_align_self(child_style, container_style).keyword,
         SelfAlignmentKeyword::Auto | SelfAlignmentKeyword::Normal | SelfAlignmentKeyword::Stretch
     );
-    let cross_size_is_auto = if physical_direction.is_row_axis() {
-        child_style.box_values.height.is_auto()
-    } else {
-        child_style.box_values.width.is_auto()
-    };
+    let cross_size_is_auto = flex_item_cross_size_is_auto(child_style, physical_direction);
     if !cross_size_is_auto {
         return FlexLineCrossRemeasureKind::None;
     }
@@ -1130,6 +1173,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn post_line_remeasurement_preserves_flex_resolved_main_size() {
+        let mut item = FlexItemLayout::new(ContainerRect::new(
+            ContainerPoint::new(0.0, 0.0),
+            ContainerSize::new(40.0, 50.0),
+        ));
+        let estimate = FlexItemEstimate::fixed(
+            PhysicalContentWidth::new(content_box_pt(100.0)),
+            PhysicalContentHeight::new(content_box_pt(50.0)),
+        );
+        let axes = PhysicalFlexDirection::new(FlexDirection::Row);
+
+        let cross_size_changed = FlexPostLineRemeasurement::new(estimate, FlexCrossSize::new(50.0))
+            .apply_to_layout(&mut item, axes);
+
+        assert!(!cross_size_changed);
+        assert_eq!(item.main_size(axes), FlexMainSize::new(40.0));
+        assert_eq!(item.cross_size(axes), FlexCrossSize::new(50.0));
+    }
+
+    #[test]
     fn wrapped_column_fit_content_keeps_a_non_stretched_item_within_container_cross_size() {
         let child_style = ComputedStyle::initial();
         let resolution = FlexItemLineCrossSizeResolution::for_item(
@@ -1139,6 +1202,7 @@ mod tests {
             // Flex reconciliation. The definite container cross size remains
             // the fit-content constraint.
             FlexCrossSize::new(300.0),
+            FlexCrossSizingPhase::Hypothetical,
             Some(FlexCrossSize::new(100.0)),
         );
 
@@ -1165,6 +1229,7 @@ mod tests {
             &child_style,
             FlexDirection::Column,
             FlexCrossSize::new(200.0),
+            FlexCrossSizingPhase::Hypothetical,
             Some(FlexCrossSize::new(100.0)),
         );
 

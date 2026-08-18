@@ -1,5 +1,17 @@
 use super::*;
 
+/// Classify an inline boundary by the kind of text behavior it can affect.
+/// Paint-only changes must retain one shaping context; shaping-affecting
+/// changes may require synthetic join context; layout boundaries are hard
+/// shaping breaks:
+/// <https://drafts.csswg.org/css-text-3/#boundary-shaping>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InlineBoundaryEffect {
+    PaintOnly,
+    ShapingInputChange,
+    LayoutShapingBreak,
+}
+
 /// The directional level assigned to a source range after UAX #9 resolution.
 ///
 /// This deliberately differs from CSS `direction`: it describes the visual

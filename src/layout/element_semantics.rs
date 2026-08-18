@@ -407,8 +407,7 @@ impl DocumentCanvasResolution {
                 .map(|(element, _, style, _)| (element, style))
         });
         let propagated_body = body.filter(|(_, style)| {
-            !style_has_non_none_contain_property(html_style)
-                && !style_has_non_none_contain_property(style)
+            !style_has_active_containment(html_style) && !style_has_active_containment(style)
         });
         // When body property propagation is disabled, root overflow still
         // supplies the viewport; the body keeps its own overflow behavior.
@@ -503,6 +502,20 @@ impl DocumentCanvasResolution {
     /// <https://drafts.csswg.org/css-contain-1/#contain-property>
     pub(in crate::layout) fn is_document_canvas_flow_element(self, element: &Element) -> bool {
         self.is_document_canvas_property_source(element)
+    }
+
+    /// Whether this element supplies the resolved document principal flow.
+    ///
+    /// The root always participates in document-canvas property propagation,
+    /// but when an eligible body propagates its writing properties it alone
+    /// supplies the principal-flow child coordinate system. Conversely, a
+    /// containment-disabled body leaves the root as that source.
+    /// <https://drafts.csswg.org/css-writing-modes-4/#principal-flow>
+    pub(in crate::layout) fn is_document_principal_flow_source(self, element: &Element) -> bool {
+        match self.principal_flow.source {
+            PrincipalFlowSource::Root => self.root == Some(element.id),
+            PrincipalFlowSource::Body(body) => body == element.id,
+        }
     }
 
     /// Whether `element` supplies document-canvas properties. The root
@@ -633,16 +646,22 @@ pub(super) fn overflow_clipping_axes(style: &ComputedStyle) -> (bool, bool) {
 /// Return whether any containment effect prevents special root/body canvas
 /// property propagation.
 ///
-/// CSS Containment Level 1 prevents a contained root or body principal box
+/// CSS Containment Level 2 prevents a root or body with active containment
 /// from propagating background, overflow, and principal writing-mode canvas
-/// properties. `content` and `strict` are already expanded into these bits.
-/// <https://www.w3.org/TR/css-contain-1/#containment-layout>
-pub(super) fn style_has_non_none_contain_property(style: &ComputedStyle) -> bool {
+/// properties. `content` and `strict` are already expanded into these bits;
+/// `content-visibility: auto` and `hidden` add used containment without
+/// changing the computed `contain` value.
+/// <https://drafts.csswg.org/css-contain-2/#contain-property>
+pub(super) fn style_has_active_containment(style: &ComputedStyle) -> bool {
     style.contain.size
         || style.contain.inline_size
         || style.contain.layout
         || style.contain.paint
         || style.contain.style
+        || matches!(
+            style.content_visibility,
+            ContentVisibility::Auto | ContentVisibility::Hidden
+        )
 }
 
 /// Return whether size/layout/paint containment applies to this principal box.
@@ -786,6 +805,14 @@ impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn element_uses_document_canvas_flow(&self, element: &Element) -> bool {
         self.document_canvas_overflow
             .is_document_canvas_flow_element(element)
+    }
+
+    pub(in crate::layout) fn element_supplies_document_principal_flow(
+        &self,
+        element: &Element,
+    ) -> bool {
+        self.document_canvas_overflow
+            .is_document_principal_flow_source(element)
     }
 
     /// Returns the element's overflow after document-canvas propagation.
@@ -938,6 +965,13 @@ pub(super) fn replaced_element_kind(element: &Element) -> Option<ReplacedElement
         // implementation for img, embed, object, and video poster images.
         // <https://html.spec.whatwg.org/multipage/embedded-content.html>
         "img" | "embed" | "video" => Some(ReplacedElementKind::Image),
+        // HTML's Image Button state is an image-backed replaced control. It
+        // shares the ordinary raster-image layout path, while every other
+        // input state retains its form-control layout semantics.
+        // <https://html.spec.whatwg.org/multipage/input.html#image-button-state-(type=image)>
+        "input" if css::input_type(&element.tag, &element.attrs).as_deref() == Some("image") => {
+            Some(ReplacedElementKind::Image)
+        }
         // HTML `<object>` renders its fallback subtree unless the resource
         // selection algorithm chose a supported external representation.
         // The static renderer resolves that state before building CSS boxes.
@@ -1140,14 +1174,19 @@ mod tests {
             );
         }
 
-        let content_visibility = resolve_document_canvas(
-            "<html><body>content</body></html>",
-            "body { content-visibility: hidden; writing-mode: vertical-rl }",
-        );
-        assert!(matches!(
-            content_visibility.principal_flow().source,
-            PrincipalFlowSource::Body(_)
-        ));
+        for content_visibility in ["auto", "hidden"] {
+            let resolution = resolve_document_canvas(
+                "<html><body>content</body></html>",
+                &format!(
+                    "body {{ content-visibility: {content_visibility}; writing-mode: vertical-rl }}"
+                ),
+            );
+            assert_eq!(
+                resolution.principal_flow().source,
+                PrincipalFlowSource::Root,
+                "content-visibility: {content_visibility}"
+            );
+        }
 
         let hidden_body = resolve_document_canvas(
             "<html><body hidden>content</body></html>",
@@ -1157,6 +1196,107 @@ mod tests {
             hidden_body.principal_flow().source,
             PrincipalFlowSource::Root
         );
+    }
+
+    #[test]
+    fn active_containment_on_root_or_body_disables_body_propagation() {
+        let containment_declarations = [
+            "contain: size",
+            "contain: inline-size",
+            "contain: layout",
+            "contain: paint",
+            "contain: style",
+            "content-visibility: auto",
+            "content-visibility: hidden",
+        ];
+
+        for selector in ["html", "body"] {
+            for declaration in containment_declarations {
+                let resolution = resolve_document_canvas(
+                    "<html><body>content</body></html>",
+                    &format!("html {{ writing-mode: vertical-lr }} {selector} {{ {declaration} }}"),
+                );
+                assert!(
+                    resolution.propagated_body.is_none(),
+                    "{selector} {{ {declaration} }}"
+                );
+                assert_eq!(
+                    resolution.principal_flow().source,
+                    PrincipalFlowSource::Root,
+                    "{selector} {{ {declaration} }}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn root_principal_properties_remain_used_when_containment_blocks_body() {
+        let resolution = resolve_document_canvas(
+            "<html><body>content</body></html>",
+            "html { writing-mode: vertical-lr; direction: rtl; text-orientation: mixed } \
+             body { contain: style; writing-mode: horizontal-tb; direction: ltr; text-orientation: upright }",
+        );
+
+        assert_eq!(
+            resolution.principal_flow().source,
+            PrincipalFlowSource::Root
+        );
+        assert_eq!(
+            resolution.principal_flow().writing_mode,
+            WritingMode::VerticalLr
+        );
+        assert_eq!(resolution.principal_flow().direction, Direction::Rtl);
+        assert_eq!(
+            resolution.principal_flow().text_orientation,
+            TextOrientation::Mixed
+        );
+    }
+
+    #[test]
+    fn principal_flow_source_distinguishes_root_participation_from_body_propagation() {
+        let resolve_and_assert = |author_css: &str, body_propagates: bool| {
+            let root = crate::dom::parse("<html><body>content</body></html>");
+            let document = root
+                .as_element()
+                .expect("parsed document has an element root");
+            let html = document
+                .children
+                .iter()
+                .filter_map(Node::as_element)
+                .find(|element| element.tag == "html")
+                .expect("document has an HTML root");
+            let body = html
+                .children
+                .iter()
+                .filter_map(Node::as_element)
+                .find(|element| element.tag == "body")
+                .expect("HTML root has a body");
+            let author = css::parse_stylesheet(&crate::css::Css::from_string(author_css));
+            let stylesheets = Stylesheets::for_document(
+                css::html5_user_agent_stylesheet(),
+                None,
+                std::slice::from_ref(&author),
+            );
+            let page_box = box_tree::build_page_box(&root, &stylesheets, &ComputedStyle::initial());
+            let resolution = DocumentCanvasResolution::from_page_box(&page_box);
+
+            assert!(resolution.is_document_canvas_flow_element(html));
+            assert_eq!(
+                resolution.is_document_canvas_flow_element(body),
+                body_propagates
+            );
+            assert_eq!(
+                resolution.is_document_principal_flow_source(html),
+                !body_propagates
+            );
+            assert_eq!(
+                resolution.is_document_principal_flow_source(body),
+                body_propagates
+            );
+        };
+
+        resolve_and_assert("body { writing-mode: vertical-lr }", true);
+        resolve_and_assert("body { contain: layout; writing-mode: vertical-lr }", false);
     }
 
     #[test]
@@ -1386,23 +1526,22 @@ mod tests {
     }
 
     #[test]
-    fn body_propagation_uses_only_the_contain_property() {
+    fn body_propagation_checks_all_active_containment() {
         let mut style = ComputedStyle::initial();
-        assert!(!style_has_non_none_contain_property(&style));
+        assert!(!style_has_active_containment(&style));
 
         style.contain.inline_size = true;
-        assert!(style_has_non_none_contain_property(&style));
+        assert!(style_has_active_containment(&style));
         style.contain.inline_size = false;
 
         style.contain.style = true;
-        assert!(style_has_non_none_contain_property(&style));
+        assert!(style_has_active_containment(&style));
         style.contain.style = false;
 
-        style.content_visibility = ContentVisibility::Hidden;
-        assert!(
-            !style_has_non_none_contain_property(&style),
-            "content-visibility does not change contain's used value"
-        );
+        for content_visibility in [ContentVisibility::Auto, ContentVisibility::Hidden] {
+            style.content_visibility = content_visibility;
+            assert!(style_has_active_containment(&style));
+        }
     }
 
     #[test]
@@ -1476,6 +1615,28 @@ mod tests {
             replaced_element_kind(&image),
             Some(ReplacedElementKind::Image)
         );
+    }
+
+    #[test]
+    fn only_html_image_buttons_are_replaced_images() {
+        let mut image_button = html_element("input");
+        image_button
+            .attrs
+            .insert("type".to_string(), "IMAGE".to_string());
+        assert_eq!(
+            replaced_element_kind(&image_button),
+            Some(ReplacedElementKind::Image)
+        );
+
+        for input_type in [None, Some("text"), Some("not-a-real-state")] {
+            let mut input = html_element("input");
+            if let Some(input_type) = input_type {
+                input
+                    .attrs
+                    .insert("type".to_string(), input_type.to_string());
+            }
+            assert_eq!(replaced_element_kind(&input), None, "{input_type:?}");
+        }
     }
 
     #[test]

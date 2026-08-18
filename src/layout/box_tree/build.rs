@@ -185,12 +185,9 @@ fn build_child_boxes_inner<'a>(
                 }
             }
             NodeKind::Element(child_element) => {
-                let signature = ElementSignature::with_sibling_list(
-                    child_element.tag.clone(),
-                    child_element.attrs.clone(),
-                    element_index,
-                    sibling_tags.clone(),
-                );
+                let signature =
+                    ElementSignature::from_sibling_snapshot(element_index, sibling_tags.clone())
+                        .expect("source child must have a cached sibling signature");
                 element_index += 1;
                 if is_html_select_item_element(child_element)
                     && !has_html_select_context(element, ancestors)

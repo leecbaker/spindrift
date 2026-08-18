@@ -1,7 +1,6 @@
 //! Integration tests for supported PDF profiles and compression behavior.
 
 use base64::Engine as _;
-use image::{ExtendedColorType, ImageEncoder};
 use moxcms::{ColorProfile, ToneReprCurve};
 use quire::{Document, Html, PdfCompression, PdfOptions, PdfProfile, RenderOptions};
 
@@ -49,11 +48,15 @@ fn wide_gamut_profile() -> Vec<u8> {
 
 fn tagged_png_data_url(profile: &[u8]) -> String {
     let mut image = Vec::new();
-    let mut encoder = image::codecs::png::PngEncoder::new(&mut image);
-    encoder.set_icc_profile(profile.to_vec()).unwrap();
-    encoder
-        .write_image(&[230, 32, 16], 1, 1, ExtendedColorType::Rgb8)
+    let mut info = png::Info::with_size(1, 1);
+    info.color_type = png::ColorType::Rgb;
+    info.icc_profile = Some(profile.to_vec().into());
+    let mut writer = png::Encoder::with_info(&mut image, info)
+        .unwrap()
+        .write_header()
         .unwrap();
+    writer.write_image_data(&[230, 32, 16]).unwrap();
+    drop(writer);
     format!(
         "data:image/png;base64,{}",
         base64::engine::general_purpose::STANDARD.encode(image)

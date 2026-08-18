@@ -21,6 +21,14 @@ pub(crate) enum LayoutUnit {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RasterPixelUnit {}
 
+/// Marker for an integer CSS-pixel image dimension.
+///
+/// This is deliberately distinct from [`RasterPixelUnit`]: a raster source's
+/// preferred CSS size can come from validated image metadata rather than its
+/// encoded sample grid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CssPixelUnit {}
+
 /// Marker for a CSS content-box length or size.
 ///
 /// This is still stored in Quire's PDF-point layout scalar, but the marker
@@ -59,6 +67,57 @@ pub(crate) enum NonContentUnit {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MarginBoxUnit {}
 
+/// A named text baseline measured from a CSS inline content-box block start.
+///
+/// This must not be used as a line-relative displacement: it has a content-box
+/// origin and becomes comparable with another baseline only after rebasing on
+/// each box's alphabetic baseline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContentBoxBaselineUnit {}
+
+/// A named baseline measured relative to its box's alphabetic baseline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AlphabeticBaselineRelativeUnit {}
+
+/// The CSS Inline baseline-table displacement between a child and its direct
+/// parent, before `baseline-shift` is applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BaselineTableAlignmentUnit {}
+
+/// The used displacement authored through CSS `baseline-shift`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthorBaselineShiftUnit {}
+
+/// A line-relative displacement that may be applied to a painted glyph
+/// baseline origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GlyphBaselineDisplacementUnit {}
+
+/// A baseline exported by an atomic inline's own alignment source box.
+///
+/// The source can be the principal border box or, for an `inline-table`, the
+/// table box. This is deliberately not a line-relative coordinate: callers
+/// must rebase it through the atomic inline's margin box before using it for
+/// line sizing or baseline alignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AtomicInlineBaselineSourceUnit {}
+
+/// An atomic inline baseline measured from its logical margin-box block start.
+///
+/// CSS Inline uses this coordinate when calculating the atomic inline's line
+/// contribution. It includes the logical block-start margin even when the
+/// exported source is an inline table's table box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AtomicInlineMarginBoxBaselineUnit {}
+
+/// An atomic inline baseline coordinate used to place a captured paint box.
+///
+/// This stays distinct from [`AtomicInlineMarginBoxBaselineUnit`]: a captured
+/// inline-table fragment starts at its table box and must not reapply the
+/// wrapper's block-start margin during replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AtomicInlinePaintPlacementBaselineUnit {}
+
 /// A CSS computed absolute length in Quire's canonical layout unit.
 pub(crate) type LayoutLength = euclid::Length<f32, LayoutUnit>;
 
@@ -67,6 +126,12 @@ pub(crate) type LayoutSize = euclid::Size2D<f32, LayoutUnit>;
 
 /// A decoded raster image size in source pixels.
 pub(crate) type RasterPixelSize = euclid::Size2D<u32, RasterPixelUnit>;
+
+/// A raster image's preferred natural size in CSS pixels.
+///
+/// HTML image metadata can provide this independently of the raster sample
+/// dimensions. It becomes a [`LayoutSize`] only at the CSS layout boundary.
+pub(crate) type CssPixelSize = euclid::Size2D<u32, CssPixelUnit>;
 
 /// A CSS content-box length in Quire's PDF-point layout scalar.
 pub(crate) type ContentBoxLength = euclid::Length<f32, ContentBoxUnit>;
@@ -79,6 +144,19 @@ pub(crate) type NonContentLength = euclid::Length<f32, NonContentUnit>;
 
 /// A CSS margin-box extent in Quire's PDF-point layout scalar.
 pub(crate) type MarginBoxLength = euclid::Length<f32, MarginBoxUnit>;
+
+pub(crate) type ContentBoxBaselineOffset = euclid::Length<f32, ContentBoxBaselineUnit>;
+pub(crate) type AlphabeticBaselineRelativeOffset =
+    euclid::Length<f32, AlphabeticBaselineRelativeUnit>;
+pub(crate) type BaselineTableAlignmentDelta = euclid::Length<f32, BaselineTableAlignmentUnit>;
+pub(crate) type AuthorBaselineShift = euclid::Length<f32, AuthorBaselineShiftUnit>;
+pub(crate) type GlyphBaselineDisplacement = euclid::Length<f32, GlyphBaselineDisplacementUnit>;
+pub(crate) type AtomicInlineBaselineSourceOffset =
+    euclid::Length<f32, AtomicInlineBaselineSourceUnit>;
+pub(crate) type AtomicInlineMarginBoxBaselineOffset =
+    euclid::Length<f32, AtomicInlineMarginBoxBaselineUnit>;
+pub(crate) type AtomicInlinePaintPlacementBaselineOffset =
+    euclid::Length<f32, AtomicInlinePaintPlacementBaselineUnit>;
 
 /// A physical CSS margin-box size in Quire's PDF-point layout coordinates.
 ///
@@ -121,6 +199,46 @@ pub(crate) const fn non_content_pt(value: f32) -> NonContentLength {
 /// Construct a margin-box extent from PDF points.
 pub(crate) const fn margin_box_pt(value: f32) -> MarginBoxLength {
     MarginBoxLength::new(value)
+}
+
+pub(crate) const fn content_box_baseline_pt(value: f32) -> ContentBoxBaselineOffset {
+    ContentBoxBaselineOffset::new(value)
+}
+
+pub(crate) const fn alphabetic_baseline_relative_pt(
+    value: f32,
+) -> AlphabeticBaselineRelativeOffset {
+    AlphabeticBaselineRelativeOffset::new(value)
+}
+
+pub(crate) const fn baseline_table_alignment_pt(value: f32) -> BaselineTableAlignmentDelta {
+    BaselineTableAlignmentDelta::new(value)
+}
+
+pub(crate) const fn author_baseline_shift_pt(value: f32) -> AuthorBaselineShift {
+    AuthorBaselineShift::new(value)
+}
+
+pub(crate) const fn glyph_baseline_displacement_pt(value: f32) -> GlyphBaselineDisplacement {
+    GlyphBaselineDisplacement::new(value)
+}
+
+pub(crate) const fn atomic_inline_baseline_source_pt(
+    value: f32,
+) -> AtomicInlineBaselineSourceOffset {
+    AtomicInlineBaselineSourceOffset::new(value)
+}
+
+pub(crate) const fn atomic_inline_margin_box_baseline_pt(
+    value: f32,
+) -> AtomicInlineMarginBoxBaselineOffset {
+    AtomicInlineMarginBoxBaselineOffset::new(value)
+}
+
+pub(crate) const fn atomic_inline_paint_placement_baseline_pt(
+    value: f32,
+) -> AtomicInlinePaintPlacementBaselineOffset {
+    AtomicInlinePaintPlacementBaselineOffset::new(value)
 }
 
 /// Construct a physical CSS margin-box size from PDF points.
@@ -224,6 +342,28 @@ impl IntoLayoutLength for MarginBoxLength {
 pub(crate) enum PercentageBasis<T, Source = ()> {
     Definite { value: T, source: Source },
     Indefinite,
+}
+
+/// A value whose CSS sizing definiteness has been established at a layout
+/// boundary.
+///
+/// CSS Sizing distinguishes an available numeric size from a definite size:
+/// only the latter may resolve percentage-dependent layout or justify a
+/// definite-size preflight. Keeping that fact in the type prevents callers
+/// from replacing an absent definite size with a numeric fallback.
+/// <https://www.w3.org/TR/css-sizing-3/#definite>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub(crate) struct Definite<T>(T);
+
+impl<T> Definite<T> {
+    pub(crate) fn new(value: T) -> Self {
+        Self(value)
+    }
+
+    pub(crate) fn value(self) -> T {
+        self.0
+    }
 }
 
 impl<T> PercentageBasis<T, ()> {
@@ -350,12 +490,13 @@ pub(crate) fn border_box_to_content_box_size(
     )
 }
 
-/// Convert decoded raster source pixels into natural CSS layout dimensions.
+/// Convert an image's preferred natural CSS-pixel dimensions into layout
+/// dimensions.
 ///
 /// CSS Values fixes `1px = 1/96in`, while Quire's layout unit is PDF points,
-/// so each natural raster pixel contributes `0.75pt`:
+/// so each CSS pixel contributes `0.75pt`:
 /// <https://www.w3.org/TR/css-values-4/#absolute-lengths>.
-pub(crate) fn raster_natural_layout_size(size: RasterPixelSize) -> LayoutSize {
+pub(crate) fn css_pixel_natural_layout_size(size: CssPixelSize) -> LayoutSize {
     LayoutSize::new(
         layout_points(layout_px(size.width as f32)),
         layout_points(layout_px(size.height as f32)),

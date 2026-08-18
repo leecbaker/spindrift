@@ -747,6 +747,25 @@ impl ContainIntrinsicSize {
         width: None,
         height: None,
     };
+
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        if let Some(width) = &mut self.width {
+            width.resolve_root_font_metric_lengths(basis);
+        }
+        if let Some(height) = &mut self.height {
+            height.resolve_root_font_metric_lengths(basis);
+        }
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        self.width
+            .as_ref()
+            .is_some_and(ComputedLengthPercentage::requires_root_font_metrics)
+            || self
+                .height
+                .as_ref()
+                .is_some_and(ComputedLengthPercentage::requires_root_font_metrics)
+    }
 }
 
 impl Contain {
@@ -813,6 +832,47 @@ pub(crate) enum ClipPath {
     Url,
 }
 
+impl ClipPath {
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        match self {
+            Self::Polygon(points) => {
+                for point in points {
+                    point.x.resolve_root_font_metric_lengths(basis);
+                    point.y.resolve_root_font_metric_lengths(basis);
+                }
+            }
+            Self::Inset {
+                top,
+                right,
+                bottom,
+                left,
+            } => {
+                for value in [top, right, bottom, left] {
+                    value.resolve_root_font_metric_lengths(basis);
+                }
+            }
+            Self::None | Self::Shape | Self::Url => {}
+        }
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        match self {
+            Self::Polygon(points) => points.iter().any(|point| {
+                point.x.requires_root_font_metrics() || point.y.requires_root_font_metrics()
+            }),
+            Self::Inset {
+                top,
+                right,
+                bottom,
+                left,
+            } => [top, right, bottom, left]
+                .into_iter()
+                .any(|value| value.requires_root_font_metrics()),
+            Self::None | Self::Shape | Self::Url => false,
+        }
+    }
+}
+
 /// Computed legacy CSS 2 `clip` value for absolutely positioned boxes.
 ///
 /// Unlike `clip-path`, `clip` is a rectangle whose four physical edges are
@@ -832,6 +892,23 @@ impl LegacyClip {
 
     pub(crate) fn forces_flattening(&self) -> bool {
         !matches!(self, Self::Auto)
+    }
+
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        let Self::Rect(edges) = self else {
+            return;
+        };
+        for edge in edges {
+            if let LegacyClipEdge::Length(value) = edge {
+                value.resolve_root_font_metric_lengths(basis);
+            }
+        }
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        matches!(self, Self::Rect(edges) if edges.iter().any(|edge| {
+            matches!(edge, LegacyClipEdge::Length(value) if value.requires_root_font_metrics())
+        }))
     }
 }
 
@@ -875,6 +952,22 @@ pub(crate) enum ShapeOutside {
 
 impl ShapeOutside {
     pub(crate) const NONE: Self = Self::None;
+
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        match self {
+            Self::Image(image) => image.resolve_root_font_metric_lengths(basis),
+            Self::Basic { shape, .. } => shape.resolve_root_font_metric_lengths(basis),
+            Self::None | Self::Box(_) => {}
+        }
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        match self {
+            Self::Image(image) => image.requires_root_font_metrics(),
+            Self::Basic { shape, .. } => shape.requires_root_font_metrics(),
+            Self::None | Self::Box(_) => false,
+        }
+    }
 }
 
 /// The reference box used by CSS Shapes float-area geometry.
@@ -893,6 +986,90 @@ pub(crate) enum BasicShape {
     Circle(ShapeCircle),
     Ellipse(ShapeEllipse),
     Polygon(ShapePolygon),
+}
+
+impl BasicShape {
+    fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        match self {
+            Self::Inset(shape) => {
+                for value in [
+                    &mut shape.top,
+                    &mut shape.right,
+                    &mut shape.bottom,
+                    &mut shape.left,
+                ] {
+                    value.resolve_root_font_metric_lengths(basis);
+                }
+                shape.radii.resolve_root_font_metric_lengths(basis);
+            }
+            Self::Circle(shape) => {
+                shape.radius.resolve_root_font_metric_lengths(basis);
+                shape.position.resolve_root_font_metric_lengths(basis);
+            }
+            Self::Ellipse(shape) => {
+                shape
+                    .horizontal_radius
+                    .resolve_root_font_metric_lengths(basis);
+                shape
+                    .vertical_radius
+                    .resolve_root_font_metric_lengths(basis);
+                shape.position.resolve_root_font_metric_lengths(basis);
+            }
+            Self::Polygon(shape) => {
+                for point in &mut shape.vertices {
+                    point.x.resolve_root_font_metric_lengths(basis);
+                    point.y.resolve_root_font_metric_lengths(basis);
+                }
+            }
+        }
+    }
+
+    fn requires_root_font_metrics(&self) -> bool {
+        match self {
+            Self::Inset(shape) => {
+                [&shape.top, &shape.right, &shape.bottom, &shape.left]
+                    .into_iter()
+                    .any(|value| value.requires_root_font_metrics())
+                    || shape.radii.requires_root_font_metrics()
+            }
+            Self::Circle(shape) => {
+                shape.radius.requires_root_font_metrics()
+                    || shape.position.requires_root_font_metrics()
+            }
+            Self::Ellipse(shape) => {
+                shape.horizontal_radius.requires_root_font_metrics()
+                    || shape.vertical_radius.requires_root_font_metrics()
+                    || shape.position.requires_root_font_metrics()
+            }
+            Self::Polygon(shape) => shape.vertices.iter().any(|point| {
+                point.x.requires_root_font_metrics() || point.y.requires_root_font_metrics()
+            }),
+        }
+    }
+}
+
+impl ShapeCircleRadius {
+    fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        if let Self::LengthPercentage(value) = self {
+            value.resolve_root_font_metric_lengths(basis);
+        }
+    }
+
+    fn requires_root_font_metrics(&self) -> bool {
+        matches!(self, Self::LengthPercentage(value) if value.requires_root_font_metrics())
+    }
+}
+
+impl ShapeEllipseRadius {
+    fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        if let Self::LengthPercentage(value) = self {
+            value.resolve_root_font_metric_lengths(basis);
+        }
+    }
+
+    fn requires_root_font_metrics(&self) -> bool {
+        matches!(self, Self::LengthPercentage(value) if value.requires_root_font_metrics())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -970,6 +1147,15 @@ impl ShapePosition {
             y: ComputedLengthPercentage::from_percent(0.5),
         }
     }
+
+    fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        self.x.resolve_root_font_metric_lengths(basis);
+        self.y.resolve_root_font_metric_lengths(basis);
+    }
+
+    fn requires_root_font_metrics(&self) -> bool {
+        self.x.requires_root_font_metrics() || self.y.requires_root_font_metrics()
+    }
 }
 
 /// Computed CSS Borders 4 `border-shape` value.
@@ -1025,6 +1211,87 @@ impl BorderShape {
         };
         if *current == BorderShapeGeometryBox::HalfBorder {
             *current = geometry_box;
+        }
+    }
+
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        match self {
+            Self::Circle(shape) => {
+                shape.radius.resolve_root_font_metric_lengths(basis);
+                shape.position.resolve_root_font_metric_lengths(basis);
+            }
+            Self::Ellipse(shape) => {
+                shape
+                    .horizontal_radius
+                    .resolve_root_font_metric_lengths(basis);
+                shape
+                    .vertical_radius
+                    .resolve_root_font_metric_lengths(basis);
+                shape.position.resolve_root_font_metric_lengths(basis);
+            }
+            Self::Path(shape) => {
+                for vertex in &mut shape.vertices {
+                    vertex.resolve_root_font_metric_lengths(basis);
+                }
+            }
+            Self::Inset(shape) => {
+                for value in [
+                    &mut shape.top,
+                    &mut shape.right,
+                    &mut shape.bottom,
+                    &mut shape.left,
+                ] {
+                    value.resolve_root_font_metric_lengths(basis);
+                }
+                if let Some(radius) = &mut shape.corner_radius {
+                    radius.resolve_root_font_metric_lengths(basis);
+                }
+            }
+            Self::Polygon(shape) => {
+                for vertex in &mut shape.vertices {
+                    vertex.resolve_root_font_metric_lengths(basis);
+                }
+            }
+            Self::Pair { outer, inner } => {
+                outer.resolve_root_font_metric_lengths(basis);
+                inner.resolve_root_font_metric_lengths(basis);
+            }
+            Self::None => {}
+        }
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        match self {
+            Self::Circle(shape) => {
+                shape.radius.requires_root_font_metrics()
+                    || shape.position.requires_root_font_metrics()
+            }
+            Self::Ellipse(shape) => {
+                shape.horizontal_radius.requires_root_font_metrics()
+                    || shape.vertical_radius.requires_root_font_metrics()
+                    || shape.position.requires_root_font_metrics()
+            }
+            Self::Path(shape) => shape
+                .vertices
+                .iter()
+                .any(BorderShapePosition::requires_root_font_metrics),
+            Self::Polygon(shape) => shape
+                .vertices
+                .iter()
+                .any(BorderShapePosition::requires_root_font_metrics),
+            Self::Inset(shape) => {
+                [&shape.top, &shape.right, &shape.bottom, &shape.left]
+                    .into_iter()
+                    .any(|value| value.requires_root_font_metrics())
+                    || shape
+                        .corner_radius
+                        .as_ref()
+                        .is_some_and(ComputedLengthPercentage::requires_root_font_metrics)
+            }
+            Self::Pair { outer, inner } => {
+                outer.requires_root_font_metrics() || inner.requires_root_font_metrics()
+            }
+            Self::None => false,
         }
     }
 }
@@ -1089,6 +1356,18 @@ pub(crate) enum BorderShapeCircleRadius {
     FarthestCorner,
 }
 
+impl BorderShapeCircleRadius {
+    fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        if let Self::LengthPercentage(value) = self {
+            value.resolve_root_font_metric_lengths(basis);
+        }
+    }
+
+    fn requires_root_font_metrics(&self) -> bool {
+        matches!(self, Self::LengthPercentage(value) if value.requires_root_font_metrics())
+    }
+}
+
 /// One currently-supported elliptical basic shape in `border-shape`.
 ///
 /// Ellipse radii are preserved independently because CSS percentage radii
@@ -1112,6 +1391,18 @@ pub(crate) enum BorderShapeEllipseRadius {
     FarthestCorner,
 }
 
+impl BorderShapeEllipseRadius {
+    fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        if let Self::LengthPercentage(value) = self {
+            value.resolve_root_font_metric_lengths(basis);
+        }
+    }
+
+    fn requires_root_font_metrics(&self) -> bool {
+        matches!(self, Self::LengthPercentage(value) if value.requires_root_font_metrics())
+    }
+}
+
 /// Basic-shape center relative to its selected geometry box.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BorderShapePosition {
@@ -1125,6 +1416,15 @@ impl BorderShapePosition {
             x: ComputedLengthPercentage::from_percent(0.5),
             y: ComputedLengthPercentage::from_percent(0.5),
         }
+    }
+
+    fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        self.x.resolve_root_font_metric_lengths(basis);
+        self.y.resolve_root_font_metric_lengths(basis);
+    }
+
+    fn requires_root_font_metrics(&self) -> bool {
+        self.x.requires_root_font_metrics() || self.y.requires_root_font_metrics()
     }
 }
 
@@ -1352,8 +1652,18 @@ impl ComputedPerspective {
         }
     }
 
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        if let Self::Distance(distance) = self {
+            distance.resolve_root_font_metric_lengths(basis);
+        }
+    }
+
     pub(crate) fn requires_ch_advance(&self) -> bool {
         matches!(self, Self::Distance(distance) if distance.requires_ch_advance())
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        matches!(self, Self::Distance(distance) if distance.requires_root_font_metrics())
     }
 }
 
@@ -1381,8 +1691,17 @@ impl NonNegativeComputedLength {
         debug_assert!(self.length() >= 0.0);
     }
 
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        self.0.resolve_root_font_metric_lengths(basis);
+        debug_assert!(self.length() >= 0.0);
+    }
+
     pub(crate) fn requires_ch_advance(&self) -> bool {
         self.0.requires_ch_advance()
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        self.0.requires_root_font_metrics()
     }
 }
 
@@ -1413,6 +1732,22 @@ impl TransformFunction {
         }
     }
 
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        match self {
+            Self::Translate(translation) => {
+                translation.x.resolve_root_font_metric_lengths(basis);
+                translation.y.resolve_root_font_metric_lengths(basis);
+            }
+            Self::Translate3D(translation) => {
+                translation.x.resolve_root_font_metric_lengths(basis);
+                translation.y.resolve_root_font_metric_lengths(basis);
+                translation.z.resolve_root_font_metric_lengths(basis);
+            }
+            Self::Perspective(perspective) => perspective.resolve_root_font_metric_lengths(basis),
+            _ => {}
+        }
+    }
+
     pub(crate) fn requires_ch_advance(&self) -> bool {
         match self {
             Self::Translate(translation) => {
@@ -1424,6 +1759,22 @@ impl TransformFunction {
                     || translation.z.requires_ch_advance()
             }
             Self::Perspective(perspective) => perspective.requires_ch_advance(),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        match self {
+            Self::Translate(translation) => {
+                translation.x.requires_root_font_metrics()
+                    || translation.y.requires_root_font_metrics()
+            }
+            Self::Translate3D(translation) => {
+                translation.x.requires_root_font_metrics()
+                    || translation.y.requires_root_font_metrics()
+                    || translation.z.requires_root_font_metrics()
+            }
+            Self::Perspective(perspective) => perspective.requires_root_font_metrics(),
             _ => false,
         }
     }
@@ -1461,10 +1812,23 @@ impl IndividualTransforms {
         })
     }
 
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        self.translate.as_ref().is_some_and(|translation| {
+            translation.x.requires_root_font_metrics() || translation.y.requires_root_font_metrics()
+        })
+    }
+
     pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         if let Some(translation) = &mut self.translate {
             translation.x.resolve_font_metric_lengths(ch_advance);
             translation.y.resolve_font_metric_lengths(ch_advance);
+        }
+    }
+
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        if let Some(translation) = &mut self.translate {
+            translation.x.resolve_root_font_metric_lengths(basis);
+            translation.y.resolve_root_font_metric_lengths(basis);
         }
     }
 }
@@ -1509,8 +1873,17 @@ impl PerspectiveOrigin {
         self.y.resolve_font_metric_lengths(ch_advance);
     }
 
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        self.x.resolve_root_font_metric_lengths(basis);
+        self.y.resolve_root_font_metric_lengths(basis);
+    }
+
     pub(crate) fn requires_ch_advance(&self) -> bool {
         self.x.requires_ch_advance() || self.y.requires_ch_advance()
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        self.x.requires_root_font_metrics() || self.y.requires_root_font_metrics()
     }
 
     /// Resolve the origin against the perspective element's transform
@@ -1664,6 +2037,49 @@ impl ObjectViewBox {
         }
     }
 
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        let requires = |value: &ComputedLengthPercentage| value.requires_root_font_metrics();
+        match self {
+            Self::None => false,
+            Self::Inset {
+                top,
+                right,
+                bottom,
+                left,
+                radii,
+            } => {
+                requires(top)
+                    || requires(right)
+                    || requires(bottom)
+                    || requires(left)
+                    || radii
+                        .as_ref()
+                        .is_some_and(BorderRadius::requires_root_font_metrics)
+            }
+            Self::Rect {
+                top,
+                right,
+                bottom,
+                left,
+            } => requires(top) || requires(right) || requires(bottom) || requires(left),
+            Self::Xywh {
+                x,
+                y,
+                width,
+                height,
+                radii,
+            } => {
+                requires(x)
+                    || requires(y)
+                    || requires(width)
+                    || requires(height)
+                    || radii
+                        .as_ref()
+                        .is_some_and(BorderRadius::requires_root_font_metrics)
+            }
+        }
+    }
+
     pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         let resolve =
             |value: &mut ComputedLengthPercentage| value.resolve_font_metric_lengths(ch_advance);
@@ -1712,6 +2128,55 @@ impl ObjectViewBox {
             }
         }
     }
+
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        let resolve =
+            |value: &mut ComputedLengthPercentage| value.resolve_root_font_metric_lengths(basis);
+        match self {
+            Self::None => {}
+            Self::Inset {
+                top,
+                right,
+                bottom,
+                left,
+                radii,
+            } => {
+                resolve(top);
+                resolve(right);
+                resolve(bottom);
+                resolve(left);
+                if let Some(radii) = radii {
+                    radii.resolve_root_font_metric_lengths(basis);
+                }
+            }
+            Self::Rect {
+                top,
+                right,
+                bottom,
+                left,
+            } => {
+                resolve(top);
+                resolve(right);
+                resolve(bottom);
+                resolve(left);
+            }
+            Self::Xywh {
+                x,
+                y,
+                width,
+                height,
+                radii,
+            } => {
+                resolve(x);
+                resolve(y);
+                resolve(width);
+                resolve(height);
+                if let Some(radii) = radii {
+                    radii.resolve_root_font_metric_lengths(basis);
+                }
+            }
+        }
+    }
 }
 
 impl TransformOrigin {
@@ -1741,8 +2206,20 @@ impl TransformOrigin {
         self.z.resolve_font_metric_lengths(ch_advance);
     }
 
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        self.x.resolve_root_font_metric_lengths(basis);
+        self.y.resolve_root_font_metric_lengths(basis);
+        self.z.resolve_root_font_metric_lengths(basis);
+    }
+
     pub(crate) fn requires_ch_advance(&self) -> bool {
         self.x.requires_ch_advance() || self.y.requires_ch_advance() || self.z.requires_ch_advance()
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        self.x.requires_root_font_metrics()
+            || self.y.requires_root_font_metrics()
+            || self.z.requires_root_font_metrics()
     }
 
     /// Resolve this CSS transform origin against a page-local transform
@@ -2018,17 +2495,8 @@ impl ElementSiblingSignatureList {
         Self::from_vec(Vec::<ElementSiblingSignature>::new())
     }
 
-    pub(crate) fn from_vec<Sibling>(siblings: Vec<Sibling>) -> Self
-    where
-        Sibling: Into<ElementSiblingSignature>,
-    {
-        Self(Rc::from(
-            siblings
-                .into_iter()
-                .map(Into::into)
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-        ))
+    pub(crate) fn from_vec(siblings: Vec<ElementSiblingSignature>) -> Self {
+        Self(Rc::from(siblings.into_boxed_slice()))
     }
 
     pub(crate) fn as_slice(&self) -> &[ElementSiblingSignature] {
@@ -2061,10 +2529,11 @@ impl std::ops::Deref for ElementSiblingSignatureList {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ElementSiblingSignature {
+pub(crate) struct ElementSelectorSnapshot {
     pub tag: String,
     pub namespace_url: String,
     pub document_is_html: bool,
+    pub document_compatibility_mode: crate::dom::DocumentCompatibilityMode,
     pub attrs: HashMap<String, String>,
     pub namespace_attrs: Vec<ElementAttributeSignature>,
     pub opaque_id: Rc<usize>,
@@ -2075,6 +2544,10 @@ pub(crate) struct ElementSiblingSignature {
     pub has_text_child: bool,
     pub is_target: bool,
     pub has_target_descendant: bool,
+    /// Deterministic static-document link history state. This is prepared
+    /// from the document and effective base URLs before selector snapshots
+    /// become immutable.
+    pub link_state: LinkState,
     /// HTML/document directionality known from the element itself.
     ///
     /// Selectors `:dir()` matches document-language directionality rather than
@@ -2085,13 +2558,60 @@ pub(crate) struct ElementSiblingSignature {
     pub document_direction: Option<Direction>,
 }
 
+/// The mutually-exclusive Selectors link state of a hyperlink.
+///
+/// Static rendering has no persistent history. A prepared document may mark
+/// self-links as visited without exposing host navigation history.
+/// <https://drafts.csswg.org/selectors/#link>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinkState {
+    Unvisited,
+    Visited,
+}
+
+/// Immutable selector-relevant source metadata for one DOM element.
+///
+/// A source element may be styled many times while fragmentation, intrinsic
+/// sizing, and target-reference resolution replay layout.  Keep its DOM
+/// selector data behind an [`Rc`] so those replays only copy the contextual
+/// selector state instead of cloning attributes and descendant signatures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ElementSiblingSignature(Rc<ElementSelectorSnapshot>);
+
+impl std::ops::Deref for ElementSiblingSignature {
+    type Target = ElementSelectorSnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ElementSiblingSignature {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Rc::make_mut(&mut self.0)
+    }
+}
+
+impl ElementSiblingSignature {
+    pub(crate) fn with_target(mut self, is_target: bool) -> Self {
+        Rc::make_mut(&mut self.0).is_target = is_target;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_snapshot_with(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 impl ElementSiblingSignature {
     pub(crate) fn new(tag: impl Into<String>, attrs: HashMap<String, String>) -> Self {
         let namespace_attrs = local_attribute_signatures(&attrs);
-        Self {
+        Self(Rc::new(ElementSelectorSnapshot {
             tag: tag.into(),
             namespace_url: String::new(),
             document_is_html: true,
+            document_compatibility_mode: crate::dom::DocumentCompatibilityMode::NoQuirks,
             attrs,
             namespace_attrs,
             opaque_id: next_element_signature_opaque_id(),
@@ -2100,12 +2620,13 @@ impl ElementSiblingSignature {
             has_text_child: false,
             is_target: false,
             has_target_descendant: false,
+            link_state: LinkState::Unvisited,
             document_direction: None,
-        }
+        }))
     }
 
     pub(crate) fn with_source_element_id(mut self, id: crate::dom::ElementId) -> Self {
-        self.source_element_id = Some(id);
+        Rc::make_mut(&mut self.0).source_element_id = Some(id);
         self
     }
 
@@ -2114,13 +2635,27 @@ impl ElementSiblingSignature {
         namespace_url: impl Into<String>,
         namespace_attrs: Vec<ElementAttributeSignature>,
     ) -> Self {
-        self.namespace_url = namespace_url.into();
-        self.namespace_attrs = namespace_attrs;
+        let snapshot = Rc::make_mut(&mut self.0);
+        snapshot.namespace_url = namespace_url.into();
+        snapshot.namespace_attrs = namespace_attrs;
         self
     }
 
     pub(crate) fn with_document_is_html(mut self, document_is_html: bool) -> Self {
-        self.document_is_html = document_is_html;
+        Rc::make_mut(&mut self.0).document_is_html = document_is_html;
+        self
+    }
+
+    pub(crate) fn with_document_compatibility_mode(
+        mut self,
+        document_compatibility_mode: crate::dom::DocumentCompatibilityMode,
+    ) -> Self {
+        Rc::make_mut(&mut self.0).document_compatibility_mode = document_compatibility_mode;
+        self
+    }
+
+    pub(crate) fn with_link_state(mut self, link_state: LinkState) -> Self {
+        Rc::make_mut(&mut self.0).link_state = link_state;
         self
     }
 
@@ -2129,9 +2664,10 @@ impl ElementSiblingSignature {
         children: ElementSiblingSignatureList,
         has_text_child: bool,
     ) -> Self {
-        self.children = children;
-        self.has_text_child = has_text_child;
-        self.has_target_descendant = self
+        let snapshot = Rc::make_mut(&mut self.0);
+        snapshot.children = children;
+        snapshot.has_text_child = has_text_child;
+        snapshot.has_target_descendant = snapshot
             .children
             .iter()
             .any(|child| child.is_target || child.has_target_descendant);
@@ -2144,13 +2680,13 @@ impl ElementSiblingSignature {
         Sibling: Into<ElementSiblingSignature>,
     {
         self.with_child_list(
-            ElementSiblingSignatureList::from_vec(children),
+            ElementSiblingSignatureList::from_vec(children.into_iter().map(Into::into).collect()),
             has_text_child,
         )
     }
 
     pub(crate) fn with_document_direction(mut self, direction: Direction) -> Self {
-        self.document_direction = Some(direction);
+        Rc::make_mut(&mut self.0).document_direction = Some(direction);
         self
     }
 }
@@ -2170,71 +2706,52 @@ impl From<String> for ElementSiblingSignature {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ResolvedLanguage {
     Unresolved,
-    Unknown,
-    Tag(String),
-    /// A present HTML language attribute that is not a well-formed BCP 47
-    /// tag. This selector-only state preserves the authored computed value
-    /// without allowing `:lang()` matching.
-    Malformed(String),
+    /// A document language resolved from this element or its inheritance
+    /// source. [`ContentLanguage`] retains both the authored spelling and its
+    /// one-time BCP 47 validation, so inheriting it does not copy or reparse a
+    /// language tag.
+    Resolved(ContentLanguage),
 }
 
 impl ResolvedLanguage {
     pub(crate) fn from_html_attribute(value: &str) -> Self {
-        match ContentLanguage::from_html_attribute(value) {
-            ContentLanguage::Unknown => Self::Unknown,
-            ContentLanguage::Tagged(tag) if tag.locale().is_some() => {
-                Self::Tag(tag.as_str().to_owned())
-            }
-            ContentLanguage::Tagged(tag) => Self::Malformed(tag.as_str().to_owned()),
-        }
+        Self::Resolved(ContentLanguage::from_html_attribute(value))
     }
 
     pub(crate) fn from_computed(value: &ContentLanguage) -> Self {
-        match value {
-            ContentLanguage::Unknown => Self::Unknown,
-            ContentLanguage::Tagged(tag) if tag.locale().is_some() => {
-                Self::Tag(tag.as_str().to_owned())
-            }
-            ContentLanguage::Tagged(tag) => Self::Malformed(tag.as_str().to_owned()),
-        }
+        Self::Resolved(value.clone())
     }
 
     pub(crate) fn as_computed_language(&self) -> ContentLanguage {
         match self {
-            Self::Tag(language) | Self::Malformed(language) => {
-                ContentLanguage::Tagged(LanguageTag::new(language))
-            }
-            Self::Unresolved | Self::Unknown => ContentLanguage::Unknown,
+            Self::Resolved(language) => language.clone(),
+            Self::Unresolved => ContentLanguage::Unknown,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ElementSignature {
-    pub tag: String,
-    pub namespace_url: String,
-    pub document_is_html: bool,
-    pub attrs: HashMap<String, String>,
-    pub namespace_attrs: Vec<ElementAttributeSignature>,
-    pub opaque_id: Rc<usize>,
-    pub source_element_id: Option<crate::dom::ElementId>,
+    pub(crate) selector: ElementSiblingSignature,
     pub sibling_index: Option<usize>,
     pub sibling_signatures: ElementSiblingSignatureList,
-    pub child_signatures: ElementSiblingSignatureList,
-    pub has_text_child: bool,
-    pub is_target: bool,
-    pub has_target_descendant: bool,
-    /// HTML/document directionality known from the element itself.
-    ///
-    /// This is separate from `resolved_direction`: Selectors `:dir()` is based
-    /// on host-language directionality and is unaffected by CSS `direction`.
-    /// Undefined HTML directionality inherits through the selector chain:
-    /// <https://drafts.csswg.org/selectors/#the-dir-pseudo> and
-    /// <https://html.spec.whatwg.org/multipage/dom.html#the-directionality>.
-    pub document_direction: Option<Direction>,
     pub html_direction: Option<Direction>,
     pub resolved_direction: Option<Direction>,
     pub resolved_language: ResolvedLanguage,
+}
+
+impl std::ops::Deref for ElementSignature {
+    type Target = ElementSelectorSnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.selector
+    }
+}
+
+impl std::ops::DerefMut for ElementSignature {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.selector
+    }
 }
 
 impl ResolveViewportLengths for TransformFunction {

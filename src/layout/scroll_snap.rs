@@ -220,7 +220,8 @@ impl<'a> LayoutBuilder<'a> {
             union_paint_rects(content_bounds, bounds)
         });
         let padding_box = if scope.is_document_root {
-            self.iframe_viewport.map_or(padding_box, |viewport| {
+            self.iframe_viewport.map_or(padding_box, |context| {
+                let viewport = context.viewport;
                 // An iframe has one finite scrolling viewport even though the
                 // embedded static document is laid out on an unfragmented
                 // canvas. Anchor that viewport at the root's block-start edge.

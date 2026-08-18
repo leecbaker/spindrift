@@ -1,8 +1,94 @@
 use super::*;
+use crate::css::CounterStyleRangeInterval;
 use crate::text::is_css_preserved_document_space;
+use icu_segmenter::GraphemeClusterSegmenter;
+use std::collections::HashSet;
 use std::rc::Rc;
 
+/// The writing context needed by predefined styles whose representation
+/// depends on the element's inline and block directions.
+///
+/// CSS Counter Styles defines the disclosure styles in terms of these
+/// directions, so the same context must reach direct use, generated content,
+/// and a custom style that `extends` a disclosure style.
+/// <https://drafts.csswg.org/css-counter-styles-3/#disclosure-open>
+/// <https://drafts.csswg.org/css-counter-styles-3/#disclosure-closed>
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout) struct CounterStyleRenderContext {
+    direction: Direction,
+    writing_mode: WritingMode,
+}
+
+impl CounterStyleRenderContext {
+    pub(in crate::layout) fn for_style(style: &ComputedStyle) -> Self {
+        Self {
+            direction: style.direction,
+            writing_mode: style.writing_mode,
+        }
+    }
+
+    fn default_context() -> Self {
+        Self {
+            direction: Direction::Ltr,
+            writing_mode: WritingMode::HorizontalTb,
+        }
+    }
+}
+
 impl<'a> LayoutBuilder<'a> {
+    /// Run an off-page capture whose lines cannot become an ancestor list
+    /// item's principal line.
+    ///
+    /// The closure receives a snapshot taken after the enclosing marker
+    /// anchors have been detached. It may install its own scratch coordinate
+    /// system and extract paint freely; this method always restores the outer
+    /// builder and its marker anchors after the capture returns.
+    /// <https://drafts.csswg.org/css-lists-3/#list-style-position-property>
+    pub(in crate::layout) fn with_non_principal_line_capture<T>(
+        &mut self,
+        capture: impl FnOnce(&mut Self, &LayoutSnapshot) -> T,
+    ) -> T {
+        let pending_outside_marker_anchors = self.pending_outside_marker_anchors.suspend();
+        let snapshot = self.snapshot();
+        let result = capture(self, &snapshot);
+        debug_assert!(
+            self.pending_outside_marker_anchors.is_empty(),
+            "a scratch layout must finalize its local outside-marker anchors"
+        );
+        self.restore(snapshot);
+        self.pending_outside_marker_anchors
+            .restore(pending_outside_marker_anchors);
+        result
+    }
+
+    /// Whether this list item supplies a non-empty marker line to its
+    /// principal inline flow.
+    ///
+    /// This is intentionally resolved from the same counter and generated
+    /// content state as the eventual marker, rather than inferred from the
+    /// specified `list-style-type`: an explicit `::marker { content: ... }`
+    /// can suppress an automatic marker, and a counter representation can be
+    /// empty.  The caller uses this before deciding whether the list item's
+    /// block margins can collapse through it.
+    ///
+    /// CSS Lists Level 3 makes an inside marker part of the principal block
+    /// box's first line; that line therefore prevents an otherwise empty
+    /// list item from being self-collapsing.
+    /// <https://drafts.csswg.org/css-lists-3/#list-style-position-property>
+    /// <https://drafts.csswg.org/css-lists-3/#marker-pseudo>
+    pub(in crate::layout) fn has_in_flow_marker_line(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+    ) -> bool {
+        let quote_depth = self.quote_depth;
+        let marker = self.marker_for_list_item(element, style, self.containing_block_direction);
+        self.quote_depth = quote_depth;
+        marker.is_some_and(|marker| {
+            marker.participates_in_first_line() && marker.has_in_flow_content()
+        })
+    }
+
     pub(in crate::layout) fn marker_for_list_item(
         &mut self,
         element: &Element,
@@ -70,6 +156,7 @@ impl<'a> LayoutBuilder<'a> {
                 parts,
                 counter_stacks,
                 &self.counter_styles,
+                CounterStyleRenderContext::for_style(&marker_style),
             );
             (!text.is_empty()).then_some((text, false))
         } else if marker_style.marker_content == MarkerContent::Auto {
@@ -78,7 +165,12 @@ impl<'a> LayoutBuilder<'a> {
             // representation, but cannot substitute its inherited
             // `list-style-type` or `list-style-image` values.
             // <https://drafts.csswg.org/css-lists-3/#marker-content>
-            automatic_marker_text(style.list_style_type.clone(), ordinal, &self.counter_styles)
+            automatic_marker_text_with_context(
+                style.list_style_type.clone(),
+                ordinal,
+                &self.counter_styles,
+                CounterStyleRenderContext::for_style(&marker_style),
+            )
         } else {
             marker_text(
                 &marker_style,
@@ -86,10 +178,12 @@ impl<'a> LayoutBuilder<'a> {
                 &self.counter_styles,
                 counter_stacks,
                 &mut self.quote_depth,
+                CounterStyleRenderContext::for_style(&marker_style),
             )
         };
         let (text, suffix_space) = marker?;
         Some(ListMarker {
+            source_element: Some(element.id),
             text,
             image,
             style: marker_style,
@@ -129,8 +223,8 @@ impl<'a> LayoutBuilder<'a> {
                 0.0
             };
             let x = match marker.positioning_direction {
-                Direction::Ltr => anchor.content_inline_span.left_x() - image.width - gap,
-                Direction::Rtl => anchor.content_inline_span.right_x() + gap,
+                Direction::Ltr => anchor.principal_line_inline_span.left_x() - image.width - gap,
+                Direction::Rtl => anchor.principal_line_inline_span.right_x() + gap,
             };
             let rect = PageTopRect::new(
                 x,
@@ -148,10 +242,10 @@ impl<'a> LayoutBuilder<'a> {
                     RenderedImage::from_paint_rect(
                         rect,
                         false,
-                        image.decoded.pixel_width,
-                        image.decoded.pixel_height,
-                        None,
-                        false,
+                        image.decoded.pixel_size.width,
+                        image.decoded.pixel_size.height,
+                        image.decoded.source_rect,
+                        crate::layout::assets::raster_image_sampling(&marker.style),
                         image.decoded.rgb.shared(),
                         image.decoded.alpha.clone(),
                         None,
@@ -184,8 +278,8 @@ impl<'a> LayoutBuilder<'a> {
             )
         };
         let marker_left = match marker.positioning_direction {
-            Direction::Ltr => anchor.content_inline_span.left_x() - marker_width,
-            Direction::Rtl => anchor.content_inline_span.right_x(),
+            Direction::Ltr => anchor.principal_line_inline_span.left_x() - marker_width,
+            Direction::Rtl => anchor.principal_line_inline_span.right_x(),
         };
         let marker_baseline_offset = layout_pt(sequence.first_line_baseline_offset(
             self.inline_box_text_line_layout_baseline_offset(&marker.style),
@@ -193,12 +287,13 @@ impl<'a> LayoutBuilder<'a> {
         let marker_block_start = anchor
             .alphabetic_baseline
             .toward_block_start(marker_baseline_offset);
-        self.paint_inline_box_sequence(
+        self.paint_inline_box_sequence_with_float_policy(
             &sequence,
             &marker.style,
             marker_left,
             marker_width,
             marker_block_start.points(),
+            NestedInlinePaintFloatPolicy::PreserveResolvedGeometry,
         );
     }
 
@@ -218,12 +313,22 @@ impl<'a> LayoutBuilder<'a> {
         if list_item_style.writing_mode != WritingMode::HorizontalTb {
             return false;
         }
+        let fallback_alphabetic_baseline = PageTopBlockPosition::new(self.cursor_y)
+            .toward_block_end(layout_pt(
+                self.inline_box_text_line_layout_baseline_offset(list_item_style),
+            ));
         self.pending_outside_marker_anchors
             .push(PendingOutsideMarkerAnchor {
                 marker: marker.clone(),
                 list_item_style: list_item_style.clone(),
-                content_inline_span,
-                fallback_line_block_start: PageTopBlockPosition::new(self.cursor_y),
+                fallback: OutsideMarkerFallbackCandidate {
+                    containing_inline_span: content_inline_span,
+                    fallback_line_block_span: PageBlockSpan::new(
+                        self.cursor_y,
+                        list_item_style.line_height,
+                    ),
+                    alphabetic_baseline: fallback_alphabetic_baseline,
+                },
                 painted: false,
             });
         true
@@ -238,25 +343,17 @@ impl<'a> LayoutBuilder<'a> {
         if pending.painted {
             return;
         }
-        let line_block_start = pending.fallback_line_block_start;
-        let fallback_baseline = line_block_start.toward_block_end(layout_pt(
-            self.inline_box_text_line_layout_baseline_offset(&pending.list_item_style),
-        ));
-        self.paint_outside_marker(
-            &pending.marker,
-            &pending.list_item_style,
-            OutsideMarkerAnchor {
-                content_inline_span: pending.content_inline_span,
-                formatted_line_block_start: line_block_start,
-                alphabetic_baseline: fallback_baseline,
-            },
-        );
+        let anchor = self.resolve_float_adjacent_outside_marker_fallback(pending.fallback);
+        self.paint_outside_marker(&pending.marker, &pending.list_item_style, anchor);
     }
 
     pub(in crate::layout) fn outside_marker_anchor_is_pending(&self, marker: &ListMarker) -> bool {
-        self.pending_outside_marker_anchors
-            .iter()
-            .any(|pending| pending.marker == *marker)
+        self.pending_outside_marker_anchors.iter().any(|pending| {
+            match (pending.marker.source_element, marker.source_element) {
+                (Some(pending_source), Some(marker_source)) => pending_source == marker_source,
+                _ => pending.marker == *marker,
+            }
+        })
     }
 
     pub(in crate::layout) fn outside_marker_fallback_anchor(
@@ -265,13 +362,44 @@ impl<'a> LayoutBuilder<'a> {
         content_inline_span: PageInlineSpan,
     ) -> OutsideMarkerAnchor {
         let formatted_line_block_start = PageTopBlockPosition::new(self.cursor_y);
-        let alphabetic_baseline = formatted_line_block_start.toward_block_end(layout_pt(
-            self.inline_box_text_line_layout_baseline_offset(style),
-        ));
+        let fallback_baseline_offset = self.inline_box_text_line_layout_baseline_offset(style);
+        let fallback = OutsideMarkerFallbackCandidate {
+            containing_inline_span: content_inline_span,
+            fallback_line_block_span: PageBlockSpan::new(self.cursor_y, style.line_height),
+            alphabetic_baseline: formatted_line_block_start
+                .toward_block_end(layout_pt(fallback_baseline_offset)),
+        };
+        if style.writing_mode != WritingMode::HorizontalTb {
+            return OutsideMarkerAnchor {
+                principal_line_inline_span: fallback.containing_inline_span,
+                formatted_line_block_start,
+                alphabetic_baseline: fallback.alphabetic_baseline,
+            };
+        }
+        self.resolve_float_adjacent_outside_marker_fallback(fallback)
+    }
+
+    /// Resolve Quire's compatibility placement for an outside marker that
+    /// lacks a principal line. CSS Lists leaves float-adjacent placement
+    /// undefined; using the fallback line's float band keeps the marker on
+    /// the inline-start side of the principal box without moving that box.
+    /// <https://drafts.csswg.org/css-lists-3/#list-style-position-property>
+    fn resolve_float_adjacent_outside_marker_fallback(
+        &self,
+        candidate: OutsideMarkerFallbackCandidate,
+    ) -> OutsideMarkerAnchor {
+        let principal_line_inline_span = self
+            .float_band_in_span(
+                candidate.fallback_line_block_span,
+                candidate.containing_inline_span,
+            )
+            .span;
         OutsideMarkerAnchor {
-            content_inline_span,
-            formatted_line_block_start,
-            alphabetic_baseline,
+            principal_line_inline_span,
+            formatted_line_block_start: PageTopBlockPosition::new(
+                candidate.fallback_line_block_span.top_y(),
+            ),
+            alphabetic_baseline: candidate.alphabetic_baseline,
         }
     }
 
@@ -292,7 +420,7 @@ impl<'a> LayoutBuilder<'a> {
                     pending.marker.clone(),
                     pending.list_item_style.clone(),
                     OutsideMarkerAnchor {
-                        content_inline_span: pending.content_inline_span,
+                        principal_line_inline_span: pending.fallback.containing_inline_span,
                         formatted_line_block_start,
                         alphabetic_baseline,
                     },
@@ -303,7 +431,7 @@ impl<'a> LayoutBuilder<'a> {
             // Mark this before marker-line layout re-enters the shared line
             // painter. The marker's own generated line is not the list
             // item's principal line and must not recursively re-anchor it.
-            self.pending_outside_marker_anchors[index].painted = true;
+            self.pending_outside_marker_anchors.mark_painted(index);
             self.paint_outside_marker(&marker, &list_item_style, anchor);
         }
     }
@@ -403,27 +531,33 @@ impl<'a> LayoutBuilder<'a> {
         style: &ComputedStyle,
     ) -> Option<MarkerImage> {
         let image = style.list_style_image.as_image()?;
-        let css::BackgroundImage::Url {
-            src,
-            base_url,
-            root_url,
-            request_modifiers,
-        } = image.selected_image()
-        else {
-            // CSS generated images are not yet marker paint sources. They
-            // remain an invalid marker image here, allowing list-style-type
-            // fallback while that rendering path is implemented.
-            return None;
+        let asset = match image.selected_image() {
+            css::BackgroundImage::Url(_) | css::BackgroundImage::ImageFunction(_) => {
+                match resolve_css_image_source(
+                    image.selected_image(),
+                    ImageResolutionContext {
+                        base_url: self.base_url,
+                        root_url: None,
+                        current_color: style.color,
+                        orientation: crate::layout::asset_helpers::raster_orientation_policy(
+                            style.image_orientation,
+                        ),
+                        svg_context: crate::svg::SvgImageContext::from_used_color_scheme(
+                            style.used_color_scheme,
+                        ),
+                        resource_cache: self.resource_cache,
+                    },
+                ) {
+                    ResolvedCssImage::External(asset) => asset,
+                    ResolvedCssImage::SolidColor(color) => {
+                        ResolvedImageAsset::Raster(solid_color_marker_image(color))
+                    }
+                    ResolvedCssImage::Invalid => return None,
+                }
+            }
+            // Existing gradient marker support is deliberately unchanged.
+            _ => return None,
         };
-        let asset = load_resolved_image_source_with_request(
-            src,
-            base_url.as_ref().or(self.base_url),
-            root_url.as_ref(),
-            self.resource_cache,
-            style.image_orientation == css::ImageOrientation::FromImage,
-            crate::svg::SvgImageContext::from_used_color_scheme(style.used_color_scheme),
-            request_modifiers,
-        )?;
         // Candidate density selects SVG options but does not rescale their
         // vector natural dimensions.
         // <https://drafts.csswg.org/css-images-4/#image-set-notation>
@@ -454,6 +588,22 @@ impl<'a> LayoutBuilder<'a> {
     }
 }
 
+fn solid_color_marker_image(color: CssColor) -> DecodedPngImage {
+    let color = crate::css::color_to_predefined_rgb(color, crate::css::CssColorSpace::Srgb)
+        .expect("sRGB is a predefined CSS RGB space");
+    DecodedPngImage::new(
+        1,
+        1,
+        vec![
+            (color.components()[0] * 255.0).round().clamp(0.0, 255.0) as u8,
+            (color.components()[1] * 255.0).round().clamp(0.0, 255.0) as u8,
+            (color.components()[2] * 255.0).round().clamp(0.0, 255.0) as u8,
+        ],
+        (color.alpha() < 1.0)
+            .then_some(vec![(color.alpha() * 255.0).round().clamp(0.0, 255.0) as u8]),
+    )
+}
+
 pub(in crate::layout) fn marker_inline_scope_style(style: &ComputedStyle) -> ComputedStyle {
     let mut style = style.clone();
     style.display = Display::INLINE;
@@ -466,11 +616,15 @@ pub(in crate::layout) fn marker_text(
     counter_styles: &HashMap<String, CounterStyleRule>,
     counter_stack: &HashMap<String, Vec<i32>>,
     quote_depth: &mut usize,
+    render_context: CounterStyleRenderContext,
 ) -> Option<(String, bool)> {
     match &style.marker_content {
-        MarkerContent::Auto => {
-            automatic_marker_text(style.list_style_type.clone(), ordinal, counter_styles)
-        }
+        MarkerContent::Auto => automatic_marker_text_with_context(
+            style.list_style_type.clone(),
+            ordinal,
+            counter_styles,
+            render_context,
+        ),
         MarkerContent::None => None,
         MarkerContent::Parts(parts) => {
             let mut text = String::new();
@@ -507,10 +661,11 @@ pub(in crate::layout) fn marker_text(
                                 .and_then(|values| values.last().cloned())
                                 .unwrap_or(0)
                         };
-                        if let Some(counter) = counter_text(
+                        if let Some(counter) = counter_text_with_context(
                             counter_style.clone().unwrap_or(ListStyleType::Decimal),
                             value,
                             counter_styles,
+                            render_context,
                         ) {
                             text.push_str(&counter);
                         }
@@ -524,7 +679,14 @@ pub(in crate::layout) fn marker_text(
                         let style = counter_style.clone().unwrap_or(ListStyleType::Decimal);
                         let counters = values
                             .into_iter()
-                            .filter_map(|value| counter_text(style.clone(), value, counter_styles))
+                            .filter_map(|value| {
+                                counter_text_with_context(
+                                    style.clone(),
+                                    value,
+                                    counter_styles,
+                                    render_context,
+                                )
+                            })
                             .collect::<Vec<_>>();
                         if !counters.is_empty() {
                             text.push_str(&counters.join(separator));
@@ -537,25 +699,69 @@ pub(in crate::layout) fn marker_text(
     }
 }
 
+#[cfg(test)]
 pub(in crate::layout) fn automatic_marker_text(
     list_style_type: ListStyleType,
     ordinal: i32,
     counter_styles: &HashMap<String, CounterStyleRule>,
 ) -> Option<(String, bool)> {
+    automatic_marker_text_with_context(
+        list_style_type,
+        ordinal,
+        counter_styles,
+        CounterStyleRenderContext::default_context(),
+    )
+}
+
+pub(in crate::layout) fn automatic_marker_text_with_context(
+    list_style_type: ListStyleType,
+    ordinal: i32,
+    counter_styles: &HashMap<String, CounterStyleRule>,
+    render_context: CounterStyleRenderContext,
+) -> Option<(String, bool)> {
     if let ListStyleType::Named(name) = &list_style_type
-        && let Some(rule) = counter_styles.get(name)
+        && let Some(effective) = complex_predefined_counter_style(name)
     {
-        return custom_counter_marker_text(rule, ordinal, counter_styles);
+        let mut fallback_context = CounterStyleFallbackContext::default();
+        fallback_context.visit(name);
+        return custom_counter_marker_text_with_effective(
+            &effective,
+            ordinal,
+            counter_styles,
+            render_context,
+            &mut fallback_context,
+        );
     }
     if let ListStyleType::Named(name) = &list_style_type
-        && let Some((representation, suffix)) = predefined_named_counter_text(name, ordinal)
+        && let Some(rule) = counter_style_rule(name, counter_styles)
+    {
+        return custom_counter_marker_text_with_context(
+            rule,
+            ordinal,
+            counter_styles,
+            render_context,
+        );
+    }
+    if let ListStyleType::Named(name) = &list_style_type
+        && let Some((representation, suffix)) =
+            predefined_named_counter_text_with_context(name, ordinal, render_context)
     {
         return Some((format!("{representation}{suffix}"), suffix == " "));
     }
     if let ListStyleType::Anonymous(rule) = &list_style_type {
-        return custom_counter_marker_text(rule, ordinal, counter_styles);
+        return custom_counter_marker_text_with_context(
+            rule,
+            ordinal,
+            counter_styles,
+            render_context,
+        );
     }
-    let representation = counter_text(list_style_type.clone(), ordinal, counter_styles)?;
+    let representation = counter_text_with_context(
+        list_style_type.clone(),
+        ordinal,
+        counter_styles,
+        render_context,
+    )?;
     match list_style_type {
         ListStyleType::Disc
         | ListStyleType::Circle
@@ -576,31 +782,105 @@ pub(in crate::layout) fn counter_text(
     ordinal: i32,
     counter_styles: &HashMap<String, CounterStyleRule>,
 ) -> Option<String> {
+    counter_text_with_context(
+        list_style_type,
+        ordinal,
+        counter_styles,
+        CounterStyleRenderContext::default_context(),
+    )
+}
+
+pub(in crate::layout) fn counter_text_with_context(
+    list_style_type: ListStyleType,
+    ordinal: i32,
+    counter_styles: &HashMap<String, CounterStyleRule>,
+    render_context: CounterStyleRenderContext,
+) -> Option<String> {
     match list_style_type {
         ListStyleType::Disc => Some("\u{2022}".to_string()),
         ListStyleType::Circle => Some("\u{25e6}".to_string()),
         ListStyleType::Square => Some("\u{25aa}".to_string()),
-        ListStyleType::DisclosureOpen => Some("\u{25be}".to_string()),
-        ListStyleType::DisclosureClosed => Some("\u{25b8}".to_string()),
+        ListStyleType::DisclosureOpen => Some(disclosure_symbol(true, render_context).to_string()),
+        ListStyleType::DisclosureClosed => {
+            Some(disclosure_symbol(false, render_context).to_string())
+        }
         ListStyleType::Decimal => Some(ordinal.to_string()),
         ListStyleType::String(text) => Some(text),
-        ListStyleType::Anonymous(rule) => custom_counter_text(&rule, ordinal, counter_styles),
-        ListStyleType::Named(name) => counter_styles
-            .get(&name)
-            .and_then(|rule| custom_counter_text(rule, ordinal, counter_styles))
-            .or_else(|| predefined_named_counter_text(&name, ordinal).map(|(text, _)| text))
+        ListStyleType::Anonymous(rule) => {
+            custom_counter_text_with_context(&rule, ordinal, counter_styles, render_context)
+        }
+        ListStyleType::Named(name) => counter_style_rule(&name, counter_styles)
+            .and_then(|rule| {
+                custom_counter_text_with_context(rule, ordinal, counter_styles, render_context)
+            })
+            .or_else(|| {
+                complex_predefined_counter_style(&name).and_then(|effective| {
+                    let mut fallback_context = CounterStyleFallbackContext::default();
+                    fallback_context.visit(&name);
+                    custom_counter_text_with_effective(
+                        &effective,
+                        ordinal,
+                        counter_styles,
+                        render_context,
+                        &mut fallback_context,
+                    )
+                })
+            })
+            .or_else(|| {
+                predefined_named_counter_text_with_context(&name, ordinal, render_context)
+                    .map(|(text, _)| text)
+            })
             .or_else(|| Some(ordinal.to_string())),
         ListStyleType::None => None,
     }
 }
 
+#[cfg(test)]
 pub(in crate::layout) fn custom_counter_marker_text(
     rule: &CounterStyleRule,
     ordinal: i32,
     counter_styles: &HashMap<String, CounterStyleRule>,
 ) -> Option<(String, bool)> {
+    custom_counter_marker_text_with_context(
+        rule,
+        ordinal,
+        counter_styles,
+        CounterStyleRenderContext::default_context(),
+    )
+}
+
+pub(in crate::layout) fn custom_counter_marker_text_with_context(
+    rule: &CounterStyleRule,
+    ordinal: i32,
+    counter_styles: &HashMap<String, CounterStyleRule>,
+    render_context: CounterStyleRenderContext,
+) -> Option<(String, bool)> {
     let effective = resolve_counter_style(rule, counter_styles, 0);
-    custom_counter_text_with_effective(&effective, ordinal, counter_styles, 0).map(|text| {
+    let mut fallback_context = CounterStyleFallbackContext::for_rule(rule);
+    custom_counter_marker_text_with_effective(
+        &effective,
+        ordinal,
+        counter_styles,
+        render_context,
+        &mut fallback_context,
+    )
+}
+
+fn custom_counter_marker_text_with_effective(
+    effective: &EffectiveCounterStyle,
+    ordinal: i32,
+    counter_styles: &HashMap<String, CounterStyleRule>,
+    render_context: CounterStyleRenderContext,
+    fallback_context: &mut CounterStyleFallbackContext,
+) -> Option<(String, bool)> {
+    custom_counter_text_with_effective(
+        effective,
+        ordinal,
+        counter_styles,
+        render_context,
+        fallback_context,
+    )
+    .map(|text| {
         (
             format!("{}{}{}", effective.prefix, text, effective.suffix),
             false,
@@ -608,26 +888,78 @@ pub(in crate::layout) fn custom_counter_marker_text(
     })
 }
 
+#[cfg(test)]
 pub(in crate::layout) fn custom_counter_text(
     rule: &CounterStyleRule,
     ordinal: i32,
     counter_styles: &HashMap<String, CounterStyleRule>,
 ) -> Option<String> {
-    let effective = resolve_counter_style(rule, counter_styles, 0);
-    custom_counter_text_with_effective(&effective, ordinal, counter_styles, 0)
+    custom_counter_text_with_context(
+        rule,
+        ordinal,
+        counter_styles,
+        CounterStyleRenderContext::default_context(),
+    )
 }
 
-pub(in crate::layout) fn custom_counter_text_with_effective(
+pub(in crate::layout) fn custom_counter_text_with_context(
+    rule: &CounterStyleRule,
+    ordinal: i32,
+    counter_styles: &HashMap<String, CounterStyleRule>,
+    render_context: CounterStyleRenderContext,
+) -> Option<String> {
+    let effective = resolve_counter_style(rule, counter_styles, 0);
+    let mut fallback_context = CounterStyleFallbackContext::for_rule(rule);
+    custom_counter_text_with_effective(
+        &effective,
+        ordinal,
+        counter_styles,
+        render_context,
+        &mut fallback_context,
+    )
+}
+
+/// State held while producing one counter representation.
+///
+/// CSS Counter Styles falls back to decimal when a fallback chain repeats a
+/// counter style. Tracking the normalized names makes that rule independent
+/// of arbitrary nesting depth while preserving case-sensitive custom names.
+/// <https://drafts.csswg.org/css-counter-styles-3/#counter-style-fallback>
+#[derive(Default)]
+struct CounterStyleFallbackContext {
+    visited: HashSet<String>,
+}
+
+impl CounterStyleFallbackContext {
+    fn for_rule(rule: &CounterStyleRule) -> Self {
+        let mut context = Self::default();
+        if !rule.name.is_empty() {
+            context.visit(&rule.name);
+        }
+        context
+    }
+
+    fn visit(&mut self, name: &str) -> bool {
+        let name = crate::css::canonical_predefined_counter_style_name(name).unwrap_or(name);
+        self.visited.insert(name.to_string())
+    }
+}
+
+fn custom_counter_text_with_effective(
     style: &EffectiveCounterStyle,
     ordinal: i32,
     counter_styles: &HashMap<String, CounterStyleRule>,
-    depth: usize,
+    render_context: CounterStyleRenderContext,
+    fallback_context: &mut CounterStyleFallbackContext,
 ) -> Option<String> {
-    if depth > 8 {
-        return Some(ordinal.to_string());
-    }
     if !counter_style_range_contains(&style.range, &style.system, ordinal) {
-        return fallback_counter_text(&style.fallback, ordinal, counter_styles, depth + 1);
+        return Some(fallback_counter_text(
+            &style.fallback,
+            ordinal,
+            counter_styles,
+            render_context,
+            fallback_context,
+        ));
     }
 
     let absolute_ordinal = if ordinal < 0 {
@@ -635,45 +967,119 @@ pub(in crate::layout) fn custom_counter_text_with_effective(
     } else {
         ordinal
     };
-    let mut text = match style.system {
-        CounterStyleSystem::Cyclic => cyclic_counter_text(absolute_ordinal, &style.symbols),
-        CounterStyleSystem::Numeric => numeric_counter_text(absolute_ordinal, &style.symbols),
-        CounterStyleSystem::Alphabetic => alphabetic_counter_text(absolute_ordinal, &style.symbols),
-        CounterStyleSystem::Symbolic => symbolic_counter_text(absolute_ordinal, &style.symbols),
-        CounterStyleSystem::Fixed(first) => fixed_counter_text(ordinal, first, &style.symbols),
-        CounterStyleSystem::Additive => {
-            additive_counter_text(absolute_ordinal, &style.additive_symbols)
-        }
-        CounterStyleSystem::Extends(_) => None,
-    }
-    .or_else(|| fallback_counter_text(&style.fallback, ordinal, counter_styles, depth + 1))?;
+    let is_complex_predefined = style.predefined.is_some();
+    // Fixed and cyclic systems select their symbols directly from the signed
+    // ordinal. A negative ordinal is therefore not a magnitude requiring the
+    // `negative` affix.
+    // <https://drafts.csswg.org/css-counter-styles-3/#fixed-system>
+    // <https://drafts.csswg.org/css-counter-styles-3/#cyclic-system>
+    let uses_negative_affix = ordinal < 0
+        && !is_complex_predefined
+        && !matches!(
+            style.system,
+            CounterStyleSystem::Cyclic | CounterStyleSystem::Fixed(_)
+        );
+    let Some(mut text) = style
+        .predefined
+        .and_then(|name| {
+            predefined_named_counter_text_with_context(name, ordinal, render_context)
+                .map(|(text, _)| text)
+        })
+        .or_else(|| match style.system {
+            CounterStyleSystem::Cyclic => cyclic_counter_text(ordinal, &style.symbols),
+            CounterStyleSystem::Numeric => numeric_counter_text(absolute_ordinal, &style.symbols),
+            CounterStyleSystem::Alphabetic => {
+                alphabetic_counter_text(absolute_ordinal, &style.symbols)
+            }
+            CounterStyleSystem::Symbolic => symbolic_counter_text(absolute_ordinal, &style.symbols),
+            CounterStyleSystem::Fixed(first) => fixed_counter_text(ordinal, first, &style.symbols),
+            CounterStyleSystem::Additive => {
+                additive_counter_text(absolute_ordinal, &style.additive_symbols)
+            }
+            CounterStyleSystem::Extends(_) => None,
+        })
+    else {
+        // A fallback is a complete new representation. It does not inherit
+        // the failed style's pad or negative descriptors; the originally
+        // requested marker keeps its prefix and suffix at the call site.
+        // <https://drafts.csswg.org/css-counter-styles-3/#counter-style-fallback>
+        return Some(fallback_counter_text(
+            &style.fallback,
+            ordinal,
+            counter_styles,
+            render_context,
+            fallback_context,
+        ));
+    };
     if let Some((width, symbol)) = &style.pad {
-        let text_len = text.chars().count();
+        // `pad` measures the representation after a negative affix has been
+        // accounted for, in extended grapheme clusters rather than Unicode
+        // scalar values. The affix is still appended after padding below.
+        // <https://drafts.csswg.org/css-counter-styles-3/#counter-style-pad>
+        let negative_length = if uses_negative_affix {
+            counter_representation_grapheme_length(&style.negative.0)
+                + counter_representation_grapheme_length(&style.negative.1)
+        } else {
+            0
+        };
+        let text_len = counter_representation_grapheme_length(&text) + negative_length;
         if text_len < *width {
             text = format!("{}{}", symbol.repeat(*width - text_len), text);
         }
     }
-    if ordinal < 0 {
+    if uses_negative_affix {
         text = format!("{}{}{}", style.negative.0, text, style.negative.1);
     }
     Some(text)
 }
 
-pub(in crate::layout) fn fallback_counter_text(
+fn counter_representation_grapheme_length(text: &str) -> usize {
+    GraphemeClusterSegmenter::new()
+        .segment_str(text)
+        .count()
+        .saturating_sub(1)
+}
+
+fn fallback_counter_text(
     fallback: &str,
     ordinal: i32,
     counter_styles: &HashMap<String, CounterStyleRule>,
-    depth: usize,
-) -> Option<String> {
-    if let Some(rule) = counter_styles.get(fallback) {
-        let effective = resolve_counter_style(rule, counter_styles, depth);
-        return custom_counter_text_with_effective(&effective, ordinal, counter_styles, depth);
+    render_context: CounterStyleRenderContext,
+    fallback_context: &mut CounterStyleFallbackContext,
+) -> String {
+    if !fallback_context.visit(fallback) {
+        return ordinal.to_string();
+    }
+    if let Some(rule) = counter_style_rule(fallback, counter_styles) {
+        let effective = resolve_counter_style(rule, counter_styles, 0);
+        return custom_counter_text_with_effective(
+            &effective,
+            ordinal,
+            counter_styles,
+            render_context,
+            fallback_context,
+        )
+        .unwrap_or_else(|| ordinal.to_string());
     }
     let style = css::parse_list_style_type(fallback).unwrap_or(ListStyleType::Decimal);
     match style {
-        ListStyleType::Named(name) if name == fallback => Some(ordinal.to_string()),
-        other => counter_text(other, ordinal, counter_styles),
+        ListStyleType::Named(name) if name == fallback => ordinal.to_string(),
+        other => counter_text_with_context(other, ordinal, counter_styles, render_context)
+            .unwrap_or_else(|| ordinal.to_string()),
     }
+}
+
+/// Resolve a counter-style reference without erasing the case distinction for
+/// author-defined names.  Only the predefined names are ASCII-case-insensitive.
+/// <https://drafts.csswg.org/css-counter-styles-3/#counter-style-name>
+pub(in crate::layout) fn counter_style_rule<'a>(
+    name: &str,
+    counter_styles: &'a HashMap<String, CounterStyleRule>,
+) -> Option<&'a CounterStyleRule> {
+    counter_styles.get(name).or_else(|| {
+        crate::css::canonical_predefined_counter_style_name(name)
+            .and_then(|canonical| counter_styles.get(canonical))
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -687,23 +1093,13 @@ pub(in crate::layout) struct EffectiveCounterStyle {
     pub(in crate::layout) pad: Option<(usize, String)>,
     pub(in crate::layout) range: CounterStyleRange,
     pub(in crate::layout) fallback: String,
+    /// Complex predefined styles have algorithms that cannot be expressed by
+    /// the simple `system` descriptor, but remain valid `extends` targets.
+    pub(in crate::layout) predefined: Option<&'static str>,
 }
 
-pub(in crate::layout) fn resolve_counter_style(
-    rule: &CounterStyleRule,
-    counter_styles: &HashMap<String, CounterStyleRule>,
-    depth: usize,
-) -> EffectiveCounterStyle {
-    let inherited = if let CounterStyleSystem::Extends(name) = &rule.system
-        && depth <= 8
-    {
-        counter_styles
-            .get(name)
-            .map(|rule| resolve_counter_style(rule, counter_styles, depth + 1))
-    } else {
-        None
-    };
-    let default = || EffectiveCounterStyle {
+fn default_effective_counter_style() -> EffectiveCounterStyle {
+    EffectiveCounterStyle {
         system: CounterStyleSystem::Numeric,
         symbols: decimal_counter_symbols(),
         additive_symbols: Vec::new(),
@@ -713,12 +1109,75 @@ pub(in crate::layout) fn resolve_counter_style(
         pad: None,
         range: CounterStyleRange::Auto,
         fallback: "decimal".to_string(),
+        predefined: None,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CounterStyleResolution {
+    effective: EffectiveCounterStyle,
+    /// Names in the current `extends` cycle. A style in this set replaces its
+    /// inherited base with decimal, while a non-participating caller may still
+    /// inherit the repaired style and its descriptors.
+    /// <https://drafts.csswg.org/css-counter-styles-3/#extends-system>
+    cyclic_names: Vec<String>,
+}
+
+pub(in crate::layout) fn resolve_counter_style(
+    rule: &CounterStyleRule,
+    counter_styles: &HashMap<String, CounterStyleRule>,
+    _depth: usize,
+) -> EffectiveCounterStyle {
+    let mut visiting = Vec::new();
+    if !rule.name.is_empty() {
+        visiting.push(rule.name.clone());
+    }
+    resolve_counter_style_inner(rule, counter_styles, &mut visiting).effective
+}
+
+fn resolve_counter_style_inner(
+    rule: &CounterStyleRule,
+    counter_styles: &HashMap<String, CounterStyleRule>,
+    visiting: &mut Vec<String>,
+) -> CounterStyleResolution {
+    let inherited = if let CounterStyleSystem::Extends(name) = &rule.system {
+        if let Some(cycle_start) = visiting.iter().position(|visited| visited == name) {
+            CounterStyleResolution {
+                effective: default_effective_counter_style(),
+                cyclic_names: visiting[cycle_start..].to_vec(),
+            }
+        } else if let Some(effective) = complex_predefined_counter_style(name) {
+            CounterStyleResolution {
+                effective,
+                cyclic_names: Vec::new(),
+            }
+        } else if let Some(target) = counter_style_rule(name, counter_styles) {
+            visiting.push(name.clone());
+            let resolved = resolve_counter_style_inner(target, counter_styles, visiting);
+            visiting.pop();
+            resolved
+        } else {
+            CounterStyleResolution {
+                effective: default_effective_counter_style(),
+                cyclic_names: Vec::new(),
+            }
+        }
+    } else {
+        CounterStyleResolution {
+            effective: default_effective_counter_style(),
+            cyclic_names: Vec::new(),
+        }
     };
-    let mut effective = inherited.unwrap_or_else(default);
+    let mut effective = if inherited.cyclic_names.iter().any(|name| name == &rule.name) {
+        default_effective_counter_style()
+    } else {
+        inherited.effective
+    };
     if !matches!(rule.system, CounterStyleSystem::Extends(_)) {
         effective.system = rule.system.clone();
         effective.symbols = rule.symbols.clone();
         effective.additive_symbols = rule.additive_symbols.clone();
+        effective.predefined = None;
     }
     if let Some(prefix) = &rule.prefix {
         effective.prefix = prefix.clone();
@@ -738,7 +1197,42 @@ pub(in crate::layout) fn resolve_counter_style(
     if let Some(fallback) = &rule.fallback {
         effective.fallback = fallback.clone();
     }
-    effective
+    CounterStyleResolution {
+        effective,
+        cyclic_names: inherited.cyclic_names,
+    }
+}
+
+/// Construct the effective descriptor set for the complex styles which the
+/// spec defines algorithmically rather than through the normative UA sheet.
+/// They must nevertheless be valid `extends` targets.
+/// <https://drafts.csswg.org/css-counter-styles-3/#complex-counters>
+fn complex_predefined_counter_style(name: &str) -> Option<EffectiveCounterStyle> {
+    let canonical = crate::css::canonical_predefined_counter_style_name(name)?;
+    let (suffix, range, fallback) = match canonical {
+        "disclosure-open" | "disclosure-closed" => (" ", CounterStyleRange::Auto, "decimal"),
+        "simp-chinese-informal"
+        | "simp-chinese-formal"
+        | "trad-chinese-informal"
+        | "trad-chinese-formal"
+        | "cjk-ideographic" => (
+            "、",
+            CounterStyleRange::Intervals(vec![CounterStyleRangeInterval {
+                start: -9_999,
+                end: 9_999,
+            }]),
+            "cjk-decimal",
+        ),
+        "ethiopic-numeric" => ("/ ", CounterStyleRange::Auto, "decimal"),
+        _ => return None,
+    };
+    Some(EffectiveCounterStyle {
+        suffix: suffix.to_string(),
+        range,
+        fallback: fallback.to_string(),
+        predefined: Some(canonical),
+        ..default_effective_counter_style()
+    })
 }
 
 pub(in crate::layout) fn counter_style_range_contains(
@@ -855,11 +1349,14 @@ pub(in crate::layout) fn additive_counter_text(
     (value == 0).then_some(output)
 }
 
-pub(in crate::layout) fn predefined_named_counter_text(
+pub(in crate::layout) fn predefined_named_counter_text_with_context(
     name: &str,
     ordinal: i32,
+    render_context: CounterStyleRenderContext,
 ) -> Option<(String, &'static str)> {
     match name {
+        "disclosure-open" => Some((disclosure_symbol(true, render_context).to_string(), " ")),
+        "disclosure-closed" => Some((disclosure_symbol(false, render_context).to_string(), " ")),
         "simp-chinese-informal" => {
             chinese_longhand_marker(ordinal, ChineseLonghandStyle::SimplifiedInformal)
                 .map(|text| (text, "、"))
@@ -878,6 +1375,39 @@ pub(in crate::layout) fn predefined_named_counter_text(
         }
         "ethiopic-numeric" => ethiopic_numeric_marker(ordinal).map(|text| (text, "/ ")),
         _ => None,
+    }
+}
+
+/// Return the disclosure triangle selected by the element's writing context.
+///
+/// The closed marker points toward the block's inline-end side and the open
+/// marker toward its block-end side, except that vertical writing swaps the
+/// role expected by the disclosure widget's expansion axis.
+/// <https://drafts.csswg.org/css-counter-styles-3/#disclosure-open>
+/// <https://drafts.csswg.org/css-counter-styles-3/#disclosure-closed>
+fn disclosure_symbol(open: bool, context: CounterStyleRenderContext) -> char {
+    match (context.writing_mode, context.direction, open) {
+        (WritingMode::HorizontalTb, _, true) => '\u{25be}',
+        (WritingMode::HorizontalTb, Direction::Ltr, false) => '\u{25b8}',
+        (WritingMode::HorizontalTb, Direction::Rtl, false) => '\u{25c2}',
+        (WritingMode::VerticalLr, Direction::Ltr, true) => '\u{25b8}',
+        (WritingMode::VerticalLr, Direction::Rtl, true) => '\u{25b8}',
+        (WritingMode::VerticalLr, Direction::Ltr, false) => '\u{25be}',
+        (WritingMode::VerticalLr, Direction::Rtl, false) => '\u{25b4}',
+        (WritingMode::VerticalRl, Direction::Ltr, true) => '\u{25c2}',
+        (WritingMode::VerticalRl, Direction::Rtl, true) => '\u{25c2}',
+        (WritingMode::VerticalRl, Direction::Ltr, false) => '\u{25be}',
+        (WritingMode::VerticalRl, Direction::Rtl, false) => '\u{25b4}',
+        // Sideways modes have horizontal typographic orientation but a
+        // vertical block flow. They use the matching vertical geometry.
+        (WritingMode::SidewaysLr, Direction::Ltr, true) => '\u{25b8}',
+        (WritingMode::SidewaysLr, Direction::Rtl, true) => '\u{25b8}',
+        (WritingMode::SidewaysLr, Direction::Ltr, false) => '\u{25be}',
+        (WritingMode::SidewaysLr, Direction::Rtl, false) => '\u{25b4}',
+        (WritingMode::SidewaysRl, Direction::Ltr, true) => '\u{25c2}',
+        (WritingMode::SidewaysRl, Direction::Rtl, true) => '\u{25c2}',
+        (WritingMode::SidewaysRl, Direction::Ltr, false) => '\u{25be}',
+        (WritingMode::SidewaysRl, Direction::Rtl, false) => '\u{25b4}',
     }
 }
 
@@ -1020,6 +1550,241 @@ mod tests {
             .collect()
     }
 
+    fn rule(name: &str, system: CounterStyleSystem) -> CounterStyleRule {
+        CounterStyleRule {
+            name: name.to_string(),
+            system,
+            symbols: Vec::new(),
+            additive_symbols: Vec::new(),
+            prefix: None,
+            suffix: None,
+            negative: None,
+            pad: None,
+            range: None,
+            fallback: None,
+            speak_as: None,
+        }
+    }
+
+    fn fixed_rule(name: &str, first: i32, symbols: &[&str]) -> CounterStyleRule {
+        let mut rule = rule(name, CounterStyleSystem::Fixed(first));
+        rule.symbols = symbols.iter().map(|symbol| (*symbol).to_string()).collect();
+        rule
+    }
+
+    #[test]
+    fn fallback_chains_are_unbounded_but_cycles_use_decimal() {
+        let mut styles = HashMap::new();
+        for index in 0..12 {
+            let name = format!("style-{index}");
+            let mut rule = fixed_rule(&name, 1, &["x"]);
+            rule.range = Some(CounterStyleRange::Intervals(vec![
+                CounterStyleRangeInterval { start: 1, end: 1 },
+            ]));
+            rule.fallback = Some(format!("style-{}", index + 1));
+            styles.insert(name, rule);
+        }
+        let last = fixed_rule("style-12", 13, &["z"]);
+        styles.insert(last.name.clone(), last);
+
+        assert_eq!(
+            custom_counter_text(styles.get("style-0").unwrap(), 13, &styles),
+            Some("z".to_string())
+        );
+
+        let mut a = fixed_rule("a", 1, &["a"]);
+        a.range = Some(CounterStyleRange::Intervals(vec![
+            CounterStyleRangeInterval { start: 1, end: 1 },
+        ]));
+        a.fallback = Some("b".to_string());
+        let mut b = fixed_rule("b", 1, &["b"]);
+        b.range = Some(CounterStyleRange::Intervals(vec![
+            CounterStyleRangeInterval { start: 1, end: 1 },
+        ]));
+        b.fallback = Some("a".to_string());
+        let cycles = HashMap::from([(a.name.clone(), a.clone()), (b.name.clone(), b)]);
+        assert_eq!(custom_counter_text(&a, 2, &cycles), Some("2".to_string()));
+    }
+
+    #[test]
+    fn fallback_representation_keeps_the_requested_marker_affixes() {
+        let mut requested = fixed_rule("requested", 1, &["a"]);
+        requested.range = Some(CounterStyleRange::Intervals(vec![
+            CounterStyleRangeInterval { start: 1, end: 1 },
+        ]));
+        requested.fallback = Some("fallback".to_string());
+        requested.prefix = Some("[".to_string());
+        requested.suffix = Some("]".to_string());
+        let fallback = fixed_rule("fallback", 2, &["b"]);
+        let styles = HashMap::from([
+            (requested.name.clone(), requested.clone()),
+            (fallback.name.clone(), fallback),
+        ]);
+
+        assert_eq!(
+            custom_counter_marker_text(&requested, 2, &styles),
+            Some(("[b]".to_string(), false))
+        );
+    }
+
+    #[test]
+    fn pad_uses_grapheme_clusters_and_includes_negative_affixes() {
+        let mut combining = fixed_rule("combining", 1, &["a\u{0304}"]);
+        combining.pad = Some((2, "o".to_string()));
+        assert_eq!(
+            custom_counter_text(&combining, 1, &HashMap::new()),
+            Some("oa\u{0304}".to_string())
+        );
+
+        let mut emoji = fixed_rule("emoji", 1, &["👩‍💻"]);
+        emoji.pad = Some((2, "o".to_string()));
+        assert_eq!(
+            custom_counter_text(&emoji, 1, &HashMap::new()),
+            Some("o👩‍💻".to_string())
+        );
+
+        let mut negative = rule("negative", CounterStyleSystem::Numeric);
+        negative.symbols = decimal_counter_symbols();
+        negative.pad = Some((4, "0".to_string()));
+        negative.negative = Some(("(".to_string(), ")".to_string()));
+        assert_eq!(
+            custom_counter_text(&negative, -2, &HashMap::new()),
+            Some("(02)".to_string())
+        );
+
+        let fixed = fixed_rule("negative-fixed", -1, &["a"]);
+        assert_eq!(
+            custom_counter_text(&fixed, -1, &HashMap::new()),
+            Some("a".to_string())
+        );
+
+        let cyclic = rule("negative-cyclic", CounterStyleSystem::Cyclic);
+        let mut cyclic = cyclic;
+        cyclic.symbols = vec!["a".into(), "b".into()];
+        assert_eq!(
+            custom_counter_text(&cyclic, -2, &HashMap::new()),
+            Some("b".to_string())
+        );
+    }
+
+    #[test]
+    fn disclosure_styles_follow_writing_context_and_remain_extendable() {
+        let mut extended = rule(
+            "custom-disclosure",
+            CounterStyleSystem::Extends("disclosure-closed".into()),
+        );
+        extended.prefix = Some("[".into());
+        extended.suffix = Some("]".into());
+        let styles = HashMap::from([(extended.name.clone(), extended.clone())]);
+        let cases = [
+            (ComputedStyle::initial(), "\u{25b8}", "\u{25be}"),
+            (
+                {
+                    let mut style = ComputedStyle::initial();
+                    style.direction = Direction::Rtl;
+                    style
+                },
+                "\u{25c2}",
+                "\u{25be}",
+            ),
+            (
+                {
+                    let mut style = ComputedStyle::initial();
+                    style.writing_mode = WritingMode::VerticalLr;
+                    style
+                },
+                "\u{25be}",
+                "\u{25b8}",
+            ),
+            (
+                {
+                    let mut style = ComputedStyle::initial();
+                    style.writing_mode = WritingMode::VerticalRl;
+                    style.direction = Direction::Rtl;
+                    style
+                },
+                "\u{25b4}",
+                "\u{25c2}",
+            ),
+        ];
+
+        for (style, closed, open) in cases {
+            let context = CounterStyleRenderContext::for_style(&style);
+            assert_eq!(
+                counter_text_with_context(ListStyleType::DisclosureClosed, 1, &styles, context,),
+                Some(closed.to_string())
+            );
+            assert_eq!(
+                counter_text_with_context(ListStyleType::DisclosureOpen, 1, &styles, context),
+                Some(open.to_string())
+            );
+            assert_eq!(
+                custom_counter_marker_text_with_context(&extended, 1, &styles, context),
+                Some((format!("[{closed}]"), false))
+            );
+        }
+    }
+
+    #[test]
+    fn extends_cycles_repair_only_the_cycle_members_with_decimal_bases() {
+        let mut a = rule("a", CounterStyleSystem::Extends("b".into()));
+        a.prefix = Some("a".into());
+        let mut b = rule("b", CounterStyleSystem::Extends("c".into()));
+        b.suffix = Some("b".into());
+        let mut c = rule("c", CounterStyleSystem::Extends("b".into()));
+        c.pad = Some((2, "c".into()));
+        let styles = HashMap::from([
+            (a.name.clone(), a.clone()),
+            (b.name.clone(), b),
+            (c.name.clone(), c),
+        ]);
+
+        let a = resolve_counter_style(&a, &styles, 0);
+        assert_eq!(a.prefix, "a");
+        assert_eq!(a.suffix, "b");
+        assert_eq!(a.pad, None);
+
+        let b = resolve_counter_style(styles.get("b").unwrap(), &styles, 0);
+        assert_eq!(b.prefix, "");
+        assert_eq!(b.suffix, "b");
+        assert_eq!(b.pad, None);
+
+        let c = resolve_counter_style(styles.get("c").unwrap(), &styles, 0);
+        assert_eq!(c.prefix, "");
+        assert_eq!(c.suffix, ". ");
+        assert_eq!(c.pad, Some((2, "c".into())));
+    }
+
+    #[test]
+    fn complex_predefined_styles_are_extendable() {
+        let custom = rule(
+            "chapter",
+            CounterStyleSystem::Extends("simp-chinese-informal".into()),
+        );
+        let styles = HashMap::from([(custom.name.clone(), custom.clone())]);
+        let effective = resolve_counter_style(&custom, &styles, 0);
+
+        assert_eq!(effective.predefined, Some("simp-chinese-informal"));
+        assert_eq!(effective.suffix, "、");
+        assert_eq!(
+            custom_counter_text(&custom, 1_000, &styles),
+            Some("一千".into())
+        );
+    }
+
+    #[test]
+    fn lookup_preserves_custom_case_and_normalizes_predefined_names() {
+        let custom = rule("custom", CounterStyleSystem::Numeric);
+        let predefined = rule("decimal-leading-zero", CounterStyleSystem::Numeric);
+        let styles = HashMap::from([
+            (custom.name.clone(), custom),
+            (predefined.name.clone(), predefined),
+        ]);
+        assert!(counter_style_rule("Custom", &styles).is_none());
+        assert!(counter_style_rule("custom", &styles).is_some());
+        assert!(counter_style_rule("Decimal-Leading-Zero", &styles).is_some());
+    }
+
     #[test]
     fn cjk_decimal_honors_its_ua_range_and_fallback() {
         let counter_styles = ua_counter_styles();
@@ -1055,7 +1820,14 @@ mod tests {
         let stacks = HashMap::from([(LIST_ITEM_COUNTER_NAME.to_string(), vec![2])]);
         let mut quote_depth = 0;
         assert_eq!(
-            marker_text(&marker_style, 2, &counter_styles, &stacks, &mut quote_depth),
+            marker_text(
+                &marker_style,
+                2,
+                &counter_styles,
+                &stacks,
+                &mut quote_depth,
+                CounterStyleRenderContext::for_style(&marker_style),
+            ),
             Some(("2. ".to_string(), false))
         );
     }
@@ -1064,13 +1836,13 @@ mod tests {
     fn outside_anchor_preserves_line_start_and_baseline_as_distinct_positions() {
         let line_start = PageTopBlockPosition::new(100.0);
         let anchor = OutsideMarkerAnchor {
-            content_inline_span: PageInlineSpan::from_edges(20.0, 80.0),
+            principal_line_inline_span: PageInlineSpan::from_edges(20.0, 80.0),
             formatted_line_block_start: line_start,
             alphabetic_baseline: line_start.toward_block_end(layout_pt(12.0)),
         };
 
-        assert_eq!(anchor.content_inline_span.left_x(), 20.0);
-        assert_eq!(anchor.content_inline_span.right_x(), 80.0);
+        assert_eq!(anchor.principal_line_inline_span.left_x(), 20.0);
+        assert_eq!(anchor.principal_line_inline_span.right_x(), 80.0);
         assert_eq!(anchor.formatted_line_block_start.points(), 100.0);
         assert_eq!(anchor.alphabetic_baseline.points(), 88.0);
     }

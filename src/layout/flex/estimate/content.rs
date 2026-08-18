@@ -342,7 +342,11 @@ impl<'a> LayoutBuilder<'a> {
             };
             merge_outer_intrinsic_widths(
                 contribution,
-                child_contribution,
+                constrain_non_table_child_intrinsic_width(
+                    child_style,
+                    containing_inline_size,
+                    child_contribution,
+                ),
                 child_style,
                 containing_inline_size,
             );
@@ -436,7 +440,11 @@ impl<'a> LayoutBuilder<'a> {
             };
             merge_outer_intrinsic_widths(
                 contribution,
-                child_contribution,
+                constrain_non_table_child_intrinsic_width(
+                    &child_style,
+                    containing_inline_size,
+                    child_contribution,
+                ),
                 &child_style,
                 containing_inline_size,
             );
@@ -784,6 +792,42 @@ pub(in crate::layout::flex) fn explicit_child_intrinsic_width(
     })
 }
 
+/// Apply a block child's own intrinsic inline-size constraints before it
+/// becomes a flex item's content contribution.
+///
+/// `block_intrinsic_content_widths` returns the child's raw descendant
+/// contribution because its caller normally owns the child's box-model and
+/// `min-width`/`max-width` constraints. Flex's direct descendant query is
+/// that caller. Without this transition, `min-width: max-content` on a block
+/// inside a flex item is lost and the item's automatic minimum collapses to
+/// the raw min-content width.
+/// <https://www.w3.org/TR/css-sizing-3/#intrinsic-contribution>
+/// <https://www.w3.org/TR/css-flexbox-1/#min-size-auto>
+fn constrain_non_table_child_intrinsic_width(
+    child_style: &ComputedStyle,
+    containing_inline_size: LogicalInlineContentSize,
+    contribution: inline_layout::InlineIntrinsicContribution,
+) -> inline_layout::InlineIntrinsicContribution {
+    // The table branch has already constructed the CSS Tables wrapper
+    // contribution, including its own constraints. Re-applying generic block
+    // constraints would erase that table-specific sizing result.
+    if child_style.display.is_table() {
+        return contribution;
+    }
+    let horizontal_non_content =
+        intrinsic_horizontal_non_content(child_style, containing_inline_size);
+    let (min_content, max_content) = non_replaced_intrinsic_width_contributions(
+        child_style,
+        contribution.min_content.content_box_length(),
+        contribution.max_content.content_box_length(),
+        horizontal_non_content,
+    );
+    inline_layout::InlineIntrinsicContribution::new(
+        LogicalInlineContentSize::new(min_content),
+        LogicalInlineContentSize::new(max_content),
+    )
+}
+
 /// Whether a table's preferred physical width depends on a percentage basis.
 ///
 /// Flexbox asks for a table's intrinsic automatic minimum with an indefinite
@@ -874,4 +918,28 @@ pub(in crate::layout::flex) fn flex_available_with_definite_cross_size(
     cross_size: FlexCrossSize,
 ) -> FlexAvailableSpace {
     available.with_definite_cross_size(direction, cross_size)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_child_max_content_minimum_is_preserved_for_flex_automatic_minimum() {
+        let mut child_style = ComputedStyle::initial();
+        child_style.box_values.min_width = css::ComputedLengthPercentageOrAuto::MaxContent;
+        let contribution = inline_layout::InlineIntrinsicContribution::new(
+            LogicalInlineContentSize::new(content_box_pt(20.0)),
+            LogicalInlineContentSize::new(content_box_pt(80.0)),
+        );
+
+        let constrained = constrain_non_table_child_intrinsic_width(
+            &child_style,
+            LogicalInlineContentSize::new(content_box_pt(100.0)),
+            contribution,
+        );
+
+        assert_eq!(constrained.min_content.points(), 80.0);
+        assert_eq!(constrained.max_content.points(), 80.0);
+    }
 }

@@ -1,8 +1,6 @@
 use super::super::*;
 use crate::document::PaintStrokeWidth;
-use crate::document::paint::geometry::{
-    PaintPoint, PaintRect, PaintSize, PaintSpace, PaintTransform,
-};
+use crate::document::paint::geometry::{PaintPoint, PaintSpace, PaintTransform};
 use crate::document::paint::paths::{RenderedPath, RenderedPathCommand, RenderedPathFillRule};
 
 ///

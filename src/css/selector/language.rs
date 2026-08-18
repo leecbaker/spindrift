@@ -1,4 +1,4 @@
-use crate::css::types::ResolvedLanguage;
+use crate::css::types::{ContentLanguage, ResolvedLanguage};
 use cssparser::{ToCss, serialize_identifier, serialize_string};
 use std::collections::HashMap;
 use std::fmt;
@@ -45,23 +45,24 @@ pub(in crate::css) fn language_from_attrs(
 
 /// Match Selectors `:lang()` language ranges using RFC 4647 extended filtering.
 ///
-/// Selectors Level 4 defines `:lang()` in terms of an element's document
-/// language and BCP 47 language ranges, while RFC 4647 defines extended
-/// filtering with wildcard subtags:
-/// <https://www.w3.org/TR/selectors-4/#the-lang-pseudo> and
+/// HTML requires an unrecognized `lang` value to remain a distinct unknown
+/// language tag: `lang="xyzzy"` therefore matches `:lang(xyzzy)`, despite not
+/// providing a locale for typography. Selectors Level 4 compares that document
+/// language with BCP 47 language ranges using RFC 4647 extended filtering:
+/// <https://html.spec.whatwg.org/multipage/dom.html#the-lang-and-xml:lang-attributes>,
+/// <https://www.w3.org/TR/selectors-4/#the-lang-pseudo>, and
 /// <https://www.rfc-editor.org/rfc/rfc4647#section-3.3.2>.
 pub(in crate::css) fn language_matches_any_range(
     language: &ResolvedLanguage,
     ranges: &[LanguageRange],
 ) -> bool {
     match language {
-        ResolvedLanguage::Unknown | ResolvedLanguage::Unresolved => {
+        ResolvedLanguage::Unresolved | ResolvedLanguage::Resolved(ContentLanguage::Unknown) => {
             ranges.iter().any(|range| range.as_str().is_empty())
         }
-        ResolvedLanguage::Malformed(_) => false,
-        ResolvedLanguage::Tag(tag) => ranges
+        ResolvedLanguage::Resolved(ContentLanguage::Tagged(tag)) => ranges
             .iter()
-            .any(|range| extended_language_range_matches(tag, range.as_str())),
+            .any(|range| extended_language_range_matches(tag.as_str(), range.as_str())),
     }
 }
 

@@ -29,6 +29,11 @@ That conversion is retained as private rendered-line paint metadata, so
 prepared inline groups and later table-baseline recovery use the exact
 selected-face adjustment even when fallback runs have different
 `font-size-adjust` used sizes.
+Fallback glyph selection through `unicode-range` is confined to shaping and
+painting: an element's primary metric face establishes its normal inline-box
+line extent and baseline. This keeps an auto-height inline-block's background
+geometry stable when its text uses a fallback glyph, including
+`css/CSS2/visudet/content-height-004.html`.
 OpenType per-glyph positioning offsets are retained through PDF serialization:
 outline text emits offset glyphs from their shaped origins, matching the
 existing bitmap and COLR paint paths without changing CSS inline advances or
@@ -51,14 +56,16 @@ before shaping. This keeps the face used for CSS metrics and glyph shaping
 identical to the program embedded in the PDF, rather than allowing the shaping
 engine's platform generic alias to select a different restricted font.
 
-Root-relative `rex`, `rcap`, and `ric` values used in `font-size` are measured
-from a dedicated document-root metric snapshot. That snapshot is established
-from the root's selected font even when the root has no local metric-relative
-property, so intervening generic-family ancestors cannot change the result.
+Root-relative `rem`, `rex`, `rcap`, `rch`, `ric`, and `rlh` values in modeled
+computed length-percentage properties resolve from a dedicated document-root
+metric snapshot. That snapshot is established from the root's selected font,
+so intervening generic-family ancestors cannot change the result.
 
-`font-language-override` remains blocked on a Parley shaping API capable of
-carrying a raw case-sensitive OpenType language-system tag; the limitation and
-required upstream interface are recorded in `docs/PARLEY_SHORTCOMINGS.md`.
+`font-language-override` preserves authored OpenType tag case, including the
+lower-case unknown-tag behavior exercised by `font-language-override-03`.
+Arbitrary raw case-sensitive language-system tags remain blocked on a Parley
+shaping API capable of carrying them directly; the limitation and required
+upstream interface are recorded in `docs/PARLEY_SHORTCOMINGS.md`.
 
 After the authored family list is exhausted, installed-font fallback is selected
 through Fontique's platform backend (CoreText on macOS), with the character's
@@ -79,7 +86,10 @@ text. Mixed `text-orientation` applies vertical glyph-form features to `U`,
 `Tu` use upright placement.
 Control-only fallback runs and simple selected-face fragments containing
 ZWJ/ZWNJ preserve the shaping control while omitting its fallback PDF payload;
-the two CSS Fonts feature-resolution reftests pass pixel-identically.
+the two CSS Fonts feature-resolution reftests pass pixel-identically. Arabic
+presentation-form references containing ZWNJ preserve their resolved RTL paint
+order, so the `font-variant-ligatures-11.optional` reference remains a valid
+comparison for an explicit `"rlig" off` feature setting.
 
 The cascade represents `font` as typed canonical longhand components before
 rollback. Its explicit and reset-only modeled subproperties now participate in
@@ -94,9 +104,8 @@ bases, including `#`, `*`, and the ASCII digits; `font-variant-emoji-005`
 passes.
 
 Focused CSS Fonts evaluation also passes `font-size-adjust-014`,
-`font-size-zero-3`, and `font-variant-emoji-1`. The remaining
-`font-language-override-03` failure is the documented Parley limitation, not
-a Quire fallback policy.
+`font-size-zero-3`, `font-variant-emoji-1`, and
+`font-language-override-03`.
 
 ## Largest remaining clusters
 

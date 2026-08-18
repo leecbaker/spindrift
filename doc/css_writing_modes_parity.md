@@ -2,6 +2,12 @@
 
 ## Verified behavior
 
+- Vertical text resolves each typographic unit once into either upright vertical
+  composition or sideways horizontal composition. Font features, vertical
+  metrics, and PDF placement consume that shared plan, so Mongolian and
+  Phags-pa retain their intrinsic vertical presentation without combining
+  sideways placement with OpenType vertical substitutions.
+
 - Replayed table-part styles cross the normal used-length boundary. Font-relative
   box-model lengths such as `td { width: 1em }` are therefore finalized before
   table track sizing and structural background painting.
@@ -23,20 +29,31 @@
   rtl)`, as required by CSS Conditional Rules.
 - Orthogonal available-size selection keeps percentage definiteness separate
   from direct fixed/min/max constraints, the nearest scrollport fallback, and
-  the initial-containing-block cap. The selected logical inline measure is
-  reused by intrinsic sizing and final line layout, including through
-  containment and intervening parallel formatting contexts.
+  the initial-containing-block cap. Its initial containing-block measure is
+  stable across page fragmentation, rather than being taken from the current
+  fragmentainer; the typed selected measure now selects one final-equivalent,
+  frozen ordinary inline stream for intrinsic sizing and final line layout.
+  Positioned descendants are retained as deferred static-position recipes and
+  materialized after that selected line stack establishes the containing box.
+  The remaining visual mismatch in the ICB/scroller WPT cases is tracked in
+  `SPEC_DIVERGENCES.md`.
 - Mixed inline visual ordering resolves the selected line with CSS's explicit
   paragraph direction through UAX #9 rather than inserting an LRM/RLM into
   author text. CSS-generated embedding, isolate, and override controls remain
   part of the same source sequence for reordering. The bidi embedding,
   isolate, override, unset, plaintext, block-plaintext, and the positive
-  astral Adlam reftest are raster-exact. The Adlam anti-reference remains
-  divergent because an explicit LTR isolate-override does not yet differ from
-  the intrinsic RTL run.
-- `available-size-003`, `005`, `012`–`014`, and `020`–`023` are
-  raster-exact. The contained/scroller variants finish within the evaluator's
-  five-second budget.
+  astral Adlam reftest and anti-reference are raster-exact. Explicit LTR
+  `isolate-override` retains its resolved visual sequence even for intrinsic
+  RTL astral text.
+- `available-size-018` is raster-exact in the current exact WPT run.
+  `available-size-003` and `available-size-012` remain visual mismatches and
+  are tracked in `SPEC_DIVERGENCES.md`; the remaining available-size cases
+  require a fresh exact run before they can be claimed as passing. The current
+  `020` run is a separate page-count mismatch (two actual pages versus five
+  reference pages).
+  The contained/scroller variants `021`–`023` remain tracked as visual
+  mismatches in the current worktree; their renderer timings are within the
+  evaluator's five-second budget but above the one-second performance target.
 - Basic `text-combine-upright: all` and `digits` compositions use a horizontal
   one-em child line, central-baseline alignment, width-feature compression,
   full-width reversal for multi-unit compositions, preserved preformatted
@@ -44,13 +61,30 @@
   orthogonal auto sizing. Generated-content and nested inherited run provenance,
   plus full bidi isolation across synthetic atomic boundaries, remain tracked in
   `SPEC_DIVERGENCES.md`.
+- Paged root flows fragment in their logical block direction. Consequently,
+  `vertical-rl` consumes the physical page area from right to left and
+  `vertical-lr` from left to right, using page-area width as fragmentainer
+  capacity while retaining physical-height percentage bases. Fragment slices
+  own `box-decoration-break: slice` start/end decoration on their first/last
+  logical page fragment.
+- Fragment paint projection carries independent source and destination axes,
+  so logical slice selection is not coupled to the destination fragmentainer's
+  physical clip. Positioned-tail clipping selects the destination logical
+  block axis but retains overflow rectangles in their specified physical axes.
+- Absolutely positioned boxes resolve a continuous physical margin box before
+  page selection. The selected page span then follows the principal
+  fragmentainer block side, rather than assuming that physical Y is page
+  progression.
 
 The following local reftests pass with the debug renderer after these changes:
 
 - `css/css-writing-modes/writing-mode-vertical-rl-003.htm`
 - `css/css-writing-modes/table-progression-vrl-004.html`
 - `css/css-writing-modes/table-progression-vlr-004.html`
+- `css/css-writing-modes/sideways-lr-main-axis.html`
 - `css/css-writing-modes/forms/range-input-vertical-rtl-painting.html`
+- `css/css-break/block-001-wm-vrl-print.html`
+- `css/css-break/block-001-wm-vlr-print.html`
 
 ## Current table projection
 
@@ -65,13 +99,21 @@ edges and captions do not yet replay from one continuous wrapper placement
 through all multicolumn destination fragments. The projection is therefore
 not claimable as complete parity.
 
+Collapsed-border conflict resolution now maps physical declaration sides to
+the root table's logical inline/block edges before grid insertion and maps
+resolved half-insets back to physical box edges only at the layout boundary.
+This covers vertical and sideways roots; fragmented collapsed-border replay
+remains separate work.
+
 ## Next work
 
 - Continue the writing-modes sweep with principal-flow propagation, text
   orientation, form controls, and row/row-group structural table painting.
-- Principal-flow body tests still double-advance a later block sibling after a
-  vertical-flow child; the correction needs to distinguish normal child flow
-  from the root/canvas paint projection.
+- Vertical propagated-body direct children now resolve against their current
+  logical block track, including page-height inline percentage bases and
+  default paragraph block margins. `sideways-lr` canvas projection uses its
+  required bottom-origin inline edge; remaining principal-flow work is root
+  pseudo-element continuation and vertical/sideways inline text extent.
 - Buttons, inputs, and selects use the browser-compatible `border-box` UA
   sizing model; textarea retains CSS's default `content-box` model. The
   remaining zero-inline-size range mismatch is in the flex replay path, which

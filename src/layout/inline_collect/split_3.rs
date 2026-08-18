@@ -75,7 +75,8 @@ pub(in crate::layout) struct InlineElementScopeState {
     pub(in crate::layout) link_target: Option<String>,
     pub(in crate::layout) baseline_shift: f32,
     pub(in crate::layout) visual_offset: InlineVisualOffset,
-    pub(in crate::layout) edge_style: ComputedStyle,
+    /// Used inline-edge metrics retained through fragment replay.
+    pub(in crate::layout) edge_style: css::ZoomedLayoutStyle,
     pub(in crate::layout) positioning_containing_block_source:
         Option<InlinePositioningContainingBlockSource>,
     pub(in crate::layout) pushed_page_scope: bool,
@@ -303,14 +304,15 @@ pub(in crate::layout) fn inline_box_blocks_hanging_end(style: &ComputedStyle) ->
 /// <https://drafts.csswg.org/css-text-4/#text-autospace-property>.
 pub(in crate::layout) fn insert_text_autospace_items(
     font_system: &mut FontSystem,
+    scratch: &mut Vec<InlineItem>,
     items: &mut Vec<InlineItem>,
 ) {
-    let mut output = Vec::with_capacity(items.len());
+    debug_assert!(scratch.is_empty());
     let mut previous_text = None::<AutospaceTextEdge>;
-    for item in std::mem::take(items) {
+    for item in items.drain(..) {
         match item {
             InlineItem::Word(word) => {
-                push_autospaced_word(font_system, &mut output, *word, &mut previous_text);
+                push_autospaced_word(font_system, scratch, word, &mut previous_text);
             }
             InlineItem::Atom(atom) => {
                 // CSS Text makes an inline edge transparent only when no
@@ -322,21 +324,21 @@ pub(in crate::layout) fn insert_text_autospace_items(
                 if !inline_edge_is_transparent_to_text_autospace(&atom) {
                     previous_text = None;
                 }
-                output.push(InlineItem::Atom(atom));
+                scratch.push(InlineItem::Atom(atom));
             }
             InlineItem::Float(float) => {
                 previous_text = None;
-                output.push(InlineItem::Float(float));
+                scratch.push(InlineItem::Float(float));
             }
             InlineItem::Break(break_) => {
                 previous_text = None;
-                output.push(InlineItem::Break(break_));
+                scratch.push(InlineItem::Break(break_));
             }
-            InlineItem::PageScopeStart(scope) => output.push(InlineItem::PageScopeStart(scope)),
-            InlineItem::PageScopeEnd => output.push(InlineItem::PageScopeEnd),
+            InlineItem::PageScopeStart(scope) => scratch.push(InlineItem::PageScopeStart(scope)),
+            InlineItem::PageScopeEnd => scratch.push(InlineItem::PageScopeEnd),
         }
     }
-    *items = output;
+    std::mem::swap(items, scratch);
 }
 
 /// Return whether an atomic inline edge preserves CSS Text autospace
@@ -365,23 +367,56 @@ pub(in crate::layout) fn inline_edge_is_transparent_to_text_autospace(atom: &Inl
 pub(in crate::layout) fn push_autospaced_word(
     font_system: &mut FontSystem,
     output: &mut Vec<InlineItem>,
-    word: InlineWord,
+    mut word: Box<InlineWord>,
     previous_text: &mut Option<AutospaceTextEdge>,
 ) {
-    if word.style.text_autospace.is_none() {
+    while let Some((boundary, predecessor_is_ideograph)) = first_internal_autospace_boundary(&word)
+    {
+        let suffix = InlineWord {
+            text: word.text.split_off(boundary),
+            style: Rc::clone(&word.style),
+            baseline_shift: word.baseline_shift,
+            visual_offset: word.visual_offset,
+            link_target: word.link_target.clone(),
+            mergeable: false,
+            source: word.source,
+            hanging_edges: word.hanging_edges,
+            ancestor_inline_decorations: Rc::clone(&word.ancestor_inline_decorations),
+        };
         push_autospace_boundary(font_system, output, previous_text, &word);
         *previous_text = AutospaceTextEdge::from_word_end(&word);
-        output.push(InlineItem::Word(Box::new(word)));
-        return;
+        output.push(InlineItem::Word(word));
+        push_text_autospace_atom(
+            font_system,
+            output,
+            &suffix.style,
+            suffix.baseline_shift,
+            suffix.visual_offset,
+            predecessor_is_ideograph,
+        );
+        *previous_text = None;
+        word = Box::new(suffix);
     }
 
-    let mut run = String::new();
-    let mut run_end = None::<char>;
-    let mut run_start_index = 0usize;
+    push_autospace_boundary(font_system, output, previous_text, &word);
+    *previous_text = AutospaceTextEdge::from_word_end(&word);
+    output.push(InlineItem::Word(word));
+}
+
+/// Find the first source position where CSS Text automatic spacing divides a
+/// word. Combining marks inherit the preceding base character's context, so a
+/// split always begins at the following non-inheriting scalar value.
+fn first_internal_autospace_boundary(word: &InlineWord) -> Option<(usize, bool)> {
+    if word.style.text_autospace.is_none() {
+        return None;
+    }
+
+    let mut previous = None::<char>;
     for (index, character) in word.text.char_indices() {
-        let inherits_boundary_context = character_inherits_autospace_boundary_context(character);
-        if !inherits_boundary_context
-            && let Some(previous) = run_end
+        if character_inherits_autospace_boundary_context(character) {
+            continue;
+        }
+        if let Some(previous) = previous
             && text_autospace_boundary_needs_spacing(
                 &word.style.text_autospace,
                 previous,
@@ -390,67 +425,11 @@ pub(in crate::layout) fn push_autospaced_word(
                 &word.style,
             )
         {
-            push_autospaced_word_run(
-                font_system,
-                output,
-                &word,
-                &mut run,
-                run_start_index,
-                previous_text,
-            );
-            push_text_autospace_atom(
-                font_system,
-                output,
-                &word.style,
-                word.baseline_shift,
-                word.visual_offset,
-                character_is_autospace_ideograph(previous),
-            );
-            *previous_text = None;
-            run_start_index = index;
+            return Some((index, character_is_autospace_ideograph(previous)));
         }
-        run.push(character);
-        if !inherits_boundary_context {
-            run_end = Some(character);
-        }
+        previous = Some(character);
     }
-    if !run.is_empty() {
-        push_autospaced_word_run(
-            font_system,
-            output,
-            &word,
-            &mut run,
-            run_start_index,
-            previous_text,
-        );
-    }
-}
-
-pub(in crate::layout) fn push_autospaced_word_run(
-    font_system: &mut FontSystem,
-    output: &mut Vec<InlineItem>,
-    word: &InlineWord,
-    run: &mut String,
-    run_start_index: usize,
-    previous_text: &mut Option<AutospaceTextEdge>,
-) {
-    if run.is_empty() {
-        return;
-    }
-    let run_word = InlineWord {
-        text: std::mem::take(run),
-        style: Rc::clone(&word.style),
-        baseline_shift: word.baseline_shift,
-        visual_offset: word.visual_offset,
-        link_target: word.link_target.clone(),
-        mergeable: word.mergeable && run_start_index == 0,
-        source: word.source,
-        hanging_edges: word.hanging_edges,
-        ancestor_inline_decorations: Rc::clone(&word.ancestor_inline_decorations),
-    };
-    push_autospace_boundary(font_system, output, previous_text, &run_word);
-    *previous_text = AutospaceTextEdge::from_word_end(&run_word);
-    output.push(InlineItem::Word(Box::new(run_word)));
+    None
 }
 
 pub(in crate::layout) fn push_autospace_boundary(
@@ -705,7 +684,12 @@ mod tests {
         let mut output = Vec::new();
         let mut previous_text = None;
 
-        push_autospaced_word(&mut font_system, &mut output, word, &mut previous_text);
+        push_autospaced_word(
+            &mut font_system,
+            &mut output,
+            Box::new(word),
+            &mut previous_text,
+        );
 
         let styles = output
             .iter()
@@ -717,6 +701,79 @@ mod tests {
         assert_eq!(styles.len(), 2);
         assert!(Rc::ptr_eq(&shared_style, &styles[0]));
         assert!(Rc::ptr_eq(&shared_style, &styles[1]));
+    }
+
+    #[test]
+    fn autospace_unsplit_word_retains_word_and_text_allocations() {
+        let mut style = ComputedStyle::initial();
+        style.text_autospace = TextAutospace::NORMAL;
+        let word = Box::new(InlineWord {
+            text: "ordinary text".to_string(),
+            style: inline_style(&style),
+            baseline_shift: 0.0,
+            visual_offset: InlineVisualOffset::zero(),
+            link_target: None,
+            mergeable: true,
+            source: InlineTextSource::Normal,
+            hanging_edges: InlineHangingEdges::default(),
+            ancestor_inline_decorations: Vec::new().into(),
+        });
+        let word_pointer: *const InlineWord = &*word;
+        let text_pointer = word.text.as_ptr();
+        let mut font_system = FontSystem::new();
+        let mut output = Vec::new();
+        let mut previous = None;
+
+        push_autospaced_word(&mut font_system, &mut output, word, &mut previous);
+
+        let [InlineItem::Word(word)] = output.as_slice() else {
+            panic!("an unsplit word must remain one word item");
+        };
+        assert!(std::ptr::eq::<InlineWord>(&**word, word_pointer));
+        assert_eq!(word.text.as_ptr(), text_pointer);
+    }
+
+    #[test]
+    fn autospace_preprocessing_swaps_reusable_item_buffers() {
+        fn word(style: &ComputedStyle) -> InlineItem {
+            InlineItem::Word(Box::new(InlineWord {
+                text: "ordinary text".to_string(),
+                style: inline_style(style),
+                baseline_shift: 0.0,
+                visual_offset: InlineVisualOffset::zero(),
+                link_target: None,
+                mergeable: true,
+                source: InlineTextSource::Normal,
+                hanging_edges: InlineHangingEdges::default(),
+                ancestor_inline_decorations: Vec::new().into(),
+            }))
+        }
+
+        let mut style = ComputedStyle::initial();
+        style.text_autospace = TextAutospace::NORMAL;
+        let mut font_system = FontSystem::new();
+        let mut scratch = Vec::with_capacity(1);
+        let scratch_buffer = scratch.as_ptr();
+        let mut items = Vec::with_capacity(1);
+        items.push(word(&style));
+        let input_buffer = items.as_ptr();
+
+        insert_text_autospace_items(&mut font_system, &mut scratch, &mut items);
+
+        assert_eq!(items.as_ptr(), scratch_buffer);
+        assert_eq!(scratch.as_ptr(), input_buffer);
+        assert!(scratch.is_empty());
+
+        items.clear();
+        items.push(word(&style));
+        let next_input_buffer = items.as_ptr();
+        let next_scratch_buffer = scratch.as_ptr();
+
+        insert_text_autospace_items(&mut font_system, &mut scratch, &mut items);
+
+        assert_eq!(items.as_ptr(), next_scratch_buffer);
+        assert_eq!(scratch.as_ptr(), next_input_buffer);
+        assert!(scratch.is_empty());
     }
 
     #[test]
@@ -738,7 +795,7 @@ mod tests {
         let mut output = Vec::new();
         let mut previous = None;
 
-        push_autospaced_word(&mut font_system, &mut output, word, &mut previous);
+        push_autospaced_word(&mut font_system, &mut output, Box::new(word), &mut previous);
 
         assert!(matches!(
             output.as_slice(),
@@ -770,7 +827,7 @@ mod tests {
         let mut output = Vec::new();
         let mut previous = None;
 
-        push_autospaced_word(&mut font_system, &mut output, word, &mut previous);
+        push_autospaced_word(&mut font_system, &mut output, Box::new(word), &mut previous);
 
         let spacing = output.iter().find_map(|item| match item {
             InlineItem::Atom(atom)
@@ -833,17 +890,18 @@ mod tests {
         upright_style.text_orientation = TextOrientation::Upright;
         upright_style.text_autospace = TextAutospace::NORMAL;
         let mut font_system = FontSystem::new();
+        let mut scratch = Vec::new();
 
         for text in ["国X国", "国1国"] {
             let mut items = vec![word(text, &upright_style)];
-            insert_text_autospace_items(&mut font_system, &mut items);
+            insert_text_autospace_items(&mut font_system, &mut scratch, &mut items);
             assert_eq!(autospace_count(&items), 0, "{text}: {items:?}");
         }
 
         let mut mixed_style = upright_style.clone();
         mixed_style.text_orientation = TextOrientation::Mixed;
         let mut mixed_items = vec![word("国X国", &mixed_style)];
-        insert_text_autospace_items(&mut font_system, &mut mixed_items);
+        insert_text_autospace_items(&mut font_system, &mut scratch, &mut mixed_items);
         assert_eq!(autospace_count(&mixed_items), 2, "{mixed_items:?}");
 
         for text in ["X", "1"] {
@@ -852,7 +910,7 @@ mod tests {
                 word(text, &upright_style),
                 word("国", &mixed_style),
             ];
-            insert_text_autospace_items(&mut font_system, &mut items);
+            insert_text_autospace_items(&mut font_system, &mut scratch, &mut items);
             assert_eq!(autospace_count(&items), 0, "{text}: {items:?}");
         }
     }
@@ -913,13 +971,14 @@ mod tests {
         let mut text_style = ComputedStyle::initial();
         text_style.text_autospace = TextAutospace::NORMAL;
         let mut font_system = FontSystem::new();
+        let mut scratch = Vec::new();
 
         let mut zero_edge_items = vec![
             word("国", &text_style),
             box_edge(text_style.clone()),
             word("A", &text_style),
         ];
-        insert_text_autospace_items(&mut font_system, &mut zero_edge_items);
+        insert_text_autospace_items(&mut font_system, &mut scratch, &mut zero_edge_items);
         assert_eq!(autospace_count(&zero_edge_items), 1);
 
         let mut decorated_edge_style = text_style.clone();
@@ -929,7 +988,7 @@ mod tests {
             box_edge(decorated_edge_style),
             word("A", &text_style),
         ];
-        insert_text_autospace_items(&mut font_system, &mut decorated_edge_items);
+        insert_text_autospace_items(&mut font_system, &mut scratch, &mut decorated_edge_items);
         assert_eq!(autospace_count(&decorated_edge_items), 0);
     }
 }

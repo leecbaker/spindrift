@@ -1,9 +1,9 @@
 use super::*;
 use crate::units::IntoLayoutLength;
 
-/// A replaced flex item's physical content-box dimensions before the legacy
-/// aspect-ratio constraint routine. Keeping the axes together prevents a
-/// width value being re-used as the height half of a later constraint pass.
+/// A replaced flex item's physical content-box dimensions before aspect-ratio
+/// constraint resolution. Keeping the axes together prevents a width value
+/// being re-used as the height half of a later constraint pass.
 #[derive(Debug, Clone, Copy)]
 struct FlexReplacedContentSize {
     width: ContentBoxLength,
@@ -54,6 +54,45 @@ mod tests {
         assert_eq!(estimate.width.points(), 100.0);
         assert_eq!(estimate.height.points(), 100.0);
     }
+
+    #[test]
+    fn ratio_only_svg_keeps_default_object_size_separate_from_flex_stretch() {
+        let style = ComputedStyle::initial();
+        let available = FlexItemAvailableSpace {
+            width: PhysicalContentWidth::new(content_box_pt(600.0)),
+            width_basis: PercentageBasis::definite_from(
+                content_box_pt(600.0),
+                FlexAvailableSizeSource::ContainingBlock,
+            ),
+            height: None,
+            height_basis: PercentageBasis::indefinite(),
+            stretched_width: Some(PhysicalContentWidth::new(content_box_pt(600.0))),
+            stretched_height: None,
+        };
+        let estimate = estimate_replaced_flex_item(
+            IntrinsicReplacedSize {
+                width: content_box_pt(225.0),
+                height: content_box_pt(112.5),
+                preferred_aspect_ratio: Some(2.0),
+                has_intrinsic_size: false,
+                attr_width: None,
+                attr_height: None,
+            },
+            &style,
+            false,
+            PhysicalContentWidth::new(content_box_pt(600.0)),
+            available,
+        )
+        .expect("a ratio-only SVG is estimable");
+
+        assert_eq!(estimate.width.points(), 225.0);
+        assert_eq!(estimate.height.points(), 112.5);
+        let automatic = estimate
+            .automatic_preferred_physical_size
+            .expect("the CSS default object size is retained");
+        assert_eq!(automatic.width.points(), 225.0);
+        assert_eq!(automatic.height.points(), 112.5);
+    }
 }
 
 impl FlexReplacedContentSize {
@@ -68,22 +107,19 @@ impl FlexReplacedContentSize {
     fn constrain_with_aspect_ratio(
         &mut self,
         aspect_ratio: f32,
-        auto_axes: ReplacedAutoAxes,
+        preferred_sizes: ReplacedPreferredSizeAxes,
         constraints: ReplacedSizeConstraints,
     ) {
-        // `constrain_replaced_size_with_aspect_ratio` is a shared legacy
-        // scalar algorithm. Extract only at this named adapter and restore
-        // the content-box marker immediately afterward.
-        let mut width = self.width.points();
-        let mut height = self.height.points();
-        constrain_replaced_size_with_aspect_ratio(
-            &mut width,
-            &mut height,
+        let constrained = resolve_replaced_size_with_aspect_ratio(
+            content_box_size_pt(self.width.points(), self.height.points()),
             aspect_ratio,
-            auto_axes,
+            preferred_sizes,
             constraints,
         );
-        *self = Self::new(content_box_pt(width), content_box_pt(height));
+        *self = Self::new(
+            content_box_pt(constrained.width),
+            content_box_pt(constrained.height),
+        );
     }
 
     fn width_at_ratio(width: ContentBoxLength, ratio: f32) -> Self {
@@ -138,23 +174,33 @@ pub(in crate::layout::flex) fn estimate_replaced_flex_item(
             style,
             PercentageBasis::definite(containing_width.content_box_length()),
         )
-        .map(SemanticLengthExt::points),
+        .map(|width| width.max(content_box_pt(0.0))),
         max_width: used_max_width(
             style,
             PercentageBasis::definite(containing_width.content_box_length()),
         )
-        .map(SemanticLengthExt::points),
+        .map(|width| width.max(content_box_pt(0.0))),
         min_height: used_length_percentage_or_auto_with_basis(
             style.box_values.min_height.clone(),
             available.height_basis,
         )
-        .map(|height| height.points().max(0.0)),
+        .map(|height| content_box_pt(height.points().max(0.0))),
         max_height: used_length_percentage_or_auto_with_basis(
             style.box_values.max_height.clone(),
             available.height_basis,
         )
-        .map(|height| height.points().max(0.0)),
+        .map(|height| content_box_pt(height.points().max(0.0))),
     };
+    // A viewBox-only SVG has a preferred ratio but no intrinsic dimensions.
+    // Its automatic preferred size remains CSS Images' default object size;
+    // flex stretch must not masquerade as an authored definite width or
+    // height while establishing that size.
+    let ratio_only_automatic_size = !intrinsic.has_intrinsic_size
+        && aspect_ratio.is_some()
+        && intrinsic.attr_width.is_none()
+        && intrinsic.attr_height.is_none()
+        && style.box_values.width.is_auto()
+        && style.box_values.height.is_auto();
     let specified_width = used_content_box_width_or_auto(
         style,
         containing_width.content_box_length().into_layout_length(),
@@ -162,19 +208,29 @@ pub(in crate::layout::flex) fn estimate_replaced_flex_item(
     )
     .or(intrinsic.attr_width)
     .or_else(|| {
-        available
-            .stretched_width
-            .map(|width| content_box_pt((width.points() - horizontal_non_content).max(0.0)))
+        (!ratio_only_automatic_size)
+            .then(|| {
+                available
+                    .stretched_width
+                    .map(|width| content_box_pt((width.points() - horizontal_non_content).max(0.0)))
+            })
+            .flatten()
     });
-    let specified_height =
-        definite_image_content_height_without_percent(style, vertical_non_content)
-            .map(content_box_pt)
-            .or(intrinsic.attr_height)
-            .or_else(|| {
+    let specified_height = used_content_box_height_or_auto_with_basis(
+        style,
+        available.height_basis,
+        non_content_pt(vertical_non_content),
+    )
+    .or(intrinsic.attr_height)
+    .or_else(|| {
+        (!ratio_only_automatic_size)
+            .then(|| {
                 available
                     .stretched_height
                     .map(|height| content_box_pt((height.points() - vertical_non_content).max(0.0)))
-            });
+            })
+            .flatten()
+    });
     let width_is_auto = specified_width.is_none();
     let height_is_auto = specified_height.is_none();
     let contained_intrinsic_width = style
@@ -210,21 +266,22 @@ pub(in crate::layout::flex) fn estimate_replaced_flex_item(
         (None, Some(height), Some(ratio)) => {
             FlexReplacedContentSize::height_at_ratio(height, ratio)
         }
-        // An inline SVG root with only a `viewBox` provides a preferred
-        // aspect ratio but no intrinsic dimensions. Its automatic flex size
-        // therefore uses the available content-box inline space, rather than
-        // CSS's generic default object dimensions; the ratio then supplies
-        // the opposite axis. This is the SVG root sizing case in CSS Sizing's
-        // flex-item algorithm.
+        // An SVG image with only a `viewBox` provides a preferred aspect
+        // ratio but no intrinsic dimensions. CSS Images still supplies its
+        // default object size as the automatic preferred physical size.
+        // Preserve that size rather than replacing it with the flex
+        // container's available cross space; the automatic-minimum phase
+        // later transfers the applicable physical axis through the ratio.
         // <https://www.w3.org/TR/css-sizing-3/#intrinsic-sizes>
         // <https://www.w3.org/TR/css-flexbox-1/#algo-main-item>
         (None, None, Some(ratio)) if !intrinsic.has_intrinsic_size => {
-            let available_width = (available.width.points()
-                - horizontal_non_content
-                - style.margin.left
-                - style.margin.right)
-                .max(0.0);
-            FlexReplacedContentSize::width_at_ratio(content_box_pt(available_width), ratio)
+            let width = intrinsic.width.max(content_box_pt(0.0));
+            let height = intrinsic.height.max(content_box_pt(0.0));
+            if width > content_box_pt(0.0) {
+                FlexReplacedContentSize::width_at_ratio(width, ratio)
+            } else {
+                FlexReplacedContentSize::height_at_ratio(height, ratio)
+            }
         }
         // Size containment's fallback is an intrinsic size, not a preferred
         // aspect ratio.  When an authored dimension leaves the other axis
@@ -276,9 +333,9 @@ pub(in crate::layout::flex) fn estimate_replaced_flex_item(
     let mut constrained_size = base_size;
     constrained_size.constrain_with_aspect_ratio(
         aspect_ratio,
-        ReplacedAutoAxes {
-            width: width_is_auto,
-            height: height_is_auto,
+        ReplacedPreferredSizeAxes {
+            width: ReplacedPreferredSize::from_is_automatic(width_is_auto),
+            height: ReplacedPreferredSize::from_is_automatic(height_is_auto),
         },
         block_constraints,
     );
@@ -286,21 +343,21 @@ pub(in crate::layout::flex) fn estimate_replaced_flex_item(
     let mut width_constrained_size = base_size;
     width_constrained_size.constrain_with_aspect_ratio(
         aspect_ratio,
-        ReplacedAutoAxes {
-            width: width_is_auto,
-            height: height_is_auto,
+        ReplacedPreferredSizeAxes {
+            width: ReplacedPreferredSize::from_is_automatic(width_is_auto),
+            height: ReplacedPreferredSize::from_is_automatic(height_is_auto),
         },
         ReplacedSizeConstraints {
             min_width: used_min_width(
                 style,
                 PercentageBasis::definite(containing_width.content_box_length()),
             )
-            .map(SemanticLengthExt::points),
+            .map(|width| width.max(content_box_pt(0.0))),
             max_width: used_max_width(
                 style,
                 PercentageBasis::definite(containing_width.content_box_length()),
             )
-            .map(SemanticLengthExt::points),
+            .map(|width| width.max(content_box_pt(0.0))),
             min_height: None,
             max_height: None,
         },
@@ -309,9 +366,9 @@ pub(in crate::layout::flex) fn estimate_replaced_flex_item(
     let mut height_constrained_size = base_size;
     height_constrained_size.constrain_with_aspect_ratio(
         aspect_ratio,
-        ReplacedAutoAxes {
-            width: width_is_auto,
-            height: height_is_auto,
+        ReplacedPreferredSizeAxes {
+            width: ReplacedPreferredSize::from_is_automatic(width_is_auto),
+            height: ReplacedPreferredSize::from_is_automatic(height_is_auto),
         },
         ReplacedSizeConstraints {
             min_width: None,
@@ -336,7 +393,7 @@ pub(in crate::layout::flex) fn estimate_replaced_flex_item(
     } else {
         FlexReplacedContentSize::zero()
     };
-    Some(FlexItemEstimate::from_physical_intrinsic_metrics(
+    let mut estimate = FlexItemEstimate::from_physical_intrinsic_metrics(
         FlexPhysicalIntrinsicMetrics {
             width: PhysicalContentWidth::new(constrained_size.width.max(content_box_pt(1.0))),
             height: PhysicalContentHeight::new(constrained_size.height.max(content_box_pt(1.0))),
@@ -351,5 +408,12 @@ pub(in crate::layout::flex) fn estimate_replaced_flex_item(
         },
         Some(aspect_ratio),
         FlexItemBaselineEstimate::default(),
-    ))
+    );
+    if ratio_only_automatic_size {
+        estimate.set_automatic_preferred_physical_size(FlexAutomaticPreferredPhysicalSize {
+            width: PhysicalContentWidth::new(base_size.width.max(content_box_pt(0.0))),
+            height: PhysicalContentHeight::new(base_size.height.max(content_box_pt(0.0))),
+        });
+    }
+    Some(estimate)
 }

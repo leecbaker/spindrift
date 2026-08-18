@@ -698,14 +698,24 @@ mod document;
 mod flex_conformance;
 #[path = "smoke/fonts.rs"]
 mod fonts;
+#[path = "smoke/grid_lanes_alignment.rs"]
+mod grid_lanes_alignment;
+#[path = "smoke/grid_lanes_flow_tolerance.rs"]
+mod grid_lanes_flow_tolerance;
+#[path = "smoke/grid_lanes_subgrid.rs"]
+mod grid_lanes_subgrid;
 #[path = "smoke/grid_zoom.rs"]
 mod grid_zoom;
 #[path = "smoke/layout_inline_flex.rs"]
 mod layout_inline_flex;
 #[path = "smoke/media_links_style.rs"]
 mod media_links_style;
+#[path = "smoke/multicol_column_height.rs"]
+mod multicol_column_height;
 #[path = "smoke/multicol_zoom.rs"]
 mod multicol_zoom;
+#[path = "smoke/normal_flow_zoom.rs"]
+mod normal_flow_zoom;
 #[path = "smoke/positioned_zoom.rs"]
 mod positioned_zoom;
 #[path = "smoke/positioning_fragmentation.rs"]

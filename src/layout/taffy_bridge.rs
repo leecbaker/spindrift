@@ -122,12 +122,23 @@ pub(in crate::layout) fn item_alignment(
             keyword: taffy_layout::AlignItemsKeyword::Stretch,
             safety,
         },
-        SelfAlignmentKeyword::Start | SelfAlignmentKeyword::SelfStart => taffy_layout::AlignItems {
+        SelfAlignmentKeyword::Start => taffy_layout::AlignItems {
             keyword: taffy_layout::AlignItemsKeyword::Start,
             safety,
         },
-        SelfAlignmentKeyword::End | SelfAlignmentKeyword::SelfEnd => taffy_layout::AlignItems {
+        SelfAlignmentKeyword::End => taffy_layout::AlignItems {
             keyword: taffy_layout::AlignItemsKeyword::End,
+            safety,
+        },
+        // Taffy 0.13 resolves these against the item's direction.  Quire
+        // retains its own vertical-writing and final-placement handling where
+        // Taffy's horizontal-tb model cannot represent CSS writing modes.
+        SelfAlignmentKeyword::SelfStart => taffy_layout::AlignItems {
+            keyword: taffy_layout::AlignItemsKeyword::SelfStart,
+            safety,
+        },
+        SelfAlignmentKeyword::SelfEnd => taffy_layout::AlignItems {
+            keyword: taffy_layout::AlignItemsKeyword::SelfEnd,
             safety,
         },
         SelfAlignmentKeyword::FlexStart | SelfAlignmentKeyword::Left => taffy_layout::AlignItems {

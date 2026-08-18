@@ -106,6 +106,43 @@ pub(crate) fn used_border_widths(style: &ComputedStyle) -> css::Edges {
     used_border(style).widths()
 }
 
+/// Return the physical computed border widths before `border-style` suppresses
+/// their used box-model contribution.
+///
+/// `border-image-width` numeric values and `border-image-outset` numeric
+/// values are defined in terms of these computed widths, even when (for
+/// example) `border-style: none` makes the used width zero.
+/// <https://drafts.csswg.org/css-backgrounds-3/#border-image-width>
+/// <https://drafts.csswg.org/css-backgrounds-3/#border-image-outset>
+pub(crate) fn computed_border_widths(style: &ComputedStyle) -> css::Edges {
+    css::Edges {
+        top: style
+            .border_width_values
+            .top
+            .clone()
+            .length_max_zero()
+            .points(),
+        right: style
+            .border_width_values
+            .right
+            .clone()
+            .length_max_zero()
+            .points(),
+        bottom: style
+            .border_width_values
+            .bottom
+            .clone()
+            .length_max_zero()
+            .points(),
+        left: style
+            .border_width_values
+            .left
+            .clone()
+            .length_max_zero()
+            .points(),
+    }
+}
+
 pub(crate) fn used_border_side_width(width: LayoutLength, style: BorderStyle) -> LayoutLength {
     if style.suppresses_used_width() {
         layout_pt(0.0)
@@ -172,6 +209,17 @@ mod tests {
         let width: LayoutLength = used_border_width(&style);
 
         assert_eq!(width, layout_pt(3.0));
+    }
+
+    #[test]
+    fn computed_border_width_remains_available_when_style_suppresses_used_width() {
+        let mut style = ComputedStyle::initial();
+        style.border_width_values.left = css::ComputedLengthPercentage::from_points(6.0);
+        style.border_widths.left = 0.0;
+        style.border_styles.left = BorderStyle::None;
+
+        assert_eq!(computed_border_widths(&style).left, 6.0);
+        assert_eq!(used_border_widths(&style).left, 0.0);
     }
 
     #[test]

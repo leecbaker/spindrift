@@ -1,6 +1,8 @@
 use super::*;
 use crate::layout::assets::paint_effects_for_box;
-use crate::layout::builder::{page_box_edges_from_declarations_with_ch_advance, page_for_context};
+use crate::layout::builder::{
+    page_box_edges_from_declarations_with_ch_advance_and_root_metrics, page_for_context,
+};
 use crate::layout::page_generated::{PageMarginContentItem, ResolvedPageContent};
 
 impl<'a> LayoutBuilder<'a> {
@@ -110,30 +112,41 @@ impl<'a> LayoutBuilder<'a> {
             let page_style = self.page_context_style_for_declarations(&page_declarations);
             let page_ch_advance =
                 self.ch_advance_for_style(&page_style, page_style.requires_ch_advance());
+            let root_metrics = self.root_metric_state.resolved().basis();
             for box_ in &mut boxes {
                 let ch_advance =
                     self.ch_advance_for_style(&box_.style, box_.style.requires_ch_advance());
                 box_.style.resolve_font_metric_lengths(ch_advance);
+                if let RootMetricState::Resolved(root_metrics) = self.root_metric_state {
+                    box_.style.root_font_size = root_metrics.basis().font_size.points();
+                    box_.style
+                        .resolve_root_font_metric_lengths(root_metrics.basis());
+                }
             }
-            let page_size = css::page_size_from_with_ch_advance(
+            let page_size = css::page_size_from_with_ch_advance_and_root_metrics(
                 &page_declarations,
                 base_page_context.size,
                 page_ch_advance,
+                root_metrics,
             );
-            let page_edges = page_box_edges_from_declarations_with_ch_advance(
+            let page_edges = page_box_edges_from_declarations_with_ch_advance_and_root_metrics(
                 &page_declarations,
                 page_size,
                 page_ch_advance,
+                root_metrics,
             );
             let page_margins =
-                css::page_margins_from_for_size_and_edges_with_ch_advance_and_page_context_style(
+                css::page_margins_from_for_size_and_edges_with_ch_advance_and_page_context_style_and_root_metrics(
                     &page_declarations,
                     base_page_context.margins,
                     page_size,
-                    self.page_descriptor_viewport_size,
-                    page_edges.total(),
-                    page_ch_advance,
-                    &page_style,
+                    css::PageMarginResolutionContext {
+                        viewport_size: self.page_descriptor_viewport_size,
+                        non_margin_edges: page_edges.total(),
+                        ch_advance: page_ch_advance,
+                        style: &page_style,
+                        root_metrics,
+                    },
                 );
             let page_counters = page_counter_values
                 .get(index)
@@ -277,7 +290,8 @@ impl<'a> LayoutBuilder<'a> {
     ) {
         let style = &layout.spec.style;
         let inline_extent = sequence
-            .fixed_box_physical_inline_extent(style)
+            .occupied_physical_inline_extent(style)
+            .points()
             .max(self.font_system.used_line_height(style).points());
         // In vertical writing modes the inline axis is physical y. Page
         // margin-box `vertical-align` therefore selects the inline-stack
@@ -350,6 +364,7 @@ impl<'a> LayoutBuilder<'a> {
         self.page_named_strings.clear();
         self.page_running_elements.clear();
         self.page_anchors.clear();
+        self.page_anchor_source_positions.clear();
         self.page_anchor_text.clear();
         self.document_canvas_background = None;
         self.document_canvas_fragment_insets.clear();

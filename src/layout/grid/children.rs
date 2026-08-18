@@ -16,8 +16,12 @@ impl GridUsedStyle {
         Self(style)
     }
 
-    pub(super) fn as_computed(&self) -> &ComputedStyle {
+    pub(super) fn used_style(&self) -> &css::ZoomedLayoutStyle {
         &self.0
+    }
+
+    pub(super) fn clone_used_style(&self) -> css::ZoomedLayoutStyle {
+        self.0.clone()
     }
 }
 

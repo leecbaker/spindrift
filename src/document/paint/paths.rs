@@ -60,7 +60,9 @@ pub(crate) struct RenderedSvgPathPattern {
     pub(crate) tile_size: PaintSize,
     pub(crate) origin: PaintPoint,
     pub(crate) transform: PaintTransform,
-    pub(crate) paths: Vec<RenderedPath>,
+    /// Mixed path/raster/nested-SVG content in the pattern cell's local SVG
+    /// coordinate system.  A `Box` breaks the scene/paint-server recursion.
+    pub(crate) scene: Box<crate::svg::SvgPaintGroup>,
     pub(crate) opacity: f32,
 }
 
@@ -151,6 +153,7 @@ impl Default for RenderedPathStrokeStyle {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // SVG stroke-linecap parsing has not yet exposed every PDF cap style.
 pub(crate) enum RenderedPathLineCap {
     Butt,
     Round,
@@ -158,6 +161,7 @@ pub(crate) enum RenderedPathLineCap {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // SVG stroke-linejoin parsing has not yet exposed every PDF join style.
 pub(crate) enum RenderedPathLineJoin {
     Miter,
     Round,
@@ -165,6 +169,7 @@ pub(crate) enum RenderedPathLineJoin {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(dead_code)] // SVG paint-order parsing has not yet exposed every ordering mode.
 pub(crate) enum RenderedPathPaintOrder {
     #[default]
     FillThenStroke,

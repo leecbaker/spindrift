@@ -1,142 +1,154 @@
 use super::*;
 use crate::layout::assets::DocumentPageIndex;
+use crate::layout::assets::fixed_background_page_margin_box;
 
 impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn snapshot(&self) -> LayoutSnapshot {
         LayoutSnapshot {
-            pages: self.pages.clone(),
-            page_names: self.page_names.clone(),
-            page_blanks: self.page_blanks.clone(),
-            page_name_scope_suppression: self.page_name_scope_suppression,
-            page_name_element_scope_suppression: self.page_name_element_scope_suppression,
-            page_value_scope_stack: self.page_value_scope_stack.clone(),
-            page_named_strings: self.page_named_strings.clone(),
-            page_running_elements: self.page_running_elements.clone(),
-            suppressed_named_strings_before: self.suppressed_named_strings_before.clone(),
-            suppressed_named_strings_after: self.suppressed_named_strings_after.clone(),
-            page_anchors: self.page_anchors.clone(),
-            page_anchor_text: self.page_anchor_text.clone(),
-            page_anchor_counters: self.page_anchor_counters.clone(),
-            has_normal_flow_target_references: self.has_normal_flow_target_references,
-            document_canvas_background: self.document_canvas_background.clone(),
-            document_canvas_scroll_translation: self.document_canvas_scroll_translation,
-            document_canvas_root_positioning_area: self.document_canvas_root_positioning_area,
-            document_canvas_overflow: self.document_canvas_overflow,
-            document_canvas_fragment_insets: self.document_canvas_fragment_insets.clone(),
-            current_page: self.current_page.clone(),
-            current_page_has_flow_content: self.current_page_has_flow_content,
-            current_page_has_named_page_flow_content: self.current_page_has_named_page_flow_content,
-            current_page_selected_name: self.current_page_selected_name.clone(),
-            last_block_layout_outcome: self.last_block_layout_outcome,
-            last_principal_transform_box: self.last_principal_transform_box,
-            current_page_name: self.current_page_name.clone(),
-            current_page_context: self.current_page_context,
-            initial_viewport_context: self.initial_viewport_context,
-            fragmentainer_override: self.fragmentainer_override,
-            footnote_measurements: self.footnote_measurements.clone(),
-            rendered_footnote_measurements: self.rendered_footnote_measurements.clone(),
-            measured_footnotes: self.measured_footnotes.clone(),
-            committed_inline_floats: self.committed_inline_floats.clone(),
-            rendered_footnotes: self.rendered_footnotes.clone(),
-            footnote_measurement_depth: self.footnote_measurement_depth,
-            fragmentation_suppression_depth: self.fragmentation_suppression_depth,
-            multicol_spanner_fragmentation_depth: self.multicol_spanner_fragmentation_depth,
-            multicol_spanner_speculation_depth: self.multicol_spanner_speculation_depth,
-            multicol_balance_probe_depth: self.multicol_balance_probe_depth,
-            cursor_y: self.cursor_y,
-            content_left: self.content_left,
-            content_right: self.content_right,
-            table_cell_content_coordinate_contexts: self
-                .table_cell_content_coordinate_contexts
-                .clone(),
-            principal_body_block_end_inset: self.principal_body_block_end_inset,
-            root_principal_flow_context: self.root_principal_flow_context,
-            root_pseudo_block_projection: self.root_pseudo_block_projection,
-            inline_split_float_exclusion_query_offset: self
-                .inline_split_float_exclusion_query_offset,
-            content_logical_inline_size_stack: self.content_logical_inline_size_stack.clone(),
-            container_unit_contexts: self.container_unit_contexts.clone(),
-            multicol_column_containing_blocks: self.multicol_column_containing_blocks.clone(),
-            intrinsic_inline_percentage_basis_stack: self
-                .intrinsic_inline_percentage_basis_stack
-                .clone(),
-            inline_static_position: self.inline_static_position,
-            text_box_line_trim_stack: self.text_box_line_trim_stack.clone(),
-            clamp_line_slot_captures: self.clamp_line_slot_captures.clone(),
-            positioned_inline_layout_suppression_depth: self
-                .positioned_inline_layout_suppression_depth,
-            last_in_flow_line_baseline_y: self.last_in_flow_line_baseline_y,
-            pending_outside_marker_anchors: self.pending_outside_marker_anchors.clone(),
-            block_static_position_y_offset: self.block_static_position_y_offset,
-            absolute_static_position: self.absolute_static_position,
-            grid_positioning_scopes: self.grid_positioning_scopes.clone(),
-            pending_subgrid_contexts: self.pending_subgrid_contexts.clone(),
-            escaped_atom_positioning_depth: self.escaped_atom_positioning_depth,
-            escaped_atom_containing_block: self.escaped_atom_containing_block,
-            escaped_atom_positioning_context: self.escaped_atom_positioning_context,
-            containing_block_writing_mode: self.containing_block_writing_mode,
-            fragment_top_offsets: self.fragment_top_offsets.clone(),
-            child_available_space_stack: self.child_available_space_stack.clone(),
-            normal_flow_relative_containing_blocks: self
-                .normal_flow_relative_containing_blocks
-                .clone(),
-            block_static_position_contexts: self.block_static_position_contexts.clone(),
-            definite_block_size_stack: self.definite_block_size_stack.clone(),
-            replayed_flex_item_percentage_height_bases: self
-                .replayed_flex_item_percentage_height_bases
-                .clone(),
-            table_wrapper_block_size_overrides: self.table_wrapper_block_size_overrides.clone(),
-            positioned_table_sizing: self.positioned_table_sizing.clone(),
-            multicol_text_box_trim_end_child_indices: self
-                .multicol_text_box_trim_end_child_indices
-                .clone(),
-            truncate_page_start_margins: self.truncate_page_start_margins,
-            avoid_inside_retry_depth: self.avoid_inside_retry_depth,
-            out_of_flow_prebreak_suppression_depth: self.out_of_flow_prebreak_suppression_depth,
-            element_side_effect_suppression_depth: self.element_side_effect_suppression_depth,
-            containing_blocks: self.containing_blocks.clone(),
-            fixed_containing_blocks: self.fixed_containing_blocks.clone(),
-            active_multicol_positioned_containing_block_spans: self
-                .active_multicol_positioned_containing_block_spans
-                .clone(),
-            counter_set: self.counter_set.clone(),
-            counter_plan: self.counter_plan.clone(),
-            quote_depth: self.quote_depth,
-            current_page_named_strings: self.current_page_named_strings.clone(),
-            current_page_running_elements: self.current_page_running_elements.clone(),
-            next_assignment_id: self.next_assignment_id,
-            assignment_capture_stack: self.assignment_capture_stack.clone(),
-            ancestors: self.ancestors.clone(),
-            page_counter_initial_values: self.page_counter_initial_values.clone(),
-            bookmarks: self.bookmarks.clone(),
-            positioned_layers: self.positioned_layers.clone(),
-            committed_positioned_paint_identities: self
-                .committed_positioned_paint_identities
-                .clone(),
-            positioned_paint_transaction_depth: self.positioned_paint_transaction_depth,
-            positioned_scratch_page_limit: self.positioned_scratch_page_limit,
-            fixed_layers: self.fixed_layers.clone(),
-            absolute_positioned_page_span_target: self.absolute_positioned_page_span_target,
-            pending_positioned_fragmentation: self.pending_positioned_fragmentation,
-            next_paint_source_order: self.next_paint_source_order,
-            overflow_clips: self.overflow_clips.clone(),
-            active_scroll_snap_scopes: self.active_scroll_snap_scopes.clone(),
-            next_float_id: self.next_float_id,
-            float_contexts: self.float_contexts.clone(),
-            float_fragment_parent_inline_spans: self.float_fragment_parent_inline_spans.clone(),
-            adjoining_float_origin_y: self.adjoining_float_origin_y,
-            pending_paint_fragments: self.pending_paint_fragments.clone(),
-            pending_page_side_effects: self.pending_page_side_effects.clone(),
-            applied_clearance_count: self.applied_clearance_count,
-            float_paint_capture_depth: self.float_paint_capture_depth,
-            preserve_scoped_paint_public_order: self.preserve_scoped_paint_public_order,
-            defer_next_block_decoration_promotion: self.defer_next_block_decoration_promotion,
-            suppress_next_principal_box_decoration: self.suppress_next_principal_box_decoration,
-            pending_page_footnotes: self.pending_page_footnotes.clone(),
+            rollback: RollbackLayoutState {
+                pages: self.pages.clone(),
+                page_names: self.page_names.clone(),
+                page_blanks: self.page_blanks.clone(),
+                page_name_scope_suppression: self.page_name_scope_suppression,
+                page_name_element_scope_suppression: self.page_name_element_scope_suppression,
+                page_value_scope_stack: self.page_value_scope_stack.clone(),
+                page_named_strings: self.page_named_strings.clone(),
+                page_running_elements: self.page_running_elements.clone(),
+                suppressed_named_strings_before: self.suppressed_named_strings_before.clone(),
+                suppressed_named_strings_after: self.suppressed_named_strings_after.clone(),
+                page_anchors: self.page_anchors.clone(),
+                page_anchor_source_positions: self.page_anchor_source_positions.clone(),
+                page_anchor_text: self.page_anchor_text.clone(),
+                page_anchor_counters: self.page_anchor_counters.clone(),
+                has_normal_flow_target_references: self.has_normal_flow_target_references,
+                document_canvas_background: self.document_canvas_background.clone(),
+                document_canvas_scroll_translation: self.document_canvas_scroll_translation,
+                document_canvas_root_positioning_area: self.document_canvas_root_positioning_area,
+                document_canvas_overflow: self.document_canvas_overflow,
+                document_canvas_fragment_insets: self.document_canvas_fragment_insets.clone(),
+                current_page: self.current_page.clone(),
+                current_page_has_flow_content: self.current_page_has_flow_content,
+                current_page_has_named_page_flow_content: self
+                    .current_page_has_named_page_flow_content,
+                current_page_selected_name: self.current_page_selected_name.clone(),
+                last_block_layout_outcome: self.last_block_layout_outcome,
+                last_principal_transform_box: self.last_principal_transform_box,
+                current_page_name: self.current_page_name.clone(),
+                current_page_context: self.current_page_context,
+                initial_viewport_context: self.initial_viewport_context,
+                fragmentainer_override: self.fragmentainer_override,
+                footnote_measurements: self.footnote_measurements.clone(),
+                rendered_footnote_measurements: self.rendered_footnote_measurements.clone(),
+                measured_footnotes: self.measured_footnotes.clone(),
+                committed_inline_floats: self.committed_inline_floats.clone(),
+                rendered_footnotes: self.rendered_footnotes.clone(),
+                footnote_measurement_depth: self.footnote_measurement_depth,
+                fragmentation_suppression_depth: self.fragmentation_suppression_depth,
+                multicol_spanner_fragmentation_depth: self.multicol_spanner_fragmentation_depth,
+                multicol_spanner_speculation_depth: self.multicol_spanner_speculation_depth,
+                multicol_balance_probe_depth: self.multicol_balance_probe_depth,
+                cursor_y: self.cursor_y,
+                content_left: self.content_left,
+                content_right: self.content_right,
+                table_cell_content_coordinate_contexts: self
+                    .table_cell_content_coordinate_contexts
+                    .clone(),
+                principal_body_block_end_inset: self.principal_body_block_end_inset,
+                root_principal_flow_context: self.root_principal_flow_context,
+                fragmentainer_transition_recorder_lengths: self
+                    .fragmentainer_transition_recorders
+                    .iter()
+                    .map(FragmentainerTransitionRecorder::len)
+                    .collect(),
+                root_pseudo_block_projection: self.root_pseudo_block_projection,
+                direct_block_layout_constraint: self.direct_block_layout_constraint,
+                inline_split_float_exclusion_query_offset: self
+                    .inline_split_float_exclusion_query_offset,
+                content_logical_inline_size_stack: self.content_logical_inline_size_stack.clone(),
+                container_unit_contexts: self.container_unit_contexts.clone(),
+                multicol_column_containing_blocks: self.multicol_column_containing_blocks.clone(),
+                intrinsic_inline_percentage_basis_stack: self
+                    .intrinsic_inline_percentage_basis_stack
+                    .clone(),
+                inline_static_position: self.inline_static_position,
+                text_box_line_trim_stack: self.text_box_line_trim_stack.clone(),
+                clamp_line_slot_captures: self.clamp_line_slot_captures.clone(),
+                positioned_inline_layout_suppression_depth: self
+                    .positioned_inline_layout_suppression_depth,
+                last_in_flow_line_baseline_y: self.last_in_flow_line_baseline_y,
+                pending_outside_marker_anchors: self.pending_outside_marker_anchors.clone(),
+                block_static_position_y_offset: self.block_static_position_y_offset,
+                absolute_static_position: self.absolute_static_position,
+                grid_positioning_scopes: self.grid_positioning_scopes.clone(),
+                pending_subgrid_contexts: self.pending_subgrid_contexts.clone(),
+                escaped_atom_positioning_depth: self.escaped_atom_positioning_depth,
+                escaped_atom_containing_block: self.escaped_atom_containing_block,
+                escaped_atom_positioning_context: self.escaped_atom_positioning_context,
+                containing_block_writing_mode: self.containing_block_writing_mode,
+                fragment_top_offsets: self.fragment_top_offsets.clone(),
+                child_available_space_stack: self.child_available_space_stack.clone(),
+                normal_flow_relative_containing_blocks: self
+                    .normal_flow_relative_containing_blocks
+                    .clone(),
+                static_position_containing_blocks: self.static_position_containing_blocks.clone(),
+                definite_block_size_stack: self.definite_block_size_stack.clone(),
+                replayed_flex_item_percentage_height_bases: self
+                    .replayed_flex_item_percentage_height_bases
+                    .clone(),
+                table_wrapper_block_size_overrides: self.table_wrapper_block_size_overrides.clone(),
+                positioned_table_sizing: self.positioned_table_sizing.clone(),
+                multicol_text_box_trim_end_child_indices: self
+                    .multicol_text_box_trim_end_child_indices
+                    .clone(),
+                truncate_page_start_margins: self.truncate_page_start_margins,
+                avoid_inside_retry_depth: self.avoid_inside_retry_depth,
+                out_of_flow_prebreak_suppression_depth: self.out_of_flow_prebreak_suppression_depth,
+                layout_pass_kind: self.layout_pass_kind,
+                element_side_effect_suppression_depth: self.element_side_effect_suppression_depth,
+                containing_blocks: self.containing_blocks.clone(),
+                fixed_containing_blocks: self.fixed_containing_blocks.clone(),
+                active_multicol_positioned_containing_block_spans: self
+                    .active_multicol_positioned_containing_block_spans
+                    .clone(),
+                counter_set: self.counter_set.clone(),
+                counter_plan: self.counter_plan.clone(),
+                quote_depth: self.quote_depth,
+                current_page_named_strings: self.current_page_named_strings.clone(),
+                current_page_running_elements: self.current_page_running_elements.clone(),
+                next_assignment_id: self.next_assignment_id,
+                assignment_capture_stack: self.assignment_capture_stack.clone(),
+                ancestors: self.ancestors.clone(),
+                page_counter_initial_values: self.page_counter_initial_values.clone(),
+                bookmarks: self.bookmarks.clone(),
+                positioned_layers: self.positioned_layers.clone(),
+                committed_positioned_paint_identities: self
+                    .committed_positioned_paint_identities
+                    .clone(),
+                positioned_paint_transaction_depth: self.positioned_paint_transaction_depth,
+                positioned_scratch_page_limit: self.positioned_scratch_page_limit,
+                positioned_scratch_page_origin: self.positioned_scratch_page_origin,
+                fixed_layers: self.fixed_layers.clone(),
+                absolute_positioned_page_span_target: self.absolute_positioned_page_span_target,
+                pending_positioned_fragmentation: self.pending_positioned_fragmentation,
+                next_paint_source_order: self.next_paint_source_order,
+                overflow_clips: self.overflow_clips.clone(),
+                active_scroll_snap_scopes: self.active_scroll_snap_scopes.clone(),
+                next_float_id: self.next_float_id,
+                float_contexts: self.float_contexts.clone(),
+                float_fragment_parent_inline_spans: self.float_fragment_parent_inline_spans.clone(),
+                adjoining_float_origin_y: self.adjoining_float_origin_y,
+                pending_paint_fragments: self.pending_paint_fragments.clone(),
+                pending_page_side_effects: self.pending_page_side_effects.clone(),
+                float_paint_capture_depth: self.float_paint_capture_depth,
+                preserve_scoped_paint_public_order: self.preserve_scoped_paint_public_order,
+                defer_next_block_decoration_promotion: self.defer_next_block_decoration_promotion,
+                pending_page_footnotes: self.pending_page_footnotes.clone(),
+            },
         }
     }
 
     pub(in crate::layout) fn restore(&mut self, snapshot: LayoutSnapshot) {
+        let LayoutSnapshot { rollback: snapshot } = snapshot;
         self.pages = snapshot.pages;
         self.page_names = snapshot.page_names;
         self.page_blanks = snapshot.page_blanks;
@@ -148,6 +160,7 @@ impl<'a> LayoutBuilder<'a> {
         self.suppressed_named_strings_before = snapshot.suppressed_named_strings_before;
         self.suppressed_named_strings_after = snapshot.suppressed_named_strings_after;
         self.page_anchors = snapshot.page_anchors;
+        self.page_anchor_source_positions = snapshot.page_anchor_source_positions;
         self.page_anchor_text = snapshot.page_anchor_text;
         self.page_anchor_counters = snapshot.page_anchor_counters;
         self.has_normal_flow_target_references = snapshot.has_normal_flow_target_references;
@@ -184,7 +197,20 @@ impl<'a> LayoutBuilder<'a> {
             snapshot.table_cell_content_coordinate_contexts;
         self.principal_body_block_end_inset = snapshot.principal_body_block_end_inset;
         self.root_principal_flow_context = snapshot.root_principal_flow_context;
+        debug_assert!(
+            self.fragmentainer_transition_recorders.len()
+                >= snapshot.fragmentainer_transition_recorder_lengths.len(),
+            "a speculative restore may not discard an outer transition-recorder scope"
+        );
+        for (recorder, len) in self
+            .fragmentainer_transition_recorders
+            .iter()
+            .zip(snapshot.fragmentainer_transition_recorder_lengths)
+        {
+            recorder.truncate(len);
+        }
         self.root_pseudo_block_projection = snapshot.root_pseudo_block_projection;
+        self.direct_block_layout_constraint = snapshot.direct_block_layout_constraint;
         self.inline_split_float_exclusion_query_offset =
             snapshot.inline_split_float_exclusion_query_offset;
         self.content_logical_inline_size_stack = snapshot.content_logical_inline_size_stack;
@@ -211,7 +237,7 @@ impl<'a> LayoutBuilder<'a> {
         self.child_available_space_stack = snapshot.child_available_space_stack;
         self.normal_flow_relative_containing_blocks =
             snapshot.normal_flow_relative_containing_blocks;
-        self.block_static_position_contexts = snapshot.block_static_position_contexts;
+        self.static_position_containing_blocks = snapshot.static_position_containing_blocks;
         self.definite_block_size_stack = snapshot.definite_block_size_stack;
         self.replayed_flex_item_percentage_height_bases =
             snapshot.replayed_flex_item_percentage_height_bases;
@@ -223,6 +249,7 @@ impl<'a> LayoutBuilder<'a> {
         self.avoid_inside_retry_depth = snapshot.avoid_inside_retry_depth;
         self.out_of_flow_prebreak_suppression_depth =
             snapshot.out_of_flow_prebreak_suppression_depth;
+        self.layout_pass_kind = snapshot.layout_pass_kind;
         self.element_side_effect_suppression_depth = snapshot.element_side_effect_suppression_depth;
         self.containing_blocks = snapshot.containing_blocks;
         self.fixed_containing_blocks = snapshot.fixed_containing_blocks;
@@ -242,6 +269,7 @@ impl<'a> LayoutBuilder<'a> {
         self.committed_positioned_paint_identities = snapshot.committed_positioned_paint_identities;
         self.positioned_paint_transaction_depth = snapshot.positioned_paint_transaction_depth;
         self.positioned_scratch_page_limit = snapshot.positioned_scratch_page_limit;
+        self.positioned_scratch_page_origin = snapshot.positioned_scratch_page_origin;
         self.fixed_layers = snapshot.fixed_layers;
         self.absolute_positioned_page_span_target = snapshot.absolute_positioned_page_span_target;
         self.pending_positioned_fragmentation = snapshot.pending_positioned_fragmentation;
@@ -254,12 +282,9 @@ impl<'a> LayoutBuilder<'a> {
         self.adjoining_float_origin_y = snapshot.adjoining_float_origin_y;
         self.pending_paint_fragments = snapshot.pending_paint_fragments;
         self.pending_page_side_effects = snapshot.pending_page_side_effects;
-        self.applied_clearance_count = snapshot.applied_clearance_count;
         self.float_paint_capture_depth = snapshot.float_paint_capture_depth;
         self.preserve_scoped_paint_public_order = snapshot.preserve_scoped_paint_public_order;
         self.defer_next_block_decoration_promotion = snapshot.defer_next_block_decoration_promotion;
-        self.suppress_next_principal_box_decoration =
-            snapshot.suppress_next_principal_box_decoration;
         self.pending_page_footnotes = snapshot.pending_page_footnotes;
     }
 
@@ -362,7 +387,10 @@ impl<'a> LayoutBuilder<'a> {
     }
 
     pub(in crate::layout) fn materialize_empty_current_page_for_deferred_fragment(&mut self) {
-        let next_context = self.resolved_page_context(self.pages.len() + 2, false);
+        let next_context = self.resolved_page_context(
+            self.destination_document_page_number(self.pages.len() + 2),
+            false,
+        );
         let next_page = page_for_context(next_context);
         let page = std::mem::replace(&mut self.current_page, next_page);
         self.pages.push(page);
@@ -451,12 +479,15 @@ impl<'a> LayoutBuilder<'a> {
             let page_width = self.pages[page_index].width();
             let page_height = self.pages[page_index].height();
             let page_size = PageSize::from_points(page_width, page_height);
+            let root_metrics = self.root_metric_state.resolved().basis();
             if !declarations.is_empty() {
                 let mut style = ComputedStyle::initial();
                 css::apply_declarations(&mut style, &declarations);
                 let page_ch_advance =
                     self.ch_advance_for_style(&style, style.requires_ch_advance());
                 style.resolve_font_metric_lengths(page_ch_advance);
+                style.root_font_size = root_metrics.font_size.points();
+                style.resolve_root_font_metric_lengths(root_metrics);
                 if style.visibility != Visibility::Visible {
                     // `visibility` applies to the page context's own
                     // background, border, and generated margin boxes, but it
@@ -469,12 +500,13 @@ impl<'a> LayoutBuilder<'a> {
                 }
                 let page_margins = PageContext::from_options(self.options).margins;
                 let mut background_primitives = Vec::new();
-                let page_border_area = page_background_positioning_area(
+                let page_border_area = page_background_positioning_area_with_root_metrics(
                     &declarations,
-                    page_margins,
                     page_size,
+                    page_margins,
                     css::BackgroundBox::Border,
                     page_ch_advance,
+                    root_metrics,
                 );
                 for layer in page_background_layers_for_paint(&style).iter().rev() {
                     let mut layer_style = style.clone();
@@ -499,19 +531,21 @@ impl<'a> LayoutBuilder<'a> {
                         css::CssEdges::all(css::ComputedLengthPercentage::ZERO);
                     layer_style.border_styles = css::BorderStyles::NONE;
                     layer_style.border_width = 0.0;
-                    let image_area = page_background_positioning_area(
+                    let image_area = page_background_positioning_area_with_root_metrics(
                         &declarations,
-                        page_margins,
                         page_size,
+                        page_margins,
                         layer.origin,
                         page_ch_advance,
+                        root_metrics,
                     );
-                    let clip_area = page_background_positioning_area(
+                    let clip_area = page_background_positioning_area_with_root_metrics(
                         &declarations,
-                        page_margins,
                         page_size,
+                        page_margins,
                         layer.clip,
                         page_ch_advance,
+                        root_metrics,
                     );
                     background_primitives.extend(
                         background_image_primitives_for_style_with_paint_areas(
@@ -666,19 +700,15 @@ impl<'a> LayoutBuilder<'a> {
             context.area_height(),
         );
         let page_document_bottom = self.document_canvas_page_bottom(page_index);
-        let page_context = self.finished_page_context(page_index + 1, page_size);
         let clip_area =
             DocumentCanvasBackgroundArea::from_document_canvas_rect(DocumentCanvasRect::new(
                 DocumentCanvasPoint::new(x, page_document_bottom + y),
                 DocumentCanvasSize::new(width, height),
             ));
         let positioning_area = self.document_canvas_root_positioning_area();
-        let fixed_positioning_area = DocumentCanvasBackgroundArea::new(
-            DocumentCanvasPoint::new(
-                page_context.left(),
-                page_document_bottom + page_context.bottom(),
-            ),
-            DocumentCanvasSize::new(page_context.area_width(), page_context.area_height()),
+        let fixed_positioning_area = fixed_background_page_margin_box(
+            DocumentCanvasPoint::new(0.0, page_document_bottom),
+            page_size,
         );
         let background_primitives =
             background_image_primitives_for_style_with_paint_areas_and_fixed_positioning_area(
@@ -971,7 +1001,8 @@ impl<'a> LayoutBuilder<'a> {
         let area = self
             .iframe_viewport
             .filter(|_| area.height() <= 0.01)
-            .map(|viewport| {
+            .map(|context| {
+                let viewport = context.viewport;
                 PaintBackgroundArea::new(
                     PaintPoint::new(area.x(), area.y() - viewport.height()),
                     PaintSize::new(area.width(), viewport.height()),
@@ -1015,6 +1046,9 @@ impl<'a> LayoutBuilder<'a> {
         self.page_anchors
             .entry(name.clone())
             .or_insert(self.pages.len());
+        self.page_anchor_source_positions
+            .entry(name.clone())
+            .or_insert_with(|| PaintPoint::new(self.content_left, self.cursor_y));
         if !self.page_anchor_text.contains_key(&name) {
             let anchor_text = self.anchor_text_for_element(element, style);
             self.page_anchor_text.insert(name.clone(), anchor_text);

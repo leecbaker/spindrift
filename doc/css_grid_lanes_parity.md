@@ -3,10 +3,18 @@
 ## Intrinsic auto-repeat
 
 Grid Lanes resolves an intrinsic `repeat(auto-fill|auto-fit, ...)` in two
-stages. The hypothetical stage ignores authored grid-axis placement and
-copies each item to every automatic start that fits. It derives the repeated
-slot maxima, then selects a finite repeat count. The final stage materializes
-that explicit topology before line resolution and lane packing.
+stages. Each stage contributes a definite item only at its normalized Grid
+line range and copies an automatic item to every automatic start that fits.
+It uses the shared Grid track-sizing adapter with an indefinite percentage
+basis, derives the repeated-slot maxima, and selects a finite repeat count
+from the definite preferred, maximum, or minimum grid-axis constraint. Zero
+intrinsic slots use the one-CSS-pixel repeat-count floor required by CSS Grid.
+
+The final stage materializes the explicit topology before line resolution and
+lane packing. Definite items contribute only to their resolved range, while
+automatic items contribute to every eligible start. `auto-fit` applies the
+Level 3 occupancy rule across the materialized explicit grid, then collapses
+only unoccupied repeated tracks and both adjacent gutters.
 
 This preserves fixed prefix/suffix tracks, repeated line names, and the
 provenance required to collapse only empty repeated `auto-fit` tracks. End
@@ -26,9 +34,59 @@ sizing and item percentage resolution; its measured post-layout height is
 not fed back as a percentage basis. This implements CSS Grid's cyclic
 percentage rule for intrinsic grid sizing.
 
+## Fixed-axis placement and subgrids
+
+Grid Lanes normalizes fixed-axis placement once before sizing and packing.
+This follows ordinary Grid conflict handling for reversed and equal line
+pairs, line-plus-span values, two spans, named-area edges, and negative
+lines. In particular, `grid-column: 2 / 5` occupies all three intervening
+tracks rather than a one-track default span.
+
+When that area is a subgrid axis, the child retains the used parent track
+slice and its intervening gutters; descendant placement uses hypothetical
+lines but cannot create child-owned inherited tracks. The subgrid's other
+axis remains an ordinary Grid axis and uses its local gap.
+
+## Positioned descendants and outline paint
+
+Absolutely positioned Grid descendants use the Grid positioning containing
+block, including the padding-edge fallback for automatic Grid placement. This
+keeps their percentage sizes independent from the Grid item's used size.
+
+Stacking-axis content distribution uses the packed stacking range as its sole
+alignment subject. The same range's end bounds self-alignment of the final
+item in a lane; a definite container size is the alignment container and does
+not enlarge either range.
+
+Quire also uses a documented compatibility paint policy for overlapping
+outlines: an ordinary normal-flow Grid outline paints before auto/zero-z
+positioned descendants, while an outline owned by a positioned or effect
+stacking context remains in that context's final local outline phase. CSS UI
+leaves this overlap ordering implementation-defined; the policy follows the
+historical optional per-box placement in CSS 2.2 and matches the positioned
+Grid WPT references.
+
+See [CSS Grid §9.1](https://drafts.csswg.org/css-grid-1/#abspos),
+[CSS UI §3](https://drafts.csswg.org/css-ui-4/#outline-painting), and
+[CSS 2.2 Appendix E](https://www.w3.org/TR/CSS22/zindex.html).
+
 ## Remaining gaps
 
+- Replaced/aspect-ratio row-lane items whose cyclic grid-axis percentage is
+  coupled to an automatic cross-axis size are not yet raster-exact. Their
+  virtual contribution and final packed size need a shared cross-axis
+  definiteness representation.
+- Row-lane auto-track repeats with cyclic percentage-sized items can still
+  select too many repetitions. The virtual intrinsic contribution needs to
+  preserve the percentage's Grid sizing phase without prematurely resolving
+  it against a final lane area.
 - General `grid-auto-columns` / `grid-auto-rows` sizing functions after an
   intrinsic repeat, beyond the covered default `auto` path.
-- Subgrid propagation, fragmentation, complete writing-mode behavior, and
-  advanced alignment/safe-overflow behavior for Grid Lanes.
+- Subgrid fragmentation, row-lane stacking-axis alignment, inherited-axis
+  local-gap delta adjustment, and complete writing-mode behavior for Grid
+  Lanes. Horizontal column lanes
+  support stacking-axis `normal`/`stretch`, positional, safe-overflow, and
+  `align-self` alignment after normal placement, including fill and track
+  reversal. The remaining auto-height `column-align-items-001`, `002`, `006`,
+  `007`, and `016` PDF comparisons differ from their flex-based references'
+  intrinsic track sizing rather than the Grid Lanes alignment geometry.

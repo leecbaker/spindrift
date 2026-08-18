@@ -2,7 +2,6 @@ use super::*;
 use crate::css::html5_user_agent_stylesheet;
 use crate::css::parse::LayerRegistry;
 use cssparser::{Parser, ParserInput, Token};
-use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 
@@ -71,6 +70,67 @@ mod tests {
                 "{tag}"
             );
         }
+    }
+
+    #[test]
+    fn document_root_preserves_embedding_effective_zoom_without_inheriting_parent_values() {
+        let mut embedding_context = ComputedStyle::initial();
+        embedding_context.effective_zoom = EffectiveZoom::from_parent_and_local(
+            EffectiveZoom::NORMAL,
+            CssZoom::parse("2").unwrap(),
+        );
+        embedding_context.color = CssColor::new(1, 2, 3);
+        let stylesheets = Stylesheets::for_document(html5_user_agent_stylesheet(), None, &[]);
+
+        let style = style_for_element_with_signature(
+            ElementSignature::new("html", HashMap::new()),
+            None,
+            &stylesheets,
+            Some(&embedding_context),
+            &[],
+        );
+
+        assert_eq!(style.effective_zoom.factor(), 2.0);
+        assert_eq!(style.color, ComputedStyle::initial().color);
+    }
+
+    #[test]
+    fn effective_zoom_crosses_the_computed_style_tree_without_inheriting_zoom() {
+        let stylesheet = crate::css::parse_stylesheet(&Css::from_string(".zoom { zoom: 2 }"));
+        let stylesheets = Stylesheets::for_document(
+            html5_user_agent_stylesheet(),
+            None,
+            std::slice::from_ref(&stylesheet),
+        );
+        let root = style_for_element_with_signature(
+            ElementSignature::new("html", HashMap::new()),
+            None,
+            &stylesheets,
+            None,
+            &[],
+        );
+        let zoomed = style_for_element_with_signature(
+            ElementSignature::new("div", HashMap::from([("class".into(), "zoom".into())])),
+            None,
+            &stylesheets,
+            Some(&root),
+            &[ElementSignature::new("html", HashMap::new())],
+        );
+        let descendant = style_for_element_with_signature(
+            ElementSignature::new("div", HashMap::new()),
+            None,
+            &stylesheets,
+            Some(&zoomed),
+            &[
+                ElementSignature::new("html", HashMap::new()),
+                ElementSignature::new("div", HashMap::from([("class".into(), "zoom".into())])),
+            ],
+        );
+
+        assert_eq!(zoomed.zoom.used_factor(), 2.0);
+        assert_eq!(zoomed.effective_zoom.factor(), 2.0);
+        assert_eq!(descendant.zoom.used_factor(), 1.0);
+        assert_eq!(descendant.effective_zoom.factor(), 2.0);
     }
 
     #[test]
@@ -423,10 +483,25 @@ impl SvgPresentationAttributeDeclarations {
     /// Build the static SVG transform presentation declarations. Invalid SVG
     /// syntax contributes no declaration, allowing a lower-priority valid
     /// declaration to remain the cascade winner.
+    #[cfg(test)]
     pub(crate) fn transform_properties(
         transform: Option<&str>,
         transform_origin: Option<&str>,
         transform_box: Option<&str>,
+    ) -> Self {
+        Self::svg_properties(transform, transform_origin, transform_box, None, None)
+    }
+
+    /// Build SVG presentation-attribute declarations that the host cascade
+    /// owns.  Filter color attributes need to enter this same origin and
+    /// specificity boundary so their computed `currentcolor` provenance is
+    /// available to the SVG filter bridge.
+    pub(crate) fn svg_properties(
+        transform: Option<&str>,
+        transform_origin: Option<&str>,
+        transform_box: Option<&str>,
+        flood_color: Option<&str>,
+        lighting_color: Option<&str>,
     ) -> Self {
         let mut source = String::new();
         let transform = match transform {
@@ -459,6 +534,17 @@ impl SvgPresentationAttributeDeclarations {
             source.push_str("transform-box:");
             source.push_str(transform_box);
             source.push(';');
+        }
+        for (property, value) in [
+            ("flood-color", flood_color),
+            ("lighting-color", lighting_color),
+        ] {
+            if let Some(value) = value {
+                source.push_str(property);
+                source.push(':');
+                source.push_str(value);
+                source.push(';');
+            }
         }
         Self {
             declarations: parse_declarations(&source),
@@ -546,16 +632,35 @@ impl<'a> ElementCascadeContext<'a> {
         stylesheets: &'a Stylesheets<'a>,
         rule_set: fn(&Stylesheet) -> &[StyleRule],
     ) {
+        self.collect_matching_rules_with_link_matching(
+            stylesheets,
+            rule_set,
+            crate::css::selector::LinkMatching::Actual,
+        );
+    }
+
+    fn collect_matching_rules_with_link_matching(
+        &mut self,
+        stylesheets: &'a Stylesheets<'a>,
+        rule_set: fn(&Stylesheet) -> &[StyleRule],
+        link_matching: crate::css::selector::LinkMatching,
+    ) {
+        // `selectors` caches a selector result by element identity. Link state
+        // is deliberately an additional private matching input, so cached
+        // force-unvisited results cannot be reused for the actual-state color
+        // overlay (or vice versa).
+        self.selector_caches = SelectorCaches::default();
         self.matching_rules.clear();
         for (stylesheet_index, stylesheet) in stylesheets.iter().enumerate() {
             for rule in rule_set(stylesheet) {
                 if let Some((scope_proximity, matching_specificity)) =
-                    selector_matches_with_scope_proximity_in_chain(
+                    crate::css::selector::selector_matches_with_scope_proximity_in_chain_with_link_matching(
                         &rule.selector,
                         &rule.scopes,
                         &self.chain,
                         self.current_index(),
                         &mut self.selector_caches,
+                        link_matching,
                     )
                 {
                     self.matching_rules.push(MatchedRule {
@@ -606,13 +711,29 @@ fn style_for_element_with_signature_inner(
     // https://www.w3.org/TR/css-cascade-5/#root-element
     // https://www.w3.org/TR/css-values-4/#em
     let is_document_root = ancestors.is_empty() && current.tag.eq_ignore_ascii_case("html");
-    let inheritance_source = if is_document_root {
-        &initial_style
-    } else {
-        parent.unwrap_or(&initial_style)
-    };
+    // An embedded browsing context is not a DOM child of its iframe, so the
+    // root retains CSS initial inherited values. Its effective zoom is the
+    // one exception: CSS Viewport carries that used-value context across the
+    // frame boundary even though `zoom` itself is non-inherited.
+    // <https://drafts.csswg.org/css-viewport/#zoom-property>
+    let root_inheritance_style = is_document_root.then(|| {
+        let mut style = ComputedStyle::initial();
+        style.effective_zoom = parent
+            .map(|style| style.effective_zoom)
+            .unwrap_or(EffectiveZoom::NORMAL);
+        style
+    });
+    let inheritance_source = root_inheritance_style
+        .as_ref()
+        .unwrap_or_else(|| parent.unwrap_or(&initial_style));
     let mut style = if is_document_root {
-        ComputedStyle::initial()
+        let mut initial = ComputedStyle::initial();
+        // Preserve the embedding context only until the root's own cascade
+        // composes its local `zoom`; ordinary root inheritance remains CSS
+        // initial values.
+        initial.effective_zoom = inheritance_source.effective_zoom;
+        initial.zoom = CssZoom::NORMAL;
+        initial
     } else {
         parent
             .map(inherited_base_style)
@@ -639,7 +760,14 @@ fn style_for_element_with_signature_inner(
             presentational_hints_stylesheet_index = Some(stylesheet_index);
         }
     }
-    cascade.collect_matching_rules(stylesheets, |stylesheet| &stylesheet.rules);
+    // The normal computed style must not expose visited state through layout
+    // or any non-color used value. CSS only lets the private cascade affect
+    // a constrained set of paint colors.
+    cascade.collect_matching_rules_with_link_matching(
+        stylesheets,
+        |stylesheet| &stylesheet.rules,
+        crate::css::selector::LinkMatching::ForceUnvisited,
+    );
     cascade.rebuild_cascaded_declarations();
     let user_agent_stylesheet_index = stylesheets
         .iter()
@@ -649,9 +777,10 @@ fn style_for_element_with_signature_inner(
         })
         .last()
         .unwrap_or(0);
-    push_dynamic_html_list_user_agent_declarations(
+    push_dynamic_html_user_agent_declarations(
         &mut cascade.cascaded_declarations,
         &current,
+        parent,
         user_agent_stylesheet_index,
     );
     if let Some(stylesheet_index) = presentational_hints_stylesheet_index {
@@ -724,7 +853,16 @@ fn style_for_element_with_signature_inner(
         is_document_root,
         stylesheets.color_scheme_preference(),
     );
-    select_style_image_sets(&mut style, stylesheets.image_set_resolution_dppx());
+    apply_visited_color_overlay(
+        &mut style,
+        current.clone(),
+        stylesheets,
+        inheritance_source,
+        parent_ch_advance,
+        is_document_root,
+        &mut cascade,
+    );
+    resolve_style_images(&mut style, stylesheets.image_set_resolution_dppx());
     if is_document_root {
         style.root_font_size = style.font_size;
         style.page_color_scheme = style.used_color_scheme;
@@ -756,27 +894,354 @@ fn style_for_element_with_signature_inner(
     style
 }
 
-/// Resolve image-set candidate lists after declaration parsing, variable
-/// substitution, and cascade have produced one computed style. CSS Images
-/// selection is a rendering-environment decision, not declaration parsing.
+/// Apply the visited-link color view without allowing it to affect layout.
+///
+/// The unvisited cascade remains the ordinary computed style. The actual link
+/// state is independently cascaded only for paint-color longhands, then each
+/// visited alpha is replaced by the corresponding unvisited alpha. This keeps
+/// static PDF output deterministic while following the privacy boundary for
+/// `:visited` styling.
+/// <https://drafts.csswg.org/selectors/#link>
+#[allow(clippy::too_many_arguments)]
+fn apply_visited_color_overlay<'a>(
+    style: &mut ComputedStyle,
+    current: ElementSignature,
+    stylesheets: &'a Stylesheets<'a>,
+    inheritance_source: &ComputedStyle,
+    parent_ch_advance: LayoutLength,
+    is_document_root: bool,
+    cascade: &mut ElementCascadeContext<'a>,
+) {
+    let matching_rule_keys = |cascade: &ElementCascadeContext<'_>| {
+        cascade
+            .matching_rules
+            .iter()
+            .map(|rule| {
+                (
+                    rule.stylesheet_index,
+                    rule.rule.order,
+                    rule.specificity,
+                    rule.scope_proximity,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    cascade.collect_matching_rules(stylesheets, |stylesheet| &stylesheet.rules);
+    let actual_matching_rules = matching_rule_keys(cascade);
+    cascade.collect_matching_rules_with_link_matching(
+        stylesheets,
+        |stylesheet| &stylesheet.rules,
+        crate::css::selector::LinkMatching::ForceUnvisited,
+    );
+    if actual_matching_rules == matching_rule_keys(cascade) {
+        return;
+    }
+    cascade.collect_matching_rules(stylesheets, |stylesheet| &stylesheet.rules);
+    cascade.rebuild_cascaded_declarations();
+    resolve_typed_attr_references(&mut cascade.cascaded_declarations, &current, stylesheets);
+    sort_cascaded_declarations(&mut cascade.cascaded_declarations);
+    let all_declarations = std::mem::take(&mut cascade.cascaded_declarations);
+    let color_declarations = visited_color_declarations(&all_declarations);
+    if color_declarations.is_empty() {
+        cascade.cascaded_declarations = all_declarations;
+        return;
+    }
+
+    let unvisited = style.clone();
+    let mut visited = unvisited.clone();
+    let has_row_rule_color = color_declarations
+        .iter()
+        .any(|declaration| declaration.property.css_name() == "row-rule-color");
+    let has_column_rule_color = color_declarations
+        .iter()
+        .any(|declaration| declaration.property.css_name() == "column-rule-color");
+    apply_cascaded_declarations_with_inheritance_source_and_parent_ch_advance(
+        &mut visited,
+        &color_declarations,
+        inheritance_source,
+        parent_ch_advance,
+        is_document_root,
+        stylesheets.color_scheme_preference(),
+    );
+    merge_visited_paint_colors(
+        style,
+        &unvisited,
+        &visited,
+        has_row_rule_color,
+        has_column_rule_color,
+    );
+    cascade.cascaded_declarations = all_declarations;
+}
+
+/// CSS properties whose visited cascade may influence static paint.
+///
+/// The list deliberately excludes shorthands that would also alter geometry
+/// (for example `border` and `column-rule`), plus custom properties, opacity,
+/// and image/filter values.
+fn visited_safe_color_property(name: &str) -> bool {
+    matches!(
+        name,
+        "color"
+            | "background-color"
+            | "border-color"
+            | "border-top-color"
+            | "border-right-color"
+            | "border-bottom-color"
+            | "border-left-color"
+            | "border-inline-start-color"
+            | "border-inline-end-color"
+            | "border-block-start-color"
+            | "border-block-end-color"
+            | "outline-color"
+            | "text-decoration-color"
+            | "text-emphasis-color"
+            | "-webkit-text-fill-color"
+            | "fill"
+            | "stroke"
+            | "column-rule-color"
+            | "row-rule-color"
+            | "rule-color"
+    )
+}
+
+/// Preserve every declaration that can influence the supported color
+/// longhands. `all` must remain intact through the normal cascade machinery;
+/// its non-color effects are discarded with the temporary style afterwards.
+fn visited_color_declarations<'a>(
+    declarations: &[CascadedDeclaration<'a>],
+) -> Vec<CascadedDeclaration<'a>> {
+    declarations
+        .iter()
+        .filter(|declaration| {
+            visited_safe_color_property(declaration.property.css_name())
+                || declaration.property.css_name() == "all"
+        })
+        .cloned()
+        .collect()
+}
+
+fn visited_color(unvisited: CssColor, visited: CssColor) -> CssColor {
+    visited.with_alpha(unvisited.alpha())
+}
+
+fn visited_current_color(
+    unvisited: CssColorOrCurrentColor,
+    unvisited_foreground: CssColor,
+    visited: CssColorOrCurrentColor,
+    visited_foreground: CssColor,
+) -> CssColorOrCurrentColor {
+    CssColorOrCurrentColor::Color(visited_color(
+        unvisited.resolve(unvisited_foreground),
+        visited.resolve(visited_foreground),
+    ))
+}
+
+fn visited_svg_paint(
+    unvisited: SvgPresentationPaint,
+    unvisited_foreground: CssColor,
+    visited: SvgPresentationPaint,
+    visited_foreground: CssColor,
+) -> SvgPresentationPaint {
+    let Some(visited_color_value) = visited.paint.resolve(visited_foreground) else {
+        return unvisited;
+    };
+    let Some(unvisited_color_value) = unvisited.paint.resolve(unvisited_foreground) else {
+        return unvisited;
+    };
+    SvgPresentationPaint {
+        paint: SvgPaint::Color(visited_color(unvisited_color_value, visited_color_value)),
+        source: visited.source,
+    }
+}
+
+fn merge_visited_paint_colors(
+    style: &mut ComputedStyle,
+    unvisited: &ComputedStyle,
+    visited: &ComputedStyle,
+    has_row_rule_color: bool,
+    has_column_rule_color: bool,
+) {
+    if unvisited.color != visited.color {
+        style.color = visited_color(unvisited.color, visited.color);
+    }
+    let unvisited_background = unvisited
+        .background
+        .background_color
+        .resolved_color(unvisited.color);
+    let visited_background = visited
+        .background
+        .background_color
+        .resolved_color(visited.color);
+    if unvisited_background != visited_background {
+        style.background.background_color =
+            BackgroundColor::Color(visited_color(unvisited_background, visited_background));
+    }
+    let border_color = visited_current_color(
+        unvisited.border_color,
+        unvisited.color,
+        visited.border_color,
+        visited.color,
+    );
+    if unvisited.border_color.resolve(unvisited.color)
+        != visited.border_color.resolve(visited.color)
+    {
+        style.border_color = border_color;
+    }
+    for (target, unvisited_color, visited_color_value) in [
+        (
+            &mut style.border_colors.top,
+            unvisited.border_colors.top,
+            visited.border_colors.top,
+        ),
+        (
+            &mut style.border_colors.right,
+            unvisited.border_colors.right,
+            visited.border_colors.right,
+        ),
+        (
+            &mut style.border_colors.bottom,
+            unvisited.border_colors.bottom,
+            visited.border_colors.bottom,
+        ),
+        (
+            &mut style.border_colors.left,
+            unvisited.border_colors.left,
+            visited.border_colors.left,
+        ),
+    ] {
+        let color = visited_current_color(
+            unvisited_color,
+            unvisited.color,
+            visited_color_value,
+            visited.color,
+        );
+        if unvisited_color.resolve(unvisited.color) != visited_color_value.resolve(visited.color) {
+            *target = color;
+        }
+    }
+    let outline_color = visited_current_color(
+        unvisited.outline_color,
+        unvisited.color,
+        visited.outline_color,
+        visited.color,
+    );
+    if unvisited.outline_color.resolve(unvisited.color)
+        != visited.outline_color.resolve(visited.color)
+    {
+        style.outline_color = outline_color;
+    }
+    let text_fill_color = visited_current_color(
+        unvisited.text_fill_color,
+        unvisited.color,
+        visited.text_fill_color,
+        visited.color,
+    );
+    if unvisited.text_fill_color.resolve(unvisited.color)
+        != visited.text_fill_color.resolve(visited.color)
+    {
+        style.text_fill_color = text_fill_color;
+    }
+    let text_emphasis_color = visited_current_color(
+        unvisited.text_emphasis_color,
+        unvisited.color,
+        visited.text_emphasis_color,
+        visited.color,
+    );
+    if unvisited.text_emphasis_color.resolve(unvisited.color)
+        != visited.text_emphasis_color.resolve(visited.color)
+    {
+        style.text_emphasis_color = text_emphasis_color;
+    }
+    let text_decoration_color = visited_current_color(
+        unvisited.text_decoration.color,
+        unvisited.color,
+        visited.text_decoration.color,
+        visited.color,
+    );
+    if unvisited.text_decoration.color.resolve(unvisited.color)
+        != visited.text_decoration.color.resolve(visited.color)
+    {
+        style.text_decoration.color = text_decoration_color;
+    }
+    let svg_fill = visited_svg_paint(
+        unvisited.svg_fill,
+        unvisited.color,
+        visited.svg_fill,
+        visited.color,
+    );
+    if svg_fill != unvisited.svg_fill {
+        style.svg_fill = svg_fill;
+    }
+    let svg_stroke = visited_svg_paint(
+        unvisited.svg_stroke,
+        unvisited.color,
+        visited.svg_stroke,
+        visited.color,
+    );
+    if svg_stroke != unvisited.svg_stroke {
+        style.svg_stroke = svg_stroke;
+    }
+    if has_row_rule_color {
+        style.row_rule.visited_colors = Some(visited.row_rule.colors.clone());
+    }
+    if has_column_rule_color {
+        style.column_rule.visited_colors = Some(visited.column_rule.colors.clone());
+    }
+}
+
+/// Resolve image values after declaration parsing, variable substitution, and
+/// cascade have produced one computed style. CSS Color 5's `light-dark()`
+/// selection precedes CSS Images' `image-set()` candidate negotiation.
+/// <https://drafts.csswg.org/css-color-5/#light-dark>
 /// <https://drafts.csswg.org/css-images-4/#image-set-notation>
-fn select_style_image_sets(style: &mut ComputedStyle, resolution_dppx: f32) {
-    style.background.select_image_sets(resolution_dppx);
-    style.border_image.source.select_image_set(resolution_dppx);
-    style.list_style_image.select_image_set(resolution_dppx);
+fn resolve_style_images(style: &mut ComputedStyle, resolution_dppx: f32) {
+    let context = ImageSelectionContext {
+        used_color_scheme: style.used_color_scheme,
+        resolution_dppx,
+    };
+    resolve_background_images(&mut style.background, context);
+    style.border_image.source.resolve_for_context(context);
+    style.mask_border_source.resolve_for_context(context);
+    style.list_style_image.resolve_for_context(context);
+    resolve_named_string_images(&mut style.string_sets, context);
+    if let ShapeOutside::Image(image) = &mut style.shape_outside
+        && !image.resolve_for_context(context)
+    {
+        style.shape_outside = ShapeOutside::None;
+    }
     match &mut style.content {
-        Content::List { parts, .. } => select_generated_content_image_sets(parts, resolution_dppx),
+        Content::List { parts, .. } => resolve_generated_content_images(parts, context),
         Content::Replacement { image, .. } => {
-            select_generated_content_image_sets(std::slice::from_mut(image), resolution_dppx)
+            resolve_generated_content_images(std::slice::from_mut(image), context)
         }
         Content::Normal | Content::None => {}
     }
 }
 
-fn select_generated_content_image_sets(parts: &mut [GeneratedContentPart], resolution_dppx: f32) {
+fn resolve_background_images(background: &mut Background, context: ImageSelectionContext) {
+    background.background_image.resolve_for_context(context);
+    for layer in &mut background.background_layers {
+        layer.image.resolve_for_context(context);
+    }
+}
+
+fn resolve_generated_content_images(
+    parts: &mut [GeneratedContentPart],
+    context: ImageSelectionContext,
+) {
     for part in parts {
         if let GeneratedContentPart::Image { image } = part {
-            image.select_image_set(resolution_dppx);
+            image.resolve_for_context(context);
+        }
+    }
+}
+
+fn resolve_named_string_images(sets: &mut [NamedStringSet], context: ImageSelectionContext) {
+    for set in sets {
+        for part in &mut set.parts {
+            if let NamedStringPart::Image(image) = part {
+                image.resolve_for_context(context);
+            }
         }
     }
 }
@@ -930,7 +1395,9 @@ fn apply_forced_color_used_values(
         }
     }
     style.row_rule.colors = GapRuleList::single(palette.canvas_text);
+    style.row_rule.visited_colors = None;
     style.column_rule.colors = GapRuleList::single(palette.canvas_text);
+    style.column_rule.visited_colors = None;
     style.box_shadow.clear();
     style.text_shadow.clear();
     // URL images are retained, except on ordinary inline boxes. Their
@@ -1023,7 +1490,7 @@ fn resolve_style_system_colors(style: &mut ComputedStyle, palette: ForcedColorPa
 fn background_image_contains_url(image: &ComputedImage) -> bool {
     image
         .as_image()
-        .is_some_and(|image| matches!(image.selected_image(), BackgroundImage::Url { .. }))
+        .is_some_and(|image| matches!(image.selected_image(), BackgroundImage::Url(_)))
 }
 
 fn style_has_url_background_image(style: &ComputedStyle) -> bool {
@@ -1414,15 +1881,17 @@ fn typed_attr_replacement<'a>(raw: &'a str, type_syntax: &str) -> Option<&'a str
     None
 }
 
-/// Adds the value-dependent portion of HTML's user-agent list rules.
+/// Adds HTML user-agent declarations whose selector matching depends on
+/// computed parent state or element attributes.
 ///
 /// Unlike legacy presentational hints, `ol[start]`, `ol[reversed]`,
 /// and `li[value]` define the list's semantic ordinal. Expressing them as UA
 /// counter declarations lets the ordinary cascade give author CSS precedence:
 /// <https://html.spec.whatwg.org/multipage/rendering.html#lists>.
-fn push_dynamic_html_list_user_agent_declarations(
+fn push_dynamic_html_user_agent_declarations(
     output: &mut Vec<CascadedDeclaration<'_>>,
     element: &ElementSignature,
+    parent: Option<&ComputedStyle>,
     stylesheet_index: usize,
 ) {
     if !element.document_is_html
@@ -1434,10 +1903,53 @@ fn push_dynamic_html_list_user_agent_declarations(
         return;
     }
 
+    // HTML's suggested rendering centers a header cell only when the parent
+    // computes `text-align` to its initial value. This is a computed-value
+    // condition, so it cannot be represented by an ordinary CSS selector.
+    // Keep it at UA origin to let all author declarations, including
+    // `text-align: inherit`, override it through the normal cascade.
+    // https://html.spec.whatwg.org/multipage/rendering.html#tables-2
+    if element.tag == "th" && parent.is_some_and(|style| style.text_align == TextAlign::Start) {
+        output.push(CascadedDeclaration {
+            property: CascadedProperty::from_name(std::borrow::Cow::Borrowed("text-align")),
+            value: std::borrow::Cow::Borrowed("center"),
+            origin: StylesheetOrigin::UserAgent,
+            base_url: None,
+            root_url: None,
+            important: false,
+            layer_order: None,
+            specificity: 1,
+            scope_proximity: usize::MAX,
+            stylesheet_index,
+            rule_order: usize::MAX,
+            declaration_order: 0,
+        });
+    }
+
+    // HTML's suggested rendering centers table captions. Keep this at UA
+    // origin so an author-specified caption alignment wins normally.
+    // https://html.spec.whatwg.org/multipage/rendering.html#tables-2
+    if element.tag == "caption" {
+        output.push(CascadedDeclaration {
+            property: CascadedProperty::from_name(std::borrow::Cow::Borrowed("text-align")),
+            value: std::borrow::Cow::Borrowed("center"),
+            origin: StylesheetOrigin::UserAgent,
+            base_url: None,
+            root_url: None,
+            important: false,
+            layer_order: None,
+            specificity: 1,
+            scope_proximity: usize::MAX,
+            stylesheet_index,
+            rule_order: usize::MAX,
+            declaration_order: 0,
+        });
+    }
+
     // The obsolete HTML `font` element remains part of the HTML rendering
     // rules. Its positive integer size maps to the legacy absolute-size
     // ladder, independently of optional presentational-hint support.
-    // <https://html.spec.whatwg.org/multipage/rendering.html#phrasing-content-3>
+    // <https://html.spec.whatwg.org/multipage/rendering.html#rendering>
     if element.tag == "font"
         && let Some(size) = element
             .attrs
@@ -1621,7 +2133,10 @@ fn push_dynamic_replaced_element_dimension_hint_declarations<'a>(
     stylesheet: &'a Stylesheet,
     declaration_order: &mut usize,
 ) {
-    if !element.document_is_html {
+    // HTML's rendering rules express these hints in the XHTML namespace, so
+    // XML-syntax HTML documents receive the same image dimension mapping.
+    // <https://html.spec.whatwg.org/multipage/rendering.html#attributes-for-embedded-content-and-images>
+    if !element.document_is_html && element.namespace_url != "http://www.w3.org/1999/xhtml" {
         return;
     }
     let is_image_button = element.tag == "input"
@@ -1897,13 +2412,18 @@ fn push_dynamic_table_presentational_hint_declarations<'a>(
 ) {
     let is_table = element.tag == "table";
     let is_cell = matches!(element.tag.as_str(), "td" | "th");
+    let is_column = element.tag == "col";
     let is_row_group = matches!(element.tag.as_str(), "thead" | "tbody" | "tfoot");
     let is_row = element.tag == "tr";
-    if !(is_table || is_cell || is_row_group || is_row) {
+    if !(is_table || is_cell || is_column || is_row_group || is_row) {
         return;
     }
 
-    if (is_table || is_cell)
+    // HTML maps the legacy `width` attribute on a column to the CSS width
+    // property.  Table track sizing then consumes that computed column
+    // constraint in both auto and fixed layout.
+    // <https://html.spec.whatwg.org/multipage/rendering.html#phrasing-content-3>
+    if (is_table || is_cell || is_column)
         && let Some(width) = element
             .attrs
             .get("width")
@@ -2165,15 +2685,7 @@ fn is_html_space(character: char) -> bool {
 /// computed longhands while preserving the decorating box's used values:
 /// <https://drafts.csswg.org/css-text-decor-4/#line-decoration>.
 pub(super) fn finalize_text_decoration_layers(style: &mut ComputedStyle) {
-    if style.text_decoration.clone().has_visible_line() {
-        let decoration = style.text_decoration.clone();
-        let mut origin_style = style.clone();
-        origin_style.text_decoration_layers.clear();
-        style.text_decoration_layers.push(TextDecorationLayer {
-            decoration,
-            origin_style: Rc::new(origin_style),
-        });
-    }
+    style.rebuild_own_text_decoration_layer();
 }
 
 /// Add HTML `dir=auto`/`bdi` directionality as a UA cascade declaration.
@@ -2332,10 +2844,14 @@ fn apply_marker_rules_from_rule_set<'a>(
     parent_ch_advance: LayoutLength,
     rule_set: fn(&Stylesheet) -> &[StyleRule],
 ) {
-    cascade.collect_matching_rules(stylesheets, rule_set);
-    if cascade.matching_rules.is_empty() && !style.display.is_list_item() {
+    // ::marker generates a box only for list items. Checking the originating
+    // computed display before selector matching avoids constructing a marker
+    // style for every ordinary element matched by the UA's universal rule.
+    // https://drafts.csswg.org/css-pseudo-4/#marker-pseudo
+    if !style.display.is_list_item() {
         return;
     }
+    cascade.collect_matching_rules(stylesheets, rule_set);
 
     // CSS Pseudo-Elements 4 and CSS Lists 3 model `::marker` as a generated
     // marker box with a restricted property set. The marker starts from the
@@ -2364,7 +2880,7 @@ fn apply_marker_rules_from_rule_set<'a>(
         parent_ch_advance,
         stylesheets.color_scheme_preference(),
     );
-    select_style_image_sets(&mut marker_style, stylesheets.image_set_resolution_dppx());
+    resolve_style_images(&mut marker_style, stylesheets.image_set_resolution_dppx());
     marker_style
         .quotes
         .resolve_auto_language(style.language.as_deref());
@@ -2436,7 +2952,7 @@ fn generated_pseudo_style_with_context<'a>(
         false,
         stylesheets.color_scheme_preference(),
     );
-    select_style_image_sets(&mut pseudo_style, stylesheets.image_set_resolution_dppx());
+    resolve_style_images(&mut pseudo_style, stylesheets.image_set_resolution_dppx());
     pseudo_style
         .quotes
         .resolve_auto_language(originating_style.language.as_deref());

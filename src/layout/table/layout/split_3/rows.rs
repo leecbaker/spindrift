@@ -67,8 +67,11 @@ impl TableFragmentStartPlacement {
     }
 
     fn fragmentainer(self) -> TableFragmentainerPlacement {
+        // The destination cell grid is derived from the fragmentainer's
+        // wrapper grid exactly once.  Applying this continuation-only inset
+        // here used to shift every separated-border continuation a second
+        // time, after `TableGridFrames` had already removed the outer edge.
         self.fragmentainer
-            .inset_destination_grid_block_start(self.leading_grid_edge_spacing)
     }
 }
 
@@ -82,7 +85,10 @@ impl<'a> LayoutBuilder<'a> {
     /// so row decisions continue to use one logical block coordinate system:
     /// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box> and
     /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>.
-    fn table_fragmentainer_block_size(&self, style: &ComputedStyle) -> f32 {
+    pub(in crate::layout::table) fn table_fragmentainer_block_size(
+        &self,
+        style: &ComputedStyle,
+    ) -> f32 {
         if style.writing_mode.has_vertical_lines() {
             (self.content_right - self.content_left).max(0.0)
         } else {
@@ -235,7 +241,7 @@ impl<'a> LayoutBuilder<'a> {
         Option<TableBodyPaintFragment>,
         PageBreak,
         TableFragmentRepeatPolicy,
-        TableContinuationInlineOffset,
+        HorizontalTableContinuationInlineOffset,
     ) {
         let TableBodyRowsInput {
             fragmentainer_kind,
@@ -288,9 +294,8 @@ impl<'a> LayoutBuilder<'a> {
         );
         let mut table_x = table_x;
         let continuation_inline_offset =
-            TableContinuationInlineOffset::capture(table_x, self.content_left);
+            HorizontalTableContinuationInlineOffset::capture(table_x, self.content_left);
         let mut table_body_fragment_started = false;
-        let mut table_body_fragment: Option<TableBodyPaintFragment> = None;
         let logical_block_edge_spacing =
             Self::table_logical_block_edge_spacing(style, planned_row_occupancy, &table_metrics);
         let mut logical_block_cursor = if style.writing_mode.has_vertical_lines() {
@@ -321,6 +326,7 @@ impl<'a> LayoutBuilder<'a> {
                 self.cursor_y
             },
         );
+        let mut table_body_fragment: Option<TableBodyPaintFragment> = None;
         let mut forced_break_carry = TableForcedBreakCarryState::new(fragmentainer_kind);
         let mut avoid_break_candidates = TableAvoidBreakCandidateState::new(fragmentainer_kind);
         let mut previous_row_page_end: Option<Option<String>> = None;
@@ -422,7 +428,11 @@ impl<'a> LayoutBuilder<'a> {
                 && row_page_start != self.active_page_value_scope(style)
             {
                 self.switch_page_name_at_class_a_boundary(row_page_start.as_deref());
-                fragment_commit_context.rebase_to_content_left(self.content_left);
+                fragment_commit_context.rebase_destination_grid_to_fragmentainer(
+                    style,
+                    self.content_left,
+                    self.content_right,
+                );
                 table_x = fragment_commit_context.table_x;
                 logical_block_cursor = self.table_block_cursor_after_fragment_start(style, 0.0);
                 pending_fragmentainer_placement = self.table_fragmentainer_placement(
@@ -458,7 +468,11 @@ impl<'a> LayoutBuilder<'a> {
                     named_page_break.boundary,
                 );
                 self.switch_page_name_at_class_a_boundary(named_page_break.page_name.as_deref());
-                fragment_commit_context.rebase_to_content_left(self.content_left);
+                fragment_commit_context.rebase_destination_grid_to_fragmentainer(
+                    style,
+                    self.content_left,
+                    self.content_right,
+                );
                 table_x = fragment_commit_context.table_x;
                 logical_block_cursor =
                     self.table_block_cursor_after_fragment_start(style, logical_block_edge_spacing);
@@ -500,10 +514,14 @@ impl<'a> LayoutBuilder<'a> {
                 forced_break_carry.take_box_context(break_before, break_after, next_break_before);
             let forced_break_before = row_breaks.forced_break_before_in(fragmentainer_kind);
             let mut broke_before_row = forced_break_before.is_some();
+            let wrapper_timeline_checkpoint = table_body_fragment
+                .as_ref()
+                .and_then(TableBodyPaintFragment::wrapper_timeline_checkpoint);
             let pending_row_start_candidate = PendingTableBreakCandidate {
                 meta: TableBreakCandidateMeta {
                     row_index,
                     table_body_fragment: table_body_fragment.clone(),
+                    wrapper_timeline_checkpoint,
                     repeat_policy: current_fragment_repeat_policy,
                     height: 0.0,
                 },
@@ -528,16 +546,20 @@ impl<'a> LayoutBuilder<'a> {
                 );
                 current_fragment_repeat_policy = forced_break.start.repeat_policy;
                 pending_fragment_start = forced_break.start;
-                self.apply_table_body_forced_break(
+                if let Some(destination_cursor) = self.apply_table_body_forced_break(
                     &mut table_body_fragment,
                     &mut fragment_commit_context,
                     &mut pending_fragmentainer_placement,
                     forced_break,
                     source_row_has_occupied_cell,
-                );
+                ) {
+                    logical_block_cursor = destination_cursor;
+                    start_chrome_replayed_after_break = true;
+                } else {
+                    logical_block_cursor = self
+                        .table_block_cursor_after_fragment_start(style, logical_block_edge_spacing);
+                }
                 table_x = fragment_commit_context.table_x;
-                logical_block_cursor =
-                    self.table_block_cursor_after_fragment_start(style, logical_block_edge_spacing);
             }
             // Rows and row groups are both table fragmentation containers.
             // Represent a row-level `break-inside: avoid` as a one-row range
@@ -659,7 +681,7 @@ impl<'a> LayoutBuilder<'a> {
                     // call site.
                     avoid_row_group_keep_state.commit(decision);
                     pending_fragment_start = transition.start;
-                    self.apply_table_body_fragment_transition(
+                    logical_block_cursor = self.apply_table_body_fragment_transition(
                         &mut table_body_fragment,
                         &mut fragment_commit_context,
                         &mut pending_fragmentainer_placement,
@@ -669,7 +691,6 @@ impl<'a> LayoutBuilder<'a> {
                     );
                     table_body_fragment_started = true;
                     table_x = fragment_commit_context.table_x;
-                    logical_block_cursor = self.table_block_cursor_after_fragment_start(style, 0.0);
                     start_chrome_replayed_after_break = true;
                     broke_before_row = true;
                 }
@@ -686,7 +707,7 @@ impl<'a> LayoutBuilder<'a> {
                     );
                     current_fragment_repeat_policy = transition.start.repeat_policy;
                     pending_fragment_start = transition.start;
-                    self.apply_table_body_fragment_transition(
+                    logical_block_cursor = self.apply_table_body_fragment_transition(
                         &mut table_body_fragment,
                         &mut fragment_commit_context,
                         &mut pending_fragmentainer_placement,
@@ -696,8 +717,6 @@ impl<'a> LayoutBuilder<'a> {
                     );
                     table_body_fragment_started = true;
                     table_x = fragment_commit_context.table_x;
-                    logical_block_cursor = self
-                        .table_block_cursor_after_fragment_start(style, logical_block_edge_spacing);
                     start_chrome_replayed_after_break = true;
                     broke_before_row = true;
                 }
@@ -737,6 +756,12 @@ impl<'a> LayoutBuilder<'a> {
                         > current_fragmentainer.available_block_size().points() + 0.01
                 );
                 let candidate_meta = decision.candidate.restore(self);
+                if let (Some(fragment), Some(checkpoint)) = (
+                    candidate_meta.table_body_fragment.as_ref(),
+                    candidate_meta.wrapper_timeline_checkpoint,
+                ) {
+                    fragment.rewind_wrapper_timeline(checkpoint);
+                }
                 table_body_fragment = candidate_meta.table_body_fragment;
                 current_fragment_repeat_policy = candidate_meta.repeat_policy;
                 let transition = Self::table_body_fragment_transition(
@@ -754,7 +779,7 @@ impl<'a> LayoutBuilder<'a> {
                 );
                 current_fragment_repeat_policy = transition.start.repeat_policy;
                 pending_fragment_start = transition.start;
-                self.apply_table_body_fragment_transition(
+                logical_block_cursor = self.apply_table_body_fragment_transition(
                     &mut table_body_fragment,
                     &mut fragment_commit_context,
                     &mut pending_fragmentainer_placement,
@@ -764,8 +789,6 @@ impl<'a> LayoutBuilder<'a> {
                 );
                 table_body_fragment_started = true;
                 table_x = fragment_commit_context.table_x;
-                logical_block_cursor =
-                    self.table_block_cursor_after_fragment_start(style, logical_block_edge_spacing);
                 row_index = candidate_meta.row_index;
                 avoid_break_candidates.reset();
                 continue;
@@ -797,7 +820,7 @@ impl<'a> LayoutBuilder<'a> {
                 );
                 current_fragment_repeat_policy = transition.start.repeat_policy;
                 pending_fragment_start = transition.start;
-                self.apply_table_body_fragment_transition(
+                logical_block_cursor = self.apply_table_body_fragment_transition(
                     &mut table_body_fragment,
                     &mut fragment_commit_context,
                     &mut pending_fragmentainer_placement,
@@ -807,8 +830,6 @@ impl<'a> LayoutBuilder<'a> {
                 );
                 table_body_fragment_started = true;
                 table_x = fragment_commit_context.table_x;
-                logical_block_cursor =
-                    self.table_block_cursor_after_fragment_start(style, logical_block_edge_spacing);
                 start_chrome_replayed_after_break = true;
                 broke_before_row = true;
             }
@@ -818,6 +839,8 @@ impl<'a> LayoutBuilder<'a> {
                         &fragment_commit_context,
                         pending_fragment_start,
                     );
+                    logical_block_cursor = self
+                        .table_block_cursor_after_fragment_start(style, logical_block_edge_spacing);
                 }
                 let after_header_fragmentainer = row_chrome_context.current_fragmentainer(
                     PageTopBlockPosition::new(logical_block_cursor),
@@ -854,7 +877,7 @@ impl<'a> LayoutBuilder<'a> {
                     );
                     current_fragment_repeat_policy = transition.start.repeat_policy;
                     pending_fragment_start = transition.start;
-                    self.apply_table_body_fragment_transition(
+                    logical_block_cursor = self.apply_table_body_fragment_transition(
                         &mut table_body_fragment,
                         &mut fragment_commit_context,
                         &mut pending_fragmentainer_placement,
@@ -864,8 +887,6 @@ impl<'a> LayoutBuilder<'a> {
                     );
                     table_body_fragment_started = true;
                     table_x = fragment_commit_context.table_x;
-                    logical_block_cursor = self
-                        .table_block_cursor_after_fragment_start(style, logical_block_edge_spacing);
                 }
             }
 
@@ -1035,7 +1056,7 @@ impl<'a> LayoutBuilder<'a> {
                         );
                         current_fragment_repeat_policy = transition.start.repeat_policy;
                         pending_fragment_start = transition.start;
-                        self.apply_table_body_fragment_transition(
+                        logical_block_cursor = self.apply_table_body_fragment_transition(
                             &mut table_body_fragment,
                             &mut fragment_commit_context,
                             &mut pending_fragmentainer_placement,
@@ -1045,8 +1066,6 @@ impl<'a> LayoutBuilder<'a> {
                         );
                         table_body_fragment_started = true;
                         table_x = fragment_commit_context.table_x;
-                        logical_block_cursor =
-                            self.table_block_cursor_after_fragment_start(style, 0.0);
                         let fragment_placement = pending_fragmentainer_placement;
                         self.ensure_committed_table_body_fragment(
                             &mut table_body_fragment,
@@ -1138,7 +1157,7 @@ impl<'a> LayoutBuilder<'a> {
                         );
                         current_fragment_repeat_policy = transition.start.repeat_policy;
                         pending_fragment_start = transition.start;
-                        self.apply_table_body_fragment_transition(
+                        logical_block_cursor = self.apply_table_body_fragment_transition(
                             &mut table_body_fragment,
                             &mut fragment_commit_context,
                             &mut pending_fragmentainer_placement,
@@ -1148,8 +1167,6 @@ impl<'a> LayoutBuilder<'a> {
                         );
                         table_body_fragment_started = true;
                         table_x = fragment_commit_context.table_x;
-                        logical_block_cursor =
-                            self.table_block_cursor_after_fragment_start(style, 0.0);
                         let fragment_placement = pending_fragmentainer_placement;
                         self.ensure_committed_table_body_fragment(
                             &mut table_body_fragment,
@@ -1383,15 +1400,46 @@ impl<'a> LayoutBuilder<'a> {
         transition: TableFragmentTransitionDecision,
         _starts_table_body: bool,
         source_row_has_occupied_cell: bool,
-    ) {
+    ) -> f32 {
         self.commit_table_body_fragment_boundary(fragment, context, transition.boundary);
         let Some(cursor_top) = self.materialize_table_fragmentainer_advance(
             transition.fragmentainer_kind,
             FragmentainerAdvance::Unforced,
         ) else {
-            return;
+            return self.table_block_cursor_after_fragment_start(context.style, 0.0);
         };
-        context.rebase_to_content_left(self.content_left);
+        self.start_table_body_fragment(
+            context,
+            pending_fragmentainer_placement,
+            transition.start,
+            cursor_top,
+            source_row_has_occupied_cell,
+        )
+    }
+
+    /// Establish one destination table fragment after the page/column advance.
+    ///
+    /// Both forced and unforced table breaks must derive their row-fit cursor
+    /// only after destination placement and optional repeated-header replay.
+    /// Otherwise a forced break can retain a pre-header cursor while an
+    /// avoid/overflow break observes the post-header cursor, causing the two
+    /// equivalent fragment starts to choose different row slices.
+    ///
+    /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+    /// <https://www.w3.org/TR/CSS22/tables.html#value-def-table-header-group>
+    fn start_table_body_fragment(
+        &mut self,
+        context: &mut TableBodyFragmentCommitContext<'_, '_>,
+        pending_fragmentainer_placement: &mut TableFragmentainerPlacement,
+        start: TableFragmentStartDecision,
+        cursor_top: f32,
+        source_row_has_occupied_cell: bool,
+    ) -> f32 {
+        context.rebase_destination_grid_to_fragmentainer(
+            context.style,
+            self.content_left,
+            self.content_right,
+        );
         let fragmentainer = self.table_fragmentainer_placement(
             context.style,
             context.table_x,
@@ -1404,7 +1452,7 @@ impl<'a> LayoutBuilder<'a> {
         );
         let placement = TableFragmentStartPlacement::for_destination(
             context,
-            transition.start,
+            start,
             fragmentainer,
             source_row_has_occupied_cell,
         );
@@ -1413,9 +1461,11 @@ impl<'a> LayoutBuilder<'a> {
         }
         *pending_fragmentainer_placement = placement.fragmentainer();
         debug_assert!(
-            (placement.fragmentainer().table_x().points() - context.table_x).abs() <= 0.01
+            (placement.fragmentainer().destination_grid_origin().x() - context.table_x).abs()
+                <= 0.01
         );
-        self.replay_table_fragment_start_chrome(context, transition.start);
+        self.replay_table_fragment_start_chrome(context, start);
+        self.table_block_cursor_after_fragment_start(context.style, 0.0)
     }
 
     /// Ensure a table body paint fragment exists and consume its start decision.
@@ -1504,8 +1554,8 @@ impl<'a> LayoutBuilder<'a> {
     ///
     /// The outgoing table fragment is finalized from the committed boundary
     /// before `apply_forced_break` performs the paged-media page transition.
-    /// Repeated header replay remains owned by the returned start decision and
-    /// is consumed just before the next row fragment is painted:
+    /// The common destination-start handoff then replays repeated headers and
+    /// returns the resulting cursor, matching unforced table transitions:
     /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>.
     fn apply_table_body_forced_break(
         &mut self,
@@ -1514,35 +1564,19 @@ impl<'a> LayoutBuilder<'a> {
         pending_fragmentainer_placement: &mut TableFragmentainerPlacement,
         decision: TableForcedBreakDecision,
         source_row_has_occupied_cell: bool,
-    ) {
+    ) -> Option<f32> {
         self.commit_table_body_fragment_boundary(fragment, context, decision.boundary);
-        let Some(cursor_top) = self.materialize_table_fragmentainer_advance(
+        let cursor_top = self.materialize_table_fragmentainer_advance(
             decision.fragmentainer_kind,
             FragmentainerAdvance::Forced(decision.page_break),
-        ) else {
-            return;
-        };
-        context.rebase_to_content_left(self.content_left);
-        let fragmentainer = self.table_fragmentainer_placement(
-            context.style,
-            context.table_x,
-            context.wrapper_table_x,
-            if context.style.writing_mode.has_vertical_lines() {
-                context.table_inline_origin.points()
-            } else {
-                cursor_top
-            },
-        );
-        let placement = TableFragmentStartPlacement::for_destination(
+        )?;
+        Some(self.start_table_body_fragment(
             context,
+            pending_fragmentainer_placement,
             decision.start,
-            fragmentainer,
+            cursor_top,
             source_row_has_occupied_cell,
-        );
-        if !context.style.writing_mode.has_vertical_lines() {
-            self.cursor_y = placement.cursor_for_start();
-        }
-        *pending_fragmentainer_placement = placement.fragmentainer();
+        ))
     }
 
     /// Advance a table body to a committed destination fragmentainer.
@@ -1690,7 +1724,7 @@ impl<'a> LayoutBuilder<'a> {
                 column_plan,
                 source_grid_placement,
                 root_background_source_grid_placement,
-                wrapper_timeline,
+                wrapper_timeline.clone(),
                 planned_row_heights,
                 planned_row_occupancy,
                 table_metrics.clone(),

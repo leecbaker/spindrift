@@ -20,10 +20,19 @@ than text shaping alone.
   scopes consume that used value while computed `direction` remains available
   for inheritance. Upright text also enters bidi ordering as strong LTR rather
   than merely as an LTR embedding.
-- Mixed vertical text preserves the glyph selected by OpenType `vert`/`vrt2`
-  through PDF emission for Unicode space separators, instead of replacing it
-  with the horizontal U+0020 glyph. Transformed-rotated (`Tr`) typographic
-  units also select a vertical glyph form before their sideways rotation.
+- `::marker` text inherits and accepts the writing-mode text controls
+  `direction`, `unicode-bidi`, `text-orientation`, and
+  `text-combine-upright`, including upright marker punctuation in vertical
+  lists.
+- Mixed vertical text preserves OpenType vertical glyph forms through PDF
+  emission. Transformed-rotated (`Tr`) typographic units select those forms
+  and are typeset upright, matching CSS Writing Modes' mixed-orientation
+  policy; only `R` units are sideways.
+- Mongolian and Phags-pa are resolved as complete sideways-horizontal units
+  where their intrinsic vertical presentation requires that composition.
+  Their feature selection, font metrics, and PDF matrix now share one
+  per-unit plan, preventing vertical substitutions or vertical advances from
+  leaking into sideways runs.
 - Inline fragments with transparent source glyphs remain paintable when an
   explicit visible `text-shadow` needs their glyph outline. This keeps the
   shadow paint path independent of the source fill's alpha in horizontal,
@@ -41,10 +50,19 @@ than text shaping alone.
   a physical `width` but automatic `height` from collapsing to its inline
   content height, including the principal geometry exercised by
   `scrollbar-vertical-rl.html`.
+- A definite vertical physical `height` remains the block's used logical
+  inline size after selected inline lines are painted. The selected line
+  sequence reports intrinsic occupancy for generated-box alignment and
+  auto-sizing only; it cannot replace a specified height, including after a
+  selected soft-hyphen break.
 - Normal block intrinsic `width` sizing now keeps logical inline and block
   content-size contributions typed separately before projecting to physical
   width, so vertical writing-mode `width:min-content` and `width:max-content`
   use block-axis line-column size.
+- Parallel vertical and sideways normal-flow blocks now resolve physical
+  `width:auto` as their content-derived logical block-size, not as a
+  fill-available horizontal width. The propagated `html`/principal-`body`
+  canvas remains the intentional initial-containing-block exception.
 - Orthogonal auto inline sizing uses the CSS Writing Modes fit-content rule
   against the containing block's available perpendicular size. For auto-height
   containing blocks, fixed `max-height` is floored by fixed `min-height` before
@@ -58,11 +76,9 @@ than text shaping alone.
   assigned physical height when its items use orthogonal writing modes,
   covering `flexbox_align-items-stretch-writing-modes.html`.
 - Block-level absolute-position replay retains the originating vertical block
-  container's physical content span through anonymous inline wrappers. This
-  resolves automatic static positions for mixed `vertical-rl`/`vertical-lr`
-  descendants after an in-flow sibling. Fixed and automatic physical block
-  axes now retain their distinct static-position behavior, covering
-  `abs-pos-border-offset-002.html` and `abs-pos-border-offset-003.html`.
+  container's physical content span through anonymous inline wrappers. Fixed
+  and automatic physical block axes retain their distinct static-position
+  behavior.
 - Auto-sized vertical absolute-positioned boxes now measure their physical
   height as a fit-content logical inline axis against the positioned
   containing block, rather than as a normal-flow stretching height. The
@@ -104,10 +120,12 @@ than text shaping alone.
 - Intrinsic inline-size callers now avoid computing an unrelated logical
   block contribution. Likewise, a definite physical width on an orthogonal
   block child is used directly instead of recursively measuring its contents.
-  This preserves the existing intrinsic result while bounding nested
-  `word-break: break-all` probes, allowing `available-size-020.html` through
-  `available-size-023.html` and their references to complete within the WPT
-  render limit.
+  Simple vertical inline streams retain their selected final sequence, so the
+  final block geometry consumes the same line measurement rather than shaping
+  it again. A release WPT run on 2026-08-12 measured renderer time of 1.648 s,
+  1.421 s, 1.406 s, and 1.545 s for `available-size-020.html` through
+  `available-size-023.html`, respectively. These are within the WPT's
+  five-second limit, but remain above the one-second performance target.
 - A resolved physical `height` is handed to vertical auto-width measurement as
   its logical inline-size before wrapped columns are counted. This prevents a
   height-constrained vertical block from measuring against the page-height
@@ -173,20 +191,48 @@ than text shaping alone.
   physical `height` property, and parent/float intrinsic sizing projects the
   table's logical block tracks to physical width. This prevents a vertical
   table's column extent from being replayed as a horizontal float width.
+- Table-wrapper grid sizing now carries a `LogicalInlineContentSize` with its
+  `TableAxes`. Its preferred, minimum, and maximum logical-inline constraints
+  resolve through `height`/`min-height`/`max-height` and top/bottom decoration
+  for vertical roots (rather than through physical-width constraints and
+  left/right edges). The corresponding horizontal path continues to use width
+  constraints and left/right decoration.
 - Empty vertical float-avoidance scopes preserve the hypothetical physical
   top for both inline directions. In particular, a bottom-to-top nested BFC
   no longer jumps by the full available page-inline span before table layout.
 - Principal-flow block advancement now consumes the painted fragment's actual
   physical block span without a right-to-left offset, so a later vertical-rl
-  sibling starts after the full preceding block and its logical margin. A
-  bottom-origin `sideways-lr` body lays out each in-flow child on a valid
-  scratch line before projecting its paint fragment to the body canvas's
-  bottom inline edge (including the propagated body inset). This avoids a
-  spurious page break and covers `wm-propagation-body-043.html`. Inline root
+  sibling starts after the full preceding block and its logical margin. The
+  bottom-origin `sideways-lr` scratch/replay path is raster-exact for
+  `wm-propagation-body-043.html` and `wm-propagation-body-051.html`. Inline root
   generated content uses the propagated principal axes, while a block-level
   root pseudo remains an independent orthogonal formatting context with its
   computed writing mode and its own computed block-start edge; this covers
   `wm-propagation-body-044.html`.
+- Fixed normal-flow blocks in vertical paged roots retain their principal
+  logical block fragments separately from visible descendant overflow. The
+  overflow replays through later page areas on the root's horizontal block
+  axis, with `vertical-rl` progressing right-to-left and `vertical-lr`
+  left-to-right, without enlarging the fixed box or advancing later siblings.
+- Fragment paint projection now records independent source and destination
+  writing-mode axes. This keeps a source flow's logical slice selection
+  separate from the destination fragmentainer's physical clip and translation.
+  Positioned-tail clipping likewise selects the fragmentainer's logical block
+  axis while retaining CSS overflow rectangles as physical geometry.
+- Absolute-positioned page-span selection now resolves physical inset
+  properties into a continuous margin box first, then measures that box along
+  the principal fragmentainer's block-start side. This keeps `vertical-rl`
+  right-to-left and `vertical-lr` left-to-right page selection independent of
+  physical `top`/`bottom` positioning.
+- Definite absolute blocks retain that continuous source extent while consuming
+  every destination page's actual page-area capacity. A later differently
+  sized page therefore changes only local fragmentainer capacity, not the
+  absolute containing block or percentage basis.
+- A propagated `sideways-lr` body now lays direct canvas children in a
+  top-origin scratch coordinate system and projects the resulting paint to its
+  bottom-origin principal inline edge. This makes
+  `wm-propagation-body-051.html` raster-exact without changing computed root
+  values.
 - A vertical propagated root keeps the initial containing block's physical
   canvas width for `width:auto`; it is not shrink-wrapped from the body's
   content while establishing the principal writing mode. This covers the
@@ -221,10 +267,20 @@ than text shaping alone.
 - Orthogonal available-size coverage for grid, table-cell, absolutely
   positioned, and deeply nested mixed-writing-mode descendants needs broader
   WPT coverage beyond the shared scope handoff.
+- Propagated root pseudo-element inline layout still needs an audit of its
+  available inline extent in vertical and sideways roots. In
+  `wm-propagation-body-047.html`, the propagated body canvas is correctly
+  bottom-originated, but `html::after` is still laid out as narrow
+  one-character columns.
 - Table wrapper origin placement for RTL vertical roots, structural
   backgrounds, collapsed borders, alignment, and fragmentation still retain
   physical horizontal-grid assumptions after the primary cell-grid projection;
   vertical and sideways table WPTs therefore remain incomplete.
+- `css/css-tables/table-intrinsic-size-003.html` and
+  `table-intrinsic-size-004.html` still differ by the same wrapper-paint
+  projection (a 100px green square plus a separate border stripe). Their
+  logical inline preferred/min/max resolution is now shared and typed, but the
+  remaining physical wrapper projection is outside that sizing boundary.
 - `text-combine-upright` now parses, cascades, and inherits `none`, `all`, and
   `digits 2..4`; normalized eligible runs form horizontal child sequences in a
   one-em atomic inline and their captured paint subtree is compressed and

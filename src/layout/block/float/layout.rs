@@ -70,7 +70,7 @@ impl<'a> LayoutBuilder<'a> {
                 Some(self.build_frozen_child_boxes_with_current_ancestors(
                     child_element,
                     stylesheets,
-                    &placed_style,
+                    child_style,
                 ))
             } else {
                 None
@@ -88,6 +88,7 @@ impl<'a> LayoutBuilder<'a> {
                 .last()
                 .cloned()
                 .unwrap_or_else(PercentageBasis::indefinite),
+            child_element.document_compatibility_mode == dom::DocumentCompatibilityMode::Quirks,
         );
 
         let inline_size = self.resolved_float_inline_size(
@@ -169,16 +170,8 @@ impl<'a> LayoutBuilder<'a> {
                     placed_style.direction,
                     float_side,
                 );
-                let margin_box_left = match float_side {
-                    UsedFloatSide::Left => placement.available_span.left_x(),
-                    UsedFloatSide::Right => {
-                        placement.available_span.left_x()
-                            + (placement.available_span.width()
-                                - inline_size.margin_box_width.points())
-                            .max(0.0)
-                    }
-                    UsedFloatSide::Top | UsedFloatSide::Bottom => unreachable!(),
-                };
+                let margin_box_left = placement
+                    .inline_float_margin_box_left(float_side, inline_size.margin_box_width);
                 (margin_box_left, placement.origin.top_y())
             };
         let mut logical_placement = LogicalFloatPlacement::from_physical_margin_box(
@@ -257,16 +250,8 @@ impl<'a> LayoutBuilder<'a> {
                         placed_style.direction,
                         float_side,
                     );
-                    let margin_box_left = match float_side {
-                        UsedFloatSide::Left => placement.available_span.left_x(),
-                        UsedFloatSide::Right => {
-                            placement.available_span.left_x()
-                                + (placement.available_span.width()
-                                    - inline_size.margin_box_width.points())
-                                .max(0.0)
-                        }
-                        UsedFloatSide::Top | UsedFloatSide::Bottom => unreachable!(),
-                    };
+                    let margin_box_left = placement
+                        .inline_float_margin_box_left(float_side, inline_size.margin_box_width);
                     (margin_box_left, placement.origin.top_y())
                 };
             logical_placement = LogicalFloatPlacement::from_physical_margin_box(
@@ -294,12 +279,6 @@ impl<'a> LayoutBuilder<'a> {
         let named_page_flow_content_before_float = self.current_page_has_named_page_flow_content;
         let previous_left = self.content_left;
         let previous_right = self.content_right;
-        if std::env::var_os("QUIRE_TRACE_FLOATS").is_some() {
-            eprintln!(
-                "float entry id={float_id:?} containing_left={} containing_right={}",
-                previous_left, previous_right,
-            );
-        }
         let previous_cursor_y = self.cursor_y;
         let previous_direction = self.containing_block_direction;
         let previous_writing_mode = self.containing_block_writing_mode;
@@ -342,13 +321,6 @@ impl<'a> LayoutBuilder<'a> {
             child_children,
             table_fragment,
         );
-        if std::env::var_os("QUIRE_TRACE_FLOATS").is_some() {
-            eprintln!(
-                "float layout id={float_id:?} start_page={paint_page_index} end_page={} top={top} cursor={}",
-                self.pages.len(),
-                self.cursor_y,
-            );
-        }
         self.preserve_scoped_paint_public_order = previous_preserve_scoped_paint_public_order;
         self.float_paint_capture_depth = self.float_paint_capture_depth.saturating_sub(1);
         self.pop_float_context();
@@ -358,7 +330,23 @@ impl<'a> LayoutBuilder<'a> {
         self.pop_page_name_scope_suppression();
         self.ancestors.pop();
 
-        let actual_bottom = self.cursor_y.min(top - margin_box_height.points());
+        // Float placement starts with a speculative margin-box height, but the
+        // committed isolated replay is the only authoritative used block
+        // geometry. In particular, a BFC-root float containing descendant
+        // floats can receive an overlarge recursive probe height even though
+        // its final replay establishes the short used extent required by CSS
+        // 2.2. Keep the speculative size only for selecting an initial
+        // placement; publish the replayed margin-box extent to later `clear`
+        // and float-avoidance queries.
+        //
+        // The replay suppresses the float's margins and starts at the border
+        // box, so reconstruct the final margin-box bottom explicitly instead
+        // of comparing two differently scoped cursors.
+        // <https://www.w3.org/TR/CSS22/visudet.html#root-height>
+        // <https://www.w3.org/TR/CSS22/visuren.html#floats>
+        let replayed_border_box_height = (top - placed_style.margin.top - self.cursor_y).max(0.0);
+        let actual_bottom = top
+            - (placed_style.margin.top + replayed_border_box_height + placed_style.margin.bottom);
         let float_margin_box = PageTopRect::new(
             margin_box_left,
             top,
@@ -577,6 +565,7 @@ impl<'a> LayoutBuilder<'a> {
                     self.pending_paint_fragments.push(PendingPaintFragment {
                         page_index: float_fragment.page_index,
                         fragment: paint_fragment,
+                        kind: PendingPaintFragmentKind::FragmentedFloat,
                     });
                 }
                 self.push_float_fragment_shape(&float_fragment, run);
@@ -814,13 +803,12 @@ fn resolve_image_float_area(
     // Shapes sizes image sources as replaced elements with that content box.
     // <https://drafts.csswg.org/css-shapes-1/#shapes-from-image>
     if content.width() <= FLOAT_EPSILON || content.height() <= FLOAT_EPSILON {
-        let width = decoded.pixel_width as f32 * css::CSS_PX_TO_PT;
-        let height = decoded.pixel_height as f32 * css::CSS_PX_TO_PT;
+        let natural_size = decoded.natural_layout_size();
         content = PageTopRect::new(
             margin_rect.x() + style.margin.left + style.border_widths.left + style.padding.left,
             margin_rect.top_y() - style.margin.top - style.border_widths.top - style.padding.top,
-            width,
-            height,
+            natural_size.width,
+            natural_size.height,
         );
     }
     let threshold = (style.shape_image_threshold.value() * 255.0).round() as u8;
@@ -842,14 +830,15 @@ fn resolve_image_float_area(
             let alpha = raster.alpha.unwrap_or_else(|| {
                 vec![
                     255;
-                    raster.metadata.pixel_width as usize * raster.metadata.pixel_height as usize
+                    raster.metadata.pixel_size.width as usize
+                        * raster.metadata.pixel_size.height as usize
                 ]
             });
             FloatArea::new(
                 FloatContour::RasterAlpha {
                     rect: content,
-                    pixel_width: raster.metadata.pixel_width,
-                    pixel_height: raster.metadata.pixel_height,
+                    pixel_width: raster.metadata.pixel_size.width,
+                    pixel_height: raster.metadata.pixel_size.height,
                     alpha,
                     threshold,
                 },

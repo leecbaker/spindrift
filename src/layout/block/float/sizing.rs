@@ -70,6 +70,7 @@ pub(in crate::layout) fn freeze_float_replay_width(
 pub(in crate::layout) fn freeze_float_replay_height(
     style: &mut ComputedStyle,
     containing_block_height: BlockSizePercentageBasis,
+    preserve_quirks_auto_height: bool,
 ) -> Option<ContentBoxLength> {
     let vertical_non_content = non_content_pt(
         style.padding.top
@@ -82,7 +83,17 @@ pub(in crate::layout) fn freeze_float_replay_height(
         style.box_sizing,
         containing_block_height,
         vertical_non_content,
-    )?;
+    )
+    .or_else(|| {
+        // This is deliberately not part of standards-mode float sizing.
+        // Browser quirks mode retains a definite containing-block height
+        // through an auto-height float so descendant percentage heights can
+        // resolve. HTML does not fully specify quirks layout behavior.
+        // <https://html.spec.whatwg.org/multipage/parsing.html>
+        (preserve_quirks_auto_height && style.box_values.height.is_auto())
+            .then(|| containing_block_height.value())
+            .flatten()
+    })?;
     let replay_height = match style.box_sizing {
         BoxSizing::ContentBox => content_height.points(),
         BoxSizing::BorderBox => {
@@ -196,17 +207,28 @@ impl<'a> LayoutBuilder<'a> {
         // the float's intrinsic width.
         // <https://www.w3.org/TR/css-sizing-3/#intrinsic-sizes>
         // <https://www.w3.org/TR/css-sizing-3/#percentage-sizing>
+        let containing_block_height_basis = self
+            .definite_block_size_stack
+            .last()
+            .cloned()
+            .unwrap_or_else(PercentageBasis::indefinite);
         let intrinsic_height_basis = used_content_box_size_with_basis(
             style.box_values.height.value().clone(),
             style.box_sizing,
-            self.definite_block_size_stack
-                .last()
-                .cloned()
-                .unwrap_or_else(PercentageBasis::indefinite),
+            containing_block_height_basis,
             vertical_non_content,
         )
-        .map(|height| {
-            PercentageBasis::definite_from(height, BlockSizeBasisSource::ContainingBlock)
+        .map(|height| PercentageBasis::definite_from(height, BlockSizeBasisSource::ContainingBlock))
+        .or_else(|| {
+            // Browsers retain a definite ancestor height through an
+            // auto-height float while calculating percentage heights in a
+            // quirks document. HTML intentionally leaves much quirks layout
+            // behavior undocumented; retain this as a narrow compatibility
+            // rule rather than treating it as ordinary CSS percentage sizing.
+            // <https://html.spec.whatwg.org/multipage/parsing.html>
+            (element.document_compatibility_mode == dom::DocumentCompatibilityMode::Quirks
+                && containing_block_height_basis.is_definite())
+            .then_some(containing_block_height_basis)
         });
         let measure_intrinsic_widths = |layout: &mut Self, available_width: f32| {
             if let Some(basis) = intrinsic_height_basis {
@@ -364,19 +386,26 @@ impl<'a> LayoutBuilder<'a> {
                 self.build_frozen_child_boxes_with_current_ancestors(element, stylesheets, style);
             Some(built_child_boxes.as_slice())
         };
+        // A flex float's automatic block size is its used flex formatting
+        // context height at the already-resolved float width.  It cannot use
+        // the generic flow-root cursor probe: that probe is intentionally
+        // formatting-context agnostic, while Flexbox owns its final cross-size
+        // resolution and line geometry.
+        // <https://www.w3.org/TR/CSS22/visudet.html#root-height>
+        // <https://www.w3.org/TR/css-flexbox-1/#algo-cross-item>
+        if style.display.is_flex() {
+            return self.measure_floated_flex_margin_box_height(
+                element,
+                style,
+                stylesheets,
+                PhysicalContentWidth::new(inline_size.content_width),
+                child_boxes,
+            );
+        }
         // A definite used height needs no speculative formatting pass. Keep
-        // the established estimator for that path, which is also used by
-        // intrinsic float queries.
+        // the established estimator for non-flex formatting contexts, which is
+        // also used by intrinsic float queries.
         if !has_auto_height(style) {
-            if style.display.is_flex() {
-                return self.estimate_floated_flex_margin_box_height(
-                    element,
-                    style,
-                    stylesheets,
-                    inline_size.margin_box_width,
-                    child_boxes,
-                );
-            }
             return margin_box_pt(
                 self.estimate_element_height(
                     element,
@@ -465,6 +494,10 @@ impl<'a> LayoutBuilder<'a> {
             return height;
         }
         self.active_auto_float_measurements.push(element_key);
+        // This replay measures a float's own BFC. Its lines cannot select an
+        // anchor for an outside marker owned by the surrounding principal
+        // flow.
+        let pending_outside_marker_anchors = self.pending_outside_marker_anchors.suspend();
         let snapshot = self.snapshot();
         let probe_top = 10_000.0;
         let replay_style = float_replay_style(placed_style);
@@ -503,6 +536,8 @@ impl<'a> LayoutBuilder<'a> {
         );
         let border_box_height = (probe_top - placed_style.margin.top - self.cursor_y).max(0.0);
         self.restore(snapshot);
+        self.pending_outside_marker_anchors
+            .restore(pending_outside_marker_anchors);
         let popped = self.active_auto_float_measurements.pop();
         debug_assert_eq!(popped, Some(element_key));
 

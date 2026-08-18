@@ -1,4 +1,5 @@
 use super::*;
+use crate::layout::block::ParentStartClearanceHypothesis;
 
 pub(in crate::layout) fn has_later_normal_block_flow_child_with_resolver(
     element: &Element,
@@ -25,7 +26,7 @@ pub(in crate::layout) fn has_later_normal_block_flow_child_with_resolver(
             current_index,
             sibling_tags.clone(),
         );
-        let style = resolver.style_for_element(
+        let style = resolver.structural_style_for_element(
             child_element,
             signature,
             stylesheets,
@@ -172,6 +173,41 @@ pub(in crate::layout) fn collapsed_margin_delta(
 pub(in crate::layout) struct AdjoiningBlockStartMargin {
     collapsed: LayoutLength,
     descendant_deferred_to_child: LayoutLength,
+}
+
+/// The complete start-margin set a parent has provisionally adjoined with its
+/// first in-flow child.  A cleared child also needs the parent border edge as
+/// its `clear:none` counterfactual position.
+/// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
+/// <https://www.w3.org/TR/CSS22/visuren.html#flow-control>
+#[derive(Clone, Copy, Debug)]
+pub(in crate::layout) struct InheritedAdjoiningStartMargin {
+    complete_margin: LayoutLength,
+    parent_start_clearance_hypothesis: ParentStartClearanceHypothesis,
+}
+
+impl InheritedAdjoiningStartMargin {
+    pub(in crate::layout) fn new(
+        complete_margin: LayoutLength,
+        parent_border_edge: PageTopBlockPosition,
+    ) -> Self {
+        Self {
+            complete_margin,
+            parent_start_clearance_hypothesis: ParentStartClearanceHypothesis::new(
+                parent_border_edge,
+            ),
+        }
+    }
+
+    pub(in crate::layout) fn complete_margin(self) -> LayoutLength {
+        self.complete_margin
+    }
+
+    pub(in crate::layout) fn parent_start_clearance_hypothesis(
+        self,
+    ) -> ParentStartClearanceHypothesis {
+        self.parent_start_clearance_hypothesis
+    }
 }
 
 impl AdjoiningBlockStartMargin {
@@ -343,7 +379,9 @@ pub(in crate::layout) fn is_self_collapsing_block_box(
     // <https://drafts.csswg.org/css-pseudo-4/#generated-content>
     let has_line_box_content = has_direct_inline_content_box(child_boxes)
         || has_atomic_inline_formatting_box(child_boxes)
-        || generated_content_has_non_phantom_inline_content(style);
+        || generated_content_has_non_phantom_inline_content(style)
+        || style_has_non_phantom_generated_pseudo_content(style)
+        || style_has_in_flow_marker_line(style);
     // Clearance changes the placement of an otherwise empty box without
     // creating an own block-size. Its margins therefore remain adjoining for
     // self-collapsing classification; the block-flow cursor independently
@@ -422,6 +460,7 @@ pub(in crate::layout) fn collapsible_first_child_start_margin_from_boxes(
     parent_style: &ComputedStyle,
     overflow_context: DocumentCanvasResolution,
 ) -> Option<f32> {
+    let mut has_preceding_css_float = false;
     for child_box in child_boxes {
         // An inline split context is transparent to the parent block's
         // margin-collapse chain. Recurse into its generated block segment
@@ -455,9 +494,11 @@ pub(in crate::layout) fn collapsible_first_child_start_margin_from_boxes(
         // exception below must not make a floated first child look like the
         // first in-flow child and collapse its margin through the body.
         // <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
-        if child_style.float != Float::None
-            || matches!(child_style.position, Position::Absolute | Position::Fixed)
-        {
+        if child_style.float != Float::None {
+            has_preceding_css_float = true;
+            continue;
+        }
+        if matches!(child_style.position, Position::Absolute | Position::Fixed) {
             continue;
         }
         let is_flow_child = is_normal_block_flow_child(child_element, child_style)
@@ -468,6 +509,15 @@ pub(in crate::layout) fn collapsible_first_child_start_margin_from_boxes(
                 return None;
             }
             continue;
+        }
+        // A cleared first in-flow child after an adjoining float needs the
+        // parent-start `clear:none` hypothesis rather than a pre-collapsed
+        // used start margin. Other cleared descendants retain the ordinary
+        // margin-collapse probe; block layout resolves whether they actually
+        // introduce clearance in their containing float context.
+        // <https://www.w3.org/TR/CSS22/visuren.html#flow-control>
+        if child_style.clear != Clear::None && has_preceding_css_float {
+            return None;
         }
         if parent_style.margin_trim.block_start {
             return Some(0.0);
@@ -697,6 +747,7 @@ pub(in crate::layout) fn collapsible_first_child_start_margin_dom_with_resolver(
 ) -> Option<f32> {
     let sibling_tags = element_sibling_signature_list(element);
     let mut element_index = 0usize;
+    let mut has_preceding_css_float = false;
     for child in &element.children {
         let NodeKind::Element(child_element) = &child.kind else {
             if let NodeKind::Text(text) = &child.kind
@@ -723,9 +774,11 @@ pub(in crate::layout) fn collapsible_first_child_start_margin_dom_with_resolver(
         // Floats and positioned descendants are out of normal flow, even
         // below the document canvas; they cannot supply an adjoining margin.
         // <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
-        if child_style.float != Float::None
-            || matches!(child_style.position, Position::Absolute | Position::Fixed)
-        {
+        if child_style.float != Float::None {
+            has_preceding_css_float = true;
+            continue;
+        }
+        if matches!(child_style.position, Position::Absolute | Position::Fixed) {
             continue;
         }
         let is_flow_child = is_normal_block_flow_child(child_element, &child_style);
@@ -734,6 +787,15 @@ pub(in crate::layout) fn collapsible_first_child_start_margin_dom_with_resolver(
                 return None;
             }
             continue;
+        }
+        // A cleared first in-flow child after an adjoining float needs the
+        // parent-start `clear:none` hypothesis rather than a pre-collapsed
+        // used start margin. Other cleared descendants retain the ordinary
+        // margin-collapse probe; block layout resolves whether they actually
+        // introduce clearance in their containing float context.
+        // <https://www.w3.org/TR/CSS22/visuren.html#flow-control>
+        if child_style.clear != Clear::None && has_preceding_css_float {
+            return None;
         }
         if parent_style.margin_trim.block_start {
             return Some(0.0);
@@ -847,7 +909,8 @@ pub(in crate::layout) fn is_self_collapsing_block_dom_with_resolver(
         stylesheets,
         ancestors,
         resolver,
-    );
+    ) || style_has_non_phantom_generated_pseudo_content(style)
+        || style_has_in_flow_marker_line(style);
     is_collapsible_block_child(element, style)
         && can_collapse_own_block_margins(
             element,
@@ -864,6 +927,103 @@ pub(in crate::layout) fn is_self_collapsing_block_dom_with_resolver(
             resolver,
             overflow_context,
         )
+}
+
+/// Generated `::before` and `::after` boxes participate in their originating
+/// block's principal inline flow.  They are stored separately from DOM and
+/// formatting-box children, so self-collapsing classification must include
+/// them explicitly.
+/// <https://drafts.csswg.org/css-pseudo-4/#generated-content>
+fn style_has_non_phantom_generated_pseudo_content(style: &ComputedStyle) -> bool {
+    style
+        .before_style
+        .as_deref()
+        .is_some_and(generated_content_has_non_phantom_inline_content)
+        || style
+            .after_style
+            .as_deref()
+            .is_some_and(generated_content_has_non_phantom_inline_content)
+}
+
+/// Whether a computed list item necessarily supplies an inside marker line.
+///
+/// Margin-collapse classification happens before the inline formatter creates
+/// the actual marker.  This mirrors its empty-marker test so a marker-only
+/// list item, and every ancestor whose size depends on it, cannot be treated
+/// as self-collapsing.  Counter values are allowed to vary, but every
+/// non-`none` counter style has the decimal fallback representation required
+/// by CSS Counter Styles.
+///
+/// <https://drafts.csswg.org/css-lists-3/#list-style-position-property>
+/// <https://drafts.csswg.org/css-counter-styles-3/#counter-style-fallback>
+fn style_has_in_flow_marker_line(style: &ComputedStyle) -> bool {
+    if !style.display.is_list_item() {
+        return false;
+    }
+    let inside = if style.display.is_inline_level() && !style.display.is_atomic_inline() {
+        true
+    } else {
+        style.list_style_position == ListStylePosition::Inside
+    };
+    if !inside {
+        return false;
+    }
+
+    let marker_style = style.marker_style.as_deref().unwrap_or(style);
+    match &marker_style.marker_content {
+        MarkerContent::None => false,
+        MarkerContent::Auto => {
+            style.list_style_image.is_image()
+                || list_style_type_has_nonempty_representation(&style.list_style_type)
+        }
+        MarkerContent::Parts(parts) => parts
+            .iter()
+            .any(|part| marker_content_part_has_nonempty_representation(part, marker_style)),
+    }
+}
+
+fn list_style_type_has_nonempty_representation(style: &ListStyleType) -> bool {
+    match style {
+        ListStyleType::None => false,
+        ListStyleType::String(text) => {
+            !crate::text::trim_css_collapsible_whitespace(text).is_empty()
+        }
+        ListStyleType::Disc
+        | ListStyleType::Circle
+        | ListStyleType::Square
+        | ListStyleType::DisclosureOpen
+        | ListStyleType::DisclosureClosed
+        | ListStyleType::Decimal
+        | ListStyleType::Anonymous(_)
+        | ListStyleType::Named(_) => true,
+    }
+}
+
+fn marker_content_part_has_nonempty_representation(
+    part: &MarkerContentPart,
+    marker_style: &ComputedStyle,
+) -> bool {
+    match part {
+        MarkerContentPart::Text(text) => {
+            !crate::text::trim_css_collapsible_whitespace(text).is_empty()
+        }
+        MarkerContentPart::Counter { style, .. } | MarkerContentPart::Counters { style, .. } => {
+            style
+                .as_ref()
+                .is_none_or(list_style_type_has_nonempty_representation)
+        }
+        MarkerContentPart::Quote(GeneratedQuote::NoOpen | GeneratedQuote::NoClose) => false,
+        MarkerContentPart::Quote(GeneratedQuote::Open | GeneratedQuote::Close) => {
+            match &marker_style.quotes {
+                Quotes::None => false,
+                Quotes::Auto(_) => true,
+                Quotes::Pairs(pairs) => pairs.iter().any(|(open, close)| {
+                    !crate::text::trim_css_collapsible_whitespace(open).is_empty()
+                        || !crate::text::trim_css_collapsible_whitespace(close).is_empty()
+                }),
+            }
+        }
+    }
 }
 
 pub(in crate::layout) fn dom_children_keep_self_collapsing_parent(
@@ -1156,6 +1316,60 @@ pub(in crate::layout) fn has_only_direct_in_flow_inline_dom_content_with_font_me
 mod tests {
     use super::*;
 
+    #[test]
+    fn selector_snapshots_are_shared_after_dom_preparation() {
+        let root = dom::parse(
+            "<html><body><section id=\"hit\"><span lang=\"fr\">texte</span></section></body></html>",
+        );
+        prime_selector_snapshots(&root, None, None);
+        let section = first_element_by_tag(&root, "section").expect("expected section");
+
+        let first = element_selector_signature(section);
+        let replay = element_selector_signature(section);
+
+        assert!(first.shares_snapshot_with(&replay));
+        assert_eq!(first.children.len(), 1);
+        assert_eq!(first.children[0].attrs.get("lang"), Some(&"fr".to_string()));
+    }
+
+    #[test]
+    fn selector_preparation_marks_only_document_local_links_visited() {
+        let document_url = url::Url::parse("https://example.test/document.html#source")
+            .expect("valid document URL");
+
+        let self_link = dom::parse("<a href=\"#section\"></a>");
+        prime_selector_snapshots(&self_link, Some(&document_url), Some(&document_url));
+        assert_eq!(
+            element_selector_signature(first_element_by_tag(&self_link, "a").unwrap()).link_state,
+            css::LinkState::Visited
+        );
+
+        let external_link = dom::parse("<a href=\"other.html\"></a>");
+        prime_selector_snapshots(&external_link, Some(&document_url), Some(&document_url));
+        assert_eq!(
+            element_selector_signature(first_element_by_tag(&external_link, "a").unwrap())
+                .link_state,
+            css::LinkState::Unvisited
+        );
+
+        let base_changed_link = dom::parse("<a href=\"\"></a>");
+        let base_url = url::Url::parse("https://assets.example.test/").expect("valid base URL");
+        prime_selector_snapshots(&base_changed_link, Some(&document_url), Some(&base_url));
+        assert_eq!(
+            element_selector_signature(first_element_by_tag(&base_changed_link, "a").unwrap())
+                .link_state,
+            css::LinkState::Unvisited
+        );
+
+        let string_document = dom::parse("<a href=\"\"></a>");
+        prime_selector_snapshots(&string_document, None, Some(&document_url));
+        assert_eq!(
+            element_selector_signature(first_element_by_tag(&string_document, "a").unwrap())
+                .link_state,
+            css::LinkState::Unvisited
+        );
+    }
+
     fn test_parent_style() -> ComputedStyle {
         ComputedStyle {
             font_size: 12.0,
@@ -1178,6 +1392,139 @@ mod tests {
                     .find_map(|child| first_element_by_tag(child, tag))
             }
         }
+    }
+
+    #[tokio::test]
+    async fn structural_style_keeps_principal_cascade_and_omits_generated_pseudos() {
+        let root = dom::parse("<span></span>");
+        let span = first_element_by_tag(&root, "span").expect("expected span element");
+        let stylesheet = css::parse_stylesheet(&css::Css::from_string(
+            "span { display: block; font-size: 3ch } \
+             span::before { content: var(--missing, 'generated') }",
+        ));
+        let stylesheets = Stylesheets::for_document(
+            css::html5_user_agent_stylesheet(),
+            None,
+            std::slice::from_ref(&stylesheet),
+        );
+        let parent_style = ComputedStyle {
+            font_size: 20.0,
+            line_height: 20.0,
+            ..ComputedStyle::initial()
+        };
+        let mut font_system = FontSystem::start_loading()
+            .load_stylesheet_fonts(&stylesheets)
+            .finish()
+            .await;
+        let signature = element_signature(span);
+        let mut resolver = DomStyleResolver::with_font_system(&mut font_system);
+
+        let full = resolver.style_for_element(
+            span,
+            signature.clone(),
+            &stylesheets,
+            Some(&parent_style),
+            &[],
+        );
+        let structural = resolver.structural_style_for_element(
+            span,
+            signature,
+            &stylesheets,
+            Some(&parent_style),
+            &[],
+        );
+
+        assert_eq!(structural.display, full.display);
+        assert_eq!(structural.font_size, full.font_size);
+        assert!(full.before_style.is_some());
+        assert!(structural.before_style.is_none());
+        assert!(structural.after_style.is_none());
+        assert!(structural.marker_style.is_none());
+    }
+
+    #[tokio::test]
+    async fn structural_probes_ignore_generated_pseudo_variable_rules() {
+        let stylesheet = css::parse_stylesheet(&css::Css::from_string(
+            ".flow { display: block } \
+             .run-in { display: run-in } \
+             .row { display: table-row } \
+             .inline { display: inline } \
+             .ruby { display: ruby } \
+             .probe::before { content: var(--missing, 'generated') }",
+        ));
+        let stylesheets = Stylesheets::for_document(
+            css::html5_user_agent_stylesheet(),
+            None,
+            std::slice::from_ref(&stylesheet),
+        );
+        let parent_style = test_parent_style();
+        let mut font_system = FontSystem::start_loading()
+            .load_stylesheet_fonts(&stylesheets)
+            .finish()
+            .await;
+
+        let direct_flow = dom::parse("<div><span class=\"probe flow\"></span></div>");
+        assert!(has_direct_flow_child_with_font_metrics(
+            first_element_by_tag(&direct_flow, "div").expect("expected direct-flow parent"),
+            &parent_style,
+            &stylesheets,
+            &mut font_system,
+        ));
+
+        let run_in = dom::parse("<div><span class=\"probe run-in\"></span></div>");
+        assert!(has_direct_run_in_child_with_font_metrics(
+            first_element_by_tag(&run_in, "div").expect("expected run-in parent"),
+            &parent_style,
+            &stylesheets,
+            &[],
+            &mut font_system,
+        ));
+
+        let table = dom::parse("<div><span class=\"probe row\"></span></div>");
+        assert!(has_unwrapped_table_internal_descendant_with_font_metrics(
+            first_element_by_tag(&table, "div").expect("expected table parent"),
+            &parent_style,
+            &stylesheets,
+            &[],
+            &mut font_system,
+        ));
+
+        let block_in_inline = dom::parse(
+            "<div><span class=\"probe inline\"><span class=\"probe flow\"></span></span></div>",
+        );
+        assert!(has_block_in_inline_split_boundary_with_font_metrics(
+            first_element_by_tag(&block_in_inline, "div").expect("expected block-in-inline parent"),
+            &parent_style,
+            &stylesheets,
+            &[],
+            &mut font_system,
+        ));
+
+        let ruby = dom::parse("<div><span class=\"probe ruby\"></span></div>");
+        assert!(has_ruby_formatting_descendant_with_font_metrics(
+            first_element_by_tag(&ruby, "div").expect("expected ruby parent"),
+            &parent_style,
+            &stylesheets,
+            &[],
+            &mut font_system,
+            &mut HashMap::new(),
+        ));
+
+        let later_block = dom::parse(
+            "<div><span class=\"probe inline\"></span><span class=\"probe flow\"></span></div>",
+        );
+        let later_parent =
+            first_element_by_tag(&later_block, "div").expect("expected later-block parent");
+        let siblings = element_sibling_signature_list(later_parent);
+        assert!(has_later_normal_block_flow_child_with_font_metrics(
+            later_parent,
+            1,
+            &siblings,
+            &parent_style,
+            &stylesheets,
+            &[],
+            &mut font_system,
+        ));
     }
 
     #[test]

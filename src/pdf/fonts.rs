@@ -132,6 +132,8 @@ pub(super) fn timed_embedded_font_plans_with_profile<'a>(
                     reason: reason.clone(),
                 });
             }
+            let source_gid_to_width =
+                pdf_text_space_widths(pending.font, &audit.font_file.source_gid_to_cid);
             Ok(EmbeddedFontPlan {
                 font: pending.font,
                 resource_name: format!("RF{}", index + 1),
@@ -144,6 +146,7 @@ pub(super) fn timed_embedded_font_plans_with_profile<'a>(
                 cid_set_id: profile.emits_cid_set().then_some(base_id + 5),
                 font_program_kind: audit.font_file.program_kind,
                 source_gid_to_cid: audit.font_file.source_gid_to_cid,
+                source_gid_to_width,
                 used_cids: audit.used_cids,
                 font_file_data: audit.font_file.data,
                 embedding_kind: audit.font_file.embedding_kind,
@@ -557,19 +560,34 @@ pub(super) fn same_embedded_font_program(left: &DocumentFont, right: &DocumentFo
     left.data.blob_id() == right.data.blob_id() || left.data.as_ref() == right.data.as_ref()
 }
 
-pub(super) fn cid_width_entries(font: &EmbeddedFontPlan<'_>) -> Vec<(u16, f32)> {
-    let Ok(face) = ttf_parser::Face::parse(&font.font.data, font.font.face_index) else {
-        return Vec::new();
+fn pdf_text_space_widths(
+    font: &DocumentFont,
+    source_gid_to_cid: &BTreeMap<u16, u16>,
+) -> BTreeMap<u16, PdfTextSpaceWidth> {
+    let Ok(face) = ttf_parser::Face::parse(&font.data, font.face_index) else {
+        return BTreeMap::new();
     };
-    let units_per_em = font.font.units_per_em.max(1) as f32;
+    source_gid_to_cid
+        .keys()
+        .filter_map(|source_gid| {
+            face.glyph_hor_advance(ttf_parser::GlyphId(*source_gid))
+                .map(|advance| {
+                    (
+                        *source_gid,
+                        PdfTextSpaceWidth::from_font_units(advance, font.units_per_em),
+                    )
+                })
+        })
+        .collect()
+}
+
+pub(super) fn cid_width_entries(font: &EmbeddedFontPlan<'_>) -> Vec<(u16, f32)> {
     font.source_gid_to_cid
         .iter()
-        .map(|(source_gid, cid)| {
-            let width = face
-                .glyph_hor_advance(ttf_parser::GlyphId(*source_gid))
-                .map(|width| (width as f32 * 1000.0 / units_per_em).round() as i32)
-                .unwrap_or(0);
-            (*cid, width as f32)
+        .filter_map(|(source_gid, cid)| {
+            font.source_gid_to_width
+                .get(source_gid)
+                .map(|width| (*cid, width.as_pdf_number()))
         })
         .collect()
 }

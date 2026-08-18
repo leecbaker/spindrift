@@ -16,7 +16,12 @@ pub(crate) fn paint_clipped_rounded_border_sides(
     rect: PaintRect,
     style: &ComputedStyle,
 ) -> bool {
-    if style.border_radius.clone().is_zero() {
+    // Degenerate used radii are square corners, so they belong to the normal
+    // straight-side painter instead of this clipped rounded-path painter.
+    if rounded_radii_are_zero(used_rounded_rect_radii(
+        style.border_radius.clone(),
+        rect.size,
+    )) {
         return false;
     }
 
@@ -761,6 +766,21 @@ pub(crate) fn used_rounded_rect_radii<Space>(
                 .points(),
         ),
     };
+    // A radius with either zero component is a square corner. Keeping its
+    // nonzero companion component would ask the path backend to approximate a
+    // degenerate ellipse and can produce antialiased slivers at what CSS
+    // defines as a rectangular corner.
+    // <https://drafts.csswg.org/css-backgrounds-3/#corner-shaping>
+    for corner in [
+        &mut radii.top_left,
+        &mut radii.top_right,
+        &mut radii.bottom_right,
+        &mut radii.bottom_left,
+    ] {
+        if corner.x() == 0.0 || corner.y() == 0.0 {
+            *corner = RenderedCornerRadius::ZERO;
+        }
+    }
     let scale = [
         edge_radius_scale(width, radii.top_left.x() + radii.top_right.x()),
         edge_radius_scale(height, radii.top_right.y() + radii.bottom_right.y()),
@@ -868,6 +888,26 @@ mod tests {
             shaped_rect_path_commands(test_rect(), radii, css::CornerShapes::ROUND),
             rounded_rect_path_commands(test_rect(), radii)
         );
+    }
+
+    #[test]
+    fn zero_radius_component_produces_a_square_corner() {
+        let degenerate = css::CornerRadius {
+            x: css::CssRadius::ZERO,
+            y: css::CssRadius {
+                value: css::ComputedLengthPercentage::from_points(5.0),
+            },
+        };
+        let radius = css::BorderRadius {
+            top_left: degenerate.clone(),
+            top_right: degenerate.clone(),
+            bottom_right: degenerate.clone(),
+            bottom_left: degenerate,
+        };
+
+        let radii = used_rounded_rect_radii(radius, PaintSize::new(20.0, 20.0));
+
+        assert_eq!(radii, RenderedRoundedRectRadii::ZERO);
     }
 
     #[test]

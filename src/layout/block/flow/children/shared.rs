@@ -1,5 +1,260 @@
 use super::*;
 
+/// The physical constraints exported to one normal-flow child by a vertical
+/// principal flow.
+///
+/// The legacy block traversal stores a physical top-to-bottom cursor, whereas
+/// a vertical principal flow keeps its inline origin on that axis and advances
+/// its children through the physical horizontal block track.  Keeping those
+/// values together prevents physical page width from being used as an inline
+/// percentage basis, or a vertical cursor from being advanced as though it
+/// were the logical block cursor.
+///
+/// <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
+/// <https://www.w3.org/TR/css-writing-modes-4/#logical-to-physical>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct PrincipalVerticalChildPlacement {
+    page_inline_origin: PageTopBlockPosition,
+    horizontal_block_track: PageInlineSpan,
+    logical_inline_percentage_basis: LogicalInlineContentSize,
+    block_start: PhysicalSide,
+}
+
+impl PrincipalVerticalChildPlacement {
+    pub(in crate::layout) fn new(
+        writing_mode: WritingMode,
+        direction: Direction,
+        page_inline_origin: PageTopBlockPosition,
+        horizontal_block_track: PageInlineSpan,
+        logical_inline_percentage_basis: LogicalInlineContentSize,
+    ) -> Option<Self> {
+        let axes = WritingModeAxes::new(writing_mode, direction);
+        axes.swaps_physical_axes().then(|| Self {
+            page_inline_origin,
+            horizontal_block_track,
+            logical_inline_percentage_basis,
+            block_start: block_start_side(writing_mode),
+        })
+    }
+
+    pub(in crate::layout) fn page_inline_origin(self) -> PageTopBlockPosition {
+        self.page_inline_origin
+    }
+
+    pub(in crate::layout) fn horizontal_block_track(self) -> PageInlineSpan {
+        self.horizontal_block_track
+    }
+
+    pub(in crate::layout) fn logical_inline_percentage_basis(self) -> LogicalInlineContentSize {
+        self.logical_inline_percentage_basis
+    }
+
+    /// Export the direct child's CSS containing-inline constraint before the
+    /// child resolves its used geometry.  In a vertical principal flow the
+    /// physical horizontal span is the logical block track, while page height
+    /// remains the parent's logical inline percentage basis.
+    pub(in crate::layout) fn block_layout_inline_constraint(self) -> BlockLayoutInlineConstraint {
+        BlockLayoutInlineConstraint {
+            containing_inline_span: self.horizontal_block_track,
+            percentage_basis: PercentageBasis::definite(self.logical_inline_percentage_basis),
+            physical_width_percentage_basis: PhysicalContentWidth::new(content_box_pt(
+                self.horizontal_block_track.width(),
+            )),
+            auto_border_box_width: None,
+        }
+    }
+
+    pub(in crate::layout) fn block_track_is_exhausted(self) -> bool {
+        self.horizontal_block_track().width() <= 0.01
+    }
+
+    pub(in crate::layout) fn child_block_end_margin(self, child_style: &ComputedStyle) -> f32 {
+        match self.block_start {
+            PhysicalSide::Left => child_style.margin.right,
+            PhysicalSide::Right => child_style.margin.left,
+            PhysicalSide::Top | PhysicalSide::Bottom => {
+                unreachable!("a vertical principal flow has a horizontal block track")
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::layout) fn child_block_start_margin(self, child_style: &ComputedStyle) -> f32 {
+        match self.block_start {
+            PhysicalSide::Left => child_style.margin.left,
+            PhysicalSide::Right => child_style.margin.right,
+            PhysicalSide::Top | PhysicalSide::Bottom => {
+                unreachable!("a vertical principal flow has a horizontal block track")
+            }
+        }
+    }
+
+    pub(in crate::layout) fn track_after_committed_child(
+        self,
+        child_border_box_block_span: BorderBoxLength,
+        child_block_end_margin: f32,
+    ) -> PageInlineSpan {
+        let advance = (child_border_box_block_span.points() + child_block_end_margin).max(0.0);
+        match self.block_start {
+            PhysicalSide::Left => PageInlineSpan::from_edges(
+                (self.horizontal_block_track.left_x() + advance)
+                    .min(self.horizontal_block_track.right_x()),
+                self.horizontal_block_track.right_x(),
+            ),
+            PhysicalSide::Right => PageInlineSpan::from_edges(
+                self.horizontal_block_track.left_x(),
+                (self.horizontal_block_track.right_x() - advance)
+                    .max(self.horizontal_block_track.left_x()),
+            ),
+            PhysicalSide::Top | PhysicalSide::Bottom => {
+                unreachable!("a vertical principal flow has a horizontal block track")
+            }
+        }
+    }
+}
+
+impl<'a> LayoutBuilder<'a> {
+    /// Selects the physical page-inline origin for a direct child of the
+    /// principal vertical root flow.
+    ///
+    /// The document-canvas source supplies the root's used principal flow.
+    /// A `sideways-lr` or bottom-to-top vertical inline axis therefore starts
+    /// its first child at the physical page bottom, while the legacy block
+    /// traversal continues to use a page-top coordinate that decreases
+    /// toward physical bottom. Limiting this projection to the root or an
+    /// eligible propagated body preserves ordinary descendants' own
+    /// containing-block coordinate systems.
+    /// <https://drafts.csswg.org/css-writing-modes-4/#principal-flow>
+    /// <https://drafts.csswg.org/css-writing-modes-4/#logical-to-physical>
+    pub(in crate::layout) fn principal_vertical_child_inline_origin(
+        &self,
+        parent: &Element,
+        parent_writing_mode: WritingMode,
+        parent_direction: Direction,
+    ) -> PageTopBlockPosition {
+        if self.element_supplies_document_principal_flow(parent)
+            && inline_start_side(parent_writing_mode, parent_direction) == PhysicalSide::Bottom
+        {
+            PageTopBlockPosition::new(self.page_bottom())
+        } else {
+            PageTopBlockPosition::new(self.cursor_y)
+        }
+    }
+
+    /// Install the vertical principal-flow constraint for exactly one direct
+    /// normal-flow child. Callers restore the returned value immediately
+    /// after that child finishes so descendants and later siblings use their
+    /// own containing-block geometry.
+    pub(in crate::layout) fn replace_direct_block_layout_constraint(
+        &mut self,
+        element: &Element,
+        placement: Option<PrincipalVerticalChildPlacement>,
+    ) -> Option<DirectBlockLayoutConstraint> {
+        std::mem::replace(
+            &mut self.direct_block_layout_constraint,
+            placement.map(|placement| {
+                DirectBlockLayoutConstraint::new(
+                    element.id,
+                    placement.block_layout_inline_constraint(),
+                )
+            }),
+        )
+    }
+
+    pub(in crate::layout) fn restore_direct_block_layout_constraint(
+        &mut self,
+        previous: Option<DirectBlockLayoutConstraint>,
+    ) {
+        self.direct_block_layout_constraint = previous;
+    }
+
+    pub(in crate::layout) fn direct_block_layout_constraint_for(
+        &self,
+        element: &Element,
+    ) -> Option<BlockLayoutInlineConstraint> {
+        self.direct_block_layout_constraint
+            .and_then(|constraint| constraint.for_element(element))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vertical_principal_child_placement_projects_inline_and_block_axes() {
+        for (writing_mode, expected_left, expected_right) in [
+            (WritingMode::VerticalRl, 20.0, 135.0),
+            (WritingMode::VerticalLr, 65.0, 180.0),
+        ] {
+            let placement = PrincipalVerticalChildPlacement::new(
+                writing_mode,
+                Direction::Ltr,
+                PageTopBlockPosition::new(260.0),
+                PageInlineSpan::from_edges(20.0, 180.0),
+                LogicalInlineContentSize::new(content_box_pt(280.0)),
+            )
+            .expect("vertical writing modes have a horizontal block track");
+
+            assert_eq!(
+                placement.page_inline_origin(),
+                PageTopBlockPosition::new(260.0)
+            );
+            assert_eq!(placement.logical_inline_percentage_basis().points(), 280.0);
+            assert_eq!(placement.horizontal_block_track().width(), 160.0);
+
+            let constraint = placement.block_layout_inline_constraint();
+            assert_eq!(constraint.containing_inline_span.width(), 160.0);
+            assert_eq!(
+                constraint
+                    .percentage_basis
+                    .value()
+                    .expect("vertical principal flow exports a definite page-height basis")
+                    .points(),
+                280.0
+            );
+            assert_eq!(constraint.physical_width_percentage_basis.points(), 160.0);
+
+            let mut child_style = ComputedStyle::initial();
+            child_style.margin.left = 5.0;
+            child_style.margin.right = 12.0;
+            let expected_start_margin = if writing_mode == WritingMode::VerticalRl {
+                12.0
+            } else {
+                5.0
+            };
+            let expected_end_margin = if writing_mode == WritingMode::VerticalRl {
+                5.0
+            } else {
+                12.0
+            };
+            assert_eq!(
+                placement.child_block_start_margin(&child_style),
+                expected_start_margin
+            );
+            assert_eq!(
+                placement.child_block_end_margin(&child_style),
+                expected_end_margin
+            );
+
+            let remaining = placement.track_after_committed_child(border_box_pt(40.0), 5.0);
+            assert_eq!(remaining.left_x(), expected_left);
+            assert_eq!(remaining.right_x(), expected_right);
+        }
+
+        assert!(
+            PrincipalVerticalChildPlacement::new(
+                WritingMode::HorizontalTb,
+                Direction::Ltr,
+                PageTopBlockPosition::new(260.0),
+                PageInlineSpan::from_edges(20.0, 180.0),
+                LogicalInlineContentSize::new(content_box_pt(280.0)),
+            )
+            .is_none()
+        );
+    }
+}
+
 /// Whether the current in-flow block child owns the container's trimmed
 /// block-end edge.
 ///
@@ -22,14 +277,22 @@ pub(in crate::layout) enum BlockEndMarginTrim {
 }
 
 impl BlockEndMarginTrim {
+    /// Decide whether the current child owns the container's trimmed
+    /// block-end edge.
+    ///
+    /// `has_later_in_flow_block_child` must preserve the caller's normal
+    /// in-flow block-child classification. It is evaluated lazily because
+    /// CSS Box only needs the last-child distinction when the container
+    /// actually trims its block-end edge:
+    /// <https://drafts.csswg.org/css-box-4/#margin-trim-block>.
     pub(in crate::layout) fn for_child(
         parent_style: &ComputedStyle,
         is_in_flow_block_child: bool,
-        has_later_in_flow_block_child: bool,
+        has_later_in_flow_block_child: impl FnOnce() -> bool,
     ) -> Self {
         if parent_style.margin_trim.block_end
             && is_in_flow_block_child
-            && !has_later_in_flow_block_child
+            && !has_later_in_flow_block_child()
         {
             Self::Trim
         } else {
@@ -43,6 +306,51 @@ impl BlockEndMarginTrim {
         if self == Self::Trim {
             child_style.margin.bottom = 0.0;
         }
+    }
+}
+
+#[cfg(test)]
+mod block_end_margin_trim_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn later_sibling_query_is_evaluated_only_for_a_trimmed_in_flow_block_child() {
+        let mut parent_style = ComputedStyle::initial();
+        let queried = Cell::new(false);
+
+        assert_eq!(
+            BlockEndMarginTrim::for_child(&parent_style, true, || {
+                queried.set(true);
+                false
+            }),
+            BlockEndMarginTrim::Preserve
+        );
+        assert!(!queried.get());
+
+        parent_style.margin_trim.block_end = true;
+        assert_eq!(
+            BlockEndMarginTrim::for_child(&parent_style, false, || {
+                queried.set(true);
+                false
+            }),
+            BlockEndMarginTrim::Preserve
+        );
+        assert!(!queried.get());
+
+        assert_eq!(
+            BlockEndMarginTrim::for_child(&parent_style, true, || {
+                queried.set(true);
+                true
+            }),
+            BlockEndMarginTrim::Preserve
+        );
+        assert!(queried.replace(false));
+
+        assert_eq!(
+            BlockEndMarginTrim::for_child(&parent_style, true, || false),
+            BlockEndMarginTrim::Trim
+        );
     }
 }
 
@@ -66,25 +374,6 @@ pub(in crate::layout) fn discard_consumed_adjoining_block_end_margin(
     if let Some(margin) = previous_margin.filter(|_| !layout.cursor_is_at_page_top()) {
         layout.cursor_y += margin;
     }
-}
-
-/// Returns whether an unresolved percentage height computes as `auto` for a
-/// margin-collapse predicate.
-///
-/// CSS 2.2 treats a percentage height as `auto` when its containing block's
-/// height is not explicitly specified. The computed percentage remains useful
-/// elsewhere, so normalize only at this used-value boundary.
-/// <https://www.w3.org/TR/CSS22/visudet.html#the-height-property>
-pub(in crate::layout) fn percentage_height_is_auto_for_margin_collapse(
-    style: &ComputedStyle,
-    basis: BlockSizePercentageBasis,
-) -> bool {
-    matches!(basis, PercentageBasis::Indefinite)
-        && matches!(
-            &*style.box_values.height,
-            css::ComputedLengthPercentageOrAuto::LengthPercentage(value)
-                if value.needs_percentage_basis()
-        )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

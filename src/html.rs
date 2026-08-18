@@ -68,6 +68,9 @@ pub enum InputSyntax {
 pub struct Html {
     source: String,
     input_syntax: InputSyntax,
+    /// URL of the loaded document itself, deliberately distinct from the
+    /// effective base URL used to resolve relative references.
+    document_url: Option<Url>,
     base_url: Option<Url>,
     root_url: Option<Url>,
     stylesheets: Vec<Css>,
@@ -75,7 +78,7 @@ pub struct Html {
     iframe_depth: u8,
     /// An embedded document has a scrolling viewport distinct from the
     /// unfragmented canvas used to lay out its static contents.
-    iframe_viewport: Option<layout::PageSize>,
+    iframe_viewport: Option<layout::IframeEmbeddingContext>,
     /// Legacy body-margin values from this document's immediate container
     /// frame. They are cascade context for the embedded document, not a
     /// property of the iframe's own layout box.
@@ -93,6 +96,7 @@ impl Html {
         Self {
             source: source.into(),
             input_syntax: InputSyntax::Auto,
+            document_url: None,
             base_url: None,
             root_url: None,
             stylesheets: Vec::new(),
@@ -130,6 +134,7 @@ impl Html {
         Ok(Self {
             source,
             input_syntax: InputSyntax::Auto,
+            document_url: Some(url.clone()),
             base_url: Some(url),
             root_url: None,
             stylesheets: Vec::new(),
@@ -201,6 +206,7 @@ impl Html {
         Ok(Self {
             source,
             input_syntax: InputSyntax::Auto,
+            document_url: Some(final_url.clone()),
             root_url: resource::origin_url(&final_url),
             base_url: Some(final_url),
             stylesheets: Vec::new(),
@@ -370,7 +376,7 @@ impl Html {
         let html_important_stylesheet = (document_syntax == dom::DocumentSyntax::Html)
             .then(css::html_document_important_user_agent_stylesheet);
         let mut parsed_stylesheets = Vec::new();
-        if document_syntax == dom::DocumentSyntax::Html {
+        if document_syntax == dom::DocumentSyntax::Html || document_is_xhtml(&root) {
             parsed_stylesheets.push(css::html5_presentational_hints_stylesheet_with_urls(
                 self.base_url.as_ref(),
                 self.root_url.as_ref(),
@@ -405,7 +411,7 @@ impl Html {
         let mut visual_asset_policy = resource_fetcher.policy();
         visual_asset_policy.error_policy = resource::FetchErrorPolicy::Allow;
         let visual_asset_fetcher = resource::ResourceFetcher::new(visual_asset_policy)?;
-        let resource_cache = {
+        let mut resource_cache = {
             let resource_paths = resource_paths(
                 &root,
                 &stylesheets,
@@ -419,6 +425,14 @@ impl Html {
             ));
             resource::ResourceCache::preload(&visual_asset_fetcher, resource_paths).await?
         };
+        resource_cache
+            .preload_external_svg_uses(
+                &visual_asset_fetcher,
+                &root,
+                self.base_url(),
+                self.root_url(),
+            )
+            .await;
         resolve_object_rendering_states(
             &mut root,
             self.base_url(),
@@ -436,6 +450,7 @@ impl Html {
                 root: &root,
                 stylesheets: layout_stylesheets,
                 options: &options,
+                document_url: self.document_url.as_ref(),
                 base_url: self.base_url(),
                 root_url: self.root_url(),
                 resource_cache: &resource_cache,
@@ -461,6 +476,7 @@ impl Html {
                 root: &root,
                 stylesheets: layout_stylesheets,
                 options: &options,
+                document_url: self.document_url.as_ref(),
                 base_url: self.base_url(),
                 root_url: self.root_url(),
                 resource_cache: &resource_cache,
@@ -470,6 +486,7 @@ impl Html {
             })
         };
         let mut image_store = resource_cache.take_image_store();
+        image_store.set_output_resolution_dppx(options.device_resolution_dppx());
         image_store.finalize();
         document.image_store = Box::new(image_store);
         {
@@ -633,7 +650,7 @@ impl Html {
         &self,
         root: &dom::Node,
         options: &RenderOptions,
-        viewports: HashMap<dom::ElementId, (f32, f32)>,
+        viewports: HashMap<dom::ElementId, layout::IframeEmbeddingContext>,
     ) -> HashMap<dom::ElementId, Document> {
         const MAX_IFRAME_DEPTH: u8 = 8;
         if self.iframe_depth >= MAX_IFRAME_DEPTH {
@@ -643,8 +660,14 @@ impl Html {
         collect_iframe_sources(root, &mut sources);
         let mut documents = HashMap::new();
         for source in sources {
-            let Some((width, height)) = viewports.get(&source.element_id).copied() else {
+            let Some(context) = viewports.get(&source.element_id).copied() else {
                 continue;
+            };
+            let width = context.viewport.width();
+            let height = context.viewport.height();
+            let context = layout::IframeEmbeddingContext {
+                viewport: layout::PageSize::from_points(width.max(1.0), height.max(1.0)),
+                effective_zoom: context.effective_zoom,
             };
             let mut iframe_options = options.clone();
             iframe_options.page_size =
@@ -657,15 +680,13 @@ impl Html {
                 IframeSource::Srcdoc(srcdoc) => Ok(Html {
                     source: srcdoc,
                     input_syntax: InputSyntax::Html,
+                    document_url: None,
                     base_url: self.base_url.clone(),
                     root_url: self.root_url.clone(),
                     stylesheets: Vec::new(),
                     resource_policy: self.resource_policy,
                     iframe_depth: self.iframe_depth + 1,
-                    iframe_viewport: Some(layout::PageSize::from_points(
-                        width.max(1.0),
-                        height.max(1.0),
-                    )),
+                    iframe_viewport: Some(context),
                     iframe_container_body_margins: Some(source.container_body_margins),
                 }),
                 IframeSource::Url(url_source) => {
@@ -688,10 +709,7 @@ impl Html {
             match iframe_result {
                 Ok(mut iframe) => {
                     iframe.iframe_depth = self.iframe_depth + 1;
-                    iframe.iframe_viewport = Some(layout::PageSize::from_points(
-                        width.max(1.0),
-                        height.max(1.0),
-                    ));
+                    iframe.iframe_viewport = Some(context);
                     iframe.iframe_container_body_margins = Some(source.container_body_margins);
                     match Box::pin(iframe.render(&iframe_options)).await {
                         Ok(mut document) => {
@@ -706,6 +724,29 @@ impl Html {
         }
         documents
     }
+}
+
+/// Whether an XML document is an XHTML document governed by HTML's rendering
+/// rules.
+///
+/// The HTML rendering rules define presentational hints in the XHTML
+/// namespace, so an XHTML document receives them even when it was parsed with
+/// XML syntax. Other XML vocabularies retain the ordinary CSS cascade without
+/// HTML's legacy attribute mappings.
+/// <https://html.spec.whatwg.org/multipage/rendering.html#rendering>
+fn document_is_xhtml(root: &dom::Node) -> bool {
+    const XHTML_NAMESPACE_URL: &str = "http://www.w3.org/1999/xhtml";
+
+    let dom::NodeKind::Element(document) = &root.kind else {
+        return false;
+    };
+    document.children.iter().any(|child| {
+        matches!(
+            &child.kind,
+            dom::NodeKind::Element(element)
+                if element.tag == "html" && element.namespace_url == XHTML_NAMESPACE_URL
+        )
+    })
 }
 
 fn document_keywords(root: &dom::Node) -> Vec<String> {
@@ -841,14 +882,18 @@ fn object_has_supported_static_image(
     };
     if data.starts_with("data:") {
         return resource_cache
-            .data_image_asset_with_orientation(data, false, crate::svg::SvgImageContext::default())
+            .data_image_asset_with_orientation(
+                data,
+                crate::image_store::RasterOrientationPolicy::Encoded,
+                crate::svg::SvgImageContext::default(),
+            )
             .is_some();
     }
     resource::resolve_url(data, base_url, root_url)
         .and_then(|url| {
             resource_cache.image_asset_url_with_orientation(
                 &url,
-                false,
+                crate::image_store::RasterOrientationPolicy::Encoded,
                 crate::svg::SvgImageContext::default(),
             )
         })
@@ -917,6 +962,18 @@ fn collect_html_resource_paths(
     if element.tag == "embed"
         && let Some(src) = element.attrs.get("src")
         && let Some(path) = resource::resolve_fetchable_url(src, base_url, root_url)
+    {
+        paths.push(path);
+    }
+    // External SVG `<use>` references are visual subresources. Preload the
+    // document before SVG scene construction; the SVG adapter expands only
+    // same-origin cached targets and never performs parser-time I/O.
+    if element.namespace_url == "http://www.w3.org/2000/svg"
+        && element.tag == "use"
+        && let Some(href) = element.attrs.get("href")
+        && !href.starts_with('#')
+        && let Some(path) = resource::resolve_fetchable_url(href, base_url, root_url)
+        && path.fragment().is_none()
     {
         paths.push(path);
     }
@@ -1208,6 +1265,20 @@ mod tests {
             .find(|line| line.text == "Text")
             .expect("the XML paragraph should render");
         assert_eq!(text.x(), 16.0);
+    }
+
+    #[tokio::test]
+    async fn xhtml_rendering_applies_image_dimension_presentational_hints() {
+        let document = Html::from_xml_string(
+            "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><img width=\"100\" height=\"50\" src=\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC\" /></body></html>",
+        )
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+
+        let image = &document.pages[0].images()[0];
+        assert!((image.width() - 75.0).abs() < 0.001);
+        assert!((image.height() - 37.5).abs() < 0.001);
     }
 
     #[tokio::test]

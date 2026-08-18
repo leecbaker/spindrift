@@ -99,6 +99,10 @@ working parity snapshot for implemented behavior and nearby follow-up areas.
 - Block-level absolutely positioned descendants encountered after inline text
   use the buffered inline line sequence for their auto static-position block
   offset, so later floats do not shift or expose the positioned box.
+- Consecutive block-level absolute or fixed siblings retain the same captured
+  ordinary-flow static position until an in-flow sibling advances that source
+  position. An earlier out-of-flow sibling therefore cannot create a phantom
+  line that shifts the following sibling.
 - Block-level absolutely positioned descendants with auto horizontal insets
   honor the static-position containing block's direction, including RTL cases
   that seed `right` from the hypothetical normal-flow static position.
@@ -134,10 +138,11 @@ working parity snapshot for implemented behavior and nearby follow-up areas.
 - Positioned page-span bookkeeping separately records a logical tail and its
   materialized paint prefix. A resolved ancestor `overflow: clip` bounds the
   positioned scratch continuation before payload creation, while its logical
-  tail remains available to ordering and continuation bookkeeping. The clip
-  relation follows ancestor ownership rather than requiring the containing
-  block to fit inside the clip. Unresolved clip geometry still requires
-  deferred replay; `hidden`, `auto`, and `scroll` remain conservatively
+  tail remains available to ordering and continuation bookkeeping. Deferred
+  multicolumn replay restores its captured source clip ancestry with the
+  source containing block, rather than inheriting the restored builder state.
+  The clip relation follows ancestor ownership rather than requiring the
+  containing block to fit inside the clip. `hidden`, `auto`, and `scroll` remain conservatively
   potentially visible.
 - A decoration-free nested absolute box with no paint and no viewport-fixed
   replay requirement does not materialize otherwise blank document pages.
@@ -162,6 +167,10 @@ working parity snapshot for implemented behavior and nearby follow-up areas.
   as continuous crossed page areas, so their page span and page-margin counters
   reflect the actual fragment sequence rather than a synthetic measurement
   cursor.
+- Automatic absolute-positioned size probes preserve the established physical
+  containing block as the principal box's percentage basis. The principal's
+  ordinary formatting-context entry then establishes the separate, cyclic
+  descendant block-size basis, including for orthogonal writing modes.
 - Absolutely positioned descendants inside inline floats under a single-line
   positioned or transformed inline ancestor resolve explicit insets against
   that inline ancestor's generated padding-box containing block instead of the
@@ -189,7 +198,9 @@ working parity snapshot for implemented behavior and nearby follow-up areas.
 - Absolutely positioned children retain one typed static-alignment rectangle
   through automatic sizing and final placement. Flex supplies its sole-item
   main-axis and container cross-axis geometry, Grid supplies its grid area,
-  and ordinary positioned descendants use their containing-block rectangle;
+  and ordinary positioned descendants use their containing-block rectangle.
+  Ordinary block flow supplies its applicable `justify-items` default but not
+  `align-items`, which does not apply to hypothetical block-level children;
   all three resolve self-alignment through the same physical-axis path.
 - `align-self`, `justify-self`, and `place-self: anchor-center` use ordinary
   center alignment when no default anchor exists, as required by CSS Anchor

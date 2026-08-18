@@ -49,6 +49,7 @@ pub(crate) fn parse_stylesheet_with_media_environment(
         current_layer: css.import_layer_name().cloned(),
         current_scopes: Vec::new(),
         scope_anchor: css.scope_anchor(),
+        origin: css.origin(),
         media_environment: *media_environment,
         nesting: None,
         namespace_prelude_open: true,
@@ -346,6 +347,7 @@ use nesting::*;
 pub(crate) use page_margin::cascade_page_declarations;
 use page_margin::*;
 pub(in crate::css) use rule_parser::LayerRegistry;
+pub(in crate::css) use rule_parser::cascaded_declaration_is_valid;
 use rule_parser::*;
 pub(crate) use rule_parser::{
     custom_property_value_is_valid, is_custom_property_name, media_rule_applies,
@@ -355,10 +357,14 @@ pub(in crate::css) use rule_parser::{parse_layer_name, parse_layer_name_list};
 
 /// Parses a declaration at specified-value time and returns the canonical
 /// property/value operation the cascade should apply.
+#[allow(
+    dead_code,
+    reason = "the cascade uses borrowed validation; this adapter remains for standalone callers that need an owned canonical operation"
+)]
 pub(in crate::css) fn declaration_operation(name: &str, value: &str) -> Option<(String, String)> {
     match rule_parser::parse_canonical_declaration(name, value) {
         rule_parser::DeclarationParseResult::Valid(operation) => {
-            Some((operation.name, operation.value))
+            Some((operation.name.into_owned(), operation.value.into_owned()))
         }
         rule_parser::DeclarationParseResult::UnsupportedProperty
         | rule_parser::DeclarationParseResult::InvalidValue => None,

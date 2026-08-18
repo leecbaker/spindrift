@@ -1,4 +1,5 @@
 use super::*;
+use crate::document::paint::geometry::PaintSize;
 
 fn image_xobject_count_with_size(rendered: &str, width: u32, height: u32) -> usize {
     rendered
@@ -201,7 +202,7 @@ async fn inline_content_background_height_is_independent_of_line_height() {
 }
 
 #[tokio::test]
-async fn normal_line_height_unions_fallback_font_run_metrics() {
+async fn normal_line_height_uses_primary_metrics_despite_fallback_runs() {
     let dir =
         std::env::temp_dir().join(format!("quire-fallback-line-height-{}", std::process::id()));
     let fonts_dir = dir.join("fonts");
@@ -242,17 +243,13 @@ async fn normal_line_height_unions_fallback_font_run_metrics() {
           color: transparent;
         }
         .h { font-family: HighOnly; }
-        .d { font-family: DeepOnly; }
         .hd { font-family: HighOnly, DeepOnly; }
         .white { background: white; }
         .red { background: red; }
-        .shift { margin-left: 300px; }
         </style>
         <p>Test passes if there is no red below.</p>
         <div class="hd red">ab</div>
-        <div class="white"><span class="h">a</span><span class="d">b</span></div>
-        <div class="red shift"><span class="h">a</span><span class="d">b</span></div>
-        <div class="hd white shift">ab</div>"#,
+        <div class="h white">aa</div>"#,
     )
     .unwrap();
 
@@ -276,18 +273,16 @@ async fn normal_line_height_unions_fallback_font_run_metrics() {
         .collect::<Vec<_>>();
     red.sort_by(|left, right| left.x().total_cmp(&right.x()));
     white.sort_by(|left, right| left.x().total_cmp(&right.x()));
-    assert_eq!(red.len(), 2, "red backgrounds={red:?}");
-    assert_eq!(white.len(), 2, "white backgrounds={white:?}");
-    for (red, white) in red.iter().zip(white.iter()) {
-        assert!(
-            (red.y() - white.y()).abs() < 0.01,
-            "covering background should share y with red: red={red:?} white={white:?}"
-        );
-        assert!(
-            (red.height() - white.height()).abs() < 0.01,
-            "covering background should share height with red: red={red:?} white={white:?}"
-        );
-    }
+    assert_eq!(red.len(), 1, "red backgrounds={red:?}");
+    assert_eq!(white.len(), 1, "white backgrounds={white:?}");
+    assert!(
+        (red[0].y() - white[0].y()).abs() < 0.01,
+        "fallback glyph metrics must not shift the normal-line background: red={red:?} white={white:?}"
+    );
+    assert!(
+        (red[0].height() - white[0].height()).abs() < 0.01,
+        "fallback glyph metrics must not change the normal-line background height: red={red:?} white={white:?}"
+    );
 }
 
 #[tokio::test]
@@ -1089,7 +1084,7 @@ async fn paints_stretched_border_image_slices_from_source_pixels() {
     let border_images = document.pages[0]
         .images()
         .iter()
-        .filter(|image| image.source_rect().is_some())
+        .filter(|image| image.is_clipped())
         .collect::<Vec<_>>();
 
     assert_eq!(border_images.len(), 8);
@@ -1098,18 +1093,13 @@ async fn paints_stretched_border_image_slices_from_source_pixels() {
             .iter()
             .all(|image| image.pixel_width() == 3 && image.pixel_height() == 3)
     );
-    assert!(
-        border_images
-            .iter()
-            .all(|image| image.source_rect().unwrap().width() > 0
-                && image.source_rect().unwrap().height() > 0)
-    );
+    assert!(border_images.iter().all(|image| image.is_clipped()));
 
     let pdf = document
         .write_pdf_bytes(&crate::PdfOptions::default())
         .unwrap();
     let rendered = pdf_searchable_text(&pdf);
-    assert!(image_paint_count(&rendered, 1, 1) >= 1);
+    assert!(image_paint_count(&rendered, 3, 3) >= 1);
 }
 
 #[tokio::test]
@@ -1164,6 +1154,37 @@ async fn external_svg_url_images_paint_as_vectors_for_img_background_and_border_
             .filter(|path| path.fill == Some(CssColor::new(34, 146, 212)))
             .count()
             >= 3
+    );
+}
+
+/// SVG 2 external `<use>` references are expanded from the visual-resource
+/// cache before `usvg` builds its local use shadow trees.
+/// <https://www.w3.org/TR/SVG2/struct.html#UseElement>
+#[tokio::test]
+async fn inline_svg_use_imports_same_origin_html_and_nested_svg_documents() {
+    let base_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let document = Html::from_string(
+        r#"<style>@page { size: 320pt 120pt; margin: 10pt } body { margin: 0 }</style>
+        <svg width="100" height="100"><use href="external-svg-use-symbols.html#green"/></svg>
+        <svg width="100" height="100"><use href="external-svg-use-nested.svg#nested-green"/></svg>
+        <svg width="100" height="100"><use href="external-svg-use-non-svg-root.xml#green"/></svg>"#,
+    )
+    .with_base_path(&base_path)
+    .unwrap()
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(document.pages.len(), 1, "document={document:?}");
+    assert_eq!(
+        document.pages[0]
+            .paths()
+            .iter()
+            .filter(|path| path.fill == Some(CssColor::new(0, 128, 0)))
+            .count(),
+        3,
+        "external SVG use paths={:?}",
+        document.pages[0].paths()
     );
 }
 
@@ -1458,21 +1479,25 @@ async fn paints_repeated_border_image_tiles() {
     let border_images = document.pages[0]
         .images()
         .iter()
-        .filter(|image| image.source_rect().is_some())
+        .filter(|image| image.is_clipped())
         .collect::<Vec<_>>();
     assert!(border_images.len() > 8, "{border_images:#?}");
     assert!(
         border_images
             .iter()
-            .all(|image| image.source_rect().unwrap().width() > 0
-                && image.source_rect().unwrap().height() > 0)
+            .all(|image| image.pixel_width() == 3 && image.pixel_height() == 3)
     );
+    assert!(border_images.iter().all(|image| image.is_clipped()));
 
     let pdf = document
         .write_pdf_bytes(&crate::PdfOptions::default())
         .unwrap();
     let rendered = pdf_searchable_text(&pdf);
-    assert!(image_paint_count(&rendered, 1, 1) > 1);
+    // Repeated tiles share one raster image XObject in the PDF; the individual
+    // placements are represented by distinct transforms and clips. The display
+    // list assertion above verifies those placements, while this checks that
+    // the full source raster reaches PDF serialization.
+    assert!(image_paint_count(&rendered, 3, 3) >= 1);
 }
 
 #[tokio::test]
@@ -1503,18 +1528,18 @@ async fn border_image_width_auto_uses_source_slice_size() {
     let border_images = document.pages[0]
         .images()
         .iter()
-        .filter(|image| image.source_rect().is_some())
+        .filter(|image| image.is_clipped())
         .collect::<Vec<_>>();
     assert_eq!(border_images.len(), 8);
     assert!(
         border_images
             .iter()
-            .any(|image| (image.height() - 1.5).abs() < 0.01)
+            .any(|image| (image_clip_size(image).height - 1.5).abs() < 0.01)
     );
     assert!(
         border_images
             .iter()
-            .any(|image| (image.width() - 1.5).abs() < 0.01)
+            .any(|image| (image_clip_size(image).width - 1.5).abs() < 0.01)
     );
 }
 
@@ -1546,19 +1571,41 @@ async fn border_image_widths_scale_down_before_overlapping() {
     let border_images = document.pages[0]
         .images()
         .iter()
-        .filter(|image| image.source_rect().is_some())
+        .filter(|image| image.is_clipped())
         .collect::<Vec<_>>();
     assert_eq!(border_images.len(), 4);
+    assert!(border_images.iter().all(|image| {
+        let size = image_clip_size(image);
+        size.width <= 7.01 && size.height <= 7.01
+    }));
     assert!(
         border_images
             .iter()
-            .all(|image| image.width() <= 7.01 && image.height() <= 7.01)
+            .any(|image| (image_clip_size(image).width - 7.0).abs() < 0.01)
     );
-    assert!(
-        border_images
-            .iter()
-            .any(|image| (image.width() - 7.0).abs() < 0.01)
-    );
+}
+
+/// Border-image tiles retain and scale the complete raster source, then clip
+/// it to the selected destination slice. The clip, rather than the full
+/// source placement rectangle, is therefore the CSS border-image tile size.
+fn image_clip_size(image: &crate::document::paint::images::RenderedImage) -> PaintSize {
+    use crate::document::paint::paths::RenderedPathCommand::{Close, LineTo, MoveTo};
+
+    let commands = &image.clip().expect("border-image tile clip").commands;
+    let [
+        MoveTo(origin),
+        LineTo(inline_end),
+        LineTo(block_end),
+        LineTo(_),
+        Close,
+    ] = commands.as_slice()
+    else {
+        panic!("border-image clips are rectangular: {commands:?}");
+    };
+    PaintSize::new(
+        (inline_end.x - origin.x).abs(),
+        (block_end.y - inline_end.y).abs(),
+    )
 }
 
 #[tokio::test]

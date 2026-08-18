@@ -41,6 +41,16 @@ impl<'a> LayoutBuilder<'a> {
                     IntrinsicInlinePercentageBasisSource::MeasurementAvailableWidth,
                 )
             });
+        let replaced_sizing = ReplacedIntrinsicSizingContext {
+            available_width: content_box_pt(available_width),
+            inline_percentage_basis,
+            block_basis: IntrinsicBlockBasis::from_layout_percentage_basis(
+                self.definite_block_size_stack
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(PercentageBasis::indefinite),
+            ),
+        };
         if let Content::Replacement {
             image: GeneratedContentPart::Image { image },
             ..
@@ -60,7 +70,7 @@ impl<'a> LayoutBuilder<'a> {
             return Some(
                 InlineAtom::new(
                     content,
-                    style.as_computed().clone(),
+                    style.clone(),
                     None,
                     InlineSize::new(
                         border_box_width
@@ -80,18 +90,8 @@ impl<'a> LayoutBuilder<'a> {
         }
         let (width, height, baseline_offset) = match replaced_element_kind(element) {
             Some(ReplacedElementKind::Canvas) => {
-                let containing_block_height = self
-                    .definite_block_size_stack
-                    .last()
-                    .cloned()
-                    .unwrap_or_else(PercentageBasis::indefinite);
-                let canvas = used_canvas_with_inline_percentage_basis(
-                    element,
-                    style,
-                    available_width,
-                    inline_percentage_basis,
-                    containing_block_height,
-                );
+                let canvas =
+                    used_canvas_with_intrinsic_sizing_context(element, style, replaced_sizing);
                 let border_box_width = canvas.border_box_size.width;
                 let border_box_height = canvas.border_box_size.height;
                 (
@@ -104,18 +104,10 @@ impl<'a> LayoutBuilder<'a> {
                     border_box_height,
                 )
             }
-            Some(ReplacedElementKind::Image) => used_image_with_inline_percentage_basis(
+            Some(ReplacedElementKind::Image) => used_image_with_intrinsic_sizing_context(
                 element,
                 style,
-                IntrinsicInlineImageSizingContext {
-                    available_width: content_box_pt(available_width),
-                    inline_percentage_basis,
-                    height_basis: self
-                        .definite_block_size_stack
-                        .last()
-                        .cloned()
-                        .unwrap_or_else(PercentageBasis::indefinite),
-                },
+                replaced_sizing,
                 self.base_url,
                 self.root_url,
                 self.resource_cache,
@@ -134,15 +126,7 @@ impl<'a> LayoutBuilder<'a> {
                 )
             })?,
             Some(ReplacedElementKind::Svg) => {
-                let svg = used_svg(
-                    element,
-                    style,
-                    available_width,
-                    self.definite_block_size_stack
-                        .last()
-                        .cloned()
-                        .unwrap_or_else(PercentageBasis::indefinite),
-                )?;
+                let svg = used_svg_with_intrinsic_sizing_context(element, style, replaced_sizing)?;
                 let width = svg.border_box_size.width;
                 let height = svg.border_box_size.height;
                 (
@@ -366,7 +350,7 @@ impl<'a> LayoutBuilder<'a> {
         Some(
             InlineAtom::new(
                 InlineAtomContent::Svg { asset: None },
-                style.as_computed().clone(),
+                style.clone(),
                 None,
                 InlineSize::new(width, height),
                 baseline_offset,
@@ -733,6 +717,7 @@ impl<'a> LayoutBuilder<'a> {
                     std::slice::from_ref(part),
                     &counter_stacks,
                     &self.counter_styles,
+                    list::CounterStyleRenderContext::for_style(style),
                 );
                 push_generated_inline_words_for_style(
                     &text,
@@ -809,6 +794,7 @@ impl<'a> LayoutBuilder<'a> {
                     self.generated_image_atom_for_image(
                         image,
                         style,
+                        true,
                         baseline_shift,
                         visual_offset,
                         link_target,
@@ -826,6 +812,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         image_value: &BackgroundImage,
         style: &ComputedStyle,
+        preserve_intrinsic_image_size: bool,
         baseline_shift: f32,
         visual_offset: InlineVisualOffset,
         link_target: Option<String>,
@@ -849,16 +836,43 @@ impl<'a> LayoutBuilder<'a> {
         let border_box_width = image.border_box_size.width;
         let border_box_height = image.border_box_size.height;
         let content = image.into_inline_atom_content();
+        let mut atom_style = style.clone();
+        // `used_generated_image_value` resolves the pseudo's own used
+        // border-box size. The atom retains that footprint, while
+        // `object-fit: none` below selects the intrinsic payload size within
+        // it.
+        let atom_border_box_width = border_box_width;
+        let atom_border_box_height = border_box_height;
+        if preserve_intrinsic_image_size
+            && matches!(
+                content,
+                InlineAtomContent::Image(_) | InlineAtomContent::Svg { .. }
+            )
+        {
+            // Browser interoperability treats an image supplied as the sole
+            // content of ::before/::after as anonymous inline content inside
+            // the pseudo box. Its payload keeps its intrinsic dimensions;
+            // the pseudo's width and height still establish the decorated
+            // outer box.
+            // <https://www.w3.org/TR/css-content-3/#content-property>
+            atom_style = atom_style.map_used_values(|style| {
+                style.object_fit = css::ObjectFit::None;
+                // The anonymous image is laid out at the pseudo-element's
+                // content start, rather than using the replaced-element
+                // default centered `object-position`.
+                style.object_position = css::BackgroundPosition::INITIAL;
+            });
+        }
         Some(
             InlineAtom::new(
                 content,
-                style.as_computed().clone(),
+                atom_style,
                 None,
                 InlineSize::new(
-                    border_box_width + style.margin.left + style.margin.right,
-                    border_box_height + style.margin.top + style.margin.bottom,
+                    atom_border_box_width + style.margin.left + style.margin.right,
+                    atom_border_box_height + style.margin.top + style.margin.bottom,
                 ),
-                border_box_height,
+                atom_border_box_height,
                 baseline_shift,
                 link_target,
                 alt_text,
@@ -975,7 +989,7 @@ impl<'a> LayoutBuilder<'a> {
             output.push(InlineItem::Word(Box::new(InlineWord {
                 text: text.to_string(),
                 style: inline_style(style),
-                baseline_shift: placement.baseline_shift,
+                baseline_shift: placement.baseline_shift(),
                 visual_offset: placement.visual_offset,
                 link_target: link_target.map(Rc::from),
                 mergeable: true,
@@ -1031,6 +1045,7 @@ impl<'a> LayoutBuilder<'a> {
                 self.generated_image_atom_for_image(
                     image,
                     style,
+                    false,
                     baseline_shift,
                     visual_offset,
                     link_target,
@@ -1055,8 +1070,13 @@ impl<'a> LayoutBuilder<'a> {
                 let content = if element.tag.eq_ignore_ascii_case("iframe") {
                     self.resource_cache.record_iframe_viewport(
                         element.id,
-                        canvas.content_size.width,
-                        canvas.content_size.height,
+                        IframeEmbeddingContext {
+                            viewport: PageSize::from_points(
+                                canvas.content_size.width,
+                                canvas.content_size.height,
+                            ),
+                            effective_zoom: style.effective_zoom,
+                        },
                     );
                     InlineAtomContent::Iframe(element.id)
                 } else {
@@ -1069,7 +1089,7 @@ impl<'a> LayoutBuilder<'a> {
                 Some(
                     InlineAtom::new(
                         content,
-                        style.into_computed(),
+                        style.clone(),
                         None,
                         InlineSize::new(
                             atom_width,
@@ -1114,7 +1134,7 @@ impl<'a> LayoutBuilder<'a> {
                 Some(
                     InlineAtom::new(
                         content,
-                        style.as_computed().clone(),
+                        style.clone(),
                         None,
                         InlineSize::new(
                             border_box_width + style.margin.left + style.margin.right,
@@ -1150,7 +1170,7 @@ impl<'a> LayoutBuilder<'a> {
                 Some(
                     InlineAtom::new(
                         InlineAtomContent::Svg { asset: Some(asset) },
-                        style.into_computed(),
+                        style.clone(),
                         None,
                         InlineSize::new(
                             width + metrics.margin.left.points() + metrics.margin.right.points(),
@@ -1253,6 +1273,12 @@ impl<'a> LayoutBuilder<'a> {
                         definite_content_height,
                         BlockSizeBasisSource::InlineBlock,
                     ));
+                // An inline-block establishes a new block formatting context.
+                // Its intrinsic child layout and final inline line sequence
+                // cannot observe float exclusions from the parent line.
+                // <https://www.w3.org/TR/CSS22/visuren.html#inline-blocks>
+                // <https://www.w3.org/TR/CSS22/visuren.html#block-formatting>
+                self.push_float_context();
                 let intrinsic = self.intrinsic_inline_measurement_for_element(
                     element,
                     style,
@@ -1378,6 +1404,7 @@ impl<'a> LayoutBuilder<'a> {
                     0.0,
                     0.0,
                 );
+                self.pop_float_context();
                 let measured_logical_block_size = if vertical_writing_mode {
                     sequence
                         .records
@@ -1427,7 +1454,7 @@ impl<'a> LayoutBuilder<'a> {
                 );
                 let mut atom = InlineAtom::new(
                     InlineAtomContent::InlineBox { sequence },
-                    style.as_computed().clone(),
+                    style.clone(),
                     None,
                     InlineSize::new(
                         content_width + horizontal_extras + style.margin.left + style.margin.right,

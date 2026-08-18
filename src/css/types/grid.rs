@@ -113,6 +113,14 @@ impl GridTrackList {
         }
     }
 
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        if let Self::Tracks { components, .. } = self {
+            for component in components {
+                component.resolve_root_font_metric_lengths(basis);
+            }
+        }
+    }
+
     /// Layout and paint containment establish an independent formatting
     /// context, so a subgridded axis computes to the used value `none`.
     /// <https://drafts.csswg.org/css-grid-2/#subgrid-listing>
@@ -124,6 +132,10 @@ impl GridTrackList {
 
     pub(crate) fn requires_ch_advance(&self) -> bool {
         matches!(self, Self::Tracks { components, .. } if components.iter().any(GridTrackListComponent::requires_ch_advance))
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        matches!(self, Self::Tracks { components, .. } if components.iter().any(GridTrackListComponent::requires_root_font_metrics))
     }
 
     /// Scale fixed track-breadth components at the CSS `zoom` used-value
@@ -157,10 +169,24 @@ impl GridTrackListComponent {
         }
     }
 
+    fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        match self {
+            Self::Track(_, size) => size.resolve_root_font_metric_lengths(basis),
+            Self::Repeat(_, repeat) => repeat.resolve_root_font_metric_lengths(basis),
+        }
+    }
+
     fn requires_ch_advance(&self) -> bool {
         match self {
             Self::Track(_, size) => size.requires_ch_advance(),
             Self::Repeat(_, repeat) => repeat.requires_ch_advance(),
+        }
+    }
+
+    fn requires_root_font_metrics(&self) -> bool {
+        match self {
+            Self::Track(_, size) => size.requires_root_font_metrics(),
+            Self::Repeat(_, repeat) => repeat.requires_root_font_metrics(),
         }
     }
 
@@ -186,10 +212,22 @@ impl GridRepeat {
         }
     }
 
+    fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        for track in &mut self.tracks {
+            track.resolve_root_font_metric_lengths(basis);
+        }
+    }
+
     fn requires_ch_advance(&self) -> bool {
         self.tracks
             .iter()
             .any(GridTrackListComponent::requires_ch_advance)
+    }
+
+    fn requires_root_font_metrics(&self) -> bool {
+        self.tracks
+            .iter()
+            .any(GridTrackListComponent::requires_root_font_metrics)
     }
 
     fn scale_fixed_length_components(&mut self, factor: f32) {
@@ -231,8 +269,17 @@ impl GridTrackSize {
         self.max.resolve_font_metric_lengths(ch_advance);
     }
 
+    fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        self.min.resolve_root_font_metric_lengths(basis);
+        self.max.resolve_root_font_metric_lengths(basis);
+    }
+
     fn requires_ch_advance(&self) -> bool {
         self.min.requires_ch_advance() || self.max.requires_ch_advance()
+    }
+
+    fn requires_root_font_metrics(&self) -> bool {
+        self.min.requires_root_font_metrics() || self.max.requires_root_font_metrics()
     }
 
     pub(crate) fn scale_fixed_length_components(&mut self, factor: f32) {
@@ -256,8 +303,18 @@ impl GridMinTrackBreadth {
         }
     }
 
+    fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        if let Self::LengthPercentage(value) = self {
+            value.resolve_root_font_metric_lengths(basis);
+        }
+    }
+
     fn requires_ch_advance(&self) -> bool {
         matches!(self, Self::LengthPercentage(value) if value.requires_ch_advance())
+    }
+
+    fn requires_root_font_metrics(&self) -> bool {
+        matches!(self, Self::LengthPercentage(value) if value.requires_root_font_metrics())
     }
 
     fn scale_fixed_length_components(&mut self, factor: f32) {
@@ -287,8 +344,21 @@ impl GridMaxTrackBreadth {
         }
     }
 
+    fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        match self {
+            Self::LengthPercentage(value) | Self::FitContent(value) => {
+                value.resolve_root_font_metric_lengths(basis);
+            }
+            Self::Auto | Self::MinContent | Self::MaxContent | Self::Flex(_) => {}
+        }
+    }
+
     fn requires_ch_advance(&self) -> bool {
         matches!(self, Self::LengthPercentage(value) | Self::FitContent(value) if value.requires_ch_advance())
+    }
+
+    fn requires_root_font_metrics(&self) -> bool {
+        matches!(self, Self::LengthPercentage(value) | Self::FitContent(value) if value.requires_root_font_metrics())
     }
 
     fn scale_fixed_length_components(&mut self, factor: f32) {
@@ -375,8 +445,18 @@ impl GridAutoTrackList {
         }
     }
 
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        for track in self.iter_mut() {
+            track.resolve_root_font_metric_lengths(basis);
+        }
+    }
+
     pub(crate) fn requires_ch_advance(&self) -> bool {
         self.iter().any(|track| track.clone().requires_ch_advance())
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        self.iter().any(|track| track.requires_root_font_metrics())
     }
 
     /// Scale fixed implicit-track breadth components while retaining their
@@ -456,6 +536,17 @@ pub(crate) enum GridLanesFlowTolerance {
 
 impl GridLanesFlowTolerance {
     pub(crate) const NORMAL: Self = Self::Normal;
+
+    /// Scale the fixed length component at the CSS `zoom` used-value
+    /// boundary while retaining percentage and keyword semantics.
+    ///
+    /// <https://drafts.csswg.org/css-viewport/#zoom-property>
+    /// <https://drafts.csswg.org/css-grid-3/#flow-tolerance-property>
+    pub(crate) fn scale_fixed_length_components(&mut self, factor: f32) {
+        if let Self::LengthPercentage(value) = self {
+            value.scale_fixed_length_components(factor);
+        }
+    }
 }
 
 /// Computed CSS Grid item placement for one axis edge.

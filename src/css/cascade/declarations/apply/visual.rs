@@ -355,6 +355,28 @@ pub(in crate::css) fn apply_cascaded_visual_declaration(
                 style.svg_stroke_width = SvgStrokeWidth::HostCss(width);
             }
         }
+        "flood-color" => {
+            if let Some(color) =
+                parse_color_from_currentcolor_in_scheme(value, style.color, style.used_color_scheme)
+                    .or_else(|| parse_color(value))
+            {
+                style.svg_flood_color = SvgFilterColor {
+                    color,
+                    current_color_dependent: crate::css::color_depends_on_currentcolor(value),
+                };
+            }
+        }
+        "lighting-color" => {
+            if let Some(color) =
+                parse_color_from_currentcolor_in_scheme(value, style.color, style.used_color_scheme)
+                    .or_else(|| parse_color(value))
+            {
+                style.svg_lighting_color = SvgFilterColor {
+                    color,
+                    current_color_dependent: crate::css::color_depends_on_currentcolor(value),
+                };
+            }
+        }
         "-webkit-text-fill-color" => {
             if value.eq_ignore_ascii_case("currentcolor") {
                 style.text_fill_color = CssColorOrCurrentColor::CurrentColor;
@@ -379,16 +401,10 @@ pub(in crate::css) fn apply_cascaded_visual_declaration(
             // the inherited line height, not the value being established by
             // this declaration.
             // <https://www.w3.org/TR/css-values-4/#lh>
-            let line_height = value
-                .trim()
-                .to_ascii_lowercase()
-                .strip_suffix("lh")
-                .and_then(|multiplier| multiplier.trim().parse::<f32>().ok())
-                .map(|multiplier| {
-                    ComputedLineHeight::from_points(multiplier * inheritance_source.line_height)
-                })
-                .or_else(|| parse_computed_line_height(value, style.font_size));
-            if let Some(line_height) = line_height {
+            if let Some(mut line_height) = parse_computed_line_height(value, style.font_size) {
+                line_height.resolve_inherited_line_height_relative_lengths(layout_pt(
+                    inheritance_source.line_height,
+                ));
                 style.line_height_value = line_height;
                 project_line_height(style);
             }

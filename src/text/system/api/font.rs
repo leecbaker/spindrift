@@ -2,6 +2,90 @@ use super::*;
 use crate::css::{FontSizeAdjust, FontSizeAdjustValue, FontVariationSettings};
 use crate::text::system::api::{font_feature_family, font_size_adjust_metric_ratio};
 
+/// The font-family selection made for a styled `unicode-range` fragment.
+///
+/// It is deliberately limited to face selection at the shaping boundary.
+/// CSS metrics, provenance, and every property other than `font-family`
+/// remain on the authored computed style.
+#[derive(Debug)]
+pub(in crate::text) struct SelectedFaceStyleView<'a> {
+    authored: &'a ComputedStyle,
+    selected_family: Option<FontFamily>,
+}
+
+impl<'a> SelectedFaceStyleView<'a> {
+    pub(in crate::text) fn new(
+        authored: &'a ComputedStyle,
+        selected_family: Option<FontFamily>,
+    ) -> Self {
+        Self {
+            authored,
+            selected_family,
+        }
+    }
+
+    pub(in crate::text) fn authored(&self) -> &'a ComputedStyle {
+        self.authored
+    }
+
+    pub(in crate::text) fn font_family(&self) -> &FontFamily {
+        self.selected_family
+            .as_ref()
+            .unwrap_or(&self.authored.font_family)
+    }
+
+    pub(in crate::text) fn has_same_effective_style(&self, other: &Self) -> bool {
+        self.authored == other.authored && self.font_family() == other.font_family()
+    }
+
+    /// Return the CSS boundary effect relevant to glyph shaping.
+    ///
+    /// Paint properties such as color, text decoration, and font palette must
+    /// remain separate for painting but must not force a new shaping context.
+    /// Font selection and OpenType inputs do affect shaping and may require
+    /// synthetic join context when the backend cannot carry context across
+    /// the boundary:
+    /// <https://drafts.csswg.org/css-text-3/#boundary-shaping>.
+    pub(in crate::text) fn boundary_effect(&self, other: &Self) -> InlineBoundaryEffect {
+        if self.has_same_shaping_inputs(other) {
+            InlineBoundaryEffect::PaintOnly
+        } else {
+            InlineBoundaryEffect::ShapingInputChange
+        }
+    }
+
+    fn has_same_shaping_inputs(&self, other: &Self) -> bool {
+        let left = self.authored;
+        let right = other.authored;
+        self.font_family() == other.font_family()
+            && left.font_size == right.font_size
+            && left.font_size_adjust == right.font_size_adjust
+            && left.line_height == right.line_height
+            && left.font_weight == right.font_weight
+            && left.font_style == right.font_style
+            && left.font_width == right.font_width
+            && left.font_synthesis == right.font_synthesis
+            && left.font_feature_settings == right.font_feature_settings
+            && left.text_spacing_trim == right.text_spacing_trim
+            && left.font_variation_settings == right.font_variation_settings
+            && left.font_kerning == right.font_kerning
+            && left.font_variant_ligatures == right.font_variant_ligatures
+            && left.font_variant_position == right.font_variant_position
+            && left.font_variant_caps == right.font_variant_caps
+            && left.font_variant_numeric == right.font_variant_numeric
+            && left.font_variant_alternates == right.font_variant_alternates
+            && left.font_variant_east_asian == right.font_variant_east_asian
+            && left.font_variant_emoji == right.font_variant_emoji
+            && left.overflow_wrap == right.overflow_wrap
+            && left.text_wrap_mode == right.text_wrap_mode
+            && left.word_spacing == right.word_spacing
+            && left.letter_spacing == right.letter_spacing
+            && left.language == right.language
+            && left.writing_mode == right.writing_mode
+            && left.text_orientation == right.text_orientation
+    }
+}
+
 impl FontSystem {
     /// Run one Parley shaping pass with layout storage retained for the next
     /// pass in this document.
@@ -34,6 +118,21 @@ impl FontSystem {
         &mut self,
         style: &ComputedStyle,
     ) -> Option<FontFeatureContext> {
+        self.font_feature_context_for_family(style, &style.font_family)
+    }
+
+    pub(in crate::text) fn font_feature_context_for_selected_face(
+        &mut self,
+        style: &SelectedFaceStyleView<'_>,
+    ) -> Option<FontFeatureContext> {
+        self.font_feature_context_for_family(style.authored(), style.font_family())
+    }
+
+    fn font_feature_context_for_family(
+        &mut self,
+        style: &ComputedStyle,
+        family: &FontFamily,
+    ) -> Option<FontFeatureContext> {
         // `font-feature-settings` defaults in an @font-face rule belong to
         // the selected face, rather than its family. Resolve the authored
         // face directly: a descriptor applies while shaping the face's own
@@ -42,7 +141,7 @@ impl FontSystem {
         // <https://www.w3.org/TR/css-fonts-4/#font-face-font-feature-settings>
         let selected_face = self
             .resolve_font_family(
-                &style.font_family,
+                family,
                 style.font_weight,
                 style.font_style,
                 style.font_width,
@@ -50,7 +149,7 @@ impl FontSystem {
             .and_then(|font_id| self.document_fonts.selected_face_features(font_id));
         let (family, face_defaults) = selected_face
             .map(|(family, defaults)| (Some(family), Some(defaults)))
-            .unwrap_or_else(|| (font_feature_family(&style.font_family), None));
+            .unwrap_or_else(|| (font_feature_family(family), None));
         if face_defaults.is_none() && self.font_feature_values.values.is_empty() {
             return None;
         }
@@ -65,30 +164,26 @@ impl FontSystem {
     /// variation map. The element property remains later in the map and thus
     /// wins duplicate tags, while descriptor coordinates override registered
     /// CSS-axis defaults during shaping.
-    pub(in crate::text) fn style_with_selected_face_variations(
+    fn selected_face_variation_settings(
         &mut self,
         style: &ComputedStyle,
-    ) -> ComputedStyle {
+        family: &FontFamily,
+    ) -> Option<FontVariationSettings> {
         // Descriptor defaults belong to the authored face selected from the
         // CSS family, not to the font used for U+0020 line metrics. A
         // selected face may not contain U+0020 while still rendering its
         // supported glyphs with these variation coordinates.
         // <https://www.w3.org/TR/css-fonts-4/#font-feature-variation-resolution>
-        let Some(font_id) = self.resolve_font_family(
-            &style.font_family,
+        let font_id = self.resolve_font_family(
+            family,
             style.font_weight,
             style.font_style,
             style.font_width,
-        ) else {
-            return style.clone();
-        };
-        let Some(descriptor) = self.document_fonts.selected_face_variations(font_id) else {
-            return style.clone();
-        };
+        )?;
+        let descriptor = self.document_fonts.selected_face_variations(font_id)?;
         if descriptor.0.is_empty() {
-            return style.clone();
+            return None;
         }
-        let mut resolved = style.clone();
         let mut variations = descriptor.0;
         for setting in &style.font_variation_settings.0 {
             if let Some(existing) = variations
@@ -101,8 +196,7 @@ impl FontSystem {
             }
         }
         variations.sort_by_key(|setting| setting.tag);
-        resolved.font_variation_settings = FontVariationSettings(variations);
-        resolved
+        Some(FontVariationSettings(variations))
     }
 
     /// Prepare the style passed to the shaping backend after CSS face
@@ -112,16 +206,31 @@ impl FontSystem {
     /// (including GPOS kerning), instead of replacing it with a simplified
     /// post-shaping fallback.
     /// <https://www.w3.org/TR/css-fonts-4/#font-synthesis-intro>
-    pub(in crate::text) fn shaping_style_for_selected_face(
+    pub(in crate::text) fn shaping_style_for_selected_face<'a>(
         &mut self,
-        style: &ComputedStyle,
-    ) -> ComputedStyle {
-        let mut shaping_style = self.style_with_selected_face_variations(style);
-        let Some(font_id) = self.resolve_metric_font_for_style(style) else {
+        style: &'a ComputedStyle,
+    ) -> ParleyStyleView<'a> {
+        let selected_style = SelectedFaceStyleView::new(style, None);
+        self.shaping_style_for_selected_face_view(&selected_style)
+    }
+
+    pub(in crate::text) fn shaping_style_for_selected_face_view<'a>(
+        &mut self,
+        style: &SelectedFaceStyleView<'a>,
+    ) -> ParleyStyleView<'a> {
+        let authored = style.authored();
+        let mut shaping_style = ParleyStyleView::new(authored);
+        if let Some(variations) =
+            self.selected_face_variation_settings(authored, style.font_family())
+        {
+            shaping_style.set_font_variation_settings(variations);
+        }
+        let Some(font_id) = self.resolve_metric_font_for_family(authored, style.font_family())
+        else {
             return shaping_style;
         };
         let selected_attributes = self.document_fonts.selected_face_fixed_attributes(font_id);
-        let is_registered_css_family = named_font_families(&style.font_family)
+        let is_registered_css_family = named_font_families(style.font_family())
             .iter()
             .any(|family| self.document_fonts.has_registered_css_family(family));
         let intrinsic_attributes = is_registered_css_family
@@ -144,14 +253,14 @@ impl FontSystem {
             (None, Some((weight, style))) => (Some(weight), style),
             (None, None) => return shaping_style,
         };
-        if !style.font_synthesis.weight
+        if !authored.font_synthesis.weight
             && let Some(weight) = weight
-            && weight != style.font_weight
+            && weight != authored.font_weight
         {
-            shaping_style.font_weight = weight;
+            shaping_style.set_font_weight(weight);
         }
-        if !style.font_synthesis.style && face_style != style.font_style {
-            shaping_style.font_style = face_style;
+        if !authored.font_synthesis.style && face_style != authored.font_style {
+            shaping_style.set_font_style(face_style);
         }
         shaping_style
     }
@@ -297,6 +406,7 @@ impl FontSystem {
 
     /// Finds the first CSS font-stack face that is eligible to render one
     /// character, including `unicode-range` restrictions.
+    #[cfg(test)]
     pub(in crate::text) fn font_for_character(
         &mut self,
         style: &ComputedStyle,
@@ -304,6 +414,15 @@ impl FontSystem {
     ) -> Option<usize> {
         self.character_font_match(style, character)
             .map(|matched| matched.font_id)
+    }
+
+    pub(in crate::text) fn font_for_character_in_family(
+        &mut self,
+        style: &ComputedStyle,
+        family: &FontFamily,
+        character: char,
+    ) -> Option<usize> {
+        self.resolve_family_fallback_for_character_in_family(style, family, character)
     }
 
     pub(in crate::text) fn vertical_upright_ch_advance(

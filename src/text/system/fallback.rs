@@ -1,12 +1,13 @@
 use super::*;
 
 impl FontSystem {
-    pub(super) fn resolve_family_fallback_for_character(
+    pub(super) fn resolve_family_fallback_for_character_in_family(
         &mut self,
         style: &ComputedStyle,
+        family: &FontFamily,
         character: char,
     ) -> Option<usize> {
-        if let FontFamily::List(families) = &style.font_family {
+        if let FontFamily::List(families) = family {
             for family in families {
                 if let Some(font_id) = self.resolve_font_family(
                     family,
@@ -19,7 +20,7 @@ impl FontSystem {
                 }
             }
         }
-        if let FontFamily::Named(name) = &style.font_family
+        if let FontFamily::Named(name) = family
             && let Some(font_id) = self.resolve_single_family(
                 name.as_str(),
                 style.font_weight,
@@ -32,7 +33,7 @@ impl FontSystem {
         }
 
         if let Some(font_id) = self.resolve_generic_family(
-            &style.font_family,
+            family,
             style.font_weight,
             style.font_style,
             style.font_width,
@@ -90,7 +91,7 @@ impl FontSystem {
         )
     }
 
-    fn resolved_parley_font_family_source_for_family(
+    pub(in crate::text) fn resolved_parley_font_family_source_for_family(
         &mut self,
         family: &FontFamily,
         weight: FontWeight,

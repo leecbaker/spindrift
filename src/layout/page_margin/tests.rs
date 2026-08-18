@@ -174,6 +174,60 @@ fn page_margin_box_font_size_sets_its_em_sizing_basis() {
 }
 
 #[test]
+fn page_context_and_margin_box_inherit_base_typography_and_custom_properties() {
+    let stylesheet = css::parse_stylesheet(&Css::from_string(
+        "@page { font-size: inherit; @top-left { content: \"\"; font-size: inherit; color: var(--page-accent) } @top-right { content: \"\"; font-size: inherit; color: red } }",
+    ));
+    let mut base_page_style = ComputedStyle::initial();
+    css::apply_declarations(
+        &mut base_page_style,
+        &css::parse_declarations("--page-accent: rebeccapurple; font-size: 15pt"),
+    );
+    let mut expected_accent_style = ComputedStyle::initial();
+    css::apply_declarations(
+        &mut expected_accent_style,
+        &css::parse_declarations("color: rebeccapurple"),
+    );
+    let mut expected_override_style = ComputedStyle::initial();
+    css::apply_declarations(
+        &mut expected_override_style,
+        &css::parse_declarations("color: red"),
+    );
+
+    let boxes = page_margin_boxes_for_rules(PageMarginCascadeContext {
+        page_rules: &stylesheet.page_rules,
+        page_number: 1,
+        page_name: None,
+        is_blank: false,
+        page_progression_direction: Direction::Ltr,
+        page_declarations: &stylesheet.page_declarations,
+        base_page_style: &base_page_style,
+        initial_page_size: PageSize::A4_POINTS,
+    });
+    let top_left = boxes
+        .iter()
+        .find(|box_| box_.name == "top-left")
+        .expect("@top-left declaration should produce a page-margin box");
+    let top_right = boxes
+        .iter()
+        .find(|box_| box_.name == "top-right")
+        .expect("@top-right declaration should produce a page-margin box");
+
+    assert_eq!(top_left.style.font_size, base_page_style.font_size);
+    assert_eq!(top_right.style.font_size, base_page_style.font_size);
+    assert_eq!(top_left.style.color, expected_accent_style.color);
+    assert_eq!(top_right.style.color, expected_override_style.color);
+    assert_eq!(
+        top_left.style.custom_properties,
+        base_page_style.custom_properties
+    );
+    assert_eq!(
+        top_right.style.custom_properties,
+        base_page_style.custom_properties
+    );
+}
+
+#[test]
 fn page_margin_boxes_ignore_fragmentation_and_positioning_declarations() {
     let box_ = cascaded_top_left(
         "@page { @top-left { content: \"\"; display: flex; position: absolute; top: 1px; page-break-before: always; width: 10px; z-index: 2 } }",

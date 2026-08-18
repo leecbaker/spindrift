@@ -77,12 +77,20 @@ impl FontSystem {
     /// <https://www.w3.org/TR/CSS22/visudet.html#line-height> and
     /// <https://www.w3.org/TR/css-fonts-4/#unicode-range-desc>.
     pub(crate) fn resolve_metric_font_for_style(&mut self, style: &ComputedStyle) -> Option<usize> {
+        self.resolve_metric_font_for_family(style, &style.font_family)
+    }
+
+    pub(super) fn resolve_metric_font_for_family(
+        &mut self,
+        style: &ComputedStyle,
+        family: &FontFamily,
+    ) -> Option<usize> {
         // The element's first available font is the first face in its font
         // list that can render U+0020.  A `unicode-range` descriptor can make
         // an otherwise loadable face unavailable for that purpose, so this
         // must share the character-selection path used for shaping instead of
         // merely returning the first resolvable family.
         // <https://www.w3.org/TR/css-fonts-4/#first-available-font>
-        self.resolve_family_fallback_for_character(style, ' ')
+        self.resolve_family_fallback_for_character_in_family(style, family, ' ')
     }
 }

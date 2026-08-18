@@ -42,7 +42,7 @@ struct Cli {
     #[arg(long = "target-fragment", value_name = "FRAGMENT")]
     target_fragment: Option<String>,
 
-    /// Attach an additional author stylesheet. Can be repeated.
+    /// Attach an additional user stylesheet. Can be repeated.
     #[arg(
         short = 's',
         long = "stylesheet",
@@ -98,6 +98,15 @@ struct Cli {
     /// Output medium used to evaluate CSS Media Queries.
     #[arg(long = "media-type", value_enum, default_value_t = CliMediaType::Print)]
     media_type: CliMediaType,
+
+    /// Initial CSS-pixel viewport used for media queries and viewport-relative
+    /// page descriptors before document `@page` rules choose a page size.
+    #[arg(
+        long = "initial-viewport-size",
+        value_names = ["WIDTH", "HEIGHT"],
+        num_args = 2
+    )]
+    initial_viewport_size: Option<Vec<f32>>,
 
     /// Forced-colors palette used for CSS CssColor Adjustment.
     #[arg(long = "forced-colors", value_enum, default_value_t = CliForcedColors::None)]
@@ -261,7 +270,8 @@ async fn run(args: Cli) -> quire::Result<()> {
             } else {
                 Css::from_file(location).await?
             }
-            .with_resource_policy(resource_policy),
+            .with_resource_policy(resource_policy)
+            .with_user_origin(),
         );
     }
 
@@ -297,6 +307,12 @@ async fn run(args: Cli) -> quire::Result<()> {
     let started = Instant::now();
     let mut options = RenderOptions::default();
     options.media_type = args.media_type.into();
+    if let Some(viewport) = args.initial_viewport_size {
+        let [width, height]: [f32; 2] = viewport
+            .try_into()
+            .expect("clap enforces exactly two initial viewport dimensions");
+        options.set_initial_viewport_size(quire::CssViewportSize::new(width, height))?;
+    }
     options.forced_colors = args.forced_colors.into();
     options.target_fragment = args.target_fragment;
     let pdf_options = PdfOptions {
@@ -392,12 +408,27 @@ mod tests {
         assert!(!cli.debug);
         assert!(!cli.quiet);
         assert_eq!(cli.log_level(), LevelFilter::Warn);
+        assert_eq!(cli.initial_viewport_size, None);
         assert!(!cli.full_fonts);
         assert!(!cli.uncompressed_pdf);
         assert!(!cli.no_http_redirects);
         assert_eq!(cli.http_timeout, None);
         assert!(!cli.allow_fetch_errors);
         assert_eq!(cli.output.as_deref(), Some("output.pdf"));
+    }
+
+    #[test]
+    fn cli_accepts_initial_viewport_size() {
+        let cli = Cli::try_parse_from([
+            "quire",
+            "--initial-viewport-size",
+            "800",
+            "600",
+            "input.html",
+            "output.pdf",
+        ])
+        .unwrap();
+        assert_eq!(cli.initial_viewport_size, Some(vec![800.0, 600.0]));
     }
 
     #[test]

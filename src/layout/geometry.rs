@@ -706,6 +706,24 @@ impl FlowAxes {
         self.axes.physical_side(LogicalSide::BlockStart)
     }
 
+    /// Return the physical edge used by `text-align: left`.
+    pub(super) fn line_left_side(self) -> PhysicalSide {
+        self.axes.line_left_side()
+    }
+
+    /// Return the physical edge used by `text-align: right`.
+    pub(super) fn line_right_side(self) -> PhysicalSide {
+        self.axes.line_right_side()
+    }
+
+    /// Project a logical inline/block pair into physical horizontal/vertical
+    /// order. Layout adapters use this at their physical backend boundary so
+    /// they do not duplicate writing-mode swaps.
+    /// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+    pub(super) fn physical_size<T>(self, inline: T, block: T) -> (T, T) {
+        self.axes.physical_size(inline, block)
+    }
+
     /// Translate continuous logical block coordinates into a fragmentainer's
     /// local paint coordinates.
     ///

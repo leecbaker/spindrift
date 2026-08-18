@@ -2,6 +2,80 @@ use super::*;
 use crate::css::FontFamilyName;
 use crate::units::SemanticLengthExt;
 
+/// The subset of a computed style which may differ for one Parley shaping
+/// pass after `@font-face` selection.
+///
+/// This is intentionally a text-backend detail rather than a general CSS
+/// style overlay: callers which need a modified style for layout must still
+/// construct an owned [`ComputedStyle`].
+#[derive(Debug, Default)]
+pub(in crate::text) struct ShapingOverrides {
+    font_variation_settings: Option<FontVariationSettings>,
+    font_weight: Option<FontWeight>,
+    font_style: Option<FontStyle>,
+}
+
+/// Borrowed authored style plus the small set of effective values consumed by
+/// Parley's font selection and shaping properties.
+///
+/// CSS metrics, feature resolution, source provenance, and every non-Parley
+/// property remain on the authored style. Do not add `Deref` or a generic
+/// style interface here: doing so would obscure which values are backend
+/// overrides and would turn this into an incomplete replacement for
+/// [`ComputedStyle`].
+#[derive(Debug)]
+pub(in crate::text) struct ParleyStyleView<'a> {
+    authored: &'a ComputedStyle,
+    overrides: ShapingOverrides,
+}
+
+impl<'a> ParleyStyleView<'a> {
+    pub(in crate::text) fn new(authored: &'a ComputedStyle) -> Self {
+        Self {
+            authored,
+            overrides: ShapingOverrides::default(),
+        }
+    }
+
+    pub(in crate::text) fn authored(&self) -> &'a ComputedStyle {
+        self.authored
+    }
+
+    pub(in crate::text) fn font_variation_settings(&self) -> &FontVariationSettings {
+        self.overrides
+            .font_variation_settings
+            .as_ref()
+            .unwrap_or(&self.authored.font_variation_settings)
+    }
+
+    pub(in crate::text) fn font_weight(&self) -> FontWeight {
+        self.overrides
+            .font_weight
+            .unwrap_or(self.authored.font_weight)
+    }
+
+    pub(in crate::text) fn font_style(&self) -> FontStyle {
+        self.overrides
+            .font_style
+            .unwrap_or(self.authored.font_style)
+    }
+
+    pub(in crate::text) fn set_font_variation_settings(
+        &mut self,
+        font_variation_settings: FontVariationSettings,
+    ) {
+        self.overrides.font_variation_settings = Some(font_variation_settings);
+    }
+
+    pub(in crate::text) fn set_font_weight(&mut self, font_weight: FontWeight) {
+        self.overrides.font_weight = Some(font_weight);
+    }
+
+    pub(in crate::text) fn set_font_style(&mut self, font_style: FontStyle) {
+        self.overrides.font_style = Some(font_style);
+    }
+}
+
 pub(super) fn fontique_weight(weight: FontWeight) -> FontiqueFontWeight {
     FontiqueFontWeight::new(weight.0 as f32)
 }
@@ -70,16 +144,17 @@ pub(super) fn fontique_fixed_standard_axis_defaults(
 /// ensures that both fixed and ranged variable faces shape at their used CSS
 /// `font-weight` and `font-stretch` values:
 /// <https://www.w3.org/TR/css-fonts-4/#font-prop-desc>.
-fn parley_standard_font_variations(style: &ComputedStyle) -> ParleyFontVariations<'static> {
+fn parley_standard_font_variations(style: &ParleyStyleView<'_>) -> ParleyFontVariations<'static> {
+    let authored = style.authored();
     let mut variations = vec![
-        ParleyFontVariation::new(ParleyTag::new(b"wdth"), style.font_width.0 as f32 / 10.0),
-        ParleyFontVariation::new(ParleyTag::new(b"wght"), style.font_weight.0 as f32),
+        ParleyFontVariation::new(ParleyTag::new(b"wdth"), authored.font_width.0 as f32 / 10.0),
+        ParleyFontVariation::new(ParleyTag::new(b"wght"), style.font_weight().0 as f32),
     ];
+    let effective_font_style = style.font_style();
     let slant_angle =
-        style
-            .font_style
+        effective_font_style
             .oblique_angle()
-            .or(matches!(style.font_style, FontStyle::Italic).then_some(14.0));
+            .or(matches!(effective_font_style, FontStyle::Italic).then_some(14.0));
     if let Some(angle) = slant_angle {
         // CSS positive oblique angles slant glyphs forward, while OpenType's
         // registered `slnt` axis uses the opposite sign.
@@ -87,7 +162,7 @@ fn parley_standard_font_variations(style: &ComputedStyle) -> ParleyFontVariation
     }
     // The low-level property takes precedence over the registered CSS axis
     // properties for the same tag.
-    for setting in &style.font_variation_settings.0 {
+    for setting in &style.font_variation_settings().0 {
         let tag = ParleyTag::from_bytes(setting.tag);
         let value = f32::from_bits(setting.value);
         if let Some(existing) = variations.iter_mut().find(|axis| axis.tag == tag) {
@@ -137,53 +212,59 @@ pub(super) fn parley_font_family_source(family: &FontFamily) -> String {
 
 pub(super) fn push_parley_default_style(
     builder: &mut parley::RangedBuilder<'_, FontPalette>,
-    style: &ComputedStyle,
+    style: &ParleyStyleView<'_>,
     font_family_source: &str,
 ) {
-    push_parley_default_style_with_font_size(builder, style, font_family_source, style.font_size);
+    push_parley_default_style_with_font_size(
+        builder,
+        style,
+        font_family_source,
+        style.authored().font_size,
+    );
 }
 
 pub(super) fn push_parley_default_style_with_font_size(
     builder: &mut parley::RangedBuilder<'_, FontPalette>,
-    style: &ComputedStyle,
+    style: &ParleyStyleView<'_>,
     font_family_source: &str,
     font_size: f32,
 ) {
+    let authored = style.authored();
     builder.push_default(StyleProperty::FontFamily(ParleyFontFamily::from(
         font_family_source,
     )));
     builder.push_default(StyleProperty::FontSize(font_size));
     builder.push_default(StyleProperty::LineHeight(ParleyLineHeight::Absolute(
-        style.line_height,
+        authored.line_height,
     )));
     builder.push_default(StyleProperty::FontWeight(ParleyFontWeight::new(
-        style.font_weight.0 as f32,
+        style.font_weight().0 as f32,
     )));
     builder.push_default(StyleProperty::FontStyle(parley_font_style(
-        style.font_style,
+        style.font_style(),
     )));
     builder.push_default(StyleProperty::FontWidth(ParleyFontWidth::from_ratio(
-        style.font_width.0 as f32 / 1000.0,
+        authored.font_width.0 as f32 / 1000.0,
     )));
     builder.push_default(StyleProperty::FontVariations(
         parley_standard_font_variations(style),
     ));
     builder.push_default(StyleProperty::WordBreak(parley_word_break(
-        style.word_break,
+        authored.word_break,
     )));
     builder.push_default(StyleProperty::OverflowWrap(parley_overflow_wrap(
-        style.overflow_wrap,
+        authored.overflow_wrap,
     )));
-    builder.push_default(StyleProperty::TextWrapMode(parley_text_wrap_mode(style)));
+    builder.push_default(StyleProperty::TextWrapMode(parley_text_wrap_mode(authored)));
     builder.push_default(StyleProperty::WordSpacing(
-        style.used_word_spacing().points(),
+        authored.used_word_spacing().points(),
     ));
-    builder.push_default(StyleProperty::Locale(parley_language(style)));
+    builder.push_default(StyleProperty::Locale(parley_language(authored)));
     // Palette choice is a paint-only CSS Fonts property. Carry it in Parley's
     // brush so otherwise identical adjacent style ranges remain distinct
     // glyph runs without affecting font selection or shaping.
     // <https://drafts.csswg.org/css-fonts-4/#font-palette-prop>
-    builder.push_default(StyleProperty::Brush(style.font_palette.clone()));
+    builder.push_default(StyleProperty::Brush(authored.font_palette.clone()));
 }
 
 pub(super) fn push_parley_text_spacing_default_with_context(
@@ -203,7 +284,7 @@ pub(super) fn push_parley_text_spacing_default_with_context(
         context,
         default_feature_policy,
     )));
-    if !default_feature_policy.vertical_forms {
+    if !default_feature_policy.uses_vertical_forms() {
         push_vertical_form_feature_ranges(
             builder,
             style,
@@ -239,7 +320,7 @@ pub(super) fn push_parley_text_spacing_range_with_context(
         )),
         range.clone(),
     );
-    if !default_feature_policy.vertical_forms {
+    if !default_feature_policy.uses_vertical_forms() {
         push_vertical_form_feature_ranges(
             builder,
             style,
@@ -253,7 +334,7 @@ pub(super) fn push_parley_text_spacing_range_with_context(
 
 pub(super) fn push_parley_style_range(
     builder: &mut parley::RangedBuilder<'_, FontPalette>,
-    style: &ComputedStyle,
+    style: &ParleyStyleView<'_>,
     font_family_source: &str,
     range: Range<usize>,
 ) {
@@ -262,37 +343,38 @@ pub(super) fn push_parley_style_range(
         style,
         font_family_source,
         range,
-        style.font_size,
+        style.authored().font_size,
     );
 }
 
 pub(super) fn push_parley_style_range_with_font_size(
     builder: &mut parley::RangedBuilder<'_, FontPalette>,
-    style: &ComputedStyle,
+    style: &ParleyStyleView<'_>,
     font_family_source: &str,
     range: Range<usize>,
     font_size: f32,
 ) {
+    let authored = style.authored();
     builder.push(
         StyleProperty::FontFamily(ParleyFontFamily::from(font_family_source)),
         range.clone(),
     );
     builder.push(StyleProperty::FontSize(font_size), range.clone());
     builder.push(
-        StyleProperty::LineHeight(ParleyLineHeight::Absolute(style.line_height)),
+        StyleProperty::LineHeight(ParleyLineHeight::Absolute(authored.line_height)),
         range.clone(),
     );
     builder.push(
-        StyleProperty::FontWeight(ParleyFontWeight::new(style.font_weight.0 as f32)),
+        StyleProperty::FontWeight(ParleyFontWeight::new(style.font_weight().0 as f32)),
         range.clone(),
     );
     builder.push(
-        StyleProperty::FontStyle(parley_font_style(style.font_style)),
+        StyleProperty::FontStyle(parley_font_style(style.font_style())),
         range.clone(),
     );
     builder.push(
         StyleProperty::FontWidth(ParleyFontWidth::from_ratio(
-            style.font_width.0 as f32 / 1000.0,
+            authored.font_width.0 as f32 / 1000.0,
         )),
         range.clone(),
     );
@@ -301,26 +383,26 @@ pub(super) fn push_parley_style_range_with_font_size(
         range.clone(),
     );
     builder.push(
-        StyleProperty::Brush(style.font_palette.clone()),
+        StyleProperty::Brush(authored.font_palette.clone()),
         range.clone(),
     );
     builder.push(
-        StyleProperty::WordBreak(parley_word_break(style.word_break)),
+        StyleProperty::WordBreak(parley_word_break(authored.word_break)),
         range.clone(),
     );
     builder.push(
-        StyleProperty::OverflowWrap(parley_overflow_wrap(style.overflow_wrap)),
+        StyleProperty::OverflowWrap(parley_overflow_wrap(authored.overflow_wrap)),
         range.clone(),
     );
     builder.push(
-        StyleProperty::TextWrapMode(parley_text_wrap_mode(style)),
+        StyleProperty::TextWrapMode(parley_text_wrap_mode(authored)),
         range.clone(),
     );
     builder.push(
-        StyleProperty::WordSpacing(style.used_word_spacing().points()),
+        StyleProperty::WordSpacing(authored.used_word_spacing().points()),
         range.clone(),
     );
-    builder.push(StyleProperty::Locale(parley_language(style)), range);
+    builder.push(StyleProperty::Locale(parley_language(authored)), range);
 }
 
 /// Build the OpenType feature list for one CSS shaping context.
@@ -353,7 +435,7 @@ fn parley_font_features(
         }
     }
     let resolver = context.and_then(FontFeatureContext::resolver);
-    push_font_kerning_features(&mut features, style.font_kerning, policy.kerning_mode);
+    push_font_kerning_features(&mut features, style.font_kerning, policy.kerning_mode());
     push_font_variant_ligature_features(&mut features, style.font_variant_ligatures);
     push_font_variant_position_features(&mut features, style.font_variant_position);
     push_font_variant_caps_features(&mut features, style.font_variant_caps);
@@ -401,16 +483,25 @@ enum KerningFeatureMode {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct FontFeaturePolicy {
-    vertical_forms: bool,
-    kerning_mode: KerningFeatureMode,
+enum FontFeaturePolicy {
+    #[default]
+    Horizontal,
+    UprightVertical,
 }
 
 impl FontFeaturePolicy {
-    const UPRIGHT_VERTICAL: Self = Self {
-        vertical_forms: true,
-        kerning_mode: KerningFeatureMode::UprightVertical,
-    };
+    const UPRIGHT_VERTICAL: Self = Self::UprightVertical;
+
+    const fn uses_vertical_forms(self) -> bool {
+        matches!(self, Self::UprightVertical)
+    }
+
+    const fn kerning_mode(self) -> KerningFeatureMode {
+        match self {
+            Self::Horizontal => KerningFeatureMode::Horizontal,
+            Self::UprightVertical => KerningFeatureMode::UprightVertical,
+        }
+    }
 
     /// Derive the default policy for a text range before range-local upright
     /// overrides are layered on top. A mixed-orientation run defaults to
@@ -438,51 +529,7 @@ impl FontFeaturePolicy {
 /// <https://www.w3.org/TR/css-writing-modes-4/#text-orientation> and
 /// <https://learn.microsoft.com/en-us/typography/opentype/spec/features_uz#tag-vert>.
 fn vertical_form_feature_ranges(text: &str, style: &ComputedStyle) -> Vec<Range<usize>> {
-    let TextLayoutPolicy::Vertical(text_orientation) = style.text_layout_policy() else {
-        return Vec::new();
-    };
-    if text.is_empty() {
-        return Vec::new();
-    }
-    match text_orientation {
-        TextOrientation::Sideways => Vec::new(),
-        TextOrientation::Upright => std::iter::once(0..text.len()).collect(),
-        TextOrientation::Mixed => {
-            let mut ranges = Vec::new();
-            for range in typographic_unit_ranges(text) {
-                if typographic_unit_uses_vertical_forms_in_mixed_orientation(&text[range.clone()]) {
-                    push_vertical_form_range_with_inherited_characters(text, range, &mut ranges);
-                }
-            }
-            ranges
-        }
-    }
-}
-
-fn push_vertical_form_range_with_inherited_characters(
-    text: &str,
-    range: Range<usize>,
-    ranges: &mut Vec<Range<usize>>,
-) {
-    let mut start = range.start;
-    while let Some((previous_start, character)) = text[..start].char_indices().next_back()
-        && character_inherits_vertical_orientation(character)
-    {
-        start = previous_start;
-    }
-    let mut end = range.end;
-    while let Some((offset, character)) = text[end..].char_indices().next()
-        && character_inherits_vertical_orientation(character)
-    {
-        end += offset + character.len_utf8();
-    }
-    if let Some(previous) = ranges.last_mut()
-        && start <= previous.end
-    {
-        previous.end = previous.end.max(end);
-        return;
-    }
-    ranges.push(start..end);
+    TextTypesettingPlan::resolve(text, style).upright_vertical_ranges()
 }
 
 fn push_vertical_form_feature_ranges(
@@ -509,7 +556,7 @@ fn push_vertical_form_feature_ranges(
 }
 
 fn push_vertical_form_features(features: &mut Vec<ParleyFontFeature>, policy: FontFeaturePolicy) {
-    if policy.vertical_forms {
+    if policy.uses_vertical_forms() {
         push_parley_font_feature(features, *b"vert", 1);
     }
 }
@@ -1109,16 +1156,6 @@ pub(super) fn font_covered_glyph(font: &DocumentFont, character: char) -> Option
         .and_then(|face| CoveredGlyphId::from_face(&face, character))
 }
 
-pub(super) fn decode_data_url(value: &str) -> Option<Vec<u8>> {
-    let (metadata, payload) = value.split_once(',')?;
-    if !metadata.to_ascii_lowercase().contains(";base64") {
-        return None;
-    }
-    base64::engine::general_purpose::STANDARD
-        .decode(payload.trim())
-        .ok()
-}
-
 pub(super) fn normalize_family(name: &str) -> String {
     name.trim()
         .trim_matches('"')
@@ -1211,6 +1248,8 @@ mod tests {
         assert_eq!(parley_language(&style).unwrap().as_str(), "de");
         style.font_language_override = FontLanguageOverride::OpenType(*b"TRK ");
         assert_eq!(parley_language(&style).unwrap().as_str(), "tr");
+        style.font_language_override = FontLanguageOverride::OpenType(*b"trk ");
+        assert_eq!(parley_language(&style).unwrap().as_str(), "trk");
         assert_eq!(style.language.as_deref(), Some("tr"));
     }
 
@@ -1250,8 +1289,11 @@ mod tests {
         let mut style = ComputedStyle::initial();
         style.font_weight = FontWeight::BLACK;
         style.font_width = FontWidth::CONDENSED;
+        let shaping_style = ParleyStyleView::new(&style);
 
-        let ParleyFontVariations::List(variations) = parley_standard_font_variations(&style) else {
+        let ParleyFontVariations::List(variations) =
+            parley_standard_font_variations(&shaping_style)
+        else {
             panic!("standard variations should use a concrete setting list");
         };
         assert_eq!(

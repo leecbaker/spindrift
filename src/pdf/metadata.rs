@@ -44,9 +44,11 @@ pub(super) fn write_document_info(
 /// Writes the catalog metadata stream mirrored from the PDF information fields.
 ///
 /// PDF/A identification properties are defined by ISO 19005's PDF/A extension
-/// schema. When a PDF/A profile is selected, the stream includes the required
-/// `pdfaid:*` identification fields but does not claim that unrelated archival
-/// requirements such as output intents or color restrictions are complete.
+/// schema. PDF/A always requires this stream; ordinary PDFs write it only when
+/// the source supplied document metadata. When a PDF/A profile is selected,
+/// the stream includes the required `pdfaid:*` identification fields but does
+/// not claim that unrelated archival requirements such as output intents or
+/// color restrictions are complete.
 pub(super) fn write_document_xmp_metadata(
     pdf: &mut Pdf,
     metadata_id: Ref,

@@ -1,6 +1,99 @@
 use super::super::*;
 
 impl<'a> LayoutBuilder<'a> {
+    /// Measure the final outer extent that an avoid-constrained child occupies
+    /// in its fragmentation context's block direction.
+    ///
+    /// A vertical flow fragments across physical X, so its logical block-size
+    /// (including a winning `min-block-size`) is the used physical width, not
+    /// the physical-height estimate used by horizontal block layout. This
+    /// post-constraint measurement does not export a descendant percentage
+    /// basis.
+    /// <https://drafts.csswg.org/css-logical/#logical-dimension-properties>
+    /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+    pub(in crate::layout) fn avoid_break_fragmentation_extent(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &Stylesheets<'_>,
+        available_outer_width: f32,
+        child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
+        fragmentation_writing_mode: WritingMode,
+    ) -> Option<LayoutLength> {
+        if !WritingModeAxes::new(fragmentation_writing_mode, self.containing_block_direction)
+            .swaps_physical_axes()
+        {
+            return self
+                .estimate_element_height(
+                    element,
+                    style,
+                    stylesheets,
+                    available_outer_width,
+                    child_boxes,
+                )
+                .map(layout_pt);
+        }
+
+        let geometry = self.block_layout_geometry(element, style, stylesheets, child_boxes);
+        let used_style = &geometry.style;
+        Some(layout_pt(
+            geometry.outer_inline().width().points()
+                + used_style.margin.left
+                + used_style.margin.right,
+        ))
+    }
+
+    /// Return the active fragmentainer's capacity in the root block-flow
+    /// direction used by an avoid decision.
+    ///
+    /// Temporary multicolumn pages use their physical width when that flow is
+    /// vertical, even though their legacy cursor is represented in physical Y.
+    /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+    pub(in crate::layout) fn avoid_break_current_fragmentainer(
+        &self,
+        writing_mode: WritingMode,
+        content_block_start: PageTopBlockPosition,
+    ) -> Fragmentainer {
+        if WritingModeAxes::new(writing_mode, self.containing_block_direction).swaps_physical_axes()
+        {
+            let extent = layout_pt(self.current_page_context.area_width());
+            Fragmentainer::new(extent, extent)
+        } else {
+            self.fragmentainer_from_page_cursor(content_block_start)
+        }
+    }
+
+    /// Return the next empty fragmentainer in the active root flow's block
+    /// direction for avoid-run planning.
+    ///
+    /// The destination can use a different page or anonymous-column context,
+    /// so this must project that context as well as the current one.
+    /// <https://www.w3.org/TR/css-break-3/#unforced-breaks>
+    pub(in crate::layout) fn next_empty_avoid_break_fragmentainer(
+        &mut self,
+        fragmentainer_kind: FragmentainerKind,
+        writing_mode: WritingMode,
+    ) -> Fragmentainer {
+        if !WritingModeAxes::new(writing_mode, self.containing_block_direction)
+            .swaps_physical_axes()
+        {
+            return self.next_empty_fragmentainer(fragmentainer_kind);
+        }
+
+        let context = match fragmentainer_kind {
+            FragmentainerKind::Page => self.resolved_page_context(
+                self.destination_document_page_number(self.pages.len() + 2),
+                false,
+            ),
+            FragmentainerKind::Column => self
+                .fragmentainer_override
+                .map(|override_| override_.context_for_fragmentainer(self.pages.len() + 1))
+                .unwrap_or(self.current_page_context),
+        };
+        let extent = layout_pt(context.area_width());
+        Fragmentainer::new(extent, extent)
+    }
+
     /// Return whether this block should first be laid out speculatively for
     /// `break-inside: avoid`.
     ///
@@ -70,26 +163,33 @@ impl<'a> LayoutBuilder<'a> {
         let available_width =
             (self.content_right - self.content_left - style.margin.left - style.margin.right)
                 .max(style.font_size);
-        let Some(estimated_height) =
-            self.estimate_element_height(element, style, stylesheets, available_width, child_boxes)
-        else {
+        let Some(required_block_size) = self.avoid_break_fragmentation_extent(
+            element,
+            style,
+            stylesheets,
+            available_width,
+            child_boxes,
+            self.containing_block_writing_mode,
+        ) else {
             return false;
         };
-        let current_fragmentainer =
-            self.fragmentainer_from_page_cursor(PageTopBlockPosition::new(self.cursor_y));
+        let current_fragmentainer = self.avoid_break_current_fragmentainer(
+            self.containing_block_writing_mode,
+            PageTopBlockPosition::new(self.cursor_y),
+        );
         let should_break = FragmentPrebreakDecision::choose(FragmentPrebreakInput {
             can_advance: true,
             current_fragmentainer,
-            required_block_size: layout_pt(estimated_height),
+            required_block_size,
             empty_fragmentainer: current_fragmentainer,
-            empty_fit_block_size: layout_pt(estimated_height),
+            empty_fit_block_size: required_block_size,
         })
         .should_break;
         if should_break {
             log::debug!(
-                "moving break-inside: avoid <{}> to next page: estimated height {:.2}, remaining {:.2}",
+                "moving break-inside: avoid <{}> to next page: required block extent {:.2}, remaining {:.2}",
                 element.tag,
-                estimated_height,
+                required_block_size.points(),
                 current_fragmentainer.available_block_size().points()
             );
         }
@@ -103,6 +203,7 @@ impl<'a> LayoutBuilder<'a> {
     /// decisions inside that same kept subtree so nested avoid boxes do not push
     /// each other onto additional pages:
     /// <https://www.w3.org/TR/css-break-3/#break-within>.
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::layout) fn layout_avoiding_break_inside(
         &mut self,
         element: &Element,
@@ -111,16 +212,19 @@ impl<'a> LayoutBuilder<'a> {
         run_in_children: &[box_tree::FormattingBox<'_>],
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
+        principal_box_paint_mode: PrincipalBoxPaintMode,
     ) {
         let snapshot = self.snapshot();
         let pages_before = snapshot.pages.len();
-        self.layout_element_inner(
+        self.layout_element_inner_with_principal_effect_context(
             element,
             style,
             stylesheets,
             run_in_children,
             child_boxes,
             table_fragment,
+            true,
+            principal_box_paint_mode,
         );
         if self.pages.len() <= pages_before {
             return;
@@ -129,16 +233,25 @@ impl<'a> LayoutBuilder<'a> {
             (self.content_right - self.content_left - style.margin.left - style.margin.right)
                 .max(style.font_size);
         let avoid_box_fits_empty_page = self
-            .estimate_element_height(element, style, stylesheets, available_width, child_boxes)
-            .is_some_and(|height| {
-                let inner_height = (height - style.margin.top - style.margin.bottom).max(0.0);
+            .avoid_break_fragmentation_extent(
+                element,
+                style,
+                stylesheets,
+                available_width,
+                child_boxes,
+                self.containing_block_writing_mode,
+            )
+            .is_some_and(|required_block_size| {
                 // The speculative pass may have ended partway through a
                 // destination page. Test the retry against that page's
                 // actual fragmentainer start, not the post-fragmentation
                 // cursor, so an otherwise keepable nested box does not lose
                 // its avoid constraint.
-                self.fragmentainer_from_page_cursor(PageTopBlockPosition::new(self.page_top()))
-                    .block_size_fits_empty(layout_pt(inner_height))
+                self.avoid_break_current_fragmentainer(
+                    self.containing_block_writing_mode,
+                    PageTopBlockPosition::new(self.page_top()),
+                )
+                .block_size_fits_empty(required_block_size)
             });
 
         self.restore(snapshot);
@@ -147,7 +260,7 @@ impl<'a> LayoutBuilder<'a> {
         if !self.current_page_has_content()
             && self.active_fragmentainer_kind() == FragmentainerKind::Page
         {
-            let page_number = self.pages.len() + 1;
+            let page_number = self.destination_document_page_number(self.pages.len() + 1);
             let context = self.resolved_page_context(page_number, false);
             self.replay_fragment_continuation_on_page(&continuation, context);
         }
@@ -161,13 +274,15 @@ impl<'a> LayoutBuilder<'a> {
         if avoid_box_fits_empty_page {
             self.avoid_inside_retry_depth += 1;
         }
-        self.layout_element_inner(
+        self.layout_element_inner_with_principal_effect_context(
             element,
             &retry_style,
             stylesheets,
             run_in_children,
             child_boxes,
             table_fragment,
+            true,
+            principal_box_paint_mode,
         );
         if avoid_box_fits_empty_page {
             self.avoid_inside_retry_depth -= 1;

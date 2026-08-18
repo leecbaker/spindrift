@@ -7,6 +7,7 @@ mod intrinsic;
 mod lanes;
 mod line_resolution;
 mod replay;
+use replay::SplitGridItemSourceReplay;
 mod resolved;
 mod static_position;
 mod taffy_adapter;
@@ -82,6 +83,65 @@ impl GridPhysicalAvailableSpace {
     }
 }
 
+/// Percentage bases for authored Grid track lists after projecting their
+/// logical axes onto the physical Taffy grid axes.
+///
+/// Track breadth percentages resolve against their own grid axis, unlike box
+/// edges which always use the logical inline axis. Keeping this projection
+/// distinct prevents a vertical-writing row track from accidentally using the
+/// container height, or an indefinite block axis from becoming definite.
+/// <https://drafts.csswg.org/css-grid-2/#track-percentages>
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout::grid) struct GridTrackPercentageBases {
+    columns: GridPercentageBasis,
+    rows: GridPercentageBasis,
+}
+
+impl GridTrackPercentageBases {
+    pub(in crate::layout::grid) fn from_grid_content_box(
+        style: &ComputedStyle,
+        width: PhysicalContentWidth,
+        height: Option<PhysicalContentHeight>,
+    ) -> Self {
+        let swaps_physical_axes =
+            WritingModeAxes::new(style.writing_mode, style.used_direction()).swaps_physical_axes();
+        let physical_width = grid_percentage_basis(
+            Some(width.content_box_length()),
+            if swaps_physical_axes {
+                GridAvailableSizeSource::ContainerBlockSize
+            } else {
+                GridAvailableSizeSource::ContainerInlineSize
+            },
+        );
+        let physical_height = grid_percentage_basis(
+            height.map(PhysicalContentHeight::content_box_length),
+            if swaps_physical_axes {
+                GridAvailableSizeSource::ContainerInlineSize
+            } else {
+                GridAvailableSizeSource::ContainerBlockSize
+            },
+        );
+        if swaps_physical_axes {
+            Self {
+                columns: physical_height,
+                rows: physical_width,
+            }
+        } else {
+            Self {
+                columns: physical_width,
+                rows: physical_height,
+            }
+        }
+    }
+
+    pub(in crate::layout::grid) fn for_axis(self, axis: GridAxis) -> GridPercentageBasis {
+        match axis {
+            GridAxis::Column => self.columns,
+            GridAxis::Row => self.rows,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,6 +163,20 @@ mod tests {
 
         let inline_basis: GridLogicalInlinePercentageBasis = available.logical_inline_basis(&style);
         assert_eq!(inline_basis.points(), Some(100.0));
+    }
+
+    #[test]
+    fn track_percentage_bases_follow_logical_grid_axes() {
+        let mut style = ComputedStyle::initial();
+        style.writing_mode = WritingMode::VerticalLr;
+        let bases = GridTrackPercentageBases::from_grid_content_box(
+            &style,
+            PhysicalContentWidth::new(content_box_pt(80.0)),
+            Some(PhysicalContentHeight::new(content_box_pt(100.0))),
+        );
+
+        assert_eq!(bases.for_axis(GridAxis::Column).points(), Some(100.0));
+        assert_eq!(bases.for_axis(GridAxis::Row).points(), Some(80.0));
     }
 }
 

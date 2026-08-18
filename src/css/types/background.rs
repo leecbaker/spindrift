@@ -12,6 +12,17 @@ pub(crate) struct BackgroundPositionAxis {
 }
 
 impl BackgroundPositionAxis {
+    pub(crate) fn requires_selected_font_metrics(&self) -> bool {
+        self.offset.requires_selected_font_metrics()
+    }
+
+    pub(crate) fn resolve_selected_font_metric_lengths(
+        &mut self,
+        basis: SelectedFontMetricLengthBasis,
+    ) {
+        self.offset.resolve_selected_font_metric_lengths(basis);
+    }
+
     pub(crate) const LEFT: Self = Self {
         origin: BackgroundPositionOrigin::Start,
         offset: ComputedLengthPercentage::ZERO,
@@ -32,6 +43,14 @@ impl BackgroundPositionAxis {
     pub(crate) fn resolve_root_font_relative_lengths(&mut self, root_font_size: f32) {
         self.offset
             .resolve_root_font_relative_lengths(root_font_size);
+    }
+
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        self.offset.resolve_root_font_metric_lengths(basis);
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        self.offset.requires_root_font_metrics()
     }
 
     pub(crate) fn requires_ch_advance(&self) -> bool {
@@ -68,6 +87,18 @@ pub(crate) struct BackgroundPosition {
 }
 
 impl BackgroundPosition {
+    pub(crate) fn requires_selected_font_metrics(&self) -> bool {
+        self.x.requires_selected_font_metrics() || self.y.requires_selected_font_metrics()
+    }
+
+    pub(crate) fn resolve_selected_font_metric_lengths(
+        &mut self,
+        basis: SelectedFontMetricLengthBasis,
+    ) {
+        self.x.resolve_selected_font_metric_lengths(basis);
+        self.y.resolve_selected_font_metric_lengths(basis);
+    }
+
     pub(crate) const INITIAL: Self = Self {
         x: BackgroundPositionAxis::LEFT,
         y: BackgroundPositionAxis::TOP,
@@ -86,6 +117,15 @@ impl BackgroundPosition {
     pub(crate) fn resolve_root_font_relative_lengths(&mut self, root_font_size: f32) {
         self.x.resolve_root_font_relative_lengths(root_font_size);
         self.y.resolve_root_font_relative_lengths(root_font_size);
+    }
+
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        self.x.resolve_root_font_metric_lengths(basis);
+        self.y.resolve_root_font_metric_lengths(basis);
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        self.x.requires_root_font_metrics() || self.y.requires_root_font_metrics()
     }
 
     pub(crate) fn requires_ch_advance(&self) -> bool {
@@ -126,6 +166,21 @@ pub(crate) enum BackgroundSize {
 }
 
 impl BackgroundSize {
+    pub(crate) fn requires_selected_font_metrics(&self) -> bool {
+        matches!(self, Self::Explicit { width, height }
+            if width.requires_selected_font_metrics() || height.requires_selected_font_metrics())
+    }
+
+    pub(crate) fn resolve_selected_font_metric_lengths(
+        &mut self,
+        basis: SelectedFontMetricLengthBasis,
+    ) {
+        if let Self::Explicit { width, height } = self {
+            width.resolve_selected_font_metric_lengths(basis);
+            height.resolve_selected_font_metric_lengths(basis);
+        }
+    }
+
     pub(crate) const AUTO: Self = Self::Auto;
 
     pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
@@ -152,6 +207,17 @@ impl BackgroundSize {
         height.resolve_root_font_relative_lengths(root_font_size);
     }
 
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        if let Self::Explicit { width, height } = self {
+            width.resolve_root_font_metric_lengths(basis);
+            height.resolve_root_font_metric_lengths(basis);
+        }
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        matches!(self, Self::Explicit { width, height } if width.requires_root_font_metrics() || height.requires_root_font_metrics())
+    }
+
     pub(crate) fn requires_ch_advance(&self) -> bool {
         match self {
             Self::Explicit { width, height } => {
@@ -171,6 +237,19 @@ impl BackgroundSize {
 }
 
 impl BackgroundSizeAxis {
+    pub(crate) fn requires_selected_font_metrics(&self) -> bool {
+        matches!(self, Self::LengthPercentage(value) if value.requires_selected_font_metrics())
+    }
+
+    pub(crate) fn resolve_selected_font_metric_lengths(
+        &mut self,
+        basis: SelectedFontMetricLengthBasis,
+    ) {
+        if let Self::LengthPercentage(value) = self {
+            value.resolve_selected_font_metric_lengths(basis);
+        }
+    }
+
     pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         if let Self::LengthPercentage(value) = self {
             value.resolve_font_metric_lengths(ch_advance);
@@ -187,6 +266,16 @@ impl BackgroundSizeAxis {
         if let Self::LengthPercentage(value) = self {
             value.resolve_root_font_relative_lengths(root_font_size);
         }
+    }
+
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        if let Self::LengthPercentage(value) = self {
+            value.resolve_root_font_metric_lengths(basis);
+        }
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        matches!(self, Self::LengthPercentage(value) if value.requires_root_font_metrics())
     }
 
     pub(crate) fn requires_ch_advance(&self) -> bool {
@@ -280,6 +369,7 @@ impl ComputedImage {
 
     /// Select a concrete `image-set()` option, preserving the CSS distinction
     /// between `none` and a valid value that represents an invalid image.
+    #[cfg(test)]
     pub(crate) fn select_image_set(&mut self, device_resolution_dppx: f32) {
         let Some(image) = self.as_image_mut() else {
             return;
@@ -288,6 +378,35 @@ impl ComputedImage {
             *self = Self::Invalid;
         }
     }
+
+    /// Resolve image forms whose computed value depends on the element's
+    /// used color scheme or the rendering environment.
+    ///
+    /// CSS Color 5 selects `light-dark()` before CSS Images selects an
+    /// `image-set()` candidate, so a selected light/dark branch can itself be
+    /// an image set.
+    /// <https://drafts.csswg.org/css-color-5/#light-dark>
+    /// <https://drafts.csswg.org/css-images-4/#image-set-notation>
+    pub(crate) fn resolve_for_context(&mut self, context: ImageSelectionContext) {
+        let Some(image) = self.as_image_mut() else {
+            return;
+        };
+        if !image.resolve_for_context(context) {
+            *self = Self::Invalid;
+        }
+    }
+}
+
+/// The element and rendering-environment inputs used to resolve CSS images.
+///
+/// Keeping the color-scheme and device-resolution inputs together preserves
+/// CSS Color 5's required resolution order for `light-dark()` and
+/// `image-set()`.
+/// <https://drafts.csswg.org/css-color-5/#light-dark>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ImageSelectionContext {
+    pub(crate) used_color_scheme: UsedColorScheme,
+    pub(crate) resolution_dppx: f32,
 }
 
 /// Computed single concrete CSS image.
@@ -297,6 +416,10 @@ impl ComputedImage {
 /// <https://www.w3.org/TR/css-images-3/#gradients>.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum BackgroundImage {
+    /// A CSS Color 5 image whose concrete value depends on the owning
+    /// element's used color scheme.
+    /// <https://drafts.csswg.org/css-color-5/#light-dark>
+    LightDark(LightDarkImage),
     /// An `image-set()` before the renderer has selected its concrete option.
     ///
     /// CSS Images requires MIME filtering and duplicate-resolution removal to
@@ -313,16 +436,61 @@ pub(crate) enum BackgroundImage {
         image: Box<BackgroundImage>,
         resolution: f32,
     },
-    Url {
-        src: String,
-        base_url: Option<url::Url>,
-        root_url: Option<url::Url>,
-        request_modifiers: crate::css::RequestUrlModifiers,
-    },
+    /// A direct external image URL.
+    Url(ImageUrl),
+    /// CSS Images Level 5's `image()` notation.
+    ///
+    /// Unlike a plain URL, the source can fall back to a dimensionless color
+    /// image after resource selection. The direction tag belongs to the
+    /// source image and is intentionally retained until paint, where the
+    /// consuming element's logical inline axis is known.
+    /// <https://drafts.csswg.org/css-images-5/#image-notation>
+    ImageFunction(ImageFunction),
     LinearGradient(LinearGradient),
     RadialGradient(RadialGradient),
     ConicGradient(ConicGradient),
     CssColor(ColorImageColor),
+}
+
+/// A CSS external image reference shared by `url()` and `image()`.
+///
+/// Keeping request modifiers and stylesheet URL context with the source makes
+/// resource loading independent of the CSS function that contained it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ImageUrl {
+    pub(crate) href: String,
+    pub(crate) base_url: Option<url::Url>,
+    pub(crate) root_url: Option<url::Url>,
+    pub(crate) request_modifiers: crate::css::RequestUrlModifiers,
+}
+
+/// CSS Images Level 5's `image()` source/fallback value.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ImageFunction {
+    pub(crate) source: Option<ImageUrl>,
+    pub(crate) fallback_color: Option<ColorImageColor>,
+    pub(crate) directionality: Option<ImageDirectionality>,
+}
+
+/// The authored directionality of an `image()` source.
+///
+/// This is intentionally distinct from the element's CSS `Direction`: the
+/// latter selects whether this source needs an inline-axis reflection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImageDirectionality {
+    Ltr,
+    Rtl,
+}
+
+/// The light and dark image branches of CSS Color 5's `light-dark()`.
+///
+/// The parser normalizes a `none` branch to `image(transparent)`, so both
+/// fields are always concrete CSS images rather than optional values.
+/// <https://drafts.csswg.org/css-color-5/#light-dark>
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct LightDarkImage {
+    pub(crate) light: Box<BackgroundImage>,
+    pub(crate) dark: Box<BackgroundImage>,
 }
 
 /// Parsed CSS Images `image-set()` candidates before UA selection.
@@ -366,6 +534,92 @@ impl ColorImageColor {
 }
 
 impl BackgroundImage {
+    pub(crate) fn requires_selected_font_metrics(&self) -> bool {
+        match self {
+            Self::LightDark(branches) => {
+                branches.light.requires_selected_font_metrics()
+                    || branches.dark.requires_selected_font_metrics()
+            }
+            Self::ImageSet(set) => set
+                .options
+                .iter()
+                .any(|option| option.image.requires_selected_font_metrics()),
+            Self::SelectedImageSet { image, .. } => image.requires_selected_font_metrics(),
+            Self::LinearGradient(gradient) => gradient.requires_selected_font_metrics(),
+            Self::RadialGradient(gradient) => gradient.requires_selected_font_metrics(),
+            Self::ConicGradient(gradient) => gradient.requires_selected_font_metrics(),
+            Self::CssColor(_) | Self::Url(_) | Self::ImageFunction(_) => false,
+        }
+    }
+
+    pub(crate) fn resolve_selected_font_metric_lengths(
+        &mut self,
+        basis: SelectedFontMetricLengthBasis,
+    ) {
+        match self {
+            Self::LightDark(branches) => {
+                branches.light.resolve_selected_font_metric_lengths(basis);
+                branches.dark.resolve_selected_font_metric_lengths(basis);
+            }
+            Self::ImageSet(set) => {
+                for option in &mut set.options {
+                    option.image.resolve_selected_font_metric_lengths(basis);
+                }
+            }
+            Self::SelectedImageSet { image, .. } => {
+                image.resolve_selected_font_metric_lengths(basis)
+            }
+            Self::LinearGradient(gradient) => gradient.resolve_selected_font_metric_lengths(basis),
+            Self::RadialGradient(gradient) => gradient.resolve_selected_font_metric_lengths(basis),
+            Self::ConicGradient(gradient) => gradient.resolve_selected_font_metric_lengths(basis),
+            Self::CssColor(_) | Self::Url(_) | Self::ImageFunction(_) => {}
+        }
+    }
+
+    /// Resolve `lh` components after the consuming element's computed line
+    /// height is available.  Generated images inherit the same local
+    /// font-relative basis as their owning property.
+    /// <https://drafts.csswg.org/css-values-4/#lh>
+    pub(crate) fn resolve_line_height_relative_lengths(&mut self, line_height: LayoutLength) {
+        match self {
+            Self::LightDark(branches) => {
+                branches
+                    .light
+                    .resolve_line_height_relative_lengths(line_height);
+                branches
+                    .dark
+                    .resolve_line_height_relative_lengths(line_height);
+            }
+            Self::ImageSet(set) => {
+                for option in &mut set.options {
+                    option
+                        .image
+                        .resolve_line_height_relative_lengths(line_height);
+                }
+            }
+            Self::SelectedImageSet { image, .. } => {
+                image.resolve_line_height_relative_lengths(line_height)
+            }
+            Self::LinearGradient(gradient) => {
+                gradient.resolve_line_height_relative_lengths(line_height)
+            }
+            Self::RadialGradient(gradient) => {
+                gradient.resolve_line_height_relative_lengths(line_height)
+            }
+            Self::ConicGradient(gradient) => {
+                gradient.resolve_line_height_relative_lengths(line_height)
+            }
+            Self::CssColor(_) | Self::Url(_) | Self::ImageFunction(_) => {}
+        }
+    }
+
+    /// Resolve every environment-dependent image form before layout, asset
+    /// loading, and paint consume the concrete image.
+    pub(crate) fn resolve_for_context(&mut self, context: ImageSelectionContext) -> bool {
+        self.resolve_light_dark(context.used_color_scheme);
+        self.select_image_set(context.resolution_dppx)
+    }
+
     /// Return the selected image after unwrapping any nested `image-set()`
     /// candidates.
     pub(crate) fn selected_image(&self) -> &Self {
@@ -375,6 +629,10 @@ impl BackgroundImage {
                 debug_assert!(false, "image-set candidates must be selected before layout");
                 self
             }
+            Self::LightDark(_) => {
+                debug_assert!(false, "light-dark() must resolve before layout");
+                self
+            }
             image => image,
         }
     }
@@ -382,6 +640,7 @@ impl BackgroundImage {
     /// Return the product of selected `image-set()` resolutions.
     pub(crate) fn intrinsic_resolution(&self) -> f32 {
         match self {
+            Self::LightDark(_) => 1.0,
             Self::SelectedImageSet { image, resolution } => {
                 resolution * image.intrinsic_resolution()
             }
@@ -431,8 +690,42 @@ impl BackgroundImage {
         true
     }
 
+    /// Select the used `light-dark()` image branch throughout this image.
+    ///
+    /// Branch selection happens before `image-set()` candidate negotiation;
+    /// callers perform that second step after this traversal.
+    /// <https://drafts.csswg.org/css-color-5/#light-dark>
+    pub(crate) fn resolve_light_dark(&mut self, used_color_scheme: UsedColorScheme) {
+        match self {
+            Self::LightDark(branches) => {
+                let selected = match used_color_scheme {
+                    UsedColorScheme::Light => (*branches.light).clone(),
+                    UsedColorScheme::Dark => (*branches.dark).clone(),
+                };
+                *self = selected;
+                self.resolve_light_dark(used_color_scheme);
+            }
+            Self::ImageSet(set) => {
+                for option in &mut set.options {
+                    option.image.resolve_light_dark(used_color_scheme);
+                }
+            }
+            Self::SelectedImageSet { image, .. } => image.resolve_light_dark(used_color_scheme),
+            Self::Url(_)
+            | Self::ImageFunction(_)
+            | Self::LinearGradient(_)
+            | Self::RadialGradient(_)
+            | Self::ConicGradient(_)
+            | Self::CssColor(_) => {}
+        }
+    }
+
     pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         match self {
+            Self::LightDark(branches) => {
+                branches.light.resolve_font_metric_lengths(ch_advance);
+                branches.dark.resolve_font_metric_lengths(ch_advance);
+            }
             Self::ImageSet(set) => {
                 for option in &mut set.options {
                     option.image.resolve_font_metric_lengths(ch_advance);
@@ -442,13 +735,16 @@ impl BackgroundImage {
             Self::LinearGradient(gradient) => gradient.resolve_font_metric_lengths(ch_advance),
             Self::RadialGradient(gradient) => gradient.resolve_font_metric_lengths(ch_advance),
             Self::ConicGradient(gradient) => gradient.resolve_font_metric_lengths(ch_advance),
-            Self::CssColor(_) => {}
-            Self::Url { .. } => {}
+            Self::CssColor(_) | Self::Url(_) | Self::ImageFunction(_) => {}
         }
     }
 
     pub(crate) fn resolve_em_relative_lengths(&mut self, font_size: LayoutLength) {
         match self {
+            Self::LightDark(branches) => {
+                branches.light.resolve_em_relative_lengths(font_size);
+                branches.dark.resolve_em_relative_lengths(font_size);
+            }
             Self::ImageSet(set) => {
                 for option in &mut set.options {
                     option.image.resolve_em_relative_lengths(font_size);
@@ -458,12 +754,20 @@ impl BackgroundImage {
             Self::LinearGradient(gradient) => gradient.resolve_em_relative_lengths(font_size),
             Self::RadialGradient(gradient) => gradient.resolve_em_relative_lengths(font_size),
             Self::ConicGradient(gradient) => gradient.resolve_em_relative_lengths(font_size),
-            Self::CssColor(_) | Self::Url { .. } => {}
+            Self::CssColor(_) | Self::Url(_) | Self::ImageFunction(_) => {}
         }
     }
 
     pub(crate) fn resolve_root_font_relative_lengths(&mut self, root_font_size: f32) {
         match self {
+            Self::LightDark(branches) => {
+                branches
+                    .light
+                    .resolve_root_font_relative_lengths(root_font_size);
+                branches
+                    .dark
+                    .resolve_root_font_relative_lengths(root_font_size);
+            }
             Self::ImageSet(set) => {
                 for option in &mut set.options {
                     option
@@ -483,12 +787,52 @@ impl BackgroundImage {
             Self::ConicGradient(gradient) => {
                 gradient.resolve_root_font_relative_lengths(root_font_size)
             }
-            Self::CssColor(_) | Self::Url { .. } => {}
+            Self::CssColor(_) | Self::Url(_) | Self::ImageFunction(_) => {}
+        }
+    }
+
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        match self {
+            Self::LightDark(branches) => {
+                branches.light.resolve_root_font_metric_lengths(basis);
+                branches.dark.resolve_root_font_metric_lengths(basis);
+            }
+            Self::ImageSet(set) => {
+                for option in &mut set.options {
+                    option.image.resolve_root_font_metric_lengths(basis);
+                }
+            }
+            Self::SelectedImageSet { image, .. } => image.resolve_root_font_metric_lengths(basis),
+            Self::LinearGradient(gradient) => gradient.resolve_root_font_metric_lengths(basis),
+            Self::RadialGradient(gradient) => gradient.resolve_root_font_metric_lengths(basis),
+            Self::ConicGradient(gradient) => gradient.resolve_root_font_metric_lengths(basis),
+            Self::CssColor(_) | Self::Url(_) | Self::ImageFunction(_) => {}
+        }
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        match self {
+            Self::LightDark(branches) => {
+                branches.light.requires_root_font_metrics()
+                    || branches.dark.requires_root_font_metrics()
+            }
+            Self::ImageSet(set) => set
+                .options
+                .iter()
+                .any(|option| option.image.requires_root_font_metrics()),
+            Self::SelectedImageSet { image, .. } => image.requires_root_font_metrics(),
+            Self::LinearGradient(gradient) => gradient.requires_root_font_metrics(),
+            Self::RadialGradient(gradient) => gradient.requires_root_font_metrics(),
+            Self::ConicGradient(gradient) => gradient.requires_root_font_metrics(),
+            Self::CssColor(_) | Self::Url(_) | Self::ImageFunction(_) => false,
         }
     }
 
     pub(crate) fn requires_ch_advance(&self) -> bool {
         match self {
+            Self::LightDark(branches) => {
+                branches.light.requires_ch_advance() || branches.dark.requires_ch_advance()
+            }
             Self::ImageSet(set) => set
                 .options
                 .iter()
@@ -497,8 +841,7 @@ impl BackgroundImage {
             Self::LinearGradient(gradient) => gradient.requires_ch_advance(),
             Self::RadialGradient(gradient) => gradient.requires_ch_advance(),
             Self::ConicGradient(gradient) => gradient.requires_ch_advance(),
-            Self::CssColor(_) => false,
-            Self::Url { .. } => false,
+            Self::CssColor(_) | Self::Url(_) | Self::ImageFunction(_) => false,
         }
     }
 }
@@ -521,6 +864,25 @@ pub(crate) struct BackgroundLayer {
 }
 
 impl BackgroundLayer {
+    pub(crate) fn requires_selected_font_metrics(&self) -> bool {
+        self.image
+            .as_image()
+            .is_some_and(BackgroundImage::requires_selected_font_metrics)
+            || self.size.requires_selected_font_metrics()
+            || self.position.requires_selected_font_metrics()
+    }
+
+    pub(crate) fn resolve_selected_font_metric_lengths(
+        &mut self,
+        basis: SelectedFontMetricLengthBasis,
+    ) {
+        if let Some(image) = self.image.as_image_mut() {
+            image.resolve_selected_font_metric_lengths(basis);
+        }
+        self.size.resolve_selected_font_metric_lengths(basis);
+        self.position.resolve_selected_font_metric_lengths(basis);
+    }
+
     pub(crate) const fn initial() -> Self {
         Self {
             image: ComputedImage::None,
@@ -558,6 +920,22 @@ impl BackgroundLayer {
             .resolve_root_font_relative_lengths(root_font_size);
     }
 
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        if let Some(image) = self.image.as_image_mut() {
+            image.resolve_root_font_metric_lengths(basis);
+        }
+        self.size.resolve_root_font_metric_lengths(basis);
+        self.position.resolve_root_font_metric_lengths(basis);
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        self.image
+            .as_image()
+            .is_some_and(BackgroundImage::requires_root_font_metrics)
+            || self.size.requires_root_font_metrics()
+            || self.position.requires_root_font_metrics()
+    }
+
     pub(crate) fn requires_ch_advance(&self) -> bool {
         self.image
             .as_image()
@@ -567,6 +945,9 @@ impl BackgroundLayer {
     }
 
     pub(crate) fn resolve_line_height_relative_lengths(&mut self, line_height: LayoutLength) {
+        if let Some(image) = self.image.as_image_mut() {
+            image.resolve_line_height_relative_lengths(line_height);
+        }
         self.size.resolve_line_height_relative_lengths(line_height);
         self.position
             .resolve_line_height_relative_lengths(line_height);
@@ -653,6 +1034,17 @@ pub(crate) struct ConicGradient {
 }
 
 impl ConicGradient {
+    pub(crate) fn requires_selected_font_metrics(&self) -> bool {
+        self.position.requires_selected_font_metrics()
+    }
+
+    pub(crate) fn resolve_selected_font_metric_lengths(
+        &mut self,
+        basis: SelectedFontMetricLengthBasis,
+    ) {
+        self.position.resolve_selected_font_metric_lengths(basis);
+    }
+
     pub(crate) fn resolve_current_color(&self, current_color: CssColor) -> Self {
         let mut resolved = self.clone();
         for stop in &mut resolved.stops {
@@ -888,12 +1280,52 @@ impl ConicGradient {
             .resolve_root_font_relative_lengths(root_font_size);
     }
 
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        self.position.resolve_root_font_metric_lengths(basis);
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        self.position.requires_root_font_metrics()
+    }
+
     pub(crate) fn requires_ch_advance(&self) -> bool {
         self.position.requires_ch_advance()
+    }
+
+    pub(crate) fn resolve_line_height_relative_lengths(&mut self, line_height: LayoutLength) {
+        self.position
+            .resolve_line_height_relative_lengths(line_height);
     }
 }
 
 impl RadialGradient {
+    pub(crate) fn requires_selected_font_metrics(&self) -> bool {
+        self.size.requires_selected_font_metrics()
+            || self.position.requires_selected_font_metrics()
+            || self
+                .stops
+                .iter()
+                .any(GradientColorStop::requires_selected_font_metrics)
+            || self
+                .hints
+                .iter()
+                .any(GradientColorHint::requires_selected_font_metrics)
+    }
+
+    pub(crate) fn resolve_selected_font_metric_lengths(
+        &mut self,
+        basis: SelectedFontMetricLengthBasis,
+    ) {
+        self.size.resolve_selected_font_metric_lengths(basis);
+        self.position.resolve_selected_font_metric_lengths(basis);
+        for stop in &mut self.stops {
+            stop.resolve_selected_font_metric_lengths(basis);
+        }
+        for hint in &mut self.hints {
+            hint.resolve_selected_font_metric_lengths(basis);
+        }
+    }
+
     pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         self.size.resolve_font_metric_lengths(ch_advance);
         self.position.resolve_font_metric_lengths(ch_advance);
@@ -928,6 +1360,30 @@ impl RadialGradient {
         }
     }
 
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        self.size.resolve_root_font_metric_lengths(basis);
+        self.position.resolve_root_font_metric_lengths(basis);
+        for stop in &mut self.stops {
+            stop.resolve_root_font_metric_lengths(basis);
+        }
+        for hint in &mut self.hints {
+            hint.resolve_root_font_metric_lengths(basis);
+        }
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        self.size.requires_root_font_metrics()
+            || self.position.requires_root_font_metrics()
+            || self
+                .stops
+                .iter()
+                .any(GradientColorStop::requires_root_font_metrics)
+            || self
+                .hints
+                .iter()
+                .any(GradientColorHint::requires_root_font_metrics)
+    }
+
     pub(crate) fn requires_ch_advance(&self) -> bool {
         self.size.requires_ch_advance()
             || self.position.requires_ch_advance()
@@ -939,6 +1395,18 @@ impl RadialGradient {
                 .hints
                 .iter()
                 .any(GradientColorHint::requires_ch_advance)
+    }
+
+    pub(crate) fn resolve_line_height_relative_lengths(&mut self, line_height: LayoutLength) {
+        self.size.resolve_line_height_relative_lengths(line_height);
+        self.position
+            .resolve_line_height_relative_lengths(line_height);
+        for stop in &mut self.stops {
+            stop.resolve_line_height_relative_lengths(line_height);
+        }
+        for hint in &mut self.hints {
+            hint.resolve_line_height_relative_lengths(line_height);
+        }
     }
 }
 
@@ -965,6 +1433,30 @@ pub(crate) enum RadialGradientSize {
 }
 
 impl RadialGradientSize {
+    pub(crate) fn requires_selected_font_metrics(&self) -> bool {
+        match self {
+            Self::CircleRadius(radius) => radius.requires_selected_font_metrics(),
+            Self::EllipseRadii { x, y } => {
+                x.requires_selected_font_metrics() || y.requires_selected_font_metrics()
+            }
+            Self::Extent(_) => false,
+        }
+    }
+
+    pub(crate) fn resolve_selected_font_metric_lengths(
+        &mut self,
+        basis: SelectedFontMetricLengthBasis,
+    ) {
+        match self {
+            Self::CircleRadius(radius) => radius.resolve_selected_font_metric_lengths(basis),
+            Self::EllipseRadii { x, y } => {
+                x.resolve_selected_font_metric_lengths(basis);
+                y.resolve_selected_font_metric_lengths(basis);
+            }
+            Self::Extent(_) => {}
+        }
+    }
+
     pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         match self {
             Self::CircleRadius(radius) => radius.resolve_font_metric_lengths(ch_advance),
@@ -998,11 +1490,43 @@ impl RadialGradientSize {
         }
     }
 
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        match self {
+            Self::CircleRadius(radius) => radius.resolve_root_font_metric_lengths(basis),
+            Self::EllipseRadii { x, y } => {
+                x.resolve_root_font_metric_lengths(basis);
+                y.resolve_root_font_metric_lengths(basis);
+            }
+            Self::Extent(_) => {}
+        }
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        match self {
+            Self::CircleRadius(radius) => radius.requires_root_font_metrics(),
+            Self::EllipseRadii { x, y } => {
+                x.requires_root_font_metrics() || y.requires_root_font_metrics()
+            }
+            Self::Extent(_) => false,
+        }
+    }
+
     pub(crate) fn requires_ch_advance(&self) -> bool {
         match self {
             Self::CircleRadius(radius) => radius.requires_ch_advance(),
             Self::EllipseRadii { x, y } => x.requires_ch_advance() || y.requires_ch_advance(),
             Self::Extent(_) => false,
+        }
+    }
+
+    pub(crate) fn resolve_line_height_relative_lengths(&mut self, line_height: LayoutLength) {
+        match self {
+            Self::CircleRadius(radius) => radius.resolve_line_height_relative_lengths(line_height),
+            Self::EllipseRadii { x, y } => {
+                x.resolve_line_height_relative_lengths(line_height);
+                y.resolve_line_height_relative_lengths(line_height);
+            }
+            Self::Extent(_) => {}
         }
     }
 }
@@ -1016,6 +1540,28 @@ pub(crate) enum RadialGradientExtent {
 }
 
 impl LinearGradient {
+    pub(crate) fn requires_selected_font_metrics(&self) -> bool {
+        self.stops
+            .iter()
+            .any(GradientColorStop::requires_selected_font_metrics)
+            || self
+                .hints
+                .iter()
+                .any(GradientColorHint::requires_selected_font_metrics)
+    }
+
+    pub(crate) fn resolve_selected_font_metric_lengths(
+        &mut self,
+        basis: SelectedFontMetricLengthBasis,
+    ) {
+        for stop in &mut self.stops {
+            stop.resolve_selected_font_metric_lengths(basis);
+        }
+        for hint in &mut self.hints {
+            hint.resolve_selected_font_metric_lengths(basis);
+        }
+    }
+
     pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         for stop in &mut self.stops {
             stop.resolve_font_metric_lengths(ch_advance);
@@ -1043,6 +1589,25 @@ impl LinearGradient {
         }
     }
 
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        for stop in &mut self.stops {
+            stop.resolve_root_font_metric_lengths(basis);
+        }
+        for hint in &mut self.hints {
+            hint.resolve_root_font_metric_lengths(basis);
+        }
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        self.stops
+            .iter()
+            .any(GradientColorStop::requires_root_font_metrics)
+            || self
+                .hints
+                .iter()
+                .any(GradientColorHint::requires_root_font_metrics)
+    }
+
     pub(crate) fn requires_ch_advance(&self) -> bool {
         self.stops
             .iter()
@@ -1051,6 +1616,15 @@ impl LinearGradient {
                 .hints
                 .iter()
                 .any(GradientColorHint::requires_ch_advance)
+    }
+
+    pub(crate) fn resolve_line_height_relative_lengths(&mut self, line_height: LayoutLength) {
+        for stop in &mut self.stops {
+            stop.resolve_line_height_relative_lengths(line_height);
+        }
+        for hint in &mut self.hints {
+            hint.resolve_line_height_relative_lengths(line_height);
+        }
     }
 }
 
@@ -1095,6 +1669,21 @@ pub(crate) struct GradientColorStop {
 }
 
 impl GradientColorStop {
+    pub(crate) fn requires_selected_font_metrics(&self) -> bool {
+        self.position
+            .as_ref()
+            .is_some_and(ComputedLengthPercentage::requires_selected_font_metrics)
+    }
+
+    pub(crate) fn resolve_selected_font_metric_lengths(
+        &mut self,
+        basis: SelectedFontMetricLengthBasis,
+    ) {
+        if let Some(position) = &mut self.position {
+            position.resolve_selected_font_metric_lengths(basis);
+        }
+    }
+
     pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         if let Some(position) = &mut self.position {
             position.resolve_font_metric_lengths(ch_advance);
@@ -1113,10 +1702,28 @@ impl GradientColorStop {
         }
     }
 
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        if let Some(position) = &mut self.position {
+            position.resolve_root_font_metric_lengths(basis);
+        }
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        self.position
+            .as_ref()
+            .is_some_and(ComputedLengthPercentage::requires_root_font_metrics)
+    }
+
     pub(crate) fn requires_ch_advance(&self) -> bool {
         self.position
             .as_ref()
             .is_some_and(ComputedLengthPercentage::requires_ch_advance)
+    }
+
+    pub(crate) fn resolve_line_height_relative_lengths(&mut self, line_height: LayoutLength) {
+        if let Some(position) = &mut self.position {
+            position.resolve_line_height_relative_lengths(line_height);
+        }
     }
 }
 
@@ -1132,6 +1739,17 @@ pub(crate) struct GradientColorHint {
 }
 
 impl GradientColorHint {
+    pub(crate) fn requires_selected_font_metrics(&self) -> bool {
+        self.position.requires_selected_font_metrics()
+    }
+
+    pub(crate) fn resolve_selected_font_metric_lengths(
+        &mut self,
+        basis: SelectedFontMetricLengthBasis,
+    ) {
+        self.position.resolve_selected_font_metric_lengths(basis);
+    }
+
     pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         self.position.resolve_font_metric_lengths(ch_advance);
     }
@@ -1145,8 +1763,21 @@ impl GradientColorHint {
             .resolve_root_font_relative_lengths(root_font_size);
     }
 
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        self.position.resolve_root_font_metric_lengths(basis);
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        self.position.requires_root_font_metrics()
+    }
+
     pub(crate) fn requires_ch_advance(&self) -> bool {
         self.position.requires_ch_advance()
+    }
+
+    pub(crate) fn resolve_line_height_relative_lengths(&mut self, line_height: LayoutLength) {
+        self.position
+            .resolve_line_height_relative_lengths(line_height);
     }
 }
 
@@ -1184,6 +1815,10 @@ impl ResolveViewportLengths for BackgroundSizeAxis {
 impl ResolveViewportLengths for BackgroundImage {
     fn resolve_viewport_lengths(&mut self, basis: ViewportLengthBasis) {
         match self {
+            Self::LightDark(branches) => {
+                branches.light.resolve_viewport_lengths(basis);
+                branches.dark.resolve_viewport_lengths(basis);
+            }
             Self::ImageSet(set) => {
                 for option in &mut set.options {
                     option.image.resolve_viewport_lengths(basis);
@@ -1193,8 +1828,7 @@ impl ResolveViewportLengths for BackgroundImage {
             Self::LinearGradient(gradient) => gradient.resolve_viewport_lengths(basis),
             Self::RadialGradient(gradient) => gradient.resolve_viewport_lengths(basis),
             Self::ConicGradient(gradient) => gradient.resolve_viewport_lengths(basis),
-            Self::CssColor(_) => {}
-            Self::Url { .. } => {}
+            Self::CssColor(_) | Self::Url(_) | Self::ImageFunction(_) => {}
         }
     }
 }

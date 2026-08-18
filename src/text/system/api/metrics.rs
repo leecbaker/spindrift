@@ -1,11 +1,241 @@
 use super::*;
-use crate::css::{BaselineShift, FontSizeAdjust, FontSizeAdjustMetric, FontSizeAdjustValue};
+use crate::css::{BaselineMetric, BaselineShift, FontSizeAdjustMetric, TextLayoutPolicy};
 #[cfg(test)]
 use crate::document::paint::text::RenderedLine;
 use crate::document::paint::text::RenderedTextRun;
-use crate::units::{LayoutLength, SemanticLengthExt, layout_pt};
+use crate::units::{LayoutLength, layout_points, layout_pt};
+use read_fonts::tables::variations::DeltaSetIndex;
+use read_fonts::types::{F2Dot14, Fixed, Tag};
+use read_fonts::{FontRef, TableProvider};
 
 impl FontSystem {
+    /// Return a selected CSS baseline position measured from the inline
+    /// content area's block-start edge. `BASE` coordinates are retained in
+    /// design units and converted only after the selected face, variation
+    /// instance, script, and typographic axis are known.
+    ///
+    /// Format 3 deltas are evaluated in normalized `fvar`/`avar` space. This
+    /// deliberately uses the same CSS standard-axis and low-level variation
+    /// precedence as shaping.
+    /// <https://drafts.csswg.org/css-inline-3/#baseline-tables>
+    /// <https://learn.microsoft.com/en-us/typography/opentype/spec/base>
+    pub(crate) fn baseline_offset_for_style(
+        &mut self,
+        style: &ComputedStyle,
+        metric: BaselineMetric,
+    ) -> LayoutLength {
+        let metric = baseline_metric_for_typography(metric, style.text_layout_policy());
+        // Baseline selection uses the same first available metric face as
+        // shaping and inline content-area metrics. A BASE table describes a
+        // selected font; it cannot bypass `unicode-range` eligibility by
+        // choosing an otherwise loadable earlier face in the family list.
+        let font_id = self.resolve_metric_font_for_style(style);
+        let used_font_size = font_id
+            .and_then(|id| self.font_size_adjusted_size_for_font_id(style, id))
+            .unwrap_or(style.font_size);
+        let Some(font_id) = font_id else {
+            return layout_pt(synthesized_baseline_offset(
+                metric,
+                style.font_size,
+                style.font_size,
+                self.used_x_height_for_style(style).points(),
+            ));
+        };
+        let x_height = self.used_x_height_for_style(style).points();
+        let Some(font) = self.document_fonts.get(font_id) else {
+            return layout_pt(style.font_size);
+        };
+        let units_per_em = font.units_per_em.max(1) as f32;
+        let coordinate_value = |coordinate: crate::document::OpenTypeBaselineCoordinate| {
+            let delta = coordinate
+                .variation_index
+                .map(|index| self.base_variation_delta(font_id, index, style))
+                .unwrap_or(0.0);
+            f32::from(coordinate.design_units) + delta
+        };
+        let tagged_coordinate =
+            |tag| baseline_coordinate_for_style(font, style, tag).map(coordinate_value);
+        let (central_coordinate, ideographic_under_coordinate) =
+            derive_ideographic_design_coordinates(
+                tagged_coordinate(*b"idtp"),
+                tagged_coordinate(*b"ideo"),
+                units_per_em,
+            );
+        // BASE coordinates are located from the font's design-space origin,
+        // whereas CSS inline content-area coordinates are located from the
+        // selected layout ascent. Appendix A's em-over/em-under construction
+        // is intentionally *not* a CSS layout metric: CSS Inline defines it
+        // only for Canvas TextMetrics consistency. In particular, a BASE
+        // central baseline must not move text-over/text-under or re-anchor
+        // the alphabetic baseline inside an inline box.
+        // <https://drafts.csswg.org/css-inline-3/#calculating-em-over-and-em-under>
+        let content_over_coordinate = font.layout_metrics.ascender as f32;
+        let base_offset = |coordinate| {
+            css_content_baseline_offset(
+                content_over_coordinate,
+                coordinate,
+                used_font_size,
+                units_per_em,
+            )
+        };
+        let tagged_offset = |tag| tagged_coordinate(tag).map(base_offset);
+        let alphabetic = tagged_offset(*b"romn")
+            .unwrap_or_else(|| font.layout_metrics.ascender as f32 * used_font_size / units_per_em);
+        let central = central_coordinate.map(base_offset);
+        let ideographic = ideographic_under_coordinate.map(base_offset);
+        let baseline_coordinate = match metric {
+            BaselineMetric::Central => central,
+            BaselineMetric::Ideographic => ideographic,
+            _ => baseline_tag_for_metric(metric).and_then(|tag| tagged_offset(*tag)),
+        };
+        let measured_baseline = baseline_coordinate.is_none().then(|| {
+            self.measured_baseline_offset_for_style(
+                font_id,
+                style,
+                metric,
+                alphabetic,
+                used_font_size,
+            )
+        });
+        let offset = match metric {
+            BaselineMetric::TextTop => 0.0,
+            BaselineMetric::TextBottom => used_font_size,
+            BaselineMetric::Central => baseline_coordinate.unwrap_or(used_font_size / 2.0),
+            BaselineMetric::Middle => baseline_coordinate.unwrap_or(alphabetic - x_height / 2.0),
+            _ => baseline_coordinate
+                .or(measured_baseline.flatten())
+                .unwrap_or_else(|| {
+                    synthesized_baseline_offset(metric, alphabetic, used_font_size, x_height)
+                }),
+        };
+        layout_pt(offset)
+    }
+
+    /// Resolve the selected CSS content-area alphabetic baseline position.
+    /// The content area remains one em tall and is anchored at the selected
+    /// CSS layout ascent; BASE supplies baseline positions within it.
+    fn content_baseline_offset_for_style(&mut self, style: &ComputedStyle) -> LayoutLength {
+        self.baseline_offset_for_style(style, BaselineMetric::Alphabetic)
+    }
+
+    /// Measure font outlines only when `BASE` lacks a requested mathematical
+    /// or hanging baseline. CSS Inline Appendix A permits the center of a
+    /// minus sign for math and script-appropriate ink tops for hanging.
+    ///
+    /// Measurements stay in design coordinates until this final conversion,
+    /// so they scale with the actual selected face and its used font size.
+    /// <https://drafts.csswg.org/css-inline-3/#baseline-synthesis>
+    fn measured_baseline_offset_for_style(
+        &self,
+        font_id: usize,
+        style: &ComputedStyle,
+        metric: BaselineMetric,
+        alphabetic: f32,
+        used_font_size: f32,
+    ) -> Option<f32> {
+        let font = self.document_fonts.get(font_id)?;
+        let face = ttf_parser::Face::parse(&font.data, font.face_index).ok()?;
+        let design_coordinate = match metric {
+            BaselineMetric::Mathematical => ['\u{2212}', '+'].into_iter().find_map(|character| {
+                let glyph = face.glyph_index(character)?;
+                let bounds = face.glyph_bounding_box(glyph)?;
+                Some((f32::from(bounds.y_min) + f32::from(bounds.y_max)) / 2.0)
+            }),
+            BaselineMetric::Hanging => hanging_measurement_characters(style.language.as_deref())
+                .iter()
+                .find_map(|&character| {
+                    let glyph = face.glyph_index(character)?;
+                    face.glyph_bounding_box(glyph)
+                        .map(|bounds| f32::from(bounds.y_max))
+                }),
+            _ => None,
+        }?;
+        Some(alphabetic - design_coordinate * used_font_size / f32::from(font.units_per_em.max(1)))
+    }
+
+    fn base_variation_delta(
+        &self,
+        font_id: usize,
+        index: crate::document::OpenTypeVariationIndex,
+        style: &ComputedStyle,
+    ) -> f32 {
+        let Some(font) = self.document_fonts.get(font_id) else {
+            return 0.0;
+        };
+        let Ok(font_ref) = FontRef::from_index(&font.data, font.face_index) else {
+            return 0.0;
+        };
+        let (Ok(base), Ok(fvar)) = (font_ref.base(), font_ref.fvar()) else {
+            return 0.0;
+        };
+        let Some(Ok(store)) = base.item_var_store() else {
+            return 0.0;
+        };
+        let Ok(axes) = fvar.axes() else {
+            return 0.0;
+        };
+        let axis_count = axes.len();
+        let mut normalized = vec![F2Dot14::ZERO; axis_count];
+        let avar = font_ref.avar().ok();
+        fvar.user_to_normalized(
+            avar.as_ref(),
+            self.used_variation_coordinates(style, font_id),
+            &mut normalized,
+        );
+        store
+            .compute_delta(
+                DeltaSetIndex {
+                    outer: index.outer,
+                    inner: index.inner,
+                },
+                &normalized,
+            )
+            .map_or(0.0, |delta| delta as f32)
+    }
+
+    fn used_variation_coordinates(
+        &self,
+        style: &ComputedStyle,
+        font_id: usize,
+    ) -> Vec<(Tag, Fixed)> {
+        let mut coordinates = vec![
+            (
+                Tag::new(b"wdth"),
+                Fixed::from_f64(style.font_width.0 as f64 / 10.0),
+            ),
+            (
+                Tag::new(b"wght"),
+                Fixed::from_f64(style.font_weight.0 as f64),
+            ),
+        ];
+        let effective_style = style.font_style;
+        if let Some(angle) =
+            effective_style
+                .oblique_angle()
+                .or(matches!(effective_style, FontStyle::Italic).then_some(14.0))
+        {
+            coordinates.push((Tag::new(b"slnt"), Fixed::from_f64(-f64::from(angle))));
+        }
+        let mut apply = |settings: &FontVariationSettings| {
+            for setting in &settings.0 {
+                let tag = Tag::new(&setting.tag);
+                let value = Fixed::from_f64(f64::from(f32::from_bits(setting.value)));
+                if let Some(existing) = coordinates
+                    .iter_mut()
+                    .find(|(existing, _)| *existing == tag)
+                {
+                    existing.1 = value;
+                } else {
+                    coordinates.push((tag, value));
+                }
+            }
+        };
+        if let Some(settings) = self.document_fonts.selected_face_variations(font_id) {
+            apply(&settings);
+        }
+        apply(&style.font_variation_settings);
+        coordinates
+    }
     pub(crate) fn ch_advance(&mut self, style: &ComputedStyle) -> LayoutLength {
         if matches!(
             style.text_layout_policy(),
@@ -102,17 +332,24 @@ impl FontSystem {
                 .unwrap_or(style.font_size),
         )
     }
+}
 
-    /// Returns the horizontal U+6C34 advance irrespective of writing mode.
-    /// <https://www.w3.org/TR/css-values-4/#ic>
-    pub(crate) fn horizontal_ic_advance_for_style(
-        &mut self,
-        style: &ComputedStyle,
-    ) -> LayoutLength {
-        layout_pt(
-            self.selected_font_glyph_advance_for_style(style, '水')
-                .unwrap_or(style.font_size),
-        )
+/// Script-appropriate ink samples for Appendix A hanging-baseline
+/// measurement. The fallback is intentionally empty for scripts without a
+/// specified representative character, allowing the normative .6em fallback.
+fn hanging_measurement_characters(language: Option<&str>) -> &'static [char] {
+    match opentype_script_for_language(language) {
+        Some([b'd', b'e', b'v', b'2']) => &['क'],
+        Some([b'b', b'n', b'g', b'2']) => &['ক'],
+        Some([b'g', b'u', b'r', b'2']) => &['ਕ'],
+        Some([b'g', b'j', b'r', b'2']) => &['ક'],
+        Some([b'o', b'r', b'y', b'2']) => &['କ'],
+        Some([b'm', b'l', b'm', b'2']) => &['ക'],
+        Some([b't', b'e', b'l', b'2']) => &['క'],
+        Some([b'k', b'n', b'd', b'2']) => &['ಕ'],
+        Some([b't', b'i', b'b', b't']) => &['ཀ'],
+        Some([b'h', b'e', b'b', b'r']) => &['ה'],
+        _ => &[],
     }
 }
 
@@ -154,70 +391,20 @@ impl FontSystem {
     /// unspecified, but it requires the choice not to change with
     /// `line-height`; backgrounds, borders, and padding consume this metric.
     ///
-    /// `line-height: normal`, by contrast, may enclose participating fallback
-    /// font line boxes. The baseline remains anchored to the style's first
-    /// available font while the line box incorporates those fallback runs:
+    /// The normal line box uses that same primary metric face. Fallback faces
+    /// remain per-glyph shaping and painting concerns, so the characters in a
+    /// run cannot change the inline box's CSS geometry:
     /// <https://www.w3.org/TR/CSS22/visudet.html#line-height> and
     /// <https://www.w3.org/TR/css-fonts-4/#unicode-range-desc>.
     pub(crate) fn resolved_inline_text_metrics(
         &mut self,
         style: &ComputedStyle,
-        shaped: Option<&ShapedInlineLine>,
     ) -> ResolvedInlineTextMetrics {
         let selected_font_id = self.resolve_metric_font_for_style(style);
         let content = self
             .content_extents_for_style_font(selected_font_id, style)
             .unwrap_or_else(|| FontRunVerticalExtents::from_points(style.font_size, 0.0));
-        let mut line = self.line_extents_for_style_font(selected_font_id, style, content);
-
-        if !style.line_height_is_normal() {
-            return ResolvedInlineTextMetrics { content, line };
-        }
-
-        let Some(shaped) = shaped else {
-            return ResolvedInlineTextMetrics { content, line };
-        };
-
-        // A preserved tab is a CSS layout advance, not a shaped font glyph.
-        // It must neither select a fallback font nor expand the normal
-        // line-height box.
-        // <https://drafts.csswg.org/css-text-3/#tab-size-property>
-        for run in shaped.runs.iter().filter(|run| {
-            run.font_id.is_some() && run.text.chars().any(|character| character != '\t')
-        }) {
-            let Some(run_content) = self.content_extents_for_font(run.font_id, run.font_size)
-            else {
-                continue;
-            };
-            let run_line =
-                self.normal_line_extents_for_font(run.font_id, run.font_size, run_content);
-            line = line.union(run_line);
-        }
-
-        // Parley's shaped runs normally retain the selected document font, but
-        // an `@font-face unicode-range` split can be flattened before its
-        // fallback run reaches this metric pass. Resolve the source characters
-        // through the CSS Fonts stack as well, so `line-height: normal`
-        // encloses every eligible face rather than only the first face in the
-        // family list.
-        // <https://www.w3.org/TR/css-fonts-4/#unicode-range-desc>
-        for character in shaped.text.chars().filter(|character| *character != '\t') {
-            let Some(font_id) = self.font_for_character(style, character) else {
-                continue;
-            };
-            let used_font_size = self
-                .font_size_adjusted_size_for_font_id(style, font_id)
-                .unwrap_or(style.font_size);
-            let Some(run_content) = self.content_extents_for_font(Some(font_id), used_font_size)
-            else {
-                continue;
-            };
-            line = line.union(self.normal_line_extents_for_font(
-                Some(font_id),
-                used_font_size,
-                run_content,
-            ));
-        }
+        let line = self.line_extents_for_style_font(selected_font_id, style, content);
 
         ResolvedInlineTextMetrics { content, line }
     }
@@ -230,16 +417,17 @@ impl FontSystem {
         let used_font_size = font_id
             .and_then(|font_id| self.font_size_adjusted_size_for_font_id(style, font_id))
             .unwrap_or(style.font_size);
-        self.content_extents_for_font(font_id, used_font_size)
+        let content_baseline_offset = self.content_baseline_offset_for_style(style).points();
+        self.content_extents_for_font(font_id, used_font_size, content_baseline_offset)
     }
 
     fn content_extents_for_font(
         &self,
         font_id: Option<usize>,
         font_size: f32,
+        content_baseline_offset: f32,
     ) -> Option<FontRunVerticalExtents> {
-        let font = font_id.and_then(|id| self.document_fonts.get(id))?;
-        let units_per_em = font.units_per_em.max(1) as f32;
+        font_id.and_then(|id| self.document_fonts.get(id))?;
         if !font_size.is_finite() || font_size < 0.0 {
             return None;
         }
@@ -250,7 +438,7 @@ impl FontSystem {
         // they instead determine `line-height: normal` separately below.
         // <https://www.w3.org/TR/CSS22/visudet.html#line-height>
         // <https://drafts.csswg.org/css-inline-3/#inline-height>
-        let above_baseline = font.layout_metrics.ascender as f32 * font_size / units_per_em;
+        let above_baseline = content_baseline_offset;
         let below_baseline = font_size - above_baseline;
         Some(FontRunVerticalExtents::from_points(
             above_baseline,
@@ -669,11 +857,490 @@ impl FontSystem {
     }
 }
 
+/// CSS Inline defines `middle` as x-middle except for upright typography,
+/// where alphabetic and x-height are not meaningful and `middle` uses the
+/// central baseline instead.
+/// <https://drafts.csswg.org/css-inline-3/#baseline-metrics>
+fn baseline_metric_for_typography(
+    metric: BaselineMetric,
+    policy: TextLayoutPolicy,
+) -> BaselineMetric {
+    if matches!(
+        (metric, policy),
+        (
+            BaselineMetric::Middle,
+            TextLayoutPolicy::Vertical(TextOrientation::Upright)
+        )
+    ) {
+        BaselineMetric::Central
+    } else {
+        metric
+    }
+}
+
 fn layout_to_program_ascent_delta(font: &DocumentFont, used_font_size: f32) -> f32 {
     let units_per_em = font.units_per_em.max(1) as f32;
     let layout_ascent = font.layout_metrics.ascender as f32 * used_font_size / units_per_em;
     let program_ascent = font.program_metrics.ascender as f32 * used_font_size / units_per_em;
     layout_ascent - program_ascent
+}
+
+fn baseline_tag_for_metric(metric: BaselineMetric) -> Option<&'static [u8; 4]> {
+    match metric {
+        BaselineMetric::Alphabetic => Some(b"romn"),
+        BaselineMetric::Ideographic => Some(b"ideo"),
+        // `central` has no OpenType BASE tag: it is derived from `idtp` and
+        // `ideo` in `baseline_offset_for_style`.
+        BaselineMetric::Central => None,
+        BaselineMetric::Mathematical => Some(b"math"),
+        BaselineMetric::Hanging => Some(b"hang"),
+        BaselineMetric::TextBottom | BaselineMetric::Middle | BaselineMetric::TextTop => None,
+    }
+}
+
+/// Derive CSS's ideographic-under and central baselines from OpenType's
+/// ideographic-over (`idtp`) and ideographic-under (`ideo`) coordinates.
+///
+/// These are OpenType Y coordinates, so ideographic-over is one em *above*
+/// ideographic-under. CSS Inline Appendix A defines central as their midpoint
+/// and permits the missing partner to be inferred one em away when a font
+/// exposes only one.
+fn derive_ideographic_design_coordinates(
+    ideographic_over: Option<f32>,
+    ideographic_under: Option<f32>,
+    em: f32,
+) -> (Option<f32>, Option<f32>) {
+    let central = match (ideographic_over, ideographic_under) {
+        (Some(over), Some(under)) => Some((over + under) / 2.0),
+        (Some(over), None) => Some(over - em / 2.0),
+        (None, Some(under)) => Some(under + em / 2.0),
+        (None, None) => None,
+    };
+    let ideographic_under = ideographic_under.or_else(|| ideographic_over.map(|over| over - em));
+    (central, ideographic_under)
+}
+
+/// Convert one BASE design-space coordinate into the CSS inline content area.
+/// Unlike Canvas's em-over/em-under metrics, CSS line layout remains anchored
+/// to the selected layout ascent.
+/// <https://drafts.csswg.org/css-inline-3/#calculating-em-over-and-em-under>
+fn css_content_baseline_offset(
+    content_over_coordinate: f32,
+    baseline_coordinate: f32,
+    used_font_size: f32,
+    units_per_em: f32,
+) -> f32 {
+    (content_over_coordinate - baseline_coordinate) * used_font_size / units_per_em
+}
+
+/// Select the OpenType `BASE` axis and script matching CSS typography. A
+/// language's script selects an exact BaseScript record; only when that record
+/// is absent do we use the font's `DFLT` script record.
+fn baseline_coordinate_for_style(
+    font: &DocumentFont,
+    style: &ComputedStyle,
+    tag: [u8; 4],
+) -> Option<crate::document::OpenTypeBaselineCoordinate> {
+    let axis = baseline_axis_for_policy(&font.baselines, style.text_layout_policy());
+    let preferred = style
+        .font_language_override
+        .opentype_tag()
+        .and_then(opentype_script_for_language_override)
+        .or_else(|| opentype_script_for_language(style.language.as_deref()));
+    let script = select_baseline_script(axis, preferred)?;
+    script
+        .coordinates
+        .iter()
+        .find_map(|(candidate, coordinate)| (*candidate == tag).then_some(*coordinate))
+}
+
+/// Pick the BASE table axis for CSS's typographic mode. Sideways text uses
+/// the horizontal table; mixed and upright vertical typography use the
+/// vertical table.
+fn baseline_axis_for_policy(
+    baselines: &crate::document::OpenTypeBaselineTable,
+    policy: TextLayoutPolicy,
+) -> &crate::document::OpenTypeBaselineAxis {
+    match policy {
+        TextLayoutPolicy::Vertical(TextOrientation::Mixed | TextOrientation::Upright) => {
+            &baselines.vertical
+        }
+        TextLayoutPolicy::Horizontal
+        | TextLayoutPolicy::Vertical(TextOrientation::Sideways)
+        | TextLayoutPolicy::Sideways(_) => &baselines.horizontal,
+    }
+}
+
+fn select_baseline_script(
+    axis: &crate::document::OpenTypeBaselineAxis,
+    preferred: Option<[u8; 4]>,
+) -> Option<&crate::document::OpenTypeBaselineScript> {
+    preferred
+        .and_then(|wanted| axis.scripts.iter().find(|script| script.script == wanted))
+        .or_else(|| axis.scripts.iter().find(|script| script.script == *b"DFLT"))
+}
+
+/// BCP 47 language-to-OpenType script selection for the scripts whose BASE
+/// tables commonly differ. Script subtags take precedence; a primary-language
+/// fallback is used only when no script subtag is declared.
+fn opentype_script_for_language(language: Option<&str>) -> Option<[u8; 4]> {
+    let language = language?.replace('_', "-");
+    let mut parts = language.split('-');
+    let primary = parts.next()?.to_ascii_lowercase();
+    if let Some(script) = parts.find(|part| part.len() == 4) {
+        return Some(match script.to_ascii_lowercase().as_str() {
+            "latn" => *b"latn",
+            "cyrl" => *b"cyrl",
+            "grek" => *b"grek",
+            "arab" => *b"arab",
+            "hebr" => *b"hebr",
+            "deva" => *b"dev2",
+            "beng" => *b"bng2",
+            "guru" => *b"gur2",
+            "gujr" => *b"gjr2",
+            "orya" => *b"ory2",
+            "mlym" => *b"mlm2",
+            "telu" => *b"tel2",
+            "knda" => *b"knd2",
+            "tibt" => *b"tibt",
+            "hani" | "hans" | "hant" => *b"hani",
+            "hang" => *b"hang",
+            "kana" => *b"kana",
+            "thai" => *b"thai",
+            _ => return None,
+        });
+    }
+    Some(match primary.as_str() {
+        "ja" => *b"kana",
+        "ko" => *b"hang",
+        "zh" => *b"hani",
+        "ar" | "fa" | "ur" => *b"arab",
+        "he" | "yi" => *b"hebr",
+        "hi" | "mr" | "ne" => *b"dev2",
+        "bn" => *b"bng2",
+        "pa" => *b"gur2",
+        "gu" => *b"gjr2",
+        "or" => *b"ory2",
+        "ml" => *b"mlm2",
+        "te" => *b"tel2",
+        "kn" => *b"knd2",
+        "bo" | "dz" => *b"tibt",
+        "th" => *b"thai",
+        "ru" | "uk" | "bg" | "sr" => *b"cyrl",
+        "el" => *b"grek",
+        _ => *b"latn",
+    })
+}
+
+/// OpenType language-system overrides replace shaping's language system. BASE
+/// values are script-specific rather than language-system-specific, but the
+/// override still provides the best script hint when the element has no BCP 47
+/// language. Keep this conversion at the baseline-table selection boundary so
+/// shaping and baseline choice consume the same CSS inputs.
+/// <https://drafts.csswg.org/css-fonts-4/#font-language-override-prop>
+/// <https://learn.microsoft.com/en-us/typography/opentype/spec/base#basescript-table>
+fn opentype_script_for_language_override(tag: [u8; 4]) -> Option<[u8; 4]> {
+    Some(match &tag {
+        b"JAN " | b"JPN " => *b"kana",
+        b"KOR " => *b"hang",
+        b"ZHS " | b"ZHT " | b"CHN " => *b"hani",
+        b"ARA " | b"FAR " | b"URD " => *b"arab",
+        b"IWR " | b"YID " => *b"hebr",
+        b"HIN " | b"MAR " | b"NEP " => *b"dev2",
+        b"RUS " | b"SRB " | b"UKR " => *b"cyrl",
+        b"ELL " => *b"grek",
+        b"THA " => *b"thai",
+        // Common OpenType Latin language-system tags. Keep this list
+        // deliberately explicit: an unknown raw tag must still fall through
+        // to the document language instead of being guessed as Latin.
+        b"DEU " | b"ENG " | b"ENU " | b"ESP " | b"FRA " | b"ITA " | b"NLD " | b"NOR " | b"PTB "
+        | b"PTG " | b"SVE " | b"TRK " => *b"latn",
+        // An unknown OpenType language-system tag does not establish a
+        // script. Let the element language select BASE in that case instead
+        // of incorrectly treating, for example, an unrecognized Arabic or
+        // Indic language system as Latin.
+        _ => return None,
+    })
+}
+
+/// CSS Inline Appendix A synthesis when the selected baseline table does not
+/// define a requested metric. Values are positions from the content area's
+/// block-start edge, not arbitrary box midpoints.
+/// <https://drafts.csswg.org/css-inline-3/#baseline-synthesis>
+fn synthesized_baseline_offset(
+    metric: BaselineMetric,
+    alphabetic: f32,
+    em: f32,
+    x_height: f32,
+) -> f32 {
+    match metric {
+        BaselineMetric::TextTop => 0.0,
+        BaselineMetric::TextBottom => em,
+        BaselineMetric::Alphabetic => alphabetic,
+        BaselineMetric::Middle => alphabetic - x_height / 2.0,
+        BaselineMetric::Central => em / 2.0,
+        // In the absence of a BASE value, Appendix A places the hanging and
+        // mathematical baselines from the text-edge/font-metric fallbacks.
+        BaselineMetric::Hanging => alphabetic - em * 0.6,
+        BaselineMetric::Ideographic => em,
+        BaselineMetric::Mathematical => alphabetic - x_height / 2.0,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod baseline_tests {
+    use super::*;
+    use crate::css::{ContentLanguage, FontLanguageOverride, SidewaysOrientation};
+
+    #[test]
+    fn baseline_synthesis_uses_font_metric_relationships() {
+        assert_eq!(
+            synthesized_baseline_offset(BaselineMetric::Alphabetic, 8.0, 10.0, 5.0),
+            8.0
+        );
+        assert_eq!(
+            synthesized_baseline_offset(BaselineMetric::Middle, 8.0, 10.0, 5.0),
+            5.5
+        );
+        assert_eq!(
+            synthesized_baseline_offset(BaselineMetric::Central, 8.0, 10.0, 5.0),
+            5.0
+        );
+        assert_eq!(
+            synthesized_baseline_offset(BaselineMetric::TextTop, 8.0, 10.0, 5.0),
+            0.0
+        );
+        assert_eq!(
+            synthesized_baseline_offset(BaselineMetric::TextBottom, 8.0, 10.0, 5.0),
+            10.0
+        );
+    }
+
+    #[test]
+    fn declared_script_subtag_precedes_primary_language_fallback() {
+        assert_eq!(
+            opentype_script_for_language(Some("zh-Hant-TW")),
+            Some(*b"hani")
+        );
+        assert_eq!(
+            opentype_script_for_language(Some("sr-Cyrl")),
+            Some(*b"cyrl")
+        );
+        assert_eq!(opentype_script_for_language(Some("ja")), Some(*b"kana"));
+        assert_eq!(opentype_script_for_language(Some("en")), Some(*b"latn"));
+        assert_eq!(
+            opentype_script_for_language(Some("bn-Beng")),
+            Some(*b"bng2")
+        );
+    }
+
+    #[test]
+    fn language_override_supplies_a_script_hint_without_a_document_language() {
+        assert_eq!(
+            opentype_script_for_language_override(*b"JAN "),
+            Some(*b"kana")
+        );
+        assert_eq!(
+            opentype_script_for_language_override(*b"ZHS "),
+            Some(*b"hani")
+        );
+        assert_eq!(
+            opentype_script_for_language_override(*b"DEU "),
+            Some(*b"latn")
+        );
+        assert_eq!(opentype_script_for_language_override(*b"XXX "), None);
+    }
+
+    #[test]
+    fn language_override_replaces_the_content_language_script_hint() {
+        let mut style = ComputedStyle::initial();
+        style.language = ContentLanguage::from_html_attribute("ja");
+        style.font_language_override = FontLanguageOverride::OpenType(*b"RUS ");
+        let axis = crate::document::OpenTypeBaselineAxis {
+            scripts: vec![
+                crate::document::OpenTypeBaselineScript {
+                    script: *b"kana",
+                    default_baseline: None,
+                    coordinates: Vec::new(),
+                },
+                crate::document::OpenTypeBaselineScript {
+                    script: *b"cyrl",
+                    default_baseline: None,
+                    coordinates: Vec::new(),
+                },
+            ],
+        };
+        let preferred = style
+            .font_language_override
+            .opentype_tag()
+            .and_then(opentype_script_for_language_override)
+            .or_else(|| opentype_script_for_language(style.language.as_deref()));
+        assert_eq!(
+            select_baseline_script(&axis, preferred).unwrap().script,
+            *b"cyrl"
+        );
+
+        style.font_language_override = FontLanguageOverride::OpenType(*b"XXX ");
+        let preferred = style
+            .font_language_override
+            .opentype_tag()
+            .and_then(opentype_script_for_language_override)
+            .or_else(|| opentype_script_for_language(style.language.as_deref()));
+        assert_eq!(
+            select_baseline_script(&axis, preferred).unwrap().script,
+            *b"kana"
+        );
+    }
+
+    #[test]
+    fn css_metrics_map_to_their_opentype_base_tags() {
+        assert_eq!(
+            baseline_tag_for_metric(BaselineMetric::Alphabetic),
+            Some(b"romn")
+        );
+        assert_eq!(
+            baseline_tag_for_metric(BaselineMetric::Ideographic),
+            Some(b"ideo")
+        );
+        assert_eq!(baseline_tag_for_metric(BaselineMetric::Central), None);
+        assert_eq!(
+            baseline_tag_for_metric(BaselineMetric::Mathematical),
+            Some(b"math")
+        );
+        assert_eq!(
+            baseline_tag_for_metric(BaselineMetric::Hanging),
+            Some(b"hang")
+        );
+    }
+
+    #[test]
+    fn central_and_ideographic_fallbacks_follow_appendix_a_relationships() {
+        // In OpenType's upward design coordinates, central is half an em
+        // below ideographic-over and ideographic-under is a full em below.
+        assert_eq!(
+            derive_ideographic_design_coordinates(Some(12.0), None, 10.0),
+            (Some(7.0), Some(2.0))
+        );
+        assert_eq!(
+            derive_ideographic_design_coordinates(Some(12.0), Some(2.0), 10.0),
+            (Some(7.0), Some(2.0))
+        );
+        // The suggested hanging fallback is .6em above alphabetic.
+        assert_eq!(
+            synthesized_baseline_offset(BaselineMetric::Hanging, 8.0, 10.0, 5.0),
+            2.0
+        );
+    }
+
+    #[test]
+    fn css_baseline_coordinates_remain_anchored_at_the_layout_ascent() {
+        // BaselineDiagnostic's ascender is 800 and alphabetic BASE coordinate
+        // is 50. Its central baseline is 350, but Appendix A's em-over value
+        // (850) is a Canvas metric and must not move this CSS baseline.
+        assert_eq!(
+            css_content_baseline_offset(800.0, 50.0, 240.0, 1000.0),
+            180.0
+        );
+        assert_eq!(
+            css_content_baseline_offset(800.0, 650.0, 240.0, 1000.0),
+            36.0
+        );
+    }
+
+    #[test]
+    fn baseline_axis_follows_the_css_typographic_mode() {
+        let table = crate::document::OpenTypeBaselineTable {
+            horizontal: crate::document::OpenTypeBaselineAxis {
+                scripts: vec![crate::document::OpenTypeBaselineScript {
+                    script: *b"hori",
+                    default_baseline: None,
+                    coordinates: Vec::new(),
+                }],
+            },
+            vertical: crate::document::OpenTypeBaselineAxis {
+                scripts: vec![crate::document::OpenTypeBaselineScript {
+                    script: *b"vert",
+                    default_baseline: None,
+                    coordinates: Vec::new(),
+                }],
+            },
+        };
+        assert_eq!(
+            baseline_axis_for_policy(&table, TextLayoutPolicy::Horizontal).scripts[0].script,
+            *b"hori"
+        );
+        assert_eq!(
+            baseline_axis_for_policy(
+                &table,
+                TextLayoutPolicy::Sideways(SidewaysOrientation::Right)
+            )
+            .scripts[0]
+                .script,
+            *b"hori"
+        );
+        assert_eq!(
+            baseline_axis_for_policy(
+                &table,
+                TextLayoutPolicy::Vertical(TextOrientation::Sideways)
+            )
+            .scripts[0]
+                .script,
+            *b"hori"
+        );
+        assert_eq!(
+            baseline_axis_for_policy(&table, TextLayoutPolicy::Vertical(TextOrientation::Mixed))
+                .scripts[0]
+                .script,
+            *b"vert"
+        );
+    }
+
+    #[test]
+    fn middle_uses_central_only_for_upright_typography() {
+        assert_eq!(
+            baseline_metric_for_typography(BaselineMetric::Middle, TextLayoutPolicy::Horizontal),
+            BaselineMetric::Middle
+        );
+        assert_eq!(
+            baseline_metric_for_typography(
+                BaselineMetric::Middle,
+                TextLayoutPolicy::Vertical(TextOrientation::Mixed)
+            ),
+            BaselineMetric::Middle
+        );
+        assert_eq!(
+            baseline_metric_for_typography(
+                BaselineMetric::Middle,
+                TextLayoutPolicy::Vertical(TextOrientation::Upright)
+            ),
+            BaselineMetric::Central
+        );
+    }
+
+    #[test]
+    fn script_selection_uses_only_the_matching_or_default_record() {
+        let dflt = crate::document::OpenTypeBaselineScript {
+            script: *b"DFLT",
+            default_baseline: None,
+            coordinates: Vec::new(),
+        };
+        let latn = crate::document::OpenTypeBaselineScript {
+            script: *b"latn",
+            default_baseline: None,
+            coordinates: Vec::new(),
+        };
+        let axis = crate::document::OpenTypeBaselineAxis {
+            scripts: vec![dflt.clone(), latn.clone()],
+        };
+        assert_eq!(select_baseline_script(&axis, Some(*b"latn")), Some(&latn));
+        assert_eq!(select_baseline_script(&axis, Some(*b"hani")), Some(&dflt));
+
+        let no_default = crate::document::OpenTypeBaselineAxis {
+            scripts: vec![latn],
+        };
+        assert_eq!(select_baseline_script(&no_default, Some(*b"hani")), None);
+    }
 }
 
 pub(in crate::text) fn font_feature_family(font_family: &FontFamily) -> Option<String> {
@@ -691,10 +1358,10 @@ pub(in crate::text) fn font_feature_family(font_family: &FontFamily) -> Option<S
     }
 }
 
-pub(in crate::text) fn style_for_text_range<'a>(
-    ranges: &[(Range<usize>, &'a ComputedStyle)],
+pub(in crate::text) fn style_for_text_range<'a, T>(
+    ranges: &[(Range<usize>, &'a T)],
     run_range: Range<usize>,
-) -> Option<&'a ComputedStyle> {
+) -> Option<&'a T> {
     ranges
         .iter()
         .find(|(range, _)| {

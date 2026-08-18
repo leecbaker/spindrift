@@ -1,6 +1,13 @@
 use super::font_loading::post_script_name_for_face;
 use super::*;
-use crate::document::{CssFontVerticalMetrics, DocumentFontSynthesis, OpenTypeVerticalMetrics};
+use crate::document::{
+    CssFontVerticalMetrics, DocumentFontSynthesis, OpenTypeBaselineAxis,
+    OpenTypeBaselineCoordinate, OpenTypeBaselineScript, OpenTypeBaselineTable,
+    OpenTypeVariationIndex, OpenTypeVerticalMetrics,
+};
+use read_fonts::tables::base::BaseCoord;
+use read_fonts::tables::layout::DeviceOrVariationIndex;
+use read_fonts::{FontRef, TableProvider};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FontSupportKind {
@@ -18,6 +25,7 @@ struct DocumentFontMetadata {
     cap_height: i16,
     italic_angle: i16,
     bbox: [i16; 4],
+    baselines: OpenTypeBaselineTable,
     size_adjust: Option<f32>,
     synthesis: DocumentFontSynthesis,
 }
@@ -114,7 +122,7 @@ impl DocumentFontRegistry {
             .any(|metadata| metadata.family.eq_ignore_ascii_case(family))
     }
 
-    pub(super) fn selected_face_variations(&self, font_id: usize) -> Option<FontVariationSettings> {
+    pub(crate) fn selected_face_variations(&self, font_id: usize) -> Option<FontVariationSettings> {
         let font = self.get(font_id)?;
         Some(
             self.metadata_for_document_font(font)?
@@ -318,22 +326,24 @@ impl DocumentFontRegistry {
             return FontSupportKind::EmbeddableText;
         };
 
-        let visible_glyphs = text
+        let mut has_visible_glyph = false;
+        let mut has_text_outline = false;
+        for glyph in text
             .chars()
             .filter(|character| !character_is_default_ignorable_code_point(*character))
             .filter_map(|character| face.glyph_index(character))
-            .collect::<Vec<_>>();
-        if visible_glyphs.is_empty() {
-            return FontSupportKind::EmbeddableText;
+        {
+            has_visible_glyph = true;
+            has_text_outline |= face.glyph_bounding_box(glyph).is_some();
+            if face.is_color_glyph(glyph) {
+                return FontSupportKind::ColorOrEmojiOnlyFallback;
+            }
         }
 
-        let has_text_outline = visible_glyphs
-            .iter()
-            .any(|glyph| face.glyph_bounding_box(*glyph).is_some());
-        let has_color_glyph = visible_glyphs
-            .iter()
-            .any(|glyph| face.is_color_glyph(*glyph));
-        if !has_text_outline || has_color_glyph || font_label_looks_emoji(font) {
+        if !has_visible_glyph {
+            return FontSupportKind::EmbeddableText;
+        }
+        if !has_text_outline || font_label_looks_emoji(font) {
             FontSupportKind::ColorOrEmojiOnlyFallback
         } else {
             FontSupportKind::EmbeddableText
@@ -385,6 +395,7 @@ impl DocumentFontRegistry {
             cap_height: metadata.cap_height,
             italic_angle: metadata.italic_angle,
             bbox: metadata.bbox,
+            baselines: metadata.baselines,
             synthesis: metadata.synthesis,
         });
         if let Some(size_adjust) = metadata.size_adjust {
@@ -450,11 +461,105 @@ fn document_font_metadata(
         cap_height: face.capital_height().unwrap_or_else(|| face.ascender()),
         italic_angle: face.italic_angle().round() as i16,
         bbox,
+        baselines: baseline_table_for_font(data, face_index),
         size_adjust,
         synthesis: DocumentFontSynthesis {
             embolden: synthesize_bold,
         },
     })
+}
+
+/// Extract immutable design-unit baseline information from OpenType `BASE`.
+///
+/// CSS Inline defines font baseline tables independently for horizontal and
+/// vertical typography, while OpenType stores those axes in the corresponding
+/// `BASE` Axis tables. Format 2 device corrections are deliberately not
+/// retained: PDF layout is resolution-independent and unhinted. Format 3
+/// variation indices are retained for resolution at the exact CSS variation
+/// instance during layout.
+/// <https://drafts.csswg.org/css-inline-3/#baseline-tables>
+/// <https://learn.microsoft.com/en-us/typography/opentype/spec/base>
+fn baseline_table_for_font(data: &[u8], face_index: u32) -> OpenTypeBaselineTable {
+    let Ok(font) = FontRef::from_index(data, face_index) else {
+        return OpenTypeBaselineTable::default();
+    };
+    let Ok(base) = font.base() else {
+        return OpenTypeBaselineTable::default();
+    };
+    OpenTypeBaselineTable {
+        horizontal: base
+            .horiz_axis()
+            .and_then(Result::ok)
+            .map(parse_baseline_axis)
+            .unwrap_or_default(),
+        vertical: base
+            .vert_axis()
+            .and_then(Result::ok)
+            .map(parse_baseline_axis)
+            .unwrap_or_default(),
+    }
+}
+
+fn parse_baseline_axis(axis: read_fonts::tables::base::Axis<'_>) -> OpenTypeBaselineAxis {
+    let Some(Ok(tag_list)) = axis.base_tag_list() else {
+        return OpenTypeBaselineAxis::default();
+    };
+    let Ok(script_list) = axis.base_script_list() else {
+        return OpenTypeBaselineAxis::default();
+    };
+    let baseline_tags: Vec<_> = tag_list
+        .baseline_tags()
+        .iter()
+        .map(|tag| tag.get().to_be_bytes())
+        .collect();
+    let mut scripts = Vec::new();
+    for record in script_list.base_script_records() {
+        let Ok(script) = record.base_script(script_list.offset_data()) else {
+            continue;
+        };
+        let Some(Ok(values)) = script.base_values() else {
+            continue;
+        };
+        let coordinates = values.base_coords();
+        let mut parsed_coordinates = Vec::new();
+        for (index, tag) in baseline_tags.iter().enumerate() {
+            let Ok(coord) = coordinates.get(index) else {
+                continue;
+            };
+            parsed_coordinates.push((*tag, parse_baseline_coordinate(coord)));
+        }
+        let default_baseline = baseline_tags
+            .get(usize::from(values.default_baseline_index()))
+            .copied();
+        scripts.push(OpenTypeBaselineScript {
+            script: record.base_script_tag().to_be_bytes(),
+            default_baseline,
+            coordinates: parsed_coordinates,
+        });
+    }
+    OpenTypeBaselineAxis { scripts }
+}
+
+fn parse_baseline_coordinate(coord: BaseCoord<'_>) -> OpenTypeBaselineCoordinate {
+    let variation_index = match coord {
+        BaseCoord::Format3(ref format) => {
+            format
+                .device()
+                .and_then(Result::ok)
+                .and_then(|device| match device {
+                    DeviceOrVariationIndex::VariationIndex(index) => Some(OpenTypeVariationIndex {
+                        outer: index.delta_set_outer_index(),
+                        inner: index.delta_set_inner_index(),
+                    }),
+                    DeviceOrVariationIndex::Device(_) => None,
+                })
+        }
+        BaseCoord::Format1(_) | BaseCoord::Format2(_) => None,
+    };
+    OpenTypeBaselineCoordinate {
+        design_units: coord.coordinate(),
+        variation_index,
+    }
 }
 
 fn apply_metric_overrides(metadata: &mut DocumentFontMetadata, face: &RegisteredFontFaceMetadata) {
@@ -474,6 +579,113 @@ fn metric_override_units(value: u32, units_per_em: f32) -> i16 {
     (f32::from_bits(value) * units_per_em)
         .round()
         .clamp(0.0, i16::MAX as f32) as i16
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod baseline_table_tests {
+    use super::*;
+    use read_fonts::tables::variations::{DeltaSetIndex, ItemVariationStore};
+    use read_fonts::types::F2Dot14;
+    use read_fonts::{FontData, FontRead};
+
+    #[test]
+    fn base_coord_formats_retain_design_coordinates_and_only_format_three_variations() {
+        let format_1 = BaseCoord::read(FontData::new(&[0, 1, 0, 50])).unwrap();
+        let format_2 = BaseCoord::read(FontData::new(&[0, 2, 0, 50, 0, 1, 0, 0])).unwrap();
+        // Format 3's device offset resolves a VariationIndex with outer=1 and
+        // inner=2. The delta-format high bit distinguishes it from a device
+        // table. Device corrections in format 2 deliberately remain unused.
+        let format_3 =
+            BaseCoord::read(FontData::new(&[0, 3, 0, 50, 0, 6, 0, 1, 0, 2, 0x80, 0])).unwrap();
+
+        assert_eq!(
+            parse_baseline_coordinate(format_1),
+            OpenTypeBaselineCoordinate {
+                design_units: 50,
+                variation_index: None,
+            }
+        );
+        assert_eq!(
+            parse_baseline_coordinate(format_2),
+            OpenTypeBaselineCoordinate {
+                design_units: 50,
+                variation_index: None,
+            }
+        );
+        assert_eq!(
+            parse_baseline_coordinate(format_3),
+            OpenTypeBaselineCoordinate {
+                design_units: 50,
+                variation_index: Some(OpenTypeVariationIndex { outer: 1, inner: 2 }),
+            }
+        );
+    }
+
+    #[test]
+    fn base_axis_preserves_script_default_and_tagged_coordinates() {
+        // Axis → BaseTagList(`romn`, `hang`) → BaseScriptList(`DFLT`) →
+        // BaseValues. This is intentionally a table-local fixture: it keeps
+        // parser coverage in the repository without depending on a host font.
+        let bytes = [
+            0, 4, 0, 14, // Axis offsets
+            0, 2, b'r', b'o', b'm', b'n', b'h', b'a', b'n', b'g', // BaseTagList
+            0, 1, b'D', b'F', b'L', b'T', 0, 8, // BaseScriptList
+            0, 6, 0, 0, 0, 0, // BaseScript
+            0, 0, 0, 2, 0, 8, 0, 12, // BaseValues
+            0, 1, 0, 50, // `romn` BaseCoord format 1
+            0, 2, 2, 138, 0, 1, 0, 0, // `hang` BaseCoord format 2
+        ];
+        let axis = read_fonts::tables::base::Axis::read(FontData::new(&bytes)).unwrap();
+
+        assert_eq!(
+            parse_baseline_axis(axis),
+            OpenTypeBaselineAxis {
+                scripts: vec![OpenTypeBaselineScript {
+                    script: *b"DFLT",
+                    default_baseline: Some(*b"romn"),
+                    coordinates: vec![
+                        (
+                            *b"romn",
+                            OpenTypeBaselineCoordinate {
+                                design_units: 50,
+                                variation_index: None,
+                            },
+                        ),
+                        (
+                            *b"hang",
+                            OpenTypeBaselineCoordinate {
+                                design_units: 650,
+                                variation_index: None,
+                            },
+                        ),
+                    ],
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn format_three_variation_index_selects_the_normalized_instance_delta() {
+        // A one-axis ItemVariationStore: its only region rises from zero to
+        // one and contributes +50 design units at normalized coordinate 1.
+        // This is the delta store addressed by the Format 3 coordinate above.
+        let store = ItemVariationStore::read(FontData::new(&[
+            0, 1, // format
+            0, 0, 0, 12, // VariationRegionList offset
+            0, 1, // ItemVariationData count
+            0, 0, 0, 22, // ItemVariationData offset
+            0, 1, 0, 1, // one axis, one region
+            0, 0, 0x40, 0, 0x40, 0, // start=0, peak=1, end=1
+            0, 1, 0, 1, 0, 1, // one item, one word delta, one region
+            0, 0, // region index
+            0, 50, // delta set 0
+        ]))
+        .unwrap();
+        let delta = DeltaSetIndex { outer: 0, inner: 0 };
+        assert_eq!(store.compute_delta(delta, &[F2Dot14::ZERO]).unwrap(), 0);
+        assert_eq!(store.compute_delta(delta, &[F2Dot14::ONE]).unwrap(), 50);
+    }
 }
 
 fn font_label_looks_emoji(font: &DocumentFont) -> bool {

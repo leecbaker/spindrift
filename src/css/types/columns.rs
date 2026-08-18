@@ -1,4 +1,7 @@
-use super::{ComputedLengthPercentage, ResolveViewportLengths, ViewportLengthBasis};
+use super::{
+    ComputedLengthPercentage, ResolveViewportLengths, RootFontMetricLengthBasis,
+    ViewportLengthBasis,
+};
 use crate::units::LayoutLength;
 use std::num::NonZeroUsize;
 
@@ -10,12 +13,26 @@ pub(crate) enum ColumnCount {
     Count(NonZeroUsize),
 }
 
-/// Computed CSS Flexbox Level 2 `flex-line-count`.
+/// Computed CSS Flexbox Level 2 author-requested minimum number of lines in a
+/// balanced flex container.
+///
+/// The initial and computed value are both `1`; unlike column count, this is
+/// not an `auto` value. Keeping the CSS lower bound non-zero makes it
+/// impossible for later balance planning to manufacture an empty line.
 /// <https://drafts.csswg.org/css-flexbox-2/#flex-line-count-property>
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FlexLineCount {
-    Auto,
-    Count(NonZeroUsize),
+pub(crate) struct FlexLineCount(NonZeroUsize);
+
+impl FlexLineCount {
+    pub(crate) const ONE: Self = Self(NonZeroUsize::MIN);
+
+    pub(crate) const fn get(self) -> usize {
+        self.0.get()
+    }
+
+    pub(crate) const fn new(count: NonZeroUsize) -> Self {
+        Self(count)
+    }
 }
 
 /// Computed CSS value for `column-width`.
@@ -46,6 +63,16 @@ impl ComputedColumnWidth {
         if let Self::Length(length) = self {
             length.resolve_font_metric_lengths(ch_advance);
         }
+    }
+
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        if let Self::Length(length) = self {
+            length.resolve_root_font_metric_lengths(basis);
+        }
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        matches!(self, Self::Length(length) if length.requires_root_font_metrics())
     }
 
     pub(crate) fn requires_ch_advance(&self) -> bool {
@@ -81,6 +108,16 @@ impl ComputedColumnHeight {
         if let Self::Length(length) = self {
             length.resolve_font_metric_lengths(ch_advance);
         }
+    }
+
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        if let Self::Length(length) = self {
+            length.resolve_root_font_metric_lengths(basis);
+        }
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        matches!(self, Self::Length(length) if length.requires_root_font_metrics())
     }
 
     pub(crate) fn requires_ch_advance(&self) -> bool {

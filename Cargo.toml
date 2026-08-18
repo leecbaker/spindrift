@@ -27,6 +27,9 @@ strip = false
 lto = false #"thin"
 split-debuginfo = "packed"
 
+[profile.test]
+opt-level = 1
+
 [dependencies]
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
@@ -57,11 +60,12 @@ markup5ever_rcdom = "0.39.0"
 miniz_oxide = "0.8.9"
 parley = "0.11"
 pdf-writer = "0.15"
+png = "0.18.1"
 precomputed-hash = "0.1.1"
 read-fonts = "0.40.2"
 sha2 = "0.10"
 selectors = "0.40"
-taffy = "0.12"
+taffy = "0.13"
 thiserror = "2"
 tiny-skia-path = "0.12"
 # `sync` is supported on every Quire target. Runtime and filesystem support
@@ -71,8 +75,9 @@ tokio = { version = "1.52", default-features = false, features = ["sync"] }
 ttf-parser = "0.25"
 unicode-bidi = "0.3.18"
 url = "2"
-usvg = { version = "0.47", default-features = false }
-woff2-patched = "0.4"
+usvg = { version = "0.48", default-features = false }
+wuff = { version = "0.2.8", default-features = false, features = ["z", "brotli"] }
+kamadak-exif = "0.6.1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }

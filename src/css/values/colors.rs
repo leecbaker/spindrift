@@ -6,6 +6,39 @@ use palette::{
     white_point::{D50, D65},
 };
 
+/// Whether a parsed CSS color value contains the `currentcolor` keyword.
+///
+/// This deliberately walks CSS component values rather than searching source
+/// text, so comments, strings, escapes, and nested color functions retain
+/// their CSS Syntax meaning.
+pub(crate) fn color_depends_on_currentcolor(value: &str) -> bool {
+    fn contains_currentcolor(parser: &mut cssparser::Parser<'_, '_>) -> bool {
+        let mut found = false;
+        while let Ok(token) = parser.next_including_whitespace_and_comments() {
+            let token = token.clone();
+            match token {
+                cssparser::Token::Ident(ident) if ident.eq_ignore_ascii_case("currentcolor") => {
+                    found = true;
+                }
+                cssparser::Token::Function(_)
+                | cssparser::Token::ParenthesisBlock
+                | cssparser::Token::SquareBracketBlock
+                | cssparser::Token::CurlyBracketBlock => {
+                    let _ = parser.parse_nested_block(|nested| {
+                        found |= contains_currentcolor(nested);
+                        Ok::<_, cssparser::ParseError<'_, ()>>(())
+                    });
+                }
+                _ => {}
+            }
+        }
+        found
+    }
+
+    let mut input = cssparser::ParserInput::new(value);
+    contains_currentcolor(&mut cssparser::Parser::new(&mut input))
+}
+
 pub(crate) fn parse_color(value: &str) -> Option<CssColor> {
     let value = normalize_css_comments(trim_css_value(value));
     let value = value.trim();
@@ -1939,6 +1972,26 @@ mod color_space_tests {
             ),
             Some(CssColor::rgba(1, 2, 3, 1.0))
         );
+    }
+
+    #[test]
+    fn currentcolor_provenance_walks_nested_color_component_values() {
+        for value in [
+            "currentcolor",
+            "color-mix(in srgb, currentcolor 50%, red)",
+            "contrast-color(currentcolor vs white, black)",
+            "rgb(from currentcolor r g b)",
+        ] {
+            assert!(color_depends_on_currentcolor(value), "{value}");
+        }
+        for value in [
+            "red",
+            "rgb(1 2 3)",
+            "\"currentcolor\"",
+            "/* currentcolor */ blue",
+        ] {
+            assert!(!color_depends_on_currentcolor(value), "{value}");
+        }
     }
 
     #[test]

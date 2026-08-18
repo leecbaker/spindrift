@@ -14,9 +14,7 @@ pub(crate) fn html5_user_agent_stylesheet() -> &'static Stylesheet {
         // Keep this parsed as a real UA-origin stylesheet so author rules
         // cascade over it instead of mirroring tag defaults in layout code.
         // https://html.spec.whatwg.org/multipage/rendering.html
-        let mut stylesheet = parse_stylesheet(&Css::from_string(HTML5_UA_CSS));
-        stylesheet.origin = StylesheetOrigin::UserAgent;
-        stylesheet
+        parse_stylesheet(&Css::from_string(HTML5_UA_CSS).with_user_agent_origin())
     })
 }
 

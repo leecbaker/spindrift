@@ -1,5 +1,5 @@
 use super::*;
-use crate::layout::block::percentage_height_is_auto_for_margin_collapse;
+use crate::layout::block::height_behaves_as_auto_for_margin_collapse;
 
 /// The first row baseline exported by an inline table together with the
 /// selected cell font's paint-coordinate adjustment.
@@ -197,13 +197,13 @@ impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout::table) fn distribute_table_height_plan(
         &self,
         rows: &mut [TableRowHeightPlan],
-        target_content_height: Option<ContentBoxLength>,
+        target: TableHeightDistributionTarget,
         table_metrics: TableMetrics,
     ) {
         for row in rows.iter_mut() {
             row.final_height = row.base;
         }
-        let Some(target_content_height) = target_content_height else {
+        let Some(target_content_height) = target.definite_content_height() else {
             for row in rows.iter_mut() {
                 row.final_height = row.reference;
             }
@@ -327,8 +327,7 @@ impl<'a> LayoutBuilder<'a> {
                     // layout below still formats and paints the descendants.
                     // <https://www.w3.org/TR/css-contain-1/#containment-size>
                     if used_property_containment(caption.element, &caption_style).size {
-                        let mut used_style =
-                            self.style_with_current_viewport_lengths(&caption_style);
+                        let mut used_style = caption_style.used_style().clone();
                         let metrics = apply_used_box_metrics(
                             &mut used_style,
                             PercentageBasis::definite(layout_pt(table_width.max(0.0))),
@@ -671,7 +670,7 @@ impl<'a> LayoutBuilder<'a> {
         );
         let text = table_cell_inline_text(cell);
         Some(PreparedTableCell {
-            style: style.as_computed().clone(),
+            style: style.used_style().clone(),
             row_sizing_style,
             area,
             inline_bounds,
@@ -784,7 +783,7 @@ impl<'a> LayoutBuilder<'a> {
         cell: &TableCell<'_>,
         cell_style: &ComputedStyle,
         stylesheets: &Stylesheets<'_>,
-        cell_width: f32,
+        content_box: TableCellContentBox,
         border_insets: css::Edges,
         first_pass: TableCellLayoutMetrics,
         content_pass: TableCellContentPass,
@@ -795,12 +794,11 @@ impl<'a> LayoutBuilder<'a> {
         let percentage_height_basis = final_basis.percentage_basis();
 
         self.with_positioned_layout_suppressed(|layout| {
-            let available_width = (cell_width
-                - cell_style.padding.left
-                - cell_style.padding.right
-                - border_insets.left
-                - border_insets.right)
-                .max(0.0);
+            // This box was projected through the table root's writing mode
+            // before entering this physical measurement API. Its width is
+            // therefore the actual horizontal content measure, not a root
+            // logical inline track that happens to be named `width`.
+            let available_width = content_box.width();
             let text_height =
                 layout.table_cell_text_content_height(cell, cell_style, available_width);
             let inline_sequence_height = cell.children.as_deref().and_then(|children| {
@@ -1054,6 +1052,34 @@ impl<'a> LayoutBuilder<'a> {
         available_width: f32,
         percentage_height_basis: BlockSizePercentageBasis,
     ) -> Option<f32> {
+        if !percentage_height_basis.is_definite()
+            && children.iter().all(|child| {
+                matches!(
+                    child,
+                    box_tree::FormattingBox::AtomicInline(_) | box_tree::FormattingBox::Replaced(_)
+                )
+            })
+            && children
+                .iter()
+                .any(table_cell_formatting_child_has_parent_percentage_block_size)
+        {
+            // A direct atomic-only cell still forms an inline sequence, but
+            // CSS Tables measures each percentage-dependent atom as `auto`
+            // during row-minimum sizing. The general inline collector has no
+            // table-pass policy, so use the pass-aware atom measurement here
+            // before the final cell content height is committed.
+            // <https://drafts.csswg.org/css-tables-3/#row-layout>
+            return children
+                .iter()
+                .filter_map(|child| {
+                    self.table_cell_measured_inline_outer_height(
+                        child,
+                        stylesheets,
+                        available_width,
+                    )
+                })
+                .reduce(f32::max);
+        }
         self.table_cell_nested_inline_sequence_for_children(
             style,
             children,
@@ -1149,6 +1175,16 @@ impl<'a> LayoutBuilder<'a> {
                 available_width,
                 child,
             ),
+            box_tree::FormattingBox::AtomicInline(_) | box_tree::FormattingBox::Replaced(_) => {
+                // CSS Tables row minimum sizing treats percentage-dependent
+                // atomic and replaced content as auto. The inline helper owns
+                // that pass-specific measurement; using the durable outer
+                // height here would feed fallback replaced geometry back into
+                // the row plan before the cell has a committed height.
+                // <https://drafts.csswg.org/css-tables-3/#row-layout>
+                self.table_cell_measured_inline_outer_height(child, stylesheets, available_width)
+                    .unwrap_or_else(|| table_cell_formatting_child_outer_height(child).points())
+            }
             // An anonymous block is one contiguous inline run generated by
             // CSS 2.2's block-in-inline transformation. Measure its prepared
             // line sequence directly: recursively taking the maximum child
@@ -1322,12 +1358,12 @@ impl<'a> LayoutBuilder<'a> {
             PercentageBasis::definite(layout_pt(available_outer_width.max(0.0))),
         );
         let style = &used_style;
-        // An unresolved percentage height computes to `auto` for this
-        // self-collapsing predicate, even though the computed percentage is
-        // retained for the later table-cell relayout.
-        // <https://www.w3.org/TR/CSS22/visudet.html#the-height-property>
+        // The computed height remains necessary for final table-cell sizing,
+        // but CSS Sizing values that behave as `auto` use an auto proxy for
+        // this self-collapsing predicate.
+        // <https://drafts.csswg.org/css-sizing-3/#behave-auto>
         let mut margin_collapse_style = None;
-        if percentage_height_is_auto_for_margin_collapse(style, PercentageBasis::indefinite()) {
+        if height_behaves_as_auto_for_margin_collapse(style, PercentageBasis::indefinite()) {
             let mut style_for_margin_collapse = style.clone();
             style_for_margin_collapse
                 .box_values
@@ -1713,12 +1749,12 @@ impl<'a> LayoutBuilder<'a> {
             PercentageBasis::definite(layout_pt(available_outer_width.max(0.0))),
         );
         let style = &used_style;
-        // An unresolved percentage height computes to `auto` for this
-        // self-collapsing predicate, even though the computed percentage is
-        // retained for the later table-cell relayout.
-        // <https://www.w3.org/TR/CSS22/visudet.html#the-height-property>
+        // The computed height remains necessary for final table-cell sizing,
+        // but CSS Sizing values that behave as `auto` use an auto proxy for
+        // this self-collapsing predicate.
+        // <https://drafts.csswg.org/css-sizing-3/#behave-auto>
         let mut margin_collapse_style = None;
-        if percentage_height_is_auto_for_margin_collapse(style, parent_percentage_height_basis) {
+        if height_behaves_as_auto_for_margin_collapse(style, parent_percentage_height_basis) {
             let mut style_for_margin_collapse = style.clone();
             style_for_margin_collapse
                 .box_values
@@ -2095,7 +2131,7 @@ fn table_cell_self_collapsing_block_margin(
 ) -> Option<f32> {
     let (element, _, style, children) = child.element_parts()?;
     let mut margin_collapse_style = None;
-    if percentage_height_is_auto_for_margin_collapse(style, percentage_height_basis) {
+    if height_behaves_as_auto_for_margin_collapse(style, percentage_height_basis) {
         let mut style_for_margin_collapse = style.clone();
         style_for_margin_collapse
             .box_values

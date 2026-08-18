@@ -40,6 +40,136 @@ impl CssComponentValueList {
     }
 }
 
+/// Parsed arguments of CSS Variables' `var()` function.
+///
+/// The name argument is an arbitrary substitution value: it is syntactically
+/// a non-empty `<declaration-value>` and only becomes a custom-property name
+/// after its substitutions have been resolved. A present empty fallback is
+/// distinct from no fallback (`var(--name,)`).
+/// <https://drafts.csswg.org/css-variables-2/#funcdef-var>
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParsedVarArguments {
+    pub(crate) name_argument: CssComponentValueList,
+    pub(crate) fallback: Option<CssComponentValueList>,
+}
+
+/// Parses the CSS Variables arbitrary-substitution-function grammar inside a
+/// `var()` function block.
+///
+/// The first top-level comma separates the name argument from its fallback;
+/// commas after that point are fallback content. A sole curly block is the
+/// CSS Values free-form wrapper and supplies its contents as the name value.
+/// <https://drafts.csswg.org/css-variables-2/#funcdef-var>
+/// <https://drafts.csswg.org/css-values-5/#component-function-commas>
+pub(crate) fn parse_var_function_arguments(
+    parser: &mut Parser<'_, '_>,
+) -> Option<ParsedVarArguments> {
+    let start = parser.position();
+    let mut comma = None;
+    while !parser.is_exhausted() {
+        let token_start = parser.position();
+        let token = parser
+            .next_including_whitespace_and_comments()
+            .ok()?
+            .clone();
+        if token.is_parse_error() {
+            return None;
+        }
+        if matches!(token, Token::Comma) && comma.is_none() {
+            comma = Some((token_start, parser.position()));
+            continue;
+        }
+        if matches!(token, Token::Semicolon | Token::Delim('!')) {
+            return None;
+        }
+        if matches!(token, Token::Function(ref name) if name.eq_ignore_ascii_case("var")) {
+            if parser
+                .parse_nested_block(|nested| {
+                    parse_var_function_arguments(nested)
+                        .ok_or_else(|| nested.new_custom_error::<(), ()>(()))
+                })
+                .is_err()
+            {
+                return None;
+            }
+        } else if is_simple_block(&token) && !consume_nested_block(parser) {
+            return None;
+        }
+    }
+
+    let (name_source, fallback_source) = if let Some((comma_start, fallback_start)) = comma {
+        (
+            parser.slice(start..comma_start),
+            Some(parser.slice_from(fallback_start)),
+        )
+    } else {
+        (parser.slice_from(start), None)
+    };
+    let name_argument = parse_var_name_argument(name_source)?;
+    let fallback = match fallback_source {
+        Some(source) => Some(CssComponentValueList::parse(source)?),
+        None => None,
+    };
+    Some(ParsedVarArguments {
+        name_argument,
+        fallback,
+    })
+}
+
+fn parse_var_name_argument(value: &str) -> Option<CssComponentValueList> {
+    let mut input = ParserInput::new(value);
+    let mut parser = Parser::new(&mut input);
+    let mut significant = 0usize;
+    let mut curly_contents = None;
+    while !parser.is_exhausted() {
+        let token = parser
+            .next_including_whitespace_and_comments()
+            .ok()?
+            .clone();
+        if token.is_parse_error() || matches!(token, Token::Semicolon | Token::Delim('!')) {
+            return None;
+        }
+        if matches!(token, Token::WhiteSpace(_) | Token::Comment(_)) {
+            continue;
+        }
+        significant += 1;
+        if matches!(token, Token::CurlyBracketBlock) {
+            let contents = parser
+                .parse_nested_block(|nested| {
+                    serialize_component_values(nested)
+                        .map(|value| value.css)
+                        .map_err(|_| nested.new_custom_error::<(), ()>(()))
+                })
+                .ok()?;
+            curly_contents = Some(contents);
+        } else if is_simple_block(&token) && !consume_nested_block(&mut parser) {
+            return None;
+        }
+    }
+    if significant == 0 || (curly_contents.is_some() && significant != 1) {
+        return None;
+    }
+    CssComponentValueList::parse(curly_contents.as_deref().unwrap_or(value))
+}
+
+/// Consumes and validates every component value remaining in `parser`.
+///
+/// Simple blocks are recursively consumed so tokenizer errors in nested
+/// values are rejected just like errors at the top level. CSS Syntax permits
+/// EOF-closed simple blocks, which `cssparser` exposes through
+/// `parse_nested_block` without an error.
+pub(crate) fn validate_component_value_list_from_parser(parser: &mut Parser<'_, '_>) -> bool {
+    while !parser.is_exhausted() {
+        let Ok(token) = parser.next_including_whitespace_and_comments() else {
+            return false;
+        };
+        if token.is_parse_error() || (is_simple_block(token) && !consume_nested_block(parser)) {
+            return false;
+        }
+    }
+    true
+}
+
 #[derive(Default)]
 struct SerializedComponentValues {
     css: String,
@@ -130,15 +260,11 @@ fn serialize_component_values(
 fn consume_nested_block(parser: &mut Parser<'_, '_>) -> bool {
     parser
         .parse_nested_block(|nested| {
-            while let Ok(token) = nested.next_including_whitespace_and_comments() {
-                if token.is_parse_error() {
-                    return Err(nested.new_custom_error(()));
-                }
-                if is_simple_block(token) && !consume_nested_block(nested) {
-                    return Err(nested.new_custom_error(()));
-                }
+            if validate_component_value_list_from_parser(nested) {
+                Ok::<_, cssparser::ParseError<'_, ()>>(())
+            } else {
+                Err(nested.new_custom_error(()))
             }
-            Ok::<_, cssparser::ParseError<'_, ()>>(())
         })
         .is_ok()
 }
@@ -652,6 +778,54 @@ pub(in crate::css) fn find_css_top_level_keyword_range(
 mod tests {
     use super::*;
 
+    fn parse_var_arguments(value: &str) -> Option<ParsedVarArguments> {
+        let mut input = ParserInput::new(value);
+        let mut parser = Parser::new(&mut input);
+        let token = parser.next().ok()?.clone();
+        matches!(token, Token::Function(ref name) if name.eq_ignore_ascii_case("var"))
+            .then(|| ())?;
+        parser
+            .parse_nested_block(|nested| {
+                parse_var_function_arguments(nested)
+                    .ok_or_else(|| nested.new_custom_error::<(), ()>(()))
+            })
+            .ok()
+    }
+
+    #[test]
+    fn var_arguments_preserve_the_free_form_name_and_empty_fallback() {
+        let empty_fallback = parse_var_arguments("var(--name,)").expect("valid var()");
+        assert_eq!(empty_fallback.name_argument.as_css(), "--name");
+        assert_eq!(
+            empty_fallback.fallback.expect("present fallback").as_css(),
+            ""
+        );
+
+        let nested_name =
+            parse_var_arguments("var(var(--name), red, blue)").expect("nested name argument");
+        assert_eq!(nested_name.name_argument.as_css(), "var(--name)");
+        assert_eq!(
+            nested_name.fallback.expect("fallback").as_css(),
+            " red, blue"
+        );
+
+        let braced_name = parse_var_arguments("var({ --name })").expect("braced name");
+        assert_eq!(braced_name.name_argument.as_css(), " --name");
+    }
+
+    #[test]
+    fn var_arguments_reject_invalid_free_form_structure() {
+        for value in [
+            "var()",
+            "var(, red)",
+            "var({--name} extra)",
+            "var(--name, !important)",
+            "var(--name; red)",
+        ] {
+            assert!(parse_var_arguments(value).is_none(), "{value}");
+        }
+    }
+
     #[test]
     fn component_value_stream_rejects_css_syntax_error_tokens() {
         for value in ["red)", "var(--color, \"\n", "var(--color, url(\"\n"] {
@@ -667,6 +841,25 @@ mod tests {
             "--> var(--color)",
         ] {
             assert!(CssComponentValueList::parse(value).is_some(), "{value}");
+        }
+    }
+
+    #[test]
+    fn borrowed_component_value_validation_matches_component_value_syntax() {
+        for (value, valid) in [
+            ("{ [ var(--color) ] }", true),
+            ("var(--color, calc(1px + 2px)", true),
+            ("red)", false),
+            ("var(--color, \"\n", false),
+            ("var(--color, url(\"\n", false),
+        ] {
+            let mut input = ParserInput::new(value);
+            let mut parser = Parser::new(&mut input);
+            assert_eq!(
+                validate_component_value_list_from_parser(&mut parser),
+                valid,
+                "{value}"
+            );
         }
     }
 

@@ -1,9 +1,10 @@
 # Table Fragmentation Parity
 
-Separated-border table geometry retains one leading and one trailing logical
-block-axis `border-spacing` edge in the unfragmented source grid. Destination
-fragments expose only their committed row slices; internal and fragment-local
-spacing gaps are not structural background clips.
+Separated-border table geometry has one immutable wrapper-grid frame and one
+cell-grid frame. The wrapper frame retains the two logical block-axis
+`border-spacing` edges; the cell frame removes them once, at frame
+construction. Destination fragments expose only their committed row slices;
+internal and fragment-local spacing gaps are not structural background clips.
 
 Fragmented table structural backgrounds use a shared source-grid projection:
 the table, column, column-group, row, and row-group layers resolve their
@@ -17,17 +18,26 @@ phase across adjacent fragments, including vertical writing modes.
 
 The destination adapter keeps vertical block origins logical: `vertical-rl`
 and `vertical-lr` fragments advance over the fragmentainer's physical block
-span without reusing a physical `y` cursor. `box-decoration-break: slice`
-continues to use the whole source box; clone behavior selects the fragment
-positioning area explicitly.
+span without reusing a physical `y` cursor. A continuation derives its
+complete cell-grid physical-left edge from the root flow: `content-left` for
+LR and `content-right − cell-grid block extent` for RL. This prevents an RL
+continuation from treating its block-start edge as the grid's physical left
+edge. `box-decoration-break: slice` continues to use the whole source box;
+clone behavior selects the fragment positioning area explicitly.
 
-The exact fragmented table-paint matrix is not yet at parity. The twelve
-reported horizontal-tb LTR, vertical-lr RTL, and vertical-rl RTL cases for
-table/column/row/row-group backgrounds (including the horizontal grid
-control) still differ. The common remaining issue is wrapper/chrome replay
-through multicolumn fragmentainers: continuation slices must retain one
-continuous wrapper decoration and caption placement while exposing only their
-destination-local grid visibility. This is tracked centrally in
+Table wrapper paint retains only table-wrapper-local block intervals. Its
+committed slices carry the table-selected destination fragmentainer; the
+enclosing multicolumn projection consumes that already-materialized paint
+rather than interpreting a table-local offset as a continuous column-source
+coordinate. This makes a caption/grid offset unable to select column zero
+while source clipping remains local to the immutable table grid.
+
+The exact fragmented table-paint matrix is not yet at parity. Simple
+separated-border wrapper replay through multicolumn fragmentainers now keeps a
+typed wrapper-border source interval distinct from the later grid-content
+origin, so `box-decoration-break: slice` retains the full root border box.
+Vertical-lr/vertical-rl continuations and advanced row, row-group, and grid
+structural-background cases still differ. This is tracked centrally in
 `SPEC_DIVERGENCES.md`; no claim of complete writing-mode parity is intended.
 
 Collapsed-border painting for root-level `inline-table` elements also follows

@@ -9,7 +9,13 @@ pub(super) fn outline_plan(document: &Document, first_outline_id: usize) -> Opti
     let root_id = first_outline_id;
     let mut nodes = Vec::new();
     let mut next_id = first_outline_id + 1;
-    let visible_count = append_outline_nodes(&tree, root_id, &mut next_id, &mut nodes);
+    let visible_count = append_outline_nodes(
+        &tree,
+        root_id,
+        &mut next_id,
+        &mut nodes,
+        document.pages.len(),
+    );
     Some(OutlinePlan {
         root_id,
         nodes,
@@ -89,6 +95,7 @@ pub(super) fn append_outline_nodes(
     parent_id: usize,
     next_id: &mut usize,
     output: &mut Vec<OutlineNodePlan>,
+    page_count: usize,
 ) -> i32 {
     let ids = siblings
         .iter()
@@ -103,14 +110,17 @@ pub(super) fn append_outline_nodes(
         let first_child_id = (!node.children.is_empty()).then_some(*next_id);
         let last_child_id =
             first_child_id.map(|first_child_id| first_child_id + node.children.len() - 1);
-        let child_count = append_outline_nodes(&node.children, ids[index], next_id, output);
+        let child_count =
+            append_outline_nodes(&node.children, ids[index], next_id, output, page_count);
         visible_count += match node.bookmark.state {
             BookmarkState::Open => child_count,
             BookmarkState::Closed => 0,
         };
         output.push(OutlineNodePlan {
             id: ids[index],
-            bookmark: node.bookmark.clone(),
+            label: node.bookmark.label.clone(),
+            page_index: node.bookmark.page_index.min(page_count.saturating_sub(1)),
+            target: node.bookmark.target(),
             parent_id,
             prev_id: index.checked_sub(1).map(|prev| ids[prev]),
             next_id: ids.get(index + 1).cloned(),

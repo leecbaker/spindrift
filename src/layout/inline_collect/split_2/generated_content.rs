@@ -1,5 +1,6 @@
 use super::*;
 use crate::layout::inline_layout::InlineLineStackCursor;
+use crate::units::glyph_baseline_displacement_pt;
 use std::rc::Rc;
 
 /// Layout-only style for the hypothetical in-flow box used to select an
@@ -76,7 +77,7 @@ struct DeferredInlineStaticPositionedDescendant {
     /// The block formatting context that owns the hypothetical source. It is
     /// captured at source order because deferred replay may occur after an
     /// anonymous-inline split has changed the active builder context.
-    static_position_context: Option<BlockStaticPositionContext>,
+    static_position_containing_block: Option<StaticPositionContainingBlock>,
     /// The nearest positioned inline establishes the actual absolute
     /// containing block. It is independent of the static-position
     /// containing block retained above, and therefore must survive deferred
@@ -88,6 +89,44 @@ struct DeferredInlineStaticPositionedDescendant {
     hypothetical_ancestor_offset: InlineVisualOffset,
     content: DeferredStaticPositionedContent,
     static_position_index: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FrozenInlineReplayEligibility {
+    Eligible,
+    HasInlineFlowEffects,
+    EstablishesScrollContainer,
+}
+
+/// A side-effect-free frozen inline source that can be selected while sizing
+/// an orthogonal block and committed after its final physical geometry is
+/// known.
+///
+/// `eligibility` records why the candidate may not be replayed. In
+/// particular, a scroll container has clipping and fragmentation behavior
+/// beyond a simple line stack, so it stays on the normal final-layout path.
+/// The item stream is assembled by the same frozen-box collector as final
+/// inline layout. Positioned descendants are retained as static-position
+/// recipes: they are out of flow and therefore cannot affect the selected
+/// line stack, but must be materialized against the final containing box.
+/// <https://drafts.csswg.org/css-overflow-3/#scroll-containers>
+/// <https://drafts.csswg.org/css-writing-modes-4/#orthogonal-flows>
+/// <https://drafts.csswg.org/css-position-3/#abspos-layout>
+#[derive(Clone)]
+pub(in crate::layout) struct FrozenInlineReplayInput {
+    items: Vec<InlineItem>,
+    deferred_static_positioned_descendants: Vec<DeferredInlineStaticPositionedDescendant>,
+    eligibility: FrozenInlineReplayEligibility,
+}
+
+impl FrozenInlineReplayInput {
+    pub(in crate::layout) fn selection_items(&self) -> Vec<InlineItem> {
+        self.items.clone()
+    }
+
+    pub(in crate::layout) fn is_replay_safe(&self) -> bool {
+        self.eligibility == FrozenInlineReplayEligibility::Eligible
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -108,6 +147,71 @@ enum DeferredStaticPositionedContent {
 struct InlinePositioningFragmentEdgeCapture {
     logical_edge: InlineLogicalEdge,
     rect: PageTopRect,
+}
+
+/// The source-order fragment edges that form an inline absolute-positioning
+/// containing block.
+///
+/// CSS Positioned Layout selects logical start edges from the first fragment
+/// and logical end edges from the end-most fragment. A physical bounding union
+/// is wrong for vertical writing modes (and bidi fragments), because it can
+/// take both sides of either source fragment instead of the required logical
+/// corner. Keep the fragment roles and their axes together until this named
+/// geometry conversion.
+/// <https://drafts.csswg.org/css-position-3/#def-cb>
+#[derive(Debug, Clone, Copy)]
+struct InlineContainingBlockContentEdges {
+    first_fragment: PageTopRect,
+    end_fragment: PageTopRect,
+    axes: WritingModeAxes,
+}
+
+impl InlineContainingBlockContentEdges {
+    /// Form the positioned containing block from the first fragment's logical
+    /// start edges and the end fragment's logical end edges.
+    ///
+    /// This is the only adapter that projects those logical edges into a
+    /// physical `PageTopRect`; callers retain a `ContainingBlock` rather than
+    /// recombining page coordinates themselves.
+    /// <https://drafts.csswg.org/css-position-3/#def-cb>
+    fn to_containing_block(self) -> ContainingBlock {
+        let (horizontal_start, horizontal_end) = self.physical_axis_edges(PhysicalAxis::Horizontal);
+        let (vertical_start, vertical_end) = self.physical_axis_edges(PhysicalAxis::Vertical);
+
+        let first_x = Self::coordinate_on_side(self.first_fragment, horizontal_start);
+        let end_x = Self::coordinate_on_side(self.end_fragment, horizontal_end);
+        let first_y = Self::coordinate_on_side(self.first_fragment, vertical_start);
+        let end_y = Self::coordinate_on_side(self.end_fragment, vertical_end);
+
+        let left = first_x.min(end_x);
+        let right = first_x.max(end_x);
+        let bottom = first_y.min(end_y);
+        let top = first_y.max(end_y);
+        ContainingBlock::from_page_top_rect(PageTopRect::new(left, top, right - left, top - bottom))
+    }
+
+    fn physical_axis_edges(self, axis: PhysicalAxis) -> (PhysicalSide, PhysicalSide) {
+        let logical_axis = if self.axes.physical_axis(LogicalAxis::Inline) == axis {
+            LogicalAxis::Inline
+        } else {
+            debug_assert_eq!(self.axes.physical_axis(LogicalAxis::Block), axis);
+            LogicalAxis::Block
+        };
+        let (start, end) = match logical_axis {
+            LogicalAxis::Inline => (LogicalSide::InlineStart, LogicalSide::InlineEnd),
+            LogicalAxis::Block => (LogicalSide::BlockStart, LogicalSide::BlockEnd),
+        };
+        (self.axes.physical_side(start), self.axes.physical_side(end))
+    }
+
+    fn coordinate_on_side(rect: PageTopRect, side: PhysicalSide) -> f32 {
+        match side {
+            PhysicalSide::Left => rect.x(),
+            PhysicalSide::Right => rect.x() + rect.width(),
+            PhysicalSide::Top => rect.top_y(),
+            PhysicalSide::Bottom => rect.bottom_y(),
+        }
+    }
 }
 
 /// Paint produced while resolving a positioned descendant whose lexical inline
@@ -182,61 +286,8 @@ impl<'a> LayoutBuilder<'a> {
     /// an anonymous split has restored a wider ancestor context, but CSS
     /// Position keeps the hypothetical box's containing block unchanged.
     /// <https://drafts.csswg.org/css-position-3/#staticpos-rect>
-    fn current_static_position_context(&self) -> Option<BlockStaticPositionContext> {
-        let mut context = self.block_static_position_contexts.last().copied()?;
-        // Inline descendants can change lexical direction without changing
-        // the block that establishes the hypothetical box's containing
-        // block. CSS 2.2's both-auto horizontal rule uses that block's
-        // direction, not the descendant span's direction.
-        // <https://www.w3.org/TR/CSS22/visudet.html#abs-non-replaced-width>
-        context.axes = WritingModeAxes::new(
-            self.containing_block_writing_mode,
-            self.containing_block_direction,
-        );
-        // A block static-position rectangle spans the hypothetical box's
-        // containing block, whose physical inline sides are the used content
-        // box. Capture that box now; an inline split may otherwise restore
-        // the parent border box before deferred replay.
-        // <https://drafts.csswg.org/css-position-3/#staticpos-rect>
-        let content_rect = match context.axes.physical_axis(LogicalAxis::Inline) {
-            PhysicalAxis::Horizontal => PageTopRect::new(
-                self.content_left,
-                context.content_rect.top_y(),
-                (self.content_right - self.content_left).max(0.0),
-                context.content_rect.height(),
-            ),
-            PhysicalAxis::Vertical => PageTopRect::new(
-                context.content_rect.x(),
-                context.content_rect.top_y(),
-                context.content_rect.width(),
-                self.current_content_logical_inline_size(),
-            ),
-        };
-        if context.axes.writing_mode().has_vertical_lines() {
-            let actual_containing_block = self.current_containing_block().rect;
-            log::trace!(
-                target: "quire::layout::static_position",
-                "checkpoint=static-context axes=({:?},{:?}) retained=(x:{:.2},top:{:.2},width:{:.2},height:{:.2}) active=(x:{:.2},top:{:.2},width:{:.2},height:{:.2}) selected=(x:{:.2},top:{:.2},width:{:.2},height:{:.2})",
-                context.axes.writing_mode(),
-                context.axes.direction(),
-                context.content_rect.x(),
-                context.content_rect.top_y(),
-                context.content_rect.width(),
-                context.content_rect.height(),
-                actual_containing_block.x(),
-                actual_containing_block.top_y(),
-                actual_containing_block.width(),
-                actual_containing_block.height(),
-                content_rect.x(),
-                content_rect.top_y(),
-                content_rect.width(),
-                content_rect.height(),
-            );
-        }
-        Some(BlockStaticPositionContext {
-            content_rect,
-            ..context
-        })
+    fn current_static_position_containing_block(&self) -> Option<StaticPositionContainingBlock> {
+        self.static_position_containing_blocks.last().copied()
     }
 
     pub(in crate::layout) fn push_element_content_items_from_dom(
@@ -314,7 +365,7 @@ impl<'a> LayoutBuilder<'a> {
                 style,
                 box_tree::CounterEventSource::Principal,
                 inherited_link.clone(),
-                placement.baseline_shift,
+                placement.baseline_shift(),
                 placement.visual_offset,
                 alt_text.clone(),
                 output,
@@ -437,7 +488,7 @@ impl<'a> LayoutBuilder<'a> {
                         text,
                         style,
                         inherited_link.clone(),
-                        placement.baseline_shift,
+                        placement.baseline_shift(),
                         placement.visual_offset,
                         output,
                     );
@@ -448,12 +499,11 @@ impl<'a> LayoutBuilder<'a> {
                     {
                         continue;
                     }
-                    let child_signature = ElementSignature::with_sibling_list(
-                        child_element.tag.clone(),
-                        child_element.attrs.clone(),
+                    let child_signature = ElementSignature::from_sibling_snapshot(
                         element_index,
                         sibling_tags.clone(),
-                    );
+                    )
+                    .expect("source child must have a cached sibling signature");
                     element_index += 1;
                     let mut child_style = self.style_for_layout_element_with_parent_font_metrics(
                         child_element,
@@ -499,7 +549,7 @@ impl<'a> LayoutBuilder<'a> {
                                 inline_style_establishes_positioning_containing_block(style).then(
                                     || InlinePositioningContainingBlockSource {
                                         id: InlinePositioningContainingBlockId(output.len()),
-                                        style: style.clone(),
+                                        style: self.style_with_current_used_lengths(style),
                                     },
                                 )
                             }),
@@ -569,7 +619,8 @@ impl<'a> LayoutBuilder<'a> {
                                 line_formatting_context_style: line_formatting_context_style
                                     .clone(),
                                 static_position_container_style: style.clone(),
-                                static_position_context: self.current_static_position_context(),
+                                static_position_containing_block: self
+                                    .current_static_position_containing_block(),
                                 positioning_containing_block_source:
                                     active_positioning_containing_block.cloned(),
                                 hypothetical_ancestor_offset: placement.visual_offset,
@@ -582,7 +633,7 @@ impl<'a> LayoutBuilder<'a> {
                             inline_style_establishes_positioning_containing_block(style).then(
                                 || InlinePositioningContainingBlockSource {
                                     id: InlinePositioningContainingBlockId(output.len()),
-                                    style: style.clone(),
+                                    style: self.style_with_current_used_lengths(style),
                                 },
                             );
                         self.layout_positioned_inline_descendant(
@@ -624,10 +675,12 @@ impl<'a> LayoutBuilder<'a> {
                         // box shift here as well would align the same
                         // `vertical-align` value twice.
                         // <https://www.w3.org/TR/css-inline-3/#atomic-inline>
-                        .with_added_baseline_shift(if !child_is_atomic_inline {
+                        .with_added_baseline_placement(if !child_is_atomic_inline {
                             self.vertical_align_baseline_shift_for_inline_style(&child_style, style)
                         } else {
-                            Default::default()
+                            InlineBaselinePlacement::from_inherited_glyph_displacement(
+                                glyph_baseline_displacement_pt(0.0),
+                            )
                         })
                         .with_added_visual_offset(
                             self.inline_visual_offset_for_style(&child_style),
@@ -680,14 +733,16 @@ impl<'a> LayoutBuilder<'a> {
                                 &child_boxes,
                                 table_fragment,
                                 stylesheets,
-                                child_placement.baseline_shift,
+                                child_placement.baseline_shift(),
                                 child_placement.visual_offset,
                                 link.clone(),
                             );
                             layout.end_counter_scope(counter_scope);
                             if let Some(mut atom) = atom {
-                                atom.baseline_shift +=
-                                    layout.vertical_align_baseline_shift_for_atom(&atom, style);
+                                atom.baseline_shift += layout
+                                    .vertical_align_baseline_shift_for_atom(&atom, style)
+                                    .glyph_displacement()
+                                    .get();
                                 output.push(InlineItem::Atom(Box::new(atom)));
                             }
                             return;
@@ -715,7 +770,7 @@ impl<'a> LayoutBuilder<'a> {
                             &child_style,
                             child_style.before_style.as_deref(),
                             link.clone(),
-                            child_placement.baseline_shift,
+                            child_placement.baseline_shift(),
                             child_placement.visual_offset,
                             GeneratedPseudoCounterMode::Commit,
                             output,
@@ -760,7 +815,7 @@ impl<'a> LayoutBuilder<'a> {
                             &child_style,
                             child_style.after_style.as_deref(),
                             link.clone(),
-                            child_placement.baseline_shift,
+                            child_placement.baseline_shift(),
                             child_placement.visual_offset,
                             GeneratedPseudoCounterMode::Commit,
                             output,
@@ -806,6 +861,7 @@ impl<'a> LayoutBuilder<'a> {
             visual_offset,
             block_style,
             block_style,
+            block_style,
             propagated_decoration_layers,
             None,
             None,
@@ -819,6 +875,79 @@ impl<'a> LayoutBuilder<'a> {
         );
     }
 
+    /// Collect the final inline-box representation without committing its
+    /// positioned descendants or other layout side effects.
+    ///
+    /// This is deliberately not the intrinsic collector: atomic inline
+    /// construction, inline edges, whitespace inputs, and bidi controls must
+    /// match the stream final line layout would select. The snapshot restores
+    /// counter, paint, and positioning state after collection; positioned
+    /// descendants are preserved as recipes for the final replay.
+    /// <https://drafts.csswg.org/css-inline-3/#line-box>
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::layout) fn collect_frozen_inline_replay_input(
+        &mut self,
+        children: &[box_tree::FormattingBox<'_>],
+        stylesheets: &Stylesheets<'_>,
+        inherited_link: Option<String>,
+        baseline_shift: f32,
+        visual_offset: InlineVisualOffset,
+        block_style: &ComputedStyle,
+        propagated_decoration_layers: Vec<css::TextDecorationLayer>,
+    ) -> FrozenInlineReplayInput {
+        let snapshot = self.snapshot();
+        let mut items = Vec::new();
+        let mut deferred_static_positioned_descendants = Vec::new();
+        self.with_positioned_layout_suppressed(|layout| {
+            layout.collect_inline_box_items_with_float_containing_block(
+                children,
+                stylesheets,
+                inherited_link,
+                baseline_shift,
+                visual_offset,
+                block_style,
+                block_style,
+                block_style,
+                propagated_decoration_layers,
+                None,
+                None,
+                Some(&mut deferred_static_positioned_descendants),
+                &mut items,
+            );
+        });
+        self.restore(snapshot);
+        let eligibility =
+            if block_style.overflow_x.is_scrollable() || block_style.overflow_y.is_scrollable() {
+                FrozenInlineReplayEligibility::EstablishesScrollContainer
+            } else if items
+                .iter()
+                .all(|item| matches!(item, InlineItem::Word(_) | InlineItem::Atom(_)))
+            {
+                FrozenInlineReplayEligibility::Eligible
+            } else {
+                FrozenInlineReplayEligibility::HasInlineFlowEffects
+            };
+        FrozenInlineReplayInput {
+            items,
+            deferred_static_positioned_descendants,
+            eligibility,
+        }
+    }
+
+    /// Materialize the out-of-flow portion of a frozen replay only after the
+    /// selected orthogonal line stack has established its containing box.
+    pub(in crate::layout) fn layout_frozen_inline_replay_positioned_descendants(
+        &mut self,
+        input: &FrozenInlineReplayInput,
+        stylesheets: &Stylesheets<'_>,
+    ) {
+        self.layout_deferred_inline_static_positioned_descendants(
+            input.deferred_static_positioned_descendants.clone(),
+            stylesheets,
+            &input.items,
+        );
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn collect_inline_box_items_with_float_containing_block(
         &mut self,
@@ -828,6 +957,7 @@ impl<'a> LayoutBuilder<'a> {
         baseline_shift: f32,
         visual_offset: InlineVisualOffset,
         block_style: &ComputedStyle,
+        parent_baseline_style: &ComputedStyle,
         static_position_container_style: &ComputedStyle,
         propagated_decoration_layers: Vec<css::TextDecorationLayer>,
         active_float_containing_block: Option<&InlinePositioningContainingBlockSource>,
@@ -862,7 +992,8 @@ impl<'a> LayoutBuilder<'a> {
                         style: style.clone(),
                         line_formatting_context_style: block_style.clone(),
                         static_position_container_style: static_position_container_style.clone(),
-                        static_position_context: self.current_static_position_context(),
+                        static_position_containing_block: self
+                            .current_static_position_containing_block(),
                         positioning_containing_block_source: active_float_containing_block.cloned(),
                         hypothetical_ancestor_offset: visual_offset,
                         content: DeferredStaticPositionedContent::Frozen,
@@ -924,6 +1055,7 @@ impl<'a> LayoutBuilder<'a> {
                     baseline_shift,
                     visual_offset,
                     block_style,
+                    parent_baseline_style,
                     static_position_container_style,
                     propagated_decoration_layers_for_child(
                         &propagated_decoration_layers,
@@ -1009,10 +1141,10 @@ impl<'a> LayoutBuilder<'a> {
                         && block_style.first_letter_style.is_some()
                         && !output.iter().any(inline_item_has_typographic_content);
                     let child_placement = InlinePlacement::new(baseline_shift, visual_offset)
-                        .with_added_baseline_shift(
+                        .with_added_baseline_placement(
                             self.vertical_align_baseline_shift_for_inline_style(
                                 &inline_style,
-                                block_style,
+                                parent_baseline_style,
                             ),
                         )
                         .with_added_visual_offset(
@@ -1057,9 +1189,10 @@ impl<'a> LayoutBuilder<'a> {
                                     std::slice::from_ref(&out_of_flow_overlay),
                                     stylesheets,
                                     inherited_link.clone(),
-                                    child_placement.baseline_shift,
+                                    child_placement.baseline_shift(),
                                     child_placement.visual_offset,
                                     block_style,
+                                    &inline_style,
                                     static_position_container_style,
                                     decoration_layers.clone(),
                                     active_float_containing_block,
@@ -1165,7 +1298,7 @@ impl<'a> LayoutBuilder<'a> {
                             inline_children,
                             stylesheets,
                             link.clone(),
-                            child_placement.baseline_shift,
+                            child_placement.baseline_shift(),
                             child_placement.visual_offset,
                             block_style,
                             decoration_layers.clone(),
@@ -1190,9 +1323,10 @@ impl<'a> LayoutBuilder<'a> {
                             inline_children,
                             stylesheets,
                             link.clone(),
-                            child_placement.baseline_shift,
+                            child_placement.baseline_shift(),
                             child_placement.visual_offset,
                             block_style,
+                            &inline_style,
                             &inline_style,
                             decoration_layers,
                             next_float_containing_block,
@@ -1269,8 +1403,10 @@ impl<'a> LayoutBuilder<'a> {
                     );
                     self.end_counter_scope(counter_scope);
                     if let Some(mut atom) = atom {
-                        atom.baseline_shift +=
-                            self.vertical_align_baseline_shift_for_atom(&atom, block_style);
+                        atom.baseline_shift += self
+                            .vertical_align_baseline_shift_for_atom(&atom, parent_baseline_style)
+                            .glyph_displacement()
+                            .get();
                         output.push(InlineItem::Atom(Box::new(atom)));
                     } else {
                         let text = inline_text_for_style(box_.core.element, &box_.core.style);
@@ -1317,8 +1453,10 @@ impl<'a> LayoutBuilder<'a> {
                     );
                     self.end_counter_scope(counter_scope);
                     if let Some(mut atom) = atom {
-                        atom.baseline_shift +=
-                            self.vertical_align_baseline_shift_for_atom(&atom, block_style);
+                        atom.baseline_shift += self
+                            .vertical_align_baseline_shift_for_atom(&atom, parent_baseline_style)
+                            .glyph_displacement()
+                            .get();
                         output.push(InlineItem::Atom(Box::new(atom)));
                     }
                 }
@@ -1365,8 +1503,10 @@ impl<'a> LayoutBuilder<'a> {
                     );
                     self.end_counter_scope(counter_scope);
                     if let Some(mut atom) = atom {
-                        atom.baseline_shift +=
-                            self.vertical_align_baseline_shift_for_atom(&atom, block_style);
+                        atom.baseline_shift += self
+                            .vertical_align_baseline_shift_for_atom(&atom, parent_baseline_style)
+                            .glyph_displacement()
+                            .get();
                         output.push(InlineItem::Atom(Box::new(atom)));
                     } else {
                         let text = inline_text_for_style(box_.core.element, &box_.core.style);
@@ -1388,6 +1528,7 @@ impl<'a> LayoutBuilder<'a> {
                         baseline_shift,
                         visual_offset,
                         block_style,
+                        parent_baseline_style,
                         static_position_container_style,
                         propagated_decoration_layers_for_child(
                             &propagated_decoration_layers,
@@ -1417,7 +1558,7 @@ impl<'a> LayoutBuilder<'a> {
         block_style: &ComputedStyle,
         static_position_container_style: &ComputedStyle,
         positioning_containing_block_source: Option<&InlinePositioningContainingBlockSource>,
-        static_position_context: Option<BlockStaticPositionContext>,
+        static_position_containing_block: Option<StaticPositionContainingBlock>,
         static_position_index: Option<usize>,
         hypothetical_ancestor_offset: InlineVisualOffset,
         output: &[InlineItem],
@@ -1439,7 +1580,7 @@ impl<'a> LayoutBuilder<'a> {
             let previous_principal_static_position = self.absolute_static_position;
             if (is_replaced_element(element) || matches!(element.tag.as_str(), "audio" | "svg"))
                 && !block_style.writing_mode.has_vertical_lines()
-                && let Some(vertical_parent) = self.block_static_position_contexts.last()
+                && let Some(vertical_parent) = self.static_position_containing_blocks.last()
                 && vertical_parent.axes.writing_mode().has_vertical_lines()
                 && vertical_parent.axes.writing_mode() == WritingMode::VerticalRl
             {
@@ -1594,14 +1735,14 @@ impl<'a> LayoutBuilder<'a> {
         // explicitly; otherwise the active block formatting context does.
         // <https://drafts.csswg.org/css-position-3/#staticpos-rect>
         let (static_writing_mode, static_direction, static_justify_items, static_align_items) =
-            if let Some(context) = static_position_context
-                .or_else(|| self.block_static_position_contexts.last().copied())
+            if let Some(context) = static_position_containing_block
+                .or_else(|| self.static_position_containing_blocks.last().copied())
             {
                 (
                     context.axes.writing_mode(),
                     context.axes.direction(),
                     context.justify_items,
-                    context.align_items,
+                    css::SelfAlignment::NORMAL,
                 )
             } else {
                 (
@@ -1616,8 +1757,8 @@ impl<'a> LayoutBuilder<'a> {
         // unadvanced inline collector cursor and expecting later positioned
         // layout to reconstruct that information.
         // <https://drafts.csswg.org/css-position-3/#staticpos-rect>
-        let static_area = static_position_context
-            .or_else(|| self.block_static_position_contexts.last().copied())
+        let static_area = static_position_containing_block
+            .or_else(|| self.static_position_containing_blocks.last().copied())
             .map(|context| {
                 context
                     .rectangle_at_hypothetical_block_box(hypothetical_block_box)
@@ -1854,12 +1995,13 @@ impl<'a> LayoutBuilder<'a> {
         let end = end?;
         debug_assert_eq!(start.logical_edge, InlineLogicalEdge::Start);
         debug_assert_eq!(end.logical_edge, InlineLogicalEdge::End);
-        let left = start.rect.x().min(end.rect.x());
-        let right = (start.rect.x() + start.rect.width()).max(end.rect.x() + end.rect.width());
-        let bottom = start.rect.bottom_y().min(end.rect.bottom_y());
-        let top = start.rect.top_y().max(end.rect.top_y());
-        let containing_block =
-            PageTopRect::new(left, top, (right - left).max(0.0), (top - bottom).max(0.0));
+        let containing_block_edges = InlineContainingBlockContentEdges {
+            first_fragment: start.rect,
+            end_fragment: end.rect,
+            axes: WritingModeAxes::new(source.style.writing_mode, source.style.used_direction()),
+        };
+        let containing_block = containing_block_edges.to_containing_block();
+        let containing_rect = containing_block.rect;
         log::trace!(
             target: "quire::layout::static_position",
             "checkpoint=positioned-inline-containing-block source={:?} axes=({:?},{:?}) start=(x:{:.2},top:{:.2},width:{:.2},height:{:.2}) end=(x:{:.2},top:{:.2},width:{:.2},height:{:.2}) containing_block=(x:{:.2},top:{:.2},width:{:.2},height:{:.2})",
@@ -1874,12 +2016,12 @@ impl<'a> LayoutBuilder<'a> {
             end.rect.top_y(),
             end.rect.width(),
             end.rect.height(),
-            containing_block.x(),
-            containing_block.top_y(),
-            containing_block.width(),
-            containing_block.height(),
+            containing_rect.x(),
+            containing_rect.top_y(),
+            containing_rect.width(),
+            containing_rect.height(),
         );
-        Some(ContainingBlock::from_page_top_rect(containing_block))
+        Some(containing_block)
     }
 
     fn layout_deferred_inline_positioned_descendants(
@@ -1951,7 +2093,7 @@ impl<'a> LayoutBuilder<'a> {
                 &descendant.line_formatting_context_style,
                 &descendant.static_position_container_style,
                 descendant.positioning_containing_block_source.as_ref(),
-                descendant.static_position_context,
+                descendant.static_position_containing_block,
                 Some(descendant.static_position_index),
                 descendant.hypothetical_ancestor_offset,
                 output,
@@ -2072,7 +2214,10 @@ impl<'a> LayoutBuilder<'a> {
             if has_base_content {
                 pending_first_letter_style = None;
             }
-            atom.baseline_shift += self.vertical_align_baseline_shift_for_atom(&atom, block_style);
+            atom.baseline_shift += self
+                .vertical_align_baseline_shift_for_atom(&atom, block_style)
+                .glyph_displacement()
+                .get();
             ruby_atoms.push(InlineItem::Atom(Box::new(atom)));
         }
         normalize_ruby_column_group_metrics(&mut ruby_atoms, block_style);
@@ -2118,7 +2263,7 @@ impl<'a> LayoutBuilder<'a> {
             &column.base.boxes,
             stylesheets,
             link.clone(),
-            placement.baseline_shift,
+            placement.baseline_shift(),
             placement.visual_offset,
             block_style,
             propagated_decoration_layers.clone(),
@@ -2175,7 +2320,7 @@ impl<'a> LayoutBuilder<'a> {
                     &annotation.segment.boxes,
                     stylesheets,
                     link.clone(),
-                    placement.baseline_shift,
+                    placement.baseline_shift(),
                     placement.visual_offset,
                     block_style,
                     propagated_decoration_layers.clone(),
@@ -2307,7 +2452,7 @@ impl<'a> LayoutBuilder<'a> {
                     base_block_size + annotation_block_size,
                 ),
                 annotation_block_size + base_baseline,
-                placement.baseline_shift,
+                placement.baseline_shift(),
                 link,
                 None,
             )
@@ -2611,7 +2756,7 @@ impl<'a> LayoutBuilder<'a> {
 
         InlineAtom::new(
             InlineAtomContent::StaticPositionPlaceholder,
-            placeholder_style.as_computed().clone(),
+            placeholder_style.clone(),
             None,
             InlineSize::new(
                 border_box_width + placeholder_style.margin.left + placeholder_style.margin.right,
@@ -2633,9 +2778,9 @@ impl<'a> LayoutBuilder<'a> {
         let saved_cursor_y = self.cursor_y;
         let saved_left = self.content_left;
         let saved_right = self.content_right;
-        let static_position_context = self.current_static_position_context();
+        let static_position_containing_block = self.current_static_position_containing_block();
         let (static_writing_mode, static_direction, static_justify_items, static_align_items) =
-            static_position_context.map_or(
+            static_position_containing_block.map_or(
                 (
                     block_style.writing_mode,
                     block_style.used_direction(),
@@ -2647,7 +2792,7 @@ impl<'a> LayoutBuilder<'a> {
                         context.axes.writing_mode(),
                         context.axes.direction(),
                         context.justify_items,
-                        context.align_items,
+                        css::SelfAlignment::NORMAL,
                     )
                 },
             );
@@ -2745,7 +2890,7 @@ impl<'a> LayoutBuilder<'a> {
                             // agree on an unindented line, but loses
                             // `text-indent` and bidi placement.
                             // <https://www.w3.org/TR/CSS22/visudet.html#abs-non-replaced-width>
-                            let static_line_inline_start_x = if static_position_context.is_some_and(
+                            let static_line_inline_start_x = if static_position_containing_block.is_some_and(
                                 |context| {
                                     context.axes.physical_axis(LogicalAxis::Inline)
                                         == PhysicalAxis::Horizontal
@@ -2922,7 +3067,7 @@ impl<'a> LayoutBuilder<'a> {
                         .or_else(|| inherited_link.clone());
                     let child_placement =
                         InlinePlacement::new(context.baseline_shift, context.visual_offset)
-                            .with_added_baseline_shift(
+                            .with_added_baseline_placement(
                                 self.vertical_align_baseline_shift_for_inline_style(
                                     &inline_style,
                                     context.block_style,
@@ -2959,7 +3104,7 @@ impl<'a> LayoutBuilder<'a> {
                             inline_children,
                             stylesheets,
                             link.clone(),
-                            child_placement.baseline_shift,
+                            child_placement.baseline_shift(),
                             child_placement.visual_offset,
                             decoration_layers.clone(),
                             output,
@@ -2979,7 +3124,7 @@ impl<'a> LayoutBuilder<'a> {
                             link.clone(),
                             context
                                 .clone()
-                                .with_baseline_shift(child_placement.baseline_shift)
+                                .with_baseline_shift(child_placement.baseline_shift())
                                 .with_visual_offset(child_placement.visual_offset)
                                 .with_block_style(&inline_style.clone())
                                 .with_propagated_decoration_layers(decoration_layers),
@@ -3032,8 +3177,10 @@ impl<'a> LayoutBuilder<'a> {
                     self.end_counter_scope(counter_scope);
                     self.counter_set = counter_snapshot;
                     if let Some(mut atom) = atom {
-                        atom.baseline_shift +=
-                            self.vertical_align_baseline_shift_for_atom(&atom, context.block_style);
+                        atom.baseline_shift += self
+                            .vertical_align_baseline_shift_for_atom(&atom, context.block_style)
+                            .glyph_displacement()
+                            .get();
                         output.push(InlineItem::Atom(Box::new(atom)));
                     } else {
                         let text = inline_text_for_style(box_.core.element, &box_.core.style);
@@ -3076,8 +3223,10 @@ impl<'a> LayoutBuilder<'a> {
                     self.end_counter_scope(counter_scope);
                     self.counter_set = counter_snapshot;
                     if let Some(mut atom) = atom {
-                        atom.baseline_shift +=
-                            self.vertical_align_baseline_shift_for_atom(&atom, context.block_style);
+                        atom.baseline_shift += self
+                            .vertical_align_baseline_shift_for_atom(&atom, context.block_style)
+                            .glyph_displacement()
+                            .get();
                         output.push(InlineItem::Atom(Box::new(atom)));
                     }
                 }
@@ -3269,7 +3418,7 @@ fn ruby_distribution_unit_count(items: &[InlineItem]) -> Option<usize> {
         let InlineItem::Word(word) = item else {
             return None;
         };
-        for range in crate::text::typographic_unit_ranges(&word.text) {
+        for range in crate::text::CursiveProtectedUnitRanges::new(&word.text) {
             let unit = &word.text[range];
             if !unit
                 .chars()
@@ -3325,10 +3474,12 @@ fn normalize_ruby_column_group_metrics(
             annotation_block_sizes[index] = annotation_block_sizes[index].max(*block_size);
         }
         base_baseline = base_baseline.max(
-            atom.baseline_offset_from_border_box_block_start(
+            atom.baseline_offset_from_alignment_source_block_start(
                 inline_atom_logical_border_block_size(atom, containing_style),
                 containing_style,
-            ) - column_annotation_block_sizes.iter().sum::<f32>(),
+            )
+            .points()
+                - column_annotation_block_sizes.iter().sum::<f32>(),
         );
     }
 
@@ -3382,7 +3533,10 @@ fn normalize_ruby_column_group_metrics(
             .collect();
         atom.size.height = group_block_size;
         atom.baseline = InlineAtomBaseline::Exported {
-            offset_from_border_box_block_start: metrics.exported_baseline.points(),
+            source: InlineAtomBaselineSource::BorderBox,
+            offset_from_source_box_block_start: atomic_inline_baseline_source_pt(
+                metrics.exported_baseline.points(),
+            ),
         };
     }
 }
@@ -3431,8 +3585,10 @@ fn normalize_ruby_annotation_span_inline_sizes(
 ///
 /// A `content: url(...)` item is the child of the tree-abiding pseudo-element,
 /// not a replacement of that pseudo-element itself. Its parent owns the
-/// pseudo's box decoration; copying those edges into the image atom would
-/// paint the border twice and size the image as the pseudo's border box:
+/// pseudo's box decoration. The generated inline atom retains the pseudo's
+/// background so a sole image paints inside its decorated pseudo box, but it
+/// must not copy box edges that would size the payload as the pseudo's border
+/// box or paint a border twice:
 /// <https://www.w3.org/TR/css-content-3/#content-property> and
 /// <https://drafts.csswg.org/css-pseudo-4/#generated-content>.
 fn generated_pseudo_inline_content_style(style: &ComputedStyle) -> ComputedStyle {
@@ -3449,9 +3605,6 @@ fn generated_pseudo_inline_content_style(style: &ComputedStyle) -> ComputedStyle
     content_style.border_radius = css::BorderRadius::ZERO;
     content_style.corner_shapes = css::CornerShapes::ROUND;
     content_style.border_image = css::BorderImage::initial();
-    content_style.background.background_color = css::BackgroundColor::TRANSPARENT;
-    content_style.background.background_image = css::ComputedImage::None;
-    content_style.background.background_layers.clear();
     content_style
 }
 
@@ -3496,4 +3649,31 @@ fn inline_style_establishes_positioning_containing_block(style: &ComputedStyle) 
         style.position,
         Position::Absolute | Position::Fixed | Position::Relative | Position::Sticky
     ) || style.has_transform()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A vertical-rl inline's block-start edge is physical right, while its
+    /// inline-start edge is physical top. The containing block must select
+    /// those first-fragment edges and the matching end-fragment left/bottom
+    /// edges, rather than treating either source rectangle as a physical
+    /// bounding-box contribution.
+    /// <https://drafts.csswg.org/css-position-3/#def-cb>
+    /// <https://drafts.csswg.org/css-writing-modes-4/#logical-to-physical>
+    #[test]
+    fn vertical_rl_inline_containing_block_uses_logical_fragment_edges() {
+        let containing_block = InlineContainingBlockContentEdges {
+            first_fragment: PageTopRect::new(40.0, 100.0, 20.0, 30.0),
+            end_fragment: PageTopRect::new(10.0, 60.0, 15.0, 10.0),
+            axes: WritingModeAxes::new(WritingMode::VerticalRl, Direction::Ltr),
+        }
+        .to_containing_block();
+
+        assert_eq!(
+            containing_block.rect,
+            PageTopRect::new(10.0, 100.0, 50.0, 50.0)
+        );
+    }
 }

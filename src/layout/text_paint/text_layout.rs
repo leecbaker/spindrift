@@ -20,6 +20,8 @@ impl<'a> LayoutBuilder<'a> {
         padding_right: f32,
         link_target: Option<&str>,
     ) -> InlineLayoutOutcome {
+        let used_style = self.style_with_current_used_lengths(style);
+        let style = &used_style;
         if self.layout_multicol_text_block(
             text,
             style,
@@ -295,14 +297,23 @@ impl<'a> LayoutBuilder<'a> {
             if block_bidi_scope_needs_inline_controls(style) {
                 self.push_bidi_scope_end(style, None, 0.0, InlineVisualOffset::zero(), &mut items);
             }
+            // A marker's own style, not the list item's inherited strut,
+            // contributes its inline box to the marker-only line. This is
+            // observable for `li::marker { font-size/line-height: ... }`.
+            // <https://drafts.csswg.org/css-lists-3/#marker-properties>
+            let line_style = if text.is_empty() && marker.has_in_flow_content() {
+                &marker.style
+            } else {
+                style
+            };
             let sequence = self.collect_inline_line_sequence_with_text_box_trim(
                 items,
-                style,
+                line_style,
                 available_width,
                 padding_left,
                 0.0,
             );
-            self.paint_inline_line_sequence(&sequence, style);
+            self.paint_inline_line_sequence(&sequence, line_style);
             return;
         }
 

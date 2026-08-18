@@ -20,6 +20,7 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &Stylesheets<'_>,
         cell_borders: css::Edges,
         content_geometry: TableCellContentGeometry,
+        overflow_clip: Option<OverflowClip>,
     ) {
         // Table internal boxes retain their computed styles in the frozen
         // grid. Carry the table's in-flow decoration origins into the cell's
@@ -59,6 +60,7 @@ impl<'a> LayoutBuilder<'a> {
         let content_scope = self.enter_table_cell_content_scope(
             cell_style,
             content_box,
+            overflow_clip,
             self.table_cell_child_ancestors(cell, row),
             content_pass.percentage_basis(),
         );
@@ -134,6 +136,7 @@ impl<'a> LayoutBuilder<'a> {
         cell_borders: css::Edges,
         border_box: TableCellBorderBox,
         placement: TableGridPlacement,
+        overflow_clip: Option<OverflowClip>,
     ) {
         // A positioned descendant's static position is the position it would
         // have in normal flow before cell vertical alignment moves in-flow
@@ -193,6 +196,7 @@ impl<'a> LayoutBuilder<'a> {
         let content_scope = self.enter_table_cell_content_scope(
             cell_style,
             static_content_box,
+            overflow_clip,
             child_ancestors.clone(),
             PercentageBasis::indefinite(),
         );

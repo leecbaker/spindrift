@@ -1,5 +1,4 @@
 use super::super::*;
-use std::borrow::Cow;
 
 pub(crate) fn span_boundary_needs_join_control(left: &str, right: &str) -> bool {
     if left
@@ -26,6 +25,104 @@ pub(crate) fn span_boundary_needs_join_control(left: &str, right: &str) -> bool 
     character_can_join_following(left) && character_can_join_preceding(right)
 }
 
+/// Provenance for characters that exist in the shaping buffer but are not
+/// necessarily authored CSS text.
+///
+/// Keeping this distinction typed prevents an internal boundary-control glyph
+/// from being confused with authored source text during PDF conversion:
+/// <https://drafts.csswg.org/css-text-3/#boundary-shaping>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::text) enum ShapingContextKind {
+    AuthoredJoinControl,
+    SyntheticBoundaryJoinControl,
+    SyntheticEdgeContext,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::text) struct ShapingContextRange {
+    range: Range<usize>,
+    kind: ShapingContextKind,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(in crate::text) struct ShapingContextMap {
+    ranges: Vec<ShapingContextRange>,
+}
+
+impl ShapingContextMap {
+    #[cfg(test)]
+    pub(in crate::text) fn from_synthetic_ranges(ranges: &[Range<usize>]) -> Self {
+        Self {
+            ranges: ranges
+                .iter()
+                .cloned()
+                .map(|range| ShapingContextRange {
+                    range,
+                    kind: ShapingContextKind::SyntheticBoundaryJoinControl,
+                })
+                .collect(),
+        }
+    }
+
+    fn push(&mut self, range: Range<usize>, kind: ShapingContextKind) {
+        self.ranges.push(ShapingContextRange { range, kind });
+    }
+
+    fn shift_after_insertion(&mut self, index: usize, amount: usize) {
+        for context in &mut self.ranges {
+            if context.range.start >= index {
+                context.range.start += amount;
+                context.range.end += amount;
+            } else if context.range.end >= index {
+                context.range.end += amount;
+            }
+        }
+    }
+
+    pub(in crate::text) fn add_authored_join_controls(&mut self, text: &str) {
+        for (start, character) in text.char_indices() {
+            let end = start + character.len_utf8();
+            if character_is_join_control(character)
+                && !self.is_synthetic_at(start)
+                && !self
+                    .ranges
+                    .iter()
+                    .any(|context| context.range.start == start && context.range.end == end)
+            {
+                self.push(start..end, ShapingContextKind::AuthoredJoinControl);
+            }
+        }
+    }
+
+    pub(in crate::text) fn is_synthetic_at(&self, index: usize) -> bool {
+        self.ranges.iter().any(|context| {
+            context.range.contains(&index)
+                && matches!(
+                    context.kind,
+                    ShapingContextKind::SyntheticBoundaryJoinControl
+                        | ShapingContextKind::SyntheticEdgeContext
+                )
+        })
+    }
+
+    fn is_synthetic_only(&self, range: Range<usize>) -> bool {
+        range.start < range.end
+            && self.ranges.iter().any(|context| {
+                context.range.start <= range.start
+                    && range.end <= context.range.end
+                    && matches!(
+                        context.kind,
+                        ShapingContextKind::SyntheticBoundaryJoinControl
+                            | ShapingContextKind::SyntheticEdgeContext
+                    )
+            })
+    }
+
+    pub(in crate::text) fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+}
+
 /// Append a shaping-only ZWJ and remember its byte range for output cleanup.
 ///
 /// CSS Text shaping may need join controls that are not present in the DOM
@@ -35,11 +132,14 @@ pub(crate) fn span_boundary_needs_join_control(left: &str, right: &str) -> bool 
 /// <https://www.w3.org/TR/css-text-3/#boundary-shaping>.
 pub(in crate::text) fn push_synthetic_join_control(
     text: &mut String,
-    synthetic_ranges: &mut Vec<Range<usize>>,
+    contexts: &mut ShapingContextMap,
 ) {
     let start = text.len();
     text.push('\u{200d}');
-    synthetic_ranges.push(start..text.len());
+    contexts.push(
+        start..text.len(),
+        ShapingContextKind::SyntheticBoundaryJoinControl,
+    );
 }
 
 pub(in crate::text) fn text_needs_edge_join_context(text: &str) -> bool {
@@ -75,10 +175,10 @@ pub(in crate::text) fn text_needs_trailing_join_context(text: &str) -> bool {
 /// it from emitted glyph text:
 /// <https://www.w3.org/TR/css-text-3/#text-encoding> and
 /// <https://www.w3.org/TR/alreq/#h_joining_enforcement>.
-pub(in crate::text) fn push_edge_join_context(
+pub(in crate::text) fn push_edge_join_context<T>(
     text: &mut String,
-    ranges: &mut Vec<(Range<usize>, &ComputedStyle)>,
-    synthetic_ranges: &mut Vec<Range<usize>>,
+    ranges: &mut Vec<(Range<usize>, &T)>,
+    contexts: &mut ShapingContextMap,
 ) {
     let mut insertions = Vec::new();
     for (range, _) in ranges.iter() {
@@ -116,18 +216,15 @@ pub(in crate::text) fn push_edge_join_context(
     insertions.sort_unstable();
     insertions.dedup();
     for index in insertions.into_iter().rev() {
-        insert_synthetic_join_context(text, ranges, synthetic_ranges, index);
+        insert_synthetic_join_context(text, ranges, contexts, index);
     }
 }
 
 pub(in crate::text) fn range_is_synthetic_only(
     range: Range<usize>,
-    synthetic_ranges: &[Range<usize>],
+    contexts: &ShapingContextMap,
 ) -> bool {
-    range.start < range.end
-        && synthetic_ranges
-            .iter()
-            .any(|synthetic| synthetic.start <= range.start && range.end <= synthetic.end)
+    contexts.is_synthetic_only(range)
 }
 
 pub(in crate::text) fn leading_join_context_insertion_index(text: &str) -> Option<usize> {
@@ -151,10 +248,10 @@ pub(in crate::text) fn trailing_join_context_insertion_index(text: &str) -> Opti
         })
 }
 
-pub(in crate::text) fn insert_synthetic_join_context(
+pub(in crate::text) fn insert_synthetic_join_context<T>(
     text: &mut String,
-    ranges: &mut [(Range<usize>, &ComputedStyle)],
-    synthetic_ranges: &mut Vec<Range<usize>>,
+    ranges: &mut [(Range<usize>, &T)],
+    contexts: &mut ShapingContextMap,
     index: usize,
 ) {
     let context_len = '\u{0640}'.len_utf8();
@@ -167,15 +264,11 @@ pub(in crate::text) fn insert_synthetic_join_context(
             range.end += context_len;
         }
     }
-    for range in synthetic_ranges.iter_mut() {
-        if range.start >= index {
-            range.start += context_len;
-            range.end += context_len;
-        } else if range.end >= index {
-            range.end += context_len;
-        }
-    }
-    synthetic_ranges.push(index..index + context_len);
+    contexts.shift_after_insertion(index, context_len);
+    contexts.push(
+        index..index + context_len,
+        ShapingContextKind::SyntheticEdgeContext,
+    );
 }
 
 /// Remove shaping-only join controls from emitted text content.
@@ -187,7 +280,7 @@ pub(in crate::text) fn insert_synthetic_join_context(
 pub(in crate::text) fn text_without_synthetic_join_controls(
     text: &str,
     range: Range<usize>,
-    synthetic_ranges: &[Range<usize>],
+    contexts: &ShapingContextMap,
 ) -> String {
     let Some(slice) = text.get(range.clone()) else {
         return String::new();
@@ -196,10 +289,7 @@ pub(in crate::text) fn text_without_synthetic_join_controls(
         .char_indices()
         .filter_map(|(offset, character)| {
             let index = range.start + offset;
-            (!synthetic_ranges
-                .iter()
-                .any(|synthetic| synthetic.contains(&index)))
-            .then_some(character)
+            (!contexts.is_synthetic_at(index)).then_some(character)
         })
         .collect()
 }
@@ -213,7 +303,7 @@ pub(in crate::text) fn glyphs_without_synthetic_join_controls(
     glyphs: Vec<RenderedGlyph>,
     raw_text: &str,
     run_start: usize,
-    synthetic_ranges: &[Range<usize>],
+    contexts: &ShapingContextMap,
 ) -> Vec<RenderedGlyph> {
     let mut glyphs = glyphs.into_iter();
     let mut output = raw_text
@@ -221,11 +311,7 @@ pub(in crate::text) fn glyphs_without_synthetic_join_controls(
         .filter_map(|(offset, character)| {
             let mut glyph = glyphs.next()?;
             let index = run_start + offset;
-            if synthetic_ranges
-                .iter()
-                .any(|synthetic| synthetic.contains(&index))
-                || character_is_default_ignorable_code_point(character)
-            {
+            if contexts.is_synthetic_at(index) || character_is_join_control(character) {
                 None
             } else {
                 glyph.unicode = character.to_string();
@@ -237,8 +323,57 @@ pub(in crate::text) fn glyphs_without_synthetic_join_controls(
     output
 }
 
-/// A default-ignorable-only run that participated in shaping but must not
-/// contribute visible fallback geometry.
+/// An advance reported by the shaping backend, in its inline-axis coordinate
+/// system. It must not be added directly to CSS layout widths.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub(in crate::text) struct ShaperInlineAdvance(f32);
+
+impl ShaperInlineAdvance {
+    pub(in crate::text) fn from_parley(value: f32) -> Self {
+        Self(value)
+    }
+
+    pub(in crate::text) fn points(self) -> f32 {
+        self.0
+    }
+
+    pub(in crate::text) fn is_zero(self) -> bool {
+        self.0 == 0.0
+    }
+}
+
+/// A visual position reported by the shaping backend before conversion to
+/// physical paint coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub(in crate::text) struct ShaperVisualInlinePosition(f32);
+
+impl ShaperVisualInlinePosition {
+    pub(in crate::text) fn from_parley(value: f32) -> Self {
+        Self(value)
+    }
+
+    pub(in crate::text) fn points(self) -> f32 {
+        self.0
+    }
+}
+
+/// A CSS layout inline advance. Control-only shaping runs always convert to
+/// this zero value, regardless of a fallback font's nominal advance.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub(in crate::text) struct LayoutInlineAdvance(f32);
+
+impl LayoutInlineAdvance {
+    pub(in crate::text) fn zero() -> Self {
+        Self(0.0)
+    }
+
+    pub(in crate::text) fn points(self) -> f32 {
+        self.0
+    }
+}
+
+/// A control-only run that participated in shaping but must not contribute
+/// visible fallback geometry.
 ///
 /// Font fallback may select a face solely to map a ZWJ, ZWNJ, or another
 /// default-ignorable control. The control remains part of the shaping stream,
@@ -247,18 +382,24 @@ pub(in crate::text) fn glyphs_without_synthetic_join_controls(
 /// conversion removes the advance from those offsets when the run is omitted.
 /// <https://www.w3.org/TR/css-text-3/#text-encoding>
 #[derive(Debug, Clone, PartialEq)]
-pub(in crate::text) struct DroppedDefaultIgnorableRun {
-    pub(in crate::text) x_offset: f32,
-    pub(in crate::text) advance: f32,
+pub(in crate::text) struct SourceOnlyRun {
+    pub(in crate::text) visual_position: ShaperVisualInlinePosition,
+    pub(in crate::text) shaper_advance: ShaperInlineAdvance,
     /// Authored controls remain in extraction text even though this fallback
     /// run produces no paintable glyphs.
     pub(in crate::text) text: Rc<str>,
 }
 
+impl SourceOnlyRun {
+    pub(in crate::text) fn layout_inline_advance(&self) -> LayoutInlineAdvance {
+        LayoutInlineAdvance::zero()
+    }
+}
+
 /// Return whether a complete shaping run consists only of default-ignorable
 /// controls.
-pub(in crate::text) fn text_is_default_ignorable_only(text: &str) -> bool {
-    !text.is_empty() && text.chars().all(character_is_default_ignorable_code_point)
+pub(in crate::text) fn text_is_join_control_only(text: &str) -> bool {
+    !text.is_empty() && text.chars().all(character_is_join_control)
 }
 
 /// How a fallback run containing a default-ignorable shaping control converts
@@ -282,8 +423,8 @@ pub(in crate::text) struct ControlFallbackRehomeRequest {
     pub(in crate::text) fallback_font_id: usize,
     pub(in crate::text) text: Rc<str>,
     pub(in crate::text) font_size: f32,
-    pub(in crate::text) x_offset: f32,
-    pub(in crate::text) parley_advance: f32,
+    pub(in crate::text) visual_position: ShaperVisualInlinePosition,
+    pub(in crate::text) shaper_advance: ShaperInlineAdvance,
     pub(in crate::text) source_range: Option<Range<usize>>,
 }
 
@@ -297,7 +438,7 @@ pub(in crate::text) fn classify_control_fallback_cluster(
     text: &str,
     has_positioned_glyph: bool,
 ) -> ControlFallbackCluster {
-    if text_is_default_ignorable_only(text) {
+    if text_is_join_control_only(text) {
         return ControlFallbackCluster::DropControlOnly;
     }
     if has_positioned_glyph || !text.chars().any(character_is_join_control) {
@@ -334,16 +475,23 @@ fn character_has_simple_shaping(character: char) -> bool {
 /// Parley exposes run origins in physical visual order. Removing a positive
 /// advance therefore shifts only origins physically after the omitted run,
 /// independent of the run's logical bidi direction.
-pub(in crate::text) fn corrected_visual_run_x_offset(
-    x_offset: f32,
-    dropped_runs: &[DroppedDefaultIgnorableRun],
-) -> f32 {
-    x_offset
-        - dropped_runs
+pub(in crate::text) fn corrected_visual_inline_position(
+    position: ShaperVisualInlinePosition,
+    dropped_runs: &[SourceOnlyRun],
+) -> ShaperVisualInlinePosition {
+    debug_assert!(
+        dropped_runs
             .iter()
-            .filter(|dropped| dropped.x_offset < x_offset)
-            .map(|dropped| dropped.advance)
-            .sum::<f32>()
+            .all(|run| run.layout_inline_advance().points() == 0.0)
+    );
+    ShaperVisualInlinePosition(
+        position.0
+            - dropped_runs
+                .iter()
+                .filter(|dropped| dropped.visual_position < position)
+                .map(|dropped| dropped.shaper_advance.points())
+                .sum::<f32>(),
+    )
 }
 
 /// Stitch a re-homed control fallback fragment to its immediately following
@@ -388,7 +536,7 @@ pub(in crate::text) fn stitch_rehomed_control_fallback_run(
 /// run so extraction still preserves logical text without changing paint.
 pub(in crate::text) fn stitch_dropped_join_control_runs(
     runs: &mut Vec<ShapedGlyphRun>,
-    dropped_runs: &[DroppedDefaultIgnorableRun],
+    dropped_runs: &[SourceOnlyRun],
 ) {
     for dropped in dropped_runs {
         if !dropped.text.chars().any(character_is_join_control) {
@@ -397,14 +545,14 @@ pub(in crate::text) fn stitch_dropped_join_control_runs(
         let Some(previous_index) = runs
             .iter()
             .enumerate()
-            .filter(|(_, run)| run.x_offset <= dropped.x_offset)
+            .filter(|(_, run)| run.x_offset <= dropped.visual_position.points())
             .map(|(index, _)| index)
             .next_back()
         else {
             continue;
         };
         let next_index = (previous_index + 1..runs.len())
-            .find(|&index| runs[index].x_offset >= dropped.x_offset);
+            .find(|&index| runs[index].x_offset >= dropped.visual_position.points());
         let mut combined_text = String::from(runs[previous_index].text.as_ref());
         combined_text.push_str(&dropped.text);
         let can_merge_next = next_index.is_some_and(|index| {
@@ -463,7 +611,7 @@ pub(in crate::text) fn opentype_position_feature_substituted(
     face: &ttf_parser::Face<'_>,
     text: &str,
 ) -> bool {
-    let visible_glyphs = glyphs
+    let mut visible_glyphs = glyphs
         .iter()
         .filter(|glyph| !glyph.unicode.is_empty())
         .filter(|glyph| {
@@ -471,12 +619,10 @@ pub(in crate::text) fn opentype_position_feature_substituted(
                 .unicode
                 .chars()
                 .any(|character| !character_is_default_ignorable_code_point(character))
-        })
-        .collect::<Vec<_>>();
-    let visible_characters = text
+        });
+    let mut visible_characters = text
         .chars()
-        .filter(|character| !character_is_default_ignorable_code_point(*character))
-        .collect::<Vec<_>>();
+        .filter(|character| !character_is_default_ignorable_code_point(*character));
 
     // CSS Fonts requires an all-or-nothing choice for a super/subscript run:
     // if the requested OpenType feature cannot provide alternates for every
@@ -484,15 +630,22 @@ pub(in crate::text) fn opentype_position_feature_substituted(
     // single substituted digit as sufficient would mix Lato's `sups` glyphs
     // with ordinary spaces and punctuation.
     // <https://drafts.csswg.org/css-fonts-4/#font-variant-position-prop>
-    visible_characters.len() == visible_glyphs.len()
-        && !visible_characters.is_empty()
-        && visible_characters
-            .into_iter()
-            .zip(visible_glyphs)
-            .all(|(character, glyph)| {
-                face.glyph_index(character)
-                    .is_some_and(|nominal| Some(nominal.0) != glyph.painted_id())
-            })
+    let mut has_visible_character = false;
+    loop {
+        match (visible_characters.next(), visible_glyphs.next()) {
+            (Some(character), Some(glyph)) => {
+                has_visible_character = true;
+                let Some(nominal) = face.glyph_index(character) else {
+                    return false;
+                };
+                if Some(nominal.0) == glyph.painted_id() {
+                    return false;
+                }
+            }
+            (None, None) => return has_visible_character,
+            _ => return false,
+        }
+    }
 }
 
 /// Return whether a shaped glyph cluster represents only default-ignorable code points.
@@ -542,22 +695,69 @@ pub(in crate::text) fn glyph_is_non_painting_shaping_artifact(
             .is_some_and(|advance| advance != 0)
 }
 
+/// Return whether an empty-Unicode glyph in a join-control cluster is the
+/// fallback glyph for the control itself rather than a visible contextual
+/// glyph. CID 0 is the common fallback representation; the nominal joiner
+/// glyph IDs cover fonts that map the controls explicitly.
+pub(in crate::text) fn glyph_is_join_control_artifact(
+    face: &ttf_parser::Face<'_>,
+    glyph_id: u16,
+    unicode: &str,
+    cluster_text: &str,
+) -> bool {
+    unicode.is_empty()
+        && cluster_text.chars().any(character_is_join_control)
+        && (glyph_id == 0
+            || ['\u{200c}', '\u{200d}'].into_iter().any(|character| {
+                face.glyph_index(character)
+                    .is_some_and(|nominal| nominal.0 == glyph_id)
+            }))
+}
+
 pub(in crate::text) fn default_ignorable_cluster_has_shaping_glyph(
     face: &ttf_parser::Face<'_>,
-    run_text: &str,
+    cluster_text: &str,
     emitted_cluster_text: &str,
     glyphs: impl IntoIterator<Item = (u16, f32)>,
 ) -> bool {
-    run_text
+    if !cluster_text.chars().any(character_is_join_control) {
+        return cluster_text
+            .chars()
+            .any(|character| !character_is_default_ignorable_code_point(character))
+            && glyphs.into_iter().any(|(glyph_id, advance)| {
+                advance != 0.0
+                    && !emitted_cluster_text.chars().any(|character| {
+                        face.glyph_index(character)
+                            .is_some_and(|nominal| nominal.0 == glyph_id)
+                    })
+            });
+    }
+    let nominal_cluster_glyphs = cluster_text
+        .chars()
+        .filter_map(|character| face.glyph_index(character).map(|glyph| glyph.0))
+        .collect::<Vec<_>>();
+    if cluster_text
         .chars()
         .any(|character| !character_is_default_ignorable_code_point(character))
-        && glyphs.into_iter().any(|(glyph_id, advance)| {
+    {
+        return glyphs.into_iter().any(|(glyph_id, advance)| {
             advance != 0.0
                 && !emitted_cluster_text.chars().any(|character| {
                     face.glyph_index(character)
                         .is_some_and(|nominal| nominal.0 == glyph_id)
                 })
-        })
+        });
+    }
+
+    // A complex shaper may assign the visible contextual glyph to the
+    // cluster containing an edge join control. Such a cluster is still
+    // source-default-ignorable, but dropping it wholesale would discard the
+    // neighboring letter's glyph. Keep nonzero glyphs that are neither the
+    // nominal control glyph nor CID 0; the per-glyph artifact checks below
+    // remove the control/fallback glyphs while retaining the contextual one.
+    glyphs.into_iter().any(|(glyph_id, advance)| {
+        advance != 0.0 && glyph_id != 0 && !nominal_cluster_glyphs.contains(&glyph_id)
+    })
 }
 
 #[cfg(test)]
@@ -565,10 +765,12 @@ mod tests {
     use super::*;
     use crate::document::paint::text::RenderedTextMatrix;
     #[test]
-    fn default_ignorable_only_text_is_recognized_as_shaping_control() {
-        assert!(text_is_default_ignorable_only("\u{200c}\u{200d}"));
-        assert!(!text_is_default_ignorable_only("f\u{200c}i"));
-        assert!(!text_is_default_ignorable_only(""));
+    fn join_control_only_text_is_distinguished_from_other_ignorables() {
+        assert!(text_is_join_control_only("\u{200c}\u{200d}"));
+        assert!(!text_is_join_control_only("f\u{200c}i"));
+        assert!(!text_is_join_control_only("\u{fe0f}"));
+        assert!(!text_is_join_control_only("\u{00ad}"));
+        assert!(!text_is_join_control_only(""));
     }
 
     #[test]
@@ -597,15 +799,36 @@ mod tests {
 
     #[test]
     fn dropped_default_ignorable_run_shifts_later_visual_origins() {
-        let dropped_runs = [DroppedDefaultIgnorableRun {
-            x_offset: 10.0,
-            advance: 3.0,
+        let dropped_runs = [SourceOnlyRun {
+            visual_position: ShaperVisualInlinePosition::from_parley(10.0),
+            shaper_advance: ShaperInlineAdvance::from_parley(3.0),
             text: Rc::from(""),
         }];
 
-        assert_eq!(corrected_visual_run_x_offset(5.0, &dropped_runs), 5.0);
-        assert_eq!(corrected_visual_run_x_offset(10.0, &dropped_runs), 10.0);
-        assert_eq!(corrected_visual_run_x_offset(16.0, &dropped_runs), 13.0);
+        assert_eq!(
+            corrected_visual_inline_position(
+                ShaperVisualInlinePosition::from_parley(5.0),
+                &dropped_runs,
+            )
+            .points(),
+            5.0
+        );
+        assert_eq!(
+            corrected_visual_inline_position(
+                ShaperVisualInlinePosition::from_parley(10.0),
+                &dropped_runs,
+            )
+            .points(),
+            10.0
+        );
+        assert_eq!(
+            corrected_visual_inline_position(
+                ShaperVisualInlinePosition::from_parley(16.0),
+                &dropped_runs,
+            )
+            .points(),
+            13.0
+        );
     }
 
     #[test]
@@ -614,20 +837,34 @@ mod tests {
         // logical text order. The correction therefore depends only on the
         // physical origins Parley provided.
         let dropped_runs = [
-            DroppedDefaultIgnorableRun {
-                x_offset: 18.0,
-                advance: 2.0,
+            SourceOnlyRun {
+                visual_position: ShaperVisualInlinePosition::from_parley(18.0),
+                shaper_advance: ShaperInlineAdvance::from_parley(2.0),
                 text: Rc::from(""),
             },
-            DroppedDefaultIgnorableRun {
-                x_offset: 6.0,
-                advance: 1.5,
+            SourceOnlyRun {
+                visual_position: ShaperVisualInlinePosition::from_parley(6.0),
+                shaper_advance: ShaperInlineAdvance::from_parley(1.5),
                 text: Rc::from(""),
             },
         ];
 
-        assert_eq!(corrected_visual_run_x_offset(12.0, &dropped_runs), 10.5);
-        assert_eq!(corrected_visual_run_x_offset(24.0, &dropped_runs), 20.5);
+        assert_eq!(
+            corrected_visual_inline_position(
+                ShaperVisualInlinePosition::from_parley(12.0),
+                &dropped_runs,
+            )
+            .points(),
+            10.5
+        );
+        assert_eq!(
+            corrected_visual_inline_position(
+                ShaperVisualInlinePosition::from_parley(24.0),
+                &dropped_runs,
+            )
+            .points(),
+            20.5
+        );
     }
 
     #[test]

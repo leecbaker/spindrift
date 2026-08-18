@@ -118,7 +118,7 @@ pub(crate) fn parse_counter_resets(value: &str) -> Option<Vec<CounterReset>> {
 /// leaking into the counter model.
 /// <https://drafts.csswg.org/css-values-4/#calc-notation>
 /// <https://drafts.csswg.org/css-lists-3/#counter-properties>
-fn parse_counter_integer<'i, 't>(
+pub(in crate::css) fn parse_counter_integer<'i, 't>(
     input: &mut Parser<'i, 't>,
 ) -> Result<i32, cssparser::ParseError<'i, ()>> {
     if let Ok(value) = input.try_parse(|input| input.expect_integer()) {
@@ -130,7 +130,13 @@ fn parse_counter_integer<'i, 't>(
         return Err(input.new_custom_error(()));
     }
     input.parse_nested_block(|input| {
-        let Some(MathValue::Number(value)) = parse_math_sum(input, 0.0, ROOT_FONT_SIZE_PT) else {
+        // Counter-style descriptors are not attached to an element. Use the
+        // initial font-size descriptor context for font-relative terms rather
+        // than a zero-length placeholder, so expressions such as
+        // `sign(100em - 1px)` retain their CSS Values dimension semantics.
+        let Some(MathValue::Number(value)) =
+            parse_math_sum(input, ROOT_FONT_SIZE_PT, ROOT_FONT_SIZE_PT)
+        else {
             return Err(input.new_custom_error(()));
         };
         if !input.is_exhausted()
@@ -143,6 +149,19 @@ fn parse_counter_integer<'i, 't>(
         }
         Ok(value as i32)
     })
+}
+
+/// Parse a complete CSS `<integer>` value for a descriptor that shares the
+/// counter grammar but is not itself a CSS Lists counter property.
+///
+/// `@counter-style` uses this for `fixed`, `range`, `pad`, and
+/// `additive-symbols`.
+/// <https://drafts.csswg.org/css-counter-styles-3/#counter-style-system>
+pub(in crate::css) fn parse_counter_style_integer(value: &str) -> Option<i32> {
+    let mut input = ParserInput::new(trim_css_value(value));
+    let mut parser = Parser::new(&mut input);
+    let value = parse_counter_integer(&mut parser).ok()?;
+    parser.is_exhausted().then_some(value)
 }
 
 pub(crate) fn is_counter_name(value: &str) -> bool {

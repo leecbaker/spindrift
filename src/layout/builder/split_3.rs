@@ -45,10 +45,34 @@ pub(in crate::layout) fn collect_target_element_text(node: &Node, output: &mut S
 /// size before layout consumes used values:
 /// <https://www.w3.org/TR/css-page-3/#page-model> and
 /// <https://www.w3.org/TR/CSS22/box.html#padding-properties>.
+#[allow(dead_code)]
 pub(in crate::layout) fn page_box_edges_from_declarations_with_ch_advance(
     declarations: &Declarations,
     page_size: PageSize,
     ch_advance: LayoutLength,
+) -> PageBoxEdges {
+    let mut style = ComputedStyle::initial();
+    css::apply_declarations(&mut style, declarations);
+    page_box_edges_from_declarations_with_ch_advance_and_root_metrics(
+        declarations,
+        page_size,
+        ch_advance,
+        css::RootFontMetricLengthBasis {
+            font_size: layout_pt(style.font_size),
+            ch_advance,
+            x_height: layout_pt(style.font_size * 0.5),
+            cap_height: layout_pt(style.font_size * 0.7),
+            ic_advance: ch_advance,
+            line_height: layout_pt(style.line_height),
+        },
+    )
+}
+
+pub(in crate::layout) fn page_box_edges_from_declarations_with_ch_advance_and_root_metrics(
+    declarations: &Declarations,
+    page_size: PageSize,
+    ch_advance: LayoutLength,
+    root_metrics: css::RootFontMetricLengthBasis,
 ) -> PageBoxEdges {
     if declarations.is_empty() {
         return PageBoxEdges::ZERO;
@@ -56,12 +80,14 @@ pub(in crate::layout) fn page_box_edges_from_declarations_with_ch_advance(
     let mut style = ComputedStyle::initial();
     css::apply_declarations(&mut style, declarations);
     style.resolve_font_metric_lengths(ch_advance);
+    style.resolve_root_font_metric_lengths(root_metrics);
     PageBoxEdges {
         border: used_border_widths(&style),
-        padding: css::page_padding_from_for_size_with_ch_advance(
+        padding: css::page_padding_from_for_size_with_ch_advance_and_root_metrics(
             declarations,
             page_size,
             ch_advance,
+            root_metrics,
         ),
     }
 }
@@ -73,6 +99,7 @@ pub(in crate::layout) fn page_box_edges_from_declarations_with_ch_advance(
 /// page padding:
 /// <https://www.w3.org/TR/css-backgrounds-3/#the-background-origin> and
 /// <https://www.w3.org/TR/css-page-3/#page-model>.
+#[allow(dead_code)]
 pub(in crate::layout) fn page_background_positioning_area(
     declarations: &Declarations,
     base_margins: PageMargins,
@@ -80,15 +107,53 @@ pub(in crate::layout) fn page_background_positioning_area(
     origin: css::BackgroundBox,
     ch_advance: LayoutLength,
 ) -> PaintRect {
-    let edges =
-        page_box_edges_from_declarations_with_ch_advance(declarations, page_size, ch_advance);
-    let margins = css::page_margins_from_for_size_and_edges_with_ch_advance(
+    let style = ComputedStyle::initial();
+    page_background_positioning_area_with_root_metrics(
         declarations,
-        base_margins,
         page_size,
-        edges.total(),
+        base_margins,
+        origin,
         ch_advance,
+        css::RootFontMetricLengthBasis {
+            font_size: layout_pt(style.font_size),
+            ch_advance,
+            x_height: layout_pt(style.font_size * 0.5),
+            cap_height: layout_pt(style.font_size * 0.7),
+            ic_advance: ch_advance,
+            line_height: layout_pt(style.line_height),
+        },
+    )
+}
+
+pub(in crate::layout) fn page_background_positioning_area_with_root_metrics(
+    declarations: &Declarations,
+    page_size: PageSize,
+    base_margins: PageMargins,
+    origin: css::BackgroundBox,
+    ch_advance: LayoutLength,
+    root_metrics: css::RootFontMetricLengthBasis,
+) -> PaintRect {
+    let edges = page_box_edges_from_declarations_with_ch_advance_and_root_metrics(
+        declarations,
+        page_size,
+        ch_advance,
+        root_metrics,
     );
+    let mut page_style = ComputedStyle::initial();
+    css::apply_declarations(&mut page_style, declarations);
+    let margins =
+        css::page_margins_from_for_size_and_edges_with_ch_advance_and_page_context_style_and_root_metrics(
+            declarations,
+            base_margins,
+            page_size,
+            css::PageMarginResolutionContext {
+                viewport_size: page_size,
+                non_margin_edges: edges.total(),
+                ch_advance,
+                style: &page_style,
+                root_metrics,
+            },
+        );
     let border_box = paint_space_rect(
         margins.left(),
         margins.bottom(),

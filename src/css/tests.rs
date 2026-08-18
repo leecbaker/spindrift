@@ -1,4 +1,7 @@
-use super::values::{edge_all, parse_computed_length_percentage};
+use super::values::{
+    edge_all, parse_computed_length_percentage, parse_computed_line_height,
+    parse_deferred_font_size,
+};
 use super::*;
 use crate::css::page::page_style_for_declarations;
 use crate::{
@@ -22,9 +25,57 @@ fn flex_basis_percentage(value: ComputedLengthPercentage) -> ComputedFlexBasis {
 
 fn list_style_image_url(style: &ComputedStyle) -> Option<&str> {
     match style.list_style_image.as_image()?.selected_image() {
-        BackgroundImage::Url { src, .. } => Some(src),
+        BackgroundImage::Url(url) => Some(&url.href),
         _ => None,
     }
+}
+
+#[test]
+fn image_rendering_preserves_each_specified_keyword() {
+    assert_eq!(parse_image_rendering("auto"), Some(ImageRendering::Auto));
+    assert_eq!(
+        parse_image_rendering("smooth"),
+        Some(ImageRendering::Smooth)
+    );
+    assert_eq!(
+        parse_image_rendering("high-quality"),
+        Some(ImageRendering::HighQuality)
+    );
+    assert_eq!(
+        parse_image_rendering("pixelated"),
+        Some(ImageRendering::Pixelated)
+    );
+    assert_eq!(
+        parse_image_rendering("crisp-edges"),
+        Some(ImageRendering::CrispEdges)
+    );
+    assert_eq!(
+        parse_image_rendering("optimizeSpeed"),
+        Some(ImageRendering::CrispEdges)
+    );
+    assert_eq!(
+        parse_image_rendering("optimizeQuality"),
+        Some(ImageRendering::Smooth)
+    );
+}
+
+#[test]
+fn image_rendering_cascades_and_inherits_the_specified_keyword() {
+    let parent = style_for_element_with_signature(
+        ElementSignature::new("div", HashMap::new()),
+        Some("image-rendering: pixelated"),
+        &Stylesheets::borrowed(&[html5_user_agent_stylesheet()]),
+        None,
+        &[],
+    );
+    let child = style_for_element_with_signature(
+        ElementSignature::new("img", HashMap::new()),
+        None,
+        &Stylesheets::borrowed(&[html5_user_agent_stylesheet()]),
+        Some(&parent),
+        &[ElementSignature::new("div", HashMap::new())],
+    );
+    assert_eq!(child.image_rendering, ImageRendering::Pixelated);
 }
 
 #[test]
@@ -41,6 +92,31 @@ fn baseline_shift_used_value_preserves_layout_length_type() {
             .length_percentage_shift(layout_pt(20.0));
 
     assert_eq!(shift, layout_pt(10.0));
+}
+
+#[test]
+fn background_attachment_longhand_updates_each_image_layer() {
+    let declarations = parse_declarations(
+        "background-image: url(first.png), url(second.png); background-attachment: fixed, local",
+    );
+    let mut style = ComputedStyle::initial();
+
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(
+        style.background.background_attachment,
+        BackgroundAttachment::Fixed
+    );
+    assert_eq!(style.background.background_layers.len(), 2);
+    assert_eq!(
+        style
+            .background
+            .background_layers
+            .iter()
+            .map(|layer| layer.attachment)
+            .collect::<Vec<_>>(),
+        vec![BackgroundAttachment::Fixed, BackgroundAttachment::Local],
+    );
 }
 
 #[tokio::test]
@@ -102,6 +178,60 @@ async fn page_size_viewport_units_use_the_initial_page_box() {
     assert_eq!(
         page_size_from(&stylesheet.page_declarations, base),
         PageSize::from_points(432.0, 360.0)
+    );
+}
+
+#[tokio::test]
+async fn page_descriptors_use_the_document_root_font_metric_snapshot() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "@page { font-size: 100pt; size: 2rem 3rch; margin: 1rlh; padding: 1rex }",
+    ));
+    let root_metrics = RootFontMetricLengthBasis {
+        font_size: layout_pt(10.0),
+        ch_advance: layout_pt(2.0),
+        x_height: layout_pt(3.0),
+        cap_height: layout_pt(4.0),
+        ic_advance: layout_pt(5.0),
+        line_height: layout_pt(6.0),
+    };
+    let page_size = page_size_from_with_ch_advance_and_root_metrics(
+        &stylesheet.page_declarations,
+        PageSize::A4_POINTS,
+        layout_pt(50.0),
+        root_metrics,
+    );
+    let mut page_style = ComputedStyle::initial();
+    apply_declarations(&mut page_style, &stylesheet.page_declarations);
+    let margins =
+        page_margins_from_for_size_and_edges_with_ch_advance_and_page_context_style_and_root_metrics(
+            &stylesheet.page_declarations,
+            PageMargins::all_points(0.0),
+            page_size,
+            PageMarginResolutionContext {
+                viewport_size: PageSize::A4_POINTS,
+                non_margin_edges: Edges::ZERO,
+                ch_advance: layout_pt(50.0),
+                style: &page_style,
+                root_metrics,
+            },
+        );
+    let padding = page_padding_from_for_size_with_ch_advance_and_root_metrics(
+        &stylesheet.page_declarations,
+        page_size,
+        layout_pt(50.0),
+        root_metrics,
+    );
+
+    assert_eq!(page_size, PageSize::from_points(20.0, 6.0));
+    assert_eq!(margins, PageMargins::all_points(6.0));
+    assert_eq!(
+        padding,
+        Edges {
+            top: 3.0,
+            right: 3.0,
+            bottom: 3.0,
+            left: 3.0,
+        }
     );
 }
 
@@ -1456,6 +1586,41 @@ async fn lang_pseudo_class_matches_basic_and_inherited_languages() {
 
     assert_eq!(english.color, CssColor::new(0, 0, 255));
     assert_eq!(inherited.color, CssColor::new(255, 0, 0));
+    assert!(parent.language.shares_tag_storage_with(&inherited.language));
+}
+
+#[tokio::test]
+async fn unrecognized_html_language_tags_match_only_their_own_lang_ranges() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "p { color: black } p:lang(xyzzy) { color: green } p:lang(abcde) { color: red }",
+    ));
+    let direct = style_for_element_with_signature(
+        ElementSignature::new(
+            "p",
+            HashMap::from([("lang".to_string(), "XYZzy".to_string())]),
+        ),
+        None,
+        std::slice::from_ref(&stylesheet),
+        None,
+        &[],
+    );
+    let parent = ComputedStyle {
+        language: ContentLanguage::from_html_attribute("xyzzy"),
+        ..ComputedStyle::initial()
+    };
+    let inherited = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        std::slice::from_ref(&stylesheet),
+        Some(&parent),
+        &[],
+    );
+
+    assert_eq!(direct.color, CssColor::new(0, 128, 0));
+    assert_eq!(direct.language.as_deref(), None);
+    assert_eq!(inherited.color, CssColor::new(0, 128, 0));
+    assert_eq!(inherited.language.as_deref(), None);
+    assert!(parent.language.shares_tag_storage_with(&inherited.language));
 }
 
 #[tokio::test]
@@ -1478,6 +1643,32 @@ async fn malformed_html_language_tags_do_not_match_lang_or_drive_typography() {
     assert_eq!(style.language.as_deref(), None);
     let ContentLanguage::Tagged(tag) = style.language else {
         panic!("a malformed but present HTML lang value remains tagged")
+    };
+    assert_eq!(tag.as_str(), "ja_Hang");
+}
+
+#[tokio::test]
+async fn inherited_malformed_html_language_tags_remain_selector_and_typography_ineligible() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "p { color: black } p:lang(ja) { color: red }",
+    ));
+    let parent = ComputedStyle {
+        language: ContentLanguage::from_html_attribute("ja_Hang"),
+        ..ComputedStyle::initial()
+    };
+    let style = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        std::slice::from_ref(&stylesheet),
+        Some(&parent),
+        &[],
+    );
+
+    assert_eq!(style.color, CssColor::BLACK);
+    assert_eq!(style.language.as_deref(), None);
+    assert!(parent.language.shares_tag_storage_with(&style.language));
+    let ContentLanguage::Tagged(tag) = style.language else {
+        panic!("an inherited malformed HTML lang value remains tagged")
     };
     assert_eq!(tag.as_str(), "ja_Hang");
 }
@@ -1977,6 +2168,97 @@ async fn static_link_history_pseudo_classes_keep_links_unvisited() {
 }
 
 #[tokio::test]
+async fn visited_link_colors_use_actual_state_without_exposing_layout_state() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "a:link { color: rgb(255 0 0 / .5); display: block; opacity: .75; column-rule-color: rgb(255 0 0 / .5), rgb(0 128 0 / .25) } \
+         a:visited { color: blue; display: none; opacity: .1; column-rule-color: blue, yellow } \
+         .parent { background-color: red } \
+         .parent:has(:visited) { background-color: blue } \
+         a:visited .descendant { border-top-color: blue }",
+    ));
+    let visited_link =
+        ElementSignature::new("a", HashMap::from([("href".to_string(), "".to_string())]))
+            .with_link_state(LinkState::Visited);
+
+    let style = style_for_element_with_signature(
+        visited_link.clone(),
+        None,
+        std::slice::from_ref(&stylesheet),
+        None,
+        &[],
+    );
+    assert_eq!(style.color, CssColor::rgba(0, 0, 255, 0.5));
+    assert_eq!(style.display, Display::BLOCK);
+    assert_eq!(style.opacity, 0.75);
+    assert_eq!(
+        style.column_rule.colors.value_for_index(0, 2),
+        Some(CssColor::rgba(255, 0, 0, 0.5))
+    );
+    assert_eq!(
+        style
+            .column_rule
+            .visited_colors
+            .as_ref()
+            .and_then(|colors| colors.value_for_index(0, 2)),
+        Some(CssColor::new(0, 0, 255))
+    );
+
+    let parent = ElementSignature::new(
+        "div",
+        HashMap::from([("class".to_string(), "parent".to_string())]),
+    )
+    .with_children(
+        vec![
+            ElementSiblingSignature::new(
+                "a",
+                HashMap::from([("href".to_string(), "".to_string())]),
+            )
+            .with_link_state(LinkState::Visited),
+        ],
+        false,
+    );
+    let parent_rule = stylesheet
+        .rules
+        .iter()
+        .find(|rule| rule.selector_text.contains(":has(:visited)"))
+        .expect("fixture contains the visited relational selector");
+    assert!(
+        crate::css::selector::selector_matches_with_scope_proximity_in_chain_with_link_matching(
+            &parent_rule.selector,
+            &parent_rule.scopes,
+            &crate::css::selector::selector_chain(&parent, &[]),
+            0,
+            &mut selectors::context::SelectorCaches::default(),
+            crate::css::selector::LinkMatching::Actual,
+        )
+        .is_some()
+    );
+    let parent_style = style_for_element_with_signature(
+        parent,
+        None,
+        std::slice::from_ref(&stylesheet),
+        None,
+        &[],
+    );
+    assert_eq!(
+        parent_style.background.background_color.color(),
+        Some(CssColor::new(0, 0, 255))
+    );
+
+    let descendant_style = style_for_element_with_signature(
+        ElementSignature::new(
+            "div",
+            HashMap::from([("class".to_string(), "descendant".to_string())]),
+        ),
+        None,
+        std::slice::from_ref(&stylesheet),
+        Some(&parent_style),
+        std::slice::from_ref(&visited_link),
+    );
+    assert_eq!(descendant_style.border_colors.top, CssColor::new(0, 0, 255));
+}
+
+#[tokio::test]
 async fn sibling_signatures_keep_child_snapshots_for_ancestor_has_rules() {
     let stylesheet = parse_stylesheet(&Css::from_string(
         ".container:has(> .a) { border-top-color: red }\
@@ -2013,7 +2295,7 @@ async fn sibling_signatures_keep_child_snapshots_for_ancestor_has_rules() {
             0,
             container_siblings,
         );
-        assert_eq!(container.child_signatures.len(), 2);
+        assert_eq!(container.children.len(), 2);
         let container_style = style_for_element_with_signature(
             container.clone(),
             None,
@@ -2389,7 +2671,7 @@ async fn form_state_pseudo_classes_use_html_disabled_and_local_constraint_state(
     )
     .with_children(fieldset_children.clone(), false);
     let legend = ElementSignature::with_siblings("legend", HashMap::new(), 0, fieldset_children)
-        .with_child_list(first_legend.children, false);
+        .with_child_list(first_legend.children.clone(), false);
     let enabled_inside_first_legend = style_for_element_with_signature(
         ElementSignature::with_siblings(
             "input",
@@ -2807,6 +3089,7 @@ async fn nested_generated_pseudo_declarations_do_not_style_the_originating_eleme
 async fn marker_style_inherits_without_cloning_non_inherited_properties() {
     let stylesheet = parse_stylesheet(&Css::from_string(
         r#"li {
+             display: list-item;
              color: red;
              font-size: 18pt;
              margin-left: 20pt;
@@ -2837,7 +3120,8 @@ async fn marker_style_inherits_without_cloning_non_inherited_properties() {
 #[tokio::test]
 async fn marker_all_property_expands_before_color_and_font_size_prepasses() {
     let stylesheet = parse_stylesheet(&Css::from_string(
-        r#"li::marker { all: initial; color: green; font-size: 18pt; content: "x" }"#,
+        r#"li { display: list-item }
+           li::marker { all: initial; color: green; font-size: 18pt; content: "x" }"#,
     ));
     let style = style_for_element_with_signature(
         ElementSignature::new("li", HashMap::new()),
@@ -2850,6 +3134,123 @@ async fn marker_all_property_expands_before_color_and_font_size_prepasses() {
 
     assert_eq!(marker.color, CssColor::new(0, 128, 0));
     assert_eq!(marker.font_size, 18.0);
+}
+
+#[tokio::test]
+async fn marker_text_properties_use_the_regular_text_cascade_without_accepting_layout() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        r#"li { display: list-item; writing-mode: vertical-rl }
+           li::marker {
+             direction: rtl;
+             unicode-bidi: plaintext;
+             writing-mode: horizontal-tb;
+             text-orientation: upright;
+             text-combine-upright: all;
+             letter-spacing: 2pt;
+             word-spacing: 3pt;
+             tab-size: 4;
+             word-break: break-all;
+             overflow-wrap: anywhere;
+             line-break: anywhere;
+             hyphens: none;
+             text-decoration: underline blue;
+             text-emphasis: filled dot red;
+             text-shadow: 1pt 2pt green;
+           }"#,
+    ));
+    let style = style_for_element_with_signature(
+        ElementSignature::new("li", HashMap::new()),
+        None,
+        &[stylesheet],
+        None,
+        &[],
+    );
+    let marker = style.marker_style.as_deref().expect("li has marker style");
+
+    assert_eq!(marker.direction, Direction::Rtl);
+    assert_eq!(marker.unicode_bidi, UnicodeBidi::Plaintext);
+    assert_eq!(marker.writing_mode, WritingMode::VerticalRl);
+    assert_eq!(marker.text_orientation, TextOrientation::Upright);
+    assert_eq!(marker.text_combine_upright, TextCombineUpright::All);
+    assert_eq!(
+        marker.letter_spacing,
+        ComputedLengthPercentage::from_points(2.0)
+    );
+    assert_eq!(
+        marker.word_spacing,
+        ComputedLengthPercentage::from_points(3.0)
+    );
+    assert_eq!(marker.tab_size, TabSize::Spaces(4.0));
+    assert_eq!(marker.word_break, WordBreak::BreakAll);
+    assert_eq!(marker.overflow_wrap, OverflowWrap::Anywhere);
+    assert_eq!(marker.line_break, LineBreak::Anywhere);
+    assert_eq!(marker.hyphens, Hyphens::None);
+    assert!(marker.text_decoration.underline);
+    assert_eq!(
+        marker.text_decoration.color,
+        CssColorOrCurrentColor::Color(CssColor::new(0, 0, 255))
+    );
+    assert_eq!(
+        marker
+            .text_emphasis_style
+            .mark_for_writing_mode(marker.writing_mode),
+        Some("\u{2022}")
+    );
+    assert_eq!(
+        marker.text_emphasis_color,
+        CssColorOrCurrentColor::Color(CssColor::new(255, 0, 0))
+    );
+    assert_eq!(marker.text_shadow.len(), 1);
+}
+
+#[tokio::test]
+async fn marker_all_unset_allows_later_supported_text_properties_to_win() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        r#"li { display: list-item; writing-mode: vertical-rl }
+           li::marker {
+             all: unset;
+             text-orientation: upright;
+             text-combine-upright: all;
+           }"#,
+    ));
+    let style = style_for_element_with_signature(
+        ElementSignature::new("li", HashMap::new()),
+        None,
+        &[stylesheet],
+        None,
+        &[],
+    );
+    let marker = style.marker_style.as_deref().expect("li has marker style");
+
+    assert_eq!(marker.text_orientation, TextOrientation::Upright);
+    assert_eq!(marker.text_combine_upright, TextCombineUpright::All);
+}
+
+#[tokio::test]
+async fn marker_text_orientation_cascades_through_a_descendant_selector() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "li { display: list-item } .test ol li::marker { text-orientation: upright }",
+    ));
+    let mut list_style = ComputedStyle::initial();
+    list_style.writing_mode = WritingMode::VerticalRl;
+    let style = style_for_element_with_signature(
+        ElementSignature::new("li", HashMap::new()),
+        None,
+        &[stylesheet],
+        Some(&list_style),
+        &[
+            ElementSignature::new("html", HashMap::new()),
+            ElementSignature::new("body", HashMap::new()),
+            ElementSignature::new(
+                "figure",
+                HashMap::from([("class".to_string(), "test".to_string())]),
+            ),
+            ElementSignature::new("ol", HashMap::new()),
+        ],
+    );
+    let marker = style.marker_style.as_deref().expect("li has marker style");
+
+    assert_eq!(marker.text_orientation, TextOrientation::Upright);
 }
 
 #[test]
@@ -3039,7 +3440,7 @@ async fn css_url_tokens_handle_quoted_parentheses() {
 
     assert!(matches!(
         style.background.background_image.as_image(),
-        Some(BackgroundImage::Url { src, .. }) if src == "images/report ) cover.png"
+        Some(BackgroundImage::Url(url)) if url.href == "images/report ) cover.png"
     ));
     assert_eq!(list_style_image_url(&style), Some("markers/a)b.png"));
 
@@ -3105,7 +3506,227 @@ async fn parses_color_image_background_image() {
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
     assert!(
-        matches!(style.background.background_image.as_image(), Some(BackgroundImage::CssColor(ColorImageColor::CssColor(color))) if *color == CssColor::new(0, 128, 0))
+        matches!(style.background.background_image.as_image(), Some(BackgroundImage::ImageFunction(ImageFunction { source: None, fallback_color: Some(ColorImageColor::CssColor(color)), directionality: None })) if *color == CssColor::new(0, 128, 0))
+    );
+}
+
+#[test]
+fn image_function_parsing_preserves_source_fallback_and_directionality() {
+    let source_only = parse_css_image(r#"image("green.png")"#, None, None);
+    assert!(matches!(
+        source_only,
+        ParsedImage::Image(ComputedImage::Image(image))
+            if matches!(*image, BackgroundImage::ImageFunction(ImageFunction {
+                source: Some(ImageUrl { ref href, .. }),
+                fallback_color: None,
+                directionality: None,
+            }) if href == "green.png")
+    ));
+
+    let source_and_fallback =
+        parse_css_image("image(rtl url(green.png), currentcolor)", None, None);
+    assert!(matches!(
+        source_and_fallback,
+        ParsedImage::Image(ComputedImage::Image(image))
+            if matches!(*image, BackgroundImage::ImageFunction(ImageFunction {
+                source: Some(ImageUrl { ref href, .. }),
+                fallback_color: Some(ColorImageColor::CurrentColor),
+                directionality: Some(ImageDirectionality::Rtl),
+            }) if href == "green.png")
+    ));
+
+    let directional = parse_css_image("image(rtl url(green.png), blue)", None, None);
+    assert!(matches!(
+        directional,
+        ParsedImage::Image(ComputedImage::Image(image))
+            if matches!(*image, BackgroundImage::ImageFunction(ImageFunction {
+                source: Some(ImageUrl { ref href, .. }),
+                fallback_color: Some(ColorImageColor::CssColor(color)),
+                directionality: Some(ImageDirectionality::Rtl),
+            }) if href == "green.png" && color == CssColor::new(0, 0, 255))
+    ));
+}
+
+#[test]
+fn image_function_rejects_duplicate_or_misordered_components() {
+    for value in [
+        "image()",
+        "image(url(one.png),)",
+        "image(red, blue)",
+        "image(url(one.png), url(two.png))",
+        "image(ltr, blue)",
+        "image(ltr red)",
+        "image(url(one.png) blue)",
+        "image(url(one.png), blue, red)",
+    ] {
+        assert!(
+            matches!(parse_css_image(value, None, None), ParsedImage::SyntaxError),
+            "expected invalid image() grammar: {value}"
+        );
+    }
+}
+
+#[test]
+fn light_dark_image_parsing_preserves_typed_branches_and_rejects_nonimages() {
+    let ParsedImage::Image(ComputedImage::Image(image)) = parse_css_image(
+        "light-dark(url(light.png), linear-gradient(red, blue))",
+        None,
+        None,
+    ) else {
+        panic!("expected a typed light-dark() image");
+    };
+    assert!(matches!(
+        *image,
+        BackgroundImage::LightDark(LightDarkImage { light, dark })
+            if matches!(*light, BackgroundImage::Url(ref url) if url.href == "light.png")
+                && matches!(*dark, BackgroundImage::LinearGradient(_))
+    ));
+
+    let ParsedImage::Image(ComputedImage::Image(image)) =
+        parse_css_image("light-dark(none, url(dark.png))", None, None)
+    else {
+        panic!("expected a typed light-dark() image");
+    };
+    assert!(matches!(
+        *image,
+        BackgroundImage::LightDark(LightDarkImage { light, dark })
+            if matches!(*light, BackgroundImage::CssColor(ColorImageColor::CssColor(color)) if color == CssColor::TRANSPARENT)
+                && matches!(*dark, BackgroundImage::Url(ref url) if url.href == "dark.png")
+    ));
+
+    for value in [
+        "light-dark(url(one.png))",
+        "light-dark(url(one.png),)",
+        "light-dark(url(one.png), blue)",
+    ] {
+        assert!(matches!(
+            parse_css_image(value, None, None),
+            ParsedImage::SyntaxError
+        ));
+    }
+    assert!(matches!(
+        parse_css_image("light-dark(red, blue)", None, None),
+        ParsedImage::NotAnImage
+    ));
+
+    let declarations = parse_declarations("background: light-dark(red, blue)");
+    let mut style = default_style_for_tag("div");
+    style.used_color_scheme = UsedColorScheme::Dark;
+    apply_declarations(&mut style, &declarations);
+    assert_eq!(
+        style
+            .background
+            .background_color
+            .resolved_color(style.color),
+        CssColor::new(0, 0, 255)
+    );
+}
+
+#[test]
+fn light_dark_image_selection_precedes_image_set_selection() {
+    let ParsedImage::Image(mut image) = parse_css_image(
+        "light-dark(\
+            image-set(url(light-one.png) 1x, url(light-two.png) 2x),\
+            image-set(url(dark-one.png) 1x, url(dark-two.png) 2x))",
+        None,
+        None,
+    ) else {
+        panic!("expected a light-dark() image");
+    };
+    image.resolve_for_context(ImageSelectionContext {
+        used_color_scheme: UsedColorScheme::Dark,
+        resolution_dppx: 1.5,
+    });
+    assert!(matches!(
+        image.as_image(),
+        Some(BackgroundImage::SelectedImageSet { image, resolution })
+            if *resolution == 2.0
+                && matches!(**image, BackgroundImage::Url(ref url) if url.href == "dark-two.png")
+    ));
+
+    assert!(matches!(
+        parse_css_image(
+            "image-set(light-dark(image-set(url(nested.png) 1x), url(dark.png)) 1x)",
+            None,
+            None,
+        ),
+        ParsedImage::SyntaxError
+    ));
+}
+
+#[tokio::test]
+async fn light_dark_images_resolve_for_all_typed_image_consumers() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "div {\
+             color-scheme: dark;\
+             background-image: light-dark(url(background-light.png), url(background-dark.png));\
+             border-image-source: light-dark(url(border-light.png), url(border-dark.png));\
+             mask-border-source: light-dark(url(mask-light.png), url(mask-dark.png));\
+             list-style-image: light-dark(url(marker-light.png), url(marker-dark.png));\
+             content: light-dark(url(content-light.png), url(content-dark.png));\
+             string-set: label light-dark(url(string-light.png), url(string-dark.png));\
+             shape-outside: light-dark(url(shape-light.png), url(shape-dark.png));\
+           }\
+           span {\
+             background-image: light-dark(url(inherited-light.png), url(inherited-dark.png));\
+           }",
+    ));
+    let parent = style_for_element_with_signature(
+        ElementSignature::new("div", HashMap::new()),
+        None,
+        std::slice::from_ref(&stylesheet),
+        None,
+        &[],
+    );
+    let child = style_for_element_with_signature(
+        ElementSignature::new("span", HashMap::new()),
+        None,
+        std::slice::from_ref(&stylesheet),
+        Some(&parent),
+        &[ElementSignature::new("div", HashMap::new())],
+    );
+    fn selected_url(image: &ComputedImage) -> Option<&str> {
+        match image.as_image()?.selected_image() {
+            BackgroundImage::Url(url) => Some(url.href.as_str()),
+            _ => None,
+        }
+    }
+
+    assert_eq!(parent.used_color_scheme, UsedColorScheme::Dark);
+    assert_eq!(
+        selected_url(&parent.background.background_image),
+        Some("background-dark.png")
+    );
+    assert_eq!(
+        selected_url(&parent.border_image.source),
+        Some("border-dark.png")
+    );
+    assert_eq!(
+        selected_url(&parent.mask_border_source),
+        Some("mask-dark.png")
+    );
+    assert_eq!(
+        selected_url(&parent.list_style_image),
+        Some("marker-dark.png")
+    );
+    let Content::Replacement { image, .. } = &parent.content else {
+        panic!("expected image replacement content");
+    };
+    let GeneratedContentPart::Image { image } = image else {
+        panic!("expected generated image content");
+    };
+    assert_eq!(selected_url(image), Some("content-dark.png"));
+    let NamedStringPart::Image(image) = &parent.string_sets[0].parts[0] else {
+        panic!("expected named-string image content");
+    };
+    assert_eq!(selected_url(image), Some("string-dark.png"));
+    assert!(matches!(
+        parent.shape_outside,
+        ShapeOutside::Image(BackgroundImage::Url(ref url)) if url.href == "shape-dark.png"
+    ));
+    assert_eq!(
+        selected_url(&child.background.background_image),
+        Some("inherited-dark.png")
     );
 }
 
@@ -3120,7 +3741,7 @@ async fn image_set_keeps_the_selected_candidate_resolution() {
         Some(BackgroundImage::ImageSet(set))
             if set.options.len() == 1
                 && set.options[0].resolution_dppx == 0.5
-                && matches!(*set.options[0].image, BackgroundImage::Url { ref src, .. } if src == "green.png")
+                && matches!(*set.options[0].image, BackgroundImage::Url(ref url) if url.href == "green.png")
     ));
 }
 
@@ -3134,7 +3755,7 @@ async fn invalid_image_set_does_not_replace_the_cascaded_background_image() {
 
     assert!(matches!(
         style.background.background_image.as_image(),
-        Some(BackgroundImage::Url { src, .. }) if src == "green.png"
+        Some(BackgroundImage::Url(url)) if url.href == "green.png"
     ));
 }
 
@@ -3184,7 +3805,7 @@ async fn malformed_image_set_type_does_not_replace_the_cascaded_image() {
 
     assert!(matches!(
         style.background.background_image.as_image(),
-        Some(BackgroundImage::Url { src, .. }) if src == "green.png"
+        Some(BackgroundImage::Url(url)) if url.href == "green.png"
     ));
 }
 
@@ -3200,7 +3821,7 @@ async fn supported_image_set_type_selects_its_candidate() {
         Some(BackgroundImage::ImageSet(set))
             if set.options.len() == 1
                 && set.options[0].resolution_dppx == 1.0
-                && matches!(*set.options[0].image, BackgroundImage::Url { ref src, .. } if src == "green.png")
+                && matches!(*set.options[0].image, BackgroundImage::Url(ref url) if url.href == "green.png")
     ));
 }
 
@@ -3224,7 +3845,7 @@ async fn image_set_selection_uses_the_rendering_density_after_mime_filtering() {
         style.background.background_image.as_image(),
         Some(BackgroundImage::SelectedImageSet { image, resolution })
             if *resolution == 2.0
-                && matches!(**image, BackgroundImage::Url { ref src, .. } if src == "two.png")
+                && matches!(**image, BackgroundImage::Url(ref url) if url.href == "two.png")
     ));
 }
 
@@ -3253,7 +3874,7 @@ async fn image_set_uses_component_value_aliases_and_escaped_string_sources() {
     assert!(matches!(
         style.background.background_image.as_image(),
         Some(BackgroundImage::ImageSet(set))
-            if matches!(*set.options[0].image, BackgroundImage::Url { ref src, .. } if src == "green.png")
+            if matches!(*set.options[0].image, BackgroundImage::Url(ref url) if url.href == "green.png")
                 && set.options[0].mime_type.as_deref() == Some("image/png")
     ));
 }
@@ -3288,7 +3909,7 @@ async fn malformed_image_set_mime_parameters_are_filtered_not_syntax_errors() {
     assert!(matches!(
         style.background.background_image.as_image(),
         Some(BackgroundImage::SelectedImageSet { image, .. })
-            if matches!(**image, BackgroundImage::Url { ref src, .. } if src == "good.png")
+            if matches!(**image, BackgroundImage::Url(ref url) if url.href == "good.png")
     ));
 }
 
@@ -3919,11 +4540,11 @@ async fn parses_comma_separated_background_layers() {
     assert_eq!(style.background.background_layers.len(), 2);
     assert!(matches!(
         style.background.background_layers[0].image.as_image(),
-        Some(BackgroundImage::Url { src, .. }) if src == "top.png"
+        Some(BackgroundImage::Url(url)) if url.href == "top.png"
     ));
     assert!(matches!(
         style.background.background_layers[1].image.as_image(),
-        Some(BackgroundImage::Url { src, .. }) if src == "bottom.png"
+        Some(BackgroundImage::Url(url)) if url.href == "bottom.png"
     ));
     assert_eq!(
         style.background.background_layers[0].repeat,
@@ -4110,12 +4731,12 @@ async fn parses_mixed_generated_content_parts() {
                     fallback: Some("Fallback".to_string()),
                 },
                 GeneratedContentPart::Image {
-                    image: ComputedImage::image(BackgroundImage::Url {
-                        src: "icon.png".to_string(),
+                    image: ComputedImage::image(BackgroundImage::Url(ImageUrl {
+                        href: "icon.png".to_string(),
                         base_url: None,
                         root_url: None,
                         request_modifiers: RequestUrlModifiers::default(),
-                    }),
+                    })),
                 },
             ],
             alt: None,
@@ -4329,12 +4950,12 @@ async fn parses_content_replacement_and_quotes_property() {
         style.content,
         Content::Replacement {
             image: GeneratedContentPart::Image {
-                image: ComputedImage::image(BackgroundImage::Url {
-                    src: "icon.png".to_string(),
+                image: ComputedImage::image(BackgroundImage::Url(ImageUrl {
+                    href: "icon.png".to_string(),
                     base_url: None,
                     root_url: None,
                     request_modifiers: RequestUrlModifiers::default(),
-                }),
+                })),
             },
             alt: Some(vec![GeneratedAltTextPart::Text("Icon".to_string())]),
         }
@@ -4585,7 +5206,7 @@ async fn parses_font_size_adjust_values() {
 }
 
 #[test]
-fn font_language_override_normalizes_tags_and_font_shorthand_resets_it() {
+fn font_language_override_preserves_case_and_font_shorthand_resets_it() {
     let mut parent = default_style_for_tag("p");
     apply_declarations(
         &mut parent,
@@ -4595,6 +5216,12 @@ fn font_language_override_normalizes_tags_and_font_shorthand_resets_it() {
         parent.font_language_override,
         FontLanguageOverride::OpenType(*b"TRK ")
     );
+    let lower_case_tag = crate::css::values::parse_font_language_override("\"trk\"");
+    assert_eq!(
+        lower_case_tag,
+        Some(FontLanguageOverride::OpenType(*b"trk "))
+    );
+    assert_ne!(lower_case_tag, Some(parent.font_language_override));
 
     let mut child = parent.clone();
     apply_declarations(
@@ -4670,7 +5297,7 @@ async fn font_size_adjust_inherits_and_resets_from_font_shorthand() {
 #[tokio::test]
 async fn font_size_adjust_applies_to_marker_and_generated_pseudo_styles() {
     let stylesheet = parse_stylesheet(&Css::from_string(
-        "li { font-size-adjust: 0.8 }
+        "li { display: list-item; font-size-adjust: 0.8 }
          li::marker { font-size-adjust: cap-height 0.7 }
          li::before { content: \"\"; font-size-adjust: from-font }",
     ));
@@ -4934,6 +5561,7 @@ async fn font_feature_controls_inherit_and_apply_to_marker_styles() {
     let stylesheet = parse_stylesheet(&Css::from_string(
         r#"p { font-feature-settings: "kern" off; font-variant-numeric: tabular-nums }
            p span { font-feature-settings: inherit; font-variant-numeric: inherit }
+           li { display: list-item }
            li::marker { font-feature-settings: "liga" off; font-variant-numeric: tabular-nums }"#,
     ));
     let parent = style_for_element_with_signature(
@@ -7588,6 +8216,20 @@ async fn ua_marker_default_is_bidi_isolated() {
 }
 
 #[tokio::test]
+async fn marker_rules_do_not_generate_marker_styles_for_non_list_items() {
+    let stylesheet = parse_stylesheet(&Css::from_string(r#"p::marker { content: "x" }"#));
+    let style = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        std::slice::from_ref(&stylesheet),
+        None,
+        &[],
+    );
+
+    assert!(style.marker_style.is_none());
+}
+
+#[tokio::test]
 async fn ua_marker_defaults_apply_to_nested_generated_markers() {
     let ua = html5_user_agent_stylesheet();
     let author = parse_stylesheet(&Css::from_string(
@@ -7662,7 +8304,7 @@ async fn list_style_image_preserves_image_set_resolution_and_rejects_invalid_val
         Some(BackgroundImage::ImageSet(set))
             if set.options.len() == 1
                 && set.options[0].resolution_dppx == 0.5
-                && matches!(*set.options[0].image, BackgroundImage::Url { ref src, .. } if src == "marker.png")
+                && matches!(*set.options[0].image, BackgroundImage::Url(ref url) if url.href == "marker.png")
     ));
 
     apply_declarations(
@@ -7676,7 +8318,7 @@ async fn list_style_image_preserves_image_set_resolution_and_rejects_invalid_val
         Some(BackgroundImage::ImageSet(set))
             if set.options.len() == 1
                 && set.options[0].resolution_dppx == 2.0
-                && matches!(*set.options[0].image, BackgroundImage::Url { ref src, .. } if src == "shorthand.png")
+                && matches!(*set.options[0].image, BackgroundImage::Url(ref url) if url.href == "shorthand.png")
     ));
 }
 
@@ -7811,9 +8453,55 @@ async fn symbols_function_rejects_unquoted_symbols_but_counter_styles_accept_ide
 }
 
 #[tokio::test]
+async fn counter_style_references_decode_custom_identifiers_in_lists_and_content() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        r"@counter-style \3BB \3B1 { system: cyclic; symbols: \2023; suffix: '' }",
+    ));
+    assert_eq!(stylesheet.counter_styles[0].name, "λα");
+
+    let declarations = parse_declarations(
+        r"list-style-type: \3BB \3B1; content: counter(item, \3BB \3B1) counters(item, '.', \3BB \3B1)",
+    );
+    let mut style = default_style_for_tag("li");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(
+        style.list_style_type,
+        ListStyleType::Named("λα".to_string())
+    );
+    let Content::List { parts, .. } = style.content else {
+        panic!("counter() and counters() should parse")
+    };
+    assert_eq!(
+        parts,
+        vec![
+            GeneratedContentPart::Counter {
+                name: "item".to_string(),
+                style: Some(ListStyleType::Named("λα".to_string())),
+            },
+            GeneratedContentPart::Counters {
+                name: "item".to_string(),
+                separator: ".".to_string(),
+                style: Some(ListStyleType::Named("λα".to_string())),
+            },
+        ]
+    );
+}
+
+#[test]
+fn predefined_counter_styles_other_than_the_six_reserved_names_can_be_redefined() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "@counter-style lower-roman { system: cyclic; symbols: r; suffix: ' ' }",
+    ));
+    assert_eq!(stylesheet.counter_styles.len(), 1);
+    assert_eq!(stylesheet.counter_styles[0].name, "lower-roman");
+    assert_eq!(stylesheet.counter_styles[0].symbols, ["r"]);
+}
+
+#[tokio::test]
 async fn parses_counter_style_range_intervals_and_auto() {
     let stylesheet = parse_stylesheet(&Css::from_string(
-        "@counter-style split { system: numeric; symbols: 0 1; range: 1 10, 20 infinite }\
+        "@counter-style split { system: numeric; symbols: \"0\" \"1\"; range: 1 10, 20 infinite }\
          @counter-style automatic { system: symbolic; symbols: x; range: auto }",
     ));
 
@@ -7917,7 +8605,8 @@ async fn parses_markers_of_before_and_after_pseudo_elements() {
 #[tokio::test]
 async fn marker_content_preserves_attr_for_layout_time_evaluation() {
     let stylesheet = parse_stylesheet(&Css::from_string(
-        r#"li::marker { content: attr(icon, "* ") }"#,
+        r#"li { display: list-item }
+           li::marker { content: attr(icon, "* ") }"#,
     ));
     let style = style_for_element_with_signature(
         ElementSignature::new(
@@ -8291,12 +8980,12 @@ async fn parses_named_string_sets() {
         style.string_sets[4].parts,
         vec![
             NamedStringPart::String("Icon".to_string()),
-            NamedStringPart::Image(ComputedImage::image(BackgroundImage::Url {
-                src: "icon.png".to_string(),
+            NamedStringPart::Image(ComputedImage::image(BackgroundImage::Url(ImageUrl {
+                href: "icon.png".to_string(),
                 base_url: None,
                 root_url: None,
                 request_modifiers: RequestUrlModifiers::default(),
-            }))
+            })))
         ]
     );
 }
@@ -10281,6 +10970,12 @@ async fn parses_reverse_flex_direction_and_wrap_values() {
 
 #[tokio::test]
 async fn parses_balanced_flex_wrap_with_cross_axis_direction() {
+    assert_eq!(
+        default_style_for_tag("div").flex_line_count,
+        FlexLineCount::ONE,
+        "the initial flex-line-count is the CSS minimum of one"
+    );
+
     let declarations = parse_declarations("flex-wrap: balance wrap-reverse");
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
@@ -10299,7 +10994,7 @@ async fn parses_balanced_flex_wrap_with_cross_axis_direction() {
     apply_declarations(&mut style, &declarations);
     assert_eq!(
         style.flex_line_count,
-        FlexLineCount::Count(NonZeroUsize::new(4).expect("positive line count"))
+        FlexLineCount::new(NonZeroUsize::new(4).expect("positive line count"))
     );
 }
 
@@ -10699,6 +11394,69 @@ async fn embedded_html5_ua_stylesheet_matches_weasyprint_defaults() {
 }
 
 #[tokio::test]
+async fn html5_ua_centers_table_headers_only_when_parent_alignment_is_initial() {
+    let ua = html5_user_agent_stylesheet();
+    let initial_parent = default_style_for_tag("tr");
+
+    let ua_default = style_for_element_with_signature(
+        ElementSignature::new("th", HashMap::new()),
+        None,
+        &Stylesheets::borrowed(&[ua]),
+        Some(&initial_parent),
+        &[],
+    );
+    assert_eq!(ua_default.text_align, TextAlign::Center);
+
+    let non_initial_parent = ComputedStyle {
+        text_align: TextAlign::End,
+        ..default_style_for_tag("tr")
+    };
+    let inherited_end = style_for_element_with_signature(
+        ElementSignature::new("th", HashMap::new()),
+        None,
+        &Stylesheets::borrowed(&[ua]),
+        Some(&non_initial_parent),
+        &[],
+    );
+    assert_eq!(inherited_end.text_align, TextAlign::End);
+
+    let author = parse_stylesheet(&Css::from_string("th { text-align: inherit }"));
+    let inherited = style_for_element_with_signature(
+        ElementSignature::new("th", HashMap::new()),
+        None,
+        &Stylesheets::borrowed(&[ua, &author]),
+        Some(&initial_parent),
+        &[],
+    );
+    assert_eq!(inherited.text_align, TextAlign::Start);
+}
+
+#[tokio::test]
+async fn html5_ua_centers_table_captions_unless_author_css_overrides_it() {
+    let ua = html5_user_agent_stylesheet();
+    let parent = default_style_for_tag("table");
+
+    let ua_default = style_for_element_with_signature(
+        ElementSignature::new("caption", HashMap::new()),
+        None,
+        &Stylesheets::borrowed(&[ua]),
+        Some(&parent),
+        &[],
+    );
+    assert_eq!(ua_default.text_align, TextAlign::Center);
+
+    let author = parse_stylesheet(&Css::from_string("caption { text-align: end }"));
+    let overridden = style_for_element_with_signature(
+        ElementSignature::new("caption", HashMap::new()),
+        None,
+        &Stylesheets::borrowed(&[ua, &author]),
+        Some(&parent),
+        &[],
+    );
+    assert_eq!(overridden.text_align, TextAlign::End);
+}
+
+#[tokio::test]
 async fn css_text_ua_preformatted_elements_disable_autospace() {
     let ua = html5_user_agent_stylesheet();
     let parent = default_style_for_tag("body");
@@ -10771,6 +11529,105 @@ async fn author_rules_override_user_agent_stylesheet_at_equal_specificity() {
 
     assert_eq!(style.margin, Edges::ZERO);
     assert_eq!(style.font_size, 10.0);
+}
+
+#[tokio::test]
+async fn html_list_type_presentational_hints_follow_element_and_case_rules() {
+    let ua = html5_user_agent_stylesheet();
+    let hints = html5_presentational_hints_stylesheet();
+    let stylesheets = [ua, &hints];
+    let stylesheets = Stylesheets::borrowed(&stylesheets);
+    let style_for_type = |tag: &str, value: &str| {
+        style_for_element_with_signature(
+            ElementSignature::new(
+                tag,
+                HashMap::from([("type".to_string(), value.to_string())]),
+            ),
+            None,
+            &stylesheets,
+            None,
+            &[],
+        )
+    };
+
+    for value in [
+        "decimal",
+        "DECIMAL",
+        "1",
+        "lower-alpha",
+        "LOWER-ALPHA",
+        "a",
+        "upper-alpha",
+        "UPPER-ALPHA",
+        "A",
+        "lower-roman",
+        "LOWER-ROMAN",
+        "i",
+        "upper-roman",
+        "UPPER-ROMAN",
+        "I",
+        "disk",
+        "DISK",
+        "x",
+    ] {
+        assert_eq!(
+            style_for_type("ul", value).list_style_type,
+            ListStyleType::Disc,
+            "ul[type={value}] must keep the unordered-list default"
+        );
+    }
+
+    for (value, expected) in [
+        ("1", ListStyleType::Decimal),
+        ("a", ListStyleType::Named("lower-alpha".to_string())),
+        ("A", ListStyleType::Named("upper-alpha".to_string())),
+        ("i", ListStyleType::Named("lower-roman".to_string())),
+        ("I", ListStyleType::Named("upper-roman".to_string())),
+    ] {
+        for tag in ["ol", "li"] {
+            assert_eq!(
+                style_for_type(tag, value).list_style_type,
+                expected,
+                "{tag}[type={value}]"
+            );
+        }
+    }
+
+    for (value, expected) in [
+        ("none", ListStyleType::None),
+        ("NONE", ListStyleType::None),
+        ("disc", ListStyleType::Disc),
+        ("DISC", ListStyleType::Disc),
+        ("circle", ListStyleType::Circle),
+        ("CIRCLE", ListStyleType::Circle),
+        ("square", ListStyleType::Square),
+        ("SQUARE", ListStyleType::Square),
+    ] {
+        for tag in ["ul", "li"] {
+            assert_eq!(
+                style_for_type(tag, value).list_style_type,
+                expected,
+                "{tag}[type={value}]"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn author_overflow_visible_overrides_the_replaced_element_ua_clip() {
+    let ua = html5_user_agent_stylesheet();
+    let author = parse_stylesheet(&Css::from_string("img.default { overflow: visible }"));
+    let parent = default_style_for_tag("body");
+    let style = style_for_element_with_signature(
+        ElementSignature::new("img", HashMap::from([("class".into(), "default".into())])),
+        None,
+        &Stylesheets::borrowed(&[ua, &author]),
+        Some(&parent),
+        &[],
+    );
+
+    assert_eq!(style.overflow_x, Overflow::Visible);
+    assert_eq!(style.overflow_y, Overflow::Visible);
 }
 
 #[tokio::test]
@@ -10851,6 +11708,97 @@ async fn replaced_element_dimension_hints_map_to_css_and_respect_author_css() {
         panic!("author CSS width should remain definite");
     };
     assert!((width.length_points() - 40.0 * CSS_PX_TO_PT).abs() < 0.001);
+}
+
+#[tokio::test]
+async fn image_button_uses_replaced_element_hints_without_text_control_defaults() {
+    let ua = html5_user_agent_stylesheet();
+    let hints = html5_presentational_hints_stylesheet();
+    let automatic_style = style_for_element_with_signature(
+        ElementSignature::new(
+            "input",
+            HashMap::from([("type".to_string(), "IMAGE".to_string())]),
+        ),
+        None,
+        &Stylesheets::borrowed(&[ua, &hints]),
+        None,
+        &[],
+    );
+    assert!(automatic_style.box_values.width.is_auto());
+    assert!(automatic_style.box_values.height.value().is_auto());
+    assert_eq!(automatic_style.padding, Edges::ZERO);
+    assert_eq!(automatic_style.border_styles, BorderStyles::NONE);
+
+    let image_button = ElementSignature::new(
+        "input",
+        HashMap::from([
+            ("type".to_string(), "IMAGE".to_string()),
+            ("width".to_string(), "100".to_string()),
+            ("height".to_string(), "50".to_string()),
+        ]),
+    );
+    let style = style_for_element_with_signature(
+        image_button,
+        None,
+        &Stylesheets::borrowed(&[ua, &hints]),
+        None,
+        &[],
+    );
+
+    let ComputedLengthPercentageOrAuto::LengthPercentage(width) = style.box_values.width else {
+        panic!("image button width attribute should map to CSS width");
+    };
+    let ComputedLengthPercentageOrAuto::LengthPercentage(height) =
+        style.box_values.height.value().clone()
+    else {
+        panic!("image button height attribute should map to CSS height");
+    };
+    assert!((width.length_points() - 100.0 * CSS_PX_TO_PT).abs() < 0.001);
+    assert!((height.length_points() - 50.0 * CSS_PX_TO_PT).abs() < 0.001);
+    assert_eq!(style.padding, Edges::ZERO);
+    assert_eq!(style.border_styles, BorderStyles::NONE);
+    assert_eq!(
+        style.aspect_ratio,
+        AspectRatio::auto_with_ratio(2.0).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn replaced_element_dimension_hints_apply_to_xhtml_namespace_images() {
+    let ua = html5_user_agent_stylesheet();
+    let hints = html5_presentational_hints_stylesheet();
+    let image = ElementSignature::new(
+        "img",
+        HashMap::from([
+            ("width".to_string(), "100".to_string()),
+            ("height".to_string(), "50".to_string()),
+        ]),
+    )
+    .with_document_is_html(false)
+    .with_namespace("http://www.w3.org/1999/xhtml", Vec::new());
+
+    let style = style_for_element_with_signature(
+        image,
+        None,
+        &Stylesheets::borrowed(&[ua, &hints]),
+        None,
+        &[],
+    );
+
+    let ComputedLengthPercentageOrAuto::LengthPercentage(width) = style.box_values.width else {
+        panic!("XHTML img width attribute should map to CSS width");
+    };
+    let ComputedLengthPercentageOrAuto::LengthPercentage(height) =
+        style.box_values.height.value().clone()
+    else {
+        panic!("XHTML img height attribute should map to CSS height");
+    };
+    assert!((width.length_points() - 100.0 * CSS_PX_TO_PT).abs() < 0.001);
+    assert!((height.length_points() - 50.0 * CSS_PX_TO_PT).abs() < 0.001);
+    assert_eq!(
+        style.aspect_ratio,
+        AspectRatio::auto_with_ratio(2.0).unwrap()
+    );
 }
 
 #[tokio::test]
@@ -11215,6 +12163,20 @@ async fn table_dynamic_presentational_hints_use_css_values_and_author_precedence
     assert_eq!(width.length_points(), 25.0);
     assert_eq!(overridden.border_spacing.horizontal.length_points(), 2.0);
     assert_eq!(overridden.border_colors.top, CssColor::new(0, 0, 255));
+
+    let mut column_attrs = HashMap::new();
+    column_attrs.insert("width".to_string(), "40".to_string());
+    let column = style_for_element_with_signature(
+        ElementSignature::new("col", column_attrs),
+        None,
+        &Stylesheets::borrowed(&[ua, &hints]),
+        None,
+        &[],
+    );
+    let ComputedLengthPercentageOrAuto::LengthPercentage(width) = column.box_values.width else {
+        panic!("column width hint should map to a CSS length");
+    };
+    assert!((width.length_points() - 40.0 * CSS_PX_TO_PT).abs() < 0.001);
 }
 
 #[tokio::test]
@@ -12226,7 +13188,7 @@ async fn parses_border_image_longhands() {
             .source
             .as_image()
             .and_then(|source| match source.selected_image() {
-                BackgroundImage::Url { src, .. } => Some(src.as_str()),
+                BackgroundImage::Url(url) => Some(url.href.as_str()),
                 _ => None,
             }),
         Some("images/border.png")
@@ -12315,7 +13277,7 @@ async fn parses_border_image_shorthand_and_resets_omitted_longhands() {
             .source
             .as_image()
             .and_then(|source| match source.selected_image() {
-                BackgroundImage::Url { src, .. } => Some(src.as_str()),
+                BackgroundImage::Url(url) => Some(url.href.as_str()),
                 _ => None,
             }),
         Some("images/border.png")
@@ -12460,6 +13422,25 @@ async fn parses_border_radius_shorthand_lengths_and_percentages() {
             .percentage_coefficient_or_zero(),
         0.2
     );
+}
+
+#[tokio::test]
+async fn border_radius_shorthand_preserves_a_zero_horizontal_radius() {
+    let declarations = parse_declarations("border-radius: 0em / 5em");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    for radius in [
+        style.border_radius.top_left,
+        style.border_radius.top_right,
+        style.border_radius.bottom_right,
+        style.border_radius.bottom_left,
+    ] {
+        assert_eq!(radius.x.value.length_points(), 0.0);
+        // The initial CSS `medium` font size is 16px, i.e. 12pt at the
+        // CSS reference pixel ratio. `5em` therefore resolves to 60pt.
+        assert_eq!(radius.y.value.length_points(), 60.0);
+    }
 }
 
 #[tokio::test]
@@ -13126,6 +14107,48 @@ async fn ch_text_decoration_inset_preserves_font_metric_component_until_used_res
         TextDecorationInset::Lengths { start, end }
             if start == ComputedLengthPercentage::from_points(12.0)
                 && end == ComputedLengthPercentage::from_points(1.0)
+    ));
+}
+
+#[test]
+fn text_decoration_origin_layer_refreshes_font_metric_lengths() {
+    let declarations = parse_declarations(
+        "text-decoration: underline; text-decoration-inset: -0.5ch; text-decoration-thickness: 1ch; text-underline-offset: 0.25ch",
+    );
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    style.rebuild_own_text_decoration_layer();
+    assert_eq!(style.text_decoration_layers.len(), 1);
+    assert!(matches!(
+        style.text_decoration_layers[0].decoration.inset,
+        TextDecorationInset::Lengths { ref start, ref end }
+            if *start == ComputedLengthPercentage::from_ch(-0.5)
+                && *end == ComputedLengthPercentage::from_ch(-0.5)
+    ));
+
+    style.resolve_font_metric_lengths(layout_pt(6.0));
+    style.rebuild_own_text_decoration_layer();
+    style.rebuild_own_text_decoration_layer();
+
+    assert_eq!(style.text_decoration_layers.len(), 1);
+    let layer = &style.text_decoration_layers[0];
+    assert!(layer.origin_style.text_decoration_layers.is_empty());
+    assert!(matches!(
+        layer.decoration.inset,
+        TextDecorationInset::Lengths { ref start, ref end }
+            if *start == ComputedLengthPercentage::from_points(-3.0)
+                && *end == ComputedLengthPercentage::from_points(-3.0)
+    ));
+    assert!(matches!(
+        layer.decoration.thickness,
+        TextDecorationThickness::LengthPercentage(ref value)
+            if *value == ComputedLengthPercentage::from_points(6.0)
+    ));
+    assert!(matches!(
+        layer.decoration.underline_offset,
+        TextUnderlineOffset::LengthPercentage(ref value)
+            if *value == ComputedLengthPercentage::from_points(1.5)
     ));
 }
 
@@ -16498,6 +17521,27 @@ async fn revert_applies_to_page_context_declarations() {
 }
 
 #[tokio::test]
+async fn normal_user_page_declarations_do_not_override_author_preferences() {
+    let author = parse_stylesheet(&Css::from_string("@page { margin: 2in }"));
+    let user = parse_stylesheet(&Css::from_string("@page { margin: 3in }").with_user_origin());
+    let page_rules = author
+        .page_rules
+        .iter()
+        .chain(user.page_rules.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let margins = page_margins_from(
+        &cascade_page_declarations(&page_rules, 1),
+        PageMargins::all_points(0.0),
+    );
+
+    // A CLI stylesheet is a user preference: an explicit author page rule
+    // remains authoritative under the normal CSS cascade.
+    assert_eq!(margins, PageMargins::all_points(144.0));
+}
+
+#[tokio::test]
 async fn user_important_revert_applies_to_page_context_declarations() {
     let ua = parse_stylesheet(&Css::from_string("@page { margin: 1in }").with_user_agent_origin());
     let author = parse_stylesheet(&Css::from_string("@page { margin: 2in !important }"));
@@ -17581,6 +18625,29 @@ fn deferred_font_size_detects_only_parent_ch_dependencies() {
 }
 
 #[test]
+fn deferred_font_size_resolves_lh_against_parent_line_height() {
+    let font_size = parse_deferred_font_size("calc(1lh + 2pt)").unwrap();
+    let parent = FontRelativeLengthBasis::new(layout_pt(10.0), layout_pt(5.0))
+        .with_line_height(layout_pt(24.0));
+
+    assert_eq!(font_size.resolve(parent), layout_pt(26.0));
+}
+
+#[test]
+fn line_height_uses_inherited_lh_and_own_selected_metrics() {
+    let mut line_height = parse_computed_line_height("calc(1lh + 1ex)", 20.0).unwrap();
+    line_height.resolve_inherited_line_height_relative_lengths(layout_pt(24.0));
+    line_height.resolve_selected_font_metric_lengths(SelectedFontMetricLengthBasis::new(
+        layout_pt(10.0),
+        layout_pt(10.0),
+        layout_pt(8.0),
+        layout_pt(14.0),
+    ));
+
+    assert_eq!(line_height.projected(20.0).0, 32.0);
+}
+
+#[test]
 fn object_fit_parses_and_cascades() {
     let mut style = ComputedStyle::initial();
     apply_declarations(
@@ -17653,10 +18720,15 @@ fn computed_style_ch_advance_query_matches_font_metric_projection() {
 #[test]
 fn computed_style_selected_font_metrics_include_ic_ex_and_cap() {
     for declaration in [
+        "width: 2ch",
         "width: 2ic",
         "width: calc(100px + 2ic)",
         "width: 2ex",
         "width: 2cap",
+        "line-height: 2ch",
+        "line-height: calc(100px + 2ic)",
+        "line-height: 2ex",
+        "line-height: 2cap",
     ] {
         let mut style = ComputedStyle::initial();
         apply_declarations(&mut style, &parse_declarations(declaration));
@@ -17666,6 +18738,141 @@ fn computed_style_selected_font_metrics_include_ic_ex_and_cap() {
 
     let style = ComputedStyle::initial();
     assert!(!style.requires_selected_font_metrics());
+}
+
+#[test]
+fn computed_style_root_font_metric_query_matches_root_metric_projection() {
+    fn projected_requires_root_font_metrics(style: &ComputedStyle) -> bool {
+        let zero = layout_pt(0.0);
+        let mut projected = style.clone();
+        // `rem` resolves during computed-value finalization, before the
+        // document-root selected-font metric snapshot is needed.
+        projected.finalize_computed_font_relative_lengths();
+        let normalized = projected.clone();
+        projected.resolve_root_font_metric_lengths(RootFontMetricLengthBasis {
+            font_size: zero,
+            ch_advance: zero,
+            x_height: zero,
+            cap_height: zero,
+            ic_advance: zero,
+            line_height: zero,
+        });
+        normalized != projected
+            || [
+                style.marker_style.as_deref(),
+                style.before_style.as_deref(),
+                style.after_style.as_deref(),
+                style.first_line_style.as_deref(),
+                style.first_letter_style.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(projected_requires_root_font_metrics)
+    }
+
+    for (declarations, expected) in [
+        ("", false),
+        ("line-height: 2rex", true),
+        ("width: 2rcap", true),
+        ("margin-left: 2rch", true),
+        ("padding-top: 2ric", true),
+        ("height: 2rlh", true),
+        ("width: 2rem", false),
+    ] {
+        let mut style = ComputedStyle::initial();
+        apply_declarations(&mut style, &parse_declarations(declarations));
+
+        assert_eq!(
+            style.requires_root_font_metrics(),
+            expected,
+            "declarations: {declarations}",
+        );
+        assert_eq!(
+            style.requires_root_font_metrics(),
+            projected_requires_root_font_metrics(&style),
+            "declarations: {declarations}",
+        );
+    }
+
+    let root_metric_calc_sizes = [
+        (
+            CalcSize {
+                basis: CalcSizeBasis::Auto,
+                size_multiplier: 0.0,
+                additive: ComputedLengthPercentage::from_rex(1.0),
+                lower_bound: None,
+                upper_bound: None,
+            },
+            "additive term",
+        ),
+        (
+            CalcSize {
+                basis: CalcSizeBasis::Auto,
+                size_multiplier: 0.0,
+                additive: ComputedLengthPercentage::ZERO,
+                lower_bound: Some(CalcSizeAffine {
+                    size_multiplier: 0.0,
+                    additive: ComputedLengthPercentage::from_rcap(1.0),
+                }),
+                upper_bound: None,
+            },
+            "lower bound",
+        ),
+        (
+            CalcSize {
+                basis: CalcSizeBasis::Auto,
+                size_multiplier: 0.0,
+                additive: ComputedLengthPercentage::ZERO,
+                lower_bound: None,
+                upper_bound: Some(CalcSizeAffine {
+                    size_multiplier: 0.0,
+                    additive: ComputedLengthPercentage::from_rch(1.0),
+                }),
+            },
+            "upper bound",
+        ),
+        (
+            CalcSize {
+                basis: CalcSizeBasis::LengthPercentage(ComputedLengthPercentage::from_ric(1.0)),
+                size_multiplier: 0.0,
+                additive: ComputedLengthPercentage::ZERO,
+                lower_bound: None,
+                upper_bound: None,
+            },
+            "length-percentage basis",
+        ),
+    ];
+    for (value, source) in root_metric_calc_sizes {
+        let mut style = ComputedStyle::initial();
+        style.box_values.width = ComputedLengthPercentageOrAuto::CalcSize(value);
+
+        assert!(style.requires_root_font_metrics(), "{source}");
+        assert!(projected_requires_root_font_metrics(&style), "{source}");
+    }
+
+    fn root_metric_child() -> ComputedStyle {
+        let mut child = ComputedStyle::initial();
+        child.box_values.width = ComputedLengthPercentageOrAuto::LengthPercentage(
+            ComputedLengthPercentage::from_rlh(1.0),
+        );
+        child
+    }
+
+    let mut style = ComputedStyle::initial();
+    style.marker_style = Some(Box::new(root_metric_child()));
+    assert!(style.requires_root_font_metrics());
+    let mut style = ComputedStyle::initial();
+    style.before_style = Some(Box::new(root_metric_child()));
+    assert!(style.requires_root_font_metrics());
+    let mut style = ComputedStyle::initial();
+    style.after_style = Some(Box::new(root_metric_child()));
+    assert!(style.requires_root_font_metrics());
+    let mut style = ComputedStyle::initial();
+    style.first_line_style = Some(Box::new(root_metric_child()));
+    assert!(style.requires_root_font_metrics());
+    let mut style = ComputedStyle::initial();
+    style.first_letter_style = Some(Box::new(root_metric_child()));
+    assert!(style.requires_root_font_metrics());
 }
 
 #[test]

@@ -57,7 +57,7 @@ Tests can be found at `~/projects/quire-wpt/third_party/wpt`.
 
 The latest results for each web platform test are in `~/projects/quire-wpt/results/engine-cache/`. Use those to figure out pass rate for a group or to find tests to work on.
 
-Use `quire-wpt evaluate-test <path>` to render and evaluate one WPT test by its exact path across every configured engine, producing the normal PDFs, raster artifacts, diffs, and report. It is exact selection rather than a prefix filter; add `--include-scripts` only when evaluating a script-driven test. `quire-wpt` can be run with cargo inside `~/projects/quire-wpt/`.
+Use `quire-wpt evaluate-test <path>` to render and evaluate one WPT test by its exact path across every configured engine, producing the normal PDFs, raster artifacts, diffs, and report. It is exact selection rather than a prefix filter; add `--include-scripts` only when evaluating a script-driven test. `quire-wpt` can be run with cargo inside `~/projects/quire-wpt/`. Make sure to compile the release binary yourself before running.
 
 ### Fixing Web Platform Tests
 

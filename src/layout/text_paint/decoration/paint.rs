@@ -1,5 +1,54 @@
 use super::super::positioning::rendered_text_line_width;
 use super::*;
+use crate::css::BoxDecorationBreak;
+use crate::layout::text_paint::TextDecorationOriginFragmentGeometry;
+
+/// Resolve decoration endpoint adjustments for one fragment of the
+/// decorating box.
+///
+/// For `slice`, the percentage basis is the complete decorating-box chain and
+/// positive adjustments continue into later fragments when they consume an
+/// earlier fragment. Negative adjustments extend only the outer endpoint. For
+/// `clone`, each fragment has its own basis and both edges are adjusted.
+/// <https://drafts.csswg.org/css-text-decor-4/#text-decoration-inset-property>
+fn text_decoration_fragment_insets(
+    decoration: &TextDecorationLayer,
+    fragment: &TextDecorationOriginFragmentGeometry,
+) -> (f32, f32) {
+    debug_assert!(std::rc::Rc::ptr_eq(
+        &decoration.origin_style,
+        &fragment.origin_style
+    ));
+    let percentage_basis = match fragment.origin_style.box_decoration_break {
+        BoxDecorationBreak::Slice => fragment.total_inline_extent,
+        BoxDecorationBreak::Clone => fragment.fragment_inline_extent,
+    };
+    let (start, end) = decoration
+        .decoration
+        .inset
+        .clone()
+        .used(percentage_basis, fragment.origin_style.font_size);
+    match fragment.origin_style.box_decoration_break {
+        BoxDecorationBreak::Clone => (start, end),
+        BoxDecorationBreak::Slice => {
+            let start = if start.is_sign_positive() {
+                (start - fragment.preceding_inline_extent.points()).max(0.0)
+            } else if fragment.is_first_fragment {
+                start
+            } else {
+                0.0
+            };
+            let end = if end.is_sign_positive() {
+                (end - fragment.following_inline_extent.points()).max(0.0)
+            } else if fragment.is_last_fragment {
+                end
+            } else {
+                0.0
+            };
+            (start, end)
+        }
+    }
+}
 
 impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn paint_text_shadows(
@@ -91,29 +140,6 @@ impl<'a> LayoutBuilder<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(in crate::layout) fn paint_text_decoration_lines_for_phase_with_line_geometries(
-        &mut self,
-        x: f32,
-        baseline_y: f32,
-        width: f32,
-        style: &ComputedStyle,
-        runs: &[RenderedTextRun],
-        phase: TextDecorationPaintPhase,
-        line_geometries: &[TextDecorationOriginLineGeometry],
-    ) {
-        self.paint_text_decoration_lines_for_phase_with_color_and_line_geometries(
-            x,
-            baseline_y,
-            width,
-            style,
-            runs,
-            phase,
-            None,
-            line_geometries,
-        );
-    }
-
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::layout) fn paint_text_decoration_lines_for_phase_with_color(
         &mut self,
         x: f32,
@@ -154,7 +180,7 @@ impl<'a> LayoutBuilder<'a> {
         }
         for decoration in &decorations {
             let line_geometry = line_geometries.iter().find(|geometry| {
-                std::rc::Rc::ptr_eq(&geometry.origin_style, &decoration.origin_style)
+                std::rc::Rc::ptr_eq(&geometry.layer.origin_style, &decoration.origin_style)
             });
             self.paint_text_decoration_layer(
                 x,
@@ -200,11 +226,15 @@ impl<'a> LayoutBuilder<'a> {
                 .color
                 .resolve(decoration.origin_style.color)
         });
-        let (inset_start, inset_end) = decoration
-            .decoration
-            .inset
-            .clone()
-            .used(origin_style.font_size);
+        let (inset_start, inset_end) = line_geometry
+            .map(|geometry| text_decoration_fragment_insets(decoration, &geometry.origin_fragment))
+            .unwrap_or_else(|| {
+                decoration
+                    .decoration
+                    .inset
+                    .clone()
+                    .used(layout_pt(width), origin_style.font_size)
+            });
         let (baseline, geometry) = if let Some(line_geometry) = line_geometry {
             let baseline = match style.writing_mode {
                 WritingMode::HorizontalTb => PaintPoint::new(x, line_geometry.line_reference.y),

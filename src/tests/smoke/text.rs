@@ -780,6 +780,26 @@ async fn supports_complex_predefined_counter_style_markers() {
 }
 
 #[tokio::test]
+async fn disclosure_counter_styles_follow_generated_content_context() {
+    let document = Html::from_string(
+        "<style>@page { size: 220pt 120pt; margin: 10pt } body, p, ul, li { margin: 0; padding: 0; font-size: 10pt; line-height: 12pt } body { counter-reset: item 0 } p { counter-increment: item } p::before { content: counter(item, disclosure-closed) \" \" counters(item, \"/\", disclosure-open) \" \" } ul { list-style-position: inside } li::marker { content: counter(list-item, disclosure-closed) \" \" }</style><p dir=rtl>RTL</p><p style=\"writing-mode: vertical-lr\">Vertical</p><ul style=\"writing-mode: vertical-rl; direction: rtl\"><li>Marker</ul>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let text = document
+        .pages
+        .iter()
+        .flat_map(|page| page.lines())
+        .map(|line| line.text.as_str())
+        .collect::<String>();
+    assert!(text.contains("RTL ▾ ◂"), "{text}");
+    assert!(text.contains("▾ ▸ Vertical"), "{text}");
+    assert!(text.contains("Marker ▴"), "{text}");
+}
+
+#[tokio::test]
 async fn supports_custom_counter_style_markers() {
     let document = Html::from_string(
         "<style>@page { size: 220pt 180pt; margin: 10pt } body { margin: 0; font-size: 10pt; line-height: 12pt } ol { margin: 0 0 4pt 18pt; padding-left: 0 }\
@@ -811,7 +831,7 @@ async fn supports_custom_counter_style_markers() {
     assert!(contains(&["☝ ", "One"]));
     assert!(contains(&["101) ", "Five"]));
     assert!(contains(&["[101] ", "Bracketed"]));
-    assert!(contains(&["[(0011)] ", "Negative"]));
+    assert!(contains(&["[(11)] ", "Negative"]));
     assert!(contains(&["c ", "Three"]));
     assert!(contains(&["d ", "Four"]));
     assert!(contains(&["VI ", "Six"]));
@@ -1136,8 +1156,11 @@ async fn generated_image_content_renders_inline_atom() {
 
     assert_eq!(document.pages[0].images().len(), 1);
     let image = &document.pages[0].images()[0];
-    assert!((image.width() - 8.0).abs() < 0.01);
-    assert!((image.height() - 6.0).abs() < 0.01);
+    // A generated pseudo's authored box remains 8×6pt, but its image payload
+    // uses the image's intrinsic CSS size (2×1 CSS pixels = 1.5×0.75pt).
+    // <https://www.w3.org/TR/css-content-3/#content-property>
+    assert!((image.width() - 1.5).abs() < 0.01);
+    assert!((image.height() - 0.75).abs() < 0.01);
     assert!(
         document.pages[0]
             .lines()
@@ -1669,6 +1692,184 @@ async fn inside_list_markers_participate_in_first_line() {
 }
 
 #[tokio::test]
+async fn empty_inside_list_items_keep_their_marker_line_boxes() {
+    let document = Html::from_string(
+        "<style>@page { size: 140pt 120pt; margin: 10pt } body, ol, li { margin: 0; padding: 0; font-size: 10pt; line-height: 12pt } ol { list-style-position: inside }</style><ol>\n  <li>\n  <li>\n  <li>\n</ol>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let markers = document.pages[0]
+        .lines()
+        .iter()
+        .filter(|line| matches!(line.text.as_str(), "1." | "2." | "3."))
+        .collect::<Vec<_>>();
+    assert_eq!(markers.len(), 3);
+    assert!(
+        markers[0].y() > markers[1].y() && markers[1].y() > markers[2].y(),
+        "{markers:?}"
+    );
+}
+
+#[tokio::test]
+async fn marker_only_inside_items_advance_their_parent_block_flow() {
+    let document = Html::from_string(
+        "<style>@page { size: 180pt 160pt; margin: 10pt } body, ol, li, p { margin: 0; padding: 0; font-size: 10pt; line-height: 12pt } ol { list-style-position: inside }</style><ol><li><li><li></ol><ol><li><li></ol><p>after</p>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let markers = page
+        .lines()
+        .iter()
+        .filter(|line| matches!(line.text.as_str(), "1." | "2." | "3."))
+        .collect::<Vec<_>>();
+    assert_eq!(markers.len(), 5, "{:#?}", page.lines());
+    assert!(
+        markers.windows(2).all(|pair| pair[0].y() > pair[1].y()),
+        "marker-only list items must remain distinct block-flow lines: {markers:?}"
+    );
+    let after = page
+        .lines()
+        .iter()
+        .find(|line| line.text.contains("after"))
+        .expect("following block should be painted");
+    assert!(
+        markers.last().unwrap().y() > after.y(),
+        "following block overlapped the marker-only lists: {markers:?}, {after:?}"
+    );
+}
+
+#[tokio::test]
+async fn custom_marker_only_inside_items_advance_their_parent_block_flow() {
+    let document = Html::from_string(
+        "<style>@page { size: 180pt 120pt; margin: 10pt } body, ol, li, p { margin: 0; padding: 0; font-size: 10pt; line-height: 12pt } ol { list-style-position: inside; list-style-type: chapter } @counter-style chapter { system: fixed 1; symbols: \"A\" \"B\"; prefix: \"Appendix \"; suffix: \"! \"; }</style><ol><li><li></ol><p>after</p>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let markers = page
+        .lines()
+        .iter()
+        .filter(|line| line.text.contains("Appendix "))
+        .collect::<Vec<_>>();
+    assert_eq!(markers.len(), 2, "{:#?}", page.lines());
+    assert!(markers[0].text.contains('A') && markers[1].text.contains('B'));
+    assert!(markers[0].y() > markers[1].y(), "{markers:?}");
+    let after = page
+        .lines()
+        .iter()
+        .find(|line| line.text.contains("after"))
+        .expect("following block should be painted");
+    assert!(markers[1].y() > after.y(), "{markers:?}, {after:?}");
+}
+
+#[tokio::test]
+async fn empty_inside_marker_lines_use_the_marker_line_height() {
+    let document = Html::from_string(
+        "<style>@page { size: 140pt 160pt; margin: 10pt } body, ol, li { margin: 0; padding: 0; font-size: 10pt; line-height: 12pt } ol { list-style-position: inside } li::marker { font-size: 24pt; line-height: 24pt }</style><ol><li><li></ol>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let markers = document.pages[0]
+        .lines()
+        .iter()
+        .filter(|line| matches!(line.text.as_str(), "1." | "2."))
+        .collect::<Vec<_>>();
+    assert_eq!(markers.len(), 2);
+    assert!(
+        markers[0].y() - markers[1].y() > 20.0,
+        "marker line height did not advance layout: {markers:?}"
+    );
+}
+
+#[tokio::test]
+async fn empty_inside_marker_lines_paginate() {
+    let document = Html::from_string(
+        "<style>@page { size: 100pt 48pt; margin: 10pt } body, ol, li { margin: 0; padding: 0; font-size: 10pt; line-height: 16pt } ol { list-style-position: inside }</style><ol><li><li><li></ol>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert!(document.pages.len() >= 2, "{:#?}", document.pages);
+    let markers = document
+        .pages
+        .iter()
+        .flat_map(|page| page.lines())
+        .filter(|line| matches!(line.text.as_str(), "1." | "2." | "3."))
+        .count();
+    assert_eq!(markers, 3);
+}
+
+#[tokio::test]
+async fn empty_inside_marker_representation_does_not_paint_marker_text() {
+    let document = Html::from_string(
+        "<style>@page { size: 140pt 120pt; margin: 10pt } body, ul, li { margin: 0; padding: 0; font-size: 10pt; line-height: 12pt } ul { list-style-position: inside; list-style-type: \"\" }</style><ul><li></ul>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert!(
+        document.pages[0]
+            .lines()
+            .iter()
+            .all(|line| line.text.is_empty())
+    );
+}
+
+#[tokio::test]
+async fn empty_inside_marker_representation_does_not_advance_parent_flow() {
+    let style = "<style>@page { size: 140pt 120pt; margin: 10pt } body, ul, li, p { margin: 0; padding: 0; font-size: 10pt; line-height: 12pt } ul { list-style-position: inside; list-style-type: \"\" }</style>";
+    let with_empty_marker = Html::from_string(format!("{style}<ul><li></ul><p>after</p>"))
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+    let without_list = Html::from_string(format!("{style}<p>after</p>"))
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+    let after_y = |document: &quire::Document| {
+        document.pages[0]
+            .lines()
+            .iter()
+            .find(|line| line.text.contains("after"))
+            .expect("following block should be painted")
+            .y()
+    };
+    assert!(
+        (after_y(&with_empty_marker) - after_y(&without_list)).abs() < 0.01,
+        "an empty marker representation must not create a line"
+    );
+}
+
+#[tokio::test]
+async fn html_type_hints_use_author_redefined_counter_styles() {
+    let document = Html::from_string(
+        "<style>@page { size: 140pt 120pt; margin: 10pt } body, ol, li { margin: 0; padding: 0; font-size: 10pt; line-height: 12pt } ol { list-style-position: inside } @counter-style lower-roman { system: cyclic; symbols: r; suffix: \" \" } @counter-style upper-alpha { system: cyclic; symbols: A; suffix: \" \" }</style><ol type=\"i\"><li>one</li></ol><ol><li type=\"A\">two</li></ol>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let text = document.pages[0]
+        .lines()
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<String>();
+    assert!(text.contains('r'), "{text}");
+    assert!(text.contains('A'), "{text}");
+}
+
+#[tokio::test]
 async fn inside_generated_marker_segment_breaks_use_shared_whitespace_context() {
     let document = Html::from_string(
         "<style>\
@@ -1945,6 +2146,41 @@ async fn text_justify_inter_character_preserves_arabic_joining_sequences() {
         .collect::<Vec<_>>();
     assert_eq!(lines.len(), 1);
     assert!(rendered_line_advance(lines[0]) < 80.0);
+}
+
+#[tokio::test]
+async fn text_justify_auto_treats_bidi_controls_as_zero_width_cjk_boundaries() {
+    let document = Html::from_string(
+        "<style>@page { size: 200pt 100pt; margin: 10pt } body { margin: 0 } p { margin: 0; width: 3.9em; font-size: 12pt; line-height: 14pt; text-align: justify; text-align-last: justify }</style><p>東\u{2066}京都東京\u{2069}都東京都</p>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let visible = document.pages[0]
+        .lines()
+        .iter()
+        .map(|line| (line.text.as_str(), line.x(), line.y()))
+        .collect::<Vec<_>>();
+    assert!(
+        visible
+            .iter()
+            .all(|(text, _, _)| !text.contains('\u{2066}') && !text.contains('\u{2069}')),
+        "bidi controls must not reach painted/extracted text: {visible:?}"
+    );
+    let mut lines = std::collections::BTreeMap::<i32, Vec<&str>>::new();
+    for (text, _, y) in &visible {
+        lines.entry(y.round() as i32).or_default().push(*text);
+    }
+    assert_eq!(
+        lines.values().cloned().collect::<Vec<_>>(),
+        vec![
+            vec!["東", "京", "都"],
+            vec!["東", "京", "都"],
+            vec!["東", "京", "都"]
+        ],
+        "controls must not change the selected CJK line boundaries: {visible:?}"
+    );
 }
 
 #[tokio::test]
@@ -4136,7 +4372,7 @@ async fn vertical_mixed_text_uses_unicode_vertical_orientation() {
     }));
     assert!(runs.iter().any(|run| {
         run.text.contains('〈')
-            && run.text_matrix == crate::document::paint::text::RenderedTextMatrix::ROTATE_CW
+            && run.text_matrix == crate::document::paint::text::RenderedTextMatrix::IDENTITY
     }));
 }
 
@@ -4167,6 +4403,79 @@ async fn vertical_text_orientation_upright_paints_latin_upright() {
         run.text.contains('中')
             && run.text_matrix == crate::document::paint::text::RenderedTextMatrix::IDENTITY
     }));
+}
+
+#[tokio::test]
+async fn vertical_lr_upright_preserved_leading_space_keeps_sibling_line_origin() {
+    let ahem = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/wpt/css/css-fonts/Ahem.ttf");
+    let render = |leading: &str| {
+        Html::from_string(format!(
+            "<style>@page {{ size: 160px 160px; margin: 0 }}\
+             @font-face {{ font-family: Ahem; src: url(file://{}) }}\
+             html {{ writing-mode: vertical-lr }}\
+             body {{ margin: 0 }}\
+             .test {{ font: 20px/1 Ahem; height: 3em; text-orientation: upright }}\
+             .line {{ white-space: pre }}</style>\
+             <div class=test><div class=line>{leading}A</div><div class=line>B</div></div>",
+            ahem.display(),
+        ))
+    };
+    let without_leading_space = render("").render(&RenderOptions::default()).await.unwrap();
+    let with_ascii_space = render(" ").render(&RenderOptions::default()).await.unwrap();
+    let with_ideographic_space = render("\u{3000}")
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+    let text_origin = |document: &quire::Document, text: char| {
+        document
+            .pages
+            .iter()
+            .flat_map(|page| page.lines())
+            .find(|line| line.text.contains(text))
+            .map(|line| {
+                line.y()
+                    + line
+                        .runs
+                        .iter()
+                        .find(|run| run.text.contains(text))
+                        .map_or(0.0, |run| run.y_offset)
+            })
+            .expect("each test character should produce a rendered line")
+    };
+    let line_origin = |document: &quire::Document, text: char| {
+        document
+            .pages
+            .iter()
+            .flat_map(|page| page.lines())
+            .find(|line| line.text.contains(text))
+            .map(|line| line.x())
+            .expect("each test character should produce a rendered line")
+    };
+
+    let plain_a = text_origin(&without_leading_space, 'A');
+    let ascii_a = text_origin(&with_ascii_space, 'A');
+    let ideographic_a = text_origin(&with_ideographic_space, 'A');
+    assert!(
+        (ascii_a - plain_a).abs() > 0.01,
+        "a preserved U+0020 must retain a shaped inline advance"
+    );
+    assert!(
+        (ideographic_a - plain_a).abs() > 0.01,
+        "U+3000 must retain its independently shaped inline advance"
+    );
+
+    let plain_b = line_origin(&without_leading_space, 'B');
+    let ascii_b = line_origin(&with_ascii_space, 'B');
+    let ideographic_b = line_origin(&with_ideographic_space, 'B');
+    assert!(
+        (ascii_b - plain_b).abs() < 0.01,
+        "a leading preserved U+0020 must not move a sibling line origin"
+    );
+    assert!(
+        (ideographic_b - plain_b).abs() < 0.01,
+        "the U+0020 correction must not alter U+3000 line placement"
+    );
 }
 
 #[tokio::test]
@@ -4308,6 +4617,52 @@ async fn vertical_inline_forced_break_stacks_atomic_lines_in_block_axis() {
         blue.x() + blue.width() <= green.x() + 0.01,
         "vertical-rl forced break should stack the next line to the physical left: green={green:?}, blue={blue:?}"
     );
+}
+
+/// CSS Text reftest behavior: a selected U+00AD in vertical writing must use
+/// the same fixed physical height and following-sibling position as the
+/// equivalent explicit conditional hyphen plus forced break.
+#[tokio::test]
+async fn vertical_soft_hyphen_preserves_definite_height_and_sibling_position() {
+    let stylesheet = "\
+        @page { size: 180pt 320pt; margin: 0 }\
+        body { margin: 0; font: 16px monospace }\
+        div { writing-mode: vertical-rl; border: 1px solid black; margin: 10px; \
+              padding: 2px; hyphens: manual; width: 3em; height: 9ch }\
+        .first { background: red } .second { background: blue }";
+    let actual = Html::from_string(format!(
+        "<style>{stylesheet}</style><div class=\"first\">hyphen&shy;ation</div>\
+         <div class=\"second\">hyphen&#x2010;<br>ation</div>"
+    ))
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+    let reference = Html::from_string(format!(
+        "<style>{stylesheet}</style><div class=\"first\">hyphen&#x2010;<br>ation</div>\
+         <div class=\"second\">hyphen&#x2010;<br>ation</div>"
+    ))
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let background_geometry = |document: &quire::Document, color| {
+        let rect = document.pages[0]
+            .rects()
+            .iter()
+            .find(|rect| rect.fill == Some(color))
+            .expect("each vertical test box paints its background");
+        (rect.y(), rect.height())
+    };
+    for color in [CssColor::new(255, 0, 0), CssColor::new(0, 0, 255)] {
+        let actual_geometry = background_geometry(&actual, color);
+        let reference_geometry = background_geometry(&reference, color);
+        assert!(
+            (actual_geometry.0 - reference_geometry.0).abs() < 0.01
+                && (actual_geometry.1 - reference_geometry.1).abs() < 0.01,
+            "selected soft-hyphen layout must retain the reference box geometry: \
+             color={color:?}, actual={actual_geometry:?}, reference={reference_geometry:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -4959,6 +5314,19 @@ async fn html_bdo_uses_ua_isolate_override() {
 }
 
 #[tokio::test]
+async fn html_bdo_ltr_overrides_astral_adlam_intrinsic_rtl_order() {
+    let adlam = "\u{1e900}\u{1e901}\u{1e902}\u{1e901}\u{1e904}";
+    let document = Html::from_string(format!(
+        "<p style=\"margin:0; font-family: serif; font-size:12pt; line-height:12pt\"><bdo dir=\"ltr\">{adlam}</bdo></p>"
+    ))
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(document.pages[0].lines()[0].text, adlam);
+}
+
+#[tokio::test]
 async fn join_controls_do_not_split_inline_shaping_runs() {
     let document = Html::from_string(
         "<p style=\"margin: 0; font-size: 12pt; line-height: 12pt; font-family: sans-serif\">A<span style=\"font-family: serif\">&#x200c;</span>B</p>",
@@ -4989,17 +5357,21 @@ async fn generated_control_characters_render_as_visible_glyphs() {
 }
 
 #[tokio::test]
-async fn document_control_characters_are_visible_without_collapsing_neighboring_spaces() {
-    let document = Html::from_string(
-        "<style>body, p { margin: 0 } p { font-size: 20pt; line-height: 20pt }</style><p>A \u{000c} B</p>",
-    )
-    .render(&RenderOptions::default())
-    .await
-    .unwrap();
+async fn literal_nel_forces_a_line_break_in_normal_and_nowrap() {
+    for white_space in ["normal", "nowrap"] {
+        let document = Html::from_string(format!(
+            "<style>body, p {{ margin: 0 }} p {{ white-space: {white_space}; font-size: 20pt; line-height: 20pt }}</style><p>One\u{0085}Two</p>"
+        ))
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
 
-    let line = &document.pages[0].lines()[0];
-    assert_eq!(line.text, "A \u{25a0} B");
-    assert!(rendered_line_advance(line) > 0.0);
+        assert_eq!(
+            grouped_line_texts(&document.pages[0]),
+            ["One", "Two"],
+            "literal NEL must remain a forced break with white-space: {white_space}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -5720,6 +6092,25 @@ async fn shows_soft_hyphens_when_line_breaks_there() {
             .map(|line| line.text.as_str())
             .collect::<String>(),
         "hyphen-ation"
+    );
+}
+
+#[tokio::test]
+async fn auto_phrase_relaxes_authored_soft_hyphens_to_prevent_overflow() {
+    let document = Html::from_string(
+        "<style>@page { size: 90pt 120pt; margin: 10pt } p { margin: 0; width: 0; font-size: 10pt; line-height: 10pt; word-break: auto-phrase; hyphens: manual }</style><p lang=en>con&shy;sid&shy;era&shy;tion</p>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(
+        document.pages[0]
+            .lines()
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>(),
+        ["con-", "sid-", "era-", "tion"]
     );
 }
 

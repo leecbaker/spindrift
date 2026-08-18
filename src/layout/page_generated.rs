@@ -145,6 +145,7 @@ pub(super) struct PageContentResolveContext<'a> {
     pub counter_styles: &'a HashMap<String, CounterStyleRule>,
     pub page_counters: &'a HashMap<String, i32>,
     pub page_counters_by_page: &'a [HashMap<String, i32>],
+    pub used_color_scheme: css::UsedColorScheme,
     pub image_set_resolution_dppx: f32,
 }
 
@@ -183,7 +184,10 @@ pub(super) fn resolve_page_content_parts(
             PageContentPart::Image { image } => {
                 let mut image =
                     page_content_image_with_context_urls(image, context.base_url, context.root_url);
-                let image = if image.select_image_set(context.image_set_resolution_dppx) {
+                let image = if image.resolve_for_context(css::ImageSelectionContext {
+                    used_color_scheme: context.used_color_scheme,
+                    resolution_dppx: context.image_set_resolution_dppx,
+                }) {
                     css::ComputedImage::image(image)
                 } else {
                     css::ComputedImage::Invalid
@@ -441,6 +445,10 @@ fn apply_page_content_image_urls(
     root_url: Option<&url::Url>,
 ) {
     match image {
+        BackgroundImage::LightDark(branches) => {
+            apply_page_content_image_urls(&mut branches.light, base_url, root_url);
+            apply_page_content_image_urls(&mut branches.dark, base_url, root_url);
+        }
         BackgroundImage::ImageSet(set) => {
             for option in &mut set.options {
                 apply_page_content_image_urls(&mut option.image, base_url, root_url);
@@ -449,16 +457,26 @@ fn apply_page_content_image_urls(
         BackgroundImage::SelectedImageSet { image, .. } => {
             apply_page_content_image_urls(image, base_url, root_url)
         }
-        BackgroundImage::Url {
+        BackgroundImage::Url(css::ImageUrl {
             base_url: image_base_url,
             root_url: image_root_url,
             ..
-        } => {
+        }) => {
             if image_base_url.is_none() {
                 *image_base_url = base_url.cloned();
             }
             if image_root_url.is_none() {
                 *image_root_url = root_url.cloned();
+            }
+        }
+        BackgroundImage::ImageFunction(function) => {
+            if let Some(source) = &mut function.source {
+                if source.base_url.is_none() {
+                    source.base_url = base_url.cloned();
+                }
+                if source.root_url.is_none() {
+                    source.root_url = root_url.cloned();
+                }
             }
         }
         BackgroundImage::LinearGradient(_)
@@ -601,12 +619,12 @@ fn parse_page_attr_function(value: &str) -> Option<(PageContentPart, &str)> {
 fn parse_page_image_token(value: &str) -> Option<(BackgroundImage, &str)> {
     if let Some((src, tail)) = css::parse_css_url_token(value) {
         return Some((
-            BackgroundImage::Url {
-                src,
+            BackgroundImage::Url(css::ImageUrl {
+                href: src,
                 base_url: None,
                 root_url: None,
                 request_modifiers: css::RequestUrlModifiers::default(),
-            },
+            }),
             tail,
         ));
     }
@@ -614,6 +632,7 @@ fn parse_page_image_token(value: &str) -> Option<(BackgroundImage, &str)> {
     if [
         "image-set",
         "-webkit-image-set",
+        "light-dark",
         "image",
         "linear-gradient",
         "repeating-linear-gradient",

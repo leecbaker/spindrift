@@ -52,11 +52,7 @@ pub(in crate::css) fn parse_declaration_value<'i, 't>(
     input: &mut Parser<'i, 't>,
 ) -> Option<(String, String)> {
     let start = input.position();
-    let mut has_tokenizer_error = false;
-    while let Ok(token) = input.next_including_whitespace_and_comments() {
-        has_tokenizer_error |= token.is_parse_error();
-    }
-    if has_tokenizer_error {
+    if !crate::css::component_values::validate_component_value_list_from_parser(input) {
         return None;
     }
     // Preserve the raw token stream through specified-value validation.
@@ -64,7 +60,6 @@ pub(in crate::css) fn parse_declaration_value<'i, 't>(
     // it a CSS Syntax `BadString` token; trimming here would incorrectly
     // recover it as an EOF-closed string.
     let raw_value = input.slice_from(start);
-    crate::css::component_values::CssComponentValueList::parse(raw_value)?;
     let name = if is_custom_property_name(&name) {
         name.to_string()
     } else {

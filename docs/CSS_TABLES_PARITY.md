@@ -1,6 +1,6 @@
 # CSS Tables Parity
 
-Last updated: 2026-08-01
+Last updated: 2026-08-13
 
 CSS 2.2 table layout, CSS Tables Level 3, CSS Sizing Level 3, CSS
 Fragmentation Level 3, and HTML table semantics are the conformance targets.
@@ -13,6 +13,7 @@ but spec conformance takes priority when behavior differs.
   non-tentative tests passing. Exact re-evaluation now passes
   `html-display-table.html`,
   `percent-height-replaced-in-percent-cell.tentative.html`,
+  `height-distribution/percentage-sizing-of-table-cell-replaced-children-001.html`,
   `row-margin-border-padding.html`, and
   `row-group-margin-border-padding.html`. A fresh full-suite run is still
   needed before publishing an updated aggregate count.
@@ -32,6 +33,11 @@ but spec conformance takes priority when behavior differs.
   cell spacing, cell padding, and legacy structural `background` URLs through
   the ordinary author-origin cascade. Author CSS therefore overrides the hints,
   and resource URLs retain the document URL context.
+- HTML's conditional table-header default is represented in the user-agent
+  cascade: a `<th>` centers its text only when its parent computes
+  `text-align` to the initial value. This matches
+  `css/css-tables/th-text-align.html`, including author `text-align: inherit`
+  overrides.
 - Authored empty table rows are preserved in durable table fragments and can
   contribute explicit row height to the grid.
 - Orphan table-internal boxes generate anonymous table wrappers, including
@@ -61,8 +67,15 @@ but spec conformance takes priority when behavior differs.
   resolved definiteness into final cell relayout. A cyclic percentage-height
   scroll container with an independent minimum block size instead contributes
   that minimum during row sizing, then resolves against the finalized cell.
+- A computed percentage table-root height makes cell descendants eligible for
+  CSS Tables 3's second layout pass even when that percentage behaves as
+  `auto`; `percent-height-table-cell-child.html` remains a legacy
+  interoperability difference rather than a Quire conformance target.
 - First-pass table-cell row minimum sizing treats descendants whose block size
-  depends on the parent cell height as auto. A percentage-height scroll
+  depends on the parent cell height as auto, including direct atomic and
+  replaced content. A percentage-height no-source image therefore cannot
+  contribute fallback object geometry until final cell-content relayout. A
+  percentage-height scroll
   container with an independent non-percentage `min-height` contributes that
   constraint rather than its overflowing descendants, then receives its final
   percentage height during the second pass.
@@ -116,6 +129,10 @@ but spec conformance takes priority when behavior differs.
   table grid consumes physical spacing values. Table row, row-group, column,
   column-group, cell, and caption helper style reconstruction resolves
   descendant `font-size: <ch>` against the measured parent zero advance.
+- Declared table-column sizes select the root table's logical inline axis:
+  physical `width` in horizontal writing and physical `height` in vertical or
+  sideways writing. This is independent of `text-orientation`, which affects
+  glyph orientation rather than table-grid axes.
 - Table root and reconstructed table-part styles cross an explicit used-value
   boundary for CSS `zoom`: fixed table dimensions, borders, padding, captions,
   cell content, separated `border-spacing`, and collapsed-border conflict
@@ -163,21 +180,22 @@ but spec conformance takes priority when behavior differs.
   border-box sizing in separated-border layout and painting; collapsed empty
   tables ignore separated wrapper padding/borders and use the empty collapsed
   grid's zero outer insets.
-- Table box `overflow:hidden` and `overflow:clip` clip to the table box rather
-  than the table wrapper that contains captions, while table box
+- Table box `overflow:hidden` and `overflow:clip` clip grid descendants at the
+  table padding edge, while retaining the table's own background, borders, and
+  bottom captions outside that scope. This differs from clipping the table
+  wrapper that contains captions, while table box
   `overflow:auto` and `overflow:scroll` behave as visible per the CSS 2.1
   errata. An HTML root table still propagates its overflow to the viewport, and
   the non-rendered HTML `head` cannot become a caption through author CSS.
-- Table-cell `overflow:auto` and `overflow:scroll` establish a used
-  padding-edge scrollport after row sizing, so overflowing cell content clips
-  without allowing a specified cell height to override the row's intrinsic
-  minimum. An explicit cell height also supplies the definite percentage basis
-  while measuring its scroll-container descendants. Table-cell `overflow:hidden`
-  remains visible when row layout grows the used cell height to fit in-flow
-  content.
-  The auto/scroll clip is retained as a PDF paint scope as well as an immediate
-  layout culling boundary, so partially intersecting glyphs and positioned
-  descendants do not escape it.
+- Table-cell `overflow:hidden`, `overflow:auto`, `overflow:scroll`, and
+  `overflow:clip` establish their used padding-edge clip after row sizing, so
+  visual overflow never changes the row's intrinsic minimum or replaces its
+  used height. `hidden`, `auto`, and `scroll` remain programmatically
+  scrollable, while `clip` marks the clipped axis non-scrollable. An explicit
+  cell height also supplies the definite percentage basis while measuring its
+  scroll-container descendants. The resolved clip is active during descendant
+  layout and retained as a PDF paint scope, so nested layout, partially
+  intersecting glyphs, and positioned descendants cannot escape it.
 - Collapsed-border conflict resolution covers table, column-group, column,
   row-group, row, and cell origins, including column and column-group
   block-edge candidates and floored CSS-pixel width priority for subpixel
@@ -232,6 +250,10 @@ but spec conformance takes priority when behavior differs.
   onto physical left-to-right grid positions for placement, backgrounds,
   conflict tie-breaking, and fragmented border painting, while separated
   column backgrounds stay inset from the outer `border-spacing`.
+- Collapsed-border candidates retain their physical CSS side for border-style
+  painting, but select conflict-resolution and half-inset grid edges through
+  the root table's writing mode and direction. Cell-local writing modes do not
+  remap the table grid.
 - In horizontal writing modes, table row, column, and column-group structural
   backgrounds use their complete structural box as the positioning area and
   each participating grid cell as its paint area. This preserves `colspan`,
@@ -257,9 +279,11 @@ but spec conformance takes priority when behavior differs.
   box painting and grid placement, while still preserving row styles as
   inheritance parents for cells. Collapsed row borders continue to participate
   through collapsed-border conflict resolution.
-- Repeated table header/footer groups are relaxed on fragments where reserving
-  them would prevent row-group `break-inside: avoid` or forward pagination
-  progress; source `thead`/`tfoot` rows still lay out in table order.
+- Repeated table header/footer groups retain the identity of the first source
+  `thead`/`tfoot` group through CSS visual reordering; their repeats are
+  relaxed on fragments where reserving them would prevent row-group
+  `break-inside: avoid` or forward pagination progress. Source `thead`/`tfoot`
+  rows still lay out in table order.
 - Table row fragments carry an explicit committed mode for whole rows, sliced
   rows, and row-group `break-inside: avoid` rows kept together with small
   separated-table chrome overflow. Table-cell flow descendants consume that
@@ -274,6 +298,9 @@ but spec conformance takes priority when behavior differs.
   footer rows already present in source order. New
   table-body fragments are likewise created from a table-local start decision
   that owns the break reason and repeated header replay for that fragment.
+  Forced and unforced starts share the same post-header cursor handoff, so
+  separated-border edge spacing cannot make equivalent starts choose different
+  oversized-row slice heights.
   Avoided row groups and fitting avoided rows are represented as explicit
   source ranges, and their keep decisions record measured group height,
   destination repeat policy, and whether optional chrome was suppressed to
@@ -370,6 +397,10 @@ but spec conformance takes priority when behavior differs.
 - Auto-layout table wrappers clamp definite used content widths to the grid
   min-content width when the authored width is too small, and parent
   min-content sizing consumes that clamped wrapper/margin-box contribution.
+- Explicit table widths are not clamped to the inherited font size. Percentage
+  columns therefore retain fractional track widths through final cell geometry,
+  matching `css/css-tables/subpixel-table-cell-width-002.html` for 7.2px and
+  6.6px tables.
 - Declared table-cell widths contribute their content width plus padding and
   cell border insets to column sizing; collapsed-border cells use the resolved
   grid-edge half-insets for both auto and fixed table layout.
@@ -445,6 +476,11 @@ but spec conformance takes priority when behavior differs.
 - Table direction and writing-mode support still needs broader WPT coverage for
   full vertical table row/cell placement, mixed writing modes, and unusual
   column-group/span combinations.
+- Vertical table-root inline sizing resolves physical `height`, `min-height`,
+  and `max-height` with top/bottom wrapper decoration before table columns are
+  measured. The two `table-intrinsic-size-003/004` WPTs still expose a
+  subsequent wrapper paint/projection mismatch, rather than this sizing
+  conversion.
 - Height and baseline coverage should be broadened with WPT and local
   WeasyPrint cases for full horizontal-axis baseline positioning in mixed
   writing modes, complex floats inside cells, large percentage matrices,

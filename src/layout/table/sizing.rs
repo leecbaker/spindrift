@@ -74,42 +74,77 @@ impl ResolvedTableWrapperInsets {
     }
 }
 
+/// Resolved wrapper decoration and grid size at the table logical-axis boundary.
+///
+/// CSS Tables sizes the grid in the root table's logical inline axis.  The
+/// physical padding and border edges remain here only for wrapper painting and
+/// are projected through `axes`; sizing callers must use `inline_non_content`.
+/// <https://drafts.csswg.org/css-tables-3/#computing-the-table-width>
+/// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
 #[derive(Debug, Clone, Copy)]
-pub(super) struct UsedTableWidth {
+pub(super) struct UsedTableWrapperGeometry {
+    pub(super) grid_inline: LogicalInlineContentSize,
+    pub(super) axes: TableAxes,
+    /// Compatibility field for physical paint paths that have not yet crossed
+    /// the logical-grid boundary. New sizing code must use `grid_inline`.
     pub(super) content_width: ContentBoxLength,
+    // These are retained at the wrapper paint boundary.  Table sizing must use
+    // the logical-axis helpers below rather than selecting physical edges.
     pub(super) border_widths: css::Edges,
     pub(super) padding: css::Edges,
 }
 
-impl UsedTableWidth {
+impl UsedTableWrapperGeometry {
+    pub(super) fn set_grid_inline(&mut self, grid_inline: LogicalInlineContentSize) {
+        self.grid_inline = grid_inline;
+        self.content_width = grid_inline.content_box_length();
+    }
+
     pub(super) fn content_x(self, outer_x: f32) -> f32 {
         outer_x + self.border_widths.left + self.padding.left
     }
 
-    pub(super) fn horizontal_non_content(self) -> NonContentLength {
-        non_content_pt(
-            self.border_widths.left
-                + self.border_widths.right
-                + self.padding.left
-                + self.padding.right,
-        )
+    pub(super) fn inline_non_content(self) -> NonContentLength {
+        if self.axes.flow.writing_mode().has_vertical_lines() {
+            non_content_pt(
+                self.border_widths.top
+                    + self.border_widths.bottom
+                    + self.padding.top
+                    + self.padding.bottom,
+            )
+        } else {
+            non_content_pt(
+                self.border_widths.left
+                    + self.border_widths.right
+                    + self.padding.left
+                    + self.padding.right,
+            )
+        }
     }
 
-    pub(super) fn wrapper_border_box_width(
-        self,
-        content_width: ContentBoxLength,
-    ) -> BorderBoxLength {
-        content_box_to_border_box_length(
-            content_width,
+    pub(super) fn block_non_content(self) -> NonContentLength {
+        if self.axes.flow.writing_mode().has_vertical_lines() {
             non_content_pt(
-                self.padding.left
-                    + self.padding.right
-                    + self.border_widths.left
-                    + self.border_widths.right,
-            ),
-        )
+                self.border_widths.left
+                    + self.border_widths.right
+                    + self.padding.left
+                    + self.padding.right,
+            )
+        } else {
+            non_content_pt(
+                self.border_widths.top
+                    + self.border_widths.bottom
+                    + self.padding.top
+                    + self.padding.bottom,
+            )
+        }
     }
 }
+
+// The table paint pipeline still carries this record under its historical
+// local name.  Keep the alias while its physical paint call sites are migrated;
+// all sizing entry points use `UsedTableWrapperGeometry` directly.
+pub(super) type UsedTableWidth = UsedTableWrapperGeometry;
 
 /// Return the table root's authored logical inline-size property.
 ///
@@ -167,6 +202,18 @@ pub(super) fn table_root_min_inline_size(
     }
 }
 
+/// Return the wrapper max-size property that constrains the table grid's
+/// logical inline axis.
+pub(super) fn table_root_max_inline_size(
+    style: &ComputedStyle,
+) -> css::ComputedLengthPercentageOrAuto {
+    if style.writing_mode.has_vertical_lines() {
+        style.box_values.max_height.clone()
+    } else {
+        style.box_values.max_width.clone()
+    }
+}
+
 /// Return the physical CSS property that controls a table root's logical block
 /// axis. CSS Tables distributes row tracks on that axis, which is physical
 /// width in vertical writing modes.
@@ -191,11 +238,11 @@ pub(super) fn table_root_block_size(style: &ComputedStyle) -> css::ComputedLengt
 /// <https://www.w3.org/TR/css-tables-3/#layout> and
 /// <https://www.w3.org/TR/css-sizing-3/#box-sizing> and
 /// <https://www.w3.org/TR/CSS22/tables.html#collapsing-borders>.
-pub(super) fn used_table_width(
+pub(super) fn used_table_wrapper_geometry(
     style: &ComputedStyle,
-    available_outer_width: f32,
+    available_outer_inline: f32,
     collapsed_outer_insets: Option<css::Edges>,
-) -> UsedTableWidth {
+) -> UsedTableWrapperGeometry {
     let collapsed = style.border_collapse == css::BorderCollapse::Collapse;
     let wrapper_insets = if collapsed {
         ResolvedTableWrapperInsets {
@@ -212,39 +259,50 @@ pub(super) fn used_table_width(
     } else {
         used_padding_edges(
             style,
-            PercentageBasis::definite(layout_pt(available_outer_width)),
+            PercentageBasis::definite(layout_pt(available_outer_inline)),
         )
         .to_css_edges()
     };
-    let width = UsedTableWidth {
+    let geometry = UsedTableWrapperGeometry {
+        grid_inline: LogicalInlineContentSize::new(content_box_pt(0.0)),
+        axes: TableAxes::for_style(style),
         content_width: content_box_pt(0.0),
         border_widths,
         padding,
     };
-    let horizontal_non_content = width.horizontal_non_content();
-    let requested_content_width = used_content_box_size(
+    let inline_non_content = geometry.inline_non_content();
+    let requested_inline = table_root_inline_content_box_size(
         table_root_inline_size(style),
         style.box_sizing,
-        PercentageBasis::definite(content_box_pt(available_outer_width)),
-        horizontal_non_content,
+        PercentageBasis::definite(content_box_pt(available_outer_inline)),
+        inline_non_content,
     )
     .unwrap_or_else(|| {
-        content_box_pt((available_outer_width - horizontal_non_content.points()).max(0.0))
+        content_box_pt((available_outer_inline - inline_non_content.points()).max(0.0))
     });
-    let content_width = content_box_pt(
-        constrain_content_width(
-            style,
-            requested_content_width,
-            PercentageBasis::definite(layout_pt(available_outer_width)),
-        )
-        .points()
-        .max(style.font_size),
+    let grid_inline = constrain_table_root_inline_size(
+        style,
+        requested_inline,
+        PercentageBasis::definite(content_box_pt(available_outer_inline)),
+        inline_non_content,
     );
 
-    UsedTableWidth {
-        content_width,
-        ..width
+    UsedTableWrapperGeometry {
+        grid_inline,
+        content_width: grid_inline.content_box_length(),
+        ..geometry
     }
+}
+
+/// Transitional compatibility entry point for wrapper paint and legacy
+/// intrinsic probes. New table sizing boundaries use
+/// [`used_table_wrapper_geometry`].
+pub(super) fn used_table_width(
+    style: &ComputedStyle,
+    available_outer_inline: f32,
+    collapsed_outer_insets: Option<css::Edges>,
+) -> UsedTableWrapperGeometry {
+    used_table_wrapper_geometry(style, available_outer_inline, collapsed_outer_insets)
 }
 
 /// Resolves the row-grid content width for a table with no rows or cells.
@@ -255,28 +313,83 @@ pub(super) fn used_table_width(
 /// with no slots that grid contributes no padding or border inset.
 /// <https://drafts.csswg.org/css-tables/#computing-the-table-width> and
 /// <https://www.w3.org/TR/CSS22/tables.html#collapsing-borders>.
-pub(super) fn used_empty_table_grid_width(
+pub(super) fn used_empty_table_grid_inline_size(
     style: &ComputedStyle,
-    available_outer_width: f32,
-    table_width: UsedTableWidth,
+    available_outer_inline: f32,
+    table_geometry: UsedTableWrapperGeometry,
 ) -> ContentBoxLength {
-    let horizontal_non_content = table_width.horizontal_non_content();
-    let requested_content_width = used_content_box_size(
+    let inline_non_content = table_geometry.inline_non_content();
+    let requested_inline = table_root_inline_content_box_size(
         table_root_inline_size(style),
         style.box_sizing,
-        PercentageBasis::definite(content_box_pt(available_outer_width)),
-        horizontal_non_content,
+        PercentageBasis::definite(content_box_pt(available_outer_inline)),
+        inline_non_content,
     )
     .unwrap_or_else(|| content_box_pt(0.0));
-    content_box_pt(
-        constrain_content_width(
-            style,
-            requested_content_width,
-            PercentageBasis::definite(layout_pt(available_outer_width)),
-        )
-        .points()
-        .max(0.0),
+    constrain_table_root_inline_size(
+        style,
+        requested_inline,
+        PercentageBasis::definite(content_box_pt(available_outer_inline)),
+        inline_non_content,
     )
+    .content_box_length()
+}
+
+/// Resolve one logical-inline table-root size property into grid content-box
+/// space.  The supplied non-content is intentionally logical-axis specific:
+/// a vertical root subtracts top/bottom decoration, never left/right.
+pub(super) fn table_root_inline_content_box_size<Source>(
+    value: css::ComputedLengthPercentageOrAuto,
+    box_sizing: BoxSizing,
+    percentage_basis: PercentageBasis<ContentBoxLength, Source>,
+    inline_non_content: NonContentLength,
+) -> Option<ContentBoxLength> {
+    used_content_box_size(value, box_sizing, percentage_basis, inline_non_content)
+}
+
+/// Apply the table root's logical-inline min/max constraints to a grid size.
+///
+/// This is deliberately separate from `constrain_content_width`: CSS physical
+/// `height` / `min-height` / `max-height` constrain a vertical root's logical
+/// inline axis.  Resolving all three through the same box-sizing conversion
+/// also makes CSS's min-over-max precedence explicit.
+pub(super) fn constrain_table_root_inline_size<Source>(
+    style: &ComputedStyle,
+    value: ContentBoxLength,
+    percentage_basis: PercentageBasis<ContentBoxLength, Source>,
+    inline_non_content: NonContentLength,
+) -> LogicalInlineContentSize {
+    let max_percentage_basis = match percentage_basis {
+        PercentageBasis::Definite { value, .. } => PercentageBasis::definite(value),
+        PercentageBasis::Indefinite => PercentageBasis::indefinite(),
+    };
+    let min = table_root_inline_content_box_size(
+        table_root_min_inline_size(style),
+        style.box_sizing,
+        max_percentage_basis,
+        inline_non_content,
+    );
+    let max = table_root_inline_content_box_size(
+        table_root_max_inline_size(style),
+        style.box_sizing,
+        percentage_basis,
+        inline_non_content,
+    );
+    let min = min.unwrap_or_else(|| content_box_pt(0.0));
+    let max = max.map(|max| max.max(min));
+    LogicalInlineContentSize::new(content_box_pt(
+        value.max(min).min(max.unwrap_or(value)).points().max(0.0),
+    ))
+}
+
+/// Transitional compatibility entry point. New table sizing code uses
+/// [`used_empty_table_grid_inline_size`].
+pub(super) fn used_empty_table_grid_width(
+    style: &ComputedStyle,
+    available_outer_inline: f32,
+    table_geometry: UsedTableWrapperGeometry,
+) -> ContentBoxLength {
+    used_empty_table_grid_inline_size(style, available_outer_inline, table_geometry)
 }
 
 /// Resolves the row-grid content height for a table with no rows or cells.
@@ -383,55 +496,44 @@ fn table_wrapper_size_to_grid_content_height(
 pub(super) fn declared_table_cell_width(
     _cell: &Element,
     style: &ComputedStyle,
-) -> Option<DeclaredTableWidth> {
-    match style.box_values.width.clone() {
-        // Legacy HTML `width` is converted into a presentational hint during
-        // cascade.  Reading it again here would turn `width=0` back into a
-        // fixed zero-width column after the hint correctly computed to auto.
-        css::ComputedLengthPercentageOrAuto::Auto => None,
-        css::ComputedLengthPercentageOrAuto::LengthPercentage(value) => {
-            if let Some(percent) = value
-                .pure_percentage_coefficient()
-                .filter(|percent| *percent != 0.0)
-            {
-                Some(DeclaredTableWidth::Percent(percent))
-            } else if value.needs_percentage_basis() {
-                // A mixed percentage/length cell width is cyclic while auto
-                // layout collects column measures. It cannot become a
-                // declared floor or percentage constraint until a grid width
-                // exists, so this stage treats it as auto.
-                None
-            } else {
-                Some(DeclaredTableWidth::Fixed(value.length_points()))
-            }
-        }
-        css::ComputedLengthPercentageOrAuto::MinContent
-        | css::ComputedLengthPercentageOrAuto::MaxContent
-        | css::ComputedLengthPercentageOrAuto::FitContent(_)
-        | css::ComputedLengthPercentageOrAuto::Stretch
-        | css::ComputedLengthPercentageOrAuto::CalcSize(_) => None,
-    }
+) -> Option<DeclaredTableTrackSize> {
+    declared_table_track_size_from_computed(style.box_values.width.clone())
 }
 
-pub(super) fn declared_table_column_width(style: &ComputedStyle) -> Option<DeclaredTableWidth> {
-    let inline_size = match style.writing_mode {
-        WritingMode::HorizontalTb => style.box_values.width.clone(),
-        WritingMode::VerticalRl | WritingMode::VerticalLr
-            if style.text_orientation != css::TextOrientation::Sideways =>
-        {
-            style.box_values.height.value().clone()
-        }
-        WritingMode::VerticalRl
-        | WritingMode::VerticalLr
-        | WritingMode::SidewaysRl
-        | WritingMode::SidewaysLr => style.box_values.width.clone(),
-    };
-    declared_table_width_from_computed(inline_size)
+/// Return a first-row cell's declared contribution to a fixed table track.
+///
+/// The table root, rather than the cell, selects whether the CSS `width` or
+/// `height` property supplies the root inline track. This remains separate
+/// from [`declared_table_cell_width`], whose physical-width interpretation is
+/// used only by the automatic-layout path.
+pub(super) fn declared_table_cell_track_size(
+    table_inline_track: TableInlineTrackSizing,
+    _cell: &Element,
+    style: &ComputedStyle,
+) -> Option<DeclaredTableTrackSize> {
+    declared_table_track_size_from_computed(table_inline_track.declared_size(style))
 }
 
-fn declared_table_width_from_computed(
+/// Return a table-column's specified size on the table root's logical inline axis.
+///
+/// CSS Writing Modes keeps `width` and `height` physical, but applies the CSS
+/// width-sizing rules to the logical inline dimension. Therefore a vertical
+/// table's column tracks use physical `height`. `text-orientation` only
+/// affects text inside line boxes (and does not apply to table columns), so it
+/// must not alter this axis selection.
+/// <https://drafts.csswg.org/css-writing-modes-4/#logical-to-physical>
+/// <https://drafts.csswg.org/css-writing-modes-4/#text-orientation>
+/// <https://drafts.csswg.org/css-tables-3/#computing-column-measures>
+pub(super) fn declared_table_column_track_size(
+    table_inline_track: TableInlineTrackSizing,
+    style: &ComputedStyle,
+) -> Option<DeclaredTableTrackSize> {
+    declared_table_track_size_from_computed(table_inline_track.declared_size(style))
+}
+
+fn declared_table_track_size_from_computed(
     value: css::ComputedLengthPercentageOrAuto,
-) -> Option<DeclaredTableWidth> {
+) -> Option<DeclaredTableTrackSize> {
     match value {
         css::ComputedLengthPercentageOrAuto::Auto => None,
         css::ComputedLengthPercentageOrAuto::LengthPercentage(value) => {
@@ -439,11 +541,11 @@ fn declared_table_width_from_computed(
                 .pure_percentage_coefficient()
                 .filter(|percent| *percent != 0.0)
             {
-                Some(DeclaredTableWidth::Percent(percent))
+                Some(DeclaredTableTrackSize::Percent(percent))
             } else if value.needs_percentage_basis() {
                 None
             } else {
-                Some(DeclaredTableWidth::Fixed(value.length_points()))
+                Some(DeclaredTableTrackSize::Fixed(value.length_points()))
             }
         }
         css::ComputedLengthPercentageOrAuto::MinContent
@@ -454,78 +556,81 @@ fn declared_table_width_from_computed(
     }
 }
 
-pub(super) fn resolve_declared_table_width(
-    width: DeclaredTableWidth,
-    table_width: LayoutLength,
+pub(super) fn resolve_declared_table_track_size(
+    size: DeclaredTableTrackSize,
+    table_inline_size: LayoutLength,
 ) -> LayoutLength {
-    match width {
-        DeclaredTableWidth::Fixed(width) => layout_pt(width),
-        DeclaredTableWidth::Percent(percent) => layout_pt(table_width.points() * percent),
+    match size {
+        DeclaredTableTrackSize::Fixed(size) => layout_pt(size),
+        DeclaredTableTrackSize::Percent(percent) => layout_pt(table_inline_size.points() * percent),
     }
 }
 
-pub(super) fn constrain_declared_table_width(
+pub(super) fn constrain_declared_table_track_size(
+    table_inline_track: TableInlineTrackSizing,
     style: &ComputedStyle,
-    width: DeclaredTableWidth,
-    table_width: ContentBoxLength,
+    size: DeclaredTableTrackSize,
+    table_inline_size: ContentBoxLength,
 ) -> ContentBoxLength {
-    constrain_content_width(
+    table_inline_track.constrain_content_box_size(
         style,
-        crate::units::layout_to_content_box_length(resolve_declared_table_width(
-            width,
-            table_width.into_layout_length(),
+        crate::units::layout_to_content_box_length(resolve_declared_table_track_size(
+            size,
+            table_inline_size.into_layout_length(),
         )),
-        PercentageBasis::definite(table_width.into_layout_length()),
+        PercentageBasis::definite(table_inline_size.into_layout_length()),
     )
 }
 
-/// Resolve a declared table-cell width to its column-space border-box width.
+/// Resolve a declared table-cell track size to its column-space border-box size.
 ///
 /// CSS Tables uses cell border boxes as column constraints, while CSS Sizing
-/// applies a table-cell `width` to the cell content box unless `box-sizing`
+/// applies a physical size to the cell content box unless `box-sizing`
 /// says otherwise. Collapsed-border cells contribute the resolved half-border
 /// insets on their outside grid edges, not their authored full border widths:
 /// <https://drafts.csswg.org/css-tables-3/#computing-column-measures>
 /// <https://www.w3.org/TR/css-sizing-3/#box-sizing>
 /// <https://www.w3.org/TR/CSS22/tables.html#collapsing-borders>
-pub(super) fn declared_table_cell_border_box_width(
+pub(super) fn declared_table_cell_track_border_box_size(
+    table_inline_track: TableInlineTrackSizing,
     style: &ComputedStyle,
-    width: DeclaredTableWidth,
-    table_width: f32,
+    size: DeclaredTableTrackSize,
+    table_inline_size: f32,
     border_insets: Option<css::Edges>,
 ) -> BorderBoxLength {
-    let non_content = table_cell_horizontal_non_content_width(style, border_insets);
-    let specified = resolve_declared_table_width(width, layout_pt(table_width));
-    table_cell_border_box_width_from_declared_size(
+    let non_content = table_cell_track_non_content_size(table_inline_track, style, border_insets);
+    let specified = resolve_declared_table_track_size(size, layout_pt(table_inline_size));
+    table_cell_track_border_box_size_from_declared_size(
+        table_inline_track,
         style,
         specified,
-        layout_pt(table_width),
+        layout_pt(table_inline_size),
         non_content,
     )
 }
 
-/// Return the fixed component of a declared table width for intrinsic sizing.
-pub(super) fn declared_table_width_length_floor(width: DeclaredTableWidth) -> LayoutLength {
-    match width {
-        DeclaredTableWidth::Fixed(width) => layout_pt(width),
-        DeclaredTableWidth::Percent(_) => layout_pt(0.0),
+/// Return the fixed component of a declared table track size for intrinsic sizing.
+pub(super) fn declared_table_track_size_length_floor(size: DeclaredTableTrackSize) -> LayoutLength {
+    match size {
+        DeclaredTableTrackSize::Fixed(size) => layout_pt(size),
+        DeclaredTableTrackSize::Percent(_) => layout_pt(0.0),
     }
 }
 
 pub(super) fn declared_table_cell_width_length_floor(
     style: &ComputedStyle,
-    width: DeclaredTableWidth,
+    width: DeclaredTableTrackSize,
     border_insets: Option<css::Edges>,
 ) -> BorderBoxLength {
     let non_content = table_cell_horizontal_non_content_width(style, border_insets);
     match width {
-        DeclaredTableWidth::Fixed(width) => table_cell_border_box_width_from_declared_size(
+        DeclaredTableTrackSize::Fixed(width) => table_cell_border_box_width_from_declared_size(
             style,
             layout_pt(width),
             layout_pt(0.0),
             non_content,
         ),
-        DeclaredTableWidth::Percent(_) => border_box_pt(0.0),
+        DeclaredTableTrackSize::Percent(_) => border_box_pt(0.0),
     }
 }
 
@@ -539,6 +644,24 @@ fn table_cell_horizontal_non_content_width(
         .unwrap_or_else(|| table_horizontal_borders(style));
     let padding = intrinsic_padding_edges(style).to_css_edges();
     non_content_pt(padding.left + padding.right) + border_width
+}
+
+fn table_cell_track_non_content_size(
+    table_inline_track: TableInlineTrackSizing,
+    style: &ComputedStyle,
+    border_insets: Option<css::Edges>,
+) -> NonContentLength {
+    let border_width = border_insets
+        .map(|borders| table_inline_track.parallel_insets(borders))
+        .unwrap_or_else(|| {
+            if table_inline_track.uses_physical_width() {
+                table_horizontal_borders(style)
+            } else {
+                table_vertical_borders(style)
+            }
+        });
+    let padding = table_inline_track.parallel_insets(intrinsic_padding_edges(style).to_css_edges());
+    padding + border_width
 }
 
 fn table_cell_border_box_width_from_declared_size(
@@ -564,15 +687,39 @@ fn table_cell_border_box_width_from_declared_size(
     )
 }
 
-pub(super) fn declared_table_width_percentage(width: DeclaredTableWidth) -> f32 {
-    match width {
-        DeclaredTableWidth::Fixed(_) => 0.0,
-        DeclaredTableWidth::Percent(percent) => percent,
+fn table_cell_track_border_box_size_from_declared_size(
+    table_inline_track: TableInlineTrackSizing,
+    style: &ComputedStyle,
+    specified: LayoutLength,
+    percentage_basis: LayoutLength,
+    non_content: NonContentLength,
+) -> BorderBoxLength {
+    let content_size = match style.box_sizing {
+        BoxSizing::BorderBox => border_box_to_content_box_length(
+            crate::units::layout_to_border_box_length(specified),
+            non_content,
+        ),
+        BoxSizing::ContentBox => content_box_pt(specified.points().max(0.0)),
+    };
+    content_box_to_border_box_length(
+        table_inline_track.constrain_content_box_size(
+            style,
+            content_size,
+            PercentageBasis::definite(layout_pt(layout_points(percentage_basis).max(0.0))),
+        ),
+        non_content,
+    )
+}
+
+pub(super) fn declared_table_track_size_percentage(size: DeclaredTableTrackSize) -> f32 {
+    match size {
+        DeclaredTableTrackSize::Fixed(_) => 0.0,
+        DeclaredTableTrackSize::Percent(percent) => percent,
     }
 }
 
-pub(super) fn declared_table_width_is_non_percentage(width: DeclaredTableWidth) -> bool {
-    declared_table_width_percentage(width) == 0.0
+pub(super) fn declared_table_track_size_is_non_percentage(size: DeclaredTableTrackSize) -> bool {
+    declared_table_track_size_percentage(size) == 0.0
 }
 
 /// Column width inputs collected before the final table width is known.
@@ -822,19 +969,22 @@ fn distribute_evenly(widths: &mut [f32], extra_width: f32, columns: &[usize]) {
 }
 
 pub(super) fn distribute_fixed_width(
-    widths: &mut [f32],
+    widths: &mut [TableGridLength],
     declared: &mut [bool],
     column: usize,
     colspan: usize,
-    target_width: f32,
+    target_width: TableGridLength,
 ) {
     let end = (column + colspan.max(1)).min(widths.len());
     if column >= end {
         return;
     }
-    let current = widths[column..end].iter().sum::<f32>();
+    let current = widths[column..end]
+        .iter()
+        .copied()
+        .fold(TableGridLength::new(0.0), |sum, width| sum + width);
     if target_width > current {
-        let extra = (target_width - current) / (end - column) as f32;
+        let extra = TableGridLength::new((target_width - current).get() / (end - column) as f32);
         for width in &mut widths[column..end] {
             *width += extra;
         }
@@ -845,17 +995,20 @@ pub(super) fn distribute_fixed_width(
 }
 
 pub(super) fn distribute_first_row_fixed_width(
-    widths: &mut [f32],
+    widths: &mut [TableGridLength],
     declared: &mut [bool],
     column: usize,
     colspan: usize,
-    target_width: f32,
+    target_width: TableGridLength,
 ) {
     let end = (column + colspan.max(1)).min(widths.len());
     if column >= end {
         return;
     }
-    let current = widths[column..end].iter().sum::<f32>();
+    let current = widths[column..end]
+        .iter()
+        .copied()
+        .fold(TableGridLength::new(0.0), |sum, width| sum + width);
     let receivers = (column..end)
         .filter(|index| !declared[*index])
         .collect::<Vec<_>>();
@@ -863,7 +1016,7 @@ pub(super) fn distribute_first_row_fixed_width(
         return;
     }
     if target_width > current {
-        let extra = (target_width - current) / receivers.len() as f32;
+        let extra = TableGridLength::new((target_width - current).get() / receivers.len() as f32);
         for index in &receivers {
             widths[*index] += extra;
         }
@@ -1512,12 +1665,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn declared_table_column_track_size_uses_root_inline_axis_not_text_orientation() {
+        let mut table_style = ComputedStyle::initial();
+        let mut column_style = ComputedStyle::initial();
+        column_style.box_values.width = length(17.0);
+        column_style
+            .box_values
+            .height
+            .replace_with_used(length(43.0));
+
+        let declared_size = |table_style: &ComputedStyle, column_style: &ComputedStyle| {
+            match declared_table_column_track_size(
+                TableInlineTrackSizing::for_table(table_style),
+                column_style,
+            ) {
+                Some(DeclaredTableTrackSize::Fixed(value)) => value,
+                value => panic!("expected fixed column size, got {value:?}"),
+            }
+        };
+
+        assert_eq!(declared_size(&table_style, &column_style), 17.0);
+        for writing_mode in [
+            WritingMode::VerticalRl,
+            WritingMode::VerticalLr,
+            WritingMode::SidewaysRl,
+            WritingMode::SidewaysLr,
+        ] {
+            table_style.writing_mode = writing_mode;
+            for text_orientation in [
+                css::TextOrientation::Mixed,
+                css::TextOrientation::Upright,
+                css::TextOrientation::Sideways,
+            ] {
+                table_style.text_orientation = text_orientation;
+                assert_eq!(
+                    declared_size(&table_style, &column_style),
+                    43.0,
+                    "{writing_mode:?} with {text_orientation:?} must use physical height"
+                );
+            }
+        }
+    }
+
     fn horizontal_edges(left: f32, right: f32) -> css::Edges {
         css::Edges {
             top: 0.0,
             right,
             bottom: 0.0,
             left,
+        }
+    }
+
+    fn vertical_edges(top: f32, bottom: f32) -> css::Edges {
+        css::Edges {
+            top,
+            right: 0.0,
+            bottom,
+            left: 0.0,
         }
     }
 
@@ -1576,7 +1781,7 @@ mod tests {
     }
 
     #[test]
-    fn table_width_content_box_expands_to_wrapper_border_box() {
+    fn wrapper_geometry_uses_horizontal_edges_for_horizontal_inline_size() {
         let mut style = style_with_width(length(150.0));
         style.border_collapse = css::BorderCollapse::Separate;
         style.box_values.padding.left = css::ComputedLengthPercentage::from_points(10.0);
@@ -1584,13 +1789,11 @@ mod tests {
         style.padding.left = 10.0;
         style.padding.right = 10.0;
 
-        let width = used_table_width(&style, 300.0, None);
+        let geometry = used_table_wrapper_geometry(&style, 300.0, None);
 
-        assert_eq!(width.content_width.points(), 150.0);
-        assert_eq!(
-            width.wrapper_border_box_width(width.content_width).points(),
-            170.0
-        );
+        assert_eq!(geometry.grid_inline.points(), 150.0);
+        assert_eq!(geometry.inline_non_content().points(), 20.0);
+        assert_eq!(geometry.block_non_content().points(), 0.0);
     }
 
     #[test]
@@ -1599,13 +1802,11 @@ mod tests {
         style.border_collapse = css::BorderCollapse::Collapse;
         style.box_sizing = BoxSizing::BorderBox;
 
-        let width = used_table_width(&style, 300.0, Some(horizontal_edges(10.0, 10.0)));
+        let geometry =
+            used_table_wrapper_geometry(&style, 300.0, Some(horizontal_edges(10.0, 10.0)));
 
-        assert_eq!(width.content_width.points(), 160.0);
-        assert_eq!(
-            width.wrapper_border_box_width(width.content_width).points(),
-            180.0
-        );
+        assert_eq!(geometry.grid_inline.points(), 160.0);
+        assert_eq!(geometry.inline_non_content().points(), 20.0);
     }
 
     #[test]
@@ -1614,13 +1815,65 @@ mod tests {
         style.border_collapse = css::BorderCollapse::Collapse;
         style.box_sizing = BoxSizing::ContentBox;
 
-        let width = used_table_width(&style, 300.0, Some(horizontal_edges(10.0, 10.0)));
+        let geometry =
+            used_table_wrapper_geometry(&style, 300.0, Some(horizontal_edges(10.0, 10.0)));
 
-        assert_eq!(width.content_width.points(), 180.0);
+        assert_eq!(geometry.grid_inline.points(), 180.0);
+        assert_eq!(geometry.inline_non_content().points(), 20.0);
+    }
+
+    #[test]
+    fn wrapper_geometry_uses_vertical_edges_for_vertical_inline_size() {
+        let mut style = ComputedStyle::initial();
+        style.writing_mode = WritingMode::VerticalLr;
+        style.box_values.height.replace_with_used(length(150.0));
+        style.box_values.padding.top = css::ComputedLengthPercentage::from_points(10.0);
+        style.box_values.padding.bottom = css::ComputedLengthPercentage::from_points(20.0);
+        style.padding.top = 10.0;
+        style.padding.bottom = 20.0;
+
+        let geometry = used_table_wrapper_geometry(&style, 300.0, None);
+
+        assert_eq!(geometry.grid_inline.points(), 150.0);
+        assert_eq!(geometry.inline_non_content().points(), 30.0);
+        assert_eq!(geometry.block_non_content().points(), 0.0);
+    }
+
+    #[test]
+    fn vertical_wrapper_inline_constraints_use_height_not_width() {
+        let mut style = ComputedStyle::initial();
+        style.writing_mode = WritingMode::VerticalRl;
+        style.box_values.min_height = length(100.0);
+        style.box_values.max_height = length(130.0);
+        style.box_values.min_width = length(280.0);
+        style.box_values.max_width = length(10.0);
+
         assert_eq!(
-            width.wrapper_border_box_width(width.content_width).points(),
-            200.0
+            used_table_wrapper_geometry(&style, 50.0, None)
+                .grid_inline
+                .points(),
+            100.0
         );
+        assert_eq!(
+            used_table_wrapper_geometry(&style, 300.0, None)
+                .grid_inline
+                .points(),
+            130.0
+        );
+    }
+
+    #[test]
+    fn collapsed_vertical_border_box_uses_top_and_bottom_insets() {
+        let mut style = ComputedStyle::initial();
+        style.writing_mode = WritingMode::VerticalLr;
+        style.border_collapse = css::BorderCollapse::Collapse;
+        style.box_sizing = BoxSizing::BorderBox;
+        style.box_values.height.replace_with_used(length(180.0));
+
+        let geometry = used_table_wrapper_geometry(&style, 300.0, Some(vertical_edges(10.0, 20.0)));
+
+        assert_eq!(geometry.grid_inline.points(), 150.0);
+        assert_eq!(geometry.inline_non_content().points(), 30.0);
     }
 
     #[test]
@@ -1686,6 +1939,8 @@ mod tests {
         let mut style = style_with_width(length(100.0));
         style.box_sizing = BoxSizing::BorderBox;
         let table_width = UsedTableWidth {
+            grid_inline: LogicalInlineContentSize::new(content_box_pt(0.0)),
+            axes: TableAxes::for_style(&style),
             content_width: content_box_pt(0.0),
             border_widths: css::Edges::ZERO,
             padding: horizontal_edges(75.0, 75.0),
@@ -1697,7 +1952,7 @@ mod tests {
     }
 
     #[test]
-    fn declared_table_cell_border_box_width_counts_extras_once() {
+    fn declared_table_cell_track_border_box_size_uses_matching_axis_insets() {
         let mut content_box_style = ComputedStyle::initial();
         content_box_style.box_sizing = BoxSizing::ContentBox;
         content_box_style.box_values.padding.left =
@@ -1707,30 +1962,49 @@ mod tests {
         content_box_style.padding = horizontal_edges(10.0, 10.0);
         let border_insets = Some(horizontal_edges(5.0, 5.0));
 
-        let content_box_width = table_cell_border_box_width_from_declared_size(
-            &content_box_style,
-            layout_pt(100.0),
-            layout_pt(300.0),
-            table_cell_horizontal_non_content_width(&content_box_style, border_insets),
-        );
+        for writing_mode in [WritingMode::HorizontalTb, WritingMode::VerticalRl] {
+            let mut content_box_style = content_box_style.clone();
+            let border_insets = if writing_mode.has_vertical_lines() {
+                content_box_style.box_values.padding.top =
+                    css::ComputedLengthPercentage::from_points(10.0);
+                content_box_style.box_values.padding.bottom =
+                    css::ComputedLengthPercentage::from_points(10.0);
+                content_box_style.padding = vertical_edges(10.0, 10.0);
+                Some(vertical_edges(5.0, 5.0))
+            } else {
+                border_insets
+            };
+            content_box_style.writing_mode = writing_mode;
+            let track = TableInlineTrackSizing::for_table(&content_box_style);
+            let content_box_size = table_cell_track_border_box_size_from_declared_size(
+                track,
+                &content_box_style,
+                layout_pt(100.0),
+                layout_pt(300.0),
+                table_cell_track_non_content_size(track, &content_box_style, border_insets),
+            );
 
-        let mut border_box_style = content_box_style;
-        border_box_style.box_sizing = BoxSizing::BorderBox;
-        let border_box_width = table_cell_border_box_width_from_declared_size(
-            &border_box_style,
-            layout_pt(100.0),
-            layout_pt(300.0),
-            table_cell_horizontal_non_content_width(&border_box_style, border_insets),
-        );
+            let mut border_box_style = content_box_style;
+            border_box_style.box_sizing = BoxSizing::BorderBox;
+            let border_box_size = table_cell_track_border_box_size_from_declared_size(
+                track,
+                &border_box_style,
+                layout_pt(100.0),
+                layout_pt(300.0),
+                table_cell_track_non_content_size(track, &border_box_style, border_insets),
+            );
 
-        assert_eq!(content_box_width.points(), 130.0);
-        assert_eq!(border_box_width.points(), 100.0);
+            assert_eq!(content_box_size.points(), 130.0, "{writing_mode:?}");
+            assert_eq!(border_box_size.points(), 100.0, "{writing_mode:?}");
+        }
     }
 
     #[test]
     fn empty_table_auto_grid_width_is_zero_content_box() {
         let style = style_with_width(css::ComputedLengthPercentageOrAuto::Auto);
         let table_width = UsedTableWidth {
+            grid_inline: LogicalInlineContentSize::new(content_box_pt(0.0)),
+            axes: TableAxes::for_style(&style),
             content_width: content_box_pt(0.0),
             border_widths: css::Edges::ZERO,
             padding: css::Edges::ZERO,
@@ -1739,6 +2013,15 @@ mod tests {
         let content = used_empty_table_grid_width(&style, 300.0, table_width);
 
         assert_eq!(content.points(), 0.0);
+    }
+
+    #[test]
+    fn explicit_table_width_is_not_clamped_to_the_font_size() {
+        let style = style_with_width(length(2.7));
+
+        let table_width = used_table_width(&style, 300.0, None);
+
+        assert_eq!(table_width.content_width.points(), 2.7);
     }
 
     #[test]

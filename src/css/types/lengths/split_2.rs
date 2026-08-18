@@ -78,10 +78,34 @@ impl ComputedFlexBasis {
         }
     }
 
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        match self {
+            Self::FitContent(Some(value)) => value.resolve_root_font_metric_lengths(basis),
+            Self::LengthPercentage(value) => value.value.resolve_root_font_metric_lengths(basis),
+            Self::Auto
+            | Self::Content
+            | Self::MinContent
+            | Self::MaxContent
+            | Self::FitContent(None) => {}
+        }
+    }
+
     pub(crate) fn requires_ch_advance(&self) -> bool {
         match self {
             Self::FitContent(Some(value)) => value.requires_ch_advance(),
             Self::LengthPercentage(value) => value.value.requires_ch_advance(),
+            Self::Auto
+            | Self::Content
+            | Self::MinContent
+            | Self::MaxContent
+            | Self::FitContent(None) => false,
+        }
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        match self {
+            Self::FitContent(Some(value)) => value.requires_root_font_metrics(),
+            Self::LengthPercentage(value) => value.value.requires_root_font_metrics(),
             Self::Auto
             | Self::Content
             | Self::MinContent
@@ -206,6 +230,20 @@ impl PartialEq<ComputedLengthPercentageOrAuto> for PhysicalHeight {
 }
 
 impl ComputedBoxValues {
+    /// Resolve every element-local font metric using the element's one inline
+    /// formatting context.  CSS Values does not select a separate metric for
+    /// each physical box edge.
+    /// <https://drafts.csswg.org/css-values-4/#font-relative-lengths>
+    pub(crate) fn resolve_selected_font_metric_lengths(
+        &mut self,
+        basis: SelectedFontMetricLengthBasis,
+    ) {
+        self.resolve_ch_relative_lengths(basis.ch_advance);
+        self.resolve_ic_relative_lengths(basis.ic_advance);
+        self.resolve_ex_relative_lengths(basis.x_height.points());
+        self.resolve_cap_relative_lengths(basis.cap_height.points());
+    }
+
     /// Scale fixed box-model length components for CSS `zoom`.
     pub(crate) fn scale_fixed_length_components(&mut self, factor: f32) {
         for value in [
@@ -242,11 +280,9 @@ impl ComputedBoxValues {
     /// differ. Physical width/left/right values therefore cannot share the
     /// basis used by physical height/top/bottom values.
     /// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>
-    pub(crate) fn resolve_font_metric_lengths_by_physical_axis(
-        &mut self,
-        horizontal_advance: LayoutLength,
-        vertical_advance: LayoutLength,
-    ) {
+    pub(crate) fn resolve_ch_relative_lengths(&mut self, advance: LayoutLength) {
+        let horizontal_advance = advance;
+        let vertical_advance = advance;
         self.margin
             .top
             .resolve_font_metric_lengths(vertical_advance);
@@ -408,11 +444,9 @@ impl ComputedBoxValues {
 
     /// Resolves `ic` terms by physical box axis.
     /// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>
-    pub(crate) fn resolve_ic_relative_lengths_by_physical_axis(
-        &mut self,
-        horizontal_advance: LayoutLength,
-        vertical_advance: LayoutLength,
-    ) {
+    fn resolve_ic_relative_lengths(&mut self, advance: LayoutLength) {
+        let horizontal_advance = advance;
+        let vertical_advance = advance;
         self.margin
             .top
             .resolve_ic_relative_lengths(vertical_advance);
@@ -603,6 +637,69 @@ impl ComputedBoxValues {
             ]
             .into_iter()
             .any(|value| value.requires_ch_advance())
+    }
+
+    /// Whether any box-model value needs a metric from its selected font.
+    /// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>
+    pub(crate) fn requires_selected_font_metrics(&self) -> bool {
+        [
+            &self.margin.top,
+            &self.margin.right,
+            &self.margin.bottom,
+            &self.margin.left,
+            &self.width,
+            self.height.value(),
+            &self.min_width,
+            &self.max_width,
+            &self.min_height,
+            &self.max_height,
+            &self.inset_left,
+            &self.inset_top,
+            &self.inset_right,
+            &self.inset_bottom,
+        ]
+        .into_iter()
+        .any(|value| value.requires_selected_font_metrics())
+            || [
+                &self.padding.top,
+                &self.padding.right,
+                &self.padding.bottom,
+                &self.padding.left,
+            ]
+            .into_iter()
+            .any(ComputedLengthPercentage::requires_selected_font_metrics)
+    }
+
+    /// Whether any box-model value needs a metric from the document root's
+    /// selected font.
+    /// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        [
+            &self.margin.top,
+            &self.margin.right,
+            &self.margin.bottom,
+            &self.margin.left,
+            &self.width,
+            self.height.value(),
+            &self.min_width,
+            &self.max_width,
+            &self.min_height,
+            &self.max_height,
+            &self.inset_left,
+            &self.inset_top,
+            &self.inset_right,
+            &self.inset_bottom,
+        ]
+        .into_iter()
+        .any(|value| value.requires_root_font_metrics())
+            || [
+                &self.padding.top,
+                &self.padding.right,
+                &self.padding.bottom,
+                &self.padding.left,
+            ]
+            .into_iter()
+            .any(ComputedLengthPercentage::requires_root_font_metrics)
     }
 }
 

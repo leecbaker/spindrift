@@ -274,6 +274,15 @@ impl ContentLanguage {
             Self::Tagged(tag) => tag.locale().map(|_| tag.as_str()),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn shares_tag_storage_with(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Unknown, Self::Unknown) => true,
+            (Self::Tagged(left), Self::Tagged(right)) => Arc::ptr_eq(&left.source, &right.source),
+            _ => false,
+        }
+    }
 }
 
 /// An authored BCP 47 language tag together with its one-time syntax check.
@@ -356,15 +365,6 @@ impl Background {
         }
     }
 
-    /// Resolve `image-set()` candidates for every layer at the rendering
-    /// environment boundary.
-    pub(crate) fn select_image_sets(&mut self, resolution_dppx: f32) {
-        self.background_image.select_image_set(resolution_dppx);
-        for layer in &mut self.background_layers {
-            layer.image.select_image_set(resolution_dppx);
-        }
-    }
-
     /// Return the clip edge used by the color painted below all image layers.
     pub(crate) fn color_clip(&self) -> BackgroundBox {
         self.background_layers
@@ -421,6 +421,28 @@ impl BackgroundColor {
 pub(crate) enum CssColorOrCurrentColor {
     CurrentColor,
     Color(CssColor),
+}
+
+/// The used SVG filter color together with whether its computed value remains
+/// dependent on `currentcolor`.
+///
+/// Filter Effects tainting is defined from the computed `flood-color` and
+/// `lighting-color` values, not from the final RGBA value supplied to the SVG
+/// scene parser.  Keep that distinction through the host-CSS bridge.
+/// <https://drafts.csswg.org/filter-effects/#tainted-filter-primitives>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct SvgFilterColor {
+    pub(crate) color: CssColor,
+    pub(crate) current_color_dependent: bool,
+}
+
+impl SvgFilterColor {
+    pub(crate) const fn absolute(color: CssColor) -> Self {
+        Self {
+            color,
+            current_color_dependent: false,
+        }
+    }
 }
 
 impl CssColorOrCurrentColor {
@@ -1321,6 +1343,35 @@ pub(crate) enum ScrollbarWidth {
 }
 
 impl ComputedStyle {
+    /// Rebuild this style's own text-decoration origin after a used-value
+    /// resolution boundary.
+    ///
+    /// Line decorations propagate independently of CSS inheritance, so their
+    /// retained origin must own the decorating box's resolved values. In
+    /// particular, selected-font metric units such as `ch` cannot remain in a
+    /// cascade-time snapshot after the owning style has resolved them.
+    /// Call this only for a raw cascaded style before ancestor decoration
+    /// layers have been propagated into a used inline style.
+    ///
+    /// CSS Text Decoration Level 4 § 2 and § 2.9.1; CSS Values Level 4 § 5.1:
+    /// <https://drafts.csswg.org/css-text-decor-4/#line-decoration>
+    /// <https://drafts.csswg.org/css-text-decor-4/#text-decoration-inset-property>
+    /// <https://drafts.csswg.org/css-values-4/#font-relative-lengths>
+    pub(crate) fn rebuild_own_text_decoration_layer(&mut self) {
+        self.text_decoration_layers.clear();
+        if !self.text_decoration.has_visible_line() {
+            return;
+        }
+
+        let decoration = self.text_decoration.clone();
+        let mut origin_style = self.clone();
+        origin_style.text_decoration_layers.clear();
+        self.text_decoration_layers.push(TextDecorationLayer {
+            decoration,
+            origin_style: Rc::new(origin_style),
+        });
+    }
+
     /// Whether the computed `line-height` retains the CSS `normal` keyword.
     pub(crate) const fn line_height_is_normal(&self) -> bool {
         matches!(&self.line_height_value, ComputedLineHeight::Normal)
@@ -1585,13 +1636,23 @@ pub(crate) fn parse_image_orientation(value: &str) -> Option<ImageOrientation> {
 pub(crate) enum ImageRendering {
     #[default]
     Auto,
+    Smooth,
+    HighQuality,
     Pixelated,
+    CrispEdges,
 }
 
 pub(crate) fn parse_image_rendering(value: &str) -> Option<ImageRendering> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "auto" | "smooth" | "high-quality" => Some(ImageRendering::Auto),
-        "pixelated" | "crisp-edges" => Some(ImageRendering::Pixelated),
+        "auto" => Some(ImageRendering::Auto),
+        "smooth" => Some(ImageRendering::Smooth),
+        "high-quality" => Some(ImageRendering::HighQuality),
+        "pixelated" => Some(ImageRendering::Pixelated),
+        "crisp-edges" => Some(ImageRendering::CrispEdges),
+        // CSS Images retains these legacy spellings as required aliases.
+        // <https://drafts.csswg.org/css-images-3/#the-image-rendering>
+        "optimizespeed" => Some(ImageRendering::CrispEdges),
+        "optimizequality" => Some(ImageRendering::Smooth),
         _ => None,
     }
 }
@@ -1653,17 +1714,18 @@ impl EffectiveZoom {
     }
 }
 
-/// Private bridge state for legacy backend records that still store a used
-/// style as `ComputedStyle`.
+mod cascaded_style_source {
+    pub trait Sealed {}
+}
+
+/// A style that may be used as a cascade or fresh used-value source.
 ///
-/// New layout boundaries use [`LayoutStyle`] and [`ZoomedLayoutStyle`]. This
-/// state exists only while a replay record cannot carry the wrapper itself;
-/// it must never participate in cascade or be exposed to callers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum LegacyLayoutZoomState {
-    #[default]
-    Computed,
-    Zoomed,
+/// This is deliberately implemented only for [`ComputedStyle`]. In
+/// particular, a [`ZoomedLayoutStyle`] must not satisfy this trait through a
+/// `Deref` coercion: a used style has already crossed the CSS `zoom` boundary
+/// and can never be normalized or inherited from again.
+pub(crate) trait CascadedStyleSource: cascaded_style_source::Sealed {
+    fn cascaded_style(&self) -> &ComputedStyle;
 }
 
 /// CSS Color Adjustment's computed `color-scheme` value. Custom identifiers
@@ -1861,7 +1923,6 @@ pub(crate) struct ComputedStyle {
     pub zoom: CssZoom,
     /// Layout-only product of this element's and all ancestor zoom values.
     pub effective_zoom: EffectiveZoom,
-    pub(crate) layout_zoom_state: LegacyLayoutZoomState,
     pub display: Display,
     /// Specified legacy `display: -webkit-box` provenance.
     ///
@@ -1964,6 +2025,8 @@ pub(crate) struct ComputedStyle {
     pub svg_fill: SvgPresentationPaint,
     pub svg_stroke: SvgPresentationPaint,
     pub svg_stroke_width: SvgStrokeWidth,
+    pub svg_flood_color: SvgFilterColor,
+    pub svg_lighting_color: SvgFilterColor,
     /// WebKit-compatible glyph fill color.
     pub text_fill_color: CssColorOrCurrentColor,
     pub font_size: f32,
@@ -2148,6 +2211,14 @@ pub(crate) struct ComputedStyle {
     pub bookmark_state: CssBookmarkState,
 }
 
+impl cascaded_style_source::Sealed for ComputedStyle {}
+
+impl CascadedStyleSource for ComputedStyle {
+    fn cascaded_style(&self) -> &ComputedStyle {
+        self
+    }
+}
+
 /// A cloned style at the layout used-value boundary, before CSS `zoom`.
 ///
 /// Viewport- and font-relative normalization mutate this owned working copy;
@@ -2159,15 +2230,13 @@ pub(crate) struct ComputedStyle {
 pub(crate) struct LayoutStyle(ComputedStyle);
 
 impl LayoutStyle {
-    pub(crate) fn from_computed(style: &ComputedStyle) -> Self {
-        Self(style.clone())
+    pub(crate) fn from_computed(style: &impl CascadedStyleSource) -> Self {
+        Self(style.cascaded_style().clone())
     }
 
     pub(crate) fn into_zoomed(mut self) -> ZoomedLayoutStyle {
-        if !matches!(self.0.layout_zoom_state, LegacyLayoutZoomState::Zoomed) {
-            self.0.apply_effective_zoom();
-        }
-        ZoomedLayoutStyle(self.0)
+        self.0.apply_effective_zoom();
+        ZoomedLayoutStyle(ZoomedComputedStyle(self.0))
     }
 }
 
@@ -2192,23 +2261,55 @@ impl DerefMut for LayoutStyle {
 /// can be read or mutated by layout algorithms, but it cannot be zoomed a
 /// second time or reused as a cascade input.
 /// <https://drafts.csswg.org/css-viewport/#zoom-property>
-#[derive(Debug, Clone)]
-pub(crate) struct ZoomedLayoutStyle(ComputedStyle);
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ZoomedLayoutStyle(ZoomedComputedStyle);
 
-impl ZoomedLayoutStyle {
-    pub(crate) fn as_computed(&self) -> &ComputedStyle {
+/// Private field-access facade for a zoomed style.
+///
+/// Keeping this separate from [`ComputedStyle`] ensures that
+/// [`ZoomedLayoutStyle`] itself has no `Deref<Target = ComputedStyle>` escape
+/// hatch.  The facade is intentionally not exported from this module: public
+/// layout boundaries receive the opaque used-style token, while existing
+/// low-level property consumers can be migrated independently.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ZoomedComputedStyle(ComputedStyle);
+
+impl Deref for ZoomedComputedStyle {
+    type Target = ComputedStyle;
+
+    fn deref(&self) -> &Self::Target {
         &self.0
     }
+}
 
-    /// Extract the temporary style at a backend boundary that cannot yet
-    /// carry the used-value phase in its type.
-    pub(crate) fn into_computed(self) -> ComputedStyle {
-        self.0
+impl DerefMut for ZoomedComputedStyle {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl ZoomedLayoutStyle {
+    /// Clone this style for a legacy used-value consumer.
+    ///
+    /// This bridge is retained only while converting durable replay records
+    /// to carry [`ZoomedLayoutStyle`] directly. It is intentionally distinct
+    /// from a cascade source: [`CascadedStyleSource`] remains implemented
+    /// only by `ComputedStyle`.
+    pub(crate) fn clone_for_legacy_used_consumer(&self) -> ComputedStyle {
+        self.0.0.clone()
+    }
+
+    /// Apply a transformation that is meaningful only after resolving used
+    /// values. The underlying computed representation never escapes this
+    /// closure, so the result remains unable to participate in cascade.
+    pub(crate) fn map_used_values(mut self, transform: impl FnOnce(&mut ComputedStyle)) -> Self {
+        transform(&mut self.0.0);
+        self
     }
 }
 
 impl Deref for ZoomedLayoutStyle {
-    type Target = ComputedStyle;
+    type Target = ZoomedComputedStyle;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -2219,6 +2320,23 @@ impl DerefMut for ZoomedLayoutStyle {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
+}
+
+/// The availability of a discretionary hyphenation opportunity during line
+/// fitting.
+///
+/// This describes CSS policy, not whether a source U+00AD exists. In
+/// particular, `word-break:auto-phrase` preserves authored and dictionary
+/// opportunities for its later overflow-relaxation stage.
+/// <https://drafts.csswg.org/css-text-4/#word-break-property>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DiscretionaryHyphenationPolicy {
+    /// The source control and dictionary opportunities have no legal break.
+    Disabled,
+    /// The candidate participates in ordinary line fitting.
+    Ordinary,
+    /// The candidate participates only after phrase-wrap relaxation fails.
+    DeferredForAutoPhrase,
 }
 
 impl ComputedStyle {
@@ -2293,22 +2411,39 @@ impl ComputedStyle {
         }
     }
 
-    /// Return whether CSS `word-break` disables both authored discretionary
-    /// hyphens and automatic language hyphenation.
+    /// Return the policy for authored U+00AD discretionary hyphens.
+    ///
+    /// `word-break:auto-phrase` retains these source-faithful opportunities
+    /// as a fallback when phrase wrapping cannot prevent overflow; it does
+    /// not remove the control from the source text.
     /// <https://drafts.csswg.org/css-text-4/#word-break-property>
-    pub(crate) fn hyphenation_is_unconditionally_suppressed(&self) -> bool {
-        self.hyphens == Hyphens::None
-            || matches!(self.word_break, WordBreak::BreakAll | WordBreak::AutoPhrase)
+    pub(crate) fn authored_discretionary_hyphenation_policy(
+        &self,
+    ) -> DiscretionaryHyphenationPolicy {
+        if self.hyphens == Hyphens::None || matches!(self.word_break, WordBreak::BreakAll) {
+            DiscretionaryHyphenationPolicy::Disabled
+        } else if matches!(self.word_break, WordBreak::AutoPhrase) {
+            DiscretionaryHyphenationPolicy::DeferredForAutoPhrase
+        } else {
+            DiscretionaryHyphenationPolicy::Ordinary
+        }
     }
 
-    /// Whether automatic hyphenation may be collected for this style.
+    /// Return the policy for language-dictionary hyphenation opportunities.
     ///
-    /// `word-break:auto-phrase` retains its opportunities as a typed fallback
-    /// when ordinary phrase-wrap relaxation cannot prevent overflow. It must
-    /// therefore not erase them during source collection.
+    /// `hyphens:auto` is required to collect dictionary opportunities, while
+    /// `word-break:auto-phrase` defers rather than suppresses those
+    /// opportunities.
+    /// <https://drafts.csswg.org/css-text-3/#hyphens-property>
     /// <https://drafts.csswg.org/css-text-4/#word-break-property>
-    pub(crate) fn automatic_hyphenation_is_suppressed(&self) -> bool {
-        self.hyphenation_is_unconditionally_suppressed()
+    pub(crate) fn automatic_discretionary_hyphenation_policy(
+        &self,
+    ) -> DiscretionaryHyphenationPolicy {
+        if self.hyphens != Hyphens::Auto {
+            DiscretionaryHyphenationPolicy::Disabled
+        } else {
+            self.authored_discretionary_hyphenation_policy()
+        }
     }
 
     /// Returns the clip edge for the color layer beneath every background
@@ -2332,7 +2467,6 @@ impl ComputedStyle {
     fn apply_effective_zoom(&mut self) {
         let factor = self.effective_zoom.factor();
         if factor == 1.0 {
-            self.layout_zoom_state = LegacyLayoutZoomState::Zoomed;
             return;
         }
         self.box_values.scale_fixed_length_components(factor);
@@ -2349,7 +2483,15 @@ impl ComputedStyle {
             .scale_fixed_length_components(factor);
         self.grid_auto_rows.scale_fixed_length_components(factor);
         self.grid_auto_columns.scale_fixed_length_components(factor);
+        self.grid_lanes_flow_tolerance
+            .scale_fixed_length_components(factor);
         self.border_spacing.scale_fixed_length_components(factor);
+        for shadow in &mut self.text_shadow {
+            shadow.scale_fixed_length_components(factor);
+        }
+        for shadow in &mut self.box_shadow {
+            shadow.scale_fixed_length_components(factor);
+        }
         self.font_size *= factor;
         self.root_font_size *= factor;
         self.line_height_value.scale_fixed_length_components(factor);
@@ -2374,7 +2516,6 @@ impl ComputedStyle {
         self.text_indent
             .amount
             .scale_fixed_length_components(factor);
-        self.layout_zoom_state = LegacyLayoutZoomState::Zoomed;
     }
 
     pub fn initial() -> Self {
@@ -2388,7 +2529,6 @@ impl ComputedStyle {
             animation_snapshot: ComputedAnimationSnapshot::INITIAL,
             zoom: CssZoom::NORMAL,
             effective_zoom: EffectiveZoom::NORMAL,
-            layout_zoom_state: LegacyLayoutZoomState::Computed,
             display: Display::INLINE,
             legacy_webkit_box: LegacyWebkitBox::None,
             webkit_box_orient: WebkitBoxOrient::Horizontal,
@@ -2403,7 +2543,7 @@ impl ComputedStyle {
             flex_shrink: FlexShrinkFactor::ONE,
             flex_basis: ComputedFlexBasis::AUTO,
             flex_wrap: FlexWrap::NoWrap,
-            flex_line_count: FlexLineCount::Auto,
+            flex_line_count: FlexLineCount::ONE,
             order: 0,
             row_gap: ComputedGap::NORMAL,
             row_rule: GapRuleAxis::initial(),
@@ -2488,6 +2628,8 @@ impl ComputedStyle {
             svg_stroke_width: SvgStrokeWidth::Initial(ComputedLengthPercentage::from_points(
                 CSS_PX_TO_PT,
             )),
+            svg_flood_color: SvgFilterColor::absolute(CssColor::BLACK),
+            svg_lighting_color: SvgFilterColor::absolute(CssColor::WHITE),
             text_fill_color: CssColorOrCurrentColor::CurrentColor,
             font_size,
             root_font_size: font_size,
@@ -2759,60 +2901,135 @@ impl ComputedStyle {
     /// Returns whether resolving this style needs metrics from its selected
     /// font, rather than only the font-size fallback values.
     ///
-    /// `ch`, `ic`, `ex`, and `cap` all use a selected-font metric. The
-    /// explicit `ch` traversal above remains useful to avoid cloning in the
-    /// common case; the other metric phases are represented throughout the
-    /// computed-value graph and are detected by resolving them on a clone.
-    /// This keeps the lookup decision in one place as new metric-bearing
-    /// properties are added:
+    /// `ch`, `ic`, `ex`, and `cap` all use a selected-font metric. The broad
+    /// `ch` traversal covers properties resolved in the earlier font-metric
+    /// phase, while the structural checks below cover the fields resolved in
+    /// the later `ic`/`ex`/`cap` phase:
     /// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>.
     pub(crate) fn requires_selected_font_metrics(&self) -> bool {
-        if self.requires_ch_advance() {
-            return true;
-        }
-        // Compare two concrete metric bases instead of comparing the source
-        // with a zero projection. A compact expression such as
-        // `calc(100px + 10ic)` can normalize its zero projection to the same
-        // fixed length and would otherwise incorrectly look metric-free.
-        let mut zero_basis = self.clone();
-        zero_basis.resolve_ic_relative_lengths(layout_pt(0.0));
-        zero_basis.resolve_ex_relative_lengths(0.0);
-        zero_basis.resolve_cap_relative_lengths(0.0);
-        let mut unit_basis = self.clone();
-        unit_basis.resolve_ic_relative_lengths(layout_pt(1.0));
-        unit_basis.resolve_ex_relative_lengths(1.0);
-        unit_basis.resolve_cap_relative_lengths(1.0);
-        zero_basis != unit_basis
+        self.requires_ch_advance()
+            || self.line_height_value.requires_selected_font_metrics()
+            || self.box_values.requires_selected_font_metrics()
+            || self
+                .background
+                .background_image
+                .as_image()
+                .is_some_and(BackgroundImage::requires_selected_font_metrics)
+            || self
+                .background
+                .background_size
+                .requires_selected_font_metrics()
+            || self
+                .background
+                .background_position
+                .requires_selected_font_metrics()
+            || self
+                .background
+                .background_layers
+                .iter()
+                .any(BackgroundLayer::requires_selected_font_metrics)
     }
 
     /// Returns whether this style contains a root-font metric unit.
     ///
     /// Root-relative selected-font units use the document root's chosen face,
     /// so the root must be measured before any descendant resolves one.  The
-    /// structural comparison keeps that lookup lazy for documents that never
+    /// Structural predicates keep that lookup lazy for documents that never
     /// use such a unit.
     /// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>
     pub(crate) fn requires_root_font_metrics(&self) -> bool {
-        if self.deferred_font_size.requires_root_font_metrics() {
-            return true;
-        }
-        let zero = layout_pt(0.0);
-        let mut resolved = self.clone();
-        resolved.resolve_root_font_metric_lengths(RootFontMetricLengthBasis {
-            font_size: zero,
-            ch_advance: zero,
-            x_height: zero,
-            cap_height: zero,
-            ic_advance: zero,
-            line_height: zero,
-        });
-        self != &resolved
+        self.deferred_font_size.requires_root_font_metrics()
+            || self.line_height_value.requires_root_font_metrics()
+            || self.box_values.requires_root_font_metrics()
+            || self.contain_intrinsic_size.requires_root_font_metrics()
+            || self.row_gap.requires_root_font_metrics()
+            || self.column_gap.requires_root_font_metrics()
+            || self.row_rule.requires_root_font_metrics()
+            || self.column_rule.requires_root_font_metrics()
+            || self.grid_template_rows.requires_root_font_metrics()
+            || self.grid_template_columns.requires_root_font_metrics()
+            || self.grid_auto_rows.requires_root_font_metrics()
+            || self.grid_auto_columns.requires_root_font_metrics()
+            || self.column_width.requires_root_font_metrics()
+            || self.column_height.requires_root_font_metrics()
+            || self.letter_spacing.requires_root_font_metrics()
+            || self.word_spacing.requires_root_font_metrics()
+            || self.border_radius.requires_root_font_metrics()
+            || self.border_shape.requires_root_font_metrics()
+            || self.shape_outside.requires_root_font_metrics()
+            || self.shape_margin.requires_root_font_metrics()
+            || self.object_view_box.requires_root_font_metrics()
+            || self.border_width_values.top.requires_root_font_metrics()
+            || self.border_width_values.right.requires_root_font_metrics()
+            || self.border_width_values.bottom.requires_root_font_metrics()
+            || self.border_width_values.left.requires_root_font_metrics()
+            || self.outline_width_value.requires_root_font_metrics()
+            || self.outline_offset.requires_root_font_metrics()
+            || self.flex_basis.requires_root_font_metrics()
+            || self.text_indent.requires_root_font_metrics()
+            || self.vertical_align.requires_root_font_metrics()
+            || self.tab_size.requires_root_font_metrics()
+            || [
+                &self.scroll_padding.top,
+                &self.scroll_padding.right,
+                &self.scroll_padding.bottom,
+                &self.scroll_padding.left,
+            ]
+            .into_iter()
+            .any(ScrollPadding::requires_root_font_metrics)
+            || [
+                &self.scroll_margin.top,
+                &self.scroll_margin.right,
+                &self.scroll_margin.bottom,
+                &self.scroll_margin.left,
+            ]
+            .into_iter()
+            .any(ComputedLengthPercentage::requires_root_font_metrics)
+            || self
+                .background
+                .background_image
+                .as_image()
+                .is_some_and(BackgroundImage::requires_root_font_metrics)
+            || self.background.background_size.requires_root_font_metrics()
+            || self
+                .background
+                .background_position
+                .requires_root_font_metrics()
+            || self.object_position.requires_root_font_metrics()
+            || self
+                .background
+                .background_layers
+                .iter()
+                .any(BackgroundLayer::requires_root_font_metrics)
+            || self
+                .transform
+                .iter()
+                .any(TransformFunction::requires_root_font_metrics)
+            || self.individual_transforms.requires_root_font_metrics()
+            || self.transform_origin.requires_root_font_metrics()
+            || self.perspective.requires_root_font_metrics()
+            || self.perspective_origin.requires_root_font_metrics()
+            || self.border_image.requires_root_font_metrics()
+            || self.text_decoration.requires_root_font_metrics()
+            || self.border_spacing.requires_root_font_metrics()
+            || self
+                .text_shadow
+                .iter()
+                .any(TextShadow::requires_root_font_metrics)
+            || self
+                .box_shadow
+                .iter()
+                .any(BoxShadow::requires_root_font_metrics)
+            || self.legacy_clip.requires_root_font_metrics()
+            || self.clip_path.requires_root_font_metrics()
             || [
                 self.marker_style.as_deref(),
                 self.before_style.as_deref(),
                 self.after_style.as_deref(),
                 self.first_line_style.as_deref(),
                 self.first_letter_style.as_deref(),
+                self.footnote_call_style.as_deref(),
+                self.footnote_marker_style.as_deref(),
             ]
             .into_iter()
             .flatten()
@@ -2884,16 +3101,42 @@ impl ComputedStyle {
     /// <https://www.w3.org/TR/css-values-4/#font-relative-lengths> and
     /// <https://www.w3.org/TR/css-cascade-5/#used>.
     pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
-        self.resolve_font_metric_lengths_with_box_axes(ch_advance, ch_advance, ch_advance);
+        self.resolve_ch_relative_lengths(ch_advance);
     }
 
-    /// Resolves selected-font `ch` metrics with distinct physical box axes.
-    pub(crate) fn resolve_font_metric_lengths_with_box_axes(
+    /// Finalize all local selected-font metrics at the computed-value
+    /// boundary. Each unit uses the element's inline-axis metric; physical
+    /// box edges do not provide independent `ch` or `ic` bases.
+    /// <https://drafts.csswg.org/css-values-4/#font-relative-lengths>
+    pub(crate) fn resolve_selected_font_metric_lengths(
         &mut self,
-        ch_advance: LayoutLength,
-        horizontal_box_advance: LayoutLength,
-        vertical_box_advance: LayoutLength,
+        basis: SelectedFontMetricLengthBasis,
     ) {
+        self.resolve_font_metric_lengths(basis.ch_advance);
+        self.line_height_value
+            .resolve_selected_font_metric_lengths(basis);
+        self.box_values.resolve_selected_font_metric_lengths(basis);
+
+        // Image values can retain metric expressions in generated geometry
+        // which is not part of the box-model traversal above.
+        if let Some(image) = self.background.background_image.as_image_mut() {
+            image.resolve_selected_font_metric_lengths(basis);
+        }
+        self.background
+            .background_size
+            .resolve_selected_font_metric_lengths(basis);
+        self.background
+            .background_position
+            .resolve_selected_font_metric_lengths(basis);
+        for layer in &mut self.background.background_layers {
+            layer.resolve_selected_font_metric_lengths(basis);
+        }
+
+        let (line_height, _, _) = self.line_height_value.clone().projected(self.font_size);
+        self.line_height = line_height;
+    }
+
+    fn resolve_ch_relative_lengths(&mut self, ch_advance: LayoutLength) {
         self.line_height_value
             .resolve_font_metric_lengths(ch_advance);
         let (line_height, _, _) = self.line_height_value.clone().projected(self.font_size);
@@ -2913,11 +3156,7 @@ impl ComputedStyle {
         self.column_height.resolve_font_metric_lengths(ch_advance);
         self.letter_spacing.resolve_font_metric_lengths(ch_advance);
         self.word_spacing.resolve_font_metric_lengths(ch_advance);
-        self.box_values
-            .resolve_font_metric_lengths_by_physical_axis(
-                horizontal_box_advance,
-                vertical_box_advance,
-            );
+        self.box_values.resolve_ch_relative_lengths(ch_advance);
         self.border_radius.resolve_font_metric_lengths(ch_advance);
         self.object_view_box.resolve_font_metric_lengths(ch_advance);
         self.border_width_values
@@ -2977,50 +3216,6 @@ impl ComputedStyle {
         }
     }
 
-    /// Resolves `ic` box-model components against the selected font's WATER
-    /// glyph advance.
-    /// <https://www.w3.org/TR/css-values-4/#ic>
-    pub(crate) fn resolve_ic_relative_lengths(&mut self, ic_advance: LayoutLength) {
-        self.resolve_ic_relative_lengths_with_box_axes(ic_advance, ic_advance, ic_advance);
-    }
-
-    /// Resolves selected-font `ic` metrics with distinct physical box axes.
-    pub(crate) fn resolve_ic_relative_lengths_with_box_axes(
-        &mut self,
-        ic_advance: LayoutLength,
-        horizontal_box_advance: LayoutLength,
-        vertical_box_advance: LayoutLength,
-    ) {
-        self.line_height_value
-            .resolve_ic_relative_lengths(ic_advance);
-        let (line_height, _, _) = self.line_height_value.clone().projected(self.font_size);
-        self.line_height = line_height;
-        self.box_values
-            .resolve_ic_relative_lengths_by_physical_axis(
-                horizontal_box_advance,
-                vertical_box_advance,
-            );
-    }
-
-    /// Resolves `ex` box-model components against the selected font's x-height.
-    /// <https://www.w3.org/TR/css-values-4/#ex>
-    pub(crate) fn resolve_ex_relative_lengths(&mut self, x_height: f32) {
-        self.line_height_value.resolve_ex_relative_lengths(x_height);
-        let (line_height, _, _) = self.line_height_value.clone().projected(self.font_size);
-        self.line_height = line_height;
-        self.box_values.resolve_ex_relative_lengths(x_height);
-    }
-
-    /// Resolves `cap` box-model components against the selected font's cap height.
-    /// <https://www.w3.org/TR/css-values-4/#cap>
-    pub(crate) fn resolve_cap_relative_lengths(&mut self, cap_height: f32) {
-        self.line_height_value
-            .resolve_cap_relative_lengths(cap_height);
-        let (line_height, _, _) = self.line_height_value.clone().projected(self.font_size);
-        self.line_height = line_height;
-        self.box_values.resolve_cap_relative_lengths(cap_height);
-    }
-
     /// Resolves ordinary `lh` components after this style's computed line
     /// height is available. `line-height` itself is intentionally excluded:
     /// CSS Values gives `lh` in that property the inherited line-height basis.
@@ -3035,6 +3230,9 @@ impl ComputedStyle {
         self.background
             .background_position
             .resolve_line_height_relative_lengths(line_height);
+        if let Some(image) = self.background.background_image.as_image_mut() {
+            image.resolve_line_height_relative_lengths(line_height);
+        }
         for layer in &mut self.background.background_layers {
             layer.resolve_line_height_relative_lengths(line_height);
         }
@@ -3049,6 +3247,99 @@ impl ComputedStyle {
         let (line_height, _, _) = self.line_height_value.clone().projected(self.font_size);
         self.line_height = line_height;
         self.box_values.resolve_root_font_metric_lengths(basis);
+        self.contain_intrinsic_size
+            .resolve_root_font_metric_lengths(basis);
+        self.row_gap.resolve_root_font_metric_lengths(basis);
+        self.column_gap.resolve_root_font_metric_lengths(basis);
+        self.row_rule.resolve_root_font_metric_lengths(basis);
+        self.column_rule.resolve_root_font_metric_lengths(basis);
+        self.grid_template_rows
+            .resolve_root_font_metric_lengths(basis);
+        self.grid_template_columns
+            .resolve_root_font_metric_lengths(basis);
+        self.grid_auto_rows.resolve_root_font_metric_lengths(basis);
+        self.grid_auto_columns
+            .resolve_root_font_metric_lengths(basis);
+        self.column_width.resolve_root_font_metric_lengths(basis);
+        self.column_height.resolve_root_font_metric_lengths(basis);
+        self.letter_spacing.resolve_root_font_metric_lengths(basis);
+        self.word_spacing.resolve_root_font_metric_lengths(basis);
+        self.border_radius.resolve_root_font_metric_lengths(basis);
+        self.border_shape.resolve_root_font_metric_lengths(basis);
+        self.shape_outside.resolve_root_font_metric_lengths(basis);
+        self.shape_margin.resolve_root_font_metric_lengths(basis);
+        self.object_view_box.resolve_root_font_metric_lengths(basis);
+        self.border_width_values
+            .top
+            .resolve_root_font_metric_lengths(basis);
+        self.border_width_values
+            .right
+            .resolve_root_font_metric_lengths(basis);
+        self.border_width_values
+            .bottom
+            .resolve_root_font_metric_lengths(basis);
+        self.border_width_values
+            .left
+            .resolve_root_font_metric_lengths(basis);
+        self.resolve_used_border_widths();
+        self.outline_width_value
+            .resolve_root_font_metric_lengths(basis);
+        self.outline_width = self.outline_width_value.length_max_zero().points();
+        self.outline_offset.resolve_root_font_metric_lengths(basis);
+        self.flex_basis.resolve_root_font_metric_lengths(basis);
+        self.text_indent.resolve_root_font_metric_lengths(basis);
+        self.vertical_align.resolve_root_font_metric_lengths(basis);
+        self.tab_size.resolve_root_font_metric_lengths(basis);
+        for edge in [
+            &mut self.scroll_padding.top,
+            &mut self.scroll_padding.right,
+            &mut self.scroll_padding.bottom,
+            &mut self.scroll_padding.left,
+        ] {
+            edge.resolve_root_font_metric_lengths(basis);
+        }
+        for edge in [
+            &mut self.scroll_margin.top,
+            &mut self.scroll_margin.right,
+            &mut self.scroll_margin.bottom,
+            &mut self.scroll_margin.left,
+        ] {
+            edge.resolve_root_font_metric_lengths(basis);
+        }
+        if let Some(image) = self.background.background_image.as_image_mut() {
+            image.resolve_root_font_metric_lengths(basis);
+        }
+        self.background
+            .background_size
+            .resolve_root_font_metric_lengths(basis);
+        self.background
+            .background_position
+            .resolve_root_font_metric_lengths(basis);
+        self.object_position.resolve_root_font_metric_lengths(basis);
+        for layer in &mut self.background.background_layers {
+            layer.resolve_root_font_metric_lengths(basis);
+        }
+        for function in &mut self.transform {
+            function.resolve_root_font_metric_lengths(basis);
+        }
+        self.individual_transforms
+            .resolve_root_font_metric_lengths(basis);
+        self.transform_origin
+            .resolve_root_font_metric_lengths(basis);
+        self.perspective.resolve_root_font_metric_lengths(basis);
+        self.perspective_origin
+            .resolve_root_font_metric_lengths(basis);
+        self.border_image.resolve_root_font_metric_lengths(basis);
+        self.text_decoration.resolve_root_font_metric_lengths(basis);
+        self.border_spacing.resolve_root_font_metric_lengths(basis);
+        for shadow in &mut self.text_shadow {
+            shadow.resolve_root_font_metric_lengths(basis);
+        }
+        for shadow in &mut self.box_shadow {
+            shadow.resolve_root_font_metric_lengths(basis);
+        }
+        self.legacy_clip.resolve_root_font_metric_lengths(basis);
+        self.clip_path.resolve_root_font_metric_lengths(basis);
     }
 
     /// Resolves font-metric-relative lengths while preserving physical
@@ -3371,6 +3662,49 @@ mod tests {
     }
 
     #[test]
+    fn effective_zoom_scales_shadow_lengths_without_scaling_percentages() {
+        let mut style = ComputedStyle::initial();
+        style.effective_zoom = EffectiveZoom(2.0);
+        style.text_shadow = vec![TextShadow {
+            color: TextShadowColor::CurrentColor,
+            offset_x: ComputedLengthPercentage::from_affine(layout_pt(3.0), 0.1, true),
+            offset_y: ComputedLengthPercentage::from_points(4.0),
+            blur_radius: ComputedLengthPercentage::from_points(5.0),
+            spread: ComputedLengthPercentage::from_affine(layout_pt(-2.0), 0.2, true),
+            inset: false,
+        }];
+        style.box_shadow = vec![BoxShadow {
+            color: BoxShadowColor::CssColor(CssColor::new(1, 2, 3)),
+            offset_x: ComputedLengthPercentage::from_points(6.0),
+            offset_y: ComputedLengthPercentage::from_points(7.0),
+            blur_radius: ComputedLengthPercentage::from_points(8.0),
+            spread: ComputedLengthPercentage::from_points(9.0),
+            inset: true,
+        }];
+
+        let style = LayoutStyle::from_computed(&style).into_zoomed();
+        let text_shadow = &style.text_shadow[0];
+        assert_eq!(text_shadow.color, TextShadowColor::CurrentColor);
+        assert_eq!(text_shadow.offset_x.length_points(), 6.0);
+        assert_eq!(text_shadow.offset_x.percentage_coefficient_or_zero(), 0.1);
+        assert_eq!(text_shadow.offset_y.length_points(), 8.0);
+        assert_eq!(text_shadow.blur_radius.length_points(), 10.0);
+        assert_eq!(text_shadow.spread.length_points(), -4.0);
+        assert_eq!(text_shadow.spread.percentage_coefficient_or_zero(), 0.2);
+
+        let box_shadow = &style.box_shadow[0];
+        assert_eq!(
+            box_shadow.color,
+            BoxShadowColor::CssColor(CssColor::new(1, 2, 3))
+        );
+        assert!(box_shadow.inset);
+        assert_eq!(box_shadow.offset_x.length_points(), 12.0);
+        assert_eq!(box_shadow.offset_y.length_points(), 14.0);
+        assert_eq!(box_shadow.blur_radius.length_points(), 16.0);
+        assert_eq!(box_shadow.spread.length_points(), 18.0);
+    }
+
+    #[test]
     fn effective_zoom_scales_fixed_position_insets_once() {
         let mut style = ComputedStyle::initial();
         style.effective_zoom = EffectiveZoom(2.0);
@@ -3603,6 +3937,29 @@ mod tests {
     }
 
     #[test]
+    fn effective_zoom_scales_fixed_grid_lanes_flow_tolerance_without_scaling_percentages() {
+        let mut style = ComputedStyle::initial();
+        style.effective_zoom = EffectiveZoom(2.0);
+        style.grid_lanes_flow_tolerance = GridLanesFlowTolerance::LengthPercentage(
+            ComputedLengthPercentage::from_affine(layout_pt(51.0), 0.17, true),
+        );
+
+        let style = LayoutStyle::from_computed(&style).into_zoomed();
+
+        let GridLanesFlowTolerance::LengthPercentage(value) = &style.grid_lanes_flow_tolerance
+        else {
+            panic!("flow tolerance remains a length-percentage");
+        };
+        assert_eq!(value.length_points(), 102.0);
+        assert_eq!(
+            value
+                .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(300.0)))
+                .unwrap(),
+            layout_pt(153.0)
+        );
+    }
+
+    #[test]
     fn cloned_styles_do_not_cross_contaminate_shared_length_expression_trees() {
         let mut original = ComputedStyle::initial();
         original.box_values.width =
@@ -3624,6 +3981,42 @@ mod tests {
         assert_eq!(first.box_values.width.length_if_no_percent(), Some(30.0));
         assert_eq!(second.box_values.width.length_if_no_percent(), Some(70.0));
         assert_eq!(original.box_values.width.length_if_no_percent(), None);
+    }
+
+    #[test]
+    fn root_metric_resolution_reaches_non_box_length_carriers() {
+        let mut style = ComputedStyle::initial();
+        style.row_gap = ComputedGap::LengthPercentage(ComputedLengthPercentage::from_rch(1.0));
+        style.column_width = ComputedColumnWidth::Length(ComputedLengthPercentage::from_rcap(1.0));
+        style.flex_basis = ComputedFlexBasis::LengthPercentage(ComputedFlexBasisLength::new(
+            ComputedLengthPercentage::from_ric(1.0),
+        ));
+        style.transform_origin.z = ComputedLengthPercentage::from_rlh(1.0);
+        style.outline_offset = ComputedLengthPercentage::from_rex(1.0);
+
+        style.resolve_root_font_metric_lengths(RootFontMetricLengthBasis {
+            font_size: layout_pt(10.0),
+            ch_advance: layout_pt(2.0),
+            x_height: layout_pt(3.0),
+            cap_height: layout_pt(4.0),
+            ic_advance: layout_pt(5.0),
+            line_height: layout_pt(6.0),
+        });
+
+        let ComputedGap::LengthPercentage(row_gap) = style.row_gap else {
+            panic!("row gap remains a length-percentage");
+        };
+        assert_eq!(row_gap.length_points(), 2.0);
+        let ComputedColumnWidth::Length(column_width) = style.column_width else {
+            panic!("column width remains a length");
+        };
+        assert_eq!(column_width.length_points(), 4.0);
+        let ComputedFlexBasis::LengthPercentage(flex_basis) = style.flex_basis else {
+            panic!("flex basis remains a length-percentage");
+        };
+        assert_eq!(flex_basis.value.length_points(), 5.0);
+        assert_eq!(style.transform_origin.z.length_points(), 6.0);
+        assert_eq!(style.outline_offset.length_points(), 3.0);
     }
 
     #[test]

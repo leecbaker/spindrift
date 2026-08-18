@@ -3,15 +3,25 @@ use crate::layout::block::{
     LogicalFloatPlacement, UsedRoundedRect,
 };
 use crate::layout::{
-    Clear, Direction, Float, FloatAvoidanceCandidate, FloatAvoidanceInlineContainment, FloatBand,
-    FloatBandPlacement, FloatClearanceResolution, FloatContext, FloatId, FloatPlacement,
-    FloatRunState, FloatShape, LogicalFloatBand, LogicalInlineSpan, PageBlockSpan, PageInlineSpan,
-    PageTopBlockPosition, PageTopPoint, PageTopRect, UsedFloatSide, WritingMode, border_box_pt,
-    margin_box_pt, margin_box_size_pt,
+    Clear, ClearedFloatOuterBlockEnd, Direction, Float, FloatAvoidanceCandidate,
+    FloatAvoidanceInlineContainment, FloatBand, FloatBandPlacement, FloatClearanceTarget,
+    FloatContext, FloatId, FloatPlacement, FloatRunState, FloatShape, HypotheticalClearBorderEdge,
+    LogicalFloatBand, LogicalInlineSpan, PageBlockSpan, PageInlineSpan, PageTopBlockPosition,
+    PageTopPoint, PageTopRect, UsedFloatSide, WritingMode, border_box_pt, margin_box_pt,
+    margin_box_size_pt,
 };
+use crate::units::SemanticLengthExt;
 
 fn top(value: f32) -> PageTopBlockPosition {
     PageTopBlockPosition::new(value)
+}
+
+fn hypothetical_top(value: f32) -> HypotheticalClearBorderEdge {
+    HypotheticalClearBorderEdge::new(top(value))
+}
+
+fn cleared_bottom(value: f32) -> ClearedFloatOuterBlockEnd {
+    ClearedFloatOuterBlockEnd::new(top(value))
 }
 
 #[test]
@@ -47,6 +57,47 @@ fn initial_letter_keeps_margin_geometry_distinct_from_wrapping_geometry() {
         shape.margin_box_block_span(),
         PageBlockSpan::new(100.0, 60.0)
     );
+}
+
+#[test]
+fn left_float_margin_box_starts_at_available_band_left_edge() {
+    let placement = FloatBandPlacement::new(FloatBand::from_edges(10.0, 30.0), top(100.0));
+
+    assert_eq!(
+        placement.inline_float_margin_box_left(UsedFloatSide::Left, margin_box_pt(12.0)),
+        10.0
+    );
+}
+
+#[test]
+fn fitting_right_float_margin_box_ends_at_available_band_right_edge() {
+    let placement = FloatBandPlacement::new(FloatBand::from_edges(10.0, 30.0), top(100.0));
+    let outer_inline_extent = margin_box_pt(12.0);
+    let left = placement.inline_float_margin_box_left(UsedFloatSide::Right, outer_inline_extent);
+
+    assert_eq!(left, 18.0);
+    assert_eq!(left + outer_inline_extent.points(), 30.0);
+}
+
+#[test]
+fn overwide_right_float_margin_box_overflows_left_to_preserve_outer_right_edge() {
+    let placement = FloatBandPlacement::new(FloatBand::from_edges(10.0, 30.0), top(100.0));
+    let outer_inline_extent = margin_box_pt(40.0);
+    let left = placement.inline_float_margin_box_left(UsedFloatSide::Right, outer_inline_extent);
+
+    assert_eq!(left, -10.0);
+    assert!(left < placement.available_span.left_x());
+    assert_eq!(left + outer_inline_extent.points(), 30.0);
+}
+
+#[test]
+fn right_float_with_negative_outer_extent_preserves_outer_right_edge() {
+    let placement = FloatBandPlacement::new(FloatBand::from_edges(10.0, 30.0), top(100.0));
+    let outer_inline_extent = margin_box_pt(-4.0);
+    let left = placement.inline_float_margin_box_left(UsedFloatSide::Right, outer_inline_extent);
+
+    assert_eq!(left, 34.0);
+    assert_eq!(left + outer_inline_extent.points(), 30.0);
 }
 
 fn bfc_measurement(left: f32, width: f32, height: f32) -> FloatAvoidanceCandidate {
@@ -941,7 +992,7 @@ fn clearance_uses_logical_direction_mapping() {
             WritingMode::HorizontalTb,
             Direction::Rtl,
             0,
-            top(95.0)
+            hypothetical_top(95.0)
         ),
         top(60.0)
     );
@@ -951,7 +1002,7 @@ fn clearance_uses_logical_direction_mapping() {
             WritingMode::HorizontalTb,
             Direction::Ltr,
             0,
-            top(95.0)
+            hypothetical_top(95.0)
         ),
         top(95.0)
     );
@@ -977,7 +1028,7 @@ fn clearance_uses_vertical_logical_used_sides() {
             WritingMode::VerticalRl,
             Direction::Ltr,
             0,
-            top(95.0)
+            hypothetical_top(95.0)
         ),
         top(60.0)
     );
@@ -987,7 +1038,7 @@ fn clearance_uses_vertical_logical_used_sides() {
             WritingMode::VerticalRl,
             Direction::Ltr,
             0,
-            top(95.0)
+            hypothetical_top(95.0)
         ),
         top(95.0)
     );
@@ -1378,7 +1429,7 @@ fn clearance_sees_continued_float_fragment_on_current_page() {
             WritingMode::HorizontalTb,
             Direction::Ltr,
             1,
-            top(95.0)
+            hypothetical_top(95.0)
         ),
         top(60.0)
     );
@@ -1388,14 +1439,14 @@ fn clearance_sees_continued_float_fragment_on_current_page() {
             WritingMode::HorizontalTb,
             Direction::Ltr,
             1,
-            top(95.0)
+            hypothetical_top(95.0)
         ),
         top(95.0)
     );
 }
 
 #[test]
-fn clearance_resolution_reports_future_continuation() {
+fn clearance_target_reports_future_continuation() {
     let mut first = shape(Float::Left, 0, 10.0, 40.0, 100.0, 10.0);
     first.id = FloatId(9);
     first.continues_on_next_page = true;
@@ -1406,29 +1457,71 @@ fn clearance_resolution_reports_future_continuation() {
     };
 
     assert_eq!(
-        context.clearance_resolution(
+        context.clearance_target(
             Clear::Both,
             WritingMode::HorizontalTb,
             Direction::Ltr,
             0,
-            top(95.0)
+            hypothetical_top(95.0)
         ),
-        FloatClearanceResolution {
-            top: top(10.0),
+        FloatClearanceTarget {
+            lowest_matching_outer_block_end: Some(cleared_bottom(10.0)),
             continued_float: Some(FloatId(9))
         }
     );
     assert_eq!(
-        context.clearance_resolution(
+        context.clearance_target(
             Clear::Both,
             WritingMode::HorizontalTb,
             Direction::Ltr,
             1,
-            top(95.0)
+            hypothetical_top(95.0)
         ),
-        FloatClearanceResolution {
-            top: top(50.0),
+        FloatClearanceTarget {
+            lowest_matching_outer_block_end: Some(cleared_bottom(50.0)),
             continued_float: None
+        }
+    );
+}
+
+#[test]
+fn clearance_target_is_a_pure_query_when_no_float_matches() {
+    let context = FloatContext {
+        shapes: vec![shape(Float::Right, 0, 10.0, 40.0, 100.0, 60.0)],
+    };
+
+    assert_eq!(
+        context.clearance_target(
+            Clear::Left,
+            WritingMode::HorizontalTb,
+            Direction::Ltr,
+            0,
+            hypothetical_top(95.0),
+        ),
+        FloatClearanceTarget {
+            lowest_matching_outer_block_end: None,
+            continued_float: None,
+        }
+    );
+}
+
+#[test]
+fn clearance_target_does_not_select_a_float_before_the_hypothetical_edge() {
+    let context = FloatContext {
+        shapes: vec![shape(Float::Left, 0, 10.0, 40.0, 100.0, 60.0)],
+    };
+
+    assert_eq!(
+        context.clearance_target(
+            Clear::Left,
+            WritingMode::HorizontalTb,
+            Direction::Ltr,
+            0,
+            hypothetical_top(50.0),
+        ),
+        FloatClearanceTarget {
+            lowest_matching_outer_block_end: None,
+            continued_float: None,
         }
     );
 }

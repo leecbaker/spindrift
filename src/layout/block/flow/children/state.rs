@@ -4,7 +4,8 @@ use crate::css::{
 };
 use crate::document::paint::geometry::{PaintPoint, PaintRect, PaintSize};
 use crate::layout::{
-    BlockEndMarginCollapse, LayoutLength, style_establishes_multicol_formatting_context,
+    BlockEndMarginCollapse, BlockMarginCollapseBoundary, LayoutLength,
+    style_establishes_multicol_formatting_context,
 };
 use crate::units::{ContentBoxLength, SemanticLengthExt, content_box_pt, layout_pt};
 use std::num::NonZeroUsize;
@@ -13,6 +14,10 @@ use std::num::NonZeroUsize;
 pub(in crate::layout) struct ChildFlowTraversalOutcome {
     pub(in crate::layout) pending_end_margin_collapse: Option<BlockEndMarginCollapse>,
     pub(in crate::layout) collapsed_start_margin_offset: LayoutLength,
+    /// Whether a descendant's actual CSS2 clearance separated the parent's
+    /// otherwise adjoining margin set. This is dynamic: `clear` alone is not
+    /// a boundary when no matching float requires clearance.
+    pub(in crate::layout) adjoining_margin_set_boundary: BlockMarginCollapseBoundary,
     /// Static geometry exported by the rendered-legend source child, when
     /// this traversal owns an HTML fieldset.  It is deliberately kept out of
     /// the ordinary block cursor state: the legend's border interruption is a
@@ -176,6 +181,7 @@ impl DiscardRegionLimit {
     }
 }
 
+#[derive(Clone)]
 pub(in crate::layout) struct BlockFlowChildTraversalState {
     source: Option<LineLimitTraversal>,
     remaining: Option<RemainingLineSlots>,
@@ -253,11 +259,19 @@ impl BlockFlowChildTraversalState {
         // could accidentally spend while the multicol implementation lays
         // its independent formatting contexts.
         // <https://drafts.csswg.org/css-overflow-4/#continue>
+        // A descendant that shares its ancestor's formatting context receives
+        // the exact remaining traversal through this transient field.  It must
+        // seed the next block-flow controller; rebuilding from the descendant's
+        // cascaded declaration would discard the already-spent slots whenever
+        // a block contains another ordinary block.
+        // <https://drafts.csswg.org/css-overflow-4/#line-clamp>
         let source = (!style_establishes_multicol_formatting_context(style))
             .then(|| {
-                style
-                    .line_clamp_container()
-                    .map(LineLimitTraversal::from_container)
+                style.line_limit_traversal.clone().or_else(|| {
+                    style
+                        .line_clamp_container()
+                        .map(LineLimitTraversal::from_container)
+                })
             })
             .flatten();
         let remaining = source.as_ref().map(|clamp| clamp.remaining);
@@ -428,6 +442,44 @@ impl BlockFlowChildTraversalState {
     /// traversal can cross a child boundary.
     pub(in crate::layout) fn has_active_clamp(&self) -> bool {
         self.remaining.is_some() || self.automatic.is_some()
+    }
+
+    /// Whether this traversal is selecting an automatic block-size cutoff.
+    /// Such a cutoff observes every normal-flow child contribution, including
+    /// a child that establishes its own formatting context.  The child does
+    /// not contribute descendant line boxes to the parent's line-count
+    /// stream, but it does occupy block-axis space between legal clamp
+    /// points.
+    /// <https://drafts.csswg.org/css-overflow-4/#line-clamp-containers>
+    pub(in crate::layout) fn has_automatic_block_size_clamp(&self) -> bool {
+        self.automatic.is_some()
+    }
+
+    /// Return the current parent-content-box allowance of an automatic
+    /// controller.  A mixed-flow walker uses this only to decide whether a
+    /// following *definite* block can be admitted after a speculative inline
+    /// endpoint; it never turns that length into a line-count budget.
+    pub(in crate::layout) fn automatic_remaining(&self) -> Option<ContentBoxLength> {
+        self.automatic
+            .as_ref()
+            .map(AutomaticBlockSizeTraversal::remaining)
+    }
+
+    /// Construct a replay style for an already measured preceding inline
+    /// source boundary.  The marker has to participate in line selection,
+    /// rather than being appended after the speculative layout has painted.
+    /// <https://drafts.csswg.org/css-overflow-4/#block-ellipsis>
+    pub(in crate::layout) fn automatic_terminal_boundary_style(
+        &self,
+        style: &ComputedStyle,
+    ) -> Option<ComputedStyle> {
+        let automatic = self.automatic.as_ref()?;
+        let mut boundary = style.clone();
+        boundary.automatic_block_size_traversal = None;
+        boundary.automatic_block_boundary_marker = Some(crate::css::AutomaticBlockBoundaryMarker(
+            automatic.marker().clone(),
+        ));
+        Some(boundary)
     }
 
     /// An automatic clamp may cross a specified zero-height block to find

@@ -99,7 +99,7 @@ impl<'a> LayoutBuilder<'a> {
         vertical_non_content: f32,
     ) -> Option<GridContainerFlexItemEstimate> {
         let used_style = self.grid_used_style(style);
-        let style = used_style.as_computed();
+        let style: &ComputedStyle = used_style.used_style();
         let built_child_boxes;
         let child_boxes = if let Some(child_boxes) = child_boxes {
             child_boxes
@@ -245,7 +245,7 @@ impl<'a> LayoutBuilder<'a> {
         axis: GridIntrinsicAxis,
     ) -> (f32, f32) {
         let used_style = self.grid_used_style(style);
-        let style = used_style.as_computed();
+        let style: &ComputedStyle = used_style.used_style();
         let scrollbar_reservation = ScrollbarGutterReservation::static_pdf_overlay();
         let built_child_boxes;
         let child_boxes = if let Some(child_boxes) = child_boxes {
@@ -308,7 +308,7 @@ impl<'a> LayoutBuilder<'a> {
             gap: style.column_gap.clone(),
         });
         let scrollbar_extent = intrinsic_grid_scrollbar_axis_extent(
-            used_style.as_computed(),
+            used_style.used_style(),
             axis,
             scrollbar_reservation,
         )
@@ -1222,13 +1222,17 @@ fn simple_implicit_column_extent(
     let auto_track_count = match auto_flow {
         css::GridAutoFlow::Row | css::GridAutoFlow::RowDense => {
             let constrained_count = constrained_row_spans.iter().cloned().max().unwrap_or(0);
-            Some(if explicit_column_count > 0 {
+            // CSS Grid creates the implicit columns before it auto-places
+            // items with automatic positions in both axes. Those items can
+            // create rows, but only their largest column span can enlarge the
+            // implicit column extent. Items pre-placed into a definite row
+            // have already made their column demand definite.
+            // <https://www.w3.org/TR/css-grid-1/#auto-placement-algo>
+            Some(
                 explicit_column_count
                     .max(max_auto_span)
-                    .max(constrained_count)
-            } else {
-                span_sum
-            })
+                    .max(constrained_count),
+            )
         }
         css::GridAutoFlow::Column | css::GridAutoFlow::ColumnDense => {
             if span_sum == 0 {
@@ -2826,6 +2830,27 @@ mod tests {
                 &[]
             ),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn row_auto_flow_reuses_one_implicit_column_across_explicit_rows() {
+        let children = [
+            anonymous_grid_child_with_style(ComputedStyle::initial()),
+            anonymous_grid_child_with_style(ComputedStyle::initial()),
+            anonymous_grid_child_with_style(ComputedStyle::initial()),
+        ];
+
+        assert_eq!(
+            simple_implicit_column_count(
+                css::GridAutoFlow::Row,
+                3,
+                0,
+                &row_lines(0),
+                &row_lines(3),
+                &children
+            ),
+            Some(1)
         );
     }
 

@@ -101,12 +101,11 @@ pub(in crate::layout) fn rendered_text_run_typographic_units(
     text: &str,
     glyphs: &[RenderedGlyph],
 ) -> Vec<RenderedTextUnit> {
-    let unit_ranges = typographic_unit_ranges(text);
-    let Some(first_range) = unit_ranges.first() else {
+    let mut unit_ranges = CursiveProtectedUnitRanges::new(text).into_iter();
+    let Some(first_range) = unit_ranges.next() else {
         return Vec::new();
     };
     let mut units = Vec::new();
-    let mut unit_index = 0usize;
     let mut unit_end = first_range.end;
     let mut consumed_text_bytes = 0usize;
     let mut pending_text = String::new();
@@ -122,9 +121,11 @@ pub(in crate::layout) fn rendered_text_run_typographic_units(
                 &mut pending_start,
                 &mut pending_end,
             );
-            while unit_index + 1 < unit_ranges.len() && consumed_text_bytes >= unit_end {
-                unit_index += 1;
-                unit_end = unit_ranges[unit_index].end;
+            while consumed_text_bytes >= unit_end {
+                let Some(range) = unit_ranges.next() else {
+                    break;
+                };
+                unit_end = range.end;
             }
         }
 

@@ -220,16 +220,34 @@ impl<'a> LayoutBuilder<'a> {
         };
         let top_caption_paint_checkpoint = self.current_page.paint_checkpoint();
         let top_caption_paint_page_index = self.pages.len();
-        self.layout_table_captions(
+        let top_caption_containing_block = TableCaptionContainingBlock::new(
+            PageInlineSpan::new(border_box_x, border_box_width),
+            TableCaptionOuterWidth::from_border_box(border_box_pt(border_box_width)),
+            TableAxes::for_style(style),
+            PageInlinePosition::new(table_x),
+        );
+        let top_caption_outcome = self.layout_table_captions(
             captions,
             style,
             stylesheets,
-            border_box_x,
-            TableCaptionOuterWidth::from_border_box(border_box_pt(border_box_width)),
+            top_caption_containing_block,
             CaptionSide::Top,
         );
 
-        let table_box_top = self.cursor_y;
+        // Even a rowless table retains its wrapper-flow ordering. In
+        // particular, a vertical top caption can cross anonymous columns
+        // before the table-root border/background is painted. Do not fall
+        // back to the opening table X coordinate in this path.
+        let top_caption_destination = if style.writing_mode.has_vertical_lines()
+            && top_caption_outcome.next_part_requires_successor()
+        {
+            self.advance_table_wrapper_fragmentainer(style, top_caption_containing_block)
+                .expect("an empty table following a caption needs a destination fragmentainer")
+        } else {
+            top_caption_outcome.final_destination()
+        };
+
+        let table_box_top = top_caption_destination.paint_top().points();
 
         let table_structure_paint_checkpoint = self.current_page.paint_checkpoint();
         let table_structure_paint_page_index = self.pages.len();
@@ -257,12 +275,31 @@ impl<'a> LayoutBuilder<'a> {
             }
         }
         let table_paint_box = TableWrapperPaintBox {
-            table_x,
-            top: table_box_top,
+            grid_origin: if style.writing_mode.has_vertical_lines()
+                && top_caption_outcome.vertical_block_progress().get() > 0.0
+            {
+                top_caption_destination.destination_grid_origin()
+            } else if style.writing_mode.has_vertical_lines() {
+                TableFragmentainerGridOrigin::for_continuation(
+                    style,
+                    self.content_left,
+                    self.content_right,
+                    HorizontalTableContinuationInlineOffset::capture(table_x, self.content_left),
+                    TableGridLength::new(content_height),
+                    PageTopBlockPosition::new(table_box_top),
+                )
+                .page_top_point()
+            } else {
+                PageTopPoint::new(
+                    table_x,
+                    table_box_top - table_width.border_widths.top - table_width.padding.top,
+                )
+            },
             axes: TableAxes::for_style(style),
             grid_size,
             table_width,
             table_metrics,
+            block_edge_spacing: TableGridLength::new(0.0),
         };
         self.paint_separated_table_wrapper_border(style, table_paint_box.clone());
         if !paint_containment_applies && self.pages.len() == table_structure_paint_page_index {
@@ -288,8 +325,12 @@ impl<'a> LayoutBuilder<'a> {
             captions,
             style,
             stylesheets,
-            border_box_x,
-            TableCaptionOuterWidth::from_border_box(border_box_pt(border_box_width)),
+            TableCaptionContainingBlock::new(
+                PageInlineSpan::new(border_box_x, border_box_width),
+                TableCaptionOuterWidth::from_border_box(border_box_pt(border_box_width)),
+                TableAxes::for_style(style),
+                PageInlinePosition::new(table_x),
+            ),
             CaptionSide::Bottom,
         );
         if paint_containment_applies && self.pages.len() == top_caption_paint_page_index {
@@ -420,7 +461,7 @@ impl<'a> LayoutBuilder<'a> {
         if wrapper.table_metrics.border_collapse == css::BorderCollapse::Collapse {
             return;
         }
-        let border_box = wrapper.clone().border_box();
+        let border_box = wrapper.border_box();
         let border_box_x = border_box.x();
         let border_box_width = border_box.width();
         let border_box_height = border_box.height();
@@ -431,7 +472,7 @@ impl<'a> LayoutBuilder<'a> {
             &mut border_paths,
             PageTopRect::new(
                 border_box_x,
-                wrapper.top,
+                border_box.top_y(),
                 border_box_width,
                 border_box_height,
             ),
@@ -795,21 +836,16 @@ impl<'a> LayoutBuilder<'a> {
                     }
                 }
 
-                let clip_active = if let Some(clip) = content_clip
+                let layout_content_clip = content_clip
                     .as_ref()
-                    .and_then(TableCellClipRegion::bounding_clip)
-                {
-                    self.push_overflow_clip(clip);
-                    true
-                } else {
-                    false
-                };
+                    .and_then(TableCellClipRegion::bounding_clip);
 
                 if !text.is_empty() && cell.children.is_none() {
                     let content_box = content_geometry.content_box();
                     let content_scope = self.enter_table_cell_content_scope(
                         cell_style,
                         content_box,
+                        layout_content_clip,
                         self.table_cell_child_ancestors(cell, row),
                         PercentageBasis::indefinite(),
                     );
@@ -845,6 +881,7 @@ impl<'a> LayoutBuilder<'a> {
                     stylesheets,
                     cell_borders,
                     content_geometry,
+                    layout_content_clip,
                 );
                 self.layout_table_cell_positioned_children(
                     cell,
@@ -861,8 +898,8 @@ impl<'a> LayoutBuilder<'a> {
                     cell_borders,
                     cell_border_box,
                     cell_placement,
+                    layout_content_clip,
                 );
-                self.pop_overflow_clip(clip_active);
             }
 
             if row_occupied {
@@ -959,15 +996,22 @@ impl<'a> LayoutBuilder<'a> {
                 bounds,
                 overflow_clip,
             );
+            let mut fragment = self
+                .current_page
+                .take_paint_fragment_since(paint_checkpoint.clone());
+            if table_outlines_use_in_flow_phase(table_style, false, &policy) {
+                fragment.promote_outline_to_in_flow_outline();
+            }
             let child_contexts = self.positioned_child_contexts_since(
                 positioned_layer_start,
                 paint_page_index,
                 &policy,
             );
-            self.scope_current_page_paint_since_with_policy(
+            self.scope_current_page_fragment_with_policy(
                 &paint_checkpoint,
                 policy,
                 bounds,
+                fragment,
                 child_contexts,
             );
         }

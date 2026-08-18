@@ -565,19 +565,41 @@ pub(in crate::layout::flex) fn estimated_flex_item_available_space(
     available: FlexAvailableSpace,
 ) -> FlexItemAvailableSpace {
     let mut item_available = FlexItemAvailableSpace::from_container(available);
-    let Some(stretched_cross_size) = estimated_stretched_flex_item_cross_size(
-        child_style,
-        container_style,
-        physical_direction,
-        available,
-    ) else {
+    let premeasure_cross_size = if container_style.flex_wrap.balances_lines()
+        && container_style.flex_line_count.get() > 1
+    {
+        estimated_stretched_flex_item_cross_size(
+            child_style,
+            container_style,
+            physical_direction,
+            available,
+        )
+        .map(FlexPremeasureCrossSize::BalancedLineSlot)
+    } else if !container_style.flex_wrap.wraps() {
+        // A single-line container with a definite cross size establishes a
+        // definite stretched item cross size before flex-base calculation.
+        // This is distinct from a final stretch replay because the result is
+        // required to determine the base size itself.
+        // <https://drafts.csswg.org/css-flexbox/#algo-main-item>
+        estimated_stretched_flex_item_cross_size(
+            child_style,
+            container_style,
+            physical_direction,
+            available,
+        )
+        .map(FlexPremeasureCrossSize::DefiniteSingleLineContainer)
+    } else {
+        None
+    };
+    let Some(premeasure_cross_size) = premeasure_cross_size else {
         return item_available;
     };
+    let stretched_cross_size = premeasure_cross_size.size();
 
     item_available.set_definite_cross_size(
         physical_direction,
         stretched_cross_size,
-        FlexAvailableSizeSource::DefiniteCrossSize,
+        premeasure_cross_size.available_size_source(),
     );
     item_available.set_stretched_cross_size(physical_direction, stretched_cross_size);
     item_available
@@ -603,22 +625,37 @@ pub(in crate::layout::flex) fn estimated_stretched_flex_item_cross_size(
         }
         let container_cross_size =
             flex_cross_size_from_content_box(available.height_basis_content_box_length()?);
-        Some(
-            (container_cross_size
-                - FlexCrossLength::new(child_style.margin.top + child_style.margin.bottom))
-            .non_negative_size(),
-        )
+        let stretch_size = (container_cross_size
+            - FlexCrossLength::new(child_style.margin.top + child_style.margin.bottom))
+        .non_negative_size();
+        Some(flex_cross_size_from_content_box(
+            constrain_flex_item_estimated_height(
+                child_style,
+                flex_cross_content_box_length(stretch_size),
+                flex_cross_content_box_length(stretch_size),
+                flex_cross_content_box_length(stretch_size),
+                available.height_basis,
+                non_content_pt(
+                    child_style.padding.top
+                        + child_style.padding.bottom
+                        + vertical_border_width(child_style),
+                ),
+            ),
+        ))
     } else {
         if !child_style.box_values.width.is_auto() {
             return None;
         }
         let container_cross_size =
             flex_cross_size_from_content_box(available.width_basis_content_box_length()?);
-        Some(
-            (container_cross_size
-                - FlexCrossLength::new(child_style.margin.left + child_style.margin.right))
-            .non_negative_size(),
-        )
+        let stretch_size = (container_cross_size
+            - FlexCrossLength::new(child_style.margin.left + child_style.margin.right))
+        .non_negative_size();
+        Some(flex_cross_size_from_content_box(constrain_content_width(
+            child_style,
+            flex_cross_content_box_length(stretch_size),
+            available.width_basis,
+        )))
     }
 }
 
@@ -807,6 +844,93 @@ mod tests {
                 available,
             ),
             Some(FlexCrossSize::new(80.0))
+        );
+    }
+
+    #[test]
+    fn single_line_definite_stretch_is_the_only_non_balanced_premeasure_basis() {
+        let child_style = ComputedStyle::initial();
+        let container_style = ComputedStyle::initial();
+        let available = FlexAvailableSpace {
+            width: PhysicalContentWidth::new(content_box_pt(300.0)),
+            width_basis: PercentageBasis::definite_from(
+                content_box_pt(300.0),
+                FlexAvailableSizeSource::ContainingBlock,
+            ),
+            height: Some(PhysicalContentHeight::new(content_box_pt(100.0))),
+            height_basis: PercentageBasis::definite_from(
+                content_box_pt(100.0),
+                FlexAvailableSizeSource::ContainingBlock,
+            ),
+        };
+
+        let stretched = estimated_flex_item_available_space(
+            &child_style,
+            &container_style,
+            FlexDirection::Row,
+            available,
+        );
+        assert_eq!(
+            stretched.height_basis,
+            PercentageBasis::definite_from(
+                content_box_pt(100.0),
+                FlexAvailableSizeSource::DefiniteSingleLineStretch,
+            )
+        );
+
+        let mut multiline_container = container_style.clone();
+        multiline_container.flex_wrap = FlexWrap::Wrap;
+        assert!(
+            estimated_flex_item_available_space(
+                &child_style,
+                &multiline_container,
+                FlexDirection::Row,
+                available,
+            )
+            .stretched_height
+            .is_none()
+        );
+
+        let mut non_stretch_container = container_style.clone();
+        non_stretch_container.align_items.keyword = SelfAlignmentKeyword::Start;
+        assert!(
+            estimated_flex_item_available_space(
+                &child_style,
+                &non_stretch_container,
+                FlexDirection::Row,
+                available,
+            )
+            .stretched_height
+            .is_none()
+        );
+
+        let mut explicit_cross_size = child_style.clone();
+        *explicit_cross_size.box_values.height =
+            css::ComputedLengthPercentageOrAuto::LengthPercentage(
+                css::ComputedLengthPercentage::from_points(10.0),
+            );
+        assert!(
+            estimated_flex_item_available_space(
+                &explicit_cross_size,
+                &container_style,
+                FlexDirection::Row,
+                available,
+            )
+            .stretched_height
+            .is_none()
+        );
+
+        let mut auto_cross_margin = child_style;
+        auto_cross_margin.box_values.margin.top = css::ComputedLengthPercentageOrAuto::Auto;
+        assert!(
+            estimated_flex_item_available_space(
+                &auto_cross_margin,
+                &container_style,
+                FlexDirection::Row,
+                available,
+            )
+            .stretched_height
+            .is_none()
         );
     }
 

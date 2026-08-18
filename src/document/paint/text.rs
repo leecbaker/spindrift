@@ -1,7 +1,9 @@
 use std::ops::Deref;
+use std::ops::Range;
 use std::rc::Rc;
 
 use crate::CssColor;
+use crate::css::FontPalette;
 
 use super::geometry::{
     PaintClip, PaintDisplacement, PaintPoint, PaintRect, PaintSize, PaintTranslation,
@@ -424,7 +426,14 @@ pub struct RenderedTextRun {
     pub text_matrix: RenderedTextMatrix,
     pub font_size: f32,
     pub font_id: Option<usize>,
+    /// The CSS palette selected while shaping this run. This is retained only
+    /// until color-glyph extraction has converted COLR glyphs to paint paths.
+    pub(crate) font_palette: FontPalette,
     pub glyphs: Option<RenderedGlyphs>,
+    /// Original line-local ranges for the rendered glyphs, retained while
+    /// layout applies vertical writing-mode placement. PDF emission does not
+    /// consume this provenance.
+    pub(crate) glyph_source_ranges: Option<Rc<[Option<Range<usize>>]>>,
 }
 
 /// PDF text matrix orientation for one shaped text run.
@@ -596,7 +605,9 @@ mod tests {
             text_matrix: RenderedTextMatrix::IDENTITY,
             font_size: 12.0,
             font_id: Some(0),
+            font_palette: crate::css::FontPalette::Normal,
             glyphs: Some(vec![test_rendered_glyph("A")].into()),
+            glyph_source_ranges: None,
         }
     }
 

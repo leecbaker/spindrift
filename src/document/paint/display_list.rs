@@ -29,6 +29,15 @@ impl PagePaintTree {
         self.root.bands.flattened_operations()
     }
 
+    /// Whether PDF lowering will emit an isolated transparency Form.
+    ///
+    /// This is a semantic property of the resolved retained paint tree, not
+    /// of the page's source colours.  Backends use it while planning the
+    /// Form's blending-space resource before assigning indirect object IDs.
+    pub(crate) fn has_transparency_group(&self) -> bool {
+        display_items_have_transparency_group(self.root.bands.bands.iter().flatten())
+    }
+
     pub(crate) fn push_operation(&mut self, band: PaintBand, operation: PaintOperation) {
         self.root.bands.push_operation(band, operation);
     }
@@ -96,6 +105,23 @@ impl PagePaintTree {
         // <https://drafts.csswg.org/css-transforms-2/#perspective-property>
         resolve_context_affine_3d(&mut self.root, None, page);
     }
+}
+
+fn display_items_have_transparency_group<'a>(
+    items: impl IntoIterator<Item = &'a PaintDisplayItem>,
+) -> bool {
+    items.into_iter().any(|item| match item {
+        PaintDisplayItem::StackingContext(context) => {
+            context.effects.needs_group()
+                || display_items_have_transparency_group(context.bands.bands.iter().flatten())
+        }
+        PaintDisplayItem::EffectScope(scope) => {
+            scope.effects.needs_group() || display_items_have_transparency_group(&scope.items)
+        }
+        PaintDisplayItem::Operation(_)
+        | PaintDisplayItem::Primitive(_)
+        | PaintDisplayItem::Link(_) => false,
+    })
 }
 
 /// Lower projective planes after affine 3D scene ordering has completed.
@@ -1204,6 +1230,15 @@ pub(crate) enum PaintBand {
     TableCollapsedBorder,
     Float,
     Inline,
+    /// Quire's compatibility outline phase for ordinary in-flow boxes.
+    ///
+    /// CSS UI deliberately leaves outline stacking implementation-defined.
+    /// Keeping in-flow outlines before auto/zero-z positioned descendants
+    /// matches the interoperable Grid reftest behavior while leaving an
+    /// atomic stacking context's own outline in its final local phase:
+    /// <https://drafts.csswg.org/css-ui-4/#outline-painting> and
+    /// <https://www.w3.org/TR/CSS22/zindex.html>.
+    InFlowOutline,
     AutoZeroZ,
     PositiveZ,
     Outline,
@@ -1211,7 +1246,7 @@ pub(crate) enum PaintBand {
 }
 
 impl PaintBand {
-    pub(crate) const ORDER: [Self; 12] = [
+    pub(crate) const ORDER: [Self; 13] = [
         Self::PageBackground,
         Self::BackgroundBorder,
         Self::TableCellBorder,
@@ -1220,6 +1255,7 @@ impl PaintBand {
         Self::TableCollapsedBorder,
         Self::Float,
         Self::Inline,
+        Self::InFlowOutline,
         Self::AutoZeroZ,
         Self::PositiveZ,
         Self::Outline,
@@ -1236,10 +1272,11 @@ impl PaintBand {
             Self::TableCollapsedBorder => 5,
             Self::Float => 6,
             Self::Inline => 7,
-            Self::AutoZeroZ => 8,
-            Self::PositiveZ => 9,
-            Self::Outline => 10,
-            Self::ViewportChrome => 11,
+            Self::InFlowOutline => 8,
+            Self::AutoZeroZ => 9,
+            Self::PositiveZ => 10,
+            Self::Outline => 11,
+            Self::ViewportChrome => 12,
         }
     }
 }
@@ -1247,7 +1284,7 @@ impl PaintBand {
 /// Ordered paint-band buckets for a fragment-local display list.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct PaintBandList {
-    pub(crate) bands: [Vec<PaintDisplayItem>; 12],
+    pub(crate) bands: [Vec<PaintDisplayItem>; 13],
 }
 
 impl PaintBandList {

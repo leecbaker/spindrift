@@ -1,6 +1,6 @@
 # CSS Custom Properties Parity
 
-Last updated: 2026-08-04
+Last updated: 2026-08-16
 
 Quire resolves unregistered CSS custom properties at computed-value time using
 CSS Syntax tokens. Custom-property names therefore compare as decoded,
@@ -16,6 +16,14 @@ that normalize to U+FFFD, and non-ASCII identifiers.
   but substituted only when the primary custom property is guaranteed-invalid;
   an unresolved nested fallback therefore cannot invalidate an available
   primary value.
+- `var()` preserves its free-form name argument until computed-value time,
+  including nested `var()` substitution, a sole braced argument, empty
+  fallbacks, and commas after the first fallback delimiter.
+- Custom-property cascade candidates apply `initial`, `inherit`, `unset`,
+  `revert`, and `revert-layer` before registered `<color>` values are typed.
+  Direct and substituted rollback values use the same candidate selection.
+- The `font` shorthand recognizes a top-level slash across whitespace and
+  comment token boundaries after custom-property substitution.
 - Shared CSS component-value boundaries now use the same tokenization for
   shorthand whitespace, commas, slashes, conditional-rule keywords, color
   functions, and stylesheet simple blocks. Escaped function names and braces
@@ -45,9 +53,12 @@ that normalize to U+FFFD, and non-ASCII identifiers.
 
 - `@property` registration is not modeled: descriptor grammar, typed values,
   inheritance controls, and registered initial values remain unsupported.
+- CSS Values arbitrary substitution functions other than nested `var()` are
+  not implemented.
+- CSS Cascade `revert-rule` is not implemented.
 - Full property grammar coverage after substitution is bounded by Quire's
-  ordinary property parsers. Complex `background` and `font` shorthands still
-  need broader CSS Variables conformance coverage.
+  ordinary property parsers. Complex `background` shorthands still need
+  broader CSS Variables conformance coverage.
 - Source-level discovery of every supported at-rule still retains a small
   amount of raw at-keyword searching before token-aware block extraction;
   malformed stylesheets with at-rule-looking text in arbitrary non-rule

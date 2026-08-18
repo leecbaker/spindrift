@@ -2126,6 +2126,26 @@ impl FloatBandPlacement {
             available_span: band.span,
         }
     }
+
+    /// Return the physical margin-box left edge for a horizontal CSS float.
+    ///
+    /// CSS 2.2 aligns a float's outer edge with the available band edge. A
+    /// right float whose signed outer extent exceeds that band therefore
+    /// overflows to the left; clamping its start would align the wrong edge.
+    /// <https://www.w3.org/TR/CSS22/visuren.html#float-position>
+    pub(in crate::layout) fn inline_float_margin_box_left(
+        self,
+        side: UsedFloatSide,
+        outer_inline_extent: MarginBoxLength,
+    ) -> f32 {
+        match side {
+            UsedFloatSide::Left => self.available_span.left_x(),
+            UsedFloatSide::Right => self.available_span.right_x() - outer_inline_extent.points(),
+            UsedFloatSide::Top | UsedFloatSide::Bottom => {
+                unreachable!("horizontal float placement requires a left or right float")
+            }
+        }
+    }
 }
 
 impl FloatPlacement {
@@ -2137,8 +2157,32 @@ impl FloatPlacement {
     }
 }
 
+/// Matching float geometry for a single hypothetical block border edge.
+///
+/// This is deliberately only a float-context query. CSS 2.2 first establishes
+/// the no-`clear` hypothetical border edge; block flow alone then decides
+/// whether a matching target introduces *clearance* and re-resolves adjoining
+/// margins. Keeping that margin-collapse decision outside [`FloatContext`]
+/// prevents float placement from accidentally manufacturing a normal-flow
+/// clearance boundary.
+/// <https://www.w3.org/TR/CSS22/visuren.html#flow-control>
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(in crate::layout) struct FloatClearanceResolution {
-    pub(in crate::layout) top: PageTopBlockPosition,
+pub(in crate::layout) struct FloatClearanceTarget {
+    /// The lowest relevant float outer block-end in this fragmentainer.
+    pub(in crate::layout) lowest_matching_outer_block_end:
+        Option<super::exclusions::ClearedFloatOuterBlockEnd>,
+    /// A matching float whose next fragment must be cleared before normal flow
+    /// can resume.
     pub(in crate::layout) continued_float: Option<FloatId>,
+}
+
+/// Whether one block's own block-start margin remained adjoining to its
+/// parent after its used clearance was resolved.
+/// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
+/// <https://www.w3.org/TR/CSS22/visuren.html#flow-control>
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(in crate::layout) enum BlockMarginCollapseBoundary {
+    #[default]
+    Adjoining,
+    SeparatedByClearance,
 }

@@ -50,8 +50,12 @@ pub(in crate::layout) fn segment_junction_endpoint(
     crossing_rule_width: GapRuleWidth,
     crossing_rule_can_paint: bool,
 ) -> GapRuleEndpoint {
-    let crossing_segment_absent = context.container_kind == GapContainerKind::Grid
-        && !crossing_rule_can_paint
+    // A geometric crossing is a junction only when its crossing decoration
+    // exists. In particular, a hidden/zero-width flex rule leaves a cap;
+    // its inset must not acquire `overlap-join` behavior merely because the
+    // two resolved gutter rectangles meet.
+    // <https://drafts.csswg.org/css-gaps-1/#gap-decoration-segments>
+    let crossing_segment_absent = !crossing_rule_can_paint
         || grid_crossing_segment_present_at_junction(context, gap, crossing_gap)
             .is_some_and(|present| !present);
     if crossing_segment_absent {
@@ -142,60 +146,83 @@ pub(in crate::layout) fn nearest_crossing_gap(
     })
 }
 
+/// Whether a physical crossing portion reaches this gap's centerline.
+///
+/// Wrapped flex main-axis gaps are finite portions of otherwise aligned
+/// physical bands. Their `segment_range` is therefore part of the junction
+/// geometry, rather than paint-only clipping metadata. Grid and ordinary
+/// multicol gaps leave it absent and remain full-span crossings.
+pub(in crate::layout) fn crossing_portion_reaches_gap(gap: GapBand, crossing_gap: GapBand) -> bool {
+    crossing_gap.segment_range.is_none_or(|range| {
+        // A flex portion may terminate at a crossing gap's edge. That shared
+        // boundary is still a CSS Gaps junction, even though the crossing
+        // rule's centerline lies inside the row/column gutter rather than in
+        // the portion's line box.
+        range.start <= gap.end + GAP_RULE_EPSILON && range.end >= gap.start - GAP_RULE_EPSILON
+    })
+}
+
 pub(in crate::layout) fn crossing_width_for_gap(
     context: AxisRuleContext<'_>,
     gap: GapBand,
 ) -> Option<GapRuleWidth> {
-    context
-        .crossing_gaps
-        .iter()
-        .position(|candidate| {
-            (candidate.start - gap.start).abs() <= GAP_RULE_EPSILON
-                && (candidate.end - gap.end).abs() <= GAP_RULE_EPSILON
-        })
-        .and_then(|index| {
-            let crossing_gap_count = context.crossing_gaps.len();
-            context
-                .crossing_rule
-                .widths
-                .value_for_index(index, crossing_gap_count)
-                .map(|width| {
-                    used_gap_rule_width(width, PercentageBasis::definite(layout_pt(gap.size())))
-                })
-        })
+    crossing_rule_slot_for_gap(context, gap).and_then(|(index, count)| {
+        context
+            .crossing_rule
+            .widths
+            .value_for_index(index, count)
+            .map(|width| {
+                used_gap_rule_width(width, PercentageBasis::definite(layout_pt(gap.size())))
+            })
+    })
 }
 
 pub(in crate::layout) fn crossing_can_paint_for_gap(
     context: AxisRuleContext<'_>,
     gap: GapBand,
 ) -> Option<bool> {
+    crossing_rule_slot_for_gap(context, gap).map(|(index, count)| {
+        crossing_rule_can_paint(
+            context
+                .crossing_rule
+                .widths
+                .value_for_index(index, count)
+                .map(|width| {
+                    used_gap_rule_width(width, PercentageBasis::definite(layout_pt(gap.size())))
+                })
+                .unwrap_or(GapRuleWidth::ZERO),
+            context.crossing_rule.styles.value_for_index(index, count),
+            context.crossing_rule.colors.value_for_index(index, count),
+        )
+    })
+}
+
+/// Resolve a crossing band to the value-list position committed by its layout
+/// topology. Flex portions can share a physical coordinate while consuming
+/// different sequential slots, so their vector position is not an assignment
+/// identity.
+fn crossing_rule_slot_for_gap(
+    context: AxisRuleContext<'_>,
+    gap: GapBand,
+) -> Option<(usize, usize)> {
+    let sequence_len = context
+        .crossing_gaps
+        .iter()
+        .enumerate()
+        .map(|(physical_index, candidate)| candidate.rule_index.unwrap_or(physical_index))
+        .max()
+        .map(|last_index| last_index + 1)?;
     context
         .crossing_gaps
         .iter()
-        .position(|candidate| {
+        .enumerate()
+        .find(|(_, candidate)| {
             (candidate.start - gap.start).abs() <= GAP_RULE_EPSILON
                 && (candidate.end - gap.end).abs() <= GAP_RULE_EPSILON
+                && candidate.segment_range == gap.segment_range
         })
-        .map(|index| {
-            let crossing_gap_count = context.crossing_gaps.len();
-            crossing_rule_can_paint(
-                context
-                    .crossing_rule
-                    .widths
-                    .value_for_index(index, crossing_gap_count)
-                    .map(|width| {
-                        used_gap_rule_width(width, PercentageBasis::definite(layout_pt(gap.size())))
-                    })
-                    .unwrap_or(GapRuleWidth::ZERO),
-                context
-                    .crossing_rule
-                    .styles
-                    .value_for_index(index, crossing_gap_count),
-                context
-                    .crossing_rule
-                    .colors
-                    .value_for_index(index, crossing_gap_count),
-            )
+        .map(|(physical_index, candidate)| {
+            (candidate.rule_index.unwrap_or(physical_index), sequence_len)
         })
 }
 
@@ -475,13 +502,17 @@ pub(in crate::layout) fn grid_cross_axis_end_line(context: AxisRuleContext<'_>) 
     }
 }
 
-pub(in crate::layout) fn gap_rule_segment_primitives(
+/// Expand a gap-rule segment while retaining its logical patterned-rule
+/// phase. The phase is only observable for dotted/dashed rules; solid and
+/// shaded rules intentionally share the ordinary primitive path.
+pub(in crate::layout) fn gap_rule_segment_primitives_with_pattern_phase(
     context: AxisRuleContext<'_>,
     gap: GapBand,
     segment: GapDecorationSegment,
     width: GapRuleWidth,
     style: BorderStyle,
     color: CssColor,
+    pattern_phase: f32,
 ) -> Vec<PaintPrimitive> {
     if !width.can_paint() || style.suppresses_used_width() || !color.is_visible() {
         return Vec::new();
@@ -506,7 +537,7 @@ pub(in crate::layout) fn gap_rule_segment_primitives(
             color,
         ),
         BorderStyle::Dotted | BorderStyle::Dashed => {
-            patterned_gap_rule_primitives(context, gap, segment, width, style, color)
+            patterned_gap_rule_primitives(context, gap, segment, width, style, color, pattern_phase)
         }
         BorderStyle::Solid | BorderStyle::Double => {
             vec![solid_gap_rule_primitive(
@@ -524,6 +555,7 @@ fn patterned_gap_rule_primitives(
     width: GapRuleWidth,
     style: BorderStyle,
     color: CssColor,
+    pattern_phase: f32,
 ) -> Vec<PaintPrimitive> {
     let (axis_start, axis_length, cross_start, horizontal) = match context.kind {
         GapRuleAxisKind::Column => (
@@ -543,19 +575,24 @@ fn patterned_gap_rule_primitives(
             true,
         ),
     };
-    if style == BorderStyle::Dotted {
-        let mut paths = Vec::new();
-        paint_dotted_border_side(
-            &mut paths,
-            axis_start,
-            axis_length,
-            cross_start,
-            width.into_paint_stroke_width(),
-            horizontal,
-            color,
-        );
-        paths.into_iter().map(PaintPrimitive::Path).collect()
-    } else {
+    // Preserve the established native border-side painter for an unbroken
+    // gap. Besides being cheaper, it is the reference rendering for CSS
+    // dotted/dashed caps. The phased path below is only needed when one gap
+    // has been split into several portions at an intersection.
+    if pattern_phase.abs() <= GAP_RULE_EPSILON {
+        if style == BorderStyle::Dotted {
+            let mut paths = Vec::new();
+            paint_dotted_border_side(
+                &mut paths,
+                axis_start,
+                axis_length,
+                cross_start,
+                width.into_paint_stroke_width(),
+                horizontal,
+                color,
+            );
+            return paths.into_iter().map(PaintPrimitive::Path).collect();
+        }
         let mut rects = Vec::new();
         paint_dashed_border_side(
             &mut rects,
@@ -567,6 +604,61 @@ fn patterned_gap_rule_primitives(
             width.into_paint_stroke_width(),
             color,
         );
+        return rects.into_iter().map(PaintPrimitive::Rect).collect();
+    }
+    // `axis_start` is the physical paint projection of the portion's logical
+    // start.  Keep the sequence phase in that same start-relative direction;
+    // the page-coordinate inversion for column rules has already happened
+    // while constructing `axis_start` above.
+    let phase_at_paint_start = pattern_phase;
+    let stroke_width = width.into_paint_stroke_width().points();
+    if style == BorderStyle::Dotted {
+        let pitch = stroke_width * 2.0;
+        let mut center = axis_start + stroke_width * 0.5 - phase_at_paint_start.rem_euclid(pitch);
+        let axis_end = axis_start + axis_length;
+        let mut paths = Vec::new();
+        while center < axis_end - GAP_RULE_EPSILON {
+            if center >= axis_start - stroke_width * 0.5 {
+                let (x, y) = if horizontal {
+                    (center, cross_start + stroke_width * 0.5)
+                } else {
+                    (cross_start + stroke_width * 0.5, center)
+                };
+                paths.push(circle_path(x, y, stroke_width * 0.5, color, None));
+            }
+            center += pitch;
+        }
+        paths.into_iter().map(PaintPrimitive::Path).collect()
+    } else {
+        let dash_length = (stroke_width * 3.0).max(1.0);
+        let period = dash_length * 2.0;
+        let axis_end = axis_start + axis_length;
+        let mut dash_start = axis_start - phase_at_paint_start.rem_euclid(period);
+        let mut rects = Vec::new();
+        while dash_start < axis_end - GAP_RULE_EPSILON {
+            let start = dash_start.max(axis_start);
+            let end = (dash_start + dash_length).min(axis_end);
+            if end > start + GAP_RULE_EPSILON {
+                let (x, y, width, height) = if horizontal {
+                    (start, cross_start, end - start, stroke_width)
+                } else {
+                    (cross_start, start, stroke_width, end - start)
+                };
+                // Patterned gap rules are not border-side boxes; their
+                // portions have already been clipped by topology resolution.
+                // Emit the remaining dash rectangle directly in paint space.
+                rects.push(RenderedRect::new(
+                    x,
+                    y,
+                    width,
+                    height,
+                    Some(color),
+                    None,
+                    PaintStrokeWidth::ZERO,
+                ));
+            }
+            dash_start += period;
+        }
         rects.into_iter().map(PaintPrimitive::Rect).collect()
     }
 }

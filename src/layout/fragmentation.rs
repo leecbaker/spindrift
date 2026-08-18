@@ -1,4 +1,310 @@
 use super::*;
+use crate::layout::assets::FragmentainerOrdinal;
+use std::cell::RefCell;
+use std::rc::Rc;
+
+/// A committed source-to-destination mapping for one container fragment.
+///
+/// A source slice and its destination fragmentainer are inseparable once
+/// fragmentation commits.  Most importantly, a destination that owns the
+/// principal box cannot be represented without its border box: callers must
+/// distinguish it from a continuation that only replays descendant overflow.
+/// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+#[derive(Debug, Clone, PartialEq)]
+pub(in crate::layout) struct CommittedContainerFragment<SourceSlice> {
+    fragmentainer: FragmentainerOrdinal,
+    source_slice: SourceSlice,
+    kind: ContainerFragmentKind,
+}
+
+impl<SourceSlice> CommittedContainerFragment<SourceSlice> {
+    pub(in crate::layout) fn principal(
+        fragmentainer: FragmentainerOrdinal,
+        source_slice: SourceSlice,
+        border_box: PaintClip,
+        decoration: FragmentDecoration,
+    ) -> Self {
+        Self {
+            fragmentainer,
+            source_slice,
+            kind: ContainerFragmentKind::Principal(DecoratedBoxFragment {
+                border_box,
+                decoration,
+            }),
+        }
+    }
+
+    pub(in crate::layout) fn descendant_overflow_only(
+        fragmentainer: FragmentainerOrdinal,
+        source_slice: SourceSlice,
+    ) -> Self {
+        Self {
+            fragmentainer,
+            source_slice,
+            kind: ContainerFragmentKind::DescendantOverflowOnly,
+        }
+    }
+
+    pub(in crate::layout) const fn fragmentainer(&self) -> FragmentainerOrdinal {
+        self.fragmentainer
+    }
+
+    pub(in crate::layout) fn source_slice(&self) -> &SourceSlice {
+        &self.source_slice
+    }
+
+    pub(in crate::layout) const fn kind(&self) -> &ContainerFragmentKind {
+        &self.kind
+    }
+
+    pub(in crate::layout) fn kind_mut(&mut self) -> &mut ContainerFragmentKind {
+        &mut self.kind
+    }
+}
+
+/// Whether a destination fragment owns the container's principal box.
+///
+/// A descendant-only continuation is real flow content, but it is not a box
+/// fragment of its ancestor and must never recreate that ancestor's
+/// background, border, outline, or shadow.
+#[derive(Debug, Clone, PartialEq)]
+pub(in crate::layout) enum ContainerFragmentKind {
+    Principal(DecoratedBoxFragment),
+    DescendantOverflowOnly,
+}
+
+impl ContainerFragmentKind {
+    pub(in crate::layout) const fn principal_box(&self) -> Option<&DecoratedBoxFragment> {
+        match self {
+            Self::Principal(fragment) => Some(fragment),
+            Self::DescendantOverflowOnly => None,
+        }
+    }
+
+    pub(in crate::layout) fn principal_box_mut(&mut self) -> Option<&mut DecoratedBoxFragment> {
+        match self {
+            Self::Principal(fragment) => Some(fragment),
+            Self::DescendantOverflowOnly => None,
+        }
+    }
+}
+
+/// The mandatory paint geometry and decoration policy of a principal box
+/// fragment.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct DecoratedBoxFragment {
+    border_box: PaintClip,
+    decoration: FragmentDecoration,
+}
+
+impl DecoratedBoxFragment {
+    pub(in crate::layout) const fn new(
+        border_box: PaintClip,
+        decoration: FragmentDecoration,
+    ) -> Self {
+        Self {
+            border_box,
+            decoration,
+        }
+    }
+
+    pub(in crate::layout) const fn border_box(&self) -> PaintClip {
+        self.border_box
+    }
+
+    pub(in crate::layout) fn set_border_box(&mut self, border_box: PaintClip) {
+        self.border_box = border_box;
+    }
+
+    pub(in crate::layout) const fn decoration(&self) -> FragmentDecoration {
+        self.decoration
+    }
+
+    pub(in crate::layout) fn decoration_mut(&mut self) -> &mut FragmentDecoration {
+        &mut self.decoration
+    }
+}
+
+/// Decoration ownership for one principal box fragment.
+///
+/// `clone` has no representable missing edges: every clone fragment owns both
+/// broken block edges. Only `slice` needs first/last-fragment edge state.
+/// <https://www.w3.org/TR/css-break-3/#break-decoration>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) enum FragmentDecoration {
+    Clone,
+    Slice(SliceFragmentEdges),
+}
+
+impl FragmentDecoration {
+    pub(in crate::layout) const fn for_box_decoration_break(
+        decoration_break: css::BoxDecorationBreak,
+        owns_block_start: bool,
+        owns_block_end: bool,
+    ) -> Self {
+        match decoration_break {
+            css::BoxDecorationBreak::Clone => Self::Clone,
+            css::BoxDecorationBreak::Slice => Self::Slice(SliceFragmentEdges {
+                owns_block_start,
+                owns_block_end,
+            }),
+        }
+    }
+
+    pub(in crate::layout) const fn owns_block_start(self) -> bool {
+        match self {
+            Self::Clone => true,
+            Self::Slice(edges) => edges.owns_block_start,
+        }
+    }
+
+    pub(in crate::layout) const fn owns_block_end(self) -> bool {
+        match self {
+            Self::Clone => true,
+            Self::Slice(edges) => edges.owns_block_end,
+        }
+    }
+
+    pub(in crate::layout) const fn is_clone(self) -> bool {
+        matches!(self, Self::Clone)
+    }
+
+    pub(in crate::layout) fn clear_block_end_for_slice(&mut self) {
+        if let Self::Slice(edges) = self {
+            edges.owns_block_end = false;
+        }
+    }
+}
+
+/// The block-axis space a principal box fragment reserves for cloned
+/// decoration before its content can make fragmentation progress.
+///
+/// CSS Fragmentation fills a fragmentainer with the box's content box while
+/// leaving room for cloned borders and padding. Margins have separate
+/// block-layout truncation rules, so they deliberately do not enter this
+/// content-capacity calculation.
+/// <https://www.w3.org/TR/css-break-3/#breaks>
+/// <https://www.w3.org/TR/css-break-3/#break-decoration>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct FragmentDecorationReservation {
+    block_start: NonContentLength,
+    block_end: NonContentLength,
+}
+
+impl FragmentDecorationReservation {
+    /// Resolve the reservations owned by one principal box fragment.
+    ///
+    /// `clone` always retains both edges. `slice` uses only the edges carried
+    /// by [`FragmentDecoration`], so callers cannot reserve a broken slice
+    /// edge by accident.
+    pub(in crate::layout) fn new(
+        decoration: FragmentDecoration,
+        block_start: NonContentLength,
+        block_end: NonContentLength,
+    ) -> Self {
+        Self {
+            block_start: if decoration.owns_block_start() {
+                block_start
+            } else {
+                non_content_pt(0.0)
+            },
+            block_end: if decoration.owns_block_end() {
+                block_end
+            } else {
+                non_content_pt(0.0)
+            },
+        }
+    }
+
+    /// The block-start inset needed when a continuation enters a fresh
+    /// fragmentainer.
+    pub(in crate::layout) const fn block_start(&self) -> NonContentLength {
+        self.block_start
+    }
+
+    /// The block-end inset that must remain available for this fragment's
+    /// owned border and padding.
+    pub(in crate::layout) const fn block_end(&self) -> NonContentLength {
+        self.block_end
+    }
+
+    /// Content capacity once the cursor has already crossed the fragment's
+    /// block-start decoration.
+    pub(in crate::layout) fn remaining_content_extent(
+        self,
+        raw_remaining_extent: LayoutLength,
+    ) -> LayoutLength {
+        layout_pt((raw_remaining_extent.points() - self.block_end.points()).max(0.0))
+    }
+
+    /// Content capacity of a fresh fragmentainer, before the fragment's
+    /// block-start decoration has been consumed.
+    pub(in crate::layout) fn fresh_content_extent(
+        self,
+        raw_fragmentainer_extent: LayoutLength,
+    ) -> LayoutLength {
+        layout_pt(
+            (raw_fragmentainer_extent.points()
+                - self.block_start.points()
+                - self.block_end.points())
+            .max(0.0),
+        )
+    }
+}
+
+/// First/last-fragment ownership used only by sliced decoration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) struct SliceFragmentEdges {
+    owns_block_start: bool,
+    owns_block_end: bool,
+}
+
+/// One committed destination selected by generic fragmentation.
+///
+/// Layout algorithms normally consume this transition immediately through
+/// their own cursor. Table captions are wrapper-flow siblings, however, and
+/// must hand the exact destination fragmentainer to table-grid layout after
+/// generic caption content has finished. This record deliberately exposes
+/// page-top bounds rather than a mutable cursor pair.
+/// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+#[allow(dead_code)] // Legacy generic observer retained for non-table instrumentation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct FragmentainerTransitionRecord {
+    pub(in crate::layout) kind: FragmentainerKind,
+    pub(in crate::layout) page_index: usize,
+    pub(in crate::layout) content_bounds: PageTopRect,
+}
+
+/// Scoped observer for committed generic fragmentainer transitions.
+///
+/// This is intentionally an internal recorder rather than a callback: it
+/// cannot alter pagination while a generic block formatter owns the
+/// transition. Callers receive a stable ordered snapshot only after closing
+/// their scope.
+#[allow(dead_code)] // Table wrapper flow no longer uses generic transition handoff.
+#[derive(Debug, Clone, Default)]
+pub(in crate::layout) struct FragmentainerTransitionRecorder(
+    Rc<RefCell<Vec<FragmentainerTransitionRecord>>>,
+);
+
+#[allow(dead_code)]
+impl FragmentainerTransitionRecorder {
+    pub(in crate::layout) fn records(&self) -> Vec<FragmentainerTransitionRecord> {
+        self.0.borrow().clone()
+    }
+
+    fn push(&self, record: FragmentainerTransitionRecord) {
+        self.0.borrow_mut().push(record);
+    }
+
+    pub(in crate::layout) fn len(&self) -> usize {
+        self.0.borrow().len()
+    }
+
+    pub(in crate::layout) fn truncate(&self, len: usize) {
+        self.0.borrow_mut().truncate(len);
+    }
+}
 
 /// Maximum anonymous column fragmentainers retained for one committed replay.
 ///
@@ -25,6 +331,7 @@ pub(in crate::layout) const MAX_MATERIALIZED_PAGE_FRAGMENTAINERS: usize = 256;
 pub(in crate::layout) const MAX_MULTICOL_BALANCE_PROBE_FRAGMENTAINERS: usize = 4;
 
 /// Bounded materialization for a run of equal-size column continuations.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::layout) struct ColumnContinuationMaterialization {
     pub(in crate::layout) pages_to_push: usize,
@@ -37,6 +344,7 @@ pub(in crate::layout) struct ColumnContinuationMaterialization {
 /// The caller may lower this limit only for a positioned subtree whose
 /// non-scrollable overflow clip makes the remaining logical tail unreachable
 /// in static output. All other callers retain the normal multicol limit.
+#[cfg(test)]
 pub(in crate::layout) fn column_continuation_materialization_with_limit(
     remaining_block_size: LayoutLength,
     continuation_block_size: LayoutLength,
@@ -52,6 +360,7 @@ pub(in crate::layout) fn column_continuation_materialization_with_limit(
 }
 
 /// Plan a bounded continuation run for any equal-size fragmentainer sequence.
+#[cfg(test)]
 pub(in crate::layout) fn continuation_materialization(
     remaining_block_size: LayoutLength,
     continuation_block_size: LayoutLength,
@@ -85,7 +394,7 @@ pub(in crate::layout) fn continuation_materialization(
 /// while keeping mode-specific reservations, such as repeated table chrome,
 /// local:
 /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::layout) struct Fragmentainer {
     fragmentainer_block_size: LayoutLength,
     available_block_size: LayoutLength,
@@ -113,6 +422,56 @@ pub(in crate::layout) enum FragmentainerAdvance {
 }
 
 impl LayoutBuilder<'_> {
+    /// Begin observing generic fragmentainer destinations for one scoped
+    /// caller. The current fragmentainer is always the first record, so an
+    /// unfragmented caption and a fragmented caption share the same outcome
+    /// shape.
+    #[allow(dead_code)]
+    pub(in crate::layout) fn begin_fragmentainer_transition_recording(
+        &mut self,
+    ) -> FragmentainerTransitionRecorder {
+        let recorder = FragmentainerTransitionRecorder::default();
+        self.fragmentainer_transition_recorders
+            .push(recorder.clone());
+        self.record_current_fragmentainer_destination();
+        recorder
+    }
+
+    /// Close the most-recent recorder scope and return its ordered records.
+    #[allow(dead_code)]
+    pub(in crate::layout) fn finish_fragmentainer_transition_recording(
+        &mut self,
+        recorder: FragmentainerTransitionRecorder,
+    ) -> Vec<FragmentainerTransitionRecord> {
+        let active = self
+            .fragmentainer_transition_recorders
+            .pop()
+            .expect("fragmentainer transition recording must be closed in scope order");
+        debug_assert!(Rc::ptr_eq(&active.0, &recorder.0));
+        recorder.records()
+    }
+
+    /// Publish the active fragmentainer after a committed pagination change.
+    pub(in crate::layout) fn record_current_fragmentainer_destination(&mut self) {
+        if self.fragmentainer_transition_recorders.is_empty() {
+            return;
+        }
+        let context = self.current_page_context;
+        let record = FragmentainerTransitionRecord {
+            kind: self.active_fragmentainer_kind(),
+            page_index: self.pages.len(),
+            content_bounds: PageTopRect::new(
+                context.left(),
+                context.top(),
+                context.area_width(),
+                context.area_height(),
+            ),
+        };
+        for recorder in &self.fragmentainer_transition_recorders {
+            recorder.push(record);
+        }
+    }
+
     /// Build a fragmentainer from a page-top cursor position and the current
     /// page's block-end edge.
     pub(in crate::layout) fn fragmentainer_from_page_cursor(
@@ -124,6 +483,311 @@ impl LayoutBuilder<'_> {
             content_block_start,
             PageTopBlockPosition::new(self.page_bottom()),
         )
+    }
+
+    /// Split a fixed principal block through root paged-media fragmentainers
+    /// whose fragmentation direction is horizontal.
+    ///
+    /// The paged-media page is always a physical rectangle, but CSS
+    /// Fragmentation selects the root flow's logical block direction. A
+    /// vertical principal flow therefore fills the current physical X track
+    /// and continues on a new page once that track is exhausted. The legacy
+    /// `cursor_y` remains the logical inline cursor; callers retain it for
+    /// line layout and do not reinterpret it as an X coordinate.
+    ///
+    /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+    /// <https://www.w3.org/TR/css-writing-modes-4/#block-flow>
+    pub(in crate::layout) fn consume_vertical_root_page_block_size(
+        &mut self,
+        block_size: LayoutLength,
+        inline_block_start: PageTopBlockPosition,
+    ) -> Option<VerticalRootPageFragmentation> {
+        if self.active_fragmentainer_kind() != FragmentainerKind::Page
+            || !WritingModeAxes::new(
+                self.principal_flow.writing_mode,
+                self.principal_flow.used_direction(),
+            )
+            .swaps_physical_axes()
+            || self.containing_block_writing_mode != self.principal_flow.writing_mode
+        {
+            return None;
+        }
+
+        let mut remaining = block_size.points().max(0.0);
+        let initial_available = self
+            .current_page_context
+            .logical_block_size(self.principal_flow.writing_mode);
+        if remaining <= initial_available + 0.01 {
+            return None;
+        }
+
+        let block_start_side = FlowAxes::new(
+            self.principal_flow.writing_mode,
+            self.principal_flow.used_direction(),
+        )
+        .block_start_side();
+        debug_assert!(matches!(
+            block_start_side,
+            PhysicalSide::Left | PhysicalSide::Right
+        ));
+
+        let mut source_block_start = 0.0;
+        let mut fragments = Vec::new();
+        loop {
+            let context = self.current_page_context;
+            let available = self
+                .current_page_context
+                .logical_block_size(self.principal_flow.writing_mode);
+            // CSS Fragmentation gives fragmentainers a one-pixel minimum
+            // block size for progress. A zero-width page area cannot expose
+            // useful paint, so do not materialize an unbounded empty run.
+            if available <= 0.01 {
+                break;
+            }
+            let used = remaining.min(available);
+            let destination_block_start = match block_start_side {
+                PhysicalSide::Left => 0.0,
+                PhysicalSide::Right => 0.0,
+                PhysicalSide::Top | PhysicalSide::Bottom => {
+                    unreachable!("a vertical root flow has a horizontal block direction")
+                }
+            };
+            fragments.push(VerticalRootPageFragmentSlice {
+                page_index: self.pages.len(),
+                source_block_start: layout_pt(source_block_start),
+                block_size: layout_pt(used),
+                destination_context: context,
+                // Root vertical page fragments restart at the page area's
+                // logical inline start. The physical `cursor_y` belongs to
+                // the legacy vertical inline layout path and is not a root
+                // page-fragmentation coordinate. The first source fragment
+                // retains its inline-start margin; continuation fragments
+                // begin at the destination fragmentainer edge.
+                destination_origin: PageTopPoint::new(context.left(), context.top()),
+                destination_extent: LogicalSize {
+                    inline: 0.0,
+                    block: available,
+                },
+                destination_block_start: layout_pt(destination_block_start),
+            });
+            remaining -= used;
+            source_block_start += used;
+            match block_start_side {
+                PhysicalSide::Left => {
+                    self.content_left = (context.left() + used).min(context.right())
+                }
+                PhysicalSide::Right => {
+                    self.content_right = (context.right() - used).max(context.left())
+                }
+                PhysicalSide::Top | PhysicalSide::Bottom => {
+                    unreachable!("a vertical root flow has a horizontal block direction")
+                }
+            }
+            if remaining <= 0.01 {
+                break;
+            }
+            // This source fragment is structural flow occupancy even when
+            // its own decoration is deferred until used-size resolution.
+            self.mark_current_page_flow_content();
+            self.push_page();
+        }
+        Some(VerticalRootPageFragmentation {
+            fragments,
+            first_inline_origin: inline_block_start,
+        })
+    }
+
+    /// Paint fixed vertical-root block fragments after their logical source
+    /// ranges have been assigned to page fragmentainers.
+    ///
+    /// [`FragmentainerProjection`] owns the logical-to-physical conversion,
+    /// including the `vertical-rl` block-direction reversal. The page painter
+    /// therefore receives only destination-local physical rectangles.
+    /// <https://www.w3.org/TR/css-break-3/#break-decoration>
+    /// <https://www.w3.org/TR/css-writing-modes-4/#logical-to-physical>
+    pub(in crate::layout) fn vertical_root_block_fragment_paint(
+        &mut self,
+        slices: &[VerticalRootPageFragmentSlice],
+        style: &ComputedStyle,
+        source_border_rect: PaintRect,
+    ) {
+        if slices.is_empty() || style.visibility != Visibility::Visible {
+            return;
+        }
+        let axes = FlowAxes::new(style.writing_mode, style.used_direction());
+        let source_extent = LogicalSize {
+            inline: source_border_rect.size.height,
+            block: source_border_rect.size.width,
+        };
+        let source_origin = PageTopPoint::new(
+            source_border_rect.origin.x,
+            source_border_rect.origin.y + source_border_rect.size.height,
+        );
+        for (index, slice) in slices.iter().enumerate() {
+            let projection = FragmentainerProjection::new(FragmentainerProjectionInput {
+                source_axes: axes,
+                source_origin,
+                source_extent,
+                source_slice: LogicalRect {
+                    origin: LogicalPoint {
+                        inline: 0.0,
+                        block: slice.source_block_start.points(),
+                    },
+                    size: LogicalSize {
+                        inline: source_extent.inline,
+                        block: slice.block_size.points(),
+                    },
+                },
+                destination_axes: axes,
+                destination_origin: slice.destination_origin,
+                destination_extent: LogicalSize {
+                    inline: source_extent.inline,
+                    block: slice.destination_extent.block,
+                },
+                destination_slice: LogicalRect {
+                    origin: LogicalPoint {
+                        inline: 0.0,
+                        block: slice.destination_block_start.points(),
+                    },
+                    size: LogicalSize {
+                        inline: source_extent.inline,
+                        block: slice.block_size.points(),
+                    },
+                },
+                destination_page_area: PageTopRect::new(
+                    slice.destination_context.left(),
+                    slice.destination_context.top(),
+                    slice.destination_context.area_width(),
+                    slice.destination_context.area_height(),
+                ),
+            });
+            let mut fragment_style = style.clone();
+            crate::layout::block::suppress_fragmented_box_edges(
+                &mut fragment_style,
+                index == 0,
+                index + 1 == slices.len(),
+            );
+            let border_rect = projection.destination_clip().paint_rect();
+            let mut fragment = PaintFragment::from_primitives(Vec::new(), Vec::new());
+            fragment.prepend_primitives_in_band(
+                PaintBand::BackgroundBorder,
+                self.box_background_primitives(border_rect, &fragment_style),
+            );
+            fragment.append_primitives_in_band(
+                PaintBand::Outline,
+                self.box_outline_primitives(border_rect, &fragment_style),
+            );
+            fragment.promote_background_border_to_in_flow_block();
+            fragment.promote_outline_to_in_flow_outline();
+            // A terminal box fragment can contain only the final decoration.
+            // Keep that page materialized even when the source document has
+            // no descendant paint tree on it.
+            if slice.page_index < self.pages.len() {
+                self.pages[slice.page_index]
+                    .append_paint_fragment_owned(fragment, PaintTranslation::identity());
+            } else {
+                self.current_page
+                    .append_paint_fragment_owned(fragment, PaintTranslation::identity());
+            }
+            if index + 1 == slices.len() {
+                if slice.page_index < self.pages.len() {
+                    self.pages[slice.page_index].mark_fragmentation_content();
+                } else {
+                    self.mark_current_page_flow_content();
+                    self.current_page.mark_fragmentation_content();
+                }
+            }
+        }
+    }
+
+    /// Replay a captured paint subtree through vertical root page slices.
+    ///
+    /// The source subtree stays in the original page-local physical space;
+    /// each destination uses the same logical slice projection as the
+    /// principal box decoration. This is intentionally separate from
+    /// `PaintFragment::clipped_to_rect`, which clips both axes and would
+    /// incorrectly constrain logical inline overflow.
+    pub(in crate::layout) fn project_vertical_root_fragment_paint(
+        &self,
+        source: PaintFragment,
+        slices: &[VerticalRootPageFragmentSlice],
+        axes: FlowAxes,
+        source_origin: PageTopPoint,
+        source_extent: LogicalSize,
+    ) -> Vec<(usize, PaintFragment)> {
+        slices
+            .iter()
+            .filter_map(|slice| {
+                let projection = FragmentainerProjection::new(FragmentainerProjectionInput {
+                    source_axes: axes,
+                    source_origin,
+                    source_extent,
+                    source_slice: LogicalRect {
+                        origin: LogicalPoint {
+                            inline: 0.0,
+                            block: slice.source_block_start.points(),
+                        },
+                        size: LogicalSize {
+                            inline: source_extent.inline,
+                            block: slice.block_size.points(),
+                        },
+                    },
+                    destination_axes: axes,
+                    destination_origin: slice.destination_origin,
+                    destination_extent: LogicalSize {
+                        inline: source_extent.inline,
+                        block: slice.destination_extent.block,
+                    },
+                    destination_slice: LogicalRect {
+                        origin: LogicalPoint {
+                            inline: 0.0,
+                            block: slice.destination_block_start.points(),
+                        },
+                        size: LogicalSize {
+                            inline: source_extent.inline,
+                            block: slice.block_size.points(),
+                        },
+                    },
+                    destination_page_area: PageTopRect::new(
+                        slice.destination_context.left(),
+                        slice.destination_context.top(),
+                        slice.destination_context.area_width(),
+                        slice.destination_context.area_height(),
+                    ),
+                });
+                let fragment = source
+                    .clone()
+                    .with_primitives_clipped_to_physical_axis_range_preserving_cross_axis_overflow(
+                        css::PhysicalAxis::Horizontal,
+                        projection.source_clip(),
+                        true,
+                    )
+                    .translated(projection.destination_translation());
+                (!fragment.is_empty()).then_some((slice.page_index, fragment))
+            })
+            .collect()
+    }
+
+    /// Materialize the next anonymous column while retaining the completed
+    /// source column as a structural fragmentainer.
+    ///
+    /// A valid class-A forced break may follow a paintless box. The empty
+    /// source column still precedes the destination in the fragmentation
+    /// context, so it must not be replaced by `push_page`'s empty-page
+    /// coalescing. Break authorization remains with the caller: this helper
+    /// only records a column once a transition has already been selected.
+    /// <https://www.w3.org/TR/css-break-3/#possible-breaks>
+    /// <https://www.w3.org/TR/css-break-3/#forced-breaks>
+    /// <https://www.w3.org/TR/css-multicol-1/#pagination-and-overflow-outside-multicol>
+    pub(in crate::layout) fn materialize_column_continuation(&mut self) {
+        debug_assert!(
+            self.fragmentainer_override
+                .is_some_and(|override_| override_.kind == FragmentainerKind::Column)
+        );
+        if !self.current_page_has_content() {
+            self.mark_current_page_flow_content();
+        }
+        self.push_page();
     }
 
     /// Materialize a layout algorithm's transition to another fragmentainer.
@@ -151,25 +815,12 @@ impl LayoutBuilder<'_> {
             {
                 return None;
             }
-            FragmentainerKind::Column => {
-                // A zero-capacity first column can require a transition
-                // before flex has any item paint to commit.  `push_page`
-                // normally replaces an empty page in that situation, which
-                // is correct for a redundant page break but loses this real
-                // anonymous-column fragmentainer and aliases the next source
-                // slice back onto column zero.  Structural occupancy makes
-                // the temporary page a durable destination record; it is
-                // later projected to the next column by the existing
-                // multicolumn replay machinery.
-                // <https://www.w3.org/TR/css-multicol-1/#pagination-and-overflow-outside-multicol>
-                self.mark_current_page_flow_content();
-                match advance {
-                    FragmentainerAdvance::Unforced => self.push_page(),
-                    FragmentainerAdvance::Forced(page_break) => {
-                        self.apply_forced_break_in(fragmentainer_kind, page_break);
-                    }
+            FragmentainerKind::Column => match advance {
+                FragmentainerAdvance::Unforced => self.materialize_column_continuation(),
+                FragmentainerAdvance::Forced(page_break) => {
+                    self.apply_forced_break_in(fragmentainer_kind, page_break);
                 }
-            }
+            },
             FragmentainerKind::Page => match advance {
                 FragmentainerAdvance::Unforced => self.push_page(),
                 FragmentainerAdvance::Forced(page_break) => {
@@ -334,26 +985,98 @@ pub(in crate::layout) struct FragmentainerProjection {
 /// same source content in their respective containers.
 #[derive(Debug, Clone, Copy)]
 pub(in crate::layout) struct FragmentainerProjectionInput {
-    pub(in crate::layout) axes: FlowAxes,
+    /// The fragmented source's coordinate system. Source ranges are selected
+    /// in this flow's logical block axis.
+    pub(in crate::layout) source_axes: FlowAxes,
     pub(in crate::layout) source_origin: PageTopPoint,
     pub(in crate::layout) source_extent: LogicalSize,
     pub(in crate::layout) source_slice: LogicalRect,
+    /// The destination fragmentainer's coordinate system. A nested
+    /// orthogonal flow can be painted into a parent fragmentainer whose
+    /// logical axes differ from the source flow.
+    pub(in crate::layout) destination_axes: FlowAxes,
     pub(in crate::layout) destination_origin: PageTopPoint,
     pub(in crate::layout) destination_extent: LogicalSize,
     pub(in crate::layout) destination_slice: LogicalRect,
     pub(in crate::layout) destination_page_area: PageTopRect,
 }
 
+/// One physical page destination for a continuous vertical root block.
+///
+/// The source range and destination range are logical block-axis lengths.
+/// Physical clipping and translation are deliberately deferred to
+/// [`FragmentainerProjection`], which is the single Writing Modes boundary
+/// for fragmented paint.
+#[derive(Debug, Clone)]
+pub(in crate::layout) struct VerticalRootPageFragmentation {
+    pub(in crate::layout) fragments: Vec<VerticalRootPageFragmentSlice>,
+    pub(in crate::layout) first_inline_origin: PageTopBlockPosition,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout) struct VerticalRootPageFragmentSlice {
+    pub(in crate::layout) page_index: usize,
+    pub(in crate::layout) source_block_start: LayoutLength,
+    pub(in crate::layout) block_size: LayoutLength,
+    pub(in crate::layout) destination_context: PageContext,
+    pub(in crate::layout) destination_origin: PageTopPoint,
+    /// The logical block capacity of this destination's active root track.
+    /// `inline` is filled from the source box when projecting paint.
+    pub(in crate::layout) destination_extent: LogicalSize,
+    pub(in crate::layout) destination_block_start: LayoutLength,
+}
+
+/// One continuous root-flow source range assigned to a page fragmentainer.
+///
+/// This remains logical even though the destination page is physical: a
+/// vertical root maps these ranges to physical X, while a horizontal root maps
+/// the equivalent ranges to physical Y.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct RootPageBlockSlice {
+    pub(in crate::layout) source_block_start: LayoutLength,
+    pub(in crate::layout) block_size: LayoutLength,
+}
+
+/// Partition a continuous root block range into equal-capacity page slices.
+///
+/// Page continuation and deferred overflow both use this source-range plan;
+/// paint projection remains responsible for the root flow's physical-axis
+/// conversion. A bounded prefix avoids allocating unbounded page state for
+/// pathological CSS lengths.
+/// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+pub(in crate::layout) fn root_page_block_slices(
+    source_block_size: LayoutLength,
+    page_block_capacity: LayoutLength,
+) -> Vec<RootPageBlockSlice> {
+    let capacity = page_block_capacity.points().max(0.0);
+    if capacity <= 0.01 {
+        return Vec::new();
+    }
+    let mut remaining = source_block_size.points().max(0.0);
+    let mut source_block_start = 0.0;
+    let mut slices = Vec::new();
+    while remaining > 0.01 && slices.len() < MAX_MATERIALIZED_PAGE_FRAGMENTAINERS {
+        let block_size = remaining.min(capacity);
+        slices.push(RootPageBlockSlice {
+            source_block_start: layout_pt(source_block_start),
+            block_size: layout_pt(block_size),
+        });
+        remaining -= block_size;
+        source_block_start += block_size;
+    }
+    slices
+}
+
 impl FragmentainerProjection {
     pub(in crate::layout) fn new(input: FragmentainerProjectionInput) -> Self {
         let source = page_top_rect_from_logical_fragment(
-            input.axes,
+            input.source_axes,
             input.source_origin,
             input.source_extent,
             input.source_slice,
         );
         let destination = page_top_rect_from_logical_fragment(
-            input.axes,
+            input.destination_axes,
             input.destination_origin,
             input.destination_extent,
             input.destination_slice,
@@ -997,6 +1720,65 @@ mod tests {
         Fragmentainer::new(layout_pt(block_size), layout_pt(available_size))
     }
 
+    #[test]
+    fn cloned_container_fragment_always_owns_both_block_edges() {
+        let fragment = CommittedContainerFragment::principal(
+            FragmentainerOrdinal::new(3),
+            "source slice",
+            PaintClip::new(10.0, 20.0, 30.0, 0.0),
+            FragmentDecoration::for_box_decoration_break(
+                css::BoxDecorationBreak::Clone,
+                false,
+                false,
+            ),
+        );
+
+        let principal = fragment
+            .kind()
+            .principal_box()
+            .expect("clone creates a principal box fragment");
+        assert!(principal.decoration().owns_block_start());
+        assert!(principal.decoration().owns_block_end());
+        assert_eq!(
+            principal.border_box(),
+            PaintClip::new(10.0, 20.0, 30.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn sliced_container_fragment_retains_only_its_owned_edges() {
+        let fragment = CommittedContainerFragment::principal(
+            FragmentainerOrdinal::new(1),
+            (),
+            PaintClip::new(0.0, 0.0, 10.0, 20.0),
+            FragmentDecoration::for_box_decoration_break(
+                css::BoxDecorationBreak::Slice,
+                true,
+                false,
+            ),
+        );
+
+        let decoration = fragment
+            .kind()
+            .principal_box()
+            .expect("slice still owns a principal box")
+            .decoration();
+        assert!(decoration.owns_block_start());
+        assert!(!decoration.owns_block_end());
+    }
+
+    #[test]
+    fn descendant_overflow_fragment_has_no_decoration_geometry() {
+        let fragment = CommittedContainerFragment::descendant_overflow_only(
+            FragmentainerOrdinal::new(2),
+            42_usize,
+        );
+
+        assert_eq!(fragment.fragmentainer(), FragmentainerOrdinal::new(2));
+        assert_eq!(fragment.source_slice(), &42);
+        assert!(fragment.kind().principal_box().is_none());
+    }
+
     fn test_layout_builder<'a, Collection: crate::css::StylesheetCollection + ?Sized>(
         options: &'a RenderOptions,
         stylesheets: &'a Collection,
@@ -1097,6 +1879,115 @@ mod tests {
     }
 
     #[test]
+    fn forced_column_break_retains_an_empty_source_column() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let initial_context = builder.current_page_context;
+        builder.fragmentainer_override = Some(FragmentainerOverride {
+            kind: FragmentainerKind::Column,
+            initial_context,
+            initial_fragmentainer_count: 1,
+            context: initial_context,
+            relax_widows_orphans: false,
+        });
+        let page_count = builder.pages.len();
+
+        builder.apply_forced_break_in(FragmentainerKind::Column, PageBreak::Column);
+
+        assert_eq!(builder.pages.len(), page_count + 1);
+        assert!(!builder.current_page_has_content());
+    }
+
+    #[test]
+    fn vertical_root_page_fragment_slices_project_in_opposite_block_directions() {
+        let context = PageContext {
+            size: PageSize::from_points(360.0, 216.0),
+            margins: PageMargins::all_points(36.0),
+            edges: PageBoxEdges::ZERO,
+            rotation: 0,
+        };
+        let source_extent = LogicalSize {
+            inline: 72.0,
+            block: context.logical_block_size(WritingMode::VerticalRl),
+        };
+        let source_slice = LogicalRect {
+            origin: LogicalPoint {
+                inline: 0.0,
+                block: 0.0,
+            },
+            size: LogicalSize {
+                inline: source_extent.inline,
+                block: 100.0,
+            },
+        };
+        let input = |writing_mode| FragmentainerProjectionInput {
+            source_axes: FlowAxes::new(writing_mode, Direction::Ltr),
+            source_origin: PageTopPoint::new(context.left(), context.top()),
+            source_extent,
+            source_slice,
+            destination_axes: FlowAxes::new(writing_mode, Direction::Ltr),
+            destination_origin: PageTopPoint::new(context.left(), context.top()),
+            destination_extent: source_extent,
+            destination_slice: source_slice,
+            destination_page_area: PageTopRect::new(
+                context.left(),
+                context.top(),
+                context.area_width(),
+                context.area_height(),
+            ),
+        };
+
+        let vertical_rl = FragmentainerProjection::new(input(WritingMode::VerticalRl));
+        let vertical_lr = FragmentainerProjection::new(input(WritingMode::VerticalLr));
+
+        assert_eq!(
+            vertical_rl.destination_clip().paint_rect().origin.x,
+            context.right() - 100.0
+        );
+        assert_eq!(
+            vertical_lr.destination_clip().paint_rect().origin.x,
+            context.left()
+        );
+        assert_eq!(
+            vertical_rl.destination_clip().paint_rect().size.width,
+            100.0
+        );
+        assert_eq!(
+            vertical_lr.destination_clip().paint_rect().size.width,
+            100.0
+        );
+    }
+
+    #[test]
+    fn root_page_block_slices_keep_fixed_and_overflow_ranges_separate() {
+        let principal = root_page_block_slices(layout_pt(360.0), layout_pt(144.0));
+        let overflow = root_page_block_slices(layout_pt(576.0), layout_pt(144.0));
+
+        assert_eq!(
+            principal,
+            vec![
+                RootPageBlockSlice {
+                    source_block_start: layout_pt(0.0),
+                    block_size: layout_pt(144.0),
+                },
+                RootPageBlockSlice {
+                    source_block_start: layout_pt(144.0),
+                    block_size: layout_pt(144.0),
+                },
+                RootPageBlockSlice {
+                    source_block_start: layout_pt(288.0),
+                    block_size: layout_pt(72.0),
+                },
+            ]
+        );
+        assert_eq!(overflow.len(), 4);
+        assert_eq!(overflow[2].source_block_start, layout_pt(288.0));
+        assert_eq!(overflow[3].source_block_start, layout_pt(432.0));
+    }
+
+    #[test]
     fn fragmentainer_capacity_uses_empty_and_remaining_block_sizes() {
         let fragmentainer = fragmentainer(100.0, 40.0);
 
@@ -1112,6 +2003,47 @@ mod tests {
         assert_eq!(
             fragmentainer.available_block_size_after_reservation(layout_pt(80.0)),
             layout_pt(0.0)
+        );
+    }
+
+    #[test]
+    fn decoration_reservation_models_clone_and_slice_content_capacity() {
+        let clone = FragmentDecorationReservation::new(
+            FragmentDecoration::Clone,
+            non_content_pt(7.5),
+            non_content_pt(7.5),
+        );
+        assert_eq!(
+            clone.remaining_content_extent(layout_pt(67.5)),
+            layout_pt(60.0)
+        );
+        assert_eq!(clone.fresh_content_extent(layout_pt(75.0)), layout_pt(60.0));
+        assert_eq!(clone.fresh_content_extent(layout_pt(10.0)), layout_pt(0.0));
+
+        let first_slice = FragmentDecorationReservation::new(
+            FragmentDecoration::Slice(SliceFragmentEdges {
+                owns_block_start: true,
+                owns_block_end: false,
+            }),
+            non_content_pt(7.5),
+            non_content_pt(7.5),
+        );
+        assert_eq!(
+            first_slice.fresh_content_extent(layout_pt(75.0)),
+            layout_pt(67.5)
+        );
+
+        let last_slice = FragmentDecorationReservation::new(
+            FragmentDecoration::Slice(SliceFragmentEdges {
+                owns_block_start: false,
+                owns_block_end: true,
+            }),
+            non_content_pt(7.5),
+            non_content_pt(7.5),
+        );
+        assert_eq!(
+            last_slice.remaining_content_extent(layout_pt(67.5)),
+            layout_pt(60.0)
         );
     }
 
@@ -1255,8 +2187,8 @@ mod tests {
     fn avoid_run_prebreak_rejects_equal_capacity_empty_fragmentainer_retry() {
         assert!(!should_move_avoid_break_run_to_next_fragmentainer(
             AvoidRunPrebreakInput {
-                run_height: 20.0,
-                next_height: 60.0,
+                run_block_extent: layout_pt(20.0),
+                next_block_extent: layout_pt(60.0),
                 retry_context: AvoidRunRetryContext {
                     current_fragmentainer: fragmentainer(100.0, 40.0),
                     empty_destination_fragmentainer: fragmentainer(100.0, 100.0),
@@ -1270,8 +2202,8 @@ mod tests {
     fn avoid_run_prebreak_uses_strictly_larger_empty_destination() {
         assert!(should_move_avoid_break_run_to_next_fragmentainer(
             AvoidRunPrebreakInput {
-                run_height: 20.0,
-                next_height: 60.0,
+                run_block_extent: layout_pt(20.0),
+                next_block_extent: layout_pt(60.0),
                 retry_context: AvoidRunRetryContext {
                     current_fragmentainer: fragmentainer(100.0, 40.0),
                     empty_destination_fragmentainer: fragmentainer(120.0, 120.0),
@@ -1285,8 +2217,8 @@ mod tests {
     fn avoid_run_prebreak_keeps_oversized_run_in_ordinary_fragmentation() {
         assert!(!should_move_avoid_break_run_to_next_fragmentainer(
             AvoidRunPrebreakInput {
-                run_height: 80.0,
-                next_height: 60.0,
+                run_block_extent: layout_pt(80.0),
+                next_block_extent: layout_pt(60.0),
                 retry_context: AvoidRunRetryContext {
                     current_fragmentainer: fragmentainer(100.0, 40.0),
                     empty_destination_fragmentainer: fragmentainer(120.0, 120.0),
@@ -1300,11 +2232,48 @@ mod tests {
     fn avoid_run_prebreak_keeps_occupied_source_behavior() {
         assert!(should_move_avoid_break_run_to_next_fragmentainer(
             AvoidRunPrebreakInput {
-                run_height: 20.0,
-                next_height: 60.0,
+                run_block_extent: layout_pt(20.0),
+                next_block_extent: layout_pt(60.0),
                 retry_context: AvoidRunRetryContext {
                     current_fragmentainer: fragmentainer(100.0, 40.0),
                     empty_destination_fragmentainer: fragmentainer(100.0, 100.0),
+                    source_occupancy: AvoidRunSourceFragmentainerOccupancy::Occupied,
+                },
+            }
+        ));
+    }
+
+    #[test]
+    fn avoid_run_prebreak_accepts_a_logical_min_block_extent_in_its_destination() {
+        // In vertical writing the caller projects `min-block-size: 40px` to
+        // this fragmentainer-block extent (physical X). The current 30px
+        // column cannot retain the child, while the empty 40px destination
+        // can, so the class-A avoid retry is selected.
+        assert!(should_move_avoid_break_run_to_next_fragmentainer(
+            AvoidRunPrebreakInput {
+                run_block_extent: layout_pt(0.0),
+                next_block_extent: layout_pt(40.0),
+                retry_context: AvoidRunRetryContext {
+                    current_fragmentainer: fragmentainer(30.0, 30.0),
+                    empty_destination_fragmentainer: fragmentainer(40.0, 40.0),
+                    source_occupancy: AvoidRunSourceFragmentainerOccupancy::Occupied,
+                },
+            }
+        ));
+    }
+
+    #[test]
+    fn avoid_run_prebreak_relaxes_an_oversized_logical_min_block_extent() {
+        // No empty column can contain the 40px logical block extent. Avoidance
+        // must not manufacture a run of empty columns instead of allowing
+        // normal fragmentation to make progress.
+        assert!(!should_move_avoid_break_run_to_next_fragmentainer(
+            AvoidRunPrebreakInput {
+                run_block_extent: layout_pt(0.0),
+                next_block_extent: layout_pt(40.0),
+                retry_context: AvoidRunRetryContext {
+                    current_fragmentainer: fragmentainer(30.0, 30.0),
+                    empty_destination_fragmentainer: fragmentainer(30.0, 30.0),
                     source_occupancy: AvoidRunSourceFragmentainerOccupancy::Occupied,
                 },
             }
@@ -1889,7 +2858,7 @@ mod tests {
     #[test]
     fn fragmentainer_projection_preserves_horizontal_column_replay_coordinates() {
         let projection = FragmentainerProjection::new(FragmentainerProjectionInput {
-            axes: FlowAxes::new(WritingMode::HorizontalTb, Direction::Ltr),
+            source_axes: FlowAxes::new(WritingMode::HorizontalTb, Direction::Ltr),
             source_origin: PageTopPoint::new(10.0, 200.0),
             source_extent: LogicalSize {
                 inline: 100.0,
@@ -1905,6 +2874,7 @@ mod tests {
                     block: 100.0,
                 },
             },
+            destination_axes: FlowAxes::new(WritingMode::HorizontalTb, Direction::Ltr),
             destination_origin: PageTopPoint::new(10.0, 200.0),
             destination_extent: LogicalSize {
                 inline: 400.0,
@@ -1939,6 +2909,59 @@ mod tests {
     }
 
     #[test]
+    fn fragmentainer_projection_maps_source_and_destination_with_independent_axes() {
+        let projection = FragmentainerProjection::new(FragmentainerProjectionInput {
+            source_axes: FlowAxes::new(WritingMode::HorizontalTb, Direction::Ltr),
+            source_origin: PageTopPoint::new(10.0, 200.0),
+            source_extent: LogicalSize {
+                inline: 100.0,
+                block: 40.0,
+            },
+            source_slice: LogicalRect {
+                origin: LogicalPoint {
+                    inline: 0.0,
+                    block: 0.0,
+                },
+                size: LogicalSize {
+                    inline: 100.0,
+                    block: 40.0,
+                },
+            },
+            destination_axes: FlowAxes::new(WritingMode::VerticalLr, Direction::Ltr),
+            destination_origin: PageTopPoint::new(10.0, 200.0),
+            destination_extent: LogicalSize {
+                inline: 100.0,
+                block: 40.0,
+            },
+            destination_slice: LogicalRect {
+                origin: LogicalPoint {
+                    inline: 0.0,
+                    block: 0.0,
+                },
+                size: LogicalSize {
+                    inline: 100.0,
+                    block: 40.0,
+                },
+            },
+            destination_page_area: PageTopRect::new(0.0, 300.0, 300.0, 300.0),
+        });
+
+        assert_eq!(
+            projection.source_clip(),
+            PageTopRect::new(10.0, 200.0, 100.0, 40.0).paint_clip()
+        );
+        assert_eq!(
+            projection.destination_clip(),
+            PageTopRect::new(10.0, 200.0, 40.0, 100.0).paint_clip()
+        );
+        assert_eq!(
+            projection.destination_translation(),
+            PaintTranslation::identity(),
+            "independent axis projection changes the destination extent, not its shared logical origin",
+        );
+    }
+
+    #[test]
     fn fragmentainer_projection_maps_vertical_rl_rtl_block_slices_to_x() {
         let source_slice = LogicalRect {
             origin: LogicalPoint {
@@ -1951,13 +2974,14 @@ mod tests {
             },
         };
         let projection = FragmentainerProjection::new(FragmentainerProjectionInput {
-            axes: FlowAxes::new(WritingMode::VerticalRl, Direction::Rtl),
+            source_axes: FlowAxes::new(WritingMode::VerticalRl, Direction::Rtl),
             source_origin: PageTopPoint::new(10.0, 500.0),
             source_extent: LogicalSize {
                 inline: 400.0,
                 block: 100.0,
             },
             source_slice,
+            destination_axes: FlowAxes::new(WritingMode::VerticalRl, Direction::Rtl),
             destination_origin: PageTopPoint::new(10.0, 500.0),
             destination_extent: LogicalSize {
                 inline: 400.0,
@@ -1996,13 +3020,14 @@ mod tests {
             },
         };
         let projection = FragmentainerProjection::new(FragmentainerProjectionInput {
-            axes: FlowAxes::new(WritingMode::VerticalLr, Direction::Rtl),
+            source_axes: FlowAxes::new(WritingMode::VerticalLr, Direction::Rtl),
             source_origin: PageTopPoint::new(10.0, 500.0),
             source_extent: LogicalSize {
                 inline: 400.0,
                 block: 100.0,
             },
             source_slice,
+            destination_axes: FlowAxes::new(WritingMode::VerticalLr, Direction::Rtl),
             destination_origin: PageTopPoint::new(10.0, 500.0),
             destination_extent: LogicalSize {
                 inline: 400.0,
@@ -2026,5 +3051,26 @@ mod tests {
             projection.destination_translation(),
             PaintTranslation::new(0.0, 100.0)
         );
+    }
+
+    #[test]
+    fn transition_recorder_preserves_order_and_rewinds_speculative_records() {
+        let recorder = FragmentainerTransitionRecorder::default();
+        let first = FragmentainerTransitionRecord {
+            kind: FragmentainerKind::Column,
+            page_index: 0,
+            content_bounds: PageTopRect::new(10.0, 200.0, 40.0, 100.0),
+        };
+        let second = FragmentainerTransitionRecord {
+            kind: FragmentainerKind::Column,
+            page_index: 1,
+            content_bounds: PageTopRect::new(10.0, 200.0, 40.0, 100.0),
+        };
+        recorder.push(first);
+        let snapshot_len = recorder.len();
+        recorder.push(second);
+        recorder.truncate(snapshot_len);
+
+        assert_eq!(recorder.records(), vec![first]);
     }
 }

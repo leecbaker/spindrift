@@ -13,6 +13,10 @@ navigation. The remaining failures are limited to two atomic/replay paint cases
 and are listed in `SPEC_DIVERGENCES.md` rather than treated as WPT-specific
 exceptions.
 
+Static iframe documents inherit the embedding element's effective CSS `zoom`
+while keeping their physical clipped viewport. Nested frames therefore scale
+their child used values and natural sizes once, without a compositing transform.
+
 ## Remaining work
 
 - Finish atomic inline and writing-mode replay so that captured descendant

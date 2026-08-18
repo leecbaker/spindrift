@@ -215,6 +215,51 @@ async fn clipped_positioned_multicolumn_tail_does_not_materialize_pages() {
     );
 }
 
+/// A deferred positioned replay retains every non-scrollable clip from its
+/// source ancestry, including clips outside its positioned containing block.
+/// <https://drafts.csswg.org/css-overflow-3/#overflow-clipping>
+/// <https://drafts.csswg.org/css-position/#abspos-breaking>
+#[test]
+fn nested_clipped_ancestor_bounds_deferred_multicolumn_positioned_replay() {
+    // This intentionally 30,000px nested-fragmentation case exceeds Rust's
+    // 2MiB test-thread stack before the renderer can prove its clipped output.
+    std::thread::Builder::new()
+        .name("nested-clipped-positioned-replay".into())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200px 200px; margin: 0 }\
+         html, body { margin: 0 }\
+         .columns { columns: 3; column-gap: 20px; column-fill: auto; height: 100px; width: 100px }\
+         .outer-clip { overflow: clip; height: 80px }\
+         .inner-clip { overflow: clip; height: 60px }\
+         .relative { position: relative; height: 300px }\
+         .absolute { position: absolute; width: 100%; height: 30000px; background: green }\
+         </style>\
+         <div class=\"columns\"><div class=\"outer-clip\"><div class=\"inner-clip\"><div class=\"relative\"><div class=\"absolute\"></div></div></div></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(
+        document.pages.len(),
+        1,
+        "nested non-scrollable ancestor clips must bound deferred positioned replay"
+    );
+                });
+        })
+        .unwrap()
+        .join()
+        .expect("nested clipped positioned replay test thread should not panic");
+}
+
 #[tokio::test]
 async fn supports_absolute_positioned_blocks() {
     let options = RenderOptions::default();
@@ -523,6 +568,146 @@ async fn absolute_position_auto_offsets_use_static_position_after_flow() {
     assert_line_baseline_at_top(&document, after, 100.0);
 }
 
+/// Consecutive block-level out-of-flow siblings share the static position
+/// selected after preceding in-flow inline content. The first positioned box
+/// cannot create a hypothetical line that moves the second box.
+/// <https://drafts.csswg.org/css-position-3/#staticpos-rect>
+#[tokio::test]
+async fn consecutive_absolute_block_siblings_keep_their_static_position_after_inline_flow() {
+    let red = CssColor::new(255, 0, 0);
+    let green = CssColor::new(0, 128, 0);
+    for position in ["absolute", "fixed"] {
+        let document = Html::from_string(format!(
+            "<!DOCTYPE html>\
+             <style>\
+             @page {{ size: 300px 180px; margin: 0 }}\
+             html, body {{ margin: 0; font: 16px/normal sans-serif }}\
+             .positioned {{ position: {position}; margin: 16px; height: 24px }}\
+             .light {{ width: 90px; background: red }}\
+             .heavy {{ width: 100px; background: green }}\
+             </style>\
+             Static source text\
+             <div class=\"positioned light\"></div><div class=\"positioned heavy\"></div>"
+        ))
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+
+        let page = &document.pages[0];
+        let light = page
+            .rects()
+            .iter()
+            .find(|rect| rect.fill == Some(red))
+            .unwrap_or_else(|| panic!("missing light {position} rectangle: {:?}", page.rects()));
+        let heavy = page
+            .rects()
+            .iter()
+            .find(|rect| rect.fill == Some(green))
+            .unwrap_or_else(|| panic!("missing heavy {position} rectangle: {:?}", page.rects()));
+
+        assert!(
+            (light.x() - heavy.x()).abs() < 0.01
+                && (light.y() - heavy.y()).abs() < 0.01
+                && heavy.width() >= light.width()
+                && heavy.height() >= light.height(),
+            "consecutive {position} siblings must share their static position: light={light:?}, heavy={heavy:?}",
+        );
+        assert_final_rect_fill(page, light, green);
+    }
+}
+
+/// `justify-self:auto` for an absolutely positioned block source takes its
+/// inline default from the nearest block static-position containing block.
+/// `align-items` on that ordinary block does not move the source on the block
+/// axis.
+/// <https://drafts.csswg.org/css-align-3/#justify-items-property>
+/// <https://drafts.csswg.org/css-position-3/#static-position>
+#[tokio::test]
+async fn abspos_static_auto_alignment_uses_nearest_block_container_defaults() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 300px 200px; margin: 0 }\
+         html, body { margin: 0 }\
+         .outer { position: relative; width: 200px; height: 200px }\
+         .case { width: 100px; height: 40px; align-items: center }\
+         .end { justify-items: end }\
+         .center { justify-items: center }\
+         .inner { width: 80px; justify-items: center }\
+         .abs { position: absolute; width: 40px; height: 20px }\
+         .red { background: rgb(255, 0, 0) }\
+         .yellow { background: rgb(255, 255, 0) }\
+         .green { background: rgb(0, 128, 0) }\
+         .blue { background: rgb(0, 0, 255) }\
+         </style>\
+         <div class=\"outer\">\
+           <div class=\"case end\"><div class=\"abs red\"></div></div>\
+           <div class=\"case center\"><div class=\"abs yellow\"></div></div>\
+           <div class=\"case end\"><div class=\"inner\"><div class=\"abs green\"></div></div></div>\
+           <div class=\"case center\"><div class=\"abs blue\" style=\"justify-self:end\"></div></div>\
+         </div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = filled_rect(page, CssColor::new(255, 0, 0));
+    let yellow = filled_rect(page, CssColor::new(255, 255, 0));
+    let green = filled_rect(page, CssColor::new(0, 128, 0));
+    let blue = filled_rect(page, CssColor::new(0, 0, 255));
+
+    // CSS px convert to 0.75pt. The first, second, and fourth boxes use a
+    // 100px static-position container; the nested green child uses 80px.
+    assert!((red.x() - 45.0).abs() < 0.01, "end alignment: {red:?}");
+    assert!(
+        (yellow.x() - 22.5).abs() < 0.01,
+        "center alignment: {yellow:?}"
+    );
+    assert!(
+        (green.x() - 15.0).abs() < 0.01,
+        "the nested 80px block, not its 100px ancestor, owns auto alignment: {green:?}"
+    );
+    assert!(
+        (blue.x() - 45.0).abs() < 0.01,
+        "explicit justify-self must override the captured auto default: {blue:?}"
+    );
+    // The source's static block position is its ordinary inline position,
+    // not the center of its 40px block container.
+    assert!(
+        (red.y() - 135.0).abs() < 0.01,
+        "align-items must not center the ordinary block source: {red:?}"
+    );
+}
+
+/// Static-position alignment keeps the containing block's logical axes with
+/// its alignment defaults in vertical writing modes.
+/// <https://drafts.csswg.org/css-position-3/#staticpos-rect>
+/// <https://drafts.csswg.org/css-writing-modes-4/#logical-to-physical>
+#[tokio::test]
+async fn vertical_block_static_position_uses_captured_inline_alignment_default() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 300px 200px; margin: 0 }\
+         html, body { margin: 0 }\
+         .vertical { writing-mode: vertical-rl; width: 40px; height: 100px; justify-items: center }\
+         .abs { position: absolute; width: 20px; height: 40px; background: rgb(128, 0, 128) }\
+         </style>\
+         <div class=\"vertical\"><div class=\"abs\"></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let purple = filled_rect(&document.pages[0], CssColor::new(128, 0, 128));
+
+    // The vertical inline axis is 100px. Centering a 40px abspos child puts
+    // its physical top 30px from the container's physical top.
+    assert!(
+        (purple.y() - 97.5).abs() < 0.01,
+        "vertical inline alignment must use the vertical owner's axes: {purple:?}"
+    );
+}
+
 #[tokio::test]
 async fn block_level_abspos_is_not_dispatched_by_raw_inline_collection() {
     let document = Html::from_string(
@@ -818,6 +1003,60 @@ async fn auto_positioned_abspos_after_text_before_float() {
             page.rects(),
         );
     }
+}
+
+/// A positioned source sibling retains its static-position boundary without
+/// allowing an enclosing inline collector to place a later float before the
+/// preceding block has advanced the flow cursor.
+/// <https://www.w3.org/TR/css-position-3/#static-position>
+/// <https://www.w3.org/TR/CSS22/visuren.html#floats>
+#[tokio::test]
+async fn positioned_sibling_keeps_later_float_after_preceding_block() {
+    let stylesheet = "<style>\
+        @page { size: 240px 180px; margin: 0 }\
+        body { margin: 0 }\
+        p { margin: 0 0 20px; font: 16px/20px sans-serif }\
+        .float { float: left; width: 60px; height: 40px; background: green }\
+        .positioned { position: absolute; width: 1px; height: 1px }\
+        </style>";
+    let render = |positioned_sibling: &str| {
+        Html::from_string(format!(
+            "{stylesheet}<p>Leading block</p>{positioned_sibling}<div class=\"float\"></div>"
+        ))
+    };
+
+    let expected = render("").render(&RenderOptions::default()).await.unwrap();
+    let actual = render("<div class=\"positioned\"></div>")
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+
+    let green = CssColor::new(0, 128, 0);
+    let expected_float = expected.pages[0]
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(green))
+        .expect("baseline float should paint");
+    let actual_page = &actual.pages[0];
+    let actual_float = actual_page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(green))
+        .expect("float after positioned sibling should paint");
+
+    assert!(
+        (actual_float.y() - expected_float.y()).abs() < 0.01,
+        "positioned sibling must not pull the float before the preceding block: expected={expected_float:?}, actual={actual_float:?}"
+    );
+    let leading_line = actual_page
+        .lines()
+        .iter()
+        .find(|line| line.text == "Leading block")
+        .expect("preceding block line should paint");
+    assert!(
+        (leading_line.x() - actual_float.x()).abs() < 0.01,
+        "the earlier block must not wrap around the later float: line={leading_line:?}, float={actual_float:?}"
+    );
 }
 
 #[tokio::test]
@@ -1182,13 +1421,13 @@ async fn fixed_static_position_inside_static_position_absolute() {
     let pdf_rects = pdf_emitted_rects_with_fills(&pdf, &[green, red]);
     assert_eq!(
         pdf_rects.len(),
-        1,
-        "PDF realization should coalesce fully covered same-color paint: {pdf_rects:?}",
+        2,
+        "PDF realization should omit the covered red rect while retaining the distinct outer and fixed green rectangles: {pdf_rects:?}",
     );
     assert_eq!(
         pdf_rects.iter().map(|rect| rect.fill).collect::<Vec<_>>(),
-        vec![green],
-        "the PDF should retain only the final visible green composition: {pdf_rects:?}",
+        vec![green, green],
+        "the PDF should retain both visible green rectangles: {pdf_rects:?}",
     );
 
     let pdf_green_rect = pdf_rects[0].rect;
@@ -1829,6 +2068,100 @@ async fn positioned_inline_block_fragment_captures_absolute_descendants() {
 }
 
 #[tokio::test]
+async fn positioned_inline_block_abspos_replays_after_normal_flow_siblings() {
+    // This is the diagnostic arrangement used by the CSS Backgrounds
+    // border-width keyword reftests. The relative inline-block has no own
+    // width; its absolutely positioned white child must be retained from the
+    // atomic scratch layout and replayed at the final atom position after the
+    // red normal-flow sibling.
+    // <https://www.w3.org/TR/CSS22/zindex.html>
+    for (side, keyword, width, is_inline_axis) in [
+        ("left", "thin", 1, true),
+        ("left", "medium", 3, true),
+        ("left", "thick", 5, true),
+        ("right", "thin", 1, true),
+        ("right", "medium", 3, true),
+        ("right", "thick", 5, true),
+        ("top", "thin", 1, false),
+        ("top", "medium", 3, false),
+        ("top", "thick", 5, false),
+        ("bottom", "thin", 1, false),
+        ("bottom", "medium", 3, false),
+        ("bottom", "thick", 5, false),
+    ] {
+        let (shared, red_if_too_thin, red_if_too_thick, white_cover, body) = if is_inline_axis {
+            (
+                "div { display: inline-block; height: 100px; }",
+                format!("width: {width}px; background: red;"),
+                "width: 20px; background: red;",
+                "width: 20px; background: white; position: absolute; left: 0;".to_owned(),
+                "<div class=red-if-too-thin></div><!--\n--><div class=cb><!--\n--><div class=border-test></div><!--\n--><div class=red-if-too-thick></div><!--\n--><div class=overlap-red-if-too-thick></div><!--\n--></div>",
+            )
+        } else {
+            (
+                "",
+                format!("height: {width}px; background: red;"),
+                "height: 20px; background: red;",
+                "height: 20px; background: white; position: absolute; top: 0; width: 100%;"
+                    .to_owned(),
+                "<div class=red-if-too-thin></div>\n<div class=cb>\n  <div class=border-test></div>\n  <div class=red-if-too-thick></div>\n  <div class=overlap-red-if-too-thick></div>\n</div>",
+            )
+        };
+        let margin_axis = if is_inline_axis { "left" } else { "top" };
+        let document = Html::from_string(format!(
+            "<!DOCTYPE html><style>{shared} .red-if-too-thin {{ {red_if_too_thin} }} .cb {{ position: relative; }} .red-if-too-thick {{ {red_if_too_thick} }} .overlap-red-if-too-thick {{ {white_cover} }} .border-test {{ border-{side}-style: solid; border-{side}-width: {keyword}; margin-{margin_axis}: -{width}px; }}</style><p>There should be a black line below and no red.</p>{body}",
+        ))
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+
+        let page = &document.pages[0];
+        let red = page
+            .rects()
+            .iter()
+            .find(|rect| {
+                rect.fill == Some(CssColor::new(255, 0, 0))
+                    && if is_inline_axis {
+                        rect.width() >= 14.0
+                    } else {
+                        rect.height() >= 14.0
+                    }
+            })
+            .unwrap_or_else(|| panic!("missing red diagnostic for {side} {keyword}"));
+        let white = page
+            .rects()
+            .iter()
+            .find(|rect| {
+                rect.fill == Some(CssColor::WHITE)
+                    && if is_inline_axis {
+                        rect.width() >= 14.0
+                    } else {
+                        rect.height() >= 14.0
+                    }
+            })
+            .unwrap_or_else(|| panic!("missing white cover for {side} {keyword}"));
+
+        assert!(
+            (white.x() - red.x()).abs() < 0.01,
+            "{side} {keyword}: {white:?} {red:?}"
+        );
+        assert!(
+            (white.y() - red.y()).abs() < 0.01,
+            "{side} {keyword}: {white:?} {red:?}"
+        );
+        assert_eq!(
+            final_rect_fill_at(
+                page,
+                red.x() + red.width() / 2.0,
+                red.y() + red.height() / 2.0
+            ),
+            Some(CssColor::WHITE),
+            "{side} {keyword}",
+        );
+    }
+}
+
+#[tokio::test]
 async fn abspos_float_inside_positioned_inline_uses_inline_containing_block() {
     let document = Html::from_string(
         "<!DOCTYPE html>\
@@ -1919,6 +2252,39 @@ async fn abspos_float_inside_nested_positioned_inline_uses_nearest_source() {
     assert!((green.y() - 120.0).abs() < 0.01, "{green:?}");
     assert!((green.width() - 75.0).abs() < 0.01, "{green:?}");
     assert!((green.height() - 75.0).abs() < 0.01, "{green:?}");
+}
+
+/// Nested vertical inline absolute-positioning must retain one physical page:
+/// `inset-block-start` is physical `right` in `vertical-rl`, while the
+/// opposite physical `top`/`bottom` auto pair uses the inline static position.
+/// Replaying the child through a physical bounding union can instead send its
+/// static placeholder into an unrelated continuation page.
+/// <https://drafts.csswg.org/css-position-3/#def-cb>
+/// <https://drafts.csswg.org/css-position-3/#resolving-auto-insets>
+/// <https://drafts.csswg.org/css-writing-modes-4/#logical-to-physical>
+#[tokio::test]
+async fn nested_vertical_rl_positioned_inlines_do_not_create_inline_axis_pages() {
+    let document = Html::from_string(
+        "<!DOCTYPE html>\
+         <style>\
+         @page { size: 800px 600px; margin: 8px }\
+         body { margin: 0 }\
+         #container { position: relative; writing-mode: vertical-rl; font: 240px/1 sans-serif }\
+         span > span { position: absolute; font-size: 0.5em; inset-block-start: 0 }\
+         </style>\
+         <div id=\"container\">\
+           <span>X<span>X<span>X<span>X<span>X</span></span></span></span></span>\
+         </div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(
+        document.pages.len(),
+        1,
+        "nested vertical inline abspos replay must not fragment along the physical inline axis"
+    );
 }
 
 #[tokio::test]
@@ -2712,6 +3078,37 @@ async fn margin_trim_block_end_discards_only_the_final_block_child_margin() {
 }
 
 #[tokio::test]
+async fn margin_trim_block_end_preserves_a_non_final_block_child_margin() {
+    let document = Html::from_string(
+        "<style>@page { size: 75pt 75pt; margin: 0 } html, body { margin: 0 }</style>\
+         <div style=\"width:75pt; height:75pt; background:red\">\
+           <div style=\"margin-trim:block-end\">\
+             <div style=\"height:18.75pt; margin-bottom:18.75pt; background:blue\"></div>\
+             <div style=\"height:18.75pt; background:green\"></div>\
+           </div>\
+         </div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    assert_eq!(
+        final_rect_fill_at(page, 37.5, 65.625),
+        Some(CssColor::new(0, 0, 255))
+    );
+    assert_eq!(
+        final_rect_fill_at(page, 37.5, 46.875),
+        Some(CssColor::new(255, 0, 0)),
+        "the first child's margin remains between in-flow block siblings"
+    );
+    assert_eq!(
+        final_rect_fill_at(page, 37.5, 28.125),
+        Some(CssColor::new(0, 128, 0))
+    );
+}
+
+#[tokio::test]
 async fn margin_trim_block_end_discards_joined_self_collapsing_end_margin_set() {
     let document = Html::from_string(
         "<style>@page { size: 75pt 75pt; margin: 0 } html, body { margin: 0 }</style>\
@@ -2802,6 +3199,72 @@ async fn absolute_principal_decoration_materializes_continuation_pages() {
                 .iter()
                 .any(|rect| rect.fill == Some(CssColor::new(255, 0, 0))),
             "expected absolute background on every continuation page: {page:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn absolute_fragments_rebase_to_varying_destination_page_geometry() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 100px; margin: 0 }\
+         @page :nth(2) { size: 100px 200px; margin: 0 }\
+         html, body { margin: 0 }\
+         #box { position: absolute; width: 100px; height: 250px; background: red }\
+         </style><div id=\"box\"></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    // CSS Position resolves the absolute box against its continuous
+    // containing block, but CSS Fragmentation then lays its continuation in
+    // the destination page area. The 200px second page therefore consumes
+    // the 150px tail without allocating a third 100px fragmentainer.
+    // <https://drafts.csswg.org/css-position-3/#fragmenting-abspos>
+    // <https://drafts.csswg.org/css-break-4/#varying-size-fragmentainers>
+    assert_eq!(document.pages.len(), 2);
+    for page in &document.pages {
+        assert!(
+            page.rects()
+                .iter()
+                .any(|rect| rect.fill == Some(CssColor::new(255, 0, 0))),
+            "expected absolute background on every used destination page: {page:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn absolute_scratch_continuation_uses_destination_document_page_context() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 100px; margin: 0 }\
+         @page :nth(3) { size: 100px 200px; margin: 0 }\
+         html, body { margin: 0 }\
+         .first-page { height: 100px }\
+         .host { position: relative }\
+         #box { position: absolute; width: 100px; height: 250px; background: red }\
+         </style>\
+         <div class=\"first-page\"></div><div class=\"host\"><div id=\"box\"></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    // Scratch page zero represents document page two. The box's source
+    // progress consumes the 100px second page, then the 200px third page;
+    // treating scratch page two as document page two would allocate a fourth
+    // page instead. Its continuous containing block remains unchanged.
+    // <https://drafts.csswg.org/css-position-3/#fragmenting-abspos>
+    // <https://drafts.csswg.org/css-break-4/#varying-size-fragmentainers>
+    assert_eq!(document.pages.len(), 3);
+    assert_eq!(document.pages[2].height(), 150.0);
+    for page in &document.pages[1..] {
+        assert!(
+            page.rects()
+                .iter()
+                .any(|rect| rect.fill == Some(CssColor::new(255, 0, 0))),
+            "expected absolute background on every destination page: {page:?}"
         );
     }
 }
@@ -3440,6 +3903,61 @@ async fn page_names_inside_absolutely_positioned_subtree_are_ignored() {
         .collect::<Vec<_>>();
     assert!(lines.contains(&"A"), "{lines:?}");
     assert!(lines.contains(&"B"), "{lines:?}");
+}
+
+#[tokio::test]
+async fn positioned_scratch_bookmark_maps_to_its_document_page() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 120pt 100pt; margin: 10pt }\
+         body, div, h2 { margin: 0; font-size: 10pt; line-height: 10pt }\
+         </style>\
+         <div style=\"height: 90pt\">First page</div>\
+         <div style=\"position: relative; height: 10pt\">\
+           <h2 style=\"position: absolute; top: 0; bookmark-level: 2\">Scratch target</h2>\
+         </div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let bookmark = document
+        .bookmarks
+        .iter()
+        .find(|bookmark| bookmark.label == "Scratch target")
+        .expect("positioned heading should retain its bookmark");
+    assert_eq!(bookmark.page_index, 1, "bookmark={bookmark:?}");
+}
+
+#[tokio::test]
+async fn positioned_scratch_named_string_maps_to_its_document_page() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 120pt 100pt; margin: 10pt; @top-center { content: string(section, last); font-size: 8pt; line-height: 8pt } }\
+         body, div { margin: 0; font-size: 10pt; line-height: 10pt }\
+         .source { string-set: section attr(data-title) }\
+         </style>\
+         <div style=\"height: 90pt\">First page</div>\
+         <div style=\"position: relative; height: 10pt\">\
+           <div style=\"position: absolute; top: 0\">\
+             <div class=\"source\" data-title=\"Positioned section\">Body</div>\
+           </div>\
+         </div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert!(document.pages.len() >= 2);
+    let second_page_lines = document.pages[1]
+        .lines()
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        second_page_lines.contains(&"Positioned section"),
+        "scratch named string must be committed to page two: {second_page_lines:?}"
+    );
 }
 
 #[tokio::test]
@@ -4156,6 +4674,7 @@ async fn table_own_page_name_selects_named_page_context() {
          @page { size: 200pt 300pt; margin: 20pt }\
          @page square { size: 360pt; margin: 30pt }\
          body, table, caption, td { margin: 0; font-size: 10pt; line-height: 10pt }\
+         caption { text-align: left }\
          table { border-spacing: 0 }\
          td { padding: 0 }\
          </style>\
@@ -5080,6 +5599,62 @@ async fn deferred_float_replays_body_and_clipped_containing_block_geometry() {
     assert!(
         (float_rect.x() - 30.0).abs() < 0.01,
         "destination float must retain page + body x-offset: {float_rect:?}"
+    );
+}
+
+/// A definite block that fits its current column may paint an overflowing
+/// descendant independently, but its in-flow successor still starts at the
+/// block's authored end edge.
+/// <https://www.w3.org/TR/css-overflow-3/#overflow>
+/// <https://www.w3.org/TR/css-multicol-1/#pagination>
+#[tokio::test]
+async fn definite_clipped_block_overflow_does_not_move_following_column_content() {
+    let document = Html::from_string(
+        "<style>@page { size: 160pt 120pt; margin: 0 }\
+         html, body { margin: 0 }\
+         .columns { columns: 2; column-gap: 0; column-fill: auto; width: 100pt; height: 100pt }\
+         .clip { height: 10pt; overflow: hidden; background: red }\
+         .tall { height: 30pt; background: blue }\
+         .after { height: 10pt; background: #00ff00 }</style>\
+         <div class=\"columns\"><div class=\"clip\"><div class=\"tall\"></div></div><div class=\"after\"></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(document.pages.len(), 1);
+    let clipped = filled_rect(&document.pages[0], CssColor::new(255, 0, 0));
+    let after = filled_rect(&document.pages[0], CssColor::new(0, 255, 0));
+    assert!(
+        (after.y() - (clipped.y() - clipped.height())).abs() < 0.01,
+        "following in-flow content must begin at the definite clipped block end: clip={clipped:?}, after={after:?}"
+    );
+}
+
+/// An auto-height promoted spanner must use ordinary block layout for its
+/// inline descendants. It has no definite-height capability for the deferred
+/// overflow estimate, but its following in-flow content remains reachable.
+#[tokio::test]
+async fn inline_heavy_auto_height_spanner_keeps_following_flow_content() {
+    let inline_content = "inline ".repeat(240);
+    let document = Html::from_string(format!(
+        "<style>@page {{ size: 180pt 140pt; margin: 10pt }}\
+         html, body {{ margin: 0; font: 10pt/10pt sans-serif }}\
+         .columns {{ columns: 2; column-gap: 10pt; column-fill: auto; height: 100pt }}\
+         .spanner {{ column-span: all; overflow: hidden }}\
+         .after {{ margin: 0 }}</style>\
+         <div class=\"columns\"><div class=\"spanner\">{inline_content}</div><p class=\"after\">After</p></div>"
+    ))
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert!(
+        document
+            .pages
+            .iter()
+            .any(|page| page_has_line(page, "After")),
+        "normal auto-height layout must retain following content"
     );
 }
 

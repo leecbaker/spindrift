@@ -10,6 +10,32 @@ fn generated_gradient_pixel_size_preserves_asymmetric_paint_size() {
 }
 
 #[test]
+fn parsed_zero_length_conic_gradient_rasterizes_as_a_border_image_source() {
+    let crate::css::ParsedImage::Image(image) =
+        crate::css::parse_css_image("conic-gradient(green 0 0)", None, None)
+    else {
+        panic!("valid conic gradient should parse as a CSS image");
+    };
+    let Some(css::BackgroundImage::ConicGradient(gradient)) = image.as_image() else {
+        panic!("expected a parsed conic gradient");
+    };
+
+    let image = rasterize_conic_gradient(
+        gradient,
+        PaintSize::new(100.0, 100.0),
+        CssColor::TRANSPARENT,
+    )
+    .expect("conic gradient should rasterize");
+    assert!(image.alpha.is_none());
+    assert!(
+        image
+            .rgb
+            .chunks_exact(3)
+            .all(|pixel| pixel[0] == 0 && pixel[1] > 0 && pixel[2] == 0)
+    );
+}
+
+#[test]
 fn fractional_background_clip_preserves_source_mapping_and_intersects_rounded_clip() {
     let image = RenderedImage::from_paint_rect(
         paint_space_rect(10.0, 20.0, 100.0, 50.0),
@@ -174,6 +200,46 @@ fn absolute_positioned_height_basis_keeps_one_inset_auto_height_indefinite() {
 }
 
 #[test]
+fn positioned_vertical_size_measurement_distinguishes_intrinsic_and_definite_heights() {
+    let mut style = ComputedStyle::initial();
+
+    assert!(positioned_vertical_size_requires_content_measurement(
+        &style
+    ));
+
+    for height in [
+        css::ComputedLengthPercentageOrAuto::MinContent,
+        css::ComputedLengthPercentageOrAuto::MaxContent,
+        css::ComputedLengthPercentageOrAuto::FitContent(None),
+        css::ComputedLengthPercentageOrAuto::CalcSize(css::CalcSize {
+            basis: css::CalcSizeBasis::Auto,
+            size_multiplier: 1.0,
+            additive: css::ComputedLengthPercentage::ZERO,
+            lower_bound: None,
+            upper_bound: None,
+        }),
+    ] {
+        style.box_values.height.replace_with_used(height);
+        assert!(positioned_vertical_size_requires_content_measurement(
+            &style
+        ));
+    }
+
+    for height in [
+        length(40.0),
+        css::ComputedLengthPercentageOrAuto::LengthPercentage(
+            css::ComputedLengthPercentage::from_percent(0.5),
+        ),
+        css::ComputedLengthPercentageOrAuto::Stretch,
+    ] {
+        style.box_values.height.replace_with_used(height);
+        assert!(!positioned_vertical_size_requires_content_measurement(
+            &style
+        ));
+    }
+}
+
+#[test]
 fn positioned_table_sizing_uses_containing_block_inline_axis() {
     let mut style = ComputedStyle::initial();
     style.writing_mode = WritingMode::VerticalRl;
@@ -278,20 +344,24 @@ fn repeated_border_image_tiles_share_decoded_pixel_storage() {
 
     push_border_image_tiles(
         &mut images,
-        &decoded,
-        RenderedImageTileRect::from_paint_rect(paint_space_rect(0.0, 0.0, 3.0, 1.0)),
-        RenderedImageSourceRect {
-            x: 0,
-            y: 0,
-            width: 1,
-            height: 1,
+        &crate::resource::ResourceCache::default(),
+        RasterBorderImageTilePaint {
+            decoded: &decoded,
+            destination: RenderedImageTileRect::from_paint_rect(paint_space_rect(
+                0.0, 0.0, 3.0, 1.0,
+            )),
+            source_image_bounds: BorderImageSourceRect::new(0.0, 0.0, 1.0, 1.0),
+            source: BorderImageSourceRect::new(0.0, 0.0, 1.0, 1.0),
+            tile_size: PaintSize::new(0.75, 1.0),
+            repeat_x: css::BorderImageRepeatKeyword::Repeat,
+            repeat_y: css::BorderImageRepeatKeyword::Stretch,
+            sampling: true.into(),
         },
-        css::BorderImageRepeatKeyword::Repeat,
-        css::BorderImageRepeatKeyword::Stretch,
-        true,
     );
 
     assert!(images.len() > 1, "{images:?}");
+    assert!(images.iter().all(|image| image.source_rect().is_some()));
+    assert!(images.iter().all(|image| !image.is_clipped()));
     assert!(
         images[1..]
             .iter()
@@ -302,12 +372,12 @@ fn repeated_border_image_tiles_share_decoded_pixel_storage() {
 #[test]
 fn repeated_border_image_tiles_center_a_clipped_single_tile() {
     assert_eq!(
-        repeat_border_image_tile_segments(10.0, 16.0, 160),
+        repeat_border_image_tile_segments(10.0, 16.0, 160.0),
         vec![BorderImageTileSegment {
             destination_offset: 0.0,
             destination_size: 10.0,
-            source_offset: 30,
-            source_size: 100,
+            source_offset: 30.0,
+            source_size: 100.0,
         }],
     );
 }
@@ -315,21 +385,29 @@ fn repeated_border_image_tiles_center_a_clipped_single_tile() {
 #[test]
 fn spaced_border_image_tiles_include_gaps_at_both_edges() {
     assert_eq!(
-        border_image_tile_segments(css::BorderImageRepeatKeyword::Space, 296.0, 100.0, 50),
+        border_image_tile_segments(css::BorderImageRepeatKeyword::Space, 296.0, 100.0, 50.0),
         vec![
             BorderImageTileSegment {
                 destination_offset: 32.0,
                 destination_size: 100.0,
-                source_offset: 0,
-                source_size: 50,
+                source_offset: 0.0,
+                source_size: 50.0,
             },
             BorderImageTileSegment {
                 destination_offset: 164.0,
                 destination_size: 100.0,
-                source_offset: 0,
-                source_size: 50,
+                source_offset: 0.0,
+                source_size: 50.0,
             },
         ],
+    );
+}
+
+#[test]
+fn spaced_border_image_tiles_leave_an_undersized_region_empty() {
+    assert!(
+        border_image_tile_segments(css::BorderImageRepeatKeyword::Space, 99.0, 100.0, 50.0,)
+            .is_empty()
     );
 }
 
@@ -337,12 +415,12 @@ fn spaced_border_image_tiles_include_gaps_at_both_edges() {
 fn round_repeat_rescales_an_auto_opposite_background_size_axis() {
     let decoded = DecodedPngImage::new(100, 100, vec![0; 100 * 100 * 3], None);
     let mut layer = css::BackgroundLayer::initial();
-    layer.image = css::ComputedImage::image(css::BackgroundImage::Url {
-        src: "image.png".to_string(),
+    layer.image = css::ComputedImage::image(css::BackgroundImage::Url(css::ImageUrl {
+        href: "image.png".to_string(),
         base_url: None,
         root_url: None,
         request_modifiers: css::RequestUrlModifiers::default(),
-    });
+    }));
     layer.size = css::BackgroundSize::Explicit {
         width: css::BackgroundSizeAxis::LengthPercentage(
             css::ComputedLengthPercentage::from_points(52.0),
@@ -416,6 +494,32 @@ fn fixed_background_positioning_uses_viewport_and_ignores_origin() {
     assert_eq!(
         background_positioning_area_for_layer(border_area, Some(viewport), false, &style, &layer,),
         PaintBackgroundArea::new(PaintPoint::new(110.0, 60.0), PaintSize::new(60.0, 40.0),),
+    );
+}
+
+#[test]
+fn fixed_background_page_margin_box_uses_full_page_size_not_page_area() {
+    let page_context = PageContext {
+        size: PageSize::from_points(500.0, 700.0),
+        margins: PageMargins::from_points(40.0, 50.0, 60.0, 70.0),
+        edges: PageBoxEdges::ZERO,
+        rotation: 0,
+    };
+
+    let page_local = fixed_background_page_margin_box(PaintPoint::new(0.0, 0.0), page_context.size);
+    assert_eq!(
+        page_local,
+        PaintBackgroundArea::new(PaintPoint::new(0.0, 0.0), PaintSize::new(500.0, 700.0)),
+    );
+
+    let canvas =
+        fixed_background_page_margin_box(DocumentCanvasPoint::new(0.0, 1_400.0), page_context.size);
+    assert_eq!(
+        canvas,
+        DocumentCanvasBackgroundArea::new(
+            DocumentCanvasPoint::new(0.0, 1_400.0),
+            DocumentCanvasSize::new(500.0, 700.0),
+        ),
     );
 }
 

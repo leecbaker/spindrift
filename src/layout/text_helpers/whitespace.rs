@@ -198,8 +198,8 @@ pub(in crate::layout) fn collect_pre_wrap_inline_text(node: &Node, output: &mut 
 
 /// Private marker used while collecting HTML `<br>` boundaries.
 ///
-/// U+000B is an authored Unicode control character and CSS Text requires it
-/// to remain visible, so it cannot also be Quire's internal break sentinel.
+/// U+000B is an authored Unicode control character with UAX #14 mandatory
+/// break semantics, so it cannot also be Quire's internal break sentinel.
 /// U+FDD0 is a noncharacter and never arises from normal HTML/CSS text input.
 /// <https://drafts.csswg.org/css-text-3/#white-space-processing>
 pub(in crate::layout) const INLINE_BREAK: char = '\u{FDD0}';

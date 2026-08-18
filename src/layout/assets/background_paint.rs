@@ -270,27 +270,51 @@ fn background_image_primitives_for_style_impl(
         let padding_clip_for_phase = (collect_border_disjoint_phase_eligibility
             && layer.clip == css::BackgroundBox::Border
             && has_opaque_square_normal_border(style))
-        .then(|| background_paint_area_for_box(clip_border_area, style, css::BackgroundBox::Padding));
-        let color_image = match layer.image.as_image().map(BackgroundImage::selected_image) {
+        .then(|| {
+            background_paint_area_for_box(clip_border_area, style, css::BackgroundBox::Padding)
+        });
+        let selected_for_source = layer.image.as_image().map(BackgroundImage::selected_image);
+        let image_function_source =
+            matches!(selected_for_source, Some(BackgroundImage::ImageFunction(_))).then(|| {
+                resolve_css_image_source(
+                    selected_for_source.expect("selected image is present"),
+                    ImageResolutionContext {
+                        base_url: fallback_base_url,
+                        root_url: fallback_root_url,
+                        current_color: style.color,
+                        orientation: crate::layout::asset_helpers::raster_orientation_policy(
+                            style.image_orientation,
+                        ),
+                        svg_context: crate::svg::SvgImageContext::from_used_color_scheme(
+                            style.used_color_scheme,
+                        ),
+                        resource_cache,
+                    },
+                )
+            });
+        let color_image = match selected_for_source {
             Some(BackgroundImage::CssColor(color)) => Some(color.resolve(style.color)),
-            _ => None,
+            _ => match image_function_source.as_ref() {
+                Some(ResolvedCssImage::SolidColor(color)) => Some(*color),
+                _ => None,
+            },
         };
-        if let Some(BackgroundImage::Url {
-            src,
-            base_url,
-            root_url,
-            request_modifiers,
-        }) = layer.image.as_image().map(BackgroundImage::selected_image)
-            && let Some(ResolvedImageAsset::Svg(asset)) = load_resolved_image_source_with_request(
-                src,
-                base_url.as_ref().or(fallback_base_url),
-                root_url.as_ref().or(fallback_root_url),
+        let svg_asset = match selected_for_source {
+            Some(BackgroundImage::Url(url)) => load_resolved_image_source_with_request(
+                &url.href,
+                url.base_url.as_ref().or(fallback_base_url),
+                url.root_url.as_ref().or(fallback_root_url),
                 resource_cache,
-                raster_image_interpolation(style),
+                crate::layout::asset_helpers::raster_orientation_policy(style.image_orientation),
                 crate::svg::SvgImageContext::from_used_color_scheme(style.used_color_scheme),
-                request_modifiers,
-            )
-        {
+                &url.request_modifiers,
+            ),
+            _ => match image_function_source.as_ref() {
+                Some(ResolvedCssImage::External(asset)) => Some(asset.clone()),
+                _ => None,
+            },
+        };
+        if let Some(ResolvedImageAsset::Svg(asset)) = svg_asset {
             let image_size = used_svg_background_layer_size(&asset, layer, positioning_area.size());
             if image_size.width <= 0.0 || image_size.height <= 0.0 {
                 phase_eligibility.disqualify();
@@ -449,13 +473,14 @@ fn background_image_primitives_for_style_impl(
         else {
             continue;
         };
-        let generated_image = matches!(
-            selected_image,
-            BackgroundImage::LinearGradient(_)
-                | BackgroundImage::RadialGradient(_)
-                | BackgroundImage::ConicGradient(_)
-                | BackgroundImage::CssColor(_)
-        );
+        let generated_image = color_image.is_some()
+            || matches!(
+                selected_image,
+                BackgroundImage::LinearGradient(_)
+                    | BackgroundImage::RadialGradient(_)
+                    | BackgroundImage::ConicGradient(_)
+                    | BackgroundImage::CssColor(_)
+            );
         // Generated CSS images have no intrinsic dimensions, so their used
         // background size is known before a raster recipe exists. This is the
         // key ordering required by CSS Backgrounds: raster fallbacks are made
@@ -468,7 +493,9 @@ fn background_image_primitives_for_style_impl(
                     fallback_base_url,
                     fallback_root_url,
                     resource_cache,
-                    style.image_orientation == css::ImageOrientation::FromImage,
+                    crate::layout::asset_helpers::raster_orientation_policy(
+                        style.image_orientation,
+                    ),
                     style.color,
                 )
             })
@@ -561,7 +588,7 @@ fn background_image_primitives_for_style_impl(
                 fallback_base_url,
                 fallback_root_url,
                 resource_cache,
-                style.image_orientation == css::ImageOrientation::FromImage,
+                crate::layout::asset_helpers::raster_orientation_policy(style.image_orientation),
                 style.color,
             )
         }) else {
@@ -639,13 +666,14 @@ fn background_image_primitives_for_style_impl(
                     PaintSize::new(step_width, step_height),
                     PaintPoint::new(origin_x, origin_y),
                 ),
-                decoded.pixel_width,
-                decoded.pixel_height,
-                raster_image_interpolation(style),
+                decoded.pixel_size.width,
+                decoded.pixel_size.height,
+                raster_image_sampling(style),
                 decoded.rgb.shared(),
                 decoded.alpha.clone(),
             )
             .with_raster_color_space(decoded.color_space.clone())
+            .with_source_rect(decoded.source_rect)
             .with_image_id(decoded.image_id);
             if let Some(clip) = tile.rounded_clip.clone() {
                 pattern = pattern.with_clip(clip);
@@ -657,10 +685,10 @@ fn background_image_primitives_for_style_impl(
             let image = RenderedImage::from_paint_rect(
                 tile_area.paint_rect(),
                 true,
-                decoded.pixel_width,
-                decoded.pixel_height,
-                None,
-                raster_image_interpolation(style),
+                decoded.pixel_size.width,
+                decoded.pixel_size.height,
+                decoded.source_rect,
+                raster_image_sampling(style),
                 decoded.rgb.shared(),
                 decoded.alpha.clone(),
                 None,
@@ -702,16 +730,24 @@ fn finite_no_repeat_tile_is_inside(
         && tile_y + f64::from(tile.size.height) <= f64::from(padding.y() + padding.height())
 }
 
-/// Select the PDF sampling hint for a raster CSS background image.
+/// Retain the selected CSS raster-sampling behavior until PDF preparation.
 ///
-/// CSS Images leaves `image-rendering: auto`'s concrete algorithm to the user
-/// agent. Quire's normal replaced-image painter emits a non-interpolating PDF
-/// image for that default; background images use the same policy so one source
-/// has identical sampling at the same used CSS size. `pixelated` likewise
-/// forbids interpolation.
+/// CSS Images applies `image-rendering` to decorative images as well as
+/// replaced content. The final sampling operation cannot be chosen here: an
+/// object-fit adjustment or a pattern tile can still change its used size.
 /// <https://drafts.csswg.org/css-images-4/#propdef-image-rendering>
-pub(in crate::layout) fn raster_image_interpolation(_style: &ComputedStyle) -> bool {
-    false
+pub(in crate::layout) fn raster_image_sampling(
+    style: &ComputedStyle,
+) -> crate::document::paint::images::RasterSampling {
+    use crate::document::paint::images::RasterSampling;
+
+    match style.image_rendering {
+        css::ImageRendering::Auto => RasterSampling::Auto,
+        css::ImageRendering::Smooth => RasterSampling::Smooth,
+        css::ImageRendering::HighQuality => RasterSampling::HighQuality,
+        css::ImageRendering::Pixelated => RasterSampling::Pixelated,
+        css::ImageRendering::CrispEdges => RasterSampling::CrispEdges,
+    }
 }
 
 fn used_svg_background_layer_size(
@@ -873,8 +909,8 @@ pub(in crate::layout) fn opaque_uniform_raster_color(
         return resource_cache
             .with_rasterized_image(image_id, |raster| {
                 opaque_uniform_raster_samples_color(
-                    raster.metadata.pixel_width,
-                    raster.metadata.pixel_height,
+                    raster.metadata.pixel_size.width,
+                    raster.metadata.pixel_size.height,
                     &raster.rgb,
                     raster.alpha.as_deref(),
                     &raster.color_space,
@@ -883,8 +919,8 @@ pub(in crate::layout) fn opaque_uniform_raster_color(
             .flatten();
     }
     opaque_uniform_raster_samples_color(
-        decoded.pixel_width,
-        decoded.pixel_height,
+        decoded.pixel_size.width,
+        decoded.pixel_size.height,
         &decoded.rgb,
         decoded.alpha.as_deref(),
         &decoded.color_space,
@@ -1788,9 +1824,13 @@ fn uniform_gradient_color(image: &BackgroundImage, current_color: CssColor) -> O
                 .collect::<Vec<_>>(),
             gradient.interpolation,
         ),
+        BackgroundImage::LightDark(_) => {
+            unreachable!("light-dark() must resolve before background paint")
+        }
         BackgroundImage::ImageSet(_)
         | BackgroundImage::SelectedImageSet { .. }
-        | BackgroundImage::Url { .. }
+        | BackgroundImage::Url(_)
+        | BackgroundImage::ImageFunction(_)
         | BackgroundImage::CssColor(_) => {
             return None;
         }
@@ -1853,10 +1893,13 @@ pub(in crate::layout) fn uniform_gradient_stop_color(
 /// <https://www.w3.org/TR/css-images-3/#radial-gradients>
 fn background_image_can_use_pdf_pattern(image: &BackgroundImage) -> bool {
     let stops = match image.selected_image() {
+        BackgroundImage::LightDark(_) => {
+            unreachable!("light-dark() must resolve before background paint")
+        }
         BackgroundImage::ImageSet(_) | BackgroundImage::SelectedImageSet { .. } => {
             unreachable!("selected image-set source is unwrapped")
         }
-        BackgroundImage::Url { .. } => return true,
+        BackgroundImage::Url(_) | BackgroundImage::ImageFunction(_) => return true,
         BackgroundImage::LinearGradient(gradient) => &gradient.stops,
         BackgroundImage::RadialGradient(gradient) => &gradient.stops,
         BackgroundImage::ConicGradient(_) => return false,
@@ -1873,26 +1916,41 @@ fn background_layer_decoded_image(
     fallback_base_url: Option<&url::Url>,
     fallback_root_url: Option<&url::Url>,
     resource_cache: &ResourceCache,
-    apply_orientation: bool,
+    orientation_policy: crate::image_store::RasterOrientationPolicy,
     current_color: CssColor,
 ) -> Option<DecodedPngImage> {
     match layer.image.as_image()?.selected_image() {
+        BackgroundImage::LightDark(_) => {
+            unreachable!("light-dark() must resolve before background paint")
+        }
         BackgroundImage::ImageSet(_) | BackgroundImage::SelectedImageSet { .. } => {
             unreachable!("selected image-set source is unwrapped")
         }
-        BackgroundImage::Url {
-            src,
-            base_url,
-            root_url,
-            request_modifiers,
-        } => load_image_source_with_request(
-            src.as_str(),
-            base_url.as_ref().or(fallback_base_url),
-            root_url.as_ref().or(fallback_root_url),
+        BackgroundImage::Url(url) => load_image_source_with_request(
+            &url.href,
+            url.base_url.as_ref().or(fallback_base_url),
+            url.root_url.as_ref().or(fallback_root_url),
             resource_cache,
-            apply_orientation,
-            request_modifiers,
+            orientation_policy,
+            &url.request_modifiers,
         ),
+        BackgroundImage::ImageFunction(_) => match resolve_css_image_source(
+            layer.image.as_image()?.selected_image(),
+            ImageResolutionContext {
+                base_url: fallback_base_url,
+                root_url: fallback_root_url,
+                current_color,
+                orientation: orientation_policy,
+                svg_context: crate::svg::SvgImageContext::default(),
+                resource_cache,
+            },
+        ) {
+            ResolvedCssImage::External(ResolvedImageAsset::Raster(image)) => Some(image),
+            ResolvedCssImage::SolidColor(color) => Some(solid_color_image(color)),
+            ResolvedCssImage::External(ResolvedImageAsset::Svg(_)) | ResolvedCssImage::Invalid => {
+                None
+            }
+        },
         BackgroundImage::LinearGradient(gradient) => {
             generated_linear_gradient_image(gradient, size, resource_cache, current_color)
         }
@@ -1915,22 +1973,37 @@ pub(in crate::layout) fn rasterize_generated_css_image(
     resource_cache: &ResourceCache,
 ) -> Option<DecodedPngImage> {
     match image.selected_image() {
+        BackgroundImage::LightDark(_) => {
+            unreachable!("light-dark() must resolve before background paint")
+        }
         BackgroundImage::ImageSet(_) | BackgroundImage::SelectedImageSet { .. } => {
             unreachable!("selected image-set source is unwrapped")
         }
-        BackgroundImage::Url {
-            src,
-            base_url,
-            root_url,
-            request_modifiers,
-        } => load_image_source_with_request(
-            src.as_str(),
-            base_url.as_ref().or(fallback_base_url),
-            root_url.as_ref().or(fallback_root_url),
+        BackgroundImage::Url(url) => load_image_source_with_request(
+            &url.href,
+            url.base_url.as_ref().or(fallback_base_url),
+            url.root_url.as_ref().or(fallback_root_url),
             resource_cache,
-            true,
-            request_modifiers,
+            crate::image_store::RasterOrientationPolicy::FromImage,
+            &url.request_modifiers,
         ),
+        BackgroundImage::ImageFunction(_) => match resolve_css_image_source(
+            image,
+            ImageResolutionContext {
+                base_url: fallback_base_url,
+                root_url: fallback_root_url,
+                current_color,
+                orientation: crate::image_store::RasterOrientationPolicy::FromImage,
+                svg_context: crate::svg::SvgImageContext::default(),
+                resource_cache,
+            },
+        ) {
+            ResolvedCssImage::External(ResolvedImageAsset::Raster(image)) => Some(image),
+            ResolvedCssImage::SolidColor(color) => Some(solid_color_image(color)),
+            ResolvedCssImage::External(ResolvedImageAsset::Svg(_)) | ResolvedCssImage::Invalid => {
+                None
+            }
+        },
         BackgroundImage::LinearGradient(gradient) => {
             generated_linear_gradient_image(gradient, size, resource_cache, current_color)
         }

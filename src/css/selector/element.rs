@@ -1,7 +1,9 @@
 use super::{CssAtom, CssString, QuirePseudoClass, QuirePseudoElement, QuireSelectorImpl};
 use super::{language_from_attrs, language_matches_any_range};
 use crate::css::html_form_state;
-use crate::css::types::{Direction, ElementSignature, ResolvedLanguage};
+use crate::css::types::{
+    ContentLanguage, Direction, ElementSignature, LinkState, ResolvedLanguage,
+};
 use selectors::attr::{AttrSelectorOperation, CaseSensitivity, NamespaceConstraint};
 use selectors::context::MatchingContext;
 use selectors::matching::ElementSelectorFlags;
@@ -35,11 +37,26 @@ pub(in crate::css) fn element_namespace_matches(
 pub(in crate::css) struct StyleElement<'a> {
     pub(in crate::css) chain: Rc<Vec<Cow<'a, ElementSignature>>>,
     pub(in crate::css) index: usize,
+    pub(in crate::css) link_matching: LinkMatching,
+}
+
+/// Which link-state view a cascade selector match observes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::css) enum LinkMatching {
+    Actual,
+    ForceUnvisited,
 }
 
 impl StyleElement<'_> {
     pub(in crate::css) fn signature(&self) -> &ElementSignature {
         &self.chain[self.index]
+    }
+
+    fn link_state(&self) -> LinkState {
+        match self.link_matching {
+            LinkMatching::Actual => self.signature().link_state,
+            LinkMatching::ForceUnvisited => LinkState::Unvisited,
+        }
     }
 
     pub(in crate::css) fn sibling_element_at(&self, sibling_index: usize) -> Option<Self> {
@@ -49,6 +66,7 @@ impl StyleElement<'_> {
         Some(Self {
             chain: Rc::new(chain),
             index: self.index,
+            link_matching: self.link_matching,
         })
     }
 
@@ -65,6 +83,7 @@ impl StyleElement<'_> {
         Some(Self {
             chain: Rc::new(chain),
             index,
+            link_matching: self.link_matching,
         })
     }
 
@@ -99,7 +118,7 @@ impl StyleElement<'_> {
         }
         self.parent_element()
             .map(|parent| parent.language())
-            .unwrap_or(ResolvedLanguage::Unknown)
+            .unwrap_or(ResolvedLanguage::Resolved(ContentLanguage::Unknown))
     }
 
     pub(in crate::css) fn is_disabled(&self) -> bool {
@@ -269,7 +288,7 @@ impl StyleElement<'_> {
                     parent.opaque() == fieldset.opaque()
                         && parent
                             .signature()
-                            .child_signatures
+                            .children
                             .iter()
                             .find(|child| child.tag == "legend")
                             .is_some_and(|legend| legend.opaque_id == element.signature().opaque_id)
@@ -321,6 +340,7 @@ impl SelectorElement for StyleElement<'_> {
         (self.index > 0).then(|| Self {
             chain: Rc::clone(&self.chain),
             index: self.index - 1,
+            link_matching: self.link_matching,
         })
     }
 
@@ -410,15 +430,9 @@ impl SelectorElement for StyleElement<'_> {
         _context: &mut MatchingContext<QuireSelectorImpl>,
     ) -> bool {
         match pc {
-            QuirePseudoClass::AnyLink | QuirePseudoClass::Link => self.is_link(),
-            // Quire has no user navigation history. Model that deterministic,
-            // privacy-preserving environment by making every hyperlink
-            // unvisited rather than inventing visit state.
-            //
-            // Selectors Level 4 permits user agents to have `:visited` never
-            // match for privacy; then hyperlinks match `:link` instead:
-            // <https://drafts.csswg.org/selectors/#link>
-            QuirePseudoClass::Visited => false,
+            QuirePseudoClass::AnyLink => self.is_link(),
+            QuirePseudoClass::Link => self.is_link() && self.link_state() == LinkState::Unvisited,
+            QuirePseudoClass::Visited => self.is_link() && self.link_state() == LinkState::Visited,
             QuirePseudoClass::Dir(direction) => self.directionality() == Some(*direction),
             QuirePseudoClass::Lang(ranges) => language_matches_any_range(&self.language(), ranges),
             QuirePseudoClass::StaticFalse(_) => false,
@@ -500,7 +514,7 @@ impl SelectorElement for StyleElement<'_> {
     }
 
     fn is_empty(&self) -> bool {
-        !self.signature().has_text_child && self.signature().child_signatures.is_empty()
+        !self.signature().has_text_child && self.signature().children.is_empty()
     }
 
     fn is_root(&self) -> bool {

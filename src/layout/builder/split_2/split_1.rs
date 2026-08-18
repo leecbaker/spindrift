@@ -27,7 +27,23 @@ impl<'a> LayoutBuilder<'a> {
             first_page_declarations.extend(stylesheet.first_page_declarations.clone());
             page_rules.extend(stylesheet.page_rules.clone());
             for counter_style in &stylesheet.counter_styles {
-                counter_styles.insert(counter_style.name.clone(), counter_style.clone());
+                // The six non-overridable predefined styles always use their
+                // UA definitions. Other predefined styles may be overridden
+                // by later author stylesheets, including the HTML `type`
+                // presentational hints that name lower-roman and friends.
+                // <https://drafts.csswg.org/css-counter-styles-3/#counter-style-name>
+                let non_overridable = matches!(
+                    counter_style.name.as_str(),
+                    "decimal"
+                        | "disc"
+                        | "square"
+                        | "circle"
+                        | "disclosure-open"
+                        | "disclosure-closed"
+                );
+                if !non_overridable || !counter_styles.contains_key(&counter_style.name) {
+                    counter_styles.insert(counter_style.name.clone(), counter_style.clone());
+                }
             }
         }
         let page_context = PageContext::from_options(config.options);
@@ -50,6 +66,7 @@ impl<'a> LayoutBuilder<'a> {
             suppressed_named_strings_before: HashMap::new(),
             suppressed_named_strings_after: HashMap::new(),
             page_anchors: HashMap::new(),
+            page_anchor_source_positions: HashMap::new(),
             page_anchor_text: HashMap::new(),
             page_anchor_counters: HashMap::new(),
             target_references: config.target_references,
@@ -102,6 +119,7 @@ impl<'a> LayoutBuilder<'a> {
             principal_body_block_end_inset: layout_pt(0.0),
             root_principal_flow_context: RootPrincipalFlowContext::default(),
             root_pseudo_block_projection: None,
+            direct_block_layout_constraint: None,
             inline_split_float_exclusion_query_offset: RelativeOffset::zero(),
             content_logical_inline_size_stack: Vec::new(),
             container_unit_contexts: Vec::new(),
@@ -112,7 +130,7 @@ impl<'a> LayoutBuilder<'a> {
             clamp_line_slot_captures: Vec::new(),
             positioned_inline_layout_suppression_depth: 0,
             last_in_flow_line_baseline_y: None,
-            pending_outside_marker_anchors: Vec::new(),
+            pending_outside_marker_anchors: PendingOutsideMarkerAnchors::default(),
             block_static_position_y_offset: None,
             absolute_static_position: None,
             grid_positioning_scopes: Vec::new(),
@@ -129,10 +147,11 @@ impl<'a> LayoutBuilder<'a> {
                 text_orientation: TextOrientation::Mixed,
                 source: PrincipalFlowSource::Root,
             },
+            fragmentainer_transition_recorders: Vec::new(),
             fragment_top_offsets: Vec::new(),
             child_available_space_stack: Vec::new(),
             normal_flow_relative_containing_blocks: Vec::new(),
-            block_static_position_contexts: Vec::new(),
+            static_position_containing_blocks: Vec::new(),
             definite_block_size_stack: Vec::new(),
             replayed_flex_item_percentage_height_bases: Vec::new(),
             table_wrapper_block_size_overrides: Vec::new(),
@@ -140,6 +159,7 @@ impl<'a> LayoutBuilder<'a> {
             truncate_page_start_margins: false,
             avoid_inside_retry_depth: 0,
             out_of_flow_prebreak_suppression_depth: 0,
+            layout_pass_kind: LayoutPassKind::Normal,
             element_side_effect_suppression_depth: 0,
             containing_blocks: Vec::new(),
             fixed_containing_blocks: Vec::new(),
@@ -163,11 +183,13 @@ impl<'a> LayoutBuilder<'a> {
             root_metric_state: RootMetricState::Bootstrapping,
             root_metrics_require_selected_font: false,
             font_system: Box::new(config.font_system),
+            autospace_items_scratch: Vec::new(),
             bookmarks: Vec::new(),
             positioned_layers: Vec::new(),
             committed_positioned_paint_identities: HashSet::new(),
             positioned_paint_transaction_depth: 0,
             positioned_scratch_page_limit: None,
+            positioned_scratch_page_origin: None,
             fixed_layers: Vec::new(),
             deferred_multicol_positioned_children: Vec::new(),
             multicol_positioned_containing_block_spans: Vec::new(),
@@ -185,11 +207,9 @@ impl<'a> LayoutBuilder<'a> {
             adjoining_float_origin_y: None,
             pending_paint_fragments: Vec::new(),
             pending_page_side_effects: Vec::new(),
-            applied_clearance_count: 0,
             float_paint_capture_depth: 0,
             preserve_scoped_paint_public_order: false,
             defer_next_block_decoration_promotion: false,
-            suppress_next_principal_box_decoration: false,
         };
         builder.rebuild_empty_current_page_context();
         builder.initial_viewport_context = builder.current_page_context;
@@ -465,23 +485,6 @@ impl<'a> LayoutBuilder<'a> {
                 || style.requires_ch_advance()
                 || pseudo_requires_parent_ch,
         );
-        // The selected `ch` metric is the existing horizontal basis except
-        // where vertical upright text supplies a distinct vertical advance.
-        // Keep the fallback selected for the style intact: the font fallback
-        // is part of CSS's `ch` definition when the selected face cannot
-        // provide the relevant advance.
-        let horizontal_ch_advance = ch_advance;
-        let vertical_ch_advance = matches!(
-            style.text_layout_policy(),
-            css::TextLayoutPolicy::Vertical(css::TextOrientation::Upright)
-        )
-        .then_some(ch_advance)
-        .unwrap_or(horizontal_ch_advance);
-        style.resolve_font_metric_lengths_with_box_axes(
-            ch_advance,
-            horizontal_ch_advance,
-            vertical_ch_advance,
-        );
         // A selected-font metric lookup interns that font in the document.
         // Do not perform one for an otherwise metric-free style: an empty
         // block with the initial `normal` line-height must not retain a font.
@@ -496,34 +499,26 @@ impl<'a> LayoutBuilder<'a> {
         } else {
             css::fallback_ch_advance_for_style(style)
         };
-        let horizontal_ic_advance = if requires_selected_font_metrics {
-            self.font_system.horizontal_ic_advance_for_style(style)
-        } else {
-            ic_advance
-        };
-        let vertical_ic_advance = matches!(
-            style.text_layout_policy(),
-            css::TextLayoutPolicy::Vertical(_)
-        )
-        .then_some(ic_advance)
-        .unwrap_or(horizontal_ic_advance);
-        style.resolve_ic_relative_lengths_with_box_axes(
-            ic_advance,
-            horizontal_ic_advance,
-            vertical_ic_advance,
-        );
         let x_height = if requires_selected_font_metrics {
             self.font_system.used_x_height_for_style(style).points()
         } else {
             style.font_size * 0.5
         };
-        style.resolve_ex_relative_lengths(x_height);
         let cap_height = if requires_selected_font_metrics {
             self.font_system.used_cap_height_for_style(style).points()
         } else {
             style.font_size * 0.7
         };
-        style.resolve_cap_relative_lengths(cap_height);
+        style.resolve_selected_font_metric_lengths(css::SelectedFontMetricLengthBasis::new(
+            ch_advance,
+            ic_advance,
+            layout_pt(x_height),
+            layout_pt(cap_height),
+        ));
+        if let RootMetricState::Resolved(root_metrics) = self.root_metric_state {
+            style.root_font_size = root_metrics.basis().font_size.points();
+            style.resolve_root_font_metric_lengths(root_metrics.basis());
+        }
         style.resolve_line_height_relative_lengths();
         if establishes_root_metrics {
             root_metrics.establish(ResolvedRootFontMetrics::measured_for_document_root(
@@ -543,9 +538,11 @@ impl<'a> LayoutBuilder<'a> {
         if box_edges_require_ch_advance {
             synchronize_resolved_fixed_box_edge_cache(style);
         }
+        style.rebuild_own_text_decoration_layer();
         let font_metrics =
             css::FontRelativeLengthBasis::new(layout_pt(style.font_size), ch_advance)
-                .with_selected_font_metrics(layout_pt(x_height), layout_pt(cap_height), ic_advance);
+                .with_selected_font_metrics(layout_pt(x_height), layout_pt(cap_height), ic_advance)
+                .with_line_height(layout_pt(style.line_height));
         if let Some(style) = &mut style.marker_style {
             self.resolve_deferred_font_metrics_in_style(style, font_metrics, root_metrics);
         }
@@ -559,6 +556,12 @@ impl<'a> LayoutBuilder<'a> {
             self.resolve_deferred_font_metrics_in_style(style, font_metrics, root_metrics);
         }
         if let Some(style) = &mut style.first_letter_style {
+            self.resolve_deferred_font_metrics_in_style(style, font_metrics, root_metrics);
+        }
+        if let Some(style) = &mut style.footnote_call_style {
+            self.resolve_deferred_font_metrics_in_style(style, font_metrics, root_metrics);
+        }
+        if let Some(style) = &mut style.footnote_marker_style {
             self.resolve_deferred_font_metrics_in_style(style, font_metrics, root_metrics);
         }
         // All font-, root-font-, viewport-, and selected-font-metric terms
@@ -693,6 +696,7 @@ impl<'a> LayoutBuilder<'a> {
         let ic_advance = self.font_system.ic_advance_for_style(style);
         css::FontRelativeLengthBasis::new(layout_pt(style.font_size), ch_advance)
             .with_selected_font_metrics(x_height, cap_height, ic_advance)
+            .with_line_height(layout_pt(style.line_height))
     }
 
     /// Finds root-relative selected-font units before resolving the root
@@ -1028,7 +1032,7 @@ impl<'a> LayoutBuilder<'a> {
 
     pub(in crate::layout) fn style_with_current_viewport_lengths(
         &self,
-        style: &ComputedStyle,
+        style: &impl css::CascadedStyleSource,
     ) -> css::ZoomedLayoutStyle {
         let mut style = css::LayoutStyle::from_computed(style);
         self.resolve_style_current_viewport_lengths(&mut style);
@@ -1037,7 +1041,7 @@ impl<'a> LayoutBuilder<'a> {
 
     pub(in crate::layout) fn style_with_current_used_lengths(
         &mut self,
-        style: &ComputedStyle,
+        style: &impl css::CascadedStyleSource,
     ) -> css::ZoomedLayoutStyle {
         let mut style = css::LayoutStyle::from_computed(style);
         self.resolve_style_current_viewport_lengths(&mut style);
@@ -1074,7 +1078,7 @@ impl<'a> LayoutBuilder<'a> {
         // <https://www.w3.org/TR/css-values-4/#viewport-relative-lengths>
         let viewport = self
             .iframe_viewport
-            .map(PageSize::layout_size)
+            .map(|context| context.viewport.layout_size())
             .unwrap_or_else(|| {
                 LayoutSize::new(
                     self.initial_viewport_context.area_width(),
@@ -1255,9 +1259,10 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &'b Element,
         stylesheets: &Stylesheets<'_>,
-        parent_style: &ComputedStyle,
+        parent_style: &impl css::CascadedStyleSource,
         ancestors: &[ElementSignature],
     ) -> Vec<box_tree::FrozenFormattingBox<'b>> {
+        let parent_style = css::CascadedStyleSource::cascaded_style(parent_style);
         let mut child_boxes = box_tree::build_child_boxes_with_font_metrics(
             element,
             stylesheets,
@@ -1275,15 +1280,24 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &'b Element,
         stylesheets: &Stylesheets<'_>,
-        parent_style: &ComputedStyle,
+        parent_style: &impl css::CascadedStyleSource,
     ) -> Vec<box_tree::FrozenFormattingBox<'b>> {
-        let ancestors = self.ancestors.clone();
-        self.build_frozen_child_boxes_with_font_metrics(
-            element,
-            stylesheets,
-            parent_style,
-            &ancestors,
-        )
+        let parent_style = css::CascadedStyleSource::cascaded_style(parent_style);
+        let mut child_boxes = {
+            let ancestors = &self.ancestors;
+            let font_system = &mut self.font_system;
+            box_tree::build_child_boxes_with_font_metrics(
+                element,
+                stylesheets,
+                parent_style,
+                ancestors,
+                font_system,
+            )
+        };
+        for child in &mut child_boxes {
+            self.resolve_font_metric_lengths_in_box(child);
+        }
+        box_tree::freeze_child_boxes(child_boxes)
     }
 
     pub(in crate::layout) fn resolve_style_font_metric_lengths(
@@ -1310,7 +1324,6 @@ impl<'a> LayoutBuilder<'a> {
             style,
             style.requires_ch_advance() || pseudo_requires_parent_ch,
         );
-        style.resolve_font_metric_lengths(ch_advance);
         // Styles created during layout (notably positioned descendants) pass
         // through this late resolution path. Resolve every selected-font box
         // metric here, not only `ch`, so their used sizes agree with styles
@@ -1322,22 +1335,31 @@ impl<'a> LayoutBuilder<'a> {
         } else {
             css::fallback_ch_advance_for_style(style)
         };
-        style.resolve_ic_relative_lengths(ic_advance);
         let x_height = if requires_selected_font_metrics {
             self.font_system.used_x_height_for_style(style).points()
         } else {
             style.font_size * 0.5
         };
-        style.resolve_ex_relative_lengths(x_height);
         let cap_height = if requires_selected_font_metrics {
             self.font_system.used_cap_height_for_style(style).points()
         } else {
             style.font_size * 0.7
         };
-        style.resolve_cap_relative_lengths(cap_height);
+        style.resolve_selected_font_metric_lengths(css::SelectedFontMetricLengthBasis::new(
+            ch_advance,
+            ic_advance,
+            layout_pt(x_height),
+            layout_pt(cap_height),
+        ));
+        if let RootMetricState::Resolved(root_metrics) = self.root_metric_state {
+            style.root_font_size = root_metrics.basis().font_size.points();
+            style.resolve_root_font_metric_lengths(root_metrics.basis());
+        }
+        style.resolve_line_height_relative_lengths();
         if box_edges_require_ch_advance {
             synchronize_resolved_fixed_box_edge_cache(style);
         }
+        style.rebuild_own_text_decoration_layer();
         if let Some(style) = &mut style.marker_style {
             self.resolve_style_font_metric_lengths(style);
         }
@@ -1353,10 +1375,17 @@ impl<'a> LayoutBuilder<'a> {
         if let Some(style) = &mut style.first_letter_style {
             self.resolve_style_font_metric_lengths(style);
         }
+        if let Some(style) = &mut style.footnote_call_style {
+            self.resolve_style_font_metric_lengths(style);
+        }
+        if let Some(style) = &mut style.footnote_marker_style {
+            self.resolve_style_font_metric_lengths(style);
+        }
     }
 
     /// Correct a lazily built descendant's provisional `font-size` once the
-    /// document root has established its selected-font metric snapshot.
+    /// document root has established its used font-size and selected-font
+    /// metric snapshot.
     ///
     /// CSS cascade intentionally retains a deferred font size while a box is
     /// being built. A child constructed after the structural prepass has not
@@ -1365,13 +1394,16 @@ impl<'a> LayoutBuilder<'a> {
     /// parent-sized fallback.
     /// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>
     fn resolve_deferred_root_font_metric_font_size(&mut self, style: &mut ComputedStyle) {
-        if !style.deferred_font_size.requires_root_font_metrics() {
+        if !style.deferred_font_size.requires_root_font_metrics()
+            && !style.deferred_font_size.requires_document_root_font_size()
+        {
             return;
         }
         let RootMetricState::Resolved(root_metrics) = self.root_metric_state else {
-            // The document-root structural pass establishes this state before
-            // ordinary lazy child construction begins.
-            debug_assert!(false, "root-relative font size before root metrics");
+            // The structural traversal has not yet reached the document root's
+            // used font-size boundary. The bootstrap path intentionally uses
+            // the CSS initial root fallback; the normal recursive pass will
+            // revisit this descendant after establishing the snapshot.
             return;
         };
         let provisional_parent_font_size = style.font_size;
@@ -1441,6 +1473,7 @@ impl<'a> LayoutBuilder<'a> {
         if box_edges_require_ch_advance {
             synchronize_resolved_fixed_box_edge_cache(style);
         }
+        style.rebuild_own_text_decoration_layer();
         if let Some(style) = &mut style.marker_style {
             self.resolve_style_font_metric_lengths(style);
         }
@@ -1454,6 +1487,12 @@ impl<'a> LayoutBuilder<'a> {
             self.resolve_style_font_metric_lengths(style);
         }
         if let Some(style) = &mut style.first_letter_style {
+            self.resolve_style_font_metric_lengths(style);
+        }
+        if let Some(style) = &mut style.footnote_call_style {
+            self.resolve_style_font_metric_lengths(style);
+        }
+        if let Some(style) = &mut style.footnote_marker_style {
             self.resolve_style_font_metric_lengths(style);
         }
     }
@@ -1485,29 +1524,30 @@ impl<'a> LayoutBuilder<'a> {
     ) -> ComputedStyle {
         let inheritance_source = parent.cloned().unwrap_or_else(ComputedStyle::initial);
         let mut parent_ch_advance = css::fallback_ch_advance_for_style(&inheritance_source);
-        let mut style = style_for_layout_element_with_parent_ch_advance(
-            element,
+        let signature = layout_element_signature(element, signature, parent);
+        let inline_style = element.attrs.get("style").map(String::as_str);
+        let mut style = style_for_layout_signature_with_parent_ch_advance(
             signature.clone(),
+            inline_style,
             stylesheets,
             parent,
             ancestors,
-            parent_ch_advance,
+            Some(parent_ch_advance),
         );
         if style
             .deferred_font_size
             .requires_parent_ch_advance(inheritance_source.font_size)
         {
             parent_ch_advance = self.font_system.ch_advance(&inheritance_source);
-            style = style_for_layout_element_with_parent_ch_advance(
-                element,
+            style = style_for_layout_signature_with_parent_ch_advance(
                 signature.clone(),
+                inline_style,
                 stylesheets,
                 parent,
                 ancestors,
-                parent_ch_advance,
+                Some(parent_ch_advance),
             );
         }
-        let signature = layout_element_signature(element, signature, parent);
         let pseudo_parent_ch_advance = css::fallback_ch_advance_for_style(&style);
         css::apply_pseudo_rules_with_parent_ch_advance(
             &mut style,
@@ -1527,6 +1567,8 @@ impl<'a> LayoutBuilder<'a> {
             );
         }
         self.resolve_deferred_parent_font_metric_font_size(&mut style, &inheritance_source);
+        self.resolve_deferred_root_font_metric_font_size(&mut style);
+        self.resolve_style_font_metric_lengths(&mut style);
         // Computed styles deliberately do not inherit text-decoration
         // longhands.  At this layout boundary, materialize the decorating
         // ancestors as used-style paint layers instead.  Keeping this after
@@ -1595,6 +1637,8 @@ impl<'a> LayoutBuilder<'a> {
             );
         }
         self.resolve_deferred_parent_font_metric_font_size(&mut style, &inheritance_source);
+        self.resolve_deferred_root_font_metric_font_size(&mut style);
+        self.resolve_style_font_metric_lengths(&mut style);
         style
     }
 
@@ -1761,6 +1805,7 @@ impl<'a> LayoutBuilder<'a> {
                     run_in_children,
                     Some(children),
                     None,
+                    PrincipalBoxPaintMode::RootPaints,
                 );
             }
         }
@@ -1810,6 +1855,7 @@ impl<'a> LayoutBuilder<'a> {
                     &[],
                     Some(children),
                     Some(fragment),
+                    PrincipalBoxPaintMode::RootPaints,
                 );
             }
         }
@@ -1826,30 +1872,94 @@ impl<'a> LayoutBuilder<'a> {
         run_in_children: &[box_tree::FormattingBox<'_>],
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
+        principal_box_paint_mode: PrincipalBoxPaintMode,
     ) {
         let counter_scope = self.begin_pseudo_counter_scope(element, source, style);
         self.element_side_effect_suppression_depth += 1;
+        // A sole image in a tree-abiding ::before/::after box is anonymous
+        // replaced content inside that pseudo's decorated box. Keep the
+        // pseudo's authored dimensions for its own background/border while
+        // the image payload retains its zoomed natural size. Principal
+        // `content: <image>` remains a replacement of the element itself.
+        // <https://www.w3.org/TR/css-content-3/#content-property>
+        let mut pseudo_content_style;
+        let style = if matches!(
+            style.content,
+            css::Content::Replacement {
+                image: css::GeneratedContentPart::Image { .. },
+                ..
+            }
+        ) {
+            pseudo_content_style = style.clone();
+            pseudo_content_style.object_fit = css::ObjectFit::None;
+            pseudo_content_style.object_position = css::BackgroundPosition::INITIAL;
+            &pseudo_content_style
+        } else {
+            style
+        };
         let consuming_root_canvas =
             !style.display.is_block_level() && self.begin_root_inline_canvas_continuation(element);
         let previous_root_pseudo_block_projection = self.root_pseudo_block_projection;
-        if element.tag.eq_ignore_ascii_case("html")
-            && style.writing_mode == WritingMode::VerticalLr
-            && self.principal_flow.writing_mode == WritingMode::HorizontalTb
-        {
-            self.root_pseudo_block_projection = Some(RootPseudoBlockProjection {
-                element: element.id,
-                block_start: PhysicalSide::Left,
-                block_end_inset: self.principal_body_block_end_inset,
-            });
+        if element.tag.eq_ignore_ascii_case("html") {
+            self.root_pseudo_block_projection =
+                match (style.writing_mode, self.principal_flow.writing_mode) {
+                    // A root pseudo retains its horizontal computed style, but
+                    // a propagated vertical-lr body establishes the initial
+                    // containing block's used principal flow. Project this one
+                    // direct root child through that flow so the ordinary child
+                    // traversal can advance the horizontal block track before
+                    // entering the body.
+                    // <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
+                    (WritingMode::HorizontalTb, WritingMode::VerticalLr)
+                        if source == box_tree::CounterEventSource::Before =>
+                    {
+                        Some(RootPseudoBlockProjection {
+                            element: element.id,
+                            block_start: PhysicalSide::Left,
+                            block_end_inset: layout_pt(0.0),
+                        })
+                    }
+                    // The inverse projection retains the propagated body's
+                    // physical block-end canvas inset while a vertical root
+                    // pseudo participates in a horizontal principal flow.
+                    (WritingMode::VerticalLr, WritingMode::HorizontalTb) => {
+                        Some(RootPseudoBlockProjection {
+                            element: element.id,
+                            block_start: PhysicalSide::Left,
+                            block_end_inset: self.principal_body_block_end_inset,
+                        })
+                    }
+                    _ => None,
+                };
         }
-        self.layout_element_inner(
+        self.layout_element_inner_with_principal_effect_context(
             element,
             style,
             stylesheets,
             run_in_children,
             child_boxes,
             table_fragment,
+            true,
+            principal_box_paint_mode,
         );
+        if element.tag.eq_ignore_ascii_case("html")
+            && source == box_tree::CounterEventSource::Before
+            && style.writing_mode == WritingMode::HorizontalTb
+            && self.principal_flow.writing_mode == WritingMode::VerticalLr
+        {
+            // The generated root pseudo is laid out directly rather than as a
+            // normal child traversal entry. It therefore must explicitly
+            // consume its committed border-box span and projected logical
+            // block-end margin from the propagated body's horizontal track.
+            // <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
+            let advance = self
+                .last_block_layout_outcome
+                .physical_border_box_inline_span
+                .points()
+                + style.margin.left
+                + style.margin.top;
+            self.content_left = (self.content_left + advance).min(self.content_right);
+        }
         if consuming_root_canvas {
             self.finish_root_inline_canvas_continuation();
         }
@@ -2024,6 +2134,7 @@ impl<'a> LayoutBuilder<'a> {
             child_boxes,
             table_fragment,
             true,
+            PrincipalBoxPaintMode::RootPaints,
         );
     }
 
@@ -2037,6 +2148,7 @@ impl<'a> LayoutBuilder<'a> {
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
         capture_principal_effect_context: bool,
+        principal_box_paint_mode: PrincipalBoxPaintMode,
     ) {
         // Most formatting contexts dispatch principal children directly to
         // this common boundary instead of through `layout_element_box`.
@@ -2135,6 +2247,7 @@ impl<'a> LayoutBuilder<'a> {
                     run_in_children,
                     child_boxes,
                     table_fragment,
+                    principal_box_paint_mode,
                 );
                 let placement = self.final_source_assignment_placement(
                     style,
@@ -2161,6 +2274,7 @@ impl<'a> LayoutBuilder<'a> {
                 child_boxes,
                 table_fragment,
                 capture_principal_effect_context,
+                principal_box_paint_mode,
             );
             let placement = self.final_source_assignment_placement(
                 style,
@@ -2187,6 +2301,7 @@ impl<'a> LayoutBuilder<'a> {
             child_boxes,
             table_fragment,
             capture_principal_effect_context,
+            principal_box_paint_mode,
         );
         if let Some(counter_scope) = counter_scope {
             self.end_counter_scope(counter_scope);

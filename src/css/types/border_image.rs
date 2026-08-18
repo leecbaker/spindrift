@@ -34,8 +34,17 @@ impl BorderImage {
         self.outset.resolve_font_metric_lengths(ch_advance);
     }
 
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        self.width.resolve_root_font_metric_lengths(basis);
+        self.outset.resolve_root_font_metric_lengths(basis);
+    }
+
     pub(crate) fn requires_ch_advance(&self) -> bool {
         self.width.requires_ch_advance() || self.outset.requires_ch_advance()
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        self.width.requires_root_font_metrics() || self.outset.requires_root_font_metrics()
     }
 }
 
@@ -109,11 +118,25 @@ impl BorderImageWidth {
         self.left.resolve_font_metric_lengths(ch_advance);
     }
 
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        self.top.resolve_root_font_metric_lengths(basis);
+        self.right.resolve_root_font_metric_lengths(basis);
+        self.bottom.resolve_root_font_metric_lengths(basis);
+        self.left.resolve_root_font_metric_lengths(basis);
+    }
+
     pub(crate) fn requires_ch_advance(&self) -> bool {
         self.top.requires_ch_advance()
             || self.right.requires_ch_advance()
             || self.bottom.requires_ch_advance()
             || self.left.requires_ch_advance()
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        self.top.requires_root_font_metrics()
+            || self.right.requires_root_font_metrics()
+            || self.bottom.requires_root_font_metrics()
+            || self.left.requires_root_font_metrics()
     }
 }
 
@@ -131,8 +154,18 @@ impl BorderImageWidthValue {
         }
     }
 
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        if let Self::LengthPercentage(value) = self {
+            value.resolve_root_font_metric_lengths(basis);
+        }
+    }
+
     pub(crate) fn requires_ch_advance(&self) -> bool {
         matches!(self, Self::LengthPercentage(value) if value.requires_ch_advance())
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        matches!(self, Self::LengthPercentage(value) if value.requires_root_font_metrics())
     }
 }
 
@@ -166,11 +199,25 @@ impl BorderImageOutset {
         self.left.resolve_font_metric_lengths(ch_advance);
     }
 
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        self.top.resolve_root_font_metric_lengths(basis);
+        self.right.resolve_root_font_metric_lengths(basis);
+        self.bottom.resolve_root_font_metric_lengths(basis);
+        self.left.resolve_root_font_metric_lengths(basis);
+    }
+
     pub(crate) fn requires_ch_advance(&self) -> bool {
         self.top.requires_ch_advance()
             || self.right.requires_ch_advance()
             || self.bottom.requires_ch_advance()
             || self.left.requires_ch_advance()
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        self.top.requires_root_font_metrics()
+            || self.right.requires_root_font_metrics()
+            || self.bottom.requires_root_font_metrics()
+            || self.left.requires_root_font_metrics()
     }
 }
 
@@ -187,8 +234,18 @@ impl BorderImageOutsetValue {
         }
     }
 
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        if let Self::Length(value) = self {
+            value.resolve_root_font_metric_lengths(basis);
+        }
+    }
+
     pub(crate) fn requires_ch_advance(&self) -> bool {
         matches!(self, Self::Length(value) if value.requires_ch_advance())
+    }
+
+    pub(crate) fn requires_root_font_metrics(&self) -> bool {
+        matches!(self, Self::Length(value) if value.requires_root_font_metrics())
     }
 }
 

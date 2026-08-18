@@ -1,5 +1,7 @@
 use super::*;
 use crate::LayoutSize;
+use crate::document::paint::patterns::RenderedImageSourceRect;
+use crate::image_store::RasterOrientationPolicy;
 use crate::layout::assets::rasterize_generated_css_image;
 use crate::svg::SvgImageContext;
 use crate::units::{IntoLayoutLength, LayoutLength, layout_px};
@@ -19,6 +21,203 @@ pub(super) enum ResolvedImageAsset {
     Svg(SharedSvgAsset),
 }
 
+/// The used result of a CSS URL-bearing image form.
+///
+/// This is the boundary at which CSS Images' invalid-source fallback becomes
+/// observable. Consumers retain their own handling for generated gradients,
+/// but all URL and `image()` users share this source/fallback selection.
+#[derive(Debug, Clone)]
+pub(super) enum ResolvedCssImage {
+    External(ResolvedImageAsset),
+    SolidColor(CssColor),
+    Invalid,
+}
+
+/// A parsed Media Fragments source rectangle. This deliberately stays in
+/// source-pixel coordinates rather than leaking into CSS layout or PDF paint
+/// coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ImagePixelRect {
+    pub(super) x: u32,
+    pub(super) y: u32,
+    pub(super) width: u32,
+    pub(super) height: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ParsedImageFragment {
+    None,
+    Xywh(ImagePixelRect),
+    Other(String),
+}
+
+/// Inputs common to every CSS `image()` source resolution.
+pub(super) struct ImageResolutionContext<'a> {
+    pub(super) base_url: Option<&'a url::Url>,
+    pub(super) root_url: Option<&'a url::Url>,
+    pub(super) current_color: CssColor,
+    pub(super) orientation: RasterOrientationPolicy,
+    pub(super) svg_context: SvgImageContext,
+    pub(super) resource_cache: &'a ResourceCache,
+}
+
+/// Resolve a direct URL or CSS Images 5 `image()` value after image-set and
+/// light-dark selection. A fallback color is used only when its source cannot
+/// be loaded as an image; it never paints beneath a successfully loaded
+/// source.
+pub(super) fn resolve_css_image_source(
+    image: &css::BackgroundImage,
+    context: ImageResolutionContext<'_>,
+) -> ResolvedCssImage {
+    let image = image.selected_image();
+    let resolve_url = |url: &css::ImageUrl| {
+        load_resolved_image_source_with_request(
+            &url.href,
+            url.base_url.as_ref().or(context.base_url),
+            url.root_url.as_ref().or(context.root_url),
+            context.resource_cache,
+            context.orientation,
+            context.svg_context,
+            &url.request_modifiers,
+        )
+    };
+    match image {
+        css::BackgroundImage::Url(url) => resolve_url(url)
+            .map(ResolvedCssImage::External)
+            .unwrap_or(ResolvedCssImage::Invalid),
+        css::BackgroundImage::ImageFunction(function) => match function.source.as_ref() {
+            Some(source) => resolve_image_function_source(source, &context)
+                .map(ResolvedCssImage::External)
+                .or_else(|| {
+                    function.fallback_color.map(|color| {
+                        ResolvedCssImage::SolidColor(color.resolve(context.current_color))
+                    })
+                })
+                .unwrap_or(ResolvedCssImage::Invalid),
+            None => function
+                .fallback_color
+                .map(|color| ResolvedCssImage::SolidColor(color.resolve(context.current_color)))
+                .unwrap_or(ResolvedCssImage::Invalid),
+        },
+        _ => ResolvedCssImage::Invalid,
+    }
+}
+
+fn resolve_image_function_source(
+    source: &css::ImageUrl,
+    context: &ImageResolutionContext<'_>,
+) -> Option<ResolvedImageAsset> {
+    let fragment = parse_image_fragment(&source.href)?;
+    match fragment {
+        ParsedImageFragment::None => load_resolved_image_source_with_request(
+            &source.href,
+            source.base_url.as_ref().or(context.base_url),
+            source.root_url.as_ref().or(context.root_url),
+            context.resource_cache,
+            context.orientation,
+            context.svg_context,
+            &source.request_modifiers,
+        ),
+        ParsedImageFragment::Other(_) => {
+            // Existing SVG view-fragment support remains available. Other
+            // raster fragments have no CSS Images 5 meaning and therefore
+            // fail this `image()` source (allowing its fallback color).
+            match load_resolved_image_source_with_request(
+                &source.href,
+                source.base_url.as_ref().or(context.base_url),
+                source.root_url.as_ref().or(context.root_url),
+                context.resource_cache,
+                context.orientation,
+                context.svg_context,
+                &source.request_modifiers,
+            )? {
+                asset @ ResolvedImageAsset::Svg(_) => Some(asset),
+                ResolvedImageAsset::Raster(_) => None,
+            }
+        }
+        ParsedImageFragment::Xywh(rect) => {
+            let href = source
+                .href
+                .split_once('#')
+                .map_or(source.href.as_str(), |(href, _)| href);
+            let asset = load_resolved_image_source_with_request(
+                href,
+                source.base_url.as_ref().or(context.base_url),
+                source.root_url.as_ref().or(context.root_url),
+                context.resource_cache,
+                context.orientation,
+                context.svg_context,
+                &source.request_modifiers,
+            )?;
+            match asset {
+                ResolvedImageAsset::Raster(image) => {
+                    clamp_raster_fragment(image, rect).map(ResolvedImageAsset::Raster)
+                }
+                // SVG crop paint uses a source viewport rather than bitmap
+                // pixels. It is not safe to silently ignore `xywh`: retain
+                // invalid-source behavior until that adapter is selected.
+                ResolvedImageAsset::Svg(_) => None,
+            }
+        }
+    }
+}
+
+fn parse_image_fragment(href: &str) -> Option<ParsedImageFragment> {
+    let Some((_, fragment)) = href.split_once('#') else {
+        return Some(ParsedImageFragment::None);
+    };
+    let Some(value) = fragment.strip_prefix("xywh=") else {
+        return Some(ParsedImageFragment::Other(fragment.to_string()));
+    };
+    // CSS Images 5 requires the unqualified integer form. Units, percent
+    // coordinates, and extra media-fragment dimensions are invalid here.
+    let mut values = value.split(',').map(str::trim);
+    let x = values.next()?.parse::<u32>().ok()?;
+    let y = values.next()?.parse::<u32>().ok()?;
+    let width = values.next()?.parse::<u32>().ok()?;
+    let height = values.next()?.parse::<u32>().ok()?;
+    if values.next().is_some() || width == 0 || height == 0 {
+        return None;
+    }
+    Some(ParsedImageFragment::Xywh(ImagePixelRect {
+        x,
+        y,
+        width,
+        height,
+    }))
+}
+
+fn clamp_raster_fragment(
+    image: DecodedPngImage,
+    fragment: ImagePixelRect,
+) -> Option<DecodedPngImage> {
+    let width = image.pixel_size.width;
+    let height = image.pixel_size.height;
+    if fragment.x >= width || fragment.y >= height {
+        return None;
+    }
+    let right = fragment.x.saturating_add(fragment.width).min(width);
+    let bottom = fragment.y.saturating_add(fragment.height).min(height);
+    let source_rect = RenderedImageSourceRect {
+        x: fragment.x,
+        y: fragment.y,
+        width: right.checked_sub(fragment.x)?,
+        height: bottom.checked_sub(fragment.y)?,
+    };
+    (source_rect.width > 0 && source_rect.height > 0).then(|| image.with_source_rect(source_rect))
+}
+
+/// Select the requested image representation from computed CSS.  A URL
+/// loader may strengthen `Encoded` to `FromImage` for an opaque response.
+pub(super) const fn raster_orientation_policy(
+    orientation: css::ImageOrientation,
+) -> RasterOrientationPolicy {
+    match orientation {
+        css::ImageOrientation::FromImage => RasterOrientationPolicy::FromImage,
+        css::ImageOrientation::None => RasterOrientationPolicy::Encoded,
+    }
+}
+
 impl ResolvedImageAsset {
     pub(super) fn intrinsic_size(&self) -> LayoutSize {
         match self {
@@ -28,12 +227,13 @@ impl ResolvedImageAsset {
     }
 }
 
+#[cfg(test)]
 pub(super) fn load_resolved_image_source(
     src: &str,
     base_url: Option<&url::Url>,
     root_url: Option<&url::Url>,
     resource_cache: &ResourceCache,
-    apply_orientation: bool,
+    orientation_policy: RasterOrientationPolicy,
     image_context: SvgImageContext,
 ) -> Option<ResolvedImageAsset> {
     load_resolved_image_source_with_request(
@@ -41,7 +241,7 @@ pub(super) fn load_resolved_image_source(
         base_url,
         root_url,
         resource_cache,
-        apply_orientation,
+        orientation_policy,
         image_context,
         &css::RequestUrlModifiers::default(),
     )
@@ -54,7 +254,7 @@ pub(super) fn load_resolved_image_source_with_request(
     base_url: Option<&url::Url>,
     root_url: Option<&url::Url>,
     resource_cache: &ResourceCache,
-    apply_orientation: bool,
+    orientation_policy: RasterOrientationPolicy,
     image_context: SvgImageContext,
     request_modifiers: &css::RequestUrlModifiers,
 ) -> Option<ResolvedImageAsset> {
@@ -62,22 +262,21 @@ pub(super) fn load_resolved_image_source_with_request(
         (
             resource_cache.data_image_asset_with_orientation(
                 src,
-                apply_orientation,
+                orientation_policy,
                 image_context,
             )?,
             None,
         )
     } else {
         let url = crate::resource::resolve_url(src, base_url, root_url)?;
-        if !resource_cache.allows_css_image_request(&url, root_url.or(base_url), request_modifiers)
-        {
-            return None;
-        }
+        let taint =
+            resource_cache.css_image_fetch_taint(&url, root_url.or(base_url), request_modifiers)?;
+        let orientation_policy = orientation_policy_for_taint(orientation_policy, taint);
         let svg_fragment = url.fragment().map(str::to_owned);
         (
             resource_cache.image_asset_url_with_orientation(
                 &url,
-                apply_orientation,
+                orientation_policy,
                 image_context,
             )?,
             svg_fragment,
@@ -87,8 +286,10 @@ pub(super) fn load_resolved_image_source_with_request(
         crate::resource::ResourceImageAsset::Raster { image_id, metadata } => {
             ResolvedImageAsset::Raster(DecodedPngImage {
                 image_id: Some(image_id),
-                pixel_width: metadata.pixel_width,
-                pixel_height: metadata.pixel_height,
+                pixel_size: metadata.pixel_size,
+                source_rect: None,
+                natural_size: metadata.natural_size,
+                sample_depth: crate::image_store::RasterSampleDepth::Eight,
                 rgb: EncodedRasterRgbSamples::from_shared(resource_cache.image_placeholder_rgb()),
                 alpha: None,
                 color_space: crate::color::RasterColorSpace::SRGB,
@@ -98,6 +299,20 @@ pub(super) fn load_resolved_image_source_with_request(
             ResolvedImageAsset::Svg(Rc::new(asset.with_view_fragment(svg_fragment.as_deref())))
         }
     })
+}
+
+/// Resolve the requested CSS representation against the fetch taint before an
+/// image can enter either raster cache.
+const fn orientation_policy_for_taint(
+    requested: RasterOrientationPolicy,
+    taint: crate::resource::ImageFetchTaint,
+) -> RasterOrientationPolicy {
+    match (requested, taint) {
+        (RasterOrientationPolicy::Encoded, crate::resource::ImageFetchTaint::Opaque) => {
+            RasterOrientationPolicy::FromImage
+        }
+        (policy, _) => policy,
+    }
 }
 
 #[cfg(test)]
@@ -113,7 +328,11 @@ pub(super) fn load_image_source(
         base_url,
         root_url,
         resource_cache,
-        apply_orientation,
+        if apply_orientation {
+            RasterOrientationPolicy::FromImage
+        } else {
+            RasterOrientationPolicy::Encoded
+        },
         &css::RequestUrlModifiers::default(),
     )
 }
@@ -123,7 +342,7 @@ pub(super) fn load_image_source_with_request(
     base_url: Option<&url::Url>,
     root_url: Option<&url::Url>,
     resource_cache: &ResourceCache,
-    apply_orientation: bool,
+    orientation_policy: RasterOrientationPolicy,
     request_modifiers: &css::RequestUrlModifiers,
 ) -> Option<DecodedPngImage> {
     match load_resolved_image_source_with_request(
@@ -131,7 +350,7 @@ pub(super) fn load_image_source_with_request(
         base_url,
         root_url,
         resource_cache,
-        apply_orientation,
+        orientation_policy,
         SvgImageContext::default(),
         request_modifiers,
     )? {
@@ -532,13 +751,15 @@ pub(super) fn intrinsic_image_size(
             })?,
         _ => element.attrs.get("src").map(|src| (src.as_str(), 1.0))?,
     };
-    let asset = load_resolved_image_source(
+    let request_modifiers = html_image_request_modifiers(element);
+    let asset = load_resolved_image_source_with_request(
         src,
         base_url,
         root_url,
         resource_cache,
-        style.image_orientation == css::ImageOrientation::FromImage,
+        raster_orientation_policy(style.image_orientation),
         SvgImageContext::from_used_color_scheme(style.used_color_scheme),
+        &request_modifiers,
     )?;
     let intrinsic_size = match &asset {
         ResolvedImageAsset::Raster(image) => image.natural_layout_size(),
@@ -564,6 +785,25 @@ pub(super) fn intrinsic_image_size(
         width: content_box_pt(width),
         height: content_box_pt(height),
     })
+}
+
+/// Translate HTML's CORS settings attribute into the common image-request
+/// representation used by CSS URL sources. Missing means no-CORS; an empty or
+/// invalid `crossorigin` value selects anonymous CORS.
+/// <https://html.spec.whatwg.org/multipage/urls-and-fetching.html#cors-settings-attributes>
+pub(super) fn html_image_request_modifiers(element: &Element) -> css::RequestUrlModifiers {
+    let cross_origin = match element.attrs.get("crossorigin") {
+        None => None,
+        Some(value) if value.eq_ignore_ascii_case("use-credentials") => {
+            Some(css::CrossOriginRequestMode::UseCredentials)
+        }
+        Some(_) => Some(css::CrossOriginRequestMode::Anonymous),
+    };
+    css::RequestUrlModifiers {
+        cross_origin,
+        integrity: None,
+        referrer_policy: None,
+    }
 }
 
 /// Select the 1dppx `srcset` candidate used by this fixed-resolution renderer.
@@ -625,26 +865,115 @@ pub(super) fn used_image(
     Some(UsedImage::from_geometry(decoded, geometry).with_svg(svg))
 }
 
-/// Geometry inputs for image sizing during intrinsic inline collection.
+/// The Flexbox operation that established an intrinsic descendant block
+/// basis.  This is deliberately narrower than a generic available-size
+/// source: each variant represents a Flexbox operation that CSS allows to
+/// make percentages definite.
+/// <https://drafts.csswg.org/css-flexbox/#definite-sizes>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FlexIntrinsicBlockBasisSource {
+    ExistingFlexItem,
+    DefiniteFlexBase,
+    PostFlexingMainSize,
+    DefinitePreferredSize,
+    BalancedLineSlot,
+    DefiniteSingleLineStretch,
+}
+
+/// The explicit bound that won while constraining an otherwise automatic
+/// intrinsic block contribution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WinningBlockConstraintKind {
+    Minimum,
+    Maximum,
+}
+
+/// A block-size result that may participate in intrinsic replaced sizing.
+///
+/// CSS Sizing keeps content-derived intrinsic measurements indefinite. The
+/// definite variants are therefore produced only by the formatting context
+/// that resolved the item's own block size.
+/// <https://drafts.csswg.org/css-sizing-3/#intrinsic-sizes>
+/// <https://drafts.csswg.org/css-flexbox-1/#definite-sizes>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum IntrinsicBlockBasis {
+    Indefinite,
+    DefiniteFromContainingBlock(ContentBoxLength),
+    DefiniteFromFlexLayout {
+        value: ContentBoxLength,
+        source: FlexIntrinsicBlockBasisSource,
+    },
+    DefiniteWinningConstraint {
+        value: ContentBoxLength,
+        kind: WinningBlockConstraintKind,
+    },
+}
+
+impl IntrinsicBlockBasis {
+    /// Adapt the established percentage basis of a general formatting context.
+    /// Flex intrinsic sizing constructs the enum variants directly, which
+    /// prevents an arbitrary available intrinsic size from becoming definite.
+    pub(super) fn from_layout_percentage_basis(basis: BlockSizePercentageBasis) -> Self {
+        match basis {
+            PercentageBasis::Indefinite => Self::Indefinite,
+            PercentageBasis::Definite {
+                value,
+                source: BlockSizeBasisSource::FlexItem,
+            } => Self::from_flex_layout(value, FlexIntrinsicBlockBasisSource::ExistingFlexItem),
+            PercentageBasis::Definite { value, .. } => Self::DefiniteFromContainingBlock(value),
+        }
+    }
+
+    pub(super) fn from_flex_layout(
+        value: ContentBoxLength,
+        source: FlexIntrinsicBlockBasisSource,
+    ) -> Self {
+        Self::DefiniteFromFlexLayout { value, source }
+    }
+
+    pub(super) fn from_winning_constraint(
+        value: ContentBoxLength,
+        kind: WinningBlockConstraintKind,
+    ) -> Self {
+        Self::DefiniteWinningConstraint { value, kind }
+    }
+
+    pub(super) fn descendant_percentage_basis(self) -> BlockSizePercentageBasis {
+        let (value, source) = match self {
+            Self::Indefinite => return PercentageBasis::indefinite(),
+            Self::DefiniteFromContainingBlock(value) => {
+                (value, BlockSizeBasisSource::ContainingBlock)
+            }
+            Self::DefiniteFromFlexLayout { value, .. }
+            | Self::DefiniteWinningConstraint { value, .. } => {
+                (value, BlockSizeBasisSource::FlexItem)
+            }
+        };
+        PercentageBasis::definite_from(value, source)
+    }
+}
+
+/// Geometry inputs for replaced sizing during intrinsic inline collection.
 ///
 /// The physical available width constrains paint geometry independently from
 /// the logical percentage basis, which may be indefinite when that width is
-/// cyclic.
+/// cyclic. Image, canvas, and SVG share this context so their percentage
+/// height behavior cannot diverge.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct IntrinsicInlineImageSizingContext {
+pub(super) struct ReplacedIntrinsicSizingContext {
     pub(super) available_width: ContentBoxLength,
     pub(super) inline_percentage_basis: IntrinsicInlinePercentageBasis,
-    pub(super) height_basis: BlockSizePercentageBasis,
+    pub(super) block_basis: IntrinsicBlockBasis,
 }
 
 /// Resolve an image while preserving whether the inline percentage basis is
 /// definite. Intrinsic inline collection uses this alongside canvas so every
 /// raster/SVG replaced image shares the same cyclic-percentage behavior.
 /// <https://drafts.csswg.org/css-sizing-3/#intrinsic-sizes>
-pub(super) fn used_image_with_inline_percentage_basis(
+pub(super) fn used_image_with_intrinsic_sizing_context(
     element: &Element,
     style: &ComputedStyle,
-    sizing: IntrinsicInlineImageSizingContext,
+    sizing: ReplacedIntrinsicSizingContext,
     base_url: Option<&url::Url>,
     root_url: Option<&url::Url>,
     resource_cache: &ResourceCache,
@@ -671,7 +1000,7 @@ pub(super) fn used_image_with_inline_percentage_basis(
         style,
         sizing.available_width,
         sizing.inline_percentage_basis,
-        sizing.height_basis,
+        sizing.block_basis.descendant_percentage_basis(),
     );
     Some(UsedImage::from_geometry(decoded, geometry).with_svg(svg))
 }
@@ -883,6 +1212,8 @@ pub(super) fn used_replaced_box_with_inline_percentage_basis(
     // <https://www.w3.org/TR/css-sizing-3/#aspect-ratio>
     let width_is_auto = css_width.is_none();
     let height_is_auto = css_height.is_none();
+    let ratio_only_automatic_size =
+        width_is_auto && height_is_auto && !intrinsic.has_intrinsic_size && aspect_ratio.is_some();
     let (mut content_width, mut content_height) = match (width, height, aspect_ratio) {
         (Some(width_value), None, Some(ratio)) => (width_value, width_value / ratio),
         (None, Some(height_value), Some(ratio)) => (height_value * ratio, height_value),
@@ -911,26 +1242,35 @@ pub(super) fn used_replaced_box_with_inline_percentage_basis(
         (None, None, _) => (intrinsic.width.points(), intrinsic.height.points()),
         (Some(width_value), Some(height_value), _) => (width_value, height_value),
     };
+    // CSS 2.2 suggests resolving a ratio-only automatic replaced element from
+    // the normal-flow width equation when its containing block does not depend
+    // on that width.  Establish that tentative size before min/max processing:
+    // the CSS 2.2 replaced-element constraint table operates on this `w`/`h`.
+    // <https://www.w3.org/TR/CSS22/visudet.html#inline-replaced-width>
+    // <https://www.w3.org/TR/CSS22/visudet.html#min-max-widths>
+    if ratio_only_automatic_size {
+        content_width = content_width.min(available_content_width);
+        content_height = content_width / aspect_ratio.expect("ratio-only size has a ratio");
+    }
     if let Some(aspect_ratio) = aspect_ratio {
-        constrain_replaced_size_with_aspect_ratio(
-            &mut content_width,
-            &mut content_height,
+        let constrained_size = resolve_replaced_size_with_aspect_ratio(
+            content_box_size_pt(content_width, content_height),
             aspect_ratio,
-            ReplacedAutoAxes {
-                width: width_is_auto,
-                height: height_is_auto,
+            ReplacedPreferredSizeAxes {
+                width: ReplacedPreferredSize::from_is_automatic(width_is_auto),
+                height: ReplacedPreferredSize::from_is_automatic(height_is_auto),
             },
             ReplacedSizeConstraints {
                 min_width: used_min_width(
                     style,
                     PercentageBasis::definite(available_width.into_layout_length()),
                 )
-                .map(SemanticLengthExt::points),
+                .map(|width| width.max(content_box_pt(0.0))),
                 max_width: used_max_width(
                     style,
                     PercentageBasis::definite(available_width.into_layout_length()),
                 )
-                .map(SemanticLengthExt::points),
+                .map(|width| width.max(content_box_pt(0.0))),
                 // CSS block-axis constraints resolve percentage values from
                 // the containing block's block-size basis. An indefinite
                 // basis leaves a percentage min/max-height unresolved rather
@@ -941,14 +1281,16 @@ pub(super) fn used_replaced_box_with_inline_percentage_basis(
                     style.box_values.min_height.clone(),
                     height_basis,
                 )
-                .map(|height| height.points().max(0.0)),
+                .map(|height| content_box_pt(height.points().max(0.0))),
                 max_height: used_length_percentage_or_auto_with_basis(
                     style.box_values.max_height.clone(),
                     height_basis,
                 )
-                .map(|height| height.points().max(0.0)),
+                .map(|height| content_box_pt(height.points().max(0.0))),
             },
         );
+        content_width = constrained_size.width;
+        content_height = constrained_size.height;
     } else {
         content_width = constrain_content_width(
             style,
@@ -963,18 +1305,6 @@ pub(super) fn used_replaced_box_with_inline_percentage_basis(
         )
         .points();
     }
-    // A ratio-only image has no intrinsic width or height. CSS Images uses the
-    // available object-size width to choose its otherwise automatic concrete
-    // size. Images with at least one intrinsic axis keep that axis and may
-    // overflow an inline formatting context instead of becoming shrink-to-fit.
-    // <https://www.w3.org/TR/CSS22/visudet.html#inline-replaced-width>
-    // <https://www.w3.org/TR/css-images-3/#default-sizing>
-    let ratio_only_automatic_size =
-        width_is_auto && height_is_auto && !intrinsic.has_intrinsic_size && aspect_ratio.is_some();
-    if ratio_only_automatic_size {
-        content_width = content_width.min(available_content_width);
-        content_height = content_width / aspect_ratio.expect("ratio-only size has a ratio");
-    }
     UsedReplacedBox::new(
         content_box_size_pt(content_width, content_height),
         non_content_pt(horizontal_non_content),
@@ -982,23 +1312,15 @@ pub(super) fn used_replaced_box_with_inline_percentage_basis(
     )
 }
 
-pub(super) fn used_generated_image(
-    src: &str,
+/// Size a concrete external asset for a CSS generated-content replacement.
+/// This intentionally receives the already-selected asset so CSS Images 5
+/// `image()` values share the same sizing path as a direct `url()`.
+fn used_generated_image_asset(
+    asset: ResolvedImageAsset,
     style: &ComputedStyle,
     available_width: f32,
     intrinsic_resolution: f32,
-    base_url: Option<&url::Url>,
-    root_url: Option<&url::Url>,
-    resource_cache: &ResourceCache,
 ) -> Option<UsedImage> {
-    let asset = load_resolved_image_source(
-        src,
-        base_url,
-        root_url,
-        resource_cache,
-        style.image_orientation == css::ImageOrientation::FromImage,
-        SvgImageContext::from_used_color_scheme(style.used_color_scheme),
-    )?;
     // CSS Images applies an image-set resolution descriptor to the natural
     // resolution of raster candidates only. Vector SVG candidates retain
     // their own intrinsic CSS dimensions.
@@ -1022,60 +1344,19 @@ pub(super) fn used_generated_image(
     if intrinsic_width <= 0.0 || intrinsic_height <= 0.0 {
         return None;
     }
-    let natural_aspect_ratio = intrinsic_width / intrinsic_height;
-    let aspect_ratio = style
-        .aspect_ratio
-        .preferred_ratio(true, Some(natural_aspect_ratio))?;
-    let borders = used_border_widths(style);
-    let horizontal_non_content =
-        borders.left + borders.right + style.padding.left + style.padding.right;
-    let vertical_non_content =
-        borders.top + borders.bottom + style.padding.top + style.padding.bottom;
-    let available_content_width = (available_width - horizontal_non_content).max(0.0);
-    let width = used_content_box_width_or_auto(
+    let geometry = used_replaced_box(
+        IntrinsicReplacedSize {
+            width: content_box_pt(intrinsic_width),
+            height: content_box_pt(intrinsic_height),
+            preferred_aspect_ratio: Some(intrinsic_width / intrinsic_height),
+            has_intrinsic_size: true,
+            attr_width: None,
+            attr_height: None,
+        },
         style,
-        layout_pt(available_width),
-        non_content_pt(horizontal_non_content),
-    )
-    .map(SemanticLengthExt::points);
-    let height = definite_image_content_height_without_percent(style, vertical_non_content);
-    let width_is_auto = width.is_none();
-    let height_is_auto = height.is_none();
-    let (mut content_width, mut content_height) = match (width, height) {
-        (Some(width_value), None) => (width_value, width_value / aspect_ratio),
-        (None, Some(height_value)) => (height_value * aspect_ratio, height_value),
-        (None, None) => (intrinsic_width, intrinsic_height),
-        (Some(width_value), Some(height_value)) => (width_value, height_value),
-    };
-    constrain_replaced_size_with_aspect_ratio(
-        &mut content_width,
-        &mut content_height,
-        aspect_ratio,
-        ReplacedAutoAxes {
-            width: width_is_auto,
-            height: height_is_auto,
-        },
-        ReplacedSizeConstraints {
-            min_width: used_min_width(style, PercentageBasis::definite(layout_pt(available_width)))
-                .map(SemanticLengthExt::points),
-            max_width: used_max_width(style, PercentageBasis::definite(layout_pt(available_width)))
-                .map(|width| width.points().min(available_content_width)),
-            min_height: used_min_height(
-                style,
-                PercentageBasis::definite(layout_pt(available_width)),
-            )
-            .map(SemanticLengthExt::points),
-            max_height: used_max_height(
-                style,
-                PercentageBasis::definite(layout_pt(available_width)),
-            )
-            .map(SemanticLengthExt::points),
-        },
+        content_box_pt(available_width),
+        PercentageBasis::indefinite(),
     );
-    content_width = content_width.min(available_content_width);
-    if width_is_auto && !height_is_auto {
-        content_height = content_width / aspect_ratio;
-    }
     let (decoded, svg) = match asset {
         ResolvedImageAsset::Raster(decoded) => (decoded, None),
         ResolvedImageAsset::Svg(svg) => (
@@ -1083,15 +1364,7 @@ pub(super) fn used_generated_image(
             Some(svg),
         ),
     };
-    Some(
-        UsedImage::new(
-            decoded,
-            content_box_size_pt(content_width, content_height),
-            non_content_pt(horizontal_non_content),
-            non_content_pt(vertical_non_content),
-        )
-        .with_svg(svg),
-    )
+    Some(UsedImage::from_geometry(decoded, geometry).with_svg(svg))
 }
 
 /// Resolve the effective natural size established by CSS Images Level 5's
@@ -1242,24 +1515,57 @@ pub(super) fn used_generated_image_value(
     resource_cache: &ResourceCache,
 ) -> Option<UsedImage> {
     let intrinsic_resolution = image.intrinsic_resolution();
-    if let BackgroundImage::Url {
-        src,
-        base_url,
-        root_url,
-        ..
-    } = image.selected_image()
-    {
-        return used_generated_image(
-            src,
-            style,
-            available_width,
-            intrinsic_resolution,
-            base_url.as_ref().or(fallback_base_url),
-            root_url.as_ref().or(fallback_root_url),
-            resource_cache,
-        );
+    if matches!(
+        image.selected_image(),
+        BackgroundImage::Url(_) | BackgroundImage::ImageFunction(_)
+    ) {
+        return match resolve_css_image_source(
+            image,
+            ImageResolutionContext {
+                base_url: fallback_base_url,
+                root_url: fallback_root_url,
+                current_color: style.color,
+                orientation: raster_orientation_policy(style.image_orientation),
+                svg_context: SvgImageContext::from_used_color_scheme(style.used_color_scheme),
+                resource_cache,
+            },
+        ) {
+            ResolvedCssImage::External(asset) => {
+                used_generated_image_asset(asset, style, available_width, intrinsic_resolution)
+            }
+            // A color fallback is a dimensionless generated image, sharing
+            // gradients' default-object sizing rather than acquiring a 1px
+            // natural size from its raster paint representation.
+            ResolvedCssImage::SolidColor(_) => used_dimensionless_generated_image(
+                image,
+                style,
+                available_width,
+                fallback_base_url,
+                fallback_root_url,
+                resource_cache,
+            ),
+            ResolvedCssImage::Invalid => None,
+        };
     }
 
+    used_dimensionless_generated_image(
+        image,
+        style,
+        available_width,
+        fallback_base_url,
+        fallback_root_url,
+        resource_cache,
+    )
+}
+
+fn used_dimensionless_generated_image(
+    image: &BackgroundImage,
+    style: &ComputedStyle,
+    available_width: f32,
+    fallback_base_url: Option<&url::Url>,
+    fallback_root_url: Option<&url::Url>,
+    resource_cache: &ResourceCache,
+) -> Option<UsedImage> {
     // Gradients have no natural dimensions or preferred aspect ratio.  They
     // therefore negotiate CSS's 300 by 150px default object size rather than
     // inheriting an arbitrary font-sized square.
@@ -1324,67 +1630,242 @@ pub(super) fn used_invalid_replacement_image(
     )
 }
 
+/// Whether a replaced element's preferred size is automatic in one axis.
+///
+/// CSS Sizing transfers constraints only into an automatic destination axis;
+/// a definite preferred size is unaffected by a transferred constraint.
+/// <https://drafts.csswg.org/css-sizing-4/#aspect-ratio>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReplacedPreferredSize {
+    Automatic,
+    Definite,
+}
+
+impl ReplacedPreferredSize {
+    pub(super) const fn from_is_automatic(is_automatic: bool) -> Self {
+        if is_automatic {
+            Self::Automatic
+        } else {
+            Self::Definite
+        }
+    }
+
+    const fn is_automatic(self) -> bool {
+        matches!(self, Self::Automatic)
+    }
+}
+
+/// Preferred-size definiteness for each physical content-box axis.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct ReplacedAutoAxes {
-    pub(super) width: bool,
-    pub(super) height: bool,
+pub(super) struct ReplacedPreferredSizeAxes {
+    pub(super) width: ReplacedPreferredSize,
+    pub(super) height: ReplacedPreferredSize,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ReplacedSizeConstraints {
-    pub(super) min_width: Option<f32>,
-    pub(super) max_width: Option<f32>,
-    pub(super) min_height: Option<f32>,
-    pub(super) max_height: Option<f32>,
+    pub(super) min_width: Option<ContentBoxLength>,
+    pub(super) max_width: Option<ContentBoxLength>,
+    pub(super) min_height: Option<ContentBoxLength>,
+    pub(super) max_height: Option<ContentBoxLength>,
 }
 
-/// Applies min/max constraints to a replaced element while preserving ratio when possible.
+/// Resolve a replaced content box against min/max constraints and its preferred ratio.
 ///
-/// CSS Sizing defines preferred aspect ratio transfer for boxes with an
-/// intrinsic ratio. When one axis is automatic, constraints in the other axis
-/// can transfer through that ratio instead of distorting the replaced content:
-/// <https://www.w3.org/TR/css-sizing-3/#aspect-ratio> and
-/// <https://www.w3.org/TR/css-sizing-3/#min-size-properties>.
-pub(super) fn constrain_replaced_size_with_aspect_ratio(
-    width: &mut f32,
-    height: &mut f32,
+/// When both preferred axes are automatic, CSS 2.2 gives an explicit
+/// two-dimensional constraint table for intrinsic-ratio replaced elements.
+/// Otherwise CSS Sizing transfers constraints only into an automatic axis.
+/// <https://www.w3.org/TR/CSS22/visudet.html#min-max-widths>
+/// <https://drafts.csswg.org/css-sizing-4/#aspect-ratio>
+pub(super) fn resolve_replaced_size_with_aspect_ratio(
+    size: ContentBoxSize,
     aspect_ratio: f32,
-    auto_axes: ReplacedAutoAxes,
+    preferred_sizes: ReplacedPreferredSizeAxes,
     constraints: ReplacedSizeConstraints,
-) {
-    if aspect_ratio <= 0.0 {
-        return;
+) -> ContentBoxSize {
+    if !aspect_ratio.is_finite() || aspect_ratio <= 0.0 {
+        return size;
     }
-    if let Some(min_width) = constraints.min_width
-        && *width < min_width
-    {
-        *width = min_width;
-        if auto_axes.height {
-            *height = *width / aspect_ratio;
+    let width_bounds = ReplacedAxisBounds::new(constraints.min_width, constraints.max_width);
+    let height_bounds = ReplacedAxisBounds::new(constraints.min_height, constraints.max_height);
+    if preferred_sizes.width.is_automatic() && preferred_sizes.height.is_automatic() {
+        return resolve_automatic_replaced_size_constraint_table(
+            size,
+            aspect_ratio,
+            width_bounds,
+            height_bounds,
+        );
+    }
+
+    let width_bounds = if preferred_sizes.width.is_automatic() {
+        width_bounds.with_transferred_from_height(height_bounds, aspect_ratio)
+    } else {
+        width_bounds
+    };
+    let height_bounds = if preferred_sizes.height.is_automatic() {
+        height_bounds.with_transferred_from_width(width_bounds, aspect_ratio)
+    } else {
+        height_bounds
+    };
+    content_box_size_pt(
+        width_bounds.clamp(size.width),
+        height_bounds.clamp(size.height),
+    )
+}
+
+/// Resolved content-box bounds for one physical axis.
+#[derive(Debug, Clone, Copy)]
+struct ReplacedAxisBounds {
+    min: ContentBoxLength,
+    max: ContentBoxLength,
+}
+
+impl ReplacedAxisBounds {
+    fn new(min: Option<ContentBoxLength>, max: Option<ContentBoxLength>) -> Self {
+        let min = min.unwrap_or_else(|| content_box_pt(0.0));
+        let max = max
+            .unwrap_or_else(|| content_box_pt(f32::INFINITY))
+            .max(min);
+        Self { min, max }
+    }
+
+    fn clamp(self, value: f32) -> f32 {
+        value.max(self.min.points()).min(self.max.points())
+    }
+
+    fn with_transferred_from_width(self, width: Self, aspect_ratio: f32) -> Self {
+        self.with_transferred_bounds(
+            content_box_pt(width.min.points() / aspect_ratio),
+            content_box_pt(width.max.points() / aspect_ratio),
+        )
+    }
+
+    fn with_transferred_from_height(self, height: Self, aspect_ratio: f32) -> Self {
+        self.with_transferred_bounds(
+            content_box_pt(height.min.points() * aspect_ratio),
+            content_box_pt(height.max.points() * aspect_ratio),
+        )
+    }
+
+    fn with_transferred_bounds(
+        self,
+        transferred_min: ContentBoxLength,
+        transferred_max: ContentBoxLength,
+    ) -> Self {
+        let min = self.min.max(transferred_min.min(self.max));
+        let max = self.max.min(transferred_max.max(min));
+        Self { min, max }
+    }
+}
+
+/// Apply CSS 2.2's replaced-element min/max constraint table.
+fn resolve_automatic_replaced_size_constraint_table(
+    size: ContentBoxSize,
+    aspect_ratio: f32,
+    width_bounds: ReplacedAxisBounds,
+    height_bounds: ReplacedAxisBounds,
+) -> ContentBoxSize {
+    let width = size.width.max(0.0);
+    let height = size.height.max(0.0);
+    let width_scale = |new_width: f32| {
+        if width > 0.0 {
+            new_width * height / width
+        } else {
+            new_width / aspect_ratio
         }
-    }
-    if let Some(max_width) = constraints.max_width
-        && *width > max_width
-    {
-        *width = max_width;
-        if auto_axes.height {
-            *height = *width / aspect_ratio;
+    };
+    let height_scale = |new_height: f32| {
+        if height > 0.0 {
+            new_height * width / height
+        } else {
+            new_height * aspect_ratio
         }
-    }
-    if let Some(min_height) = constraints.min_height
-        && *height < min_height
-    {
-        *height = min_height;
-        if auto_axes.width {
-            *width = *height * aspect_ratio;
+    };
+    let width_constraint_scale = |constraint: f32| {
+        if width > 0.0 {
+            constraint / width
+        } else if constraint > 0.0 {
+            f32::INFINITY
+        } else {
+            0.0
         }
-    }
-    if let Some(max_height) = constraints.max_height
-        && *height > max_height
-    {
-        *height = max_height;
-        if auto_axes.width {
-            *width = *height * aspect_ratio;
+    };
+    let height_constraint_scale = |constraint: f32| {
+        if height > 0.0 {
+            constraint / height
+        } else if constraint > 0.0 {
+            f32::INFINITY
+        } else {
+            0.0
+        }
+    };
+    let width_violation = ReplacedConstraintViolation::classify(width, width_bounds);
+    let height_violation = ReplacedConstraintViolation::classify(height, height_bounds);
+    let (width, height) = match (width_violation, height_violation) {
+        (ReplacedConstraintViolation::None, ReplacedConstraintViolation::None) => (width, height),
+        (ReplacedConstraintViolation::Maximum, ReplacedConstraintViolation::None) => {
+            let width = width_bounds.max.points();
+            (width, width_scale(width).max(height_bounds.min.points()))
+        }
+        (ReplacedConstraintViolation::Minimum, ReplacedConstraintViolation::None) => {
+            let width = width_bounds.min.points();
+            (width, width_scale(width).min(height_bounds.max.points()))
+        }
+        (ReplacedConstraintViolation::None, ReplacedConstraintViolation::Maximum) => {
+            let height = height_bounds.max.points();
+            (height_scale(height).max(width_bounds.min.points()), height)
+        }
+        (ReplacedConstraintViolation::None, ReplacedConstraintViolation::Minimum) => {
+            let height = height_bounds.min.points();
+            (height_scale(height).min(width_bounds.max.points()), height)
+        }
+        (ReplacedConstraintViolation::Maximum, ReplacedConstraintViolation::Maximum) => {
+            if width_constraint_scale(width_bounds.max.points())
+                <= height_constraint_scale(height_bounds.max.points())
+            {
+                let width = width_bounds.max.points();
+                (width, width_scale(width).max(height_bounds.min.points()))
+            } else {
+                let height = height_bounds.max.points();
+                (height_scale(height).max(width_bounds.min.points()), height)
+            }
+        }
+        (ReplacedConstraintViolation::Minimum, ReplacedConstraintViolation::Minimum) => {
+            if width_constraint_scale(width_bounds.min.points())
+                <= height_constraint_scale(height_bounds.min.points())
+            {
+                let height = height_bounds.min.points();
+                (height_scale(height).min(width_bounds.max.points()), height)
+            } else {
+                let width = width_bounds.min.points();
+                (width, width_scale(width).min(height_bounds.max.points()))
+            }
+        }
+        (ReplacedConstraintViolation::Minimum, ReplacedConstraintViolation::Maximum) => {
+            (width_bounds.min.points(), height_bounds.max.points())
+        }
+        (ReplacedConstraintViolation::Maximum, ReplacedConstraintViolation::Minimum) => {
+            (width_bounds.max.points(), height_bounds.min.points())
+        }
+    };
+    content_box_size_pt(width, height)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplacedConstraintViolation {
+    None,
+    Minimum,
+    Maximum,
+}
+
+impl ReplacedConstraintViolation {
+    fn classify(value: f32, bounds: ReplacedAxisBounds) -> Self {
+        if value < bounds.min.points() {
+            Self::Minimum
+        } else if value > bounds.max.points() {
+            Self::Maximum
+        } else {
+            Self::None
         }
     }
 }
@@ -1447,20 +1928,36 @@ pub(super) fn used_canvas(
     )
 }
 
-pub(super) fn used_canvas_with_inline_percentage_basis(
+pub(super) fn used_canvas_with_intrinsic_sizing_context(
     element: &Element,
     style: &ComputedStyle,
-    available_width: f32,
-    inline_percentage_basis: IntrinsicInlinePercentageBasis,
-    height_basis: BlockSizePercentageBasis,
+    sizing: ReplacedIntrinsicSizingContext,
 ) -> UsedReplacedBox {
     used_replaced_box_with_inline_percentage_basis(
         intrinsic_canvas_size(element),
         style,
-        content_box_pt(available_width),
-        inline_percentage_basis,
-        height_basis,
+        sizing.available_width,
+        sizing.inline_percentage_basis,
+        sizing.block_basis.descendant_percentage_basis(),
     )
+}
+
+/// Resolve an inline SVG element through the same typed intrinsic context as
+/// raster images and canvas.
+pub(super) fn used_svg_with_intrinsic_sizing_context(
+    element: &Element,
+    style: &ComputedStyle,
+    sizing: ReplacedIntrinsicSizingContext,
+) -> Option<UsedReplacedBox> {
+    intrinsic_svg_size(element).map(|intrinsic| {
+        used_replaced_box_with_inline_percentage_basis(
+            intrinsic,
+            style,
+            sizing.available_width,
+            sizing.inline_percentage_basis,
+            sizing.block_basis.descendant_percentage_basis(),
+        )
+    })
 }
 
 /// Resolve an inline SVG element through the same replaced-element geometry as
@@ -1812,107 +2309,88 @@ fn used_background_position_axis_precise(
     }
 }
 
+/// Source-coordinate offsets for the four `border-image-slice` edges.
+///
+/// These are deliberately floating point: SVG slices use the SVG viewport's
+/// coordinate system and CSS permits percentage-derived fractional source
+/// coordinates. Raster sources are quantized only by the PDF image adapter.
+/// <https://drafts.csswg.org/css-backgrounds-3/#border-image-slice>
 #[derive(Debug, Clone, Copy)]
 pub(super) struct UsedBorderImageSlices {
-    pub top: u32,
-    pub right: u32,
-    pub bottom: u32,
-    pub left: u32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+    pub left: f32,
 }
 
 /// Resolve `border-image-slice` against the source image dimensions.
 ///
 /// CSS Backgrounds and Borders resolves percentages against image dimensions
-/// and proportionally reduces opposing slices when their sum exceeds the image
-/// size:
+/// and clamps each edge to the corresponding image dimension. Opposing slices
+/// are intentionally allowed to overlap; in that case the relevant middle
+/// image is empty rather than the source slices being rescaled:
 /// <https://www.w3.org/TR/css-backgrounds-3/#border-image-slice>.
 pub(super) fn used_border_image_slices(
     values: css::BorderImageSliceOffsets,
-    image_width: u32,
-    image_height: u32,
+    image_width: f32,
+    image_height: f32,
 ) -> UsedBorderImageSlices {
-    let mut top = used_border_image_slice_value(values.top, image_height);
-    let mut right = used_border_image_slice_value(values.right, image_width);
-    let mut bottom = used_border_image_slice_value(values.bottom, image_height);
-    let mut left = used_border_image_slice_value(values.left, image_width);
-    reduce_opposing_slices(&mut top, &mut bottom, image_height);
-    reduce_opposing_slices(&mut left, &mut right, image_width);
     UsedBorderImageSlices {
-        top,
-        right,
-        bottom,
-        left,
+        top: used_border_image_slice_value(values.top, image_height),
+        right: used_border_image_slice_value(values.right, image_width),
+        bottom: used_border_image_slice_value(values.bottom, image_height),
+        left: used_border_image_slice_value(values.left, image_width),
     }
 }
 
-fn used_border_image_slice_value(value: css::BorderImageSliceValue, reference: u32) -> u32 {
+fn used_border_image_slice_value(value: css::BorderImageSliceValue, reference: f32) -> f32 {
     let resolved = match value {
         css::BorderImageSliceValue::Number(value) => value,
-        css::BorderImageSliceValue::Percent(value) => value * reference as f32,
+        css::BorderImageSliceValue::Percent(value) => value * reference,
     };
-    resolved.max(0.0).round() as u32
-}
-
-fn reduce_opposing_slices(first: &mut u32, second: &mut u32, reference: u32) {
-    let sum = first.saturating_add(*second);
-    if sum <= reference || sum == 0 {
-        return;
-    }
-    // A one-pixel raster source cannot represent the two half-pixel source
-    // slices produced by the border-image process. Both slices nevertheless
-    // sample that pixel; reducing either one to zero would incorrectly erase
-    // three of the four corner images. Preserve the overlapping source sample
-    // here, while destination geometry still uses the independently resolved
-    // border-image widths.
-    // <https://www.w3.org/TR/css-backgrounds-3/#border-image-slice>
-    if reference == 1 && *first > 0 && *second > 0 {
-        return;
-    }
-    let scale = reference as f32 / sum as f32;
-    *first = ((*first as f32) * scale).round() as u32;
-    *second = reference.saturating_sub(*first);
+    resolved.clamp(0.0, reference.max(0.0))
 }
 
 /// Resolve `border-image-width` to destination border-image side widths.
 ///
-/// Numeric values multiply the corresponding used border width; lengths and
+/// Numeric values multiply the corresponding computed border width; lengths and
 /// percentages resolve against the border image area dimensions. `auto` uses
 /// the intrinsic size of the corresponding image slice, falling back to the
 /// used border width only when that slice dimension is unavailable:
 /// <https://www.w3.org/TR/css-backgrounds-3/#border-image-width>.
 pub(super) fn used_border_image_widths(
     style: &ComputedStyle,
-    border_widths: css::Edges,
-    border_box_width: BorderBoxLength,
-    border_box_height: BorderBoxLength,
+    computed_border_widths: css::Edges,
+    border_image_area_width: BorderBoxLength,
+    border_image_area_height: BorderBoxLength,
     slices: UsedBorderImageSlices,
 ) -> css::Edges {
     css::Edges {
         top: used_border_image_width_value(
             style.border_image.width.top.clone(),
-            layout_pt(border_widths.top),
-            border_box_height,
+            layout_pt(computed_border_widths.top),
+            border_image_area_height,
             slices.top,
         )
         .points(),
         right: used_border_image_width_value(
             style.border_image.width.right.clone(),
-            layout_pt(border_widths.right),
-            border_box_width,
+            layout_pt(computed_border_widths.right),
+            border_image_area_width,
             slices.right,
         )
         .points(),
         bottom: used_border_image_width_value(
             style.border_image.width.bottom.clone(),
-            layout_pt(border_widths.bottom),
-            border_box_height,
+            layout_pt(computed_border_widths.bottom),
+            border_image_area_height,
             slices.bottom,
         )
         .points(),
         left: used_border_image_width_value(
             style.border_image.width.left.clone(),
-            layout_pt(border_widths.left),
-            border_box_width,
+            layout_pt(computed_border_widths.left),
+            border_image_area_width,
             slices.left,
         )
         .points(),
@@ -1923,16 +2401,16 @@ fn used_border_image_width_value(
     value: css::BorderImageWidthValue,
     border_width: LayoutLength,
     reference: BorderBoxLength,
-    slice_width: u32,
+    slice_width: f32,
 ) -> LayoutLength {
     match value {
         css::BorderImageWidthValue::Auto => {
-            if slice_width > 0 {
+            if slice_width > 0.0 {
                 // Border-image slice numbers are source CSS pixels. Convert
                 // the intrinsic slice extent into Quire's PDF-point layout
                 // space before using it as an `auto` border-image width.
                 // <https://www.w3.org/TR/css-backgrounds-3/#border-image-width>
-                layout_px(slice_width as f32)
+                layout_px(slice_width)
             } else {
                 border_width
             }
@@ -1979,7 +2457,7 @@ pub(super) fn fit_border_image_widths_to_area(
 
 /// Resolve `border-image-outset` to physical outsets.
 ///
-/// Numeric values multiply the corresponding used border width; length values
+/// Numeric values multiply the corresponding computed border width; length values
 /// are absolute:
 /// <https://www.w3.org/TR/css-backgrounds-3/#border-image-outset>.
 pub(super) fn used_border_image_outsets(
@@ -2083,6 +2561,24 @@ pub(super) fn parse_html_length(value: &str) -> Option<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opaque_images_cannot_select_the_encoded_orientation_policy() {
+        assert_eq!(
+            orientation_policy_for_taint(
+                RasterOrientationPolicy::Encoded,
+                crate::resource::ImageFetchTaint::Opaque,
+            ),
+            RasterOrientationPolicy::FromImage
+        );
+        assert_eq!(
+            orientation_policy_for_taint(
+                RasterOrientationPolicy::Encoded,
+                crate::resource::ImageFetchTaint::OriginClean,
+            ),
+            RasterOrientationPolicy::Encoded
+        );
+    }
     use crate::units::{border_box_size_pt, border_box_to_content_box_size};
     use std::rc::Rc;
 
@@ -2106,6 +2602,223 @@ mod tests {
         element
     }
 
+    fn automatic_replaced_axes() -> ReplacedPreferredSizeAxes {
+        ReplacedPreferredSizeAxes {
+            width: ReplacedPreferredSize::Automatic,
+            height: ReplacedPreferredSize::Automatic,
+        }
+    }
+
+    #[test]
+    fn automatic_replaced_size_uses_the_css22_min_max_constraint_table() {
+        struct Case {
+            name: &'static str,
+            size: ContentBoxSize,
+            constraints: ReplacedSizeConstraints,
+            expected: ContentBoxSize,
+        }
+
+        let cases = [
+            Case {
+                name: "no violation",
+                size: content_box_size_pt(100.0, 50.0),
+                constraints: ReplacedSizeConstraints {
+                    min_width: None,
+                    max_width: None,
+                    min_height: None,
+                    max_height: None,
+                },
+                expected: content_box_size_pt(100.0, 50.0),
+            },
+            Case {
+                name: "maximum width",
+                size: content_box_size_pt(200.0, 100.0),
+                constraints: ReplacedSizeConstraints {
+                    min_width: None,
+                    max_width: Some(content_box_pt(150.0)),
+                    min_height: None,
+                    max_height: None,
+                },
+                expected: content_box_size_pt(150.0, 75.0),
+            },
+            Case {
+                name: "minimum width",
+                size: content_box_size_pt(100.0, 50.0),
+                constraints: ReplacedSizeConstraints {
+                    min_width: Some(content_box_pt(150.0)),
+                    max_width: None,
+                    min_height: None,
+                    max_height: None,
+                },
+                expected: content_box_size_pt(150.0, 75.0),
+            },
+            Case {
+                name: "maximum height",
+                size: content_box_size_pt(200.0, 100.0),
+                constraints: ReplacedSizeConstraints {
+                    min_width: None,
+                    max_width: None,
+                    min_height: None,
+                    max_height: Some(content_box_pt(75.0)),
+                },
+                expected: content_box_size_pt(150.0, 75.0),
+            },
+            Case {
+                name: "minimum height",
+                size: content_box_size_pt(100.0, 50.0),
+                constraints: ReplacedSizeConstraints {
+                    min_width: None,
+                    max_width: None,
+                    min_height: Some(content_box_pt(75.0)),
+                    max_height: None,
+                },
+                expected: content_box_size_pt(150.0, 75.0),
+            },
+            Case {
+                name: "both maxima",
+                size: content_box_size_pt(200.0, 100.0),
+                constraints: ReplacedSizeConstraints {
+                    min_width: None,
+                    max_width: Some(content_box_pt(150.0)),
+                    min_height: None,
+                    max_height: Some(content_box_pt(60.0)),
+                },
+                expected: content_box_size_pt(120.0, 60.0),
+            },
+            Case {
+                name: "both minima",
+                size: content_box_size_pt(100.0, 50.0),
+                constraints: ReplacedSizeConstraints {
+                    min_width: Some(content_box_pt(150.0)),
+                    max_width: None,
+                    min_height: Some(content_box_pt(100.0)),
+                    max_height: None,
+                },
+                expected: content_box_size_pt(200.0, 100.0),
+            },
+            Case {
+                name: "minimum width and maximum height",
+                size: content_box_size_pt(100.0, 50.0),
+                constraints: ReplacedSizeConstraints {
+                    min_width: Some(content_box_pt(150.0)),
+                    max_width: None,
+                    min_height: None,
+                    max_height: Some(content_box_pt(25.0)),
+                },
+                expected: content_box_size_pt(150.0, 25.0),
+            },
+            Case {
+                name: "maximum width and minimum height",
+                size: content_box_size_pt(200.0, 100.0),
+                constraints: ReplacedSizeConstraints {
+                    min_width: None,
+                    max_width: Some(content_box_pt(150.0)),
+                    min_height: Some(content_box_pt(125.0)),
+                    max_height: None,
+                },
+                expected: content_box_size_pt(150.0, 125.0),
+            },
+            Case {
+                name: "maximum is normalized by minimum",
+                size: content_box_size_pt(200.0, 100.0),
+                constraints: ReplacedSizeConstraints {
+                    min_width: Some(content_box_pt(150.0)),
+                    max_width: Some(content_box_pt(100.0)),
+                    min_height: None,
+                    max_height: None,
+                },
+                expected: content_box_size_pt(150.0, 75.0),
+            },
+        ];
+
+        for case in cases {
+            assert_eq!(
+                resolve_replaced_size_with_aspect_ratio(
+                    case.size,
+                    2.0,
+                    automatic_replaced_axes(),
+                    case.constraints,
+                ),
+                case.expected,
+                "{}",
+                case.name,
+            );
+        }
+    }
+
+    #[test]
+    fn ratio_only_replaced_size_resolves_before_min_max_constraints() {
+        let intrinsic = IntrinsicReplacedSize {
+            width: content_box_pt(225.0),
+            height: content_box_pt(112.5),
+            preferred_aspect_ratio: Some(2.0),
+            has_intrinsic_size: false,
+            attr_width: None,
+            attr_height: None,
+        };
+        let mut style = ComputedStyle::initial();
+        style.box_values.min_height = css::ComputedLengthPercentageOrAuto::LengthPercentage(
+            css::ComputedLengthPercentage::from_points(75.0),
+        );
+        style.box_values.max_width = css::ComputedLengthPercentageOrAuto::LengthPercentage(
+            css::ComputedLengthPercentage::from_points(75.0),
+        );
+
+        let geometry = used_replaced_box(
+            intrinsic,
+            &style,
+            content_box_pt(37.5),
+            PercentageBasis::indefinite(),
+        );
+
+        assert_eq!(geometry.content_size, content_box_size_pt(75.0, 75.0));
+    }
+
+    #[test]
+    fn square_ratio_only_replaced_size_transfers_min_height_after_stretch_fit() {
+        let intrinsic = IntrinsicReplacedSize {
+            width: content_box_pt(225.0),
+            height: content_box_pt(112.5),
+            preferred_aspect_ratio: Some(1.0),
+            has_intrinsic_size: false,
+            attr_width: None,
+            attr_height: None,
+        };
+        let mut style = ComputedStyle::initial();
+        style.box_values.min_height = css::ComputedLengthPercentageOrAuto::LengthPercentage(
+            css::ComputedLengthPercentage::from_points(75.0),
+        );
+
+        let geometry = used_replaced_box(
+            intrinsic,
+            &style,
+            content_box_pt(37.5),
+            PercentageBasis::indefinite(),
+        );
+
+        assert_eq!(geometry.content_size, content_box_size_pt(75.0, 75.0));
+    }
+
+    #[test]
+    fn transferred_constraint_does_not_modify_a_definite_preferred_axis() {
+        let size = resolve_replaced_size_with_aspect_ratio(
+            content_box_size_pt(75.0, 37.5),
+            2.0,
+            ReplacedPreferredSizeAxes {
+                width: ReplacedPreferredSize::Definite,
+                height: ReplacedPreferredSize::Automatic,
+            },
+            ReplacedSizeConstraints {
+                min_width: None,
+                max_width: None,
+                min_height: Some(content_box_pt(75.0)),
+                max_height: None,
+            },
+        );
+
+        assert_eq!(size, content_box_size_pt(75.0, 75.0));
+    }
+
     #[test]
     fn percent_encoded_svg_data_url_resolves_as_a_vector_asset() {
         let cache = ResourceCache::default();
@@ -2115,7 +2828,7 @@ mod tests {
             None,
             None,
             &cache,
-            true,
+            RasterOrientationPolicy::FromImage,
             SvgImageContext::default(),
         )
         .unwrap();
@@ -2143,7 +2856,7 @@ mod tests {
             None,
             None,
             &cache,
-            true,
+            RasterOrientationPolicy::FromImage,
             SvgImageContext::default(),
         )
         .unwrap();
@@ -2162,7 +2875,11 @@ mod tests {
             .await
             .expect("local image fixture must preload");
         assert!(matches!(
-            cache.image_asset_url_with_orientation(&url, true, SvgImageContext::default()),
+            cache.image_asset_url_with_orientation(
+                &url,
+                RasterOrientationPolicy::FromImage,
+                SvgImageContext::default(),
+            ),
             Some(crate::resource::ResourceImageAsset::Svg(_))
         ));
     }
@@ -2399,6 +3116,107 @@ mod tests {
     }
 
     #[test]
+    fn only_closed_intrinsic_block_bases_create_replaced_percentage_bases() {
+        assert!(
+            !IntrinsicBlockBasis::Indefinite
+                .descendant_percentage_basis()
+                .is_definite()
+        );
+
+        for basis in [
+            IntrinsicBlockBasis::DefiniteFromContainingBlock(content_box_pt(100.0)),
+            IntrinsicBlockBasis::from_flex_layout(
+                content_box_pt(100.0),
+                FlexIntrinsicBlockBasisSource::ExistingFlexItem,
+            ),
+            IntrinsicBlockBasis::from_winning_constraint(
+                content_box_pt(100.0),
+                WinningBlockConstraintKind::Minimum,
+            ),
+        ] {
+            assert_eq!(
+                basis.descendant_percentage_basis().value(),
+                Some(content_box_pt(100.0))
+            );
+        }
+    }
+
+    #[test]
+    fn shared_intrinsic_replaced_context_transfers_definite_height_for_canvas_geometry() {
+        let mut style = ComputedStyle::initial();
+        style.box_values.height.replace_with_used(
+            css::ComputedLengthPercentageOrAuto::LengthPercentage(
+                css::ComputedLengthPercentage::from_percent(1.0),
+            ),
+        );
+        let context = ReplacedIntrinsicSizingContext {
+            available_width: content_box_pt(500.0),
+            inline_percentage_basis: PercentageBasis::indefinite(),
+            block_basis: IntrinsicBlockBasis::from_flex_layout(
+                content_box_pt(100.0),
+                FlexIntrinsicBlockBasisSource::ExistingFlexItem,
+            ),
+        };
+        let geometry = used_canvas_with_intrinsic_sizing_context(
+            &canvas_element(&[("width", "10"), ("height", "10")]),
+            &style,
+            context,
+        );
+
+        assert_eq!(geometry.content_size, content_box_size_pt(100.0, 100.0));
+    }
+
+    #[test]
+    fn image_intrinsic_context_matches_normal_flow_replaced_sizing() {
+        let mut style = ComputedStyle::initial();
+        style.box_values.height.replace_with_used(
+            css::ComputedLengthPercentageOrAuto::LengthPercentage(
+                css::ComputedLengthPercentage::from_percent(1.0),
+            ),
+        );
+        let context = ReplacedIntrinsicSizingContext {
+            available_width: content_box_pt(500.0),
+            inline_percentage_basis: PercentageBasis::indefinite(),
+            block_basis: IntrinsicBlockBasis::from_flex_layout(
+                content_box_pt(100.0),
+                FlexIntrinsicBlockBasisSource::ExistingFlexItem,
+            ),
+        };
+        let image = element_with_attrs(
+            "img",
+            &[(
+                "src",
+                "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%2210%22%20height%3D%2210%22%2F%3E",
+            )],
+        );
+        let resource_cache = ResourceCache::default();
+
+        let intrinsic = used_image_with_intrinsic_sizing_context(
+            &image,
+            &style,
+            context,
+            None,
+            None,
+            &resource_cache,
+        )
+        .expect("data SVG image must establish a replaced box");
+        let normal_flow = used_image(
+            &image,
+            &style,
+            context.available_width.points(),
+            context.block_basis.descendant_percentage_basis(),
+            None,
+            None,
+            &resource_cache,
+        )
+        .expect("data SVG image must establish a replaced box");
+
+        assert_eq!(intrinsic.content_size, content_box_size_pt(100.0, 100.0));
+        assert_eq!(intrinsic.content_size, normal_flow.content_size);
+        assert_eq!(intrinsic.border_box_size, normal_flow.border_box_size);
+    }
+
+    #[test]
     fn used_image_shared_border_to_content_conversion_clamps_at_zero() {
         let content = border_box_to_content_box_size(
             border_box_size_pt(100.0, 100.0),
@@ -2415,8 +3233,8 @@ mod tests {
         let style = ComputedStyle::initial();
         let image = used_invalid_replacement_image(&style, 100.0);
 
-        assert_eq!(image.decoded.pixel_width, 1);
-        assert_eq!(image.decoded.pixel_height, 1);
+        assert_eq!(image.decoded.pixel_size.width, 1);
+        assert_eq!(image.decoded.pixel_size.height, 1);
         assert_eq!(image.decoded.rgb.as_ref(), &[0, 0, 0]);
         assert_eq!(image.decoded.alpha.as_deref(), Some([0].as_slice()));
         assert_eq!(image.content_size.width, 0.0);
@@ -2589,14 +3407,14 @@ mod tests {
                 bottom: css::BorderImageSliceValue::Percent(0.20),
                 left: css::BorderImageSliceValue::Percent(0.10),
             },
-            200,
-            200,
+            200.0,
+            200.0,
         );
 
-        assert_eq!(slices.top, 80);
-        assert_eq!(slices.right, 60);
-        assert_eq!(slices.bottom, 40);
-        assert_eq!(slices.left, 20);
+        assert!((slices.top - 80.0).abs() < 0.001);
+        assert!((slices.right - 60.0).abs() < 0.001);
+        assert!((slices.bottom - 40.0).abs() < 0.001);
+        assert!((slices.left - 20.0).abs() < 0.001);
     }
 
     #[test]
@@ -2608,13 +3426,159 @@ mod tests {
                 bottom: css::BorderImageSliceValue::Number(20.0),
                 left: css::BorderImageSliceValue::Number(10.0),
             },
-            200,
-            200,
+            200.0,
+            200.0,
         );
 
-        assert_eq!(slices.top, 40);
-        assert_eq!(slices.right, 30);
-        assert_eq!(slices.bottom, 20);
-        assert_eq!(slices.left, 10);
+        assert_eq!(slices.top, 40.0);
+        assert_eq!(slices.right, 30.0);
+        assert_eq!(slices.bottom, 20.0);
+        assert_eq!(slices.left, 10.0);
+    }
+
+    #[test]
+    fn border_image_opposing_slices_overlap_without_rescaling() {
+        let slices = used_border_image_slices(
+            css::BorderImageSliceOffsets {
+                top: css::BorderImageSliceValue::Number(80.0),
+                right: css::BorderImageSliceValue::Number(90.0),
+                bottom: css::BorderImageSliceValue::Number(70.0),
+                left: css::BorderImageSliceValue::Number(60.0),
+            },
+            100.0,
+            100.0,
+        );
+
+        // CSS makes the middle regions empty here; it does not normalize the
+        // source edge slices to fit within the source image.
+        // <https://drafts.csswg.org/css-backgrounds-3/#border-image-slice>
+        assert_eq!(slices.top, 80.0);
+        assert_eq!(slices.bottom, 70.0);
+        assert_eq!(slices.left, 60.0);
+        assert_eq!(slices.right, 90.0);
+    }
+
+    #[test]
+    fn border_image_width_percentages_use_the_outset_area() {
+        let mut style = ComputedStyle::initial();
+        style.border_image.width = css::BorderImageWidth {
+            top: css::BorderImageWidthValue::LengthPercentage(
+                css::ComputedLengthPercentage::from_percent(0.5),
+            ),
+            right: css::BorderImageWidthValue::LengthPercentage(
+                css::ComputedLengthPercentage::from_percent(0.5),
+            ),
+            bottom: css::BorderImageWidthValue::LengthPercentage(
+                css::ComputedLengthPercentage::from_percent(0.5),
+            ),
+            left: css::BorderImageWidthValue::LengthPercentage(
+                css::ComputedLengthPercentage::from_percent(0.5),
+            ),
+        };
+
+        let widths = used_border_image_widths(
+            &style,
+            css::Edges {
+                top: 0.0,
+                right: 0.0,
+                bottom: 0.0,
+                left: 0.0,
+            },
+            border_box_pt(75.0),
+            border_box_pt(75.0),
+            UsedBorderImageSlices {
+                top: 1.0,
+                right: 1.0,
+                bottom: 1.0,
+                left: 1.0,
+            },
+        );
+
+        assert_eq!(
+            widths,
+            css::Edges {
+                top: 37.5,
+                right: 37.5,
+                bottom: 37.5,
+                left: 37.5,
+            }
+        );
+    }
+
+    #[test]
+    fn numeric_border_image_outset_uses_computed_width_input() {
+        let mut style = ComputedStyle::initial();
+        style.border_image.outset = css::BorderImageOutset {
+            top: css::BorderImageOutsetValue::Number(2.0),
+            right: css::BorderImageOutsetValue::Number(2.0),
+            bottom: css::BorderImageOutsetValue::Number(2.0),
+            left: css::BorderImageOutsetValue::Number(2.0),
+        };
+
+        let outsets = used_border_image_outsets(
+            &style,
+            css::Edges {
+                top: 5.0,
+                right: 5.0,
+                bottom: 5.0,
+                left: 5.0,
+            },
+        );
+
+        assert_eq!(
+            outsets,
+            css::Edges {
+                top: 10.0,
+                right: 10.0,
+                bottom: 10.0,
+                left: 10.0,
+            }
+        );
+    }
+
+    #[test]
+    fn image_function_xywh_fragment_requires_nonzero_integer_geometry() {
+        assert_eq!(
+            parse_image_fragment("image.png#xywh=2,3,4,5"),
+            Some(ParsedImageFragment::Xywh(ImagePixelRect {
+                x: 2,
+                y: 3,
+                width: 4,
+                height: 5,
+            }))
+        );
+        for href in [
+            "image.png#xywh=2,3,0,5",
+            "image.png#xywh=2,3,4.0,5",
+            "image.png#xywh=pixel:2,3,4,5",
+            "image.png#xywh=2,3,4,5&foo=bar",
+        ] {
+            assert_eq!(parse_image_fragment(href), None, "{href}");
+        }
+    }
+
+    #[test]
+    fn image_function_xywh_crop_clamps_to_the_source_grid() {
+        let image = DecodedPngImage::new(10, 8, vec![0; 10 * 8 * 3], None);
+        let image = clamp_raster_fragment(
+            image,
+            ImagePixelRect {
+                x: 8,
+                y: 6,
+                width: 8,
+                height: 8,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            image.source_rect,
+            Some(RenderedImageSourceRect {
+                x: 8,
+                y: 6,
+                width: 2,
+                height: 2,
+            })
+        );
+        assert_eq!(image.natural_size, crate::units::CssPixelSize::new(2, 2));
     }
 }

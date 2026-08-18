@@ -376,8 +376,8 @@ mod tests {
         short.line_height = 30.0;
         short.line_height_value = css::ComputedLineHeight::from_points(30.0);
 
-        let tall_metrics = builder.inline_text_box_metrics(&tall, None, 0.0);
-        let short_metrics = builder.inline_text_box_metrics(&short, None, 0.0);
+        let tall_metrics = builder.inline_text_box_metrics(&tall, 0.0);
+        let short_metrics = builder.inline_text_box_metrics(&short, 0.0);
 
         assert!((tall_metrics.content_block_size - 50.0).abs() < 0.01);
         assert!((short_metrics.content_block_size - 50.0).abs() < 0.01);
@@ -393,11 +393,11 @@ mod tests {
         );
     }
 
-    /// CSS 2.2 §10.6.1 keeps the inline content area stable while a
-    /// `line-height: normal` line box encloses fallback-font metrics.
+    /// CSS 2.2 §10.6.1 keeps both an inline box's content area and its normal
+    /// line metrics independent of fallback glyph selection.
     /// <https://www.w3.org/TR/CSS22/visudet.html#line-height>
     #[tokio::test]
-    async fn normal_inline_metrics_keep_primary_content_and_union_fallback_line_runs() {
+    async fn normal_inline_metrics_use_the_primary_face_despite_fallback_runs() {
         let stylesheet = css::parse_stylesheet(
             &crate::css::Css::from_string(
                 r#"@font-face {
@@ -439,20 +439,10 @@ mod tests {
         let mut high = ComputedStyle::initial();
         high.font_family = css::FontFamily::Names(vec!["HighOnly".to_string()]);
         high.font_size = 100.0;
-        let mut deep = high.clone();
-        deep.font_family = css::FontFamily::Names(vec!["DeepOnly".to_string()]);
         let mut mixed = high.clone();
         mixed.font_family =
             css::FontFamily::Names(vec!["HighOnly".to_string(), "DeepOnly".to_string()]);
 
-        let high_shaped = builder
-            .font_system
-            .shape_unwrapped_line("a", &high, high.line_height)
-            .expect("high font should shape a");
-        let deep_shaped = builder
-            .font_system
-            .shape_unwrapped_line("b", &deep, deep.line_height)
-            .expect("deep font should shape b");
         let mixed_shaped = builder
             .font_system
             .shape_unwrapped_line("ab", &mixed, mixed.line_height)
@@ -468,27 +458,18 @@ mod tests {
             "test fonts should produce more than one shaped run: {mixed_shaped:?}"
         );
 
-        let high_metrics = builder.inline_text_box_metrics(&high, Some(&high_shaped), 0.0);
-        let deep_metrics = builder.inline_text_box_metrics(&deep, Some(&deep_shaped), 0.0);
-        let mixed_metrics = builder.inline_text_box_metrics(&mixed, Some(&mixed_shaped), 0.0);
-
-        let expected_line_above = high_metrics
-            .line_baseline_offset
-            .max(deep_metrics.line_baseline_offset);
-        let expected_line_below = (high_metrics.line_block_size
-            - high_metrics.line_baseline_offset)
-            .max(deep_metrics.line_block_size - deep_metrics.line_baseline_offset);
+        let high_metrics = builder.inline_text_box_metrics(&high, 0.0);
+        let mixed_metrics = builder.inline_text_box_metrics(&mixed, 0.0);
 
         assert!(
             (mixed_metrics.content_baseline_offset - high_metrics.content_baseline_offset).abs()
                 < 0.01
         );
         assert!((mixed_metrics.content_block_size - high_metrics.content_block_size).abs() < 0.01);
-        assert!((mixed_metrics.line_baseline_offset - expected_line_above).abs() < 0.01);
         assert!(
-            (mixed_metrics.line_block_size - (expected_line_above + expected_line_below)).abs()
-                < 0.01
+            (mixed_metrics.line_baseline_offset - high_metrics.line_baseline_offset).abs() < 0.01
         );
+        assert!((mixed_metrics.line_block_size - high_metrics.line_block_size).abs() < 0.01);
     }
 
     fn inline_test_atom(width: f32, style: &ComputedStyle) -> InlineItem {
@@ -533,6 +514,7 @@ mod tests {
 
     fn list_marker_text(text: &str, style: &ComputedStyle, suffix_space: bool) -> ListMarker {
         ListMarker {
+            source_element: None,
             text: text.to_string(),
             image: None,
             style: style.clone(),
@@ -544,6 +526,7 @@ mod tests {
 
     fn list_marker_image(width: f32, height: f32, style: &ComputedStyle) -> ListMarker {
         ListMarker {
+            source_element: None,
             text: String::new(),
             image: Some(MarkerImage {
                 decoded: DecodedPngImage::new(1, 1, vec![0, 0, 0], None),
@@ -1673,15 +1656,12 @@ mod tests {
     }
 
     #[test]
-    fn inline_whitespace_processor_makes_non_whitespace_controls_visible() {
+    fn inline_whitespace_processor_preserves_mandatory_controls_as_breaks() {
         let mut style = ComputedStyle::initial();
         style.font_family = css::FontFamily::SansSerif;
         let mut items = vec![inline_word("A\u{000b}\u{000c}\u{0099}B", &style)];
 
-        assert_eq!(
-            normalized_inline_item_text(&mut items),
-            "A\u{25a0}\u{25a0}\u{25a0}B"
-        );
+        assert_eq!(normalized_inline_item_text(&mut items), "A||\u{25a0}B");
     }
 
     #[test]
@@ -1986,7 +1966,11 @@ mod tests {
         ]);
         builder.push_bidi_scope_end(&style, None, 0.0, InlineVisualOffset::zero(), &mut items);
         inline_collect::normalize_inline_whitespace_items(&mut items);
-        inline_collect::insert_text_autospace_items(&mut builder.font_system, &mut items);
+        inline_collect::insert_text_autospace_items(
+            &mut builder.font_system,
+            &mut builder.autospace_items_scratch,
+            &mut items,
+        );
         let sequence = builder.collect_inline_line_sequence(items, &style, 120.0, 0.0, 0.0);
         let context = inline_paragraph_context(&style, 120.0);
         let mut plaintext_state = None;
@@ -3206,6 +3190,7 @@ mod tests {
             used_indent: 0.0,
             available_width,
             line_height: style.line_height,
+            decoration_origin_fragments: Default::default(),
         }
     }
 
@@ -4170,33 +4155,25 @@ mod tests {
     }
 
     #[test]
-    fn content_visibility_alone_does_not_block_body_principal_flow_propagation() {
-        let root = dom::parse("<html><body>content</body></html>");
-        let author = css::parse_stylesheet(&crate::css::Css::from_string(
-            "body { content-visibility: hidden; writing-mode: vertical-rl; }",
-        ));
-        let stylesheets = Stylesheets::for_document(
-            css::html5_user_agent_stylesheet(),
-            None,
-            std::slice::from_ref(&author),
-        );
-        let parent_style = ComputedStyle::initial();
-        let body = root
-            .as_element()
-            .expect("parsed document root should be an element")
-            .children
-            .iter()
-            .filter_map(Node::as_element)
-            .find(|element| element.tag == "html")
-            .expect("parsed document should contain an HTML element")
-            .children
-            .iter()
-            .filter_map(Node::as_element)
-            .find(|element| element.tag == "body")
-            .expect("HTML element should contain a body");
-
-        let flow = resolved_document_principal_flow(&root, &stylesheets, &parent_style);
-        assert_eq!(flow.source, PrincipalFlowSource::Body(body.id));
+    fn content_visibility_blocks_body_principal_flow_propagation() {
+        for content_visibility in ["auto", "hidden"] {
+            let root = dom::parse("<html><body>content</body></html>");
+            let author = css::parse_stylesheet(&crate::css::Css::from_string(format!(
+                "body {{ content-visibility: {content_visibility}; writing-mode: vertical-rl; }}"
+            )));
+            let stylesheets = Stylesheets::for_document(
+                css::html5_user_agent_stylesheet(),
+                None,
+                std::slice::from_ref(&author),
+            );
+            let parent_style = ComputedStyle::initial();
+            let flow = resolved_document_principal_flow(&root, &stylesheets, &parent_style);
+            assert_eq!(
+                flow.source,
+                PrincipalFlowSource::Root,
+                "content-visibility: {content_visibility}"
+            );
+        }
     }
 
     #[test]
@@ -4278,7 +4255,7 @@ mod tests {
             run.text.contains('、') && run.text_matrix == RenderedTextMatrix::IDENTITY
         }));
         assert!(runs.iter().any(|run| {
-            run.text.contains('\u{2329}') && run.text_matrix == RenderedTextMatrix::ROTATE_CW
+            run.text.contains('\u{2329}') && run.text_matrix == RenderedTextMatrix::IDENTITY
         }));
     }
 
@@ -5321,6 +5298,31 @@ mod tests {
                 && opportunity.is_discretionary()
                 && opportunity.position.run_index == 0
                 && opportunity.position.byte_offset > 0
+        }));
+    }
+
+    #[test]
+    fn auto_phrase_retains_authored_soft_hyphens_as_deferred_opportunities() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let mut style = ComputedStyle::initial();
+        style.font_family = css::FontFamily::SansSerif;
+        style.font_size = 12.0;
+        style.line_height = 14.0;
+        style.word_break = css::WordBreak::AutoPhrase;
+        style.language = ContentLanguage::from_html_attribute("en");
+
+        let graph = builder.build_inline_opportunity_graph(
+            &[inline_word("con\u{00ad}sid\u{00ad}eration", &style)],
+            &style,
+        );
+
+        assert!(graph.opportunities.iter().any(|opportunity| {
+            opportunity.kind == inline_layout::InlineBreakKind::Hyphenation
+                && opportunity.is_discretionary()
+                && opportunity.availability.fitting_stage() == 2
         }));
     }
 

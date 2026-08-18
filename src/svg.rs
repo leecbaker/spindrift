@@ -11,13 +11,15 @@ use crate::document::paint::effects::PaintBlendMode;
 use crate::document::paint::geometry::{
     PaintClip, PaintPoint, PaintRect, PaintSize, PaintTransform,
 };
+use crate::document::paint::images::RenderedImage;
 use crate::document::paint::paths::{
     RenderedGradient, RenderedGradientKind, RenderedGradientStop, RenderedPath, RenderedPathClip,
-    RenderedPathClipPath, RenderedPathCommand, RenderedPathFillRule, RenderedPathLineCap,
-    RenderedPathLineJoin, RenderedPathPaint, RenderedPathPaintOrder, RenderedPathStrokeStyle,
+    RenderedPathClipPath, RenderedPathCommand, RenderedPathFillRule, RenderedPathPaint,
     RenderedSvgPathPattern,
 };
+use crate::document::paint::patterns::RenderedImageSourceRect;
 use crate::dom::{Element, ElementId, NodeKind};
+use crate::resource::ExternalSvgUseResolver;
 use crate::units::{LayoutLength, LayoutSize, SemanticLengthExt, layout_pt};
 use cssparser::{
     AtRuleParser, CowRcStr, Parser, ParserInput, ParserState, QualifiedRuleParser,
@@ -25,12 +27,100 @@ use cssparser::{
 };
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 const SVG_NAMESPACE: &str = "http://www.w3.org/2000/svg";
 const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
 const XLINK_NAMESPACE: &str = "http://www.w3.org/1999/xlink";
 const XMLNS_NAMESPACE: &str = "http://www.w3.org/2000/xmlns/";
 const SVG_IMAGE_ROOT_MARKER_ATTRIBUTE: &str = "data-quire-svg-root";
+
+/// Resource-processing policy for SVG image documents.
+///
+/// SVG images embedded by HTML/CSS are processed in SVG secure-static mode:
+/// a self-contained `data:` payload is permitted, while resolving a string
+/// URL would create an external fetch and is therefore rejected.  A future
+/// static policy can use the same resolver boundary to consult an already
+/// populated resource cache without letting `usvg` perform I/O.
+/// <https://www.w3.org/TR/SVG2/conform.html#processing-modes>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SvgResourcePolicy {
+    SecureStatic,
+}
+
+const MAX_SVG_DATA_IMAGE_COUNT: usize = 256;
+const MAX_SVG_DATA_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_SVG_DATA_IMAGE_DEPTH: usize = 8;
+
+#[derive(Default)]
+struct SvgDataResourceBudget {
+    count: usize,
+    bytes: usize,
+    svg_depth: usize,
+}
+
+/// An I/O-free adapter around `usvg`'s synchronous image callback.
+struct SvgResourceResolver {
+    policy: SvgResourcePolicy,
+    budget: Arc<Mutex<SvgDataResourceBudget>>,
+}
+
+impl SvgResourceResolver {
+    fn secure_static() -> Self {
+        Self {
+            policy: SvgResourcePolicy::SecureStatic,
+            budget: Arc::new(Mutex::new(SvgDataResourceBudget::default())),
+        }
+    }
+
+    fn image_href_resolver(self) -> usvg::ImageHrefResolver<'static> {
+        let budget = self.budget;
+        usvg::ImageHrefResolver {
+            resolve_data: Box::new(move |mime, data, options| {
+                let is_svg = mime == "image/svg+xml";
+                let approved = matches!(
+                    mime,
+                    "image/jpg"
+                        | "image/jpeg"
+                        | "image/png"
+                        | "image/gif"
+                        | "image/webp"
+                        | "image/svg+xml"
+                );
+                if !approved {
+                    return None;
+                }
+                {
+                    let mut budget = budget.lock().expect("SVG data resource budget lock");
+                    if budget.count >= MAX_SVG_DATA_IMAGE_COUNT
+                        || budget.bytes.saturating_add(data.len()) > MAX_SVG_DATA_IMAGE_BYTES
+                        || (is_svg && budget.svg_depth >= MAX_SVG_DATA_IMAGE_DEPTH)
+                    {
+                        log::debug!("SVG secure-static data image limit exceeded");
+                        return None;
+                    }
+                    budget.count += 1;
+                    budget.bytes += data.len();
+                    if is_svg {
+                        budget.svg_depth += 1;
+                    }
+                }
+                let result = usvg::ImageHrefResolver::default_data_resolver()(mime, data, options);
+                if is_svg {
+                    let mut budget = budget.lock().expect("SVG data resource budget lock");
+                    budget.svg_depth = budget.svg_depth.saturating_sub(1);
+                }
+                result
+            }),
+            // Secure-static SVG images never turn an href into a filesystem
+            // or network request.  This callback remains deliberately empty
+            // even when an outer ResourceCache already holds the SVG bytes.
+            resolve_string: Box::new(move |_, _| match self.policy {
+                SvgResourcePolicy::SecureStatic => None,
+            }),
+        }
+    }
+}
 
 /// CSS environment inherited by an SVG document embedded as an image.
 ///
@@ -262,8 +352,27 @@ pub(crate) struct SvgPresentationOverride {
     pub(crate) fill: Option<String>,
     pub(crate) stroke: Option<String>,
     pub(crate) stroke_width: Option<String>,
+    pub(crate) flood_color: Option<SvgFilterColorOverride>,
+    pub(crate) lighting_color: Option<SvgFilterColorOverride>,
     /// A forced solid color replaces this element's unsupported filter result.
     pub(crate) remove_filter: bool,
+}
+
+/// A concrete SVG parser color paired with the computed-value taint bit that
+/// cannot be represented by `usvg`'s color parser.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct SvgFilterColorOverride {
+    color: CssColor,
+    current_color_dependent: bool,
+}
+
+impl From<css::SvgFilterColor> for SvgFilterColorOverride {
+    fn from(color: css::SvgFilterColor) -> Self {
+        Self {
+            color: color.color,
+            current_color_dependent: color.current_color_dependent,
+        }
+    }
 }
 
 /// A transform selected by Quire's host-document cascade for an inline SVG
@@ -314,6 +423,7 @@ pub(crate) type SvgPresentationOverrides = HashMap<ElementId, SvgPresentationOve
 #[derive(Debug, Clone)]
 pub(crate) struct SvgAsset {
     tree: usvg::Tree,
+    filter_taint: SvgFilterTaintCatalog,
     intrinsic_size: LayoutSize,
     intrinsic_dimensions: SvgIntrinsicDimensions,
     has_degenerate_view_box: bool,
@@ -525,7 +635,13 @@ impl SvgAsset {
             return Vec::new();
         }
         let transform = ViewportTransform::new(destination, source, true, true);
-        let mut group = collect_svg_group(self.tree.root(), transform, &[]);
+        let mut group = collect_svg_group(
+            self.tree.root(),
+            transform,
+            &[],
+            usvg::Transform::default(),
+            &self.filter_taint,
+        );
         canonicalize_svg_paint_servers(&mut group);
         elide_redundant_svg_paints(&mut group);
         group.into_paths()
@@ -585,7 +701,13 @@ impl SvgAsset {
             return SvgPaintGroup::empty();
         }
         let viewport = ViewportTransform::new(destination, source, clip_viewport, false);
-        let mut group = collect_svg_group(self.tree.root(), viewport, &[]);
+        let mut group = collect_svg_group(
+            self.tree.root(),
+            viewport,
+            &[],
+            usvg::Transform::default(),
+            &self.filter_taint,
+        );
         canonicalize_svg_paint_servers(&mut group);
         elide_redundant_svg_paints(&mut group);
         group
@@ -640,7 +762,7 @@ impl SvgAsset {
 }
 
 /// An ordered SVG compositing group in page-local paint coordinates.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SvgPaintGroup {
     pub(crate) items: Vec<SvgPaintItem>,
     pub(crate) opacity: f32,
@@ -649,9 +771,14 @@ pub(crate) struct SvgPaintGroup {
     pub(crate) bounds: Option<PaintClip>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum SvgPaintItem {
     Path(Box<RenderedPath>),
+    RasterImage(Box<RenderedImage>),
+    /// A separately normalized SVG document retained as a compositing scene.
+    /// Keeping this distinct from an ordinary SVG group preserves the image
+    /// resource boundary for future Static-policy cache resolution.
+    NestedSvg(Box<SvgPaintGroup>),
     Group(Box<SvgPaintGroup>),
 }
 
@@ -691,6 +818,13 @@ impl SvgPaintGroup {
                     let nested = std::mem::replace(group, Box::new(SvgPaintGroup::empty()));
                     **group = nested.with_clip(clip.clone());
                 }
+                SvgPaintItem::NestedSvg(group) => {
+                    let nested = std::mem::replace(group, Box::new(SvgPaintGroup::empty()));
+                    **group = nested.with_clip(clip.clone());
+                }
+                SvgPaintItem::RasterImage(image) => {
+                    **image = image.as_ref().clone().with_intersected_clip(clip.clone());
+                }
             }
         }
         self
@@ -708,10 +842,41 @@ impl SvgPaintGroup {
         for item in self.items {
             match item {
                 SvgPaintItem::Path(path) => paths.push(*path),
-                SvgPaintItem::Group(group) => paths.extend(group.into_paths()),
+                SvgPaintItem::Group(group) | SvgPaintItem::NestedSvg(group) => {
+                    paths.extend(group.into_paths())
+                }
+                SvgPaintItem::RasterImage(_) => {}
             }
         }
         paths
+    }
+
+    fn transformed(mut self, transform: PaintTransform) -> Self {
+        for item in &mut self.items {
+            match item {
+                SvgPaintItem::Path(path) => **path = path.clone().transformed(transform),
+                SvgPaintItem::RasterImage(image) => {
+                    **image = image.clone().transformed(transform);
+                }
+                SvgPaintItem::Group(group) | SvgPaintItem::NestedSvg(group) => {
+                    let nested = std::mem::replace(group, Box::new(SvgPaintGroup::empty()));
+                    **group = nested.transformed(transform);
+                }
+            }
+        }
+        self
+    }
+
+    pub(crate) fn raster_images<'a>(&'a self, images: &mut Vec<&'a RenderedImage>) {
+        for item in &self.items {
+            match item {
+                SvgPaintItem::RasterImage(image) => images.push(image),
+                SvgPaintItem::Group(group) | SvgPaintItem::NestedSvg(group) => {
+                    group.raster_images(images)
+                }
+                SvgPaintItem::Path(_) => {}
+            }
+        }
     }
 }
 
@@ -744,6 +909,8 @@ fn canonicalize_svg_paint_group(
                 }
             }
             SvgPaintItem::Group(group) => canonicalize_svg_paint_group(group, servers),
+            SvgPaintItem::NestedSvg(group) => canonicalize_svg_paint_group(group, servers),
+            SvgPaintItem::RasterImage(_) => {}
         }
     }
 }
@@ -837,6 +1004,20 @@ fn elide_redundant_svg_paints_in_group(
                 if !child.items.is_empty() {
                     retained.push(item);
                 }
+            }
+            SvgPaintItem::NestedSvg(child) => {
+                // A nested SVG can contain arbitrary alpha-bearing content;
+                // never carry opaque vector coverage across its boundary.
+                let mut nested_coverage = Vec::new();
+                elide_redundant_svg_paints_in_group(child, &mut nested_coverage);
+                coverage.clear();
+                if !child.items.is_empty() {
+                    retained.push(item);
+                }
+            }
+            SvgPaintItem::RasterImage(_) => {
+                coverage.clear();
+                retained.push(item);
             }
         }
     }
@@ -957,6 +1138,7 @@ fn single_opaque_path(group: &SvgPaintGroup) -> Option<&RenderedPath> {
     match item {
         SvgPaintItem::Path(path) => Some(path),
         SvgPaintItem::Group(group) => single_opaque_path(group),
+        SvgPaintItem::NestedSvg(_) | SvgPaintItem::RasterImage(_) => None,
     }
 }
 
@@ -973,6 +1155,7 @@ fn simple_group_paths(group: &SvgPaintGroup) -> Option<Vec<&RenderedPath>> {
         match item {
             SvgPaintItem::Path(path) => paths.push(path.as_ref()),
             SvgPaintItem::Group(group) => paths.extend(simple_group_paths(group)?),
+            SvgPaintItem::NestedSvg(_) | SvgPaintItem::RasterImage(_) => return None,
         }
     }
     Some(paths)
@@ -1245,13 +1428,20 @@ fn collect_svg_group(
     group: &usvg::Group,
     viewport: ViewportTransform,
     inherited_clips: &[RenderedPathClipPath],
+    image_transform: usvg::Transform,
+    filter_taint: &SvgFilterTaintCatalog,
 ) -> SvgPaintGroup {
     // SVG masks and filters alter the alpha/color result of every descendant.
     // Until a PDF soft-mask/filter compositor exists, painting the unmodified
     // children would be an incorrect substitute.
-    if group.mask().is_some() || !group.filters().is_empty() {
+    if group.mask().is_some() {
         return SvgPaintGroup::empty();
     }
+    let image_transform = image_transform.post_concat(group.transform());
+    let filter_clip = match analyze_svg_filters(group.filters(), filter_taint) {
+        SvgFilterAnalysis::ExactSourceGraphic { filter_clip } => filter_clip,
+        SvgFilterAnalysis::RequiresRasterBackend => return SvgPaintGroup::empty(),
+    };
     let mut clips = inherited_clips.to_vec();
     if let Some(clip_path) = group.clip_path() {
         clips.extend(render_svg_clip_path(
@@ -1270,7 +1460,8 @@ fn collect_svg_group(
     for node in group.children() {
         match node {
             usvg::Node::Group(child) => {
-                let child = collect_svg_group(child, viewport, &clips);
+                let child =
+                    collect_svg_group(child, viewport, &clips, image_transform, filter_taint);
                 if !child.items.is_empty() {
                     rendered.items.push(SvgPaintItem::Group(Box::new(child)));
                 }
@@ -1280,11 +1471,398 @@ fn collect_svg_group(
                     rendered.items.push(SvgPaintItem::Path(Box::new(path)));
                 }
             }
-            usvg::Node::Image(_) | usvg::Node::Text(_) => {}
+            usvg::Node::Image(image) => {
+                if let Some(item) = render_svg_image(image, image_transform, viewport, &clips) {
+                    rendered.items.push(item);
+                }
+            }
+            usvg::Node::Text(_) => {}
         }
+    }
+    if let Some(filter_clip) = filter_clip {
+        rendered = rendered.with_clip(svg_filter_clip_path(
+            filter_clip,
+            svg_path_transform(image_transform, viewport),
+        ));
     }
     rendered.recompute_bounds();
     rendered
+}
+
+/// The vector result of proving that an SVG filter does not alter
+/// `SourceGraphic`.  Filter primitive regions remain observable clipping, so
+/// they are retained even when the pixel operation is a mandated pass-through.
+/// <https://drafts.csswg.org/filter-effects/#tainted-filter-primitives>
+#[derive(Debug, Clone, Copy)]
+enum SvgFilterAnalysis {
+    ExactSourceGraphic {
+        filter_clip: Option<usvg::NonZeroRect>,
+    },
+    RequiresRasterBackend,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SvgFilterTaintCatalog {
+    by_filter_id: HashMap<String, Vec<SvgFilterPrimitiveTaint>>,
+}
+
+#[derive(Debug, Clone)]
+struct SvgFilterPrimitiveTaint {
+    tag: String,
+    color_tainted: Option<bool>,
+    has_unsupported_standard_input: bool,
+    declared_inputs: Vec<String>,
+}
+
+fn filter_taint_catalog(
+    root: &Element,
+    overrides: &SvgPresentationOverrides,
+) -> SvgFilterTaintCatalog {
+    fn visit(
+        element: &Element,
+        overrides: &SvgPresentationOverrides,
+        catalog: &mut SvgFilterTaintCatalog,
+    ) {
+        if element.namespace_url == SVG_NAMESPACE
+            && element.tag == "filter"
+            && let Some(id) = inline_svg_unprefixed_attribute(element, "id")
+        {
+            let primitives = element
+                .children
+                .iter()
+                .filter_map(|child| match &child.kind {
+                    NodeKind::Element(child) if child.namespace_url == SVG_NAMESPACE => Some(child),
+                    _ => None,
+                })
+                .map(|primitive| {
+                    let override_values = overrides.get(&primitive.id);
+                    let color_tainted = match primitive.tag.as_str() {
+                        "feFlood" | "feDropShadow" => override_values
+                            .and_then(|values| values.flood_color)
+                            .map(|color| color.current_color_dependent),
+                        "feDiffuseLighting" | "feSpecularLighting" => override_values
+                            .and_then(|values| values.lighting_color)
+                            .map(|color| color.current_color_dependent),
+                        _ => None,
+                    };
+                    let has_unsupported_standard_input = ["in", "in2"].into_iter().any(|name| {
+                        inline_svg_unprefixed_attribute(primitive, name).is_some_and(|input| {
+                            matches!(
+                                input,
+                                "BackgroundImage" | "BackgroundAlpha" | "FillPaint" | "StrokePaint"
+                            )
+                        })
+                    });
+                    let declared_inputs = ["in", "in2"]
+                        .into_iter()
+                        .filter_map(|name| {
+                            inline_svg_unprefixed_attribute(primitive, name).map(str::to_owned)
+                        })
+                        .collect();
+                    SvgFilterPrimitiveTaint {
+                        tag: primitive.tag.clone(),
+                        color_tainted,
+                        has_unsupported_standard_input,
+                        declared_inputs,
+                    }
+                })
+                .collect();
+            catalog.by_filter_id.insert(id.to_owned(), primitives);
+        }
+        for child in &element.children {
+            if let NodeKind::Element(child) = &child.kind {
+                visit(child, overrides, catalog);
+            }
+        }
+    }
+
+    let mut catalog = SvgFilterTaintCatalog::default();
+    visit(root, overrides, &mut catalog);
+    catalog
+}
+
+fn analyze_svg_filters(
+    filters: &[Arc<usvg::filter::Filter>],
+    catalog: &SvgFilterTaintCatalog,
+) -> SvgFilterAnalysis {
+    if filters.is_empty() {
+        return SvgFilterAnalysis::ExactSourceGraphic { filter_clip: None };
+    }
+
+    let mut clip = None;
+    for filter in filters {
+        let Some(metadata) = catalog.by_filter_id.get(filter.id()) else {
+            return SvgFilterAnalysis::RequiresRasterBackend;
+        };
+        let primitives = filter.primitives();
+        if primitives.len() != metadata.len() {
+            return SvgFilterAnalysis::RequiresRasterBackend;
+        }
+        let mut results: Vec<(String, bool, Option<usvg::NonZeroRect>)> = Vec::new();
+        for (primitive, metadata) in primitives.iter().zip(metadata) {
+            if metadata.has_unsupported_standard_input
+                || !filter_kind_matches_tag(primitive.kind(), &metadata.tag)
+                || matches!(primitive.kind(), usvg::filter::Kind::Merge(_))
+                || !declared_filter_inputs_are_resolved(&metadata.declared_inputs, &results)
+            {
+                return SvgFilterAnalysis::RequiresRasterBackend;
+            }
+            let input_tainted = primitive_input_tainted(primitive.kind(), &results);
+            let color_tainted = match primitive.kind() {
+                usvg::filter::Kind::Flood(_) | usvg::filter::Kind::DropShadow(_) => {
+                    let Some(tainted) = metadata.color_tainted else {
+                        return SvgFilterAnalysis::RequiresRasterBackend;
+                    };
+                    tainted
+                }
+                usvg::filter::Kind::DiffuseLighting(_)
+                | usvg::filter::Kind::SpecularLighting(_) => {
+                    let Some(tainted) = metadata.color_tainted else {
+                        return SvgFilterAnalysis::RequiresRasterBackend;
+                    };
+                    tainted
+                }
+                // `<feImage>` depends on CORS mode and resource provenance,
+                // neither of which is represented in the static SVG adapter.
+                usvg::filter::Kind::Image(_) => return SvgFilterAnalysis::RequiresRasterBackend,
+                _ => false,
+            };
+            let tainted = input_tainted || color_tainted;
+            let exact_clip = if let usvg::filter::Kind::DisplacementMap(map) = primitive.kind() {
+                let input = exact_source_graphic_clip(map.input1(), &results, filter.rect());
+                let tainted_input = filter_input_tainted(map.input2(), &results);
+                if tainted_input {
+                    input.and_then(|clip| intersect_filter_rects(clip, primitive.rect()))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            results.push((primitive.result().to_owned(), tainted, exact_clip));
+        }
+        let Some((_, _, Some(filter_clip))) = results.last() else {
+            return SvgFilterAnalysis::RequiresRasterBackend;
+        };
+        clip = Some(match clip {
+            Some(existing) => match intersect_filter_rects(existing, *filter_clip) {
+                Some(intersection) => intersection,
+                None => return SvgFilterAnalysis::RequiresRasterBackend,
+            },
+            None => *filter_clip,
+        });
+    }
+    SvgFilterAnalysis::ExactSourceGraphic { filter_clip: clip }
+}
+
+fn declared_filter_inputs_are_resolved(
+    declared_inputs: &[String],
+    results: &[(String, bool, Option<usvg::NonZeroRect>)],
+) -> bool {
+    declared_inputs.iter().all(|input| {
+        matches!(input.as_str(), "SourceGraphic" | "SourceAlpha")
+            || results.iter().any(|(result, _, _)| result == input)
+    })
+}
+
+fn filter_kind_matches_tag(kind: &usvg::filter::Kind, tag: &str) -> bool {
+    matches!(
+        (kind, tag),
+        (usvg::filter::Kind::Blend(_), "feBlend")
+            | (usvg::filter::Kind::ColorMatrix(_), "feColorMatrix")
+            | (
+                usvg::filter::Kind::ComponentTransfer(_),
+                "feComponentTransfer"
+            )
+            | (usvg::filter::Kind::Composite(_), "feComposite")
+            | (usvg::filter::Kind::ConvolveMatrix(_), "feConvolveMatrix")
+            | (usvg::filter::Kind::DiffuseLighting(_), "feDiffuseLighting")
+            | (usvg::filter::Kind::DisplacementMap(_), "feDisplacementMap")
+            | (usvg::filter::Kind::DropShadow(_), "feDropShadow")
+            | (usvg::filter::Kind::Flood(_), "feFlood")
+            | (usvg::filter::Kind::GaussianBlur(_), "feGaussianBlur")
+            | (usvg::filter::Kind::Image(_), "feImage")
+            | (usvg::filter::Kind::Merge(_), "feMerge")
+            | (usvg::filter::Kind::Morphology(_), "feMorphology")
+            | (usvg::filter::Kind::Offset(_), "feOffset")
+            | (
+                usvg::filter::Kind::SpecularLighting(_),
+                "feSpecularLighting"
+            )
+            | (usvg::filter::Kind::Tile(_), "feTile")
+            | (usvg::filter::Kind::Turbulence(_), "feTurbulence")
+    )
+}
+
+fn primitive_input_tainted(
+    kind: &usvg::filter::Kind,
+    results: &[(String, bool, Option<usvg::NonZeroRect>)],
+) -> bool {
+    kind.has_input(&usvg::filter::Input::SourceGraphic)
+        || kind.has_input(&usvg::filter::Input::SourceAlpha)
+        || results.iter().any(|(result, tainted, _)| {
+            *tainted && kind.has_input(&usvg::filter::Input::Reference(result.clone()))
+        })
+}
+
+fn filter_input_tainted(
+    input: &usvg::filter::Input,
+    results: &[(String, bool, Option<usvg::NonZeroRect>)],
+) -> bool {
+    match input {
+        usvg::filter::Input::SourceGraphic | usvg::filter::Input::SourceAlpha => true,
+        usvg::filter::Input::Reference(reference) => results
+            .iter()
+            .rev()
+            .find(|(result, _, _)| result == reference)
+            .is_some_and(|(_, tainted, _)| *tainted),
+    }
+}
+
+fn exact_source_graphic_clip(
+    input: &usvg::filter::Input,
+    results: &[(String, bool, Option<usvg::NonZeroRect>)],
+    filter_rect: usvg::NonZeroRect,
+) -> Option<usvg::NonZeroRect> {
+    match input {
+        usvg::filter::Input::SourceGraphic => Some(filter_rect),
+        usvg::filter::Input::SourceAlpha => None,
+        usvg::filter::Input::Reference(reference) => results
+            .iter()
+            .rev()
+            .find(|(result, _, _)| result == reference)
+            .and_then(|(_, _, clip)| *clip),
+    }
+}
+
+fn intersect_filter_rects(
+    left: usvg::NonZeroRect,
+    right: usvg::NonZeroRect,
+) -> Option<usvg::NonZeroRect> {
+    let x1 = left.x().max(right.x());
+    let y1 = left.y().max(right.y());
+    let x2 = (left.x() + left.width()).min(right.x() + right.width());
+    let y2 = (left.y() + left.height()).min(right.y() + right.height());
+    usvg::NonZeroRect::from_xywh(x1, y1, x2 - x1, y2 - y1)
+}
+
+fn svg_filter_clip_path(rect: usvg::NonZeroRect, transform: PaintTransform) -> RenderedPathClip {
+    let points = [
+        PaintPoint::new(rect.x(), rect.y()),
+        PaintPoint::new(rect.x() + rect.width(), rect.y()),
+        PaintPoint::new(rect.x() + rect.width(), rect.y() + rect.height()),
+        PaintPoint::new(rect.x(), rect.y() + rect.height()),
+    ];
+    let commands = points
+        .into_iter()
+        .enumerate()
+        .map(|(index, point)| {
+            if index == 0 {
+                RenderedPathCommand::MoveTo(transform.apply_point(point))
+            } else {
+                RenderedPathCommand::LineTo(transform.apply_point(point))
+            }
+        })
+        .chain(std::iter::once(RenderedPathCommand::Close))
+        .collect();
+    RenderedPathClip::new(commands, RenderedPathFillRule::NonZero, Vec::new())
+}
+
+/// Lower a normalized SVG `<image>` without flattening its parent scene.
+///
+/// `usvg::Image::abs_transform` already contains SVG's concrete object size
+/// and `preserveAspectRatio` placement.  The extra local vertical flip bridges
+/// an image XObject's bottom-left sample coordinates to SVG's top-left image
+/// coordinates before the root SVG viewport crosses into PDF paint space.
+/// <https://www.w3.org/TR/SVG2/embedded.html#ImageElement>
+fn render_svg_image(
+    image: &usvg::Image,
+    image_transform: usvg::Transform,
+    viewport: ViewportTransform,
+    additional_clips: &[RenderedPathClipPath],
+) -> Option<SvgPaintItem> {
+    if !image.is_visible() {
+        return None;
+    }
+    let size = image.size();
+    let width = size.width();
+    let height = size.height();
+    if !(width.is_finite() && height.is_finite()) || width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    let image_to_paint = svg_path_transform(image_transform, viewport)
+        .multiply(PaintTransform::new(1.0, 0.0, 0.0, -1.0, 0.0, height));
+    match image.kind() {
+        usvg::ImageKind::JPEG(bytes)
+        | usvg::ImageKind::PNG(bytes)
+        | usvg::ImageKind::GIF(bytes)
+        | usvg::ImageKind::WEBP(bytes) => {
+            let raster = crate::image_store::decode_embedded_raster(Rc::from(bytes.as_slice()))?;
+            let mut rendered = RenderedImage::from_paint_rect(
+                PaintRect::new(PaintPoint::new(0.0, 0.0), PaintSize::new(width, height)),
+                false,
+                raster.metadata.pixel_size.width,
+                raster.metadata.pixel_size.height,
+                Some(RenderedImageSourceRect {
+                    x: 0,
+                    y: 0,
+                    width: raster.metadata.pixel_size.width,
+                    height: raster.metadata.pixel_size.height,
+                }),
+                !matches!(
+                    image.rendering_mode(),
+                    usvg::ImageRendering::CrispEdges | usvg::ImageRendering::Pixelated
+                ),
+                Rc::from(raster.rgb),
+                raster.alpha.map(Rc::from),
+                None,
+            )
+            .with_raster_sample_depth(raster.sample_depth)
+            .with_transform(image_to_paint);
+            if viewport.clip_viewport {
+                rendered = rendered.with_intersected_clip(viewport_clip(viewport));
+            }
+            for clip in additional_clips {
+                rendered = rendered.with_intersected_clip(RenderedPathClip::new(
+                    clip.commands.clone(),
+                    clip.fill_rule,
+                    Vec::new(),
+                ));
+            }
+            Some(SvgPaintItem::RasterImage(Box::new(rendered)))
+        }
+        usvg::ImageKind::SVG(tree) => {
+            let source = SvgSourceRect::new(
+                SvgSourcePoint::new(0.0, 0.0),
+                SvgSourceSize::new(width, height),
+            );
+            let local_viewport = ViewportTransform::new(
+                PaintRect::new(PaintPoint::new(0.0, 0.0), PaintSize::new(width, height)),
+                source,
+                true,
+                false,
+            );
+            let mut scene = collect_svg_group(
+                tree.root(),
+                local_viewport,
+                &[],
+                usvg::Transform::default(),
+                &SvgFilterTaintCatalog::default(),
+            )
+            .transformed(image_to_paint);
+            if viewport.clip_viewport {
+                scene = scene.with_clip(viewport_clip(viewport));
+            }
+            for clip in additional_clips {
+                scene = scene.with_clip(RenderedPathClip::new(
+                    clip.commands.clone(),
+                    clip.fill_rule,
+                    Vec::new(),
+                ));
+            }
+            Some(SvgPaintItem::NestedSvg(Box::new(scene)))
+        }
+    }
 }
 
 fn render_svg_clip_path(
@@ -1527,120 +2105,32 @@ fn svg_pattern(pattern: &usvg::Pattern, opacity: f32) -> Option<RenderedSvgPathP
     {
         return None;
     }
-    let paths = svg_pattern_group_paths(pattern.root())?;
+    // A pattern cell has its own user-coordinate system.  It deliberately
+    // does not cross the SVG-root y-axis boundary here: the target path's
+    // paint-server transform applies that mapping exactly once.
+    let cell_viewport = ViewportTransform {
+        destination: PaintRect::new(
+            PaintPoint::new(0.0, 0.0),
+            PaintSize::new(tile_width, tile_height),
+        ),
+        source_to_paint: SvgSourceToPaintTransform::new(1.0, 1.0, 0.0, 0.0),
+        clip_viewport: false,
+        hard_crop_viewport: false,
+    };
+    let scene = collect_svg_group(
+        pattern.root(),
+        cell_viewport,
+        &[],
+        usvg::Transform::default(),
+        &SvgFilterTaintCatalog::default(),
+    );
     Some(RenderedSvgPathPattern {
         tile_size: PaintSize::new(tile_width, tile_height),
         origin: PaintPoint::new(rect.x(), rect.y()),
         transform: svg_gradient_transform(pattern.transform()),
-        paths,
+        scene: Box::new(scene),
         opacity,
     })
-}
-
-/// Pattern cells intentionally support only ordinary opaque vector paths for
-/// now.  This keeps an unsupported nested paint server or effect from being
-/// silently approximated by the PDF tiling Form.
-fn svg_pattern_group_paths(group: &usvg::Group) -> Option<Vec<RenderedPath>> {
-    if group.mask().is_some()
-        || !group.filters().is_empty()
-        || group.clip_path().is_some()
-        || group.opacity().get() != 1.0
-        || group.blend_mode() != usvg::BlendMode::Normal
-        || group.isolate()
-    {
-        return None;
-    }
-    let mut paths = Vec::new();
-    for node in group.children() {
-        match node {
-            usvg::Node::Group(group) => paths.extend(svg_pattern_group_paths(group)?),
-            usvg::Node::Path(path) => {
-                let path = svg_pattern_path(path)?;
-                paths.push(path);
-            }
-            usvg::Node::Image(_) | usvg::Node::Text(_) => return None,
-        }
-    }
-    Some(paths)
-}
-
-fn svg_pattern_path(path: &usvg::Path) -> Option<RenderedPath> {
-    if !path.is_visible() {
-        return None;
-    }
-    let fill = match path.fill() {
-        Some(fill) => Some(svg_pattern_solid_paint(fill)?),
-        None => None,
-    };
-    let stroke = match path.stroke() {
-        Some(stroke) => Some(svg_pattern_stroke_paint(stroke)?),
-        None => None,
-    };
-    if fill.is_none() && stroke.is_none() {
-        return None;
-    }
-    let commands = path_commands(path.data());
-    if commands.is_empty() {
-        return None;
-    }
-    let fill_rule = match path.fill().map(usvg::Fill::rule) {
-        Some(usvg::FillRule::EvenOdd) => RenderedPathFillRule::EvenOdd,
-        _ => RenderedPathFillRule::NonZero,
-    };
-    let stroke_width = PaintStrokeWidth::new(
-        path.stroke()
-            .map(|stroke| stroke.width().get())
-            .unwrap_or(0.0),
-    );
-    let transform = path.abs_transform();
-    let rendered = RenderedPath::new(commands, fill, fill_rule, stroke, stroke_width, None)
-        .with_transform(PaintTransform::new(
-            transform.sx,
-            transform.ky,
-            transform.kx,
-            transform.sy,
-            transform.tx,
-            transform.ty,
-        ));
-    let rendered = if let Some(stroke) = path.stroke() {
-        rendered.with_stroke_style(RenderedPathStrokeStyle {
-            line_cap: match stroke.linecap() {
-                usvg::LineCap::Butt => RenderedPathLineCap::Butt,
-                usvg::LineCap::Round => RenderedPathLineCap::Round,
-                usvg::LineCap::Square => RenderedPathLineCap::Square,
-            },
-            line_join: match stroke.linejoin() {
-                usvg::LineJoin::Miter | usvg::LineJoin::MiterClip => RenderedPathLineJoin::Miter,
-                usvg::LineJoin::Round => RenderedPathLineJoin::Round,
-                usvg::LineJoin::Bevel => RenderedPathLineJoin::Bevel,
-            },
-            miter_limit: stroke.miterlimit().get(),
-            dash_array: stroke.dasharray().unwrap_or_default().to_vec(),
-            dash_offset: stroke.dashoffset(),
-        })
-    } else {
-        rendered
-    };
-    Some(rendered.with_paint_order(match path.paint_order() {
-        usvg::PaintOrder::FillAndStroke => RenderedPathPaintOrder::FillThenStroke,
-        usvg::PaintOrder::StrokeAndFill => RenderedPathPaintOrder::StrokeThenFill,
-    }))
-}
-
-fn svg_pattern_solid_paint(fill: &usvg::Fill) -> Option<CssColor> {
-    let usvg::Paint::Color(color) = fill.paint() else {
-        return None;
-    };
-    let color = svg_color(*color, fill.opacity().get());
-    color.is_opaque().then_some(color)
-}
-
-fn svg_pattern_stroke_paint(stroke: &usvg::Stroke) -> Option<CssColor> {
-    let usvg::Paint::Color(color) = stroke.paint() else {
-        return None;
-    };
-    let color = svg_color(*color, stroke.opacity().get());
-    color.is_opaque().then_some(color)
 }
 
 fn svg_linear_gradient(gradient: &usvg::LinearGradient, opacity: f32) -> Option<RenderedGradient> {
@@ -1872,13 +2362,23 @@ pub(crate) fn parse_inline_svg(element: &Element) -> Result<SvgAsset, String> {
 pub(crate) fn parse_inline_svg_with_presentation_overrides(
     element: &Element,
     overrides: &SvgPresentationOverrides,
+    external_uses: &ExternalSvgUseResolver,
 ) -> Result<SvgAsset, String> {
-    let xml = serialize_inline_svg_with_presentation_overrides(element, overrides);
-    parse_svg_bytes(xml.as_bytes())
+    let xml = external_uses.expand_inline_svg(serialize_inline_svg_with_presentation_overrides(
+        element, overrides,
+    ));
+    parse_svg_bytes_with_filter_taint(xml.as_bytes(), filter_taint_catalog(element, overrides))
 }
 
 pub(crate) fn parse_svg_bytes(bytes: &[u8]) -> Result<SvgAsset, String> {
-    parse_svg_bytes_with_optional_image_context(bytes, None)
+    parse_svg_bytes_with_filter_taint(bytes, SvgFilterTaintCatalog::default())
+}
+
+fn parse_svg_bytes_with_filter_taint(
+    bytes: &[u8],
+    filter_taint: SvgFilterTaintCatalog,
+) -> Result<SvgAsset, String> {
+    parse_svg_bytes_with_optional_image_context_and_filter_taint(bytes, None, filter_taint)
 }
 
 /// Parse an external SVG image in the color-scheme environment of its
@@ -1887,12 +2387,17 @@ pub(crate) fn parse_svg_bytes_with_image_context(
     bytes: &[u8],
     image_context: SvgImageContext,
 ) -> Result<SvgAsset, String> {
-    parse_svg_bytes_with_optional_image_context(bytes, Some(image_context))
+    parse_svg_bytes_with_optional_image_context_and_filter_taint(
+        bytes,
+        Some(image_context),
+        SvgFilterTaintCatalog::default(),
+    )
 }
 
-fn parse_svg_bytes_with_optional_image_context(
+fn parse_svg_bytes_with_optional_image_context_and_filter_taint(
     bytes: &[u8],
     image_context: Option<SvgImageContext>,
+    filter_taint: SvgFilterTaintCatalog,
 ) -> Result<SvgAsset, String> {
     let normalized_source = image_context
         .and_then(|context| normalize_svg_image_stylesheet(bytes, context))
@@ -1912,6 +2417,7 @@ fn parse_svg_bytes_with_optional_image_context(
     let view_fragments = svg_view_fragments(&normalized_source);
     Ok(SvgAsset {
         tree,
+        filter_taint,
         intrinsic_size: LayoutSize::new(
             size.width() * css::CSS_PX_TO_PT,
             size.height() * css::CSS_PX_TO_PT,
@@ -2243,10 +2749,7 @@ fn svg_start_tag_close(source: &str) -> Option<usize> {
 fn parse_svg_tree(bytes: &[u8], default_size: usvg::Size) -> Result<usvg::Tree, String> {
     let options = usvg::Options {
         default_size,
-        image_href_resolver: usvg::ImageHrefResolver {
-            resolve_data: Box::new(|_, _, _| None),
-            resolve_string: Box::new(|_, _| None),
-        },
+        image_href_resolver: SvgResourceResolver::secure_static().image_href_resolver(),
         ..usvg::Options::default()
     };
     usvg::Tree::from_data(bytes, &options).map_err(|error| error.to_string())
@@ -2457,6 +2960,44 @@ pub(crate) fn serialize_inline_svg(element: &Element) -> String {
     serialize_inline_svg_with_presentation_overrides(element, &SvgPresentationOverrides::new())
 }
 
+/// Return an inline SVG attribute in the null namespace.
+///
+/// HTML's foreign-content parser preserves a legacy `xlink:href` separately
+/// from SVG 2's null-namespace `href`. The general-purpose attribute map is
+/// keyed only by local name, so inline SVG must read the namespace-aware DOM
+/// representation to avoid conflating them.
+fn inline_svg_unprefixed_attribute<'a>(element: &'a Element, name: &str) -> Option<&'a str> {
+    if element.namespace_attrs.is_empty() {
+        return element.attrs.get(name).map(String::as_str);
+    }
+    element
+        .namespace_attrs
+        .iter()
+        .find(|attribute| attribute.namespace_url.is_empty() && attribute.local_name == name)
+        .map(|attribute| attribute.value.as_str())
+}
+
+/// Collect null-namespace inline SVG attributes for XML serialization.
+///
+/// Synthetic unit-test elements predate `namespace_attrs`; retaining the
+/// empty-vector fallback keeps those fixtures valid while parsed documents use
+/// the namespace-preserving source of truth.
+fn inline_svg_unprefixed_attributes(element: &Element) -> Vec<(&str, &str)> {
+    if element.namespace_attrs.is_empty() {
+        return element
+            .attrs
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+    }
+    element
+        .namespace_attrs
+        .iter()
+        .filter(|attribute| attribute.namespace_url.is_empty())
+        .map(|attribute| (attribute.local_name.as_str(), attribute.value.as_str()))
+        .collect()
+}
+
 /// Compose an SVG presentation `transform-origin` around an existing SVG
 /// transform list.
 ///
@@ -2467,7 +3008,7 @@ pub(crate) fn serialize_inline_svg(element: &Element) -> String {
 /// transform until the scene adapter has a general fill/stroke-box resolver.
 /// <https://drafts.csswg.org/css-transforms-1/#svg-transform>
 fn svg_presentation_transform_with_origin(element: &Element, transform: &str) -> String {
-    let Some(origin) = element.attrs.get("transform-origin") else {
+    let Some(origin) = inline_svg_unprefixed_attribute(element, "transform-origin") else {
         return transform.to_owned();
     };
     let Some((x, y, width, height)) = svg_rect_fill_box(element) else {
@@ -2490,10 +3031,7 @@ fn svg_rect_fill_box(element: &Element) -> Option<(f32, f32, f32, f32)> {
         return None;
     }
     let number = |name: &str, default: f32| {
-        element
-            .attrs
-            .get(name)
-            .map_or(Some(default), |value| svg_user_length(value))
+        inline_svg_unprefixed_attribute(element, name).map_or(Some(default), svg_user_length)
     };
     let x = number("x", 0.0)?;
     let y = number("y", 0.0)?;
@@ -2670,14 +3208,14 @@ fn serialize_element(
         output.push_str(SVG_NAMESPACE);
         output.push('"');
     }
-    let mut attrs: Vec<_> = element.attrs.iter().collect();
+    let mut attrs = inline_svg_unprefixed_attributes(element);
     attrs.sort_unstable_by_key(|(name, _)| *name);
     let selected_scene_transform = override_values.and_then(|values| match values.transform {
         Some(SvgTransformOverride::Scene(transform)) => Some(transform),
         Some(SvgTransformOverride::RootBox(_)) | None => None,
     });
     let transform_is_owned = selected_scene_transform.is_some();
-    let source_transform = element.attrs.get("transform").cloned();
+    let source_transform = inline_svg_unprefixed_attribute(element, "transform").map(str::to_owned);
     let resolved_transform = match selected_scene_transform {
         Some(SvgUsedTransform::None) => None,
         Some(SvgUsedTransform::Affine(transform)) => {
@@ -2711,25 +3249,45 @@ fn serialize_element(
             // separately serializes computed inherited presentation values.
             continue;
         }
-        if name == "style" && transform_is_owned {
-            if let Some(style) = sanitize_inline_svg_transform_style(value) {
+        if name == "style"
+            && (transform_is_owned
+                || override_values.is_some_and(|values| {
+                    values.flood_color.is_some() || values.lighting_color.is_some()
+                }))
+        {
+            if let Some(style) = sanitize_inline_svg_presentation_style(
+                value,
+                transform_is_owned,
+                override_values.is_some_and(|values| values.flood_color.is_some()),
+                override_values.is_some_and(|values| values.lighting_color.is_some()),
+            ) {
                 push_attribute(output, name, &style);
             }
             continue;
         }
-        if matches!(name.as_str(), "fill" | "stroke" | "stroke-width")
-            && ((name == "fill"
+        if matches!(
+            name,
+            "fill" | "stroke" | "stroke-width" | "flood-color" | "lighting-color"
+        ) && ((name == "fill"
+            && override_values
+                .and_then(|values| values.fill.as_ref())
+                .is_some())
+            || (name == "stroke"
                 && override_values
-                    .and_then(|values| values.fill.as_ref())
+                    .and_then(|values| values.stroke.as_ref())
                     .is_some())
-                || (name == "stroke"
-                    && override_values
-                        .and_then(|values| values.stroke.as_ref())
-                        .is_some())
-                || (name == "stroke-width"
-                    && override_values
-                        .and_then(|values| values.stroke_width.as_ref())
-                        .is_some()))
+            || (name == "stroke-width"
+                && override_values
+                    .and_then(|values| values.stroke_width.as_ref())
+                    .is_some())
+            || (name == "flood-color"
+                && override_values
+                    .and_then(|values| values.flood_color)
+                    .is_some())
+            || (name == "lighting-color"
+                && override_values
+                    .and_then(|values| values.lighting_color)
+                    .is_some()))
         {
             // The host CSS declaration has author origin and therefore
             // overrides this SVG presentation attribute.
@@ -2772,6 +3330,24 @@ fn serialize_element(
         ),
     ] {
         if let Some(value) = value {
+            push_attribute(output, name, value);
+        }
+    }
+    for (name, value) in [
+        (
+            "flood-color",
+            override_values
+                .and_then(|values| values.flood_color)
+                .map(|color| svg_filter_color_attribute(color.color)),
+        ),
+        (
+            "lighting-color",
+            override_values
+                .and_then(|values| values.lighting_color)
+                .map(|color| svg_filter_color_attribute(color.color)),
+        ),
+    ] {
+        if let Some(value) = value.as_deref() {
             push_attribute(output, name, value);
         }
     }
@@ -2820,6 +3396,16 @@ fn serialize_element(
     output.push('>');
 }
 
+fn svg_filter_color_attribute(color: CssColor) -> String {
+    format!(
+        "rgba({}, {}, {}, {})",
+        (color.components()[0] * 255.0).round().clamp(0.0, 255.0),
+        (color.components()[1] * 255.0).round().clamp(0.0, 255.0),
+        (color.components()[2] * 255.0).round().clamp(0.0, 255.0),
+        color.alpha()
+    )
+}
+
 /// Serialize a typed SVG-element matrix at the only string boundary of the
 /// host-CSS-to-SVG bridge.
 fn svg_element_transform_attribute(transform: SvgElementTransform) -> String {
@@ -2832,20 +3418,28 @@ fn svg_element_transform_attribute(transform: SvgElementTransform) -> String {
 /// Remove declarations whose used values Quire has already applied to the
 /// serialized SVG transform attribute. Rebuilding only the declaration list
 /// is safe here: this is a private payload for `usvg`, not the source DOM.
-fn sanitize_inline_svg_transform_style(value: &str) -> Option<String> {
+fn sanitize_inline_svg_presentation_style(
+    value: &str,
+    remove_transform: bool,
+    remove_flood_color: bool,
+    remove_lighting_color: bool,
+) -> Option<String> {
     let declarations = css::parse_declarations(value);
     let style = declarations
         .iter()
         .filter(|(name, _)| {
-            !matches!(
-                name.as_str(),
-                "transform"
-                    | "transform-origin"
-                    | "transform-box"
-                    | "translate"
-                    | "rotate"
-                    | "scale"
-            )
+            !((remove_transform
+                && matches!(
+                    name.as_str(),
+                    "transform"
+                        | "transform-origin"
+                        | "transform-box"
+                        | "translate"
+                        | "rotate"
+                        | "scale"
+                ))
+                || (remove_flood_color && name == "flood-color")
+                || (remove_lighting_color && name == "lighting-color"))
         })
         .map(|(name, value)| format!("{name}: {value};"))
         .collect::<String>();
@@ -2957,6 +3551,7 @@ mod tests {
             tag: "rect".to_owned(),
             namespace_url: "http://www.w3.org/2000/svg".to_owned(),
             document_syntax: crate::dom::DocumentSyntax::Html,
+            document_compatibility_mode: crate::dom::DocumentCompatibilityMode::NoQuirks,
             attrs: HashMap::from([
                 ("width".to_owned(), "150".to_owned()),
                 ("height".to_owned(), "150".to_owned()),
@@ -2966,6 +3561,7 @@ mod tests {
             namespace_attrs: Vec::new(),
             children: Vec::new(),
             is_target: false,
+            selector_snapshot: std::cell::OnceCell::new(),
             object_rendering: crate::dom::ObjectRendering::Fallback,
         };
         let mut overrides = SvgPresentationOverrides::new();
@@ -2993,6 +3589,7 @@ mod tests {
             tag: "circle".to_owned(),
             namespace_url: "http://www.w3.org/2000/svg".to_owned(),
             document_syntax: crate::dom::DocumentSyntax::Html,
+            document_compatibility_mode: crate::dom::DocumentCompatibilityMode::NoQuirks,
             attrs: HashMap::from([
                 ("fill".to_owned(), "red".to_owned()),
                 ("stroke".to_owned(), "black".to_owned()),
@@ -3000,6 +3597,7 @@ mod tests {
             namespace_attrs: Vec::new(),
             children: Vec::new(),
             is_target: false,
+            selector_snapshot: std::cell::OnceCell::new(),
             object_rendering: crate::dom::ObjectRendering::Fallback,
         };
         let mut overrides = SvgPresentationOverrides::new();
@@ -3028,10 +3626,12 @@ mod tests {
             tag: "text".to_owned(),
             namespace_url: SVG_NAMESPACE.to_owned(),
             document_syntax: crate::dom::DocumentSyntax::Html,
+            document_compatibility_mode: crate::dom::DocumentCompatibilityMode::NoQuirks,
             attrs: HashMap::from([("style".to_owned(), "opacity: 0".to_owned())]),
             namespace_attrs: Vec::new(),
             children: vec![Node::text("P")],
             is_target: false,
+            selector_snapshot: std::cell::OnceCell::new(),
             object_rendering: crate::dom::ObjectRendering::Fallback,
         };
         let group = Element {
@@ -3039,12 +3639,14 @@ mod tests {
             tag: "g".to_owned(),
             namespace_url: SVG_NAMESPACE.to_owned(),
             document_syntax: crate::dom::DocumentSyntax::Html,
+            document_compatibility_mode: crate::dom::DocumentCompatibilityMode::NoQuirks,
             attrs: HashMap::from([("style".to_owned(), "opacity: 0".to_owned())]),
             namespace_attrs: Vec::new(),
             children: vec![Node {
                 kind: NodeKind::Element(text),
             }],
             is_target: false,
+            selector_snapshot: std::cell::OnceCell::new(),
             object_rendering: crate::dom::ObjectRendering::Fallback,
         };
         let mut overrides = SvgPresentationOverrides::new();
@@ -3089,6 +3691,23 @@ mod tests {
             panic!("expected SVG root");
         };
         svg
+    }
+
+    fn inline_svg_element(source: &str) -> Element {
+        fn find_svg(node: &Node) -> Option<&Element> {
+            let NodeKind::Element(element) = &node.kind else {
+                return None;
+            };
+            if element.namespace_url == SVG_NAMESPACE && element.tag == "svg" {
+                return Some(element);
+            }
+            element.children.iter().find_map(find_svg)
+        }
+
+        let document = crate::dom::parse(source);
+        find_svg(&document)
+            .expect("expected inline SVG root")
+            .clone()
     }
 
     #[test]
@@ -3524,6 +4143,51 @@ mod tests {
     }
 
     #[test]
+    fn inline_svg_keeps_modern_href_separate_from_xlink_href() {
+        let svg = inline_svg_element(
+            r##"<svg><pattern id="Copied" href="#Modern" xlink:href="#Legacy"/></svg>"##,
+        );
+        let NodeKind::Element(pattern) = &svg.children[0].kind else {
+            panic!("expected pattern child");
+        };
+
+        assert_eq!(
+            inline_svg_unprefixed_attribute(pattern, "href"),
+            Some("#Modern")
+        );
+        assert!(pattern.namespace_attrs.iter().any(|attribute| {
+            attribute.namespace_url == XLINK_NAMESPACE
+                && attribute.local_name == "href"
+                && attribute.value == "#Legacy"
+        }));
+
+        let serialized = serialize_inline_svg(&svg);
+        assert!(serialized.contains("href=\"#Modern\""));
+        assert!(serialized.contains("xlink:href=\"#Legacy\""));
+        assert!(serialized.contains(&format!("xmlns:xlink=\"{XLINK_NAMESPACE}\"")));
+    }
+
+    #[test]
+    fn inline_svg_pattern_prefers_modern_href_over_xlink_href() {
+        let svg = inline_svg_element(
+            r##"<svg width="100" height="100"><pattern id="Modern" patternUnits="userSpaceOnUse" width="25" height="25"><rect width="25" height="25" fill="green"/></pattern><pattern id="Legacy" patternUnits="userSpaceOnUse" width="25" height="25"><rect width="25" height="25" fill="red"/></pattern><pattern id="Copied" href="#Modern" xlink:href="#Legacy"/><rect width="100" height="100" fill="url(#Copied)"/></svg>"##,
+        );
+        let asset = parse_inline_svg(&svg).expect("inline SVG parses");
+        let paths = asset.paint_paths(paint_rect(0.0, 0.0, 75.0, 75.0));
+        let [path] = paths.as_slice() else {
+            panic!("expected patterned SVG path");
+        };
+        let Some(RenderedPathPaint::SvgPattern(pattern)) = path.fill_paint.as_ref() else {
+            panic!("expected SVG tiling paint");
+        };
+        let paths = simple_group_paths(pattern.scene.as_ref())
+            .expect("the pattern cell should contain a simple vector path");
+
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].fill, Some(CssColor::new(0, 128, 0)));
+    }
+
+    #[test]
     fn normalizes_shapes_to_pdf_compatible_paths() {
         let element = svg_element(
             r#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><circle cx="5" cy="5" r="5" fill="red"/></svg>"#,
@@ -3570,11 +4234,13 @@ mod tests {
         };
 
         assert_eq!(pattern.tile_size, PaintSize::new(50.0, 100.0));
-        assert_eq!(pattern.paths.len(), 4);
+        let paths = simple_group_paths(pattern.scene.as_ref())
+            .expect("the pattern cell should contain only simple vector paths");
+        assert_eq!(paths.len(), 4);
         assert_eq!(path.transform, PaintTransform::identity());
         assert_ne!(pattern.transform, PaintTransform::identity());
-        assert_eq!(pattern.paths[0].fill, Some(CssColor::new(0, 128, 0)));
-        assert_eq!(pattern.paths[3].fill, Some(CssColor::new(0, 0, 255)));
+        assert_eq!(paths[0].fill, Some(CssColor::new(0, 128, 0)));
+        assert_eq!(paths[3].fill, Some(CssColor::new(0, 0, 255)));
     }
 
     #[test]
@@ -3834,6 +4500,56 @@ mod tests {
                 .paint_paths(paint_rect(0.0, 0.0, 15.0, 7.5))
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn tainted_displacement_map_lowers_only_its_exact_source_graphic_input() {
+        let tree = parse_svg_tree(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><defs><filter id="tainted"><feFlood result="flood" flood-color="red"/><feDisplacementMap in="SourceGraphic" in2="flood" x="2" y="3" width="10" height="4"/></filter></defs><g filter="url(#tainted)"><rect width="20" height="10" fill="green"/></g></svg>"#,
+            usvg::Size::from_wh(300.0, 150.0).unwrap(),
+        )
+        .unwrap();
+        let group = tree
+            .root()
+            .children()
+            .iter()
+            .find_map(|node| match node {
+                usvg::Node::Group(group) if !group.filters().is_empty() => Some(group),
+                _ => None,
+            })
+            .unwrap();
+        let catalog = SvgFilterTaintCatalog {
+            by_filter_id: HashMap::from([(
+                "tainted".to_owned(),
+                vec![
+                    SvgFilterPrimitiveTaint {
+                        tag: "feFlood".to_owned(),
+                        color_tainted: Some(true),
+                        has_unsupported_standard_input: false,
+                        declared_inputs: Vec::new(),
+                    },
+                    SvgFilterPrimitiveTaint {
+                        tag: "feDisplacementMap".to_owned(),
+                        color_tainted: None,
+                        has_unsupported_standard_input: false,
+                        declared_inputs: vec!["SourceGraphic".to_owned(), "flood".to_owned()],
+                    },
+                ],
+            )]),
+        };
+        assert!(matches!(
+            analyze_svg_filters(group.filters(), &catalog),
+            SvgFilterAnalysis::ExactSourceGraphic {
+                filter_clip: Some(_)
+            }
+        ));
+
+        let mut untainted = catalog;
+        untainted.by_filter_id.get_mut("tainted").unwrap()[0].color_tainted = Some(false);
+        assert!(matches!(
+            analyze_svg_filters(group.filters(), &untainted),
+            SvgFilterAnalysis::RequiresRasterBackend
+        ));
     }
 
     #[test]

@@ -1,7 +1,52 @@
 use super::*;
 use crate::layout::inline_collect::InlinePlacement;
 
+/// Result of assigning one continuous vertical caption box to table-wrapper
+/// fragmentainers. The final-block-boundary flag is kept separate from the
+/// paint slices: the next wrapper part, rather than caption layout itself,
+/// decides whether an empty successor must be materialized.
+struct VerticalTableCaptionConsumption {
+    /// The table wrapper's authoritative continuation after this caption's
+    /// final slice.  It carries both the destination origin and the remaining
+    /// logical block track; callers must not rebuild either from a restored
+    /// generic-caption containing block.
+    post_caption_destination: TableFragmentainerPlacement,
+    ends_at_fragmentainer_block_end: bool,
+    paint_slices: Vec<TableCaptionPaintSlice>,
+}
+
 impl<'a> LayoutBuilder<'a> {
+    /// Advance table-wrapper flow to the next destination fragmentainer.
+    ///
+    /// Captions, table chrome, and rows share this operation at their wrapper
+    /// boundary.  It deliberately returns a `TableFragmentainerPlacement`,
+    /// rather than exposing a raw content track, so an exhausted vertical
+    /// caption cannot be handed to the grid as a zero-width destination.
+    /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+    pub(in crate::layout::table) fn advance_table_wrapper_fragmentainer(
+        &mut self,
+        table_style: &ComputedStyle,
+        containing_block: TableCaptionContainingBlock,
+    ) -> Option<TableFragmentainerPlacement> {
+        self.materialize_table_fragmentainer_advance(
+            self.active_fragmentainer_kind(),
+            FragmentainerAdvance::Unforced,
+        )?;
+        // This table-local transition selects the next temporary parent
+        // fragment, but it does not select a physical parent multicolumn
+        // destination.  The parent formatter performs that replay once.  In
+        // particular, a vertical caption's block direction cannot move the
+        // following grid to a different parent column.
+        let grid_origin =
+            PageTopPoint::new(containing_block.wrapper_table_x().points(), self.cursor_y);
+        Some(self.table_fragmentainer_placement(
+            table_style,
+            grid_origin.x(),
+            containing_block.wrapper_table_x(),
+            grid_origin.top_y(),
+        ))
+    }
+
     pub(in crate::layout::table) fn table_cell_measured_inline_outer_height(
         &mut self,
         child: &box_tree::FormattingBox<'_>,
@@ -201,10 +246,10 @@ impl<'a> LayoutBuilder<'a> {
         &self,
         style: &ComputedStyle,
         policy: TableCellContentSizingPolicy,
-    ) -> ComputedStyle {
+    ) -> css::ZoomedLayoutStyle {
         let mut style = self.style_with_current_viewport_lengths(style);
         apply_table_cell_content_sizing_policy(&mut style, policy);
-        style.into_computed()
+        style
     }
 
     /// Measure a document-canvas element when it appears as table-cell content.
@@ -606,7 +651,7 @@ impl<'a> LayoutBuilder<'a> {
             table_cell_textual_baseline_style(children, baseline_set).unwrap_or(style)
         };
         let first_baseline = self
-            .inline_text_box_metrics(baseline_style, None, 0.0)
+            .inline_text_box_metrics(baseline_style, 0.0)
             .line_baseline_offset;
         Some(match baseline_set {
             TableCellBaselineSet::First => {
@@ -632,7 +677,7 @@ impl<'a> LayoutBuilder<'a> {
         }
 
         let input = TableLayoutInput::from_fragment(fragment);
-        let rows = input.rows.as_slice();
+        let rows = input.row_ordering.rows.as_slice();
         let table_cellpadding = element
             .attrs
             .get("cellpadding")
@@ -754,7 +799,7 @@ impl<'a> LayoutBuilder<'a> {
         borders.top
             + style.padding.top
             + self
-                .inline_text_box_metrics(style, None, 0.0)
+                .inline_text_box_metrics(style, 0.0)
                 .line_baseline_offset
     }
 
@@ -767,7 +812,7 @@ impl<'a> LayoutBuilder<'a> {
     ) -> f32 {
         match baseline_set {
             TableCellBaselineSet::First => {
-                self.inline_text_box_metrics(style, None, 0.0)
+                self.inline_text_box_metrics(style, 0.0)
                     .line_baseline_offset
             }
             TableCellBaselineSet::Last => {
@@ -794,7 +839,7 @@ impl<'a> LayoutBuilder<'a> {
                 return baseline;
             }
         }
-        self.inline_text_box_metrics(style, None, 0.0)
+        self.inline_text_box_metrics(style, 0.0)
             .line_baseline_offset
     }
 
@@ -1018,32 +1063,34 @@ impl<'a> LayoutBuilder<'a> {
     ) -> Option<OverflowClip> {
         let padding_box = placement.containing_block_for(border_box, cell_borders);
         // CSS table cells grow their used row height for normal in-flow
-        // content. Unlike ordinary blocks, `hidden` and `clip` therefore do
-        // not establish a shorter used cell scrollport merely because an
-        // author supplied `height` or `max-height`; `auto`/`scroll` retain
-        // their table-cell scrollport behavior after row sizing.
+        // content before overflow is applied.  Every non-visible overflow
+        // value then clips descendants at that resulting padding edge;
+        // `hidden`, `auto`, and `scroll` remain scrollable while `clip` does
+        // not.  Do not turn this final paint/layout clip into a shorter row
+        // sizing constraint.
         // <https://drafts.csswg.org/css-tables-3/#table-height-algorithm>
-        let (overflow_x, overflow_y) = resolved_overflow_axes(cell_style);
-        let clips_scrollport_x = matches!(overflow_x, css::Overflow::Auto | css::Overflow::Scroll);
-        let clips_scrollport_y = matches!(overflow_y, css::Overflow::Auto | css::Overflow::Scroll);
+        // <https://drafts.csswg.org/css-overflow-3/#overflow-clipping>
         let paint_containment_applies = cell_element
             .is_some_and(|element| paint_containment_applies_to_element(element, cell_style));
-        if !(clips_scrollport_x || clips_scrollport_y || paint_containment_applies) {
+        let clip_axes =
+            TableCellOverflowClipAxes::from_style(cell_style, paint_containment_applies);
+        if !clip_axes.clips_any_axis() {
             return None;
         }
         let rect = padding_box.rect;
-        Some(
-            OverflowClip::from_page_top_rect(PageTopRect::new(
+        Some(OverflowClip::from_paint_rect_with_axes_and_non_scrollable(
+            PageTopRect::new(
                 rect.x(),
                 rect.top_y(),
                 rect.width().max(0.0),
                 rect.height().max(0.0),
-            ))
-            .with_axes(
-                clips_scrollport_x || paint_containment_applies,
-                clips_scrollport_y || paint_containment_applies,
-            ),
-        )
+            )
+            .paint_rect(),
+            clip_axes.clips_x,
+            clip_axes.clips_y,
+            clip_axes.non_scrollable_x,
+            clip_axes.non_scrollable_y,
+        ))
     }
 
     pub(in crate::layout::table) fn layout_table_captions(
@@ -1051,17 +1098,35 @@ impl<'a> LayoutBuilder<'a> {
         captions: &[TableCaption<'_>],
         table_style: &ComputedStyle,
         stylesheets: &Stylesheets<'_>,
-        table_x: f32,
-        table_width: TableCaptionOuterWidth,
+        containing_block: TableCaptionContainingBlock,
         side: CaptionSide,
-    ) {
-        let table_width = table_width.points();
+    ) -> TableCaptionLayoutOutcome {
+        let table_width = containing_block.outer_width().points();
+        let table_span = containing_block.physical_span();
+        debug_assert_eq!(
+            containing_block.axes().flow.writing_mode(),
+            table_style.writing_mode,
+            "caption containing block must retain its table-root axes"
+        );
         if std::env::var_os("QUIRE_TRACE_TABLE_CAPTION").is_some() {
             eprintln!(
-                "table caption container: side={side:?} input_x={table_x} input_width={table_width} parent=({}, {}) cursor={}",
-                self.content_left, self.content_right, self.cursor_y,
+                "table caption container: side={side:?} input_x={} input_width={table_width} parent=({}, {}) cursor={}",
+                table_span.left_x(),
+                self.content_left,
+                self.content_right,
+                self.cursor_y,
             );
         }
+        let opening_content_left = self.content_left;
+        let mut final_fragmentainer_left = self.content_left;
+        // A vertical table wrapper advances along physical X.  Keep this
+        // typed destination while the wrapper track still reflects the
+        // consumed caption, rather than synthesizing one after generic
+        // caption layout restores its temporary containing block.
+        let mut post_caption_destination = None;
+        let mut vertical_block_progress = TableGridLength::new(0.0);
+        let mut ends_at_fragmentainer_block_end = false;
+        let mut caption_paint_slices = Vec::new();
         for caption in captions {
             let mut caption_style = self.style_for_table_caption(caption, table_style, stylesheets);
             if caption_style.caption_side != side || caption_style.display.is_none() {
@@ -1141,9 +1206,34 @@ impl<'a> LayoutBuilder<'a> {
                     caption_style.writing_mode, caption_style.caption_side,
                 );
             }
-            self.content_left = table_x;
-            self.content_right = table_x + caption_available_width;
+            if let Some(horizontal_span) = containing_block.legacy_horizontal_span() {
+                self.content_left = horizontal_span.left_x();
+                self.content_right = horizontal_span.right_x();
+            }
             self.push_float_context();
+            let caption_inline_block_start = PageTopBlockPosition::new(self.cursor_y);
+            // The caption's inherited writing mode is the formatting root
+            // that establishes its logical block extent.  The wrapper axis
+            // is retained for destination projection below, but using it to
+            // classify generic caption content loses inherited vertical
+            // writing modes at the anonymous table-wrapper boundary.
+            let vertical_caption = caption_style.writing_mode.has_vertical_lines();
+            // A caption is a wrapper-flow sibling, not an independently
+            // paginated physical block.  For a vertical table, first lay out
+            // one continuous source subtree and let the table wrapper assign
+            // its logical block slices to the same fragmentainer sequence as
+            // the row grid.
+            // <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+            // <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+            let caption_paint_checkpoint = self.current_page.paint_checkpoint();
+            if vertical_caption {
+                self.fragmentation_suppression_depth += 1;
+            }
+            // The table-part adapter has already applied the caption's
+            // effective zoom. Its generic block replay consumes this value
+            // only as used geometry, so prevent that nested entry from
+            // scaling the same fixed lengths again.
+            caption_style.effective_zoom = css::EffectiveZoom::NORMAL;
             if let Some(children) = caption.children.as_deref() {
                 self.layout_element_box(
                     caption.element,
@@ -1157,10 +1247,344 @@ impl<'a> LayoutBuilder<'a> {
             } else {
                 self.layout_element(caption.element, &caption_style, stylesheets);
             }
+            if !vertical_caption {
+                // Generic block layout selected the active destination for a
+                // horizontal caption.  Retain that typed track while it is
+                // current, before restoring the caller's temporary
+                // containing block for the next wrapper sibling.
+                final_fragmentainer_left = self.content_left;
+            }
+            if vertical_caption {
+                self.fragmentation_suppression_depth -= 1;
+                let caption_block_size = layout_pt(
+                    self.last_block_layout_outcome
+                        .physical_border_box_inline_span
+                        .points()
+                        .max(0.0),
+                );
+                // Keep caption paint in its own wrapper-source coordinate
+                // space.  Captions are not table-grid source paint, but they
+                // must still be replayed through the same committed parent
+                // multicol projections as the following grid.  Projecting
+                // them eagerly through root pages used a second destination
+                // sequence and made a vertical caption reappear in the wrong
+                // anonymous columns.
+                let caption_source = if let Some(source_border_rect) =
+                    self.last_block_layout_outcome.static_border_box
+                {
+                    let source = self
+                        .current_page
+                        .take_paint_fragment_since(caption_paint_checkpoint.clone());
+                    let source_bounds = PaintClip::from_paint_rect(source_border_rect);
+                    let caption_policy = StackingContextPolicy::for_atomic(
+                        &caption_style,
+                        PaintBand::InFlowBlock,
+                        source_bounds,
+                    );
+                    self.scope_current_page_fragment_with_policy(
+                        &caption_paint_checkpoint,
+                        caption_policy,
+                        source_bounds,
+                        source,
+                        Vec::new(),
+                    );
+                    Some((
+                        self.current_page
+                            .take_paint_fragment_since(caption_paint_checkpoint.clone()),
+                        PageTopPoint::new(
+                            source_border_rect.origin.x,
+                            source_border_rect.origin.y + source_border_rect.size.height,
+                        ),
+                        LogicalSize {
+                            inline: source_border_rect.size.height,
+                            block: source_border_rect.size.width,
+                        },
+                    ))
+                } else {
+                    None
+                };
+                // Generic layout temporarily uses the caption's source box as
+                // its physical X containing block. Restore the active table
+                // fragmentainer track before consuming wrapper progress.
+                self.content_left = previous_left;
+                self.content_right = previous_right;
+                let consumption = self.consume_vertical_table_caption_block_size(
+                    FlowAxes::for_style(&caption_style),
+                    caption_block_size,
+                    caption_source
+                        .as_ref()
+                        .map(|(_, _, source_extent)| source_extent.inline)
+                        .unwrap_or(0.0),
+                    table_style,
+                    containing_block,
+                );
+                if let Some(consumption) = consumption {
+                    ends_at_fragmentainer_block_end = consumption.ends_at_fragmentainer_block_end;
+                    post_caption_destination = Some(consumption.post_caption_destination);
+                    caption_paint_slices.extend(consumption.paint_slices.iter().map(|slice| {
+                        let mut slice = *slice;
+                        slice.source_block_start = layout_pt(
+                            slice.source_block_start.points() + vertical_block_progress.get(),
+                        );
+                        slice
+                    }));
+                    if let Some((source, source_origin, source_extent)) = caption_source {
+                        let projected = self.project_vertical_table_caption_paint(
+                            source,
+                            &consumption.paint_slices,
+                            FlowAxes::for_style(&caption_style),
+                            source_origin,
+                            source_extent,
+                        );
+                        let first_fragment_inline_offset = (caption_inline_block_start.points()
+                            - self.current_page_context.top())
+                        .abs();
+                        let first_page_index = consumption
+                            .paint_slices
+                            .first()
+                            .map(|slice| slice.page_index);
+                        let first_fragment_translation = if first_fragment_inline_offset > 0.01 {
+                            match FlowAxes::for_style(&caption_style).inline_start_side() {
+                                PhysicalSide::Top => {
+                                    PaintTranslation::new(0.0, -first_fragment_inline_offset)
+                                }
+                                PhysicalSide::Bottom => {
+                                    PaintTranslation::new(0.0, first_fragment_inline_offset)
+                                }
+                                PhysicalSide::Left | PhysicalSide::Right => unreachable!(
+                                    "vertical caption projection has a vertical logical inline axis"
+                                ),
+                            }
+                        } else {
+                            PaintTranslation::identity()
+                        };
+                        for (page_index, fragment) in projected {
+                            let fragment = if Some(page_index) == first_page_index {
+                                fragment.translated(first_fragment_translation)
+                            } else {
+                                fragment
+                            };
+                            if page_index < self.pages.len() {
+                                self.pages[page_index].append_paint_fragment_owned(
+                                    fragment,
+                                    PaintTranslation::identity(),
+                                );
+                            } else {
+                                self.current_page.append_paint_fragment_owned(
+                                    fragment,
+                                    PaintTranslation::identity(),
+                                );
+                            }
+                        }
+                    }
+                }
+                vertical_block_progress = TableGridLength::new(
+                    vertical_block_progress.get()
+                        + self
+                            .last_block_layout_outcome
+                            .physical_border_box_inline_span
+                            .points()
+                            .max(0.0),
+                );
+                final_fragmentainer_left = self.content_left;
+            }
             self.pop_float_context();
-            self.content_left = previous_left;
-            self.content_right = previous_right;
+            // The generic caption entry temporarily owns its containing
+            // bounds.  A vertical table wrapper then replaces those bounds
+            // with the post-caption fragmentainer track in
+            // `consume_vertical_table_caption_block_size`.  Preserve that
+            // track for the following caption and the table grid; restoring
+            // `previous_*` here would make both start before the caption.
+            // A vertical caption in a horizontal table remains generic
+            // caption content, so it retains the existing restoration.
+            if !table_style.writing_mode.has_vertical_lines() || !vertical_caption {
+                self.content_left = previous_left;
+                self.content_right = previous_right;
+            }
         }
+        let wrapper_translation = final_fragmentainer_left - opening_content_left;
+        let final_wrapper_table_x = if table_style.writing_mode.has_vertical_lines() {
+            // A vertical caption's local block slices may consume temporary
+            // parent tracks, but those tracks are not the table grid's local
+            // inline coordinate. The enclosing multicolumn formatter owns
+            // their final physical replay; leaking `content_left` here moves
+            // the grid away from its immutable source frame.
+            containing_block.wrapper_table_x()
+        } else {
+            PageInlinePosition::new(
+                containing_block.wrapper_table_x().points() + wrapper_translation,
+            )
+        };
+        let grid_origin = PageTopPoint::new(final_wrapper_table_x.points(), self.cursor_y);
+        // For a vertical root this is the exact placement captured after the
+        // final caption slice consumed its destination track.  Horizontal
+        // caption layout retains its longstanding physical-cursor contract.
+        // <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+        // <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+        let final_destination = if table_style.writing_mode.has_vertical_lines() {
+            post_caption_destination.unwrap_or_else(|| {
+                self.table_fragmentainer_placement(
+                    table_style,
+                    grid_origin.x(),
+                    final_wrapper_table_x,
+                    grid_origin.top_y(),
+                )
+            })
+        } else {
+            self.table_fragmentainer_placement(
+                table_style,
+                grid_origin.x(),
+                final_wrapper_table_x,
+                grid_origin.top_y(),
+            )
+        };
+        TableCaptionLayoutOutcome::new(
+            final_destination,
+            caption_paint_slices,
+            TableWrapperBlockInterval::new(
+                TableWrapperBlockOffset::zero(),
+                vertical_block_progress,
+            ),
+            vertical_block_progress,
+            ends_at_fragmentainer_block_end,
+        )
+    }
+
+    /// Consume a vertical table-caption's logical block extent through the
+    /// table wrapper's active fragmentainer sequence.
+    ///
+    /// This is deliberately table-local: normal block layout owns caption
+    /// content, while the table wrapper owns the class-A continuation that
+    /// follows a caption and precedes a grid or another caption.  In
+    /// particular, a multicolumn continuation must use the same materializer
+    /// as table rows so its anonymous-column page is replayed in source order.
+    /// <https://www.w3.org/TR/css-break-3/#possible-breaks>
+    /// <https://www.w3.org/TR/css-multicol-1/#pagination-and-overflow-outside-multicol>
+    fn consume_vertical_table_caption_block_size(
+        &mut self,
+        axes: FlowAxes,
+        block_size: LayoutLength,
+        source_inline_extent: f32,
+        table_style: &ComputedStyle,
+        containing_block: TableCaptionContainingBlock,
+    ) -> Option<VerticalTableCaptionConsumption> {
+        let mut remaining = block_size.points().max(0.0);
+        if remaining <= 0.01 {
+            return None;
+        }
+
+        let block_start_side = axes.block_start_side();
+        debug_assert!(matches!(
+            block_start_side,
+            PhysicalSide::Left | PhysicalSide::Right
+        ));
+        let initial_context = self.current_page_context;
+        let inline_start_inset = self.content_left - initial_context.left();
+        let inline_end_inset = initial_context.right() - self.content_right;
+        let mut source_block_start = 0.0;
+        let mut paint_slices = Vec::new();
+        loop {
+            let context = self.current_page_context;
+            let available = (self.content_right - self.content_left).max(0.0);
+            if available <= 0.01 {
+                break;
+            }
+            let used = remaining.min(available);
+            paint_slices.push(TableCaptionPaintSlice {
+                page_index: self.pages.len(),
+                source_block_start: layout_pt(source_block_start),
+                block_size: layout_pt(used),
+                destination: self.table_fragmentainer_placement(
+                    table_style,
+                    containing_block.wrapper_table_x().points(),
+                    containing_block.wrapper_table_x(),
+                    context.top(),
+                ),
+                destination_context: context,
+                // This is a selected temporary parent fragment, not the
+                // continuous caption source canvas.  Packing each caption
+                // source slice at this fragmentainer's physical origin makes
+                // the enclosing multicolumn replay apply its projection once
+                // (the same contract used by generic vertical root blocks).
+                destination_origin: PageTopPoint::new(context.left(), context.top()),
+                destination_extent: LogicalSize {
+                    inline: source_inline_extent,
+                    block: available,
+                },
+                destination_block_start: layout_pt(0.0),
+            });
+            remaining -= used;
+            source_block_start += used;
+            match block_start_side {
+                PhysicalSide::Left => {
+                    self.content_left = (self.content_left + used).min(self.content_right);
+                }
+                PhysicalSide::Right => {
+                    self.content_right = (self.content_right - used).max(self.content_left);
+                }
+                PhysicalSide::Top | PhysicalSide::Bottom => unreachable!(),
+            }
+            if remaining <= 0.01 {
+                break;
+            }
+            self.materialize_table_fragmentainer_advance(
+                self.active_fragmentainer_kind(),
+                FragmentainerAdvance::Unforced,
+            )?;
+            self.content_left = self.current_page_context.left() + inline_start_inset;
+            self.content_right =
+                (self.current_page_context.right() - inline_end_inset).max(self.content_left);
+        }
+        let ends_at_fragmentainer_block_end =
+            (self.content_right - self.content_left).abs() <= 0.01;
+        // Capture this before the caller restores any temporary generic
+        // caption bounds.  The grid is the next table-wrapper sibling and
+        // must inherit this precise remaining logical block capacity.
+        let post_caption_destination = self.table_fragmentainer_placement(
+            table_style,
+            containing_block.wrapper_table_x().points(),
+            containing_block.wrapper_table_x(),
+            self.current_page_context.top(),
+        );
+        Some(VerticalTableCaptionConsumption {
+            post_caption_destination,
+            ends_at_fragmentainer_block_end,
+            paint_slices,
+        })
+    }
+
+    /// Project retained caption paint through table-selected destinations.
+    ///
+    /// The parent multicolumn formatter receives the completed fragments as
+    /// ordinary parent paint and therefore applies its own projection once.
+    /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+    fn project_vertical_table_caption_paint(
+        &self,
+        source: PaintFragment,
+        slices: &[TableCaptionPaintSlice],
+        axes: FlowAxes,
+        source_origin: PageTopPoint,
+        source_extent: LogicalSize,
+    ) -> Vec<(usize, PaintFragment)> {
+        let parent_slices = slices
+            .iter()
+            .map(|slice| VerticalRootPageFragmentSlice {
+                page_index: slice.page_index,
+                source_block_start: slice.source_block_start,
+                block_size: slice.block_size,
+                destination_context: slice.destination_context,
+                destination_origin: slice.destination_origin,
+                destination_extent: slice.destination_extent,
+                destination_block_start: slice.destination_block_start,
+            })
+            .collect::<Vec<_>>();
+        self.project_vertical_root_fragment_paint(
+            source,
+            &parent_slices,
+            axes,
+            source_origin,
+            source_extent,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1182,7 +1606,7 @@ impl<'a> LayoutBuilder<'a> {
         let collapsed_columns =
             self.collapsed_table_columns(columns, table_style, stylesheets, column_count);
         let mut collapsed_grid =
-            CollapsedBorderGrid::new(rows.len(), column_count, table_style.used_direction());
+            CollapsedBorderGrid::new(rows.len(), column_count, TableAxes::for_style(table_style));
         collapsed_grid.add_table(table_style, rows.len(), column_count);
         for (row_index, row) in rows.iter().enumerate() {
             let row_style = self.style_for_table_row(row, table_style, stylesheets);
@@ -1286,6 +1710,37 @@ fn table_cell_inline_sequence_first_baseline_offset(
     })
 }
 
+/// Axis-specific overflow clipping established by a table cell's final used
+/// padding box.
+///
+/// Table row sizing is complete before this value is used.  It therefore
+/// describes only descendant clipping, never a substitute cell-size
+/// constraint.
+/// <https://drafts.csswg.org/css-overflow-3/#overflow-clipping>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TableCellOverflowClipAxes {
+    clips_x: bool,
+    clips_y: bool,
+    non_scrollable_x: bool,
+    non_scrollable_y: bool,
+}
+
+impl TableCellOverflowClipAxes {
+    fn from_style(cell_style: &ComputedStyle, paint_containment_applies: bool) -> Self {
+        let used_overflow = UsedOverflowAxes::from_style(cell_style);
+        Self {
+            clips_x: used_overflow.clips_x() || paint_containment_applies,
+            clips_y: used_overflow.clips_y() || paint_containment_applies,
+            non_scrollable_x: used_overflow.non_scrollable_clip_x(),
+            non_scrollable_y: used_overflow.non_scrollable_clip_y(),
+        }
+    }
+
+    fn clips_any_axis(self) -> bool {
+        self.clips_x || self.clips_y
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1313,6 +1768,35 @@ mod tests {
             target_references: crate::layout::TargetReferenceSnapshot::default(),
             font_system: FontSystem::new(),
         })
+    }
+
+    #[test]
+    fn table_cell_hidden_and_clip_keep_their_distinct_overflow_axes() {
+        let mut hidden = ComputedStyle::initial();
+        hidden.overflow_x = css::Overflow::Hidden;
+        hidden.overflow_y = css::Overflow::Hidden;
+        assert_eq!(
+            TableCellOverflowClipAxes::from_style(&hidden, false),
+            TableCellOverflowClipAxes {
+                clips_x: true,
+                clips_y: true,
+                non_scrollable_x: false,
+                non_scrollable_y: false,
+            }
+        );
+
+        let mut clip = ComputedStyle::initial();
+        clip.overflow_x = css::Overflow::Clip;
+        clip.overflow_y = css::Overflow::Clip;
+        assert_eq!(
+            TableCellOverflowClipAxes::from_style(&clip, false),
+            TableCellOverflowClipAxes {
+                clips_x: true,
+                clips_y: true,
+                non_scrollable_x: true,
+                non_scrollable_y: true,
+            }
+        );
     }
 
     #[test]

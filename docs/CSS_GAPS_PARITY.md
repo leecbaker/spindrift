@@ -68,6 +68,10 @@ decorations, plus complex intersection and writing-mode cases.
   `*-rule-visibility-items`, honors `rule-overlap`, and paints the CSS line
   styles used by borders. Double gap rules paint two symmetric stripes around
   the gap-rule centerline rather than reusing a box-edge border orientation.
+- For wrapped flex intersections, the shared painter preserves CSS flex order
+  for rule-list assignment while traversing crossing portions in physical
+  centerline order. Non-uniform main-axis gaps therefore form the required
+  ordered row-rule segments without rewriting their assigned rule slots.
 - Wrapped multicolumn rows now construct an owned gap topology containing both
   rule axes and abutting row-gap crossings. This preserves logical rule
   assignment and junction endpoints across row replay, and emits both axes in

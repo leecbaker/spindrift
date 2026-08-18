@@ -1,5 +1,6 @@
-use crate::dom::{Element, ElementId};
-use crate::image_store::{DocumentImageStore, ImageId, ImageMetadata};
+use crate::dom::{self, DocumentSyntax, Element, ElementId, Node, NodeKind};
+use crate::image_store::{DocumentImageStore, ImageId, ImageMetadata, RasterOrientationPolicy};
+use crate::layout::IframeEmbeddingContext;
 use crate::svg::{
     SharedSvgAsset, SvgImageContext, SvgPresentationOverrides,
     parse_inline_svg_with_presentation_overrides, parse_svg_bytes_with_image_context,
@@ -392,6 +393,7 @@ fn fetch_data_url(location: &Url) -> crate::Result<FetchedResource> {
 #[derive(Debug, Clone)]
 pub(crate) struct ResourceCache {
     bytes: HashMap<Url, Arc<Vec<u8>>>,
+    resource_metadata: HashMap<Url, CachedResourceMetadata>,
     cors_response_metadata: HashMap<Url, CorsResponseMetadata>,
     image_store: RefCell<DocumentImageStore>,
     svg_assets: RefCell<HashMap<ElementId, Option<SharedSvgAsset>>>,
@@ -402,10 +404,11 @@ pub(crate) struct ResourceCache {
     /// these overrides while constructing its own SVG scene, without mutating
     /// the source DOM used by HTML selector matching.
     svg_presentation_overrides: RefCell<SvgPresentationOverrides>,
+    external_svg_uses: ExternalSvgUseResolver,
     /// Used iframe content-box viewport dimensions recorded during the parent
     /// measurement layout. They let nested browsing contexts lay out against
     /// their actual embedding viewport on the final pass.
-    iframe_viewports: RefCell<HashMap<ElementId, (f32, f32)>>,
+    iframe_viewports: RefCell<HashMap<ElementId, IframeEmbeddingContext>>,
     image_assets: RefCell<HashMap<(Url, SvgImageContext), Option<ResourceImageAsset>>>,
     oriented_image_assets: RefCell<HashMap<(Url, SvgImageContext), Option<ResourceImageAsset>>>,
     data_image_assets: RefCell<HashMap<(String, SvgImageContext), Option<ResourceImageAsset>>>,
@@ -420,14 +423,34 @@ struct CorsResponseMetadata {
     allow_credentials: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+struct CachedResourceMetadata {
+    final_url: Option<Url>,
+    content_type: Option<String>,
+}
+
+/// The fetch visibility of an image response as it affects `image-orientation`.
+///
+/// An opaque cross-origin image must not reveal whether it carries orientation
+/// metadata through `image-orientation: none`; origin-clean image responses
+/// may select their encoded, unrotated representation.
+/// <https://github.com/w3c/csswg-drafts/issues/5165>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImageFetchTaint {
+    OriginClean,
+    Opaque,
+}
+
 impl Default for ResourceCache {
     fn default() -> Self {
         Self {
             bytes: HashMap::new(),
+            resource_metadata: HashMap::new(),
             cors_response_metadata: HashMap::new(),
             image_store: RefCell::new(DocumentImageStore::default()),
             svg_assets: RefCell::new(HashMap::new()),
             svg_presentation_overrides: RefCell::new(SvgPresentationOverrides::new()),
+            external_svg_uses: ExternalSvgUseResolver::default(),
             iframe_viewports: RefCell::new(HashMap::new()),
             image_assets: RefCell::new(HashMap::new()),
             oriented_image_assets: RefCell::new(HashMap::new()),
@@ -438,6 +461,307 @@ impl Default for ResourceCache {
             // until their raw-pixel parameters are removed.
             placeholder_rgb: Rc::from(vec![0, 0, 0].into_boxed_slice()),
         }
+    }
+}
+
+/// A statically preloaded external SVG document available to an inline
+/// `<use>` expansion.
+///
+/// SVG 2 treats `use` with an external `href` as a structurally external
+/// reference. The graph is deliberately resolved before `usvg` normalizes the
+/// inline SVG, since `usvg` only resolves fragment identifiers in one XML
+/// document. <https://www.w3.org/TR/SVG2/struct.html#UseElement>
+#[derive(Debug, Clone)]
+struct ExternalSvgDocument {
+    source: Node,
+    url: Url,
+}
+
+/// Read-only catalog of same-origin external SVG documents used by inline
+/// SVG `<use>` elements.
+///
+/// It contains only bytes fetched during Quire's visual-resource preload; SVG
+/// parsing never performs I/O. <https://www.w3.org/TR/SVG2/linking.html#processingURL>
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ExternalSvgUseResolver {
+    base_url: Option<Url>,
+    root_url: Option<Url>,
+    documents: HashMap<Url, ExternalSvgDocument>,
+}
+
+impl ExternalSvgUseResolver {
+    /// Expand a serialized inline SVG into one self-contained XML document.
+    /// Any failed import stays as an unresolved `<use>`, which `usvg` omits.
+    pub(crate) fn expand_inline_svg(&self, source: String) -> String {
+        if self.documents.is_empty() {
+            return source;
+        }
+        let Ok(mut document) = dom::parse_with_syntax(&source, DocumentSyntax::Xml) else {
+            return source;
+        };
+        let Some(root) = first_svg_element_mut(&mut document) else {
+            return source;
+        };
+        let Some(referring_url) = self.base_url.as_ref().or(self.root_url.as_ref()) else {
+            return source;
+        };
+        let mut state = SvgExternalImportState::default();
+        self.rewrite_external_uses(root, referring_url, &mut state);
+        if !state.imports.is_empty() {
+            let mut defs = svg_element("defs");
+            defs.children = state.imports;
+            root.children.insert(
+                0,
+                Node {
+                    kind: NodeKind::Element(defs),
+                },
+            );
+        }
+        crate::svg::serialize_inline_svg(root)
+    }
+
+    fn rewrite_external_uses(
+        &self,
+        node: &mut Element,
+        referring_url: &Url,
+        state: &mut SvgExternalImportState,
+    ) {
+        if node.namespace_url == SVG_NAMESPACE
+            && node.tag == "use"
+            && let Some(href) = svg_href(node).map(str::to_owned)
+            && let Some((document_url, fragment)) = self.external_href(&href, referring_url)
+            && let Some(local_id) = self.import_target(&document_url, &fragment, state)
+        {
+            set_svg_href(node, &format!("#{local_id}"));
+        }
+        for child in &mut node.children {
+            if let NodeKind::Element(child) = &mut child.kind {
+                self.rewrite_external_uses(child, referring_url, state);
+            }
+        }
+    }
+
+    fn import_target(
+        &self,
+        document_url: &Url,
+        fragment: &str,
+        state: &mut SvgExternalImportState,
+    ) -> Option<String> {
+        let document = self.documents.get(document_url)?;
+        let source = svg_fragment_containing_target(&document.source, fragment)?;
+        let prefix = if let Some(prefix) = state.prefixes.get(document_url) {
+            prefix.clone()
+        } else {
+            let prefix = format!("quire-external-{}-", state.prefixes.len());
+            state.prefixes.insert(document_url.clone(), prefix.clone());
+            let mut source = source;
+            namespace_svg_ids(&mut source, &prefix);
+            if let NodeKind::Element(source) = &mut source.kind {
+                self.rewrite_external_uses(source, &document.url, state);
+            }
+            state.imports.push(source);
+            prefix
+        };
+        let target = format!("{prefix}{fragment}");
+        imported_svg_id_exists(state, &target).then_some(target)
+    }
+
+    fn external_href(&self, href: &str, referring_url: &Url) -> Option<(Url, String)> {
+        if href.starts_with('#') {
+            return None;
+        }
+        let resolved = resolve_url(href, Some(referring_url), Some(referring_url))?;
+        let fragment = resolved.fragment()?.to_owned();
+        (!fragment.is_empty()).then_some(())?;
+        let document_url = fetch_url(&resolved)?;
+        same_svg_resource_origin(referring_url, &document_url).then_some(())?;
+        self.documents
+            .contains_key(&document_url)
+            .then_some((document_url, fragment))
+    }
+}
+
+#[derive(Default)]
+struct SvgExternalImportState {
+    prefixes: HashMap<Url, String>,
+    imports: Vec<Node>,
+}
+
+const SVG_NAMESPACE: &str = "http://www.w3.org/2000/svg";
+const XLINK_NAMESPACE: &str = "http://www.w3.org/1999/xlink";
+
+fn first_svg_element_mut(node: &mut Node) -> Option<&mut Element> {
+    let NodeKind::Element(element) = &mut node.kind else {
+        return None;
+    };
+    if element.namespace_url == SVG_NAMESPACE && element.tag == "svg" {
+        return Some(element);
+    }
+    element.children.iter_mut().find_map(first_svg_element_mut)
+}
+
+fn svg_fragment_containing_target(node: &Node, target: &str) -> Option<Node> {
+    fn visit(node: &Node, target: &str, owner: Option<&Element>) -> Option<Node> {
+        let NodeKind::Element(element) = &node.kind else {
+            return None;
+        };
+        let owner = (element.namespace_url == SVG_NAMESPACE && element.tag == "svg")
+            .then_some(element)
+            .or(owner);
+        if element.attrs.get("id").is_some_and(|id| id == target)
+            && element.namespace_url == SVG_NAMESPACE
+        {
+            return Some(Node {
+                kind: NodeKind::Element(
+                    owner
+                        .map(svg_owner_import_defs)
+                        .unwrap_or_else(|| element.clone()),
+                ),
+            });
+        }
+        element
+            .children
+            .iter()
+            .find_map(|child| visit(child, target, owner))
+    }
+    visit(node, target, None)
+}
+
+/// Import an owning SVG's local definition tree into the host definitions.
+/// This retains sibling paint servers and SVG-local styles without wrapping a
+/// symbol in a nested viewport, which the SVG backend does not instantiate.
+fn svg_owner_import_defs(owner: &Element) -> Element {
+    let mut defs = svg_element("defs");
+    defs.children = owner.children.clone();
+    defs
+}
+
+fn svg_element(tag: &str) -> Element {
+    let mut node = Node::element(tag);
+    let NodeKind::Element(element) = &mut node.kind else {
+        unreachable!("new node is an element");
+    };
+    element.namespace_url = SVG_NAMESPACE.to_owned();
+    element.document_syntax = DocumentSyntax::Xml;
+    element.clone()
+}
+
+fn svg_href(element: &Element) -> Option<&str> {
+    element.attrs.get("href").map(String::as_str).or_else(|| {
+        element
+            .namespace_attrs
+            .iter()
+            .find(|attribute| {
+                attribute.namespace_url == XLINK_NAMESPACE && attribute.local_name == "href"
+            })
+            .map(|attribute| attribute.value.as_str())
+    })
+}
+
+fn set_svg_href(element: &mut Element, value: &str) {
+    element.attrs.insert("href".to_owned(), value.to_owned());
+    for attribute in &mut element.namespace_attrs {
+        if attribute.local_name == "href" {
+            attribute.value = value.to_owned();
+        }
+    }
+}
+
+fn namespace_svg_ids(node: &mut Node, prefix: &str) {
+    let mut identifiers = HashMap::new();
+    collect_svg_ids(node, prefix, &mut identifiers);
+    rewrite_svg_identifiers(node, &identifiers);
+}
+
+fn collect_svg_ids(node: &Node, prefix: &str, identifiers: &mut HashMap<String, String>) {
+    let NodeKind::Element(element) = &node.kind else {
+        return;
+    };
+    if let Some(id) = element.attrs.get("id") {
+        identifiers.insert(id.clone(), format!("{prefix}{id}"));
+    }
+    for child in &element.children {
+        collect_svg_ids(child, prefix, identifiers);
+    }
+}
+
+fn rewrite_svg_identifiers(node: &mut Node, identifiers: &HashMap<String, String>) {
+    let NodeKind::Element(element) = &mut node.kind else {
+        return;
+    };
+    for (name, value) in &mut element.attrs {
+        if name == "id"
+            && let Some(replacement) = identifiers.get(value)
+        {
+            *value = replacement.clone();
+        } else {
+            *value = rewrite_svg_identifier_value(value, identifiers);
+        }
+    }
+    for attribute in &mut element.namespace_attrs {
+        if attribute.local_name == "id"
+            && attribute.namespace_url.is_empty()
+            && let Some(replacement) = identifiers.get(&attribute.value)
+        {
+            attribute.value = replacement.clone();
+        } else {
+            attribute.value = rewrite_svg_identifier_value(&attribute.value, identifiers);
+        }
+    }
+    for child in &mut element.children {
+        rewrite_svg_identifiers(child, identifiers);
+    }
+}
+
+fn rewrite_svg_identifier_value(value: &str, identifiers: &HashMap<String, String>) -> String {
+    let mut rewritten = value.to_owned();
+    if let Some(id) = value.strip_prefix('#')
+        && let Some(replacement) = identifiers.get(id)
+    {
+        rewritten = format!("#{replacement}");
+    }
+    for (id, replacement) in identifiers {
+        rewritten = rewritten.replace(&format!("url(#{id})"), &format!("url(#{replacement})"));
+    }
+    rewritten
+}
+
+fn imported_svg_id_exists(state: &SvgExternalImportState, target: &str) -> bool {
+    fn contains(node: &Node, target: &str) -> bool {
+        let NodeKind::Element(element) = &node.kind else {
+            return false;
+        };
+        element.attrs.get("id").is_some_and(|id| id == target)
+            || element.children.iter().any(|child| contains(child, target))
+    }
+    state.imports.iter().any(|node| contains(node, target))
+}
+
+/// Discover document URLs referenced by inline SVG `<use>` elements. The
+/// caller supplies the current document URL because each nested external SVG
+/// resolves relative references against the fetched document's final URL.
+fn collect_svg_use_document_urls(
+    node: &Node,
+    base_url: Option<&Url>,
+    root_url: Option<&Url>,
+    pending: &mut VecDeque<(Url, Url)>,
+) {
+    let NodeKind::Element(element) = &node.kind else {
+        return;
+    };
+    if element.namespace_url == SVG_NAMESPACE
+        && element.tag == "use"
+        && let Some(href) = svg_href(element)
+        && !href.starts_with('#')
+        && let Some(url) = resolve_url(href, base_url, root_url)
+        && url.fragment().is_some_and(|fragment| !fragment.is_empty())
+        && let Some(fetch_url) = fetch_url(&url)
+        && let Some(referring_url) = base_url.or(root_url)
+    {
+        pending.push_back((fetch_url, referring_url.clone()));
+    }
+    for child in &element.children {
+        collect_svg_use_document_urls(child, base_url, root_url, pending);
     }
 }
 
@@ -452,13 +776,15 @@ pub(crate) enum ResourceImageAsset {
 }
 
 impl ResourceCache {
-    pub(crate) fn record_iframe_viewport(&self, element: ElementId, width: f32, height: f32) {
-        self.iframe_viewports
-            .borrow_mut()
-            .insert(element, (width.max(0.0), height.max(0.0)));
+    pub(crate) fn record_iframe_viewport(
+        &self,
+        element: ElementId,
+        context: IframeEmbeddingContext,
+    ) {
+        self.iframe_viewports.borrow_mut().insert(element, context);
     }
 
-    pub(crate) fn take_iframe_viewports(&self) -> HashMap<ElementId, (f32, f32)> {
+    pub(crate) fn take_iframe_viewports(&self) -> HashMap<ElementId, IframeEmbeddingContext> {
         std::mem::take(&mut *self.iframe_viewports.borrow_mut())
     }
 
@@ -479,64 +805,26 @@ impl ResourceCache {
         fetcher: &ResourceFetcher,
         urls: impl IntoIterator<Item = Url>,
     ) -> crate::Result<Self> {
-        const MAX_SVG_RESOURCE_DEPTH: usize = 8;
-        const MAX_NESTED_SVG_RESOURCES: usize = 256;
-        const MAX_SVG_RESOURCE_BYTES: usize = 8 * 1024 * 1024;
-        const MAX_NESTED_SVG_BYTES: usize = 32 * 1024 * 1024;
         let mut cache = Self::default();
         let mut seen = HashSet::new();
-        let mut pending = urls
-            .into_iter()
-            .map(|url| (url, 0_usize, false))
-            .collect::<VecDeque<_>>();
-        let mut nested_count = 0_usize;
-        let mut nested_bytes = 0_usize;
-        while let Some((url, depth, nested)) = pending.pop_front() {
+        let mut pending = urls.into_iter().collect::<VecDeque<_>>();
+        while let Some(url) = pending.pop_front() {
             let Some(fetch_url) = fetch_url(&url) else {
                 continue;
             };
             if !seen.insert(fetch_url.clone()) {
                 continue;
             }
-            if nested && nested_count >= MAX_NESTED_SVG_RESOURCES {
-                log::debug!("SVG nested resource count limit exceeded for {fetch_url}");
-                continue;
-            }
             match fetcher.fetch(&fetch_url).await {
                 Ok(fetched) => {
-                    let cors_metadata = CorsResponseMetadata {
-                        allow_origin: fetched.access_control_allow_origin,
-                        allow_credentials: fetched.access_control_allow_credentials,
-                    };
-                    let bytes = fetched.bytes;
-                    if nested
-                        && (bytes.len() > MAX_SVG_RESOURCE_BYTES
-                            || nested_bytes.saturating_add(bytes.len()) > MAX_NESTED_SVG_BYTES)
-                    {
-                        log::debug!("SVG nested resource limit exceeded for {fetch_url}");
-                        continue;
-                    }
-                    if nested {
-                        nested_count += 1;
-                        nested_bytes += bytes.len();
-                    }
-                    let dependencies = (depth < MAX_SVG_RESOURCE_DEPTH
-                        && nested_count < MAX_NESTED_SVG_RESOURCES)
-                        .then(|| svg_dependency_urls(&bytes, &fetched.final_url))
-                        .flatten()
-                        .unwrap_or_default();
-                    let bytes = Arc::new(bytes);
-                    cache.bytes.insert(fetch_url.clone(), Arc::clone(&bytes));
-                    cache.bytes.insert(fetched.final_url.clone(), bytes);
-                    cache
-                        .cors_response_metadata
-                        .insert(fetch_url.clone(), cors_metadata.clone());
-                    cache
-                        .cors_response_metadata
-                        .insert(fetched.final_url.clone(), cors_metadata);
-                    for dependency in dependencies {
-                        pending.push_back((dependency, depth + 1, true));
-                    }
+                    // An SVG loaded as an HTML/CSS image is secure-static:
+                    // nested string URL references must not trigger preload
+                    // fetches merely because the outer SVG happened to be
+                    // fetched successfully.  `usvg` receives only the
+                    // self-contained `data:` resolver in this mode.  A
+                    // future Static policy can explicitly discover already
+                    // authorized cache entries at this boundary.
+                    cache.cache_fetched_resource(fetch_url, fetched);
                 }
                 Err(error) => {
                     if !fetcher.allows_fetch_errors() {
@@ -547,6 +835,125 @@ impl ResourceCache {
             }
         }
         Ok(cache)
+    }
+
+    /// Complete the static external-`<use>` graph after ordinary visual
+    /// resource preload. Each discovered document is parsed from cached bytes
+    /// and may enqueue further same-origin SVG `<use>` documents.
+    pub(crate) async fn preload_external_svg_uses(
+        &mut self,
+        fetcher: &ResourceFetcher,
+        root: &Node,
+        base_url: Option<&Url>,
+        root_url: Option<&Url>,
+    ) {
+        let mut pending = VecDeque::new();
+        collect_svg_use_document_urls(root, base_url, root_url, &mut pending);
+        let mut seen = HashSet::new();
+        let mut resolver = ExternalSvgUseResolver {
+            base_url: base_url.cloned(),
+            root_url: root_url.cloned(),
+            documents: HashMap::new(),
+        };
+        while let Some((url, referring_url)) = pending.pop_front() {
+            let Some(fetch_url) = fetch_url(&url) else {
+                continue;
+            };
+            if !same_svg_resource_origin(&referring_url, &fetch_url)
+                || !seen.insert(fetch_url.clone())
+            {
+                continue;
+            }
+            if !self.bytes.contains_key(&fetch_url) {
+                match fetcher.fetch(&fetch_url).await {
+                    Ok(fetched) => self.cache_fetched_resource(fetch_url.clone(), fetched),
+                    Err(error) => {
+                        log::debug!("failed to preload external SVG use {url}: {error}");
+                        continue;
+                    }
+                }
+            }
+            let Some((source, document_url)) = self.external_svg_document_source(&fetch_url) else {
+                continue;
+            };
+            let syntax = self.external_svg_document_syntax(&fetch_url);
+            let Ok(document) = dom::parse_with_syntax(source, syntax) else {
+                log::debug!("failed to parse external SVG use document {document_url}");
+                continue;
+            };
+            collect_svg_use_document_urls(
+                &document,
+                Some(&document_url),
+                Some(&document_url),
+                &mut pending,
+            );
+            let external = ExternalSvgDocument {
+                source: document,
+                url: document_url.clone(),
+            };
+            resolver
+                .documents
+                .insert(fetch_url.clone(), external.clone());
+            resolver.documents.insert(document_url, external);
+        }
+        self.external_svg_uses = resolver;
+    }
+
+    fn cache_fetched_resource(&mut self, fetch_url: Url, fetched: FetchedResource) {
+        let cors_metadata = CorsResponseMetadata {
+            allow_origin: fetched.access_control_allow_origin,
+            allow_credentials: fetched.access_control_allow_credentials,
+        };
+        let metadata = CachedResourceMetadata {
+            final_url: Some(fetched.final_url.clone()),
+            content_type: fetched.content_type,
+        };
+        let bytes = Arc::new(fetched.bytes);
+        self.bytes.insert(fetch_url.clone(), Arc::clone(&bytes));
+        self.bytes.insert(fetched.final_url.clone(), bytes);
+        self.resource_metadata
+            .insert(fetch_url.clone(), metadata.clone());
+        self.resource_metadata
+            .insert(fetched.final_url.clone(), metadata);
+        self.cors_response_metadata
+            .insert(fetch_url, cors_metadata.clone());
+        self.cors_response_metadata
+            .insert(fetched.final_url, cors_metadata);
+    }
+
+    fn external_svg_document_source(&self, url: &Url) -> Option<(&str, Url)> {
+        let bytes = self.bytes.get(url)?;
+        let source = std::str::from_utf8(bytes).ok()?;
+        let final_url = self
+            .resource_metadata
+            .get(url)
+            .and_then(|metadata| metadata.final_url.clone())
+            .unwrap_or_else(|| url.clone());
+        Some((source, final_url))
+    }
+
+    fn external_svg_document_syntax(&self, url: &Url) -> DocumentSyntax {
+        let mime_type = self
+            .resource_metadata
+            .get(url)
+            .and_then(|metadata| metadata.content_type.as_deref())
+            .map(str::trim)
+            .unwrap_or_default()
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if matches!(
+            mime_type.as_str(),
+            "image/svg+xml" | "application/xml" | "text/xml"
+        ) || url.path().ends_with(".svg")
+            || url.path().ends_with(".xml")
+        {
+            DocumentSyntax::Xml
+        } else {
+            DocumentSyntax::Html
+        }
     }
 
     /// Verify the policy modifiers attached to a CSS image source before its
@@ -594,14 +1001,37 @@ impl ResourceCache {
                     && metadata.allow_origin.as_deref() == Some(document_origin.as_str()))
     }
 
+    /// Determine the response taint after CSS request modifiers authorize the
+    /// cached response. A no-CORS cross-origin image is usable but opaque;
+    /// same-origin and CORS-authorized images are origin-clean.
+    pub(crate) fn css_image_fetch_taint(
+        &self,
+        url: &Url,
+        document_url: Option<&Url>,
+        modifiers: &crate::css::RequestUrlModifiers,
+    ) -> Option<ImageFetchTaint> {
+        if !self.allows_css_image_request(url, document_url, modifiers) {
+            return None;
+        }
+        let url = fetch_url(url)?;
+        let origin_clean = document_url.is_some_and(|document_url| {
+            urls_have_same_origin(&url, document_url) || modifiers.cross_origin.is_some()
+        });
+        Some(if origin_clean {
+            ImageFetchTaint::OriginClean
+        } else {
+            ImageFetchTaint::Opaque
+        })
+    }
+
     pub(crate) fn image_asset_url_with_orientation(
         &self,
         url: &Url,
-        apply_orientation: bool,
+        orientation_policy: RasterOrientationPolicy,
         image_context: SvgImageContext,
     ) -> Option<ResourceImageAsset> {
         let url = fetch_url(url)?;
-        let assets = if apply_orientation {
+        let assets = if orientation_policy.applies_metadata_orientation() {
             &self.oriented_image_assets
         } else {
             &self.image_assets
@@ -620,7 +1050,7 @@ impl ResourceCache {
                         .resolve_url_with_orientation(
                             url.clone(),
                             Rc::from(bytes.as_slice()),
-                            apply_orientation,
+                            orientation_policy,
                         )
                         .map(|(image_id, metadata)| ResourceImageAsset::Raster {
                             image_id,
@@ -635,10 +1065,10 @@ impl ResourceCache {
     pub(crate) fn data_image_asset_with_orientation(
         &self,
         source: &str,
-        apply_orientation: bool,
+        orientation_policy: RasterOrientationPolicy,
         image_context: SvgImageContext,
     ) -> Option<ResourceImageAsset> {
-        let assets = if apply_orientation {
+        let assets = if orientation_policy.applies_metadata_orientation() {
             &self.oriented_data_image_assets
         } else {
             &self.data_image_assets
@@ -663,7 +1093,7 @@ impl ResourceCache {
                 } else {
                     self.image_store
                         .borrow_mut()
-                        .resolve_data_url_with_orientation(source, bytes, apply_orientation)
+                        .resolve_data_url_with_orientation(source, bytes, orientation_policy)
                         .map(|(image_id, metadata)| ResourceImageAsset::Raster {
                             image_id,
                             metadata,
@@ -684,7 +1114,11 @@ impl ResourceCache {
             return asset.clone();
         }
         let overrides = self.svg_presentation_overrides.borrow();
-        let asset = match parse_inline_svg_with_presentation_overrides(element, &overrides) {
+        let asset = match parse_inline_svg_with_presentation_overrides(
+            element,
+            &overrides,
+            &self.external_svg_uses,
+        ) {
             Ok(asset) => Some(Rc::new(asset)),
             Err(error) => {
                 log::debug!("failed to parse inline SVG: {error}");
@@ -720,6 +1154,7 @@ impl ResourceCache {
     }
 }
 
+#[cfg(test)]
 fn svg_dependency_urls(bytes: &[u8], parent: &Url) -> Option<Vec<Url>> {
     let document = usvg::roxmltree::Document::parse(std::str::from_utf8(bytes).ok()?).ok()?;
     let root = document.root_element();
@@ -737,7 +1172,7 @@ fn svg_dependency_urls(bytes: &[u8], parent: &Url) -> Option<Vec<Url>> {
     )
 }
 
-fn same_svg_resource_origin(parent: &Url, child: &Url) -> bool {
+pub(crate) fn same_svg_resource_origin(parent: &Url, child: &Url) -> bool {
     match parent.scheme() {
         "file" => child.scheme() == "file",
         "http" | "https" => parent.origin() == child.origin(),
@@ -978,6 +1413,51 @@ mod tests {
     }
 
     #[test]
+    fn image_fetch_taint_distinguishes_same_origin_opaque_and_cors_images() {
+        let document = Url::parse("https://document.example.test/page.html").unwrap();
+        let same_origin = Url::parse("https://document.example.test/image.png").unwrap();
+        let cross_origin = Url::parse("https://images.example.test/image.png").unwrap();
+        let mut cache = ResourceCache::default();
+        for url in [&same_origin, &cross_origin] {
+            cache.bytes.insert(url.clone(), Arc::new(vec![0]));
+        }
+
+        assert_eq!(
+            cache.css_image_fetch_taint(
+                &same_origin,
+                Some(&document),
+                &crate::css::RequestUrlModifiers::default(),
+            ),
+            Some(ImageFetchTaint::OriginClean)
+        );
+        assert_eq!(
+            cache.css_image_fetch_taint(
+                &cross_origin,
+                Some(&document),
+                &crate::css::RequestUrlModifiers::default(),
+            ),
+            Some(ImageFetchTaint::Opaque)
+        );
+
+        cache.cors_response_metadata.insert(
+            cross_origin.clone(),
+            CorsResponseMetadata {
+                allow_origin: Some("https://document.example.test".to_string()),
+                allow_credentials: false,
+            },
+        );
+        let anonymous = crate::css::RequestUrlModifiers {
+            cross_origin: Some(crate::css::CrossOriginRequestMode::Anonymous),
+            integrity: None,
+            referrer_policy: None,
+        };
+        assert_eq!(
+            cache.css_image_fetch_taint(&cross_origin, Some(&document), &anonymous),
+            Some(ImageFetchTaint::OriginClean)
+        );
+    }
+
+    #[test]
     fn discovers_bare_image_set_sources_without_preloading_type_descriptors() {
         let source = r#".test { background-image: image-set(
             linear-gradient(red, blue) 1x,
@@ -1030,6 +1510,197 @@ mod tests {
         assert!(dependencies.iter().all(|url| url.fragment().is_none()));
     }
 
+    fn external_svg_resolver<'a>(
+        base_url: &str,
+        documents: impl IntoIterator<Item = (&'a str, &'a str, DocumentSyntax)>,
+    ) -> ExternalSvgUseResolver {
+        let mut resolver = ExternalSvgUseResolver {
+            base_url: Some(Url::parse(base_url).unwrap()),
+            root_url: None,
+            documents: HashMap::new(),
+        };
+        for (url, source, syntax) in documents {
+            let url = Url::parse(url).unwrap();
+            resolver.documents.insert(
+                url.clone(),
+                ExternalSvgDocument {
+                    source: dom::parse_with_syntax(source, syntax).unwrap(),
+                    url,
+                },
+            );
+        }
+        resolver
+    }
+
+    #[test]
+    fn external_svg_use_imports_an_html_symbol_as_a_local_reference() {
+        let resolver = external_svg_resolver(
+            "https://example.test/page.html",
+            [(
+                "https://example.test/assets/symbols.html",
+                r#"<html><svg xmlns="http://www.w3.org/2000/svg"><symbol id="green"><rect width="100" height="100" fill="green"/></symbol></svg></html>"#,
+                DocumentSyntax::Html,
+            )],
+        );
+
+        let expanded = resolver.expand_inline_svg(
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><use href="assets/symbols.html#green"/></svg>"#.to_owned(),
+        );
+
+        assert!(expanded.contains("id=\"quire-external-0-green\""));
+        assert!(expanded.contains("href=\"#quire-external-0-green\""));
+        assert!(!expanded.contains("symbols.html#green"));
+        let asset = crate::svg::parse_svg_bytes(expanded.as_bytes()).unwrap();
+        assert_eq!(
+            asset.opaque_viewport_fill(),
+            Some(crate::CssColor::new(0, 128, 0))
+        );
+    }
+
+    #[test]
+    fn external_svg_use_recursively_imports_same_origin_documents() {
+        let resolver = external_svg_resolver(
+            "https://example.test/page.html",
+            [
+                (
+                    "https://example.test/assets/outer.svg",
+                    r#"<svg xmlns="http://www.w3.org/2000/svg"><symbol id="outer"><use href="inner.svg#green"/></symbol></svg>"#,
+                    DocumentSyntax::Xml,
+                ),
+                (
+                    "https://example.test/assets/inner.svg",
+                    r#"<svg xmlns="http://www.w3.org/2000/svg"><symbol id="green"><rect width="100" height="100" fill="green"/></symbol></svg>"#,
+                    DocumentSyntax::Xml,
+                ),
+            ],
+        );
+
+        let expanded = resolver.expand_inline_svg(
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><use href="assets/outer.svg#outer"/></svg>"#
+                .to_owned(),
+        );
+
+        assert!(expanded.contains("#quire-external-0-outer"));
+        assert!(expanded.contains("#quire-external-1-green"));
+        let asset = crate::svg::parse_svg_bytes(expanded.as_bytes()).unwrap();
+        assert_eq!(
+            asset.opaque_viewport_fill(),
+            Some(crate::CssColor::new(0, 128, 0))
+        );
+    }
+
+    #[test]
+    fn external_svg_use_omits_cross_origin_documents() {
+        let resolver = external_svg_resolver(
+            "https://example.test/page.html",
+            [(
+                "https://other.test/symbols.svg",
+                r#"<svg xmlns="http://www.w3.org/2000/svg"><symbol id="green"><rect width="100" height="100" fill="green"/></symbol></svg>"#,
+                DocumentSyntax::Xml,
+            )],
+        );
+
+        let expanded = resolver.expand_inline_svg(
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><use href="https://other.test/symbols.svg#green"/></svg>"#.to_owned(),
+        );
+
+        assert!(!expanded.contains("quire-external"));
+        assert!(crate::svg::parse_svg_bytes(expanded.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn external_svg_use_keeps_missing_fragments_unresolved() {
+        let resolver = external_svg_resolver(
+            "https://example.test/page.html",
+            [(
+                "https://example.test/symbols.svg",
+                r#"<svg xmlns="http://www.w3.org/2000/svg"><symbol id="present"/></svg>"#,
+                DocumentSyntax::Xml,
+            )],
+        );
+
+        let expanded = resolver.expand_inline_svg(
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><use href="symbols.svg#missing"/></svg>"#
+                .to_owned(),
+        );
+
+        assert!(!expanded.contains("quire-external"));
+        assert!(expanded.contains("symbols.svg#missing"));
+    }
+
+    #[test]
+    fn external_svg_use_namespaces_duplicate_document_ids() {
+        let resolver = external_svg_resolver(
+            "https://example.test/page.html",
+            [
+                (
+                    "https://example.test/first.svg",
+                    r#"<svg xmlns="http://www.w3.org/2000/svg"><symbol id="green"><rect width="10" height="10" fill="green"/></symbol></svg>"#,
+                    DocumentSyntax::Xml,
+                ),
+                (
+                    "https://example.test/second.svg",
+                    r#"<svg xmlns="http://www.w3.org/2000/svg"><symbol id="green"><rect width="10" height="10" fill="green"/></symbol></svg>"#,
+                    DocumentSyntax::Xml,
+                ),
+            ],
+        );
+
+        let expanded = resolver.expand_inline_svg(
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><use href="first.svg#green"/><use href="second.svg#green"/></svg>"#.to_owned(),
+        );
+
+        assert!(expanded.contains("id=\"quire-external-0-green\""));
+        assert!(expanded.contains("id=\"quire-external-1-green\""));
+        assert!(expanded.contains("href=\"#quire-external-0-green\""));
+        assert!(expanded.contains("href=\"#quire-external-1-green\""));
+    }
+
+    #[test]
+    fn external_svg_use_handles_cycles_without_recursive_imports() {
+        let resolver = external_svg_resolver(
+            "https://example.test/page.html",
+            [
+                (
+                    "https://example.test/first.svg",
+                    r#"<svg xmlns="http://www.w3.org/2000/svg"><symbol id="first"><use href="second.svg#second"/></symbol></svg>"#,
+                    DocumentSyntax::Xml,
+                ),
+                (
+                    "https://example.test/second.svg",
+                    r#"<svg xmlns="http://www.w3.org/2000/svg"><symbol id="second"><use href="first.svg#first"/></symbol></svg>"#,
+                    DocumentSyntax::Xml,
+                ),
+            ],
+        );
+
+        let expanded = resolver.expand_inline_svg(
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><use href="first.svg#first"/></svg>"#
+                .to_owned(),
+        );
+
+        assert!(expanded.contains("#quire-external-0-first"));
+        assert!(crate::svg::parse_svg_bytes(expanded.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn external_svg_response_mime_selects_xml_parsing() {
+        let mut cache = ResourceCache::default();
+        let url = Url::parse("https://example.test/document.html").unwrap();
+        cache.resource_metadata.insert(
+            url.clone(),
+            CachedResourceMetadata {
+                final_url: Some(url.clone()),
+                content_type: Some("image/svg+xml; charset=utf-8".to_owned()),
+            },
+        );
+
+        assert_eq!(
+            cache.external_svg_document_syntax(&url),
+            DocumentSyntax::Xml
+        );
+    }
+
     #[test]
     fn svg_image_cache_keeps_color_scheme_variants_separate() {
         let mut cache = ResourceCache::default();
@@ -1044,14 +1715,14 @@ mod tests {
         let light = cache
             .image_asset_url_with_orientation(
                 &url,
-                false,
+                RasterOrientationPolicy::Encoded,
                 SvgImageContext::from_used_color_scheme(crate::css::UsedColorScheme::Light),
             )
             .unwrap();
         let dark = cache
             .image_asset_url_with_orientation(
                 &url,
-                false,
+                RasterOrientationPolicy::Encoded,
                 SvgImageContext::from_used_color_scheme(crate::css::UsedColorScheme::Dark),
             )
             .unwrap();

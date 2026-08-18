@@ -42,8 +42,7 @@ impl<'a> LayoutBuilder<'a> {
             child_boxes,
             can_collapse_start_margin,
             can_collapse_end_margin,
-            applied_start_margin,
-            clearance_consumed_adjoining_start_margin,
+            start_margin_arrangement,
             starts_at_page_top,
             laid_out_column_children,
             use_box_inline_items,
@@ -51,13 +50,20 @@ impl<'a> LayoutBuilder<'a> {
             use_ordered_mixed_flow,
             has_preceding_inline_flow_content,
             preceding_inline_local_cutoff,
+            preceding_inline_clamp_block_advance,
             discard_region_limit,
             direct_automatic_block_size_constraint,
             definite_content_height,
             descendant_percentage_height_basis,
         } = *input;
+        let can_collapse_start_margin =
+            can_collapse_start_margin && start_margin_arrangement.permits_parent_start_collapse();
+        let applied_start_margin = start_margin_arrangement
+            .applied_start_margin()
+            .unwrap_or_else(|| layout_pt(0.0));
         let mut traversal_state =
             BlockFlowChildTraversalState::new(style, direct_automatic_block_size_constraint);
+        traversal_state.debit_automatic_block_contribution(preceding_inline_clamp_block_advance);
         if preceding_inline_local_cutoff {
             traversal_state.mark_local_continuation_cutoff();
         }
@@ -65,7 +71,7 @@ impl<'a> LayoutBuilder<'a> {
         let descendant_percentage_height_basis =
             descendant_percentage_height_basis.unwrap_or_else(|| {
                 block_size_percentage_basis_from_points(
-                    definite_content_height,
+                    definite_content_height.map(|height| height.value().points()),
                     BlockSizeBasisSource::ContainingBlock,
                 )
             });
@@ -89,6 +95,7 @@ impl<'a> LayoutBuilder<'a> {
                     &mut traversal_state,
                 ),
                 collapsed_start_margin_offset: layout_pt(0.0),
+                adjoining_margin_set_boundary: BlockMarginCollapseBoundary::Adjoining,
                 rendered_legend: None,
             }
         } else if let Some(child_boxes) = child_boxes {
@@ -101,9 +108,10 @@ impl<'a> LayoutBuilder<'a> {
                 can_collapse_start_margin,
                 can_collapse_end_margin,
                 applied_start_margin,
-                clearance_consumed_adjoining_start_margin,
+                start_margin_arrangement,
                 starts_at_page_top,
                 has_preceding_inline_flow_content,
+                preceding_inline_clamp_block_advance,
                 run_in_inline_items_laid_out,
                 &mut traversal_state,
             )
@@ -116,9 +124,10 @@ impl<'a> LayoutBuilder<'a> {
                 can_collapse_start_margin,
                 can_collapse_end_margin,
                 applied_start_margin,
-                clearance_consumed_adjoining_start_margin,
+                start_margin_arrangement,
                 starts_at_page_top,
                 has_preceding_inline_flow_content,
+                preceding_inline_clamp_block_advance,
                 &mut traversal_state,
             )
         };
@@ -127,6 +136,7 @@ impl<'a> LayoutBuilder<'a> {
         BlockFlowChildrenPhaseOutcome {
             pending_end_margin_collapse: traversal_outcome.pending_end_margin_collapse,
             collapsed_start_margin_offset: traversal_outcome.collapsed_start_margin_offset,
+            adjoining_margin_set_boundary: traversal_outcome.adjoining_margin_set_boundary,
             rendered_legend: traversal_outcome.rendered_legend,
             descendant_clamp_line_slots: traversal_state.descendant_clamp_line_slots(),
             has_local_continuation_cutoff: traversal_state.has_local_continuation_cutoff(),
@@ -218,6 +228,55 @@ mod tests {
 
         assert!(text.contains("four…"), "clamped text={text:?}");
         assert!(!text.contains("five"), "clamped text={text:?}");
+    }
+
+    #[tokio::test]
+    async fn automatic_line_clamp_uses_an_independent_child_as_a_block_boundary() {
+        let text = rendered_text(
+            "<style>@page { size: 160pt 220pt; margin: 10pt } \
+             .clamp { line-clamp: auto; max-height: 6lh; width: 100pt; \
+             font: 10pt/10pt monospace; white-space: pre } \
+             .isolated { display: flow-root; margin: 0 }</style> \
+             <div class=clamp>one\ntwo\nthree\nfour\n\
+             <div class=isolated>five\nsix</div><div class=isolated>seven\neight</div>nine</div>",
+        )
+        .await;
+
+        assert!(text.contains("six"), "clamped text={text:?}");
+        assert!(!text.contains("seven"), "clamped text={text:?}");
+        assert!(!text.contains("nine"), "clamped text={text:?}");
+    }
+
+    #[tokio::test]
+    async fn automatic_line_clamp_replays_the_preceding_inline_endpoint_before_a_fixed_child() {
+        let text = rendered_text(
+            "<style>@page { size: 160pt 220pt; margin: 10pt } \
+             .clamp { line-clamp: auto; max-height: 6lh; width: 100pt; \
+             font: 10pt/10pt monospace; white-space: pre } \
+             .fixed { height: 3lh }</style> \
+             <div class=clamp>one\ntwo\nthree\nfour\n<div class=fixed>five\nsix</div>seven</div>",
+        )
+        .await;
+
+        assert!(text.contains("four…"), "clamped text={text:?}");
+        assert!(!text.contains("five"), "clamped text={text:?}");
+        assert!(!text.contains("seven"), "clamped text={text:?}");
+    }
+
+    #[tokio::test]
+    async fn automatic_line_clamp_replays_before_a_nested_minimum_height() {
+        let text = rendered_text(
+            "<style>@page { size: 160pt 220pt; margin: 10pt } \
+             .clamp { line-clamp: auto; max-height: 6lh; width: 100pt; \
+             font: 10pt/10pt monospace; white-space: pre } \
+             .minimum { min-height: 3lh }</style> \
+             <div class=clamp>one\ntwo\nthree\nfour\n<div class=minimum>five\nsix</div>seven</div>",
+        )
+        .await;
+
+        assert!(text.contains("four…"), "clamped text={text:?}");
+        assert!(!text.contains("five"), "clamped text={text:?}");
+        assert!(!text.contains("seven"), "clamped text={text:?}");
     }
 
     #[tokio::test]
@@ -436,6 +495,27 @@ four</div></div>"#,
         assert_eq!(
             style.max_lines,
             MaxLines::Lines(std::num::NonZeroUsize::new(3).unwrap())
+        );
+    }
+
+    #[test]
+    fn nested_shared_block_flow_preserves_the_remaining_line_clamp_budget() {
+        let mut root_style = ComputedStyle::initial();
+        root_style.max_lines = MaxLines::Lines(std::num::NonZeroUsize::new(3).unwrap());
+        root_style.block_ellipsis = BlockEllipsis::Auto;
+        root_style.continue_ = Continue::Collapse;
+        let mut root_traversal = BlockFlowChildTraversalState::new(&root_style, None);
+        root_traversal.debit(PositiveLineCount::from_rendered_slots(1).unwrap());
+
+        let mut child_style = ComputedStyle::initial();
+        root_traversal.apply_to(&mut child_style);
+        let nested_traversal = BlockFlowChildTraversalState::new(&child_style, None);
+
+        assert_eq!(
+            nested_traversal.remaining_line_slots(),
+            Some(RemainingLineSlots::Available(
+                PositiveLineCount::from_rendered_slots(2).unwrap()
+            )),
         );
     }
 

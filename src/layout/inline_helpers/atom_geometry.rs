@@ -117,7 +117,7 @@ pub(in crate::layout) fn inline_atom_line_anchor_block_start_margin(
         .vertical_align
         .clone()
         .has_line_relative_baseline_shift()
-        || matches!(atom.baseline, InlineAtomBaseline::ExportedTableBox { .. })
+        || atom.exports_from_table_box()
         || matches!(atom.content(), InlineAtomContent::InlineEdge(_))
     {
         0.0
@@ -160,39 +160,35 @@ pub(in crate::layout) fn inline_atom_logical_border_block_size(
 pub(in crate::layout) fn inline_atom_logical_margin_box_baseline_offset(
     atom: &InlineAtom,
     containing_style: &ComputedStyle,
-) -> f32 {
+) -> AtomicInlineMarginBoxBaselineOffset {
     let border_box_block_size = inline_atom_logical_border_block_size(atom, containing_style);
-    atom.baseline_offset_from_margin_box_block_start(
+    atom.resolve_baseline_coordinates(
         border_box_block_size,
         inline_atom_logical_block_start_margin(atom, containing_style),
         containing_style,
     )
+    .margin_box
 }
 
 /// Return the baseline coordinate used to place an atom's border-box content.
 ///
-/// The line-layout baseline contribution for an `inline-table` comes from its
-/// table box, not its wrapper. Its captured fragment retains the wrapper
-/// margins for paint replay, so placement must not add the block-start margin
-/// a second time. Ordinary atomic inlines, whose captured content excludes
-/// their outer margins, continue to use their margin-box baseline.
+/// The line-layout baseline contribution for an `inline-table` includes the
+/// wrapper's margin box, while its captured fragment begins at the table box.
+/// Placement therefore uses the separate replay coordinate returned by the
+/// atomic-baseline boundary. Ordinary atomic inlines replay from their border
+/// box and use their margin-box-relative placement coordinate.
 /// <https://www.w3.org/TR/CSS22/tables.html#table-display>
 pub(in crate::layout) fn inline_atom_logical_content_placement_baseline_offset(
     atom: &InlineAtom,
     containing_style: &ComputedStyle,
-) -> f32 {
-    let baseline = atom.baseline_offset_from_border_box_block_start(
-        inline_atom_logical_border_block_size(atom, containing_style),
+) -> AtomicInlinePaintPlacementBaselineOffset {
+    let border_box_block_size = inline_atom_logical_border_block_size(atom, containing_style);
+    atom.resolve_baseline_coordinates(
+        border_box_block_size,
+        inline_atom_logical_block_start_margin(atom, containing_style),
         containing_style,
-    );
-    match atom.baseline {
-        InlineAtomBaseline::ExportedTableBox { .. } => baseline,
-        InlineAtomBaseline::Exported { .. }
-        | InlineAtomBaseline::FlexExported { .. }
-        | InlineAtomBaseline::SynthesizedBorderBoxBlockEnd => {
-            inline_atom_logical_block_start_margin(atom, containing_style) + baseline
-        }
-    }
+    )
+    .paint_placement
 }
 
 /// Return a line item's logical block-size in its containing line.

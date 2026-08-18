@@ -23,6 +23,14 @@ linked `data:` stylesheets reach the ordinary CSS Syntax EOF-recovery path;
 the default `text/plain` data-URL MIME type is ignored for stylesheet use,
 while `data:text/css` is parsed normally.
 
+## Language pseudo-class
+
+`:lang()` preserves an unrecognized HTML language tag as a distinct value for
+selector matching. Thus `lang="xyzzy"` matches `:lang(xyzzy)` and descendants
+inherit that match, while the tag remains unavailable to locale-dependent text
+processing. Registry-backed BCP 47 canonicalization and extlang-form
+conversion are tracked in `SPEC_DIVERGENCES.md`.
+
 ## Remaining selector limitations
 
 - Shadow/tree-scoped selectors and unmodeled UI/highlight pseudo-elements are

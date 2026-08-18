@@ -134,10 +134,11 @@ pub(in crate::layout::table) fn apply_table_column_style_measures(
     if column >= end {
         return;
     }
-    let declared_width = declared_table_column_width(style);
+    let declared_width =
+        declared_table_column_track_size(TableInlineTrackSizing::for_table(style), style);
     let width_floor = declared_width
         .clone()
-        .map(declared_table_width_length_floor)
+        .map(declared_table_track_size_length_floor)
         // Intrinsic table-width constraint distribution is scalar arithmetic.
         .unwrap_or_else(|| layout_pt(0.0))
         .points();
@@ -146,7 +147,7 @@ pub(in crate::layout::table) fn apply_table_column_style_measures(
     let percentage = intrinsic_percentage_contribution(style).max(
         declared_width
             .clone()
-            .map(declared_table_width_percentage)
+            .map(declared_table_track_size_percentage)
             .unwrap_or(0.0),
     );
     for index in column..end {
@@ -156,7 +157,7 @@ pub(in crate::layout::table) fn apply_table_column_style_measures(
             measures.intrinsic_percentages[index].max(percentage);
         if declared_width
             .clone()
-            .is_some_and(declared_table_width_is_non_percentage)
+            .is_some_and(declared_table_track_size_is_non_percentage)
         {
             measures.constrained[index] = true;
         }
@@ -354,4 +355,26 @@ pub(in crate::layout::table) fn auto_table_column_widths(
     let width_count = widths.len();
     distribute_table_excess_width(measures, &mut widths, excess_width, 0..width_count);
     widths
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percentage_columns_preserve_fractional_assignable_widths() {
+        let measures = TableColumnMeasures {
+            min_content_widths: vec![0.0, 0.0],
+            max_content_widths: vec![0.0, 0.0],
+            intrinsic_percentages: vec![0.5, 0.5],
+            constrained: vec![false, false],
+            occupied: vec![true, true],
+            total_horizontal_spacing: 0.0,
+        };
+
+        let widths = auto_table_column_widths(&measures, 5.4);
+
+        assert_eq!(widths, vec![2.7, 2.7]);
+        assert!((widths.iter().sum::<f32>() - 5.4).abs() < 1e-6);
+    }
 }

@@ -2,6 +2,7 @@ use super::*;
 use crate::layout::assets::{
     BorderPaint, ResolvedBackgroundImagePaint, has_opaque_square_normal_border,
 };
+use crate::layout::block::children::state::RenderedLegendBorderExclusion;
 
 /// One visible destination slice of a continuously decorated fragmented box.
 ///
@@ -246,6 +247,34 @@ impl<'a> LayoutBuilder<'a> {
         fragment: PaintFragment,
         child_contexts: Vec<PaintStackingContext>,
     ) -> bool {
+        let source_order = self.next_paint_source_order();
+        self.scope_current_page_fragment_with_policy_and_source_order(
+            checkpoint,
+            policy,
+            bounds,
+            fragment,
+            child_contexts,
+            source_order,
+        )
+    }
+
+    /// Scope a prepared paint fragment with the source-order token captured
+    /// before its descendants were replayed.
+    ///
+    /// A pseudo stacking context can export positioned descendants to its
+    /// parent. Those descendants still sort after the owning box in tree
+    /// order, so callers that replay descendants before scoping their owner
+    /// must reserve the owner's token at the replay checkpoint:
+    /// <https://www.w3.org/TR/CSS22/zindex.html>.
+    pub(super) fn scope_current_page_fragment_with_policy_and_source_order(
+        &mut self,
+        checkpoint: &PaintCheckpoint,
+        policy: StackingContextPolicy,
+        bounds: PaintClip,
+        fragment: PaintFragment,
+        child_contexts: Vec<PaintStackingContext>,
+        source_order: usize,
+    ) -> bool {
         if fragment.is_empty() && child_contexts.is_empty() {
             return false;
         }
@@ -254,7 +283,7 @@ impl<'a> LayoutBuilder<'a> {
             fragment,
             child_contexts,
         )
-        .with_source_order(self.next_paint_source_order())
+        .with_source_order(source_order)
         .with_effects(policy.effects)
         .with_bounds(bounds);
         self.current_page.replace_paint_tree_since_with_context(
@@ -309,6 +338,12 @@ impl<'a> LayoutBuilder<'a> {
             // parent in-flow band.
             return false;
         }
+        // `border-image-outset` is ink overflow, not a layout adjustment.
+        // The monolithic-fragmentation bound chooses which replacement-box
+        // paint survives a positioned or fragmented replay, so retaining
+        // only the border box would silently drop all outset-only tiles.
+        // <https://drafts.csswg.org/css-backgrounds-3/#border-image-outset>
+        let bounds = border_image_ink_overflow_bounds(bounds, style);
         let fragment = self
             .current_page
             .paint_tree_fragment_since(checkpoint)
@@ -506,6 +541,32 @@ impl<'a> LayoutBuilder<'a> {
         Vec<PaintPrimitive>,
         Vec<PaintPrimitive>,
     )> {
+        self.split_background_and_normal_border_primitives_with_background_image_areas(
+            border_rect,
+            border_rect,
+            style,
+        )
+    }
+
+    /// Split a fragment decoration into background and normal-border phases,
+    /// retaining a distinct source positioning area for sliced backgrounds.
+    ///
+    /// Fieldset legend exclusion applies only to the border phase, while CSS
+    /// Backgrounds still resolves `box-decoration-break: slice` images from
+    /// the unfragmented positioning area.
+    /// <https://html.spec.whatwg.org/multipage/rendering.html#the-fieldset-and-legend-elements>
+    /// <https://www.w3.org/TR/css-backgrounds-3/#background-position>
+    /// <https://www.w3.org/TR/css-break-3/#break-decoration>
+    pub(super) fn split_background_and_normal_border_primitives_with_background_image_areas(
+        &self,
+        border_rect: PaintRect,
+        positioning_border_rect: PaintRect,
+        style: &ComputedStyle,
+    ) -> Option<(
+        Vec<PaintPrimitive>,
+        Vec<PaintPrimitive>,
+        Vec<PaintPrimitive>,
+    )> {
         if style.border_image.source.is_image()
             || matches!(
                 self.border_image_paint(border_rect, style),
@@ -517,8 +578,11 @@ impl<'a> LayoutBuilder<'a> {
         let mut normal_border_style = style.clone();
         normal_border_style.border_image.source = css::ComputedImage::None;
         let insets = used_border_widths(&normal_border_style);
-        let background_images =
-            self.resolved_background_image_paint_with_paint_areas(border_rect, border_rect, style);
+        let background_images = self.resolved_background_image_paint_with_paint_areas(
+            positioning_border_rect,
+            border_rect,
+            style,
+        );
         let defer_border_disjoint_images = background_images.border_disjoint_tile_geometry
             && has_opaque_square_normal_border(style)
             && !style.box_shadow.iter().any(|shadow| shadow.inset);
@@ -564,6 +628,46 @@ impl<'a> LayoutBuilder<'a> {
             Vec::new()
         };
         Some((backgrounds, borders, deferred_images))
+    }
+
+    /// Paint one box fragment while excluding a rendered fieldset legend from
+    /// its normal border phase only.
+    ///
+    /// The caller decides whether the legend belongs to this destination
+    /// fragmentainer. This preserves a complete cloned border on later
+    /// continuations, which have no rendered legend.
+    /// <https://html.spec.whatwg.org/multipage/rendering.html#the-fieldset-and-legend-elements>
+    pub(super) fn box_background_primitives_with_legend_border_exclusion(
+        &self,
+        border_rect: PaintRect,
+        positioning_border_rect: PaintRect,
+        style: &ComputedStyle,
+        legend_exclusion: Option<&RenderedLegendBorderExclusion>,
+    ) -> Vec<PaintPrimitive> {
+        let Some(exclusion) = legend_exclusion else {
+            return self.box_background_primitives_with_background_image_areas(
+                border_rect,
+                positioning_border_rect,
+                style,
+            );
+        };
+        let Some((mut backgrounds, borders, mut deferred_images)) = self
+            .split_background_and_normal_border_primitives_with_background_image_areas(
+                border_rect,
+                positioning_border_rect,
+                style,
+            )
+        else {
+            return self.box_background_primitives_with_background_image_areas(
+                border_rect,
+                positioning_border_rect,
+                style,
+            );
+        };
+        backgrounds
+            .extend(self.clip_rectangular_border_primitives(borders, &exclusion.visible_regions));
+        backgrounds.append(&mut deferred_images);
+        backgrounds
     }
 
     /// Clip rectangular border primitives to the fieldset regions visible
@@ -643,16 +747,6 @@ impl<'a> LayoutBuilder<'a> {
                 self.current_page
                     .push_opaque_text_coverage_in_band(band, line, paths);
             }
-        }
-    }
-
-    pub(super) fn extend_strokes_in_band(
-        &mut self,
-        band: PaintBand,
-        strokes: impl IntoIterator<Item = RenderedStroke>,
-    ) {
-        for stroke in strokes {
-            self.push_stroke_in_band(band, stroke);
         }
     }
 
@@ -807,6 +901,19 @@ impl<'a> LayoutBuilder<'a> {
     }
 }
 
+fn border_image_ink_overflow_bounds(bounds: PaintClip, style: &ComputedStyle) -> PaintClip {
+    if !style.border_image.source.is_image() {
+        return bounds;
+    }
+    let outsets = used_border_image_outsets(style, computed_border_widths(style));
+    PaintClip::new(
+        bounds.x() - outsets.left,
+        bounds.y() - outsets.bottom,
+        bounds.width() + outsets.left + outsets.right,
+        bounds.height() + outsets.top + outsets.bottom,
+    )
+}
+
 fn rendered_line_clip_for_overflow_clips(
     line: &RenderedLine,
     overflow_clips: &[OverflowClip],
@@ -926,7 +1033,9 @@ mod tests {
                 text_matrix: RenderedTextMatrix::IDENTITY,
                 font_size: 10.0,
                 font_id: None,
+                font_palette: crate::css::FontPalette::Normal,
                 glyphs: None,
+                glyph_source_ranges: None,
             }],
         );
         let clip = OverflowClip::from_paint_rect(paint_space_rect(10.0, 0.0, 30.0, 40.0));

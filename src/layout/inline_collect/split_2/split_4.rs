@@ -1,4 +1,5 @@
 use super::*;
+use crate::layout::block::DefinitePhysicalContentHeight;
 use crate::layout::block::child_available_space_for_formatting_context;
 use crate::layout::builder::page_for_context;
 use crate::units::content_box_to_margin_box_length;
@@ -61,6 +62,9 @@ impl<'a> LayoutBuilder<'a> {
         baseline_shift: f32,
         link_target: Option<String>,
     ) -> InlineAtom {
+        // Keep the frozen source for escaped positioned-paint identity; all
+        // sizing and paint below use the separate one-way used style.
+        let source_style = style.clone();
         let mut used_style = self.style_with_current_used_lengths(style);
         let box_metrics = apply_used_box_metrics_for_logical_inline_basis(
             &mut used_style,
@@ -97,6 +101,13 @@ impl<'a> LayoutBuilder<'a> {
                 definite_content_height,
                 BlockSizeBasisSource::InlineBlock,
             ));
+        // An inline-block establishes a new block formatting context. Its
+        // intrinsic child layout must therefore not observe float exclusions
+        // from the parent line, while floats created by its own descendants
+        // remain visible within this temporary context.
+        // <https://www.w3.org/TR/CSS22/visuren.html#inline-blocks>
+        // <https://www.w3.org/TR/CSS22/visuren.html#block-formatting>
+        self.push_float_context();
         // Intrinsic sizing may recursively collect this inline formatting
         // context in an off-page scratch coordinate space. Out-of-flow
         // descendants contribute no intrinsic inline size, and materializing
@@ -127,6 +138,7 @@ impl<'a> LayoutBuilder<'a> {
                 available_width,
             );
         self.positioned_inline_layout_suppression_depth -= 1;
+        self.pop_float_context();
         // Size containment makes the principal box's intrinsic content sizes
         // zero, but descendants are still laid out (and may visibly overflow)
         // inside the resulting zero-sized content box.
@@ -182,7 +194,6 @@ impl<'a> LayoutBuilder<'a> {
         )
         .points();
 
-        let snapshot = self.snapshot();
         // Retain the real absolute-positioning fallback before replacing the
         // current page with this atomic inline's temporary formatting page.
         // The static-position rectangle itself is constructed below in that
@@ -192,8 +203,8 @@ impl<'a> LayoutBuilder<'a> {
         // space. Its internal lines export the atom baseline, but are not
         // principal list-item lines and therefore cannot consume an outside
         // marker anchor.
-        let pending_outside_marker_anchors =
-            std::mem::take(&mut self.pending_outside_marker_anchors);
+        let pending_outside_marker_anchors = self.pending_outside_marker_anchors.suspend();
+        let snapshot = self.snapshot();
         let positioned_layer_start = self.positioned_layers.len();
         let top = 10_000.0;
         let content_left = borders.left + style.padding.left;
@@ -218,6 +229,12 @@ impl<'a> LayoutBuilder<'a> {
         self.content_left = content_left;
         self.content_right = content_left + content_width;
         self.cursor_y = content_top;
+        // This independent formatting context starts its own hypothetical
+        // line. Retaining the enclosing line's static-position rectangle
+        // makes an escaped absolute descendant resolve from that outer line
+        // and then receive the atom replay translation a second time.
+        // <https://www.w3.org/TR/css-position-3/#static-position>
+        self.inline_static_position = None;
         // A query container exposes its content box to descendants.
         // Scrollbar gutters define the scrollport used for clipping and
         // scrolling, but do not change the content-box percentage basis from
@@ -277,16 +294,20 @@ impl<'a> LayoutBuilder<'a> {
             .push(child_available_space_for_formatting_context(
                 style,
                 PhysicalContentWidth::new(content_box_pt(content_width)),
-                definite_content_height
-                    .map(|height| PhysicalContentHeight::new(content_box_pt(height))),
+                definite_content_height.map(|height| {
+                    DefinitePhysicalContentHeight::new(PhysicalContentHeight::new(content_box_pt(
+                        height,
+                    )))
+                }),
                 inherited_orthogonal_available_height,
-                PhysicalContentHeight::new(content_box_pt(self.page_area_height())),
+                self.initial_containing_block_physical_height(),
             ));
         self.definite_block_size_stack
             .push(block_size_percentage_basis_from_points(
                 definite_content_height,
                 BlockSizeBasisSource::InlineBlock,
             ));
+        let previous_escaped_atom_positioning_context = self.escaped_atom_positioning_context;
         let previous_block_static_position_y_offset = self.block_static_position_y_offset;
         let previous_absolute_static_position = self.absolute_static_position;
         // The inline-block fragment is laid out on a temporary page, while an
@@ -327,6 +348,9 @@ impl<'a> LayoutBuilder<'a> {
                 // <https://drafts.csswg.org/css-display-3/#blockify>
                 let mut multicol_flow_style = style.clone();
                 multicol_flow_style.display = multicol_flow_style.display.blockified();
+                let mut multicol_flow_source_style = source_style.clone();
+                multicol_flow_source_style.display =
+                    multicol_flow_source_style.display.blockified();
                 let eligible_multicol = (matches!(style.column_count, css::ColumnCount::Count(_))
                     || matches!(style.column_width, css::ComputedColumnWidth::Length(_))
                     || matches!(style.column_height, css::ComputedColumnHeight::Length(_)))
@@ -346,7 +370,7 @@ impl<'a> LayoutBuilder<'a> {
                         layout.build_frozen_child_boxes_with_current_ancestors(
                             element,
                             stylesheets,
-                            &multicol_flow_style,
+                            &multicol_flow_source_style,
                         )
                     });
                     let Some(normalized_children) = normalized_children else {
@@ -478,6 +502,7 @@ impl<'a> LayoutBuilder<'a> {
         self.escaped_atom_positioning_depth -= 1;
         self.block_static_position_y_offset = previous_block_static_position_y_offset;
         self.absolute_static_position = previous_absolute_static_position;
+        self.escaped_atom_positioning_context = previous_escaped_atom_positioning_context;
         self.definite_block_size_stack.pop();
         self.child_available_space_stack.pop();
         self.content_logical_inline_size_stack.pop();
@@ -621,8 +646,8 @@ impl<'a> LayoutBuilder<'a> {
                         page_index: self.pages.len(),
                         transaction_depth: self.positioned_paint_transaction_depth,
                         source_element: None,
-                        source_style: style.as_computed().clone(),
-                        source_style_identity: style.as_computed() as *const ComputedStyle as usize,
+                        source_style_identity: &source_style as *const ComputedStyle as usize,
+                        source_style: source_style.clone(),
                         multicol_fragment_index: None,
                         source_is_target: false,
                         stack_level: context.stack_level,
@@ -664,7 +689,8 @@ impl<'a> LayoutBuilder<'a> {
         );
         self.pop_container_unit_context(container_unit_scope);
         self.restore(snapshot);
-        self.pending_outside_marker_anchors = pending_outside_marker_anchors;
+        self.pending_outside_marker_anchors
+            .restore(pending_outside_marker_anchors);
 
         let resolved_margin_box = ResolvedAtomicInlineMarginBox::from_resolved_boxes(
             content_box_size_pt(content_width, content_height),
@@ -680,7 +706,7 @@ impl<'a> LayoutBuilder<'a> {
                 table_cell_context: None,
                 contents_overflow_clip_applied: static_scroll_snap_scope,
             },
-            style.as_computed().clone(),
+            style.clone(),
             escaped_positioned_layers,
             resolved_margin_box.into_inline_layout_size(),
             baseline_offset,
@@ -830,7 +856,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         style: &ComputedStyle,
     ) -> f32 {
-        self.inline_text_box_metrics(style, None, 0.0)
+        self.inline_text_box_metrics(style, 0.0)
             .line_baseline_offset
     }
 }

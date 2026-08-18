@@ -127,6 +127,12 @@ External stylesheets are supported:
 cargo run -- -s style.css input.html /tmp/hello.pdf
 ```
 
+Command-line stylesheets are user-origin stylesheets, so they provide print
+preferences without overriding an explicit author `@page` declaration. The
+library API has the same behavior when a stylesheet is marked with
+`Css::with_user_origin()`; `Html::with_stylesheet()` remains the author-origin
+API for document styles.
+
 Set document page geometry in CSS rather than command-line or crate options:
 
 ```css

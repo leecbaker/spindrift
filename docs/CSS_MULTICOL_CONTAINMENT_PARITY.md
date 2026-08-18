@@ -1,13 +1,19 @@
 # CSS Multi-column and Containment Parity
 
 This note tracks Quire's implementation of CSS Multi-column Layout Level 1,
-CSS Containment Level 1, and their shared CSS Fragmentation behavior.
+the implemented `column-height`/`column-wrap` portions of Level 2, CSS
+Containment Level 1, and their shared CSS Fragmentation behavior.
 
 ## Current support
 
 - CSS-wide `initial`, `inherit`, `unset`, and `all` apply to `column-height`
   and `column-wrap` through the same canonical longhand registry as ordinary
   declarations, so `all` resets both non-inherited multicol properties.
+- A non-`auto` `column-height` fixes every committed column row's block size;
+  `column-wrap: wrap` derives row topology and row-rule slots from the
+  committed anonymous-column sequence rather than a height estimate. This
+  leaves required unused row space intact for forced breaks, including
+  `column-height-016`.
 - `column-count`, `column-width`, `columns`, `column-gap`, column rules,
   `column-fill` (`auto`, `balance`, and `balance-all`), and `column-span`
   (`none` and `all`) have computed-value models and cascade support.
@@ -23,7 +29,12 @@ CSS Containment Level 1, and their shared CSS Fragmentation behavior.
   values, `break-inside`, widows/orphans, and rollback to an earlier class A
   boundary. A definite block that no longer fits the remaining column but fits
   an empty column takes that class-A break, while an oversized block remains
-  fragmentable rather than looping through empty columns.
+  fragmentable rather than looping through empty columns. A valid forced
+  column break retains its paintless source column as a structural
+  fragmentainer before creating the destination column. Avoid-break planning
+  measures a vertical child on its logical block axis, so a resolved
+  `min-block-size` and logical block margins participate in the same
+  destination-fit decision as horizontal block heights.
 - Inline-only multicolumn rows commit their class-B line fragments and one
   shared column block extent before painting. This keeps fixed-height
   sequential columns and their column rules consistent when `widows` or
@@ -43,7 +54,9 @@ CSS Containment Level 1, and their shared CSS Fragmentation behavior.
   non-scrollable `overflow: clip` ancestor remains in the positioned clip
   chain even when its containing block straddles the clip edge, and its
   reachable prefix bounds scratch continuation materialization before pages
-  or paint payload are created. Balance probes retain only a deferred
+  or paint payload are created. Deferred multicolumn replay restores the
+  captured source clip chain together with the source containing-block
+  context. Balance probes retain only a deferred
   positioned-principal descriptor and do not emit speculative payload. Clip
   owners whose final used geometry is unavailable at this boundary still need
   deferred replay; `hidden`, `auto`, and `scroll` intentionally retain their
@@ -58,12 +71,20 @@ CSS Containment Level 1, and their shared CSS Fragmentation behavior.
   can place part of a float above the fragmentainer start. A spanner terminates
   the preceding float scope, and empty post-spanner column sets retain zero
   intrinsic block size instead of synthesizing an inherited line-height.
+- Deferred paint preserves whether it belongs to a fragmented float,
+  normal-flow overflow, or positioned/scoped replay. Float continuation
+  columns remain available for their page-local exclusion and paint, but do
+  not create principal-box fragments for an ordinary ancestor; positioned
+  descendants continue to contribute their structural column span.
 - Anonymous column paint preserves inline overflow across column gaps and
   neighboring columns, then intersects the finished fragment with its outer
   page area. This retains authored multicol overflow while enforcing the page
   fragment's initial-containing-block boundary.
 - Sequential `column-fill:auto` treats max-height as a fragmentainer limit
-  while deriving the column set's used block size from committed content.
+  while deriving the column set's used block size from committed content. A
+  normal-flow block whose automatic height is clamped by min/max sizing owns
+  only that final fixed principal-box extent; its visible in-flow overflow
+  continues through later anonymous columns as a parallel fragmented flow.
   Column rules span only columns that actually receive inline content, and
   descendant inline-axis overflow remains visible across anonymous column
   boundaries until the multicol container's own overflow clips it.
@@ -259,12 +280,12 @@ failures are classified below rather than excluded.
   incomplete.
 - Fragmented paint-containment effect-group semantics and non-polygon
   `clip-path` shapes remain part of the separate paint-effects work.
-- CSS Multicol Level 2 `column-height` and `column-wrap`, and CSS Containment
-  Level 2 `inline-size`, style containment, and `content-visibility`, are not
-  part of the Level 1 implementation and account for a visible subset of the
-  unfiltered local directory failures. In particular, `column-height-008`
-  previously passed accidentally through unbalanced Level 1 fallback behavior;
-  definite Level 1 balancing now exposes the unsupported Level 2 row model.
+- CSS Multicol Level 2 `column-height` and `column-wrap` support fixed row
+  geometry and forced-break wrapping, but nested row continuation,
+  spanner/page-row interactions, and the `column-height-008` family remain
+  incomplete. CSS Containment Level 2 `inline-size`, style containment, and
+  `content-visibility` are likewise outside this document's implemented Level
+  1 scope and account for a visible subset of unfiltered directory failures.
 
 ## Specifications
 

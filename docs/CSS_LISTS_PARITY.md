@@ -11,7 +11,10 @@ Quire currently passes **138 of 145 (95.2%)** runnable
   membership follows CSS tree-order inheritance (parent or preceding-sibling
   membership with preceding-element values), so an omitted reversed start
   includes mutations in following siblings and descendants until a same-named
-  sibling counter shadows that instance.
+  sibling counter shadows that instance. Reversed-start planning tracks this
+  contribution scope separately from the inherited runtime counter stack, so
+  a nested same-named reset does not absorb its enclosing list's following
+  sibling increments.
 - Reset, increment, and set ordering follows CSS Lists; duplicate increments
   compound and duplicate resets/sets retain declaration-order semantics.
 - The logical counter plan excludes boxes suppressed by `display: none`, gives
@@ -22,6 +25,10 @@ Quire currently passes **138 of 145 (95.2%)** runnable
 - HTML `ol[start]`, `ol[reversed]`, and `li[value]` behavior is expressed as
   user-agent cascade declarations. Author declarations therefore override the
   HTML defaults through the normal cascade.
+- HTML `type` attributes use the rendering standard's zero-specificity
+  presentational hints: ordered values are case-sensitive on `ol` and `li`,
+  while `none`, `disc`, `circle`, and `square` are case-insensitive on `ul`
+  and `li`.
 - Implicit `list-item` increments follow the active counter direction.
 
 ## Implemented marker behavior
@@ -29,12 +36,22 @@ Quire currently passes **138 of 145 (95.2%)** runnable
 - Marker counter properties, generated quote content, nested
   `::before::marker`/`::after::marker` rules, and inherited
   `-webkit-text-fill-color` are supported.
+- Direct `::marker` declarations use the regular text-property cascade for
+  writing/text direction, spacing, line breaking, text decoration, emphasis,
+  and shadows while marker layout properties remain inert.
 - The UA marker defaults, including tabular numeral forms, apply to principal,
   `::before`, and `::after` markers.
 - Inline flow-root list items retain outside markers; non-atomic inline list
   items use inside marker participation.
 - Outside-marker baseline alignment includes half-leading, and vertical inside
   markers contribute their full marker-plus-content inline-axis extent.
+- A horizontal outside marker with no principal line resolves its fallback
+  anchor against an adjacent float's shortened line span. This is WPT
+  compatibility behavior: CSS Lists leaves exact float-adjacent outside-marker
+  placement undefined.
+- Pending outside-marker anchors are scoped to their real principal flow;
+  atomic-inline captures and speculative off-page measurements cannot consume
+  or duplicate an enclosing list item's marker.
 - URL-backed `image-set()` markers preserve the selected candidate's intrinsic
   resolution, so their inside and outside marker boxes use the correct CSS
   intrinsic dimensions.

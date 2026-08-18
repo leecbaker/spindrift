@@ -1922,7 +1922,7 @@ fn background_clip_edge_insets(
     }
 }
 
-fn rounded_radii_are_zero(radii: RenderedRoundedRectRadii) -> bool {
+pub(super) fn rounded_radii_are_zero(radii: RenderedRoundedRectRadii) -> bool {
     [
         radii.top_left,
         radii.top_right,
@@ -2121,6 +2121,13 @@ pub(in crate::layout) fn paint_box_shadows(
     style: &ComputedStyle,
     inset: bool,
 ) {
+    // Box decoration paint receives the frozen cascaded style while its
+    // geometry has already crossed the layout used-value boundary. Materialize
+    // the matching zoomed clone here so fixed shadow lengths cross that
+    // boundary exactly once as CSS Viewport requires.
+    // <https://drafts.csswg.org/css-viewport/#zoom-property>
+    let zoomed_style = css::LayoutStyle::from_computed(style).into_zoomed();
+    let style = &zoomed_style;
     for shadow in style
         .box_shadow
         .iter()
@@ -2549,7 +2556,15 @@ pub(crate) fn paint_uniform_rounded_border(
     rect: PaintRect,
     style: &ComputedStyle,
 ) -> bool {
-    if style.border_radius.clone().is_zero() || !style.corner_shapes.all_round() {
+    // Select the straight-border paint representation when the *used* radii
+    // are square. A radius such as `0 / 5px` has a nonzero computed vertical
+    // component, but CSS defines its corner as square; sending that geometry
+    // through a zero-radius rounded-path primitive changes PDF edge coverage.
+    if rounded_radii_are_zero(used_rounded_rect_radii(
+        style.border_radius.clone(),
+        rect.size,
+    )) || !style.corner_shapes.all_round()
+    {
         return false;
     }
 
@@ -2622,7 +2637,10 @@ pub(crate) fn paint_uniform_double_rounded_border(
     rect: PaintRect,
     style: &ComputedStyle,
 ) -> bool {
-    if style.border_radius.clone().is_zero() {
+    if rounded_radii_are_zero(used_rounded_rect_radii(
+        style.border_radius.clone(),
+        rect.size,
+    )) {
         return false;
     }
 
@@ -2719,7 +2737,10 @@ pub(crate) fn paint_solid_rounded_border_ring(
     rect: PaintRect,
     style: &ComputedStyle,
 ) -> bool {
-    if style.border_radius.clone().is_zero() {
+    if rounded_radii_are_zero(used_rounded_rect_radii(
+        style.border_radius.clone(),
+        rect.size,
+    )) {
         return false;
     }
 
@@ -2806,7 +2827,10 @@ pub(crate) fn paint_patterned_rounded_border_sides(
     rect: PaintRect,
     style: &ComputedStyle,
 ) -> bool {
-    if style.border_radius.clone().is_zero() {
+    if rounded_radii_are_zero(used_rounded_rect_radii(
+        style.border_radius.clone(),
+        rect.size,
+    )) {
         return false;
     }
 

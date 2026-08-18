@@ -346,7 +346,8 @@ pub struct PdfOptions {
     pub font_embedding: FontEmbeddingMode,
     /// Generated-stream compression policy.
     pub compression: PdfCompression,
-    /// Producer string written to PDF document information and XMP metadata.
+    /// Producer string written to PDF document information and, when emitted,
+    /// XMP metadata.
     pub producer: String,
 }
 
@@ -394,6 +395,22 @@ pub struct DocumentMetadata {
 }
 
 impl DocumentMetadata {
+    /// Returns whether the source document supplied any metadata property.
+    ///
+    /// A PDF producer is writer metadata rather than source metadata and is
+    /// therefore deliberately excluded. Ordinary PDFs may omit their XMP
+    /// packet when this is false, while PDF/A always requires XMP metadata.
+    pub(crate) fn has_source_metadata(&self) -> bool {
+        self.title.is_some()
+            || self.author.is_some()
+            || self.creator.is_some()
+            || self.language.is_some()
+            || self.description.is_some()
+            || !self.keywords.is_empty()
+            || self.created.is_some()
+            || self.modified.is_some()
+    }
+
     /// Returns the document title, if one was present in the source.
     ///
     /// ```no_run
@@ -870,6 +887,19 @@ impl Bookmark {
         }
     }
 
+    /// Internal replay boundary for projecting a captured source bookmark to
+    /// its committed fragment without exposing mutable destinations publicly.
+    pub(crate) fn replay_target(&self) -> PaintPoint {
+        self.target
+    }
+
+    /// Internal replay boundary for assigning the final page and paint-space
+    /// destination of a captured bookmark.
+    pub(crate) fn set_replay_destination(&mut self, page_index: usize, target: PaintPoint) {
+        self.page_index = page_index;
+        self.target = target;
+    }
+
     /// Returns the bookmark destination's horizontal position in PDF points.
     ///
     /// ```no_run
@@ -989,6 +1019,9 @@ pub(crate) struct Page {
     pub(crate) lines: Vec<RenderedLine>,
     pub(crate) links: Vec<RenderedLink>,
     pub(crate) images: Vec<RenderedImage>,
+    /// Image sources owned by retained SVG paint-server scenes. They are
+    /// resource inventory, not page-level paint operations.
+    pub(crate) svg_pattern_images: Vec<RenderedImage>,
     pub(crate) image_patterns: Vec<RenderedImagePattern>,
     pub(crate) gradient_patterns: Vec<RenderedGradientPattern>,
     pub(crate) svg_patterns: Vec<RenderedSvgPattern>,
@@ -1013,6 +1046,7 @@ impl Page {
             lines: Vec::new(),
             links: Vec::new(),
             images: Vec::new(),
+            svg_pattern_images: Vec::new(),
             image_patterns: Vec::new(),
             gradient_patterns: Vec::new(),
             svg_patterns: Vec::new(),
@@ -1100,6 +1134,13 @@ impl Page {
         !self.paint_tree.flattened_operations().is_empty()
     }
 
+    /// Whether final PDF lowering needs an isolated transparency Form for
+    /// this page.  The answer is taken from the retained paint tree so a
+    /// colourless CSS group is still visible to PDF resource planning.
+    pub(crate) fn has_transparency_group(&self) -> bool {
+        self.paint_tree.has_transparency_group()
+    }
+
     pub(crate) fn mark_fragmentation_content(&mut self) {
         self.has_fragmentation_content = true;
     }
@@ -1170,10 +1211,20 @@ fn collect_path_colors(path: &RenderedPath, colors: &mut Vec<CssColor>) {
             }
             RenderedPathPaint::Gradient(gradient) => collect_gradient_colors(gradient, colors),
             RenderedPathPaint::SvgPattern(pattern) => {
-                for path in &pattern.paths {
-                    collect_path_colors(path, colors);
-                }
+                collect_svg_scene_colors(&pattern.scene, colors);
             }
+        }
+    }
+}
+
+fn collect_svg_scene_colors(scene: &crate::svg::SvgPaintGroup, colors: &mut Vec<CssColor>) {
+    for item in &scene.items {
+        match item {
+            crate::svg::SvgPaintItem::Path(path) => collect_path_colors(path, colors),
+            crate::svg::SvgPaintItem::Group(group) | crate::svg::SvgPaintItem::NestedSvg(group) => {
+                collect_svg_scene_colors(group, colors)
+            }
+            crate::svg::SvgPaintItem::RasterImage(_) => {}
         }
     }
 }
@@ -1282,6 +1333,50 @@ pub(crate) struct DocumentFontSynthesis {
     pub(crate) embolden: bool,
 }
 
+/// An OpenType `BASE` coordinate retained in font design units.
+///
+/// The optional delta-set index belongs to a `BaseCoord` format 3 record and
+/// is resolved against the font's selected normalized variation coordinates at
+/// layout time. Quire lays out PDF text without device hinting, so format 2's
+/// nominal design coordinate is retained without its ppem-specific point
+/// adjustment.
+/// <https://learn.microsoft.com/en-us/typography/opentype/spec/base#basecoord-tables>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OpenTypeBaselineCoordinate {
+    pub(crate) design_units: i16,
+    pub(crate) variation_index: Option<OpenTypeVariationIndex>,
+}
+
+/// An OpenType ItemVariationStore delta-set index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OpenTypeVariationIndex {
+    pub(crate) outer: u16,
+    pub(crate) inner: u16,
+}
+
+/// The `BASE` values for one OpenType script in one typographic axis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OpenTypeBaselineScript {
+    pub(crate) script: [u8; 4],
+    pub(crate) default_baseline: Option<[u8; 4]>,
+    /// Coordinates retain unrecognized tags as well as CSS-used metrics so
+    /// script-specific selection never depends on a lossy parse boundary.
+    pub(crate) coordinates: Vec<([u8; 4], OpenTypeBaselineCoordinate)>,
+}
+
+/// One directional OpenType `BASE` axis.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct OpenTypeBaselineAxis {
+    pub(crate) scripts: Vec<OpenTypeBaselineScript>,
+}
+
+/// Horizontal and vertical OpenType `BASE` axes retained for layout.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct OpenTypeBaselineTable {
+    pub(crate) horizontal: OpenTypeBaselineAxis,
+    pub(crate) vertical: OpenTypeBaselineAxis,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DocumentFont {
     pub(crate) id: usize,
@@ -1296,5 +1391,6 @@ pub(crate) struct DocumentFont {
     pub(crate) cap_height: i16,
     pub(crate) italic_angle: i16,
     pub(crate) bbox: [i16; 4],
+    pub(crate) baselines: OpenTypeBaselineTable,
     pub(crate) synthesis: DocumentFontSynthesis,
 }

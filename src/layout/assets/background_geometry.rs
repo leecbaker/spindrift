@@ -17,6 +17,25 @@ pub(in crate::layout) type PaintBackgroundArea = BackgroundArea<PaintSpace>;
 /// A background area positioned on the assembled document canvas.
 pub(in crate::layout) type DocumentCanvasBackgroundArea = BackgroundArea<DocumentCanvasSpace>;
 
+/// Construct the paged-media viewport positioning area for a fixed
+/// background.
+///
+/// A page's viewport-equivalent area is its margin box, whose extent is the
+/// complete page size. It is distinct from [`PageContext::area_width`] and
+/// [`PageContext::area_height`], which describe only the document page area.
+/// The caller supplies the margin-box origin in its own coordinate space so
+/// page-local and document-canvas background paint share this definition:
+/// <https://www.w3.org/TR/css-page-3/#page-backgrounds>.
+pub(in crate::layout) fn fixed_background_page_margin_box<Space>(
+    origin: euclid::Point2D<f32, Space>,
+    page_size: PageSize,
+) -> BackgroundArea<Space> {
+    BackgroundArea::new(
+        origin,
+        euclid::Size2D::new(page_size.width(), page_size.height()),
+    )
+}
+
 impl<Space> BackgroundArea<Space> {
     pub(in crate::layout) fn new(
         origin: euclid::Point2D<f32, Space>,
@@ -221,8 +240,9 @@ pub(in crate::layout) fn used_background_layer_size(
         ),
         css::BackgroundSize::Cover | css::BackgroundSize::Contain => (false, false),
     };
-    let aspect_ratio = (!generated_image && decoded.pixel_height > 0)
-        .then(|| decoded.pixel_width as f32 / decoded.pixel_height as f32);
+    let natural_size = decoded.natural_layout_size();
+    let aspect_ratio = (!generated_image && natural_size.height > 0.0)
+        .then(|| natural_size.width / natural_size.height);
     if layer.repeat.x_axis() == css::BackgroundRepeatAxis::Round {
         size.width = rounded_background_tile_size(size.width, positioning_area.width);
         if height_is_auto && let Some(aspect_ratio) = aspect_ratio {

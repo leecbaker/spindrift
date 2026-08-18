@@ -1,0 +1,17 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>justify-content:left uses the physical left edge in RTL</title>
+<style>
+  @page { size: 160pt 100pt; margin: 10pt }
+  body { margin: 0 }
+  .flex {
+    direction: rtl;
+    display: flex;
+    justify-content: left;
+    width: 100pt;
+    height: 20pt;
+    background: red;
+  }
+  .item { width: 20pt; height: 20pt; background: green }
+</style>
+<div class="flex"><div class="item"></div></div>

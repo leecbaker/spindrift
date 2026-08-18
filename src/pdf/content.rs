@@ -1,4 +1,7 @@
-use super::colors::{PdfColorMode, PdfColorPlan, output_color, set_fill_color, set_stroke_color};
+use super::colors::{
+    PdfBlendColorSpace, PdfColorMode, PdfLoweringColorPolicy, output_color, set_fill_color,
+    set_stroke_color,
+};
 use super::*;
 use crate::document::paint::geometry::PdfSize;
 use crate::document::paint::paths::{
@@ -7,7 +10,7 @@ use crate::document::paint::paths::{
 };
 use pdf_writer::types::{ColorSpaceOperand, LineCapStyle, LineJoinStyle, TextRenderingMode};
 use pdf_writer::{Content, Name, Str, TextStr};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// PDF stroke width used to emulate a matched synthetic bold face.
 ///
@@ -52,32 +55,45 @@ fn set_filtered_stroke_color(
     set_stroke_color(content, filtered_color(color, transform), color_mode);
 }
 
+pub(super) struct PageContentRenderInputs<'a> {
+    pub(super) resources: &'a mut PdfResourceRegistry,
+    pub(super) color_policy: &'a PdfLoweringColorPolicy,
+    pub(super) image_resources: &'a [PreparedImageResource],
+    pub(super) page_image_sources: &'a [PlannedImageIndex],
+    pub(super) page_svg_pattern_image_sources: &'a [PlannedImageIndex],
+    pub(super) page_image_pattern_sources: &'a [PlannedImageIndex],
+    pub(super) raster_resolution_dppx: f32,
+}
+
 pub(super) fn page_content_render<'a>(
     page: &crate::Page,
     embedded_fonts: &EmbeddedFontPlans<'_>,
-    next_object_id: &'a mut usize,
-    color_plan: &'a PdfColorPlan,
-    image_resources: &'a [PreparedImageResource],
-    page_image_sources: &'a [PlannedImageIndex],
-    page_image_pattern_sources: &'a [PlannedImageIndex],
+    inputs: PageContentRenderInputs<'a>,
 ) -> PageContentRender {
     let mut content = Content::new();
     let mut forms = Vec::new();
-    let mut vector_paints = VectorPaintResources::default();
+    let mut vector_paints = VectorPaintResources::with_page_images(
+        page.images.as_slice(),
+        inputs.page_image_sources,
+        page.svg_pattern_images.as_slice(),
+        inputs.page_svg_pattern_image_sources,
+        inputs.raster_resolution_dppx,
+    );
     let mut state = PaintTreeRenderState {
-        next_object_id,
+        resources: inputs.resources,
         forms: &mut forms,
         next_form_name: 1,
         form_dependency_scopes: Vec::new(),
+        root_form_dependencies: BTreeMap::new(),
         vector_paints: &mut vector_paints,
         // Current page paint coordinates map identically to unrotated PDF
         // user space. Construct the typed PDF extent once at that boundary.
         page_size: PdfSize::new(page.width(), page.height()),
-        color_mode: color_plan.mode(),
-        color_plan,
-        image_resources,
-        page_image_sources,
-        page_image_pattern_sources,
+        color_mode: inputs.color_policy.mode(),
+        color_policy: inputs.color_policy,
+        image_resources: inputs.image_resources,
+        page_image_sources: inputs.page_image_sources,
+        page_image_pattern_sources: inputs.page_image_pattern_sources,
         active_paint_transform: crate::document::paint::geometry::PaintTransform::identity(),
         active_filter_color_transform: crate::css::BoundedSrgbColorTransform::IDENTITY,
     };
@@ -88,7 +104,18 @@ pub(super) fn page_content_render<'a>(
     paint_tree.resolve_affine_3d_contexts(page);
     write_paint_tree(&mut content, page, &paint_tree, embedded_fonts, &mut state);
     PageContentRender {
-        stream: content.finish().into_vec(),
+        stream: PdfStreamProgram {
+            bytes: content.finish().into_vec(),
+            resource_uses: PdfStreamResourceUses {
+                xobjects: state
+                    .root_form_dependencies
+                    .into_iter()
+                    .map(|(name, reference)| (name, PdfXObjectHandle::Form(reference.id)))
+                    .collect(),
+                ..PdfStreamResourceUses::default()
+            },
+            resolved_resources: None,
+        },
         form_xobjects: forms,
         gradient_patterns: vector_paints.plans,
         gradient_tiling_patterns: vector_paints.tilings,
@@ -108,14 +135,15 @@ fn write_paint_tree(
 }
 
 struct PaintTreeRenderState<'a, 'b> {
-    next_object_id: &'a mut usize,
+    resources: &'a mut PdfResourceRegistry,
     forms: &'b mut Vec<FormXObjectRender>,
     next_form_name: usize,
     form_dependency_scopes: Vec<BTreeMap<String, FormXObjectReference>>,
+    root_form_dependencies: BTreeMap<String, FormXObjectReference>,
     vector_paints: &'b mut VectorPaintResources,
     page_size: PdfSize,
     color_mode: PdfColorMode,
-    color_plan: &'a PdfColorPlan,
+    color_policy: &'a PdfLoweringColorPolicy,
     image_resources: &'a [PreparedImageResource],
     page_image_sources: &'a [PlannedImageIndex],
     page_image_pattern_sources: &'a [PlannedImageIndex],
@@ -146,10 +174,9 @@ impl PaintTreeRenderState<'_, '_> {
     /// completed forms, because their parent has not been recorded yet.
     fn reserve_transparency_form(&mut self) -> FormXObjectReference {
         let reference = FormXObjectReference {
-            id: *self.next_object_id,
+            id: self.resources.form(),
             name: format!("Fm{}", self.next_form_name),
         };
-        *self.next_object_id += 1;
         self.next_form_name += 1;
         reference
     }
@@ -158,17 +185,25 @@ impl PaintTreeRenderState<'_, '_> {
         self.form_dependency_scopes.push(BTreeMap::new());
     }
 
-    fn finish_form_dependencies(&mut self) -> Vec<FormXObjectReference> {
-        self.form_dependency_scopes
-            .pop()
-            .expect("form dependency scope is active")
-            .into_values()
-            .collect()
+    fn finish_form_dependencies(&mut self) -> PdfStreamResourceUses {
+        PdfStreamResourceUses {
+            xobjects: (self
+                .form_dependency_scopes
+                .pop()
+                .expect("form dependency scope is active"))
+            .into_iter()
+            .map(|(name, reference)| (name, PdfXObjectHandle::Form(reference.id)))
+            .collect(),
+            ..PdfStreamResourceUses::default()
+        }
     }
 
     fn record_form_dependency(&mut self, reference: FormXObjectReference) {
         if let Some(dependencies) = self.form_dependency_scopes.last_mut() {
             dependencies.insert(reference.name.clone(), reference);
+        } else {
+            self.root_form_dependencies
+                .insert(reference.name.clone(), reference);
         }
     }
 }
@@ -180,21 +215,67 @@ struct VectorPaintResources {
     tilings: Vec<GradientTilingPatternPlan>,
     svg_tilings: Vec<SvgTilingPatternPlan>,
     svg_path_tilings: Vec<SvgPathTilingPatternPlan>,
+    image_indexes: HashMap<ImageResourceSource, PlannedImageIndex>,
+    raster_resolution_dppx: f32,
 }
 
 impl VectorPaintResources {
+    fn with_page_images(
+        images: &[crate::document::paint::images::RenderedImage],
+        indexes: &[PlannedImageIndex],
+        svg_pattern_images: &[crate::document::paint::images::RenderedImage],
+        svg_pattern_indexes: &[PlannedImageIndex],
+        raster_resolution_dppx: f32,
+    ) -> Self {
+        Self {
+            image_indexes: images
+                .iter()
+                .zip(indexes)
+                .map(|(image, index)| {
+                    (
+                        crate::pdf::resources::image_source(image, raster_resolution_dppx),
+                        *index,
+                    )
+                })
+                .chain(
+                    svg_pattern_images
+                        .iter()
+                        .zip(svg_pattern_indexes)
+                        .map(|(image, index)| {
+                            (
+                                crate::pdf::resources::image_source(image, raster_resolution_dppx),
+                                *index,
+                            )
+                        }),
+                )
+                .collect(),
+            plans: Vec::new(),
+            gradients: BTreeMap::new(),
+            tilings: Vec::new(),
+            svg_tilings: Vec::new(),
+            svg_path_tilings: Vec::new(),
+            raster_resolution_dppx,
+        }
+    }
+
     fn svg_path_tiling_resource(
         &mut self,
         pattern: &crate::document::paint::paths::RenderedSvgPathPattern,
-        next_object_id: &mut usize,
+        resources: &mut PdfResourceRegistry,
+        color_mode: PdfColorMode,
     ) -> String {
         let name = format!("SVP{}", self.svg_path_tilings.len() + 1);
-        let id = *next_object_id;
-        *next_object_id += 1;
+        let id = resources.pattern();
         self.svg_path_tilings.push(SvgPathTilingPatternPlan {
             id,
             name: name.clone(),
             pattern: pattern.clone(),
+            stream: svg_path_pattern_tile_content(
+                pattern,
+                color_mode,
+                &self.image_indexes,
+                self.raster_resolution_dppx,
+            ),
         });
         name
     }
@@ -202,21 +283,54 @@ impl VectorPaintResources {
     fn tiling_gradient_resource(
         &mut self,
         pattern: &crate::document::paint::patterns::RenderedGradientPattern,
-        next_object_id: &mut usize,
+        resources: &mut PdfResourceRegistry,
         page_size: PdfSize,
         color_transform: crate::css::BoundedSrgbColorTransform,
     ) -> String {
         let gradient = transformed_gradient(&pattern.gradient, color_transform);
-        let shading = self.gradient_resource(&gradient, next_object_id, page_size);
+        let shading = self.gradient_resource(&gradient, resources, page_size);
         let name = format!("GP{}", self.tilings.len() + 1);
-        let id = *next_object_id;
-        *next_object_id += 1;
+        let id = resources.pattern();
+        let mut content = Content::new();
+        content.save_state();
+        if let Some(alpha_gstate_name) = &shading.alpha_gstate_name {
+            content.set_parameters(pdf_name(alpha_gstate_name));
+        }
+        content
+            .set_fill_color_space(ColorSpaceOperand::Pattern)
+            .set_fill_pattern([], pdf_name(&shading.pattern_name))
+            .rect(
+                0.0,
+                0.0,
+                pattern.tiling.tile_size.width,
+                pattern.tiling.tile_size.height,
+            )
+            .fill_nonzero()
+            .restore_state();
         self.tilings.push(GradientTilingPatternPlan {
             id,
             name: name.clone(),
-            shading_pattern_name: shading.pattern_name,
-            alpha_gstate_name: shading.alpha_gstate_name,
+            shading_pattern_name: shading.pattern_name.clone(),
+            alpha_gstate_name: shading.alpha_gstate_name.clone(),
             pattern: pattern.clone(),
+            stream: PdfStreamProgram {
+                bytes: content.finish().into_vec(),
+                resource_uses: PdfStreamResourceUses {
+                    patterns: [(
+                        shading.pattern_name,
+                        PdfPatternResourceHandle::Dynamic(shading.pattern_id),
+                    )]
+                    .into(),
+                    ext_gstates: shading
+                        .alpha_gstate_name
+                        .into_iter()
+                        .zip(shading.alpha_gstate_id)
+                        .map(|(name, handle)| (name, PdfExtGStateResourceHandle::Dynamic(handle)))
+                        .collect(),
+                    ..PdfStreamResourceUses::default()
+                },
+                resolved_resources: None,
+            },
         });
         name
     }
@@ -225,14 +339,16 @@ impl VectorPaintResources {
 #[derive(Clone)]
 struct GradientPaintResource {
     pattern_name: String,
+    pattern_id: PdfPatternHandle,
     alpha_gstate_name: Option<String>,
+    alpha_gstate_id: Option<PdfExtGStateHandle>,
 }
 
 impl VectorPaintResources {
     fn gradient_resource(
         &mut self,
         gradient: &RenderedGradient,
-        next_object_id: &mut usize,
+        resources: &mut PdfResourceRegistry,
         page_size: PdfSize,
     ) -> GradientPaintResource {
         let key = gradient_key(gradient);
@@ -240,47 +356,49 @@ impl VectorPaintResources {
             return resource.clone();
         }
         let name = format!("SG{}", self.plans.len() + 1);
-        let id = *next_object_id;
-        *next_object_id += 1;
+        let id = resources.pattern();
         let function_count = if gradient.periodic.is_some() || gradient.stops.len() == 2 {
             1
         } else {
             gradient.stops.len()
         };
-        let function_ids = (0..function_count)
-            .map(|_| {
-                let id = *next_object_id;
-                *next_object_id += 1;
-                id
-            })
-            .collect();
+        let function_ids = (0..function_count).map(|_| resources.function()).collect();
         let alpha = gradient.has_transparent_stop().then(|| {
-            let pattern_id = *next_object_id;
-            *next_object_id += 1;
-            let alpha_function_ids = (0..function_count)
-                .map(|_| {
-                    let id = *next_object_id;
-                    *next_object_id += 1;
-                    id
-                })
-                .collect();
-            let form_id = *next_object_id;
-            *next_object_id += 1;
-            let ext_gstate_id = *next_object_id;
-            *next_object_id += 1;
+            let pattern_id = resources.pattern();
+            let alpha_function_ids = (0..function_count).map(|_| resources.function()).collect();
+            let form_id = resources.form();
+            let ext_gstate_id = resources.ext_gstate();
+            let pattern_name = format!("SGA{}", self.plans.len() + 1);
+            let mut content = Content::new();
+            content
+                .set_fill_color_space(ColorSpaceOperand::Pattern)
+                .set_fill_pattern([], pdf_name(&pattern_name))
+                .rect(0.0, 0.0, page_size.width, page_size.height)
+                .fill_nonzero();
             GradientAlphaPlan {
                 pattern_id,
-                pattern_name: format!("SGA{}", self.plans.len() + 1),
+                pattern_name: pattern_name.clone(),
                 function_ids: alpha_function_ids,
                 form_id,
                 ext_gstate_id,
                 ext_gstate_name: format!("GSsvgAlpha{}", self.plans.len() + 1),
                 page_size,
+                stream: PdfStreamProgram {
+                    bytes: content.finish().into_vec(),
+                    resource_uses: PdfStreamResourceUses {
+                        patterns: [(pattern_name, PdfPatternResourceHandle::Dynamic(pattern_id))]
+                            .into(),
+                        ..PdfStreamResourceUses::default()
+                    },
+                    resolved_resources: None,
+                },
             }
         });
         let resource = GradientPaintResource {
             pattern_name: name.clone(),
+            pattern_id: id,
             alpha_gstate_name: alpha.as_ref().map(|alpha| alpha.ext_gstate_name.clone()),
+            alpha_gstate_id: alpha.as_ref().map(|alpha| alpha.ext_gstate_id),
         };
         self.plans.push(GradientPatternPlan {
             id,
@@ -590,15 +708,20 @@ fn write_effect_scope_group(
         .map(|lowering| state.push_exact_filter(lowering));
     state.begin_form_dependencies();
     write_effect_scope(&mut form_content, page, &form_scope, embedded_fonts, state);
-    let form_dependencies = state.finish_form_dependencies();
+    let resource_uses = state.finish_form_dependencies();
     state.active_filter_color_transform = parent_filter_transform;
     state.forms.push(FormXObjectRender {
         id: reference.id,
         name: reference.name.clone(),
-        form_dependencies,
         bbox,
-        stream: form_content.finish().into_vec(),
-        transparency_group: true,
+        stream: PdfStreamProgram {
+            bytes: form_content.finish().into_vec(),
+            resource_uses,
+            resolved_resources: None,
+        },
+        kind: PdfFormKind::TransparencyGroup {
+            blending_space: PdfBlendColorSpace::Srgb,
+        },
     });
     content.save_state();
     let group_alpha = filter_alpha.map_or(scope.effects.opacity, |filter_alpha| {
@@ -646,15 +769,20 @@ fn write_effect_group(
         state,
         false,
     );
-    let form_dependencies = state.finish_form_dependencies();
+    let resource_uses = state.finish_form_dependencies();
     state.active_filter_color_transform = parent_filter_transform;
     state.forms.push(FormXObjectRender {
         id: reference.id,
         name: reference.name.clone(),
-        form_dependencies,
         bbox,
-        stream: form_content.finish().into_vec(),
-        transparency_group: true,
+        stream: PdfStreamProgram {
+            bytes: form_content.finish().into_vec(),
+            resource_uses,
+            resolved_resources: None,
+        },
+        kind: PdfFormKind::TransparencyGroup {
+            blending_space: PdfBlendColorSpace::Srgb,
+        },
     });
     content.save_state();
     let group_alpha = filter_alpha.map_or(context.effects.opacity, |filter_alpha| {
@@ -1143,10 +1271,14 @@ fn rect_is_fully_covered_by_uninterrupted_prior_same_color(
             continue;
         }
         if previous.fill == rect.fill {
-            return rect_area_is_covered_by_rects(&rect, std::slice::from_ref(previous))
-                && intervening.iter().all(|intermediate| {
-                    rect_area_is_covered_by_rects(intermediate, std::slice::from_ref(&rect))
-                });
+            // A later same-color rectangle may cover the intervening paint,
+            // but that cannot make the earlier same-color fill reusable.
+            // Doing so is circular: the intervening fills can be elided only
+            // because this rectangle will paint, while this rectangle would
+            // then be elided because of the earlier fill. Preserve the later
+            // source whenever another opaque color interrupted the sequence.
+            return intervening.is_empty()
+                && rect_area_is_covered_by_rects(&rect, std::slice::from_ref(previous));
         }
         intervening.push(previous.clone());
     }
@@ -1273,7 +1405,7 @@ fn write_opaque_text_coverage(
                     content,
                     path,
                     state.vector_paints,
-                    state.next_object_id,
+                    state.resources,
                     state.page_size,
                     state.color_mode,
                     state.active_filter_color_transform,
@@ -2432,7 +2564,7 @@ fn write_page_operation(
                     content,
                     path,
                     state.vector_paints,
-                    state.next_object_id,
+                    state.resources,
                     state.page_size,
                     state.color_mode,
                     state.active_filter_color_transform,
@@ -2457,7 +2589,7 @@ fn write_page_operation(
                     .get(*index)
                     .and_then(|source| state.image_resources.get(source.0)),
             ) {
-                write_image(content, image, *index, resource, state.color_plan);
+                write_image(content, image, *index, resource, state.color_policy);
             }
         }
         crate::document::paint::page::PaintOperation::ImagePattern(index) => {
@@ -2478,7 +2610,7 @@ fn write_page_operation(
                     content,
                     pattern,
                     state.vector_paints,
-                    state.next_object_id,
+                    state.resources,
                     state.page_size,
                     state.active_filter_color_transform,
                 );
@@ -2519,7 +2651,7 @@ fn write_page_operation(
                         content,
                         path,
                         state.vector_paints,
-                        state.next_object_id,
+                        state.resources,
                         state.page_size,
                         state.color_mode,
                         state.active_filter_color_transform,
@@ -2980,7 +3112,7 @@ fn write_path(
     content: &mut Content,
     path: &RenderedPath,
     vector_paints: &mut VectorPaintResources,
-    next_object_id: &mut usize,
+    resources: &mut PdfResourceRegistry,
     page_size: PdfSize,
     color_mode: PdfColorMode,
     color_transform: crate::css::BoundedSrgbColorTransform,
@@ -3010,7 +3142,7 @@ fn write_path(
                 content,
                 path,
                 vector_paints,
-                next_object_id,
+                resources,
                 page_size,
                 color_mode,
                 color_transform,
@@ -3019,7 +3151,7 @@ fn write_path(
                 content,
                 path,
                 vector_paints,
-                next_object_id,
+                resources,
                 page_size,
                 color_mode,
                 color_transform,
@@ -3030,7 +3162,7 @@ fn write_path(
                 content,
                 path,
                 vector_paints,
-                next_object_id,
+                resources,
                 page_size,
                 color_mode,
                 color_transform,
@@ -3039,7 +3171,7 @@ fn write_path(
                 content,
                 path,
                 vector_paints,
-                next_object_id,
+                resources,
                 page_size,
                 color_mode,
                 color_transform,
@@ -3058,7 +3190,7 @@ fn write_path_fill(
     content: &mut Content,
     path: &RenderedPath,
     vector_paints: &mut VectorPaintResources,
-    next_object_id: &mut usize,
+    resources: &mut PdfResourceRegistry,
     page_size: PdfSize,
     color_mode: PdfColorMode,
     color_transform: crate::css::BoundedSrgbColorTransform,
@@ -3070,7 +3202,7 @@ fn write_path_fill(
         content,
         fill,
         vector_paints,
-        next_object_id,
+        resources,
         page_size,
         color_mode,
         color_transform,
@@ -3089,7 +3221,7 @@ fn write_path_stroke(
     content: &mut Content,
     path: &RenderedPath,
     vector_paints: &mut VectorPaintResources,
-    next_object_id: &mut usize,
+    resources: &mut PdfResourceRegistry,
     page_size: PdfSize,
     color_mode: PdfColorMode,
     color_transform: crate::css::BoundedSrgbColorTransform,
@@ -3101,7 +3233,7 @@ fn write_path_stroke(
         content,
         stroke,
         vector_paints,
-        next_object_id,
+        resources,
         page_size,
         color_mode,
         color_transform,
@@ -3132,7 +3264,7 @@ fn write_path_fill_paint(
     content: &mut Content,
     paint: &RenderedPathPaint,
     vector_paints: &mut VectorPaintResources,
-    next_object_id: &mut usize,
+    resources: &mut PdfResourceRegistry,
     page_size: PdfSize,
     color_mode: PdfColorMode,
     color_transform: crate::css::BoundedSrgbColorTransform,
@@ -3146,7 +3278,7 @@ fn write_path_fill_paint(
         RenderedPathPaint::Solid(_) => None,
         RenderedPathPaint::Gradient(gradient) => {
             let gradient = transformed_gradient(gradient, color_transform);
-            let resource = vector_paints.gradient_resource(&gradient, next_object_id, page_size);
+            let resource = vector_paints.gradient_resource(&gradient, resources, page_size);
             if let Some(name) = &resource.alpha_gstate_name {
                 content.save_state().set_parameters(pdf_name(name));
             }
@@ -3160,7 +3292,7 @@ fn write_path_fill_paint(
                 content,
                 crate::CssColor::rgba(0, 0, 0, pattern.opacity),
             );
-            let name = vector_paints.svg_path_tiling_resource(pattern, next_object_id);
+            let name = vector_paints.svg_path_tiling_resource(pattern, resources, color_mode);
             content
                 .set_fill_color_space(ColorSpaceOperand::Pattern)
                 .set_fill_pattern([], pdf_name(&name));
@@ -3173,7 +3305,7 @@ fn write_path_stroke_paint(
     content: &mut Content,
     paint: &RenderedPathPaint,
     vector_paints: &mut VectorPaintResources,
-    next_object_id: &mut usize,
+    resources: &mut PdfResourceRegistry,
     page_size: PdfSize,
     color_mode: PdfColorMode,
     color_transform: crate::css::BoundedSrgbColorTransform,
@@ -3187,7 +3319,7 @@ fn write_path_stroke_paint(
         RenderedPathPaint::Solid(_) => None,
         RenderedPathPaint::Gradient(gradient) => {
             let gradient = transformed_gradient(gradient, color_transform);
-            let resource = vector_paints.gradient_resource(&gradient, next_object_id, page_size);
+            let resource = vector_paints.gradient_resource(&gradient, resources, page_size);
             if let Some(name) = &resource.alpha_gstate_name {
                 content.save_state().set_parameters(pdf_name(name));
             }
@@ -3201,7 +3333,7 @@ fn write_path_stroke_paint(
                 content,
                 crate::CssColor::rgba(0, 0, 0, pattern.opacity),
             );
-            let name = vector_paints.svg_path_tiling_resource(pattern, next_object_id);
+            let name = vector_paints.svg_path_tiling_resource(pattern, resources, color_mode);
             content
                 .set_stroke_color_space(ColorSpaceOperand::Pattern)
                 .set_stroke_pattern([], pdf_name(&name));
@@ -3311,7 +3443,7 @@ pub(super) fn write_image(
     image: &crate::document::paint::images::RenderedImage,
     index: usize,
     resource: &PreparedImageResource,
-    color_plan: &PdfColorPlan,
+    color_policy: &PdfLoweringColorPolicy,
 ) {
     if let Some(actual_text) = &image.actual_text {
         let mut marked_content = content.begin_marked_content_with_properties(Name(b"Span"));
@@ -3332,7 +3464,7 @@ pub(super) fn write_image(
                 image.transform.is_none(),
                 "solid image fills require page-space image geometry"
             );
-            color_plan.set_raster_fill_color(content, &fill.color_space, fill.components);
+            color_policy.set_raster_fill_color(content, &fill.color_space, fill.components);
             content
                 .rect(
                     rect.origin.x,
@@ -3472,12 +3604,12 @@ fn write_gradient_tiling_pattern(
     content: &mut Content,
     pattern: &crate::document::paint::patterns::RenderedGradientPattern,
     vector_paints: &mut VectorPaintResources,
-    next_object_id: &mut usize,
+    resources: &mut PdfResourceRegistry,
     page_size: PdfSize,
     color_transform: crate::css::BoundedSrgbColorTransform,
 ) {
     let name =
-        vector_paints.tiling_gradient_resource(pattern, next_object_id, page_size, color_transform);
+        vector_paints.tiling_gradient_resource(pattern, resources, page_size, color_transform);
     write_transformed_tiling_pattern_fill(
         content,
         pattern.paint_rect(),
@@ -3522,8 +3654,7 @@ fn write_svg_tiling_pattern(
     pattern: &crate::document::paint::patterns::RenderedSvgPattern,
     state: &mut PaintTreeRenderState<'_, '_>,
 ) {
-    let form_id = *state.next_object_id;
-    *state.next_object_id += 1;
+    let form_id = state.resources.form();
     let form_name = format!("SvgTile{}", state.forms.len() + 1);
     let mut form_content = Content::new();
     for path in &pattern.paths {
@@ -3531,7 +3662,7 @@ fn write_svg_tiling_pattern(
             &mut form_content,
             path,
             state.vector_paints,
-            state.next_object_id,
+            state.resources,
             state.page_size,
             state.color_mode,
             state.active_filter_color_transform,
@@ -3540,24 +3671,28 @@ fn write_svg_tiling_pattern(
     state.forms.push(FormXObjectRender {
         id: form_id,
         name: form_name.clone(),
-        form_dependencies: Vec::new(),
         bbox: crate::document::paint::geometry::PaintClip::new(
             0.0,
             0.0,
             pattern.tiling.tile_size.width,
             pattern.tiling.tile_size.height,
         ),
-        stream: form_content.finish().into_vec(),
-        transparency_group: false,
+        stream: PdfStreamProgram {
+            bytes: form_content.finish().into_vec(),
+            resource_uses: PdfStreamResourceUses::default(),
+            resolved_resources: None,
+        },
+        kind: PdfFormKind::Ordinary,
     });
-    let id = *state.next_object_id;
-    *state.next_object_id += 1;
+    let id = state.resources.pattern();
     let name = format!("SP{}", state.vector_paints.svg_tilings.len() + 1);
+    let mut pattern_content = Content::new();
+    pattern_content.x_object(pdf_name(&form_name));
     state.vector_paints.svg_tilings.push(SvgTilingPatternPlan {
         id,
         name: name.clone(),
         form_id,
-        form_name,
+        form_name: form_name.clone(),
         pattern: pattern.clone(),
         transform: state.active_paint_transform.multiply(
             crate::document::paint::geometry::PaintTransform::translate(
@@ -3567,6 +3702,14 @@ fn write_svg_tiling_pattern(
                 ),
             ),
         ),
+        stream: PdfStreamProgram {
+            bytes: pattern_content.finish().into_vec(),
+            resource_uses: PdfStreamResourceUses {
+                xobjects: [(form_name.clone(), PdfXObjectHandle::Form(form_id))].into(),
+                ..PdfStreamResourceUses::default()
+            },
+            resolved_resources: None,
+        },
     });
     write_transformed_tiling_pattern_fill(
         content,
@@ -3583,29 +3726,107 @@ fn write_svg_tiling_pattern(
 pub(super) fn svg_path_pattern_tile_content(
     pattern: &crate::document::paint::paths::RenderedSvgPathPattern,
     color_mode: PdfColorMode,
-) -> Vec<u8> {
+    image_indexes: &HashMap<ImageResourceSource, PlannedImageIndex>,
+    raster_resolution_dppx: f32,
+) -> PdfStreamProgram {
     let mut content = Content::new();
-    let mut resources = VectorPaintResources::default();
-    let mut next_object_id = 0;
-    for path in &pattern.paths {
-        write_path(
-            &mut content,
-            path,
-            &mut resources,
-            &mut next_object_id,
-            // SVG pattern paths are expressed in the local Form XObject
-            // coordinate system. Its tile is the relevant PDF paint extent
-            // should a supported vector paint require one.
-            PdfSize::new(pattern.tile_size.width, pattern.tile_size.height),
-            color_mode,
-            crate::css::BoundedSrgbColorTransform::IDENTITY,
-        );
+    let mut vector_paints = VectorPaintResources {
+        plans: Vec::new(),
+        gradients: BTreeMap::new(),
+        tilings: Vec::new(),
+        svg_tilings: Vec::new(),
+        svg_path_tilings: Vec::new(),
+        image_indexes: image_indexes.clone(),
+        raster_resolution_dppx,
+    };
+    let mut resources = PdfResourceRegistry::default();
+    let mut image_uses = BTreeMap::new();
+    write_svg_pattern_scene(
+        &mut content,
+        &pattern.scene,
+        &mut vector_paints,
+        &mut resources,
+        PdfSize::new(pattern.tile_size.width, pattern.tile_size.height),
+        color_mode,
+        &mut image_uses,
+    );
+    debug_assert!(vector_paints.plans.is_empty());
+    debug_assert!(vector_paints.tilings.is_empty());
+    debug_assert!(vector_paints.svg_tilings.is_empty());
+    debug_assert!(vector_paints.svg_path_tilings.is_empty());
+    PdfStreamProgram {
+        bytes: content.finish().into_vec(),
+        resource_uses: PdfStreamResourceUses {
+            xobjects: image_uses,
+            ..PdfStreamResourceUses::default()
+        },
+        resolved_resources: None,
     }
-    debug_assert!(resources.plans.is_empty());
-    debug_assert!(resources.tilings.is_empty());
-    debug_assert!(resources.svg_tilings.is_empty());
-    debug_assert!(resources.svg_path_tilings.is_empty());
-    content.finish().into_vec()
+}
+
+fn write_svg_pattern_scene(
+    content: &mut Content,
+    scene: &crate::svg::SvgPaintGroup,
+    vector_paints: &mut VectorPaintResources,
+    resources: &mut PdfResourceRegistry,
+    tile_size: PdfSize,
+    color_mode: PdfColorMode,
+    image_uses: &mut BTreeMap<String, PdfXObjectHandle>,
+) {
+    for item in &scene.items {
+        match item {
+            crate::svg::SvgPaintItem::Path(path) => write_path(
+                content,
+                path,
+                vector_paints,
+                resources,
+                tile_size,
+                color_mode,
+                crate::css::BoundedSrgbColorTransform::IDENTITY,
+            ),
+            crate::svg::SvgPaintItem::RasterImage(image) => {
+                let source = crate::pdf::resources::image_source(
+                    image,
+                    vector_paints.raster_resolution_dppx,
+                );
+                let Some(index) = vector_paints.image_indexes.get(&source).copied() else {
+                    continue;
+                };
+                let name = format!("Im{}", index.0 + 1);
+                let rect = crate::document::paint::geometry::paint_rect_to_pdf(image.paint_rect());
+                content.save_state();
+                if let Some(clip) = image.clip() {
+                    write_rendered_path_clip(content, clip);
+                }
+                if let Some(transform) = image.transform {
+                    content.transform(transform.pdf_components());
+                }
+                content
+                    .transform([
+                        rect.size.width,
+                        0.0,
+                        0.0,
+                        rect.size.height,
+                        rect.origin.x,
+                        rect.origin.y,
+                    ])
+                    .x_object(pdf_name(&name));
+                content.restore_state();
+                image_uses.insert(name, PdfXObjectHandle::Image(PdfImageHandle(index.0)));
+            }
+            crate::svg::SvgPaintItem::Group(group) | crate::svg::SvgPaintItem::NestedSvg(group) => {
+                write_svg_pattern_scene(
+                    content,
+                    group,
+                    vector_paints,
+                    resources,
+                    tile_size,
+                    color_mode,
+                    image_uses,
+                )
+            }
+        }
+    }
 }
 
 pub(super) fn write_line(
@@ -3780,6 +4001,7 @@ pub(super) fn write_rendered_line(
             content.set_font(pdf_name(&font.resource_name), pdf_font_size);
             active_font = Some((embedded_font_index, pdf_font_size));
         }
+        let glyph_metrics = PdfGlyphRunMetrics::new(font, PdfTextFontSize::new(pdf_font_size));
         if let Some(actual_text) = run.actual_text {
             let mut marked_content = content.begin_marked_content_with_properties(Name(b"Span"));
             marked_content
@@ -3792,7 +4014,7 @@ pub(super) fn write_rendered_line(
                 run.text_matrix,
                 run_origin,
                 run.glyphs,
-                &font.source_gid_to_cid,
+                glyph_metrics,
                 invisible,
                 visible_mode,
             );
@@ -3800,14 +4022,7 @@ pub(super) fn write_rendered_line(
             // identity run, whose `Td` displacement is relative to it.
             content.set_text_matrix(run_text_matrix);
         } else {
-            write_glyphs(
-                content,
-                run.font_size,
-                run.glyphs,
-                &font.source_gid_to_cid,
-                invisible,
-                visible_mode,
-            );
+            write_glyphs(content, run.glyphs, glyph_metrics, invisible, visible_mode);
         }
         if run.actual_text.is_some() {
             content.end_marked_content();
@@ -3858,27 +4073,121 @@ pub(super) fn quantized_pdf_font_size(font_size: f32) -> f32 {
     (css_px * 1024.0).floor() / 1024.0 * crate::css::CSS_PX_TO_PT
 }
 
+/// The font size installed by PDF `Tf`, in PDF user-space points.
+///
+/// This differs from the CSS font size when PDF emission applies its
+/// compatibility quantization, so text positioning must use this value rather
+/// than the layout-time size.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PdfTextFontSize(f32);
+
+impl PdfTextFontSize {
+    fn new(points: f32) -> Self {
+        debug_assert!(points.is_finite() && points > 0.0);
+        Self(points.max(0.001))
+    }
+
+    fn points(self) -> f32 {
+        self.0
+    }
+}
+
+/// A `TJ` displacement in PDF text space.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PdfTextSpaceAdjustment(f32);
+
+impl PdfTextSpaceAdjustment {
+    fn for_used_advance(
+        pdf_width: Option<PdfTextSpaceWidth>,
+        font_size: PdfTextFontSize,
+        used_advance: f32,
+    ) -> Self {
+        let value = match pdf_width {
+            Some(width) => {
+                // `TJ` first applies the CID's `/W` advance. Convert the
+                // layout target directly to PDF text space. Going through
+                // points first needlessly loses precision through
+                // subtraction of nearly equal advances.
+                let adjustment = width.as_pdf_number() - used_advance * 1000.0 / font_size.points();
+                let represented_advance = adjustment * font_size.points() / 1000.0;
+                let residual =
+                    width.points_at(font_size.points()) - used_advance - represented_advance;
+                // These values are serialized as f32 PDF operands.  The two
+                // equivalent evaluation orders above can differ by a few
+                // ULPs after subtracting nearly equal advances, particularly
+                // for CFF fonts with non-power-of-two units per em.
+                let tolerance = f32::EPSILON
+                    * (width.points_at(font_size.points()).abs()
+                        + used_advance.abs()
+                        + represented_advance.abs())
+                    .max(1.0)
+                    * 8.0;
+                debug_assert!(residual.abs() <= tolerance);
+                adjustment
+            }
+            // An advance-only glyph has no CID width for PDF to apply.
+            None => -used_advance * 1000.0 / font_size.points(),
+        };
+        debug_assert!(value.is_finite());
+        Self(value)
+    }
+
+    fn is_zero(self) -> bool {
+        self.0 == 0.0
+    }
+
+    fn value(self) -> f32 {
+        self.0
+    }
+}
+
+/// Per-run PDF metrics shared by glyph encoding and `TJ` positioning.
+#[derive(Clone, Copy)]
+struct PdfGlyphRunMetrics<'a> {
+    source_gid_to_cid: &'a BTreeMap<u16, u16>,
+    source_gid_to_width: &'a BTreeMap<u16, PdfTextSpaceWidth>,
+    default_width: PdfTextSpaceWidth,
+    font_size: PdfTextFontSize,
+}
+
+impl<'a> PdfGlyphRunMetrics<'a> {
+    fn new(font: &'a EmbeddedFontPlan<'_>, font_size: PdfTextFontSize) -> Self {
+        Self {
+            source_gid_to_cid: &font.source_gid_to_cid,
+            source_gid_to_width: &font.source_gid_to_width,
+            default_width: PdfTextSpaceWidth(font.default_width.round() as i32),
+            font_size,
+        }
+    }
+
+    fn cid(self, glyph_id: u16) -> u16 {
+        self.source_gid_to_cid[&glyph_id]
+    }
+
+    fn adjustment_for(self, glyph: &RenderedGlyph) -> PdfTextSpaceAdjustment {
+        let pdf_width = glyph.painted_id().map(|glyph_id| {
+            self.source_gid_to_width
+                .get(&glyph_id)
+                .copied()
+                .unwrap_or(self.default_width)
+        });
+        PdfTextSpaceAdjustment::for_used_advance(pdf_width, self.font_size, glyph.x_advance)
+    }
+}
+
 fn write_glyphs(
     content: &mut Content,
-    font_size: f32,
     glyphs: &[RenderedGlyph],
-    source_gid_to_cid: &std::collections::BTreeMap<u16, u16>,
+    metrics: PdfGlyphRunMetrics<'_>,
     invisible: bool,
     visible_mode: TextRenderingMode,
 ) {
     if glyphs.iter().any(RenderedGlyph::is_painted_by_vector_path) {
-        write_glyphs_with_paint_modes(
-            content,
-            font_size,
-            glyphs,
-            source_gid_to_cid,
-            invisible,
-            visible_mode,
-        );
+        write_glyphs_with_paint_modes(content, glyphs, metrics, invisible, visible_mode);
         return;
     }
-    if !needs_positioned_glyphs(glyphs) {
-        let glyph_bytes = glyph_bytes(glyphs, source_gid_to_cid);
+    if !needs_positioned_glyphs(glyphs, metrics) {
+        let glyph_bytes = glyph_bytes(glyphs, metrics.source_gid_to_cid);
         content.show(Str(&glyph_bytes));
         return;
     }
@@ -3887,22 +4196,17 @@ fn write_glyphs(
     let mut items = positioned.items();
     for (index, glyph) in glyphs.iter().enumerate() {
         if let Some(glyph_id) = glyph.painted_id() {
-            let glyph_bytes = glyph_id_bytes(source_gid_to_cid[&glyph_id]);
+            let glyph_bytes = glyph_id_bytes(metrics.cid(glyph_id));
             items.show(Str(&glyph_bytes));
         }
         if index + 1 < glyphs.len() {
-            // A normal `TJ` item first advances by the shown glyph's nominal
-            // width, so it needs only the delta to its used advance. An
-            // advance-only item shows no glyph at all: its adjustment must
-            // encode the entire used advance.
-            let adjustment_advance = if glyph.is_advance_only() {
-                -glyph.x_advance
-            } else {
-                glyph.nominal_x_advance - glyph.x_advance
-            };
-            let adjustment = (adjustment_advance * 1000.0) / font_size.max(0.001);
-            if adjustment.abs() > 0.01 {
-                items.adjust(adjustment);
+            // A run may be followed by a separately painted inline fragment.
+            // Even a sub-centipoint difference accumulates in that fragment's
+            // absolute origin, so omitting it here makes the two PDF text
+            // streams rasterize at different positions.
+            let adjustment = metrics.adjustment_for(glyph);
+            if !adjustment.is_zero() {
+                items.adjust(adjustment.value());
             }
         }
     }
@@ -3914,9 +4218,8 @@ fn write_glyphs(
 /// normal font subsetting, tagging, and ToUnicode extraction.
 fn write_glyphs_with_paint_modes(
     content: &mut Content,
-    font_size: f32,
     glyphs: &[RenderedGlyph],
-    source_gid_to_cid: &std::collections::BTreeMap<u16, u16>,
+    metrics: PdfGlyphRunMetrics<'_>,
     invisible: bool,
     visible_mode: TextRenderingMode,
 ) {
@@ -3939,18 +4242,13 @@ fn write_glyphs_with_paint_modes(
         let mut positioned = content.show_positioned();
         let mut items = positioned.items();
         if let Some(glyph_id) = glyph.painted_id() {
-            let glyph_bytes = glyph_id_bytes(source_gid_to_cid[&glyph_id]);
+            let glyph_bytes = glyph_id_bytes(metrics.cid(glyph_id));
             items.show(Str(&glyph_bytes));
         }
         if index + 1 < glyphs.len() {
-            let adjustment_advance = if glyph.is_advance_only() {
-                -glyph.x_advance
-            } else {
-                glyph.nominal_x_advance - glyph.x_advance
-            };
-            let adjustment = (adjustment_advance * 1000.0) / font_size.max(0.001);
-            if adjustment.abs() > 0.01 {
-                items.adjust(adjustment);
+            let adjustment = metrics.adjustment_for(glyph);
+            if !adjustment.is_zero() {
+                items.adjust(adjustment.value());
             }
         }
     }
@@ -3973,7 +4271,7 @@ fn write_glyphs_at_origins(
     text_matrix: crate::document::paint::text::RenderedTextMatrix,
     run_origin: (f32, f32),
     glyphs: &[RenderedGlyph],
-    source_gid_to_cid: &std::collections::BTreeMap<u16, u16>,
+    metrics: PdfGlyphRunMetrics<'_>,
     invisible: bool,
     visible_mode: TextRenderingMode,
 ) {
@@ -4008,7 +4306,7 @@ fn write_glyphs_at_origins(
                 run_origin.0 + glyph_origin.x,
                 run_origin.1 + glyph_origin.y,
             ]);
-            let glyph_bytes = glyph_id_bytes(source_gid_to_cid[&glyph_id]);
+            let glyph_bytes = glyph_id_bytes(metrics.cid(glyph_id));
             content.show(Str(&glyph_bytes));
         }
         pen_x += glyph.x_advance;
@@ -4033,10 +4331,9 @@ fn pdf_text_matrix(
     [a, b, c, d, origin.0, origin.1]
 }
 
-pub(super) fn needs_positioned_glyphs(glyphs: &[RenderedGlyph]) -> bool {
-    glyphs.iter().any(|glyph| {
-        glyph.is_advance_only()
-            || (glyph.x_advance - glyph.nominal_x_advance).abs() > 0.01
+fn needs_positioned_glyphs(glyphs: &[RenderedGlyph], metrics: PdfGlyphRunMetrics<'_>) -> bool {
+    glyphs.iter().enumerate().any(|(index, glyph)| {
+        (index + 1 < glyphs.len() && !metrics.adjustment_for(glyph).is_zero())
             || glyph.x_offset.abs() > 0.01
             || glyph.y_offset.abs() > 0.01
     })
@@ -4075,15 +4372,15 @@ mod content_tests {
     };
     use std::rc::Rc;
 
-    fn test_color_plan() -> PdfColorPlan {
-        PdfColorPlan::new(
+    fn test_color_policy() -> PdfLoweringColorPolicy {
+        PdfLoweringColorPolicy::new(
             crate::PdfProfile::Pdf,
-            1,
-            std::iter::empty(),
-            [crate::css::CssColorSpace::Srgb],
-            Vec::new(),
+            &super::super::colors::PdfColorRequirements::from_paint_and_image_sources(
+                std::iter::empty(),
+                [crate::css::CssColorSpace::Srgb],
+                Vec::new(),
+            ),
         )
-        .unwrap()
     }
 
     #[test]
@@ -4194,19 +4491,20 @@ mod content_tests {
         page: &crate::Page,
         items: &[crate::document::paint::display_list::PaintDisplayItem],
     ) -> Vec<crate::document::paint::shapes::RenderedRect> {
-        let mut next_object_id = 0;
+        let mut resources = PdfResourceRegistry::default();
         let mut forms = Vec::new();
         let mut vector_paints = VectorPaintResources::default();
-        let color_plan = test_color_plan();
+        let color_policy = test_color_policy();
         let state = PaintTreeRenderState {
-            next_object_id: &mut next_object_id,
+            resources: &mut resources,
             forms: &mut forms,
             next_form_name: 1,
             form_dependency_scopes: Vec::new(),
+            root_form_dependencies: BTreeMap::new(),
             vector_paints: &mut vector_paints,
             page_size: PdfSize::new(page.width(), page.height()),
             color_mode: PdfColorMode::PreserveCssSpace,
-            color_plan: &color_plan,
+            color_policy: &color_policy,
             image_resources: &[],
             page_image_sources: &[],
             page_image_pattern_sources: &[],
@@ -4618,7 +4916,7 @@ mod content_tests {
         )
         .with_actual_text(Rc::from("⚪"));
         let mut content = Content::new();
-        let color_plan = test_color_plan();
+        let color_policy = test_color_policy();
         write_image(
             &mut content,
             &image,
@@ -4628,12 +4926,13 @@ mod content_tests {
                 pixel_height: 1,
                 interpolate: false,
                 color_space: crate::color::RasterColorSpace::SRGB,
+                sample_depth: crate::image_store::RasterSampleDepth::Eight,
                 payload: ImagePayload::Samples {
                     rgb: vec![0, 0, 0],
                     alpha: None,
                 },
             }),
-            &color_plan,
+            &color_policy,
         );
         let bytes = content.finish().into_vec();
         let content = String::from_utf8_lossy(&bytes);
@@ -4657,13 +4956,13 @@ mod content_tests {
         )
         .with_actual_text(Rc::from("transparent"));
         let mut content = Content::new();
-        let color_plan = test_color_plan();
+        let color_policy = test_color_policy();
         write_image(
             &mut content,
             &image,
             0,
             &PreparedImageResource::Transparent,
-            &color_plan,
+            &color_policy,
         );
         let bytes = content.finish().into_vec();
         let content = String::from_utf8_lossy(&bytes);
@@ -4688,7 +4987,7 @@ mod content_tests {
         )
         .with_actual_text(Rc::from("green"));
         let mut content = Content::new();
-        let color_plan = test_color_plan();
+        let color_policy = test_color_policy();
         write_image(
             &mut content,
             &image,
@@ -4697,7 +4996,7 @@ mod content_tests {
                 color_space: crate::color::RasterColorSpace::SRGB,
                 components: [0, 128, 0],
             }),
-            &color_plan,
+            &color_policy,
         );
         let bytes = content.finish().into_vec();
         let content = String::from_utf8_lossy(&bytes);
@@ -4734,7 +5033,7 @@ mod content_tests {
             Vec::new(),
         ));
         let mut content = Content::new();
-        let color_plan = test_color_plan();
+        let color_policy = test_color_policy();
         write_image(
             &mut content,
             &image,
@@ -4743,7 +5042,7 @@ mod content_tests {
                 color_space: crate::color::RasterColorSpace::SRGB,
                 components: [0, 128, 0],
             }),
-            &color_plan,
+            &color_policy,
         );
         let content = String::from_utf8_lossy(&content.finish().into_vec()).into_owned();
 
@@ -4798,5 +5097,66 @@ mod content_tests {
         assert_eq!(content.matches("W\nn").count(), 1, "content={content}");
         assert!(content.contains("/P1 scn"));
         assert!(content.contains("10 20 4 5 re"));
+    }
+
+    #[test]
+    fn pdf_text_space_adjustment_uses_the_serialized_integer_width() {
+        let width = PdfTextSpaceWidth::from_font_units(455, 2048);
+        assert_eq!(width, PdfTextSpaceWidth(222));
+
+        let font_size = PdfTextFontSize::new(12.0);
+        let used_advance = 455.0 * font_size.points() / 2048.0;
+        let adjustment =
+            PdfTextSpaceAdjustment::for_used_advance(Some(width), font_size, used_advance);
+
+        assert!(!adjustment.is_zero());
+        assert!((width.points_at(font_size.points()) - used_advance).abs() < 0.01);
+    }
+
+    #[test]
+    fn glyphs_with_a_pdf_width_rounding_delta_emit_tj() {
+        let source_gid_to_cid = BTreeMap::from([(1, 1), (2, 2)]);
+        let source_gid_to_width = BTreeMap::from([
+            (1, PdfTextSpaceWidth::from_font_units(455, 2048)),
+            (2, PdfTextSpaceWidth(500)),
+        ]);
+        let metrics = PdfGlyphRunMetrics {
+            source_gid_to_cid: &source_gid_to_cid,
+            source_gid_to_width: &source_gid_to_width,
+            default_width: PdfTextSpaceWidth(0),
+            font_size: PdfTextFontSize::new(12.0),
+        };
+        let used_advance = 455.0 * 12.0 / 2048.0;
+        let glyphs = vec![
+            RenderedGlyph {
+                kind: crate::document::paint::text::RenderedGlyphKind::Paint(1),
+                x_advance: used_advance,
+                nominal_x_advance: used_advance,
+                x_offset: 0.0,
+                y_offset: 0.0,
+                unicode: "A".to_string(),
+            },
+            RenderedGlyph {
+                kind: crate::document::paint::text::RenderedGlyphKind::Paint(2),
+                x_advance: 6.0,
+                nominal_x_advance: 6.0,
+                x_offset: 0.0,
+                y_offset: 0.0,
+                unicode: "B".to_string(),
+            },
+        ];
+        let mut content = Content::new();
+        content.begin_text();
+        write_glyphs(
+            &mut content,
+            &glyphs,
+            metrics,
+            false,
+            TextRenderingMode::Fill,
+        );
+        content.end_text();
+        let content = String::from_utf8_lossy(&content.finish().into_vec()).into_owned();
+
+        assert!(content.contains("TJ"), "content={content}");
     }
 }

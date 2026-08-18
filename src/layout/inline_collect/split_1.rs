@@ -1,8 +1,9 @@
 use super::*;
 use crate::text::{
-    SegmentBreakContext, character_is_currency_symbol, character_is_mandatory_line_break,
+    CssTextScalar, SegmentBreakContext, character_is_currency_symbol, classify_css_text_scalar,
     segment_break_is_removable,
 };
+use crate::units::glyph_baseline_displacement_pt;
 use std::rc::Rc;
 
 /// Push CSS Text-normalized inline words into the shared inline item stream.
@@ -26,13 +27,14 @@ pub(in crate::layout) fn push_inline_words_for_style(
     // helper first. Give every run its own used-style clone so CSS `zoom`
     // reaches shaping, line metrics, and letter/word spacing exactly once.
     // <https://drafts.csswg.org/css-viewport/#zoom-property>
-    let zoomed_style = css::LayoutStyle::from_computed(style).into_zoomed();
+    let used_style = css::LayoutStyle::from_computed(style).into_zoomed();
+    let style = &used_style;
     let normalized_style;
-    let style = if anonymous_inline_content_needs_normalized_style(&zoomed_style) {
-        normalized_style = normalized_anonymous_inline_content_style(&zoomed_style);
+    let style = if anonymous_inline_content_needs_normalized_style(style) {
+        normalized_style = normalized_anonymous_inline_content_style(style);
         &normalized_style
     } else {
-        &zoomed_style
+        style
     };
     push_inline_text_run(
         text,
@@ -599,26 +601,50 @@ mod tests {
     }
 
     #[test]
-    fn css_text_controls_are_visible_while_unicode_line_separators_break() {
-        let style = ComputedStyle::initial();
-        let mut items = Vec::new();
-        push_inline_text_run(
-            "1\u{000c}2\u{000b}3\u{2028}4\u{2029}5\u{0085}6",
-            &style,
-            None,
-            0.0,
-            InlineVisualOffset::zero(),
-            &mut items,
-        );
-        normalize_inline_whitespace_items(&mut items);
+    fn mandatory_unicode_breaks_force_lines_in_every_white_space_mode() {
+        for white_space in [WhiteSpace::Normal, WhiteSpace::NoWrap, WhiteSpace::PreWrap] {
+            let mut style = ComputedStyle::initial();
+            style.white_space = white_space;
+            let mut items = Vec::new();
+            push_inline_text_run(
+                "1\u{000c}2\u{000b}3\u{2028}4\u{2029}5\u{0085}6",
+                &style,
+                None,
+                0.0,
+                InlineVisualOffset::zero(),
+                &mut items,
+            );
+            normalize_inline_whitespace_items(&mut items);
 
-        assert_eq!(
-            items
-                .iter()
-                .filter(|item| matches!(item, InlineItem::Break(_)))
-                .count(),
-            2
-        );
+            assert_eq!(
+                items
+                    .iter()
+                    .filter(|item| matches!(item, InlineItem::Break(_)))
+                    .count(),
+                5,
+                "{white_space:?} must retain every BK/NL boundary"
+            );
+            assert!(
+                items
+                    .iter()
+                    .filter_map(|item| match item {
+                        InlineItem::Break(break_) => Some(break_),
+                        _ => None,
+                    })
+                    .all(|break_| break_.origin == InlineBreakOrigin::Explicit),
+                "{white_space:?} must represent BK/NL as forced, not preserved segment breaks"
+            );
+            assert_eq!(
+                items
+                    .iter()
+                    .filter_map(|item| match item {
+                        InlineItem::Word(word) => Some(word.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+                "123456"
+            );
+        }
     }
 
     #[test]
@@ -941,27 +967,36 @@ enum PendingSegmentBreakPlacement {
     BeforeInlineStart(InlineStreamItemIndex),
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub(in crate::layout) struct InlinePlacement {
-    pub(in crate::layout) baseline_shift: f32,
+    baseline: InlineBaselinePlacement,
     pub(in crate::layout) visual_offset: InlineVisualOffset,
 }
 
 impl InlinePlacement {
     pub(in crate::layout) fn new(baseline_shift: f32, visual_offset: InlineVisualOffset) -> Self {
         Self {
-            baseline_shift,
+            baseline: InlineBaselinePlacement::from_inherited_glyph_displacement(
+                glyph_baseline_displacement_pt(baseline_shift),
+            ),
             visual_offset,
         }
     }
 
     pub(in crate::layout) fn zero() -> Self {
-        Self::default()
+        Self::new(0.0, InlineVisualOffset::zero())
     }
 
-    pub(in crate::layout) fn with_added_baseline_shift(self, baseline_shift: f32) -> Self {
+    pub(in crate::layout) fn baseline_shift(self) -> f32 {
+        self.baseline.glyph_displacement().get()
+    }
+
+    pub(in crate::layout) fn with_added_baseline_placement(
+        self,
+        baseline: InlineBaselinePlacement,
+    ) -> Self {
         Self {
-            baseline_shift: self.baseline_shift + baseline_shift,
+            baseline: self.baseline.with_added(baseline),
             ..self
         }
     }
@@ -1211,7 +1246,6 @@ impl InlineWhitespaceProcessor {
     }
 
     pub(in crate::layout) fn push_word(&mut self, word: InlineWord) {
-        let text = css_text_rendering_text(&word.text);
         let meta = InlineTextRunMeta {
             style: word.style,
             baseline_shift: word.baseline_shift,
@@ -1222,7 +1256,23 @@ impl InlineWhitespaceProcessor {
             hanging_edges: word.hanging_edges,
             ancestor_inline_decorations: word.ancestor_inline_decorations,
         };
-        for character in text.chars() {
+        for source_character in word.text.chars() {
+            let character = match classify_css_text_scalar(source_character) {
+                CssTextScalar::MandatoryLineBreak(_) => {
+                    self.discard_pending_word_space_transform();
+                    self.push_segment_break(&meta, true);
+                    continue;
+                }
+                CssTextScalar::SegmentBreak => {
+                    self.discard_pending_word_space_transform();
+                    self.push_segment_break(&meta, false);
+                    continue;
+                }
+                CssTextScalar::CarriageReturn | CssTextScalar::DocumentSpace => ' ',
+                CssTextScalar::Tab => '\t',
+                CssTextScalar::VisibleControl(control) => control.synthesized_glyph(),
+                CssTextScalar::Text(character) => character,
+            };
             if character == '\u{200b}'
                 && let Some(replacement) = meta.style.word_space_transform.replacement
             {
@@ -1231,10 +1281,7 @@ impl InlineWhitespaceProcessor {
                     replacement,
                     meta: meta.clone(),
                 });
-            } else if character == '\n' {
-                self.discard_pending_word_space_transform();
-                self.push_segment_break(&meta, false);
-            } else if character == INLINE_BREAK || character_is_mandatory_line_break(character) {
+            } else if character == INLINE_BREAK {
                 self.discard_pending_word_space_transform();
                 self.push_segment_break(&meta, true);
             } else if meta.style.white_space.collapses_spaces() && matches!(character, ' ' | '\t') {

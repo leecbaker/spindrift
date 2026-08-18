@@ -82,6 +82,44 @@ pub(in crate::layout) struct PositionedChildStaticRect {
     static_alignment: Option<AbsposStaticAlignment>,
 }
 
+/// The source-coordinate overflow-clip ancestry of a positioned descendant
+/// deferred out of temporary multicolumn layout.
+///
+/// An empty chain is meaningful: it records that the descendant was captured
+/// with no ancestor overflow clips.  Replay must use this durable source
+/// geometry rather than whichever clip scopes happen to be active after the
+/// temporary column pages have been restored.
+/// <https://drafts.csswg.org/css-overflow-3/#overflow-clip-edge>
+#[derive(Debug, Clone)]
+struct PositionedSourceOverflowClipChain(Vec<OverflowClip>);
+
+impl PositionedSourceOverflowClipChain {
+    fn capture(clips: &[OverflowClip]) -> Self {
+        Self(clips.to_vec())
+    }
+
+    fn clips(&self) -> &[OverflowClip] {
+        &self.0
+    }
+}
+
+/// Durable source context required to replay one positioned descendant after
+/// its multicolumn owner restores the enclosing layout state.
+///
+/// The containing-block owner and overflow-clip ancestry are one source
+/// coordinate-system contract. Keeping them together prevents replay from
+/// restoring a containing block while silently inheriting unrelated ambient
+/// clips from the outer builder.
+/// <https://www.w3.org/TR/css-position-3/#abspos-containing-block>
+/// <https://drafts.csswg.org/css-overflow-3/#overflow-clipping>
+#[derive(Debug, Clone)]
+struct DeferredMulticolReplayContext {
+    /// Stable owner captured from the normal-flow positioned containing block,
+    /// rather than a temporary multicolumn page index.
+    containing_block_span_id: Option<u64>,
+    source_overflow_clips: PositionedSourceOverflowClipChain,
+}
+
 /// An out-of-flow flex descendant measured while a multicolumn container owns
 /// temporary fragmentainer pages.
 ///
@@ -96,9 +134,7 @@ pub(in crate::layout) struct DeferredMulticolPositionedChild {
     element: Element,
     signature: Box<ElementSignature>,
     style: ComputedStyle,
-    /// Stable owner captured from the normal-flow positioned containing block,
-    /// rather than a temporary multicolumn page index.
-    containing_block_span_id: Option<u64>,
+    replay_context: DeferredMulticolReplayContext,
     fragment: PositionedFragmentReplay,
 }
 
@@ -586,6 +622,79 @@ impl<'a> LayoutBuilder<'a> {
         source_layers
     }
 
+    /// Capture the source state that a deferred positioned child must replay
+    /// after temporary multicolumn layout restores the enclosing builder.
+    fn deferred_multicol_replay_context(
+        &self,
+        position: &Position,
+    ) -> DeferredMulticolReplayContext {
+        DeferredMulticolReplayContext {
+            containing_block_span_id: self
+                .active_multicol_positioned_containing_block_span_id(position),
+            source_overflow_clips: PositionedSourceOverflowClipChain::capture(&self.overflow_clips),
+        }
+    }
+
+    pub(in crate::layout) fn deferred_multicol_positioned_child(
+        &self,
+        element: &Element,
+        signature: &ElementSignature,
+        style: ComputedStyle,
+        fragment: PositionedFragmentReplay,
+    ) -> DeferredMulticolPositionedChild {
+        let replay_context = self.deferred_multicol_replay_context(&style.position);
+        debug_assert!(replay_context.containing_block_span_id.is_none_or(|id| {
+            self.multicol_positioned_containing_block_spans
+                .iter()
+                .any(|span| span.id == id)
+        }));
+        DeferredMulticolPositionedChild {
+            element: element.clone(),
+            signature: Box::new(signature.clone()),
+            style,
+            replay_context,
+            fragment,
+        }
+    }
+
+    /// Run deferred source layout under its captured containing-block and
+    /// overflow-clip context, then restore the enclosing builder state.
+    fn with_deferred_multicol_replay_context<T>(
+        &mut self,
+        context: &DeferredMulticolReplayContext,
+        containing_block: Option<(PositionedContainingBlockMode, ContainingBlock)>,
+        layout: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let saved_overflow_clips = std::mem::replace(
+            &mut self.overflow_clips,
+            context.source_overflow_clips.clips().to_vec(),
+        );
+        let containing_block_scope = containing_block.map(|(mode, containing_block)| {
+            self.push_positioned_containing_block(mode, containing_block)
+        });
+        let result = layout(self);
+        if let Some(scope) = containing_block_scope {
+            self.pop_positioned_containing_block(scope);
+        }
+        self.overflow_clips = saved_overflow_clips;
+        result
+    }
+
+    fn replay_deferred_multicol_source_layers(
+        &mut self,
+        context: &DeferredMulticolReplayContext,
+        containing_block: Option<(PositionedContainingBlockMode, ContainingBlock)>,
+        child: &FormattingContextChild<'_>,
+        stylesheets: &Stylesheets<'_>,
+        static_rect: PositionedChildStaticRect,
+    ) -> Vec<PositionedPaintLayer> {
+        self.with_deferred_multicol_replay_context(context, containing_block, |layout| {
+            layout.capture_deferred_multicol_source_layers(|layout| {
+                layout.layout_positioned_formatting_context_child(child, stylesheets, static_rect);
+            })
+        })
+    }
+
     /// Queue a positioned child with its already committed fragment payload.
     pub(in crate::layout) fn defer_multicol_positioned_fragment_child(
         &mut self,
@@ -619,21 +728,8 @@ impl<'a> LayoutBuilder<'a> {
         style: ComputedStyle,
         fragment: PositionedFragmentReplay,
     ) {
-        let containing_block_span_id =
-            self.active_multicol_positioned_containing_block_span_id(&style.position);
-        debug_assert!(containing_block_span_id.is_none_or(|id| {
-            self.multicol_positioned_containing_block_spans
-                .iter()
-                .any(|span| span.id == id)
-        }));
         self.deferred_multicol_positioned_children
-            .push(DeferredMulticolPositionedChild {
-                element: element.clone(),
-                signature: Box::new(signature.clone()),
-                style,
-                containing_block_span_id,
-                fragment,
-            });
+            .push(self.deferred_multicol_positioned_child(element, signature, style, fragment));
     }
 
     /// Capture a positioned principal whose containing block was established
@@ -665,7 +761,8 @@ impl<'a> LayoutBuilder<'a> {
             .iter()
             .any(|child| {
                 child.element.id == element.id
-                    && child.containing_block_span_id == Some(containing_block_span_id)
+                    && child.replay_context.containing_block_span_id
+                        == Some(containing_block_span_id)
             })
         {
             return true;
@@ -675,15 +772,15 @@ impl<'a> LayoutBuilder<'a> {
             .last()
             .cloned()
             .unwrap_or_else(|| element_signature(element));
-        self.deferred_multicol_positioned_children
-            .push(DeferredMulticolPositionedChild {
-                element: element.clone(),
-                signature: Box::new(signature),
-                style: style.clone(),
-                containing_block_span_id: Some(containing_block_span_id),
-                fragment: PositionedFragmentReplay::unfragmented(source_static_rect, None)
+        self.deferred_multicol_positioned_children.push(
+            self.deferred_multicol_positioned_child(
+                element,
+                &signature,
+                style.clone(),
+                PositionedFragmentReplay::unfragmented(source_static_rect, None)
                     .across_committed_multicolumn_fragments(),
-            });
+            ),
+        );
         true
     }
 
@@ -853,22 +950,29 @@ impl<'a> LayoutBuilder<'a> {
             self.deferred_multicol_positioned_children[start..]
                 .iter()
                 .all(|child| {
-                    child.containing_block_span_id.is_none_or(|id| {
-                        self.multicol_positioned_containing_block_spans
-                            .iter()
-                            .any(|span| span.id == id)
-                    })
+                    child
+                        .replay_context
+                        .containing_block_span_id
+                        .is_none_or(|id| {
+                            self.multicol_positioned_containing_block_spans
+                                .iter()
+                                .any(|span| span.id == id)
+                        })
                 }),
             "deferred multicol positioned descendants must reference a durable containing-block span"
         );
         let deferred = self.deferred_multicol_positioned_children.split_off(start);
         for child in deferred {
-            let containing_block_span = child.containing_block_span_id.and_then(|id| {
-                self.multicol_positioned_containing_block_spans
-                    .iter()
-                    .find(|span| span.id == id)
-                    .cloned()
-            });
+            let containing_block_span =
+                child
+                    .replay_context
+                    .containing_block_span_id
+                    .and_then(|id| {
+                        self.multicol_positioned_containing_block_spans
+                            .iter()
+                            .find(|span| span.id == id)
+                            .cloned()
+                    });
             let static_rect = child.fragment.source_static_rect;
             let stylesheets = self.stylesheets;
             let child_boxes = self.build_frozen_child_boxes_with_current_ancestors(
@@ -893,18 +997,15 @@ impl<'a> LayoutBuilder<'a> {
                 // discover it, determines which committed column slices own
                 // the result.
                 // <https://www.w3.org/TR/css-position-3/#fragmenting-absolutely-positioned-elements>
-                let source_scope =
-                    self.push_positioned_containing_block(span.mode, span.containing_block);
                 let stylesheets = self.stylesheets;
-                let source_layers = self.capture_deferred_multicol_source_layers(|layout| {
-                    layout.layout_positioned_formatting_context_child(
-                        &replay_child,
-                        &stylesheets,
-                        static_rect,
-                    );
-                });
+                let source_layers = self.replay_deferred_multicol_source_layers(
+                    &child.replay_context,
+                    Some((span.mode, span.containing_block)),
+                    &replay_child,
+                    &stylesheets,
+                    static_rect,
+                );
                 self.append_multicol_positioned_candidate_layers(&child.fragment, source_layers);
-                self.pop_positioned_containing_block(source_scope);
                 continue;
             }
             if child.fragment.localizes_static_rect_per_candidate() {
@@ -913,16 +1014,13 @@ impl<'a> LayoutBuilder<'a> {
                         child.fragment.candidate_source_space,
                         PositionedCandidateSourceSpace::DefiniteBlockInsetGlobal
                     );
-                    let scope = if global_block_inset {
+                    let containing_block = if global_block_inset {
                         child.fragment.source_containing_block()
                     } else {
                         child
                             .fragment
                             .containing_block_local_to_candidate(candidate)
-                    }
-                    .map(|(mode, containing_block)| {
-                        self.push_positioned_containing_block(mode, containing_block)
-                    });
+                    };
                     let candidate_static_rect = if global_block_inset {
                         static_rect
                     } else {
@@ -932,13 +1030,13 @@ impl<'a> LayoutBuilder<'a> {
                         ))
                     };
                     let stylesheets = self.stylesheets;
-                    let source_layers = self.capture_deferred_multicol_source_layers(|layout| {
-                        layout.layout_positioned_formatting_context_child(
-                            &replay_child,
-                            &stylesheets,
-                            candidate_static_rect,
-                        );
-                    });
+                    let source_layers = self.replay_deferred_multicol_source_layers(
+                        &child.replay_context,
+                        containing_block,
+                        &replay_child,
+                        &stylesheets,
+                        candidate_static_rect,
+                    );
                     for mut layer in source_layers {
                         // Positioned layout produces source-coordinate ink.
                         // A global definite inset retains its original source
@@ -963,34 +1061,21 @@ impl<'a> LayoutBuilder<'a> {
                             .intersect_overflow_clip_bounds(destination_clip);
                         self.positioned_layers.push(layer);
                     }
-                    if let Some(scope) = scope {
-                        self.pop_positioned_containing_block(scope);
-                    }
                 }
                 continue;
             }
-            let scope =
-                child
-                    .fragment
-                    .positioning_containing_block
-                    .map(|(mode, containing_block)| {
-                        self.push_positioned_containing_block(mode, containing_block)
-                    });
             let stylesheets = self.stylesheets;
-            let source_layers = self.capture_deferred_multicol_source_layers(|layout| {
-                layout.layout_positioned_formatting_context_child(
-                    &replay_child,
-                    &stylesheets,
-                    static_rect,
-                );
-            });
+            let source_layers = self.replay_deferred_multicol_source_layers(
+                &child.replay_context,
+                child.fragment.positioning_containing_block,
+                &replay_child,
+                &stylesheets,
+                static_rect,
+            );
             if child.fragment.has_unresolved_candidates() {
                 self.append_multicol_positioned_candidate_layers(&child.fragment, source_layers);
             } else {
                 self.positioned_layers.extend(source_layers);
-            }
-            if let Some(scope) = scope {
-                self.pop_positioned_containing_block(scope);
             }
         }
     }
@@ -1286,6 +1371,59 @@ mod tests {
             builder.fixed_containing_blocks.len(),
             initial_fixed_containing_blocks
         );
+    }
+
+    #[test]
+    fn deferred_multicol_replay_context_restores_captured_clip_chain_and_parent_state() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let source_clip = OverflowClip::from_paint_rect_with_axes_and_non_scrollable(
+            paint_space_rect(1.0, 2.0, 30.0, 40.0),
+            true,
+            true,
+            false,
+            true,
+        );
+        let enclosing_clip = OverflowClip::from_paint_rect(paint_space_rect(5.0, 6.0, 7.0, 8.0));
+        let containing_block =
+            ContainingBlock::from_page_top_rect(PageTopRect::new(10.0, 20.0, 30.0, 40.0));
+
+        builder.overflow_clips = vec![source_clip];
+        let clipped_context = builder.deferred_multicol_replay_context(&Position::Absolute);
+        builder.overflow_clips = vec![enclosing_clip];
+        let initial_containing_block_depth = builder.containing_blocks.len();
+        let observed = builder.with_deferred_multicol_replay_context(
+            &clipped_context,
+            Some((
+                PositionedContainingBlockMode::AbsoluteOnly,
+                containing_block,
+            )),
+            |layout| {
+                (
+                    layout.overflow_clips.clone(),
+                    layout.containing_blocks.len(),
+                )
+            },
+        );
+        assert_eq!(observed.0, vec![source_clip]);
+        assert_eq!(observed.1, initial_containing_block_depth + 1);
+        assert_eq!(builder.overflow_clips, vec![enclosing_clip]);
+        assert_eq!(
+            builder.containing_blocks.len(),
+            initial_containing_block_depth
+        );
+
+        builder.overflow_clips.clear();
+        let empty_context = builder.deferred_multicol_replay_context(&Position::Absolute);
+        builder.overflow_clips = vec![enclosing_clip];
+        let observed_empty =
+            builder.with_deferred_multicol_replay_context(&empty_context, None, |layout| {
+                layout.overflow_clips.clone()
+            });
+        assert!(observed_empty.is_empty());
+        assert_eq!(builder.overflow_clips, vec![enclosing_clip]);
     }
 
     #[test]

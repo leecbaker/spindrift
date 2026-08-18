@@ -35,7 +35,9 @@ pub(in crate::css) use at_rules::{
     parse_keyframes_rule, parse_layer_name, parse_layer_name_list, parse_namespace_prelude,
     parse_property_names, parse_property_rule, parse_scope_prelude, qualify_layer_name,
 };
-pub(in crate::css) use declarations::{DeclarationParseResult, parse_canonical_declaration};
+pub(in crate::css) use declarations::{
+    DeclarationParseResult, cascaded_declaration_is_valid, parse_canonical_declaration,
+};
 pub(crate) use declarations::{custom_property_value_is_valid, is_custom_property_name};
 pub(crate) use media_queries::{media_rule_applies, media_rule_applies_in_environment};
 pub(in crate::css) use parser::{

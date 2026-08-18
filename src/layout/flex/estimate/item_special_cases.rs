@@ -100,11 +100,39 @@ impl<'a> LayoutBuilder<'a> {
             };
             let children = flex_children_from_boxes(element, signature, style, child_boxes);
             (!children.is_empty()).then(|| {
-                let explicit_intrinsic_height = used_content_box_height_or_auto_with_basis(
-                    style,
-                    containing_height_basis,
-                    vertical_non_content,
-                );
+                // `available.height_basis` can describe this item's already
+                // resolved used height. In that case the nested flex
+                // container is being measured *inside* the flex item, so its
+                // own authored percentage height must not be resolved a
+                // second time against that used height. For example, a
+                // column parent's `height: 200px` gives its `height: 50%`
+                // child a 100px used main size; a nested flex estimate must
+                // use 100px, not resolve 50% of 100px again.
+                // <https://www.w3.org/TR/css-flexbox-1/#definite-sizes>
+                // <https://www.w3.org/TR/css-sizing-3/#percentage-sizing>
+                let resolved_item_height = matches!(
+                    available.height_basis,
+                    PercentageBasis::Definite {
+                        source: FlexAvailableSizeSource::DefinitePreferredMainSize
+                            | FlexAvailableSizeSource::DefinitePreferredCrossSize
+                            | FlexAvailableSizeSource::DefiniteFlexBase
+                            | FlexAvailableSizeSource::PostFlexingMainSize
+                            | FlexAvailableSizeSource::DefiniteCrossSize
+                            | FlexAvailableSizeSource::BalancedLineSlot
+                            | FlexAvailableSizeSource::DefiniteSingleLineStretch,
+                        ..
+                    }
+                )
+                .then_some(available.height)
+                .flatten()
+                .map(PhysicalContentHeight::content_box_length);
+                let explicit_intrinsic_height = resolved_item_height.or_else(|| {
+                    used_content_box_height_or_auto_with_basis(
+                        style,
+                        containing_height_basis,
+                        vertical_non_content,
+                    )
+                });
                 // An auto-height flex item stretched by a parent line
                 // has a definite used cross size for its descendants.
                 // A nested flex container must retain that marked basis
@@ -117,10 +145,17 @@ impl<'a> LayoutBuilder<'a> {
                         .stretched_height
                         .map(PhysicalContentHeight::content_box_length)
                 });
-                let intrinsic_height_basis = if explicit_intrinsic_height.is_some() {
+                let intrinsic_height_basis = if resolved_item_height.is_some() {
+                    available.height_basis
+                } else if explicit_intrinsic_height.is_some() {
+                    // This is the nested flex container's own resolved
+                    // preferred block size, not merely an intrinsic
+                    // measurement constraint. Its items may therefore use
+                    // it as a percentage basis while contributing their
+                    // intrinsic inline sizes.
                     flex_available_percentage_basis(
                         intrinsic_height,
-                        FlexAvailableSizeSource::IntrinsicContainerSize,
+                        FlexAvailableSizeSource::DefinitePreferredCrossSize,
                     )
                 } else if available.stretched_height.is_some() {
                     available.height_basis
@@ -130,31 +165,45 @@ impl<'a> LayoutBuilder<'a> {
                         FlexAvailableSizeSource::IntrinsicContainerSize,
                     )
                 };
-                layout.estimate_intrinsic_flex_container_size(
-                    &children,
-                    style,
-                    stylesheets,
-                    FlexAvailableSpace {
-                        width: PhysicalContentWidth::new(containing_width),
-                        width_basis: if main_size_resolved_by_flex {
-                            PercentageBasis::definite_from(
-                                containing_width,
-                                FlexAvailableSizeSource::PostFlexingMainSize,
-                            )
-                        } else {
-                            flex_available_percentage_basis(
-                                used_length_percentage_or_auto_with_basis(
-                                    style.box_values.width.clone(),
-                                    containing_width_basis,
+                // The nested Flex solver consumes its container style as well
+                // as the available-space record. Freeze only this temporary
+                // layout style when its parent item already has a used height;
+                // descendants continue to come from the source box tree
+                // built above, so this does not leak a used value into CSS
+                // cascade.
+                let mut intrinsic_style = style.clone();
+                if let Some(height) = resolved_item_height {
+                    set_style_used_height(&mut intrinsic_style, height.points());
+                }
+                let descendant_block_basis =
+                    intrinsic_block_basis_from_flex_available_height(intrinsic_height_basis);
+                layout.with_flex_item_percentage_height_basis(descendant_block_basis, |layout| {
+                    layout.estimate_intrinsic_flex_container_size(
+                        &children,
+                        &intrinsic_style,
+                        stylesheets,
+                        FlexAvailableSpace {
+                            width: PhysicalContentWidth::new(containing_width),
+                            width_basis: if main_size_resolved_by_flex {
+                                PercentageBasis::definite_from(
+                                    containing_width,
+                                    FlexAvailableSizeSource::PostFlexingMainSize,
                                 )
-                                .map(|_| containing_width),
-                                FlexAvailableSizeSource::IntrinsicContainerSize,
-                            )
+                            } else {
+                                flex_available_percentage_basis(
+                                    used_length_percentage_or_auto_with_basis(
+                                        style.box_values.width.clone(),
+                                        containing_width_basis,
+                                    )
+                                    .map(|_| containing_width),
+                                    FlexAvailableSizeSource::IntrinsicContainerSize,
+                                )
+                            },
+                            height: intrinsic_height.map(PhysicalContentHeight::new),
+                            height_basis: intrinsic_height_basis,
                         },
-                        height: intrinsic_height.map(PhysicalContentHeight::new),
-                        height_basis: intrinsic_height_basis,
-                    },
-                )
+                    )
+                })
             })
         });
         if let Some(intrinsic_size) = intrinsic_size {
@@ -253,13 +302,22 @@ impl<'a> LayoutBuilder<'a> {
     ) -> FlexItemEstimate {
         let FlexItemEstimateContext {
             style,
+            available,
             containing_width,
             containing_width_basis,
             containing_height_basis,
             vertical_non_content,
             ..
         } = context;
-        let (row_width, row_height) = self.measure_direct_inline_row(element, style, stylesheets);
+        // A direct inline replaced row is measured through its own flex item
+        // as well as through the enclosing item's first-pass estimate. This
+        // second boundary must preserve a resolved item height; otherwise the
+        // row's automatic minimum re-measures an image at its natural height
+        // and widens an auto-sized nested flex container.
+        let block_basis =
+            flex_item_estimate_percentage_height_basis(style, available, vertical_non_content);
+        let (row_width, row_height) =
+            self.measure_direct_inline_row(element, style, stylesheets, block_basis);
         let content_width = used_length_percentage_or_auto_with_basis(
             style.box_values.width.clone(),
             containing_width_basis,

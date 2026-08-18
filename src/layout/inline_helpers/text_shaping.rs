@@ -59,16 +59,20 @@ pub(in crate::layout) fn can_queue_inline_fragments_for_shaping(
     if left.link_target() != right.link_target() {
         return false;
     }
+    let boundary_effect = inline_boundary_effect(left, right);
     can_paint_inline_fragments_together(left, right)
-        || ((inline_fragment_is_join_control_only(left)
+        || (matches!(
+            boundary_effect,
+            InlineBoundaryEffect::PaintOnly | InlineBoundaryEffect::ShapingInputChange
+        ) && (((inline_fragment_is_join_control_only(left)
             || inline_fragment_is_join_control_only(right))
             && can_shape_inline_fragments_together(left, right))
-        || ((inline_fragment_is_arabic_tatweel_only(left)
-            || inline_fragment_is_arabic_tatweel_only(right))
-            && can_shape_inline_fragments_together(left, right))
-        || ((inline_fragment_contains_joining_context(left)
-            || inline_fragment_contains_joining_context(right))
-            && can_shape_inline_fragments_together(left, right))
+            || ((inline_fragment_is_arabic_tatweel_only(left)
+                || inline_fragment_is_arabic_tatweel_only(right))
+                && can_shape_inline_fragments_together(left, right))
+            || ((inline_fragment_contains_joining_context(left)
+                || inline_fragment_contains_joining_context(right))
+                && can_shape_inline_fragments_together(left, right))))
 }
 
 /// Return whether adjacent inline fragments can be shaped as one text run.
@@ -172,6 +176,36 @@ pub(in crate::layout) fn styles_have_equivalent_text_shaping_inputs(
         && left.language == right.language
         && left.writing_mode == right.writing_mode
         && left.text_orientation == right.text_orientation
+}
+
+/// Classify an inline boundary before choosing a shaping group.
+///
+/// Layout boundaries are hard breaks; style differences that affect glyph
+/// selection remain shaping boundaries; paint-only differences share a shaping
+/// context while retaining their own paint ranges:
+/// <https://drafts.csswg.org/css-text-3/#boundary-shaping>.
+pub(in crate::layout) fn inline_boundary_effect(
+    left: &(impl InlineFragmentAccess + ?Sized),
+    right: &(impl InlineFragmentAccess + ?Sized),
+) -> InlineBoundaryEffect {
+    if !can_shape_inline_fragments_together(left, right) {
+        InlineBoundaryEffect::LayoutShapingBreak
+    } else if styles_have_equivalent_text_shaping_inputs(left.style(), right.style()) {
+        InlineBoundaryEffect::PaintOnly
+    } else {
+        InlineBoundaryEffect::ShapingInputChange
+    }
+}
+
+pub(in crate::layout) fn style_boundary_effect(
+    left: &ComputedStyle,
+    right: &ComputedStyle,
+) -> InlineBoundaryEffect {
+    if styles_have_equivalent_text_shaping_inputs(left, right) {
+        InlineBoundaryEffect::PaintOnly
+    } else {
+        InlineBoundaryEffect::ShapingInputChange
+    }
 }
 
 pub(in crate::layout) fn inline_fragment_is_join_control_only(

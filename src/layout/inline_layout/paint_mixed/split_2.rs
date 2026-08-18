@@ -264,7 +264,8 @@ pub(in crate::layout) fn inline_atom_horizontal_content_y(
                     let baseline = inline_atom_logical_content_placement_baseline_offset(
                         atom,
                         containing_style,
-                    );
+                    )
+                    .points();
                     placement.line_top - placement.line_baseline_offset + baseline
                         - placement.content_block_size
                         + atom.baseline_shift
@@ -360,6 +361,13 @@ pub(in crate::layout) fn adjacent_fragment_paints_or_stops_edge(
 ) -> Option<bool> {
     match &item.item {
         InlineLineItem::Fragment(fragment) => {
+            // Selected-line UAX #9 controls are virtual continuation syntax,
+            // not inline box content. A clone edge remains outside those
+            // controls and must inspect the adjoining visible fragment for
+            // decoration ownership.
+            if fragment.source() == InlineTextSource::BidiControl {
+                return None;
+            }
             if *fragment.style() != *edge_style {
                 return Some(false);
             }
@@ -388,21 +396,29 @@ pub(in crate::layout) fn clear_box_edge_side(style: &mut ComputedStyle, side: Ph
             style.border_widths.top = 0.0;
             style.border_styles.top = BorderStyle::None;
             style.padding.top = 0.0;
+            style.border_radius.top_left = css::CornerRadius::ZERO;
+            style.border_radius.top_right = css::CornerRadius::ZERO;
         }
         PhysicalSide::Right => {
             style.border_widths.right = 0.0;
             style.border_styles.right = BorderStyle::None;
             style.padding.right = 0.0;
+            style.border_radius.top_right = css::CornerRadius::ZERO;
+            style.border_radius.bottom_right = css::CornerRadius::ZERO;
         }
         PhysicalSide::Bottom => {
             style.border_widths.bottom = 0.0;
             style.border_styles.bottom = BorderStyle::None;
             style.padding.bottom = 0.0;
+            style.border_radius.bottom_right = css::CornerRadius::ZERO;
+            style.border_radius.bottom_left = css::CornerRadius::ZERO;
         }
         PhysicalSide::Left => {
             style.border_widths.left = 0.0;
             style.border_styles.left = BorderStyle::None;
             style.padding.left = 0.0;
+            style.border_radius.top_left = css::CornerRadius::ZERO;
+            style.border_radius.bottom_left = css::CornerRadius::ZERO;
         }
     }
 }
@@ -416,39 +432,47 @@ pub(in crate::layout) fn opposite_physical_side(side: PhysicalSide) -> PhysicalS
     }
 }
 
-pub(in crate::layout) fn visual_leading_inline_end_box_edge_width(
-    line: &[MeasuredInlineItem],
-    geometry: InlineLineGeometry,
-) -> f32 {
-    if !matches!(geometry.writing_mode, WritingMode::HorizontalTb)
-        || !matches!(geometry.direction, Direction::Rtl)
-    {
-        return 0.0;
-    }
+/// Return the shared paint-anchor adjustment for baseline-participating atoms.
+///
+/// Atomic inline baseline metrics are measured from margin-box block start,
+/// while captured atom contents replay from their border-box origin. This
+/// renderer-specific anchor normalization keeps those coordinate systems
+/// aligned after line layout has already enclosed the participating margin
+/// boxes. It is not a substitute for CSS Inline's uppermost/lowermost-edge
+/// line-box calculation; in particular, preserving an all-negative set here
+/// ensures the specified margins still affect final placement:
+/// <https://drafts.csswg.org/css-inline-3/#line-boxes>.
+pub(in crate::layout) fn inline_line_anchor_block_start_margin<T>(
+    line: &[T],
+    containing_style: &ComputedStyle,
+) -> f32
+where
+    T: AsRef<InlineLineItem>,
+{
     line.iter()
-        .take_while(|item| {
-            matches!(
-                &item.item,
-                InlineLineItem::Atom(atom)
-                    if matches!(
-                        atom.content(),
-                        InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(_))
-                    )
-            )
+        .filter_map(|item| match item.as_ref() {
+            InlineLineItem::Atom(atom) => Some(inline_atom_line_anchor_block_start_margin(
+                atom,
+                containing_style,
+            )),
+            InlineLineItem::Fragment(_) | InlineLineItem::Float(_) => None,
         })
-        .map(|item| item.width)
-        .sum()
+        .reduce(f32::max)
+        .unwrap_or(0.0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::text::TextTypesettingPlan;
     use std::rc::Rc;
 
     fn test_text_group() -> PreparedInlineTextGroup {
         PreparedInlineTextGroup {
             bounds: PhysicalInlineTextBounds::new(InlinePoint::new(0.0, 0.0), 0.0),
             style: ComputedStyle::initial(),
+            decoration_provenance: Vec::new(),
+            text_box_trim: TextBoxLineTrim::default(),
             paint_opacity: 1.0,
             paint_scope_ancestry: Rc::from(Vec::new().into_boxed_slice()),
             link_target: None,
@@ -461,11 +485,40 @@ mod tests {
                 aligned_by_parley: false,
                 line_height: 0.0,
                 baseline_adjustment: 0.0,
+                typesetting_plan: TextTypesettingPlan::Horizontal,
                 runs: Vec::new(),
             },
             source: InlineTextSource::Normal,
             source_run: Rc::new(()),
         }
+    }
+
+    fn atom_with_logical_block_start_margin(
+        writing_mode: WritingMode,
+        block_start_margin: f32,
+    ) -> (ComputedStyle, InlineAtom) {
+        let mut style = ComputedStyle::initial();
+        style.writing_mode = writing_mode;
+        match writing_mode {
+            WritingMode::HorizontalTb => style.margin.top = block_start_margin,
+            WritingMode::VerticalRl | WritingMode::SidewaysRl => {
+                style.margin.right = block_start_margin;
+            }
+            WritingMode::VerticalLr | WritingMode::SidewaysLr => {
+                style.margin.left = block_start_margin;
+            }
+        }
+        let atom = InlineAtom::new(
+            InlineAtomContent::Canvas,
+            style.clone(),
+            None,
+            InlineSize::new(20.0, 32.0),
+            16.0,
+            0.0,
+            None,
+            None,
+        );
+        (style, atom)
     }
 
     #[test]
@@ -483,6 +536,32 @@ mod tests {
         position_horizontal_text_group_at_content_bottom(&mut group, 100.0, metrics);
 
         assert_eq!(group.y(), 108.0);
+    }
+
+    #[test]
+    fn inline_edge_paint_clears_the_opposite_corner_radii() {
+        let corner = css::CornerRadius {
+            x: css::CssRadius {
+                value: css::ComputedLengthPercentage::from_points(5.0),
+            },
+            y: css::CssRadius {
+                value: css::ComputedLengthPercentage::from_points(5.0),
+            },
+        };
+        let mut style = ComputedStyle::initial();
+        style.border_radius = css::BorderRadius {
+            top_left: corner.clone(),
+            top_right: corner.clone(),
+            bottom_right: corner.clone(),
+            bottom_left: corner,
+        };
+
+        clear_box_edge_side(&mut style, PhysicalSide::Right);
+
+        assert!(style.border_radius.top_right.is_zero());
+        assert!(style.border_radius.bottom_right.is_zero());
+        assert!(!style.border_radius.top_left.is_zero());
+        assert!(!style.border_radius.bottom_left.is_zero());
     }
 
     #[test]
@@ -599,17 +678,17 @@ mod tests {
             InlineAtomHorizontalPlacement {
                 line_top: 200.0,
                 line_height: 100.0,
-                line_baseline_offset: 40.0,
+                line_baseline_offset: 90.0,
                 line_rendered_baseline_shift: 0.0,
                 content_block_size: 50.0,
                 parent_metrics,
             },
         );
 
-        // The line aligns to the table-box baseline (40). The inline-table's
-        // captured fragment owns its wrapper margin, so this border-box
-        // placement must not add the 50px margin again.
-        assert_eq!(content_bottom, 150.0);
+        // Line metrics include the 50px wrapper margin before the table-box
+        // baseline (40). Captured-fragment replay then uses that table-box
+        // baseline directly, so the margin is applied exactly once.
+        assert_eq!(content_bottom, 100.0);
     }
 
     #[test]
@@ -664,5 +743,105 @@ mod tests {
             ),
             0.0
         );
+    }
+
+    #[test]
+    fn line_anchor_margin_preserves_signed_baseline_participant_maximum() {
+        for writing_mode in [
+            WritingMode::HorizontalTb,
+            WritingMode::VerticalRl,
+            WritingMode::VerticalLr,
+        ] {
+            let (containing_style, positive) =
+                atom_with_logical_block_start_margin(writing_mode, 16.0);
+            let (_, negative) = atom_with_logical_block_start_margin(writing_mode, -16.0);
+            let (_, more_negative) = atom_with_logical_block_start_margin(writing_mode, -24.0);
+            let (_, smaller_positive) = atom_with_logical_block_start_margin(writing_mode, 8.0);
+
+            assert_eq!(
+                inline_line_anchor_block_start_margin::<InlineLineItem>(&[], &containing_style),
+                0.0,
+                "{writing_mode:?} has no atom anchor adjustment without participants"
+            );
+            assert_eq!(
+                inline_line_anchor_block_start_margin(
+                    &[InlineLineItem::Atom(positive.clone())],
+                    &containing_style,
+                ),
+                16.0,
+                "{writing_mode:?} retains a positive block-start margin"
+            );
+            assert_eq!(
+                inline_line_anchor_block_start_margin(
+                    &[InlineLineItem::Atom(negative.clone())],
+                    &containing_style,
+                ),
+                -16.0,
+                "{writing_mode:?} must not clamp a negative margin to zero"
+            );
+            assert_eq!(
+                inline_line_anchor_block_start_margin(
+                    &[
+                        InlineLineItem::Atom(negative.clone()),
+                        InlineLineItem::Atom(more_negative.clone()),
+                    ],
+                    &containing_style,
+                ),
+                -16.0,
+                "{writing_mode:?} keeps the least-negative all-negative margin"
+            );
+            assert_eq!(
+                inline_line_anchor_block_start_margin(
+                    &[
+                        InlineLineItem::Atom(more_negative),
+                        InlineLineItem::Atom(smaller_positive),
+                        InlineLineItem::Atom(negative.clone()),
+                    ],
+                    &containing_style,
+                ),
+                8.0,
+                "{writing_mode:?} keeps the greatest signed margin"
+            );
+
+            let mut top_style = negative.style().clone();
+            top_style.vertical_align = top_style
+                .vertical_align
+                .with_baseline_shift(BaselineShift::Top);
+            let top = InlineAtom::new(
+                InlineAtomContent::Canvas,
+                top_style,
+                None,
+                InlineSize::new(20.0, 32.0),
+                16.0,
+                0.0,
+                None,
+                None,
+            );
+            let table = negative.clone().with_exported_table_box_baseline();
+            let edge = InlineAtom::new(
+                InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace(
+                    InlineTextBoundarySpacing::new(layout_pt(1.0), false),
+                )),
+                negative.style().clone(),
+                None,
+                InlineSize::new(20.0, 32.0),
+                16.0,
+                0.0,
+                None,
+                None,
+            );
+            assert_eq!(
+                inline_line_anchor_block_start_margin(
+                    &[
+                        InlineLineItem::Atom(top),
+                        InlineLineItem::Atom(table),
+                        InlineLineItem::Atom(edge),
+                    ],
+                    &containing_style,
+                ),
+                0.0,
+                "{writing_mode:?} leaves line-relative, table, and edge atoms to their owners"
+            );
+        }
     }
 }

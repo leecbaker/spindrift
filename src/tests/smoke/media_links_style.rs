@@ -1,5 +1,93 @@
 use super::*;
 
+/// A propagated vertical body establishes the document's principal flow.
+/// Consecutive blocks must therefore consume the physical horizontal block
+/// track while their descendants retain the same physical inline-start edge.
+/// <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
+#[tokio::test]
+async fn propagated_vertical_body_advances_block_children_before_laying_out_image() {
+    let document = Html::from_string(format!(
+        "<style>
+           @page {{ size: 200pt 200pt; margin: 10pt }}
+           body {{ writing-mode: vertical-rl; margin: 0 }}
+           .first {{ width: 40pt; height: 60pt; margin: 0; background: blue }}
+           .second {{ width: 30pt; height: 50pt; margin: 0; background: red }}
+           img {{ display: block; width: 20pt; height: 30pt }}
+         </style>
+         <div class=\"first\"></div><div class=\"second\"><img src=\"{GREEN_100_PNG}\"></div>"
+    ))
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(document.pages.len(), 1, "document={document:?}");
+    let page = &document.pages[0];
+    let first = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
+        .expect("expected first fixed-size block");
+    let second = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
+        .expect("expected second fixed-size block");
+    let image = page.images().first().expect("expected replaced image");
+
+    assert!(
+        second.x() + second.width() <= first.x() + 0.01,
+        "vertical-rl block progression must move the second child left: first={first:?}, second={second:?}"
+    );
+    assert!(
+        ((second.y() + second.height()) - (image.y() + image.height())).abs() < 0.01,
+        "the image must begin at its vertical principal-flow inline-start edge: second={second:?}, image={image:?}"
+    );
+}
+
+/// A propagated vertical body resolves each direct child's geometry before it
+/// is painted. In particular, the UA paragraph block-start margin moves the
+/// following replaced block through the horizontal vertical-rl track exactly
+/// once; it is not a paint-time translation.
+/// <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
+#[tokio::test]
+async fn propagated_vertical_body_uses_paragraph_block_margin_for_replaced_child() {
+    let document = Html::from_string(format!(
+        "<style>
+           @page {{ size: 300pt 200pt; margin: 0 }}
+           body {{ writing-mode: vertical-rl; margin: 0; font-size: 12pt }}
+           .blue {{ width: 75pt; height: 75pt; margin: 0; background: blue }}
+           p {{ width: 120pt }}
+           img {{ display: block; width: 120pt; height: 30pt }}
+         </style>
+         <div class=\"blue\"></div><p><img src=\"{GREEN_100_PNG}\"></p>"
+    ))
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(document.pages.len(), 1, "document={document:?}");
+    let page = &document.pages[0];
+    let blue = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
+        .expect("expected fixed-size blue block");
+    let image = page.images().first().expect("expected replaced image");
+
+    assert!(
+        ((blue.x() + blue.width()) - 300.0).abs() < 0.01,
+        "blue={blue:?}"
+    );
+    assert!(
+        ((blue.y() + blue.height()) - (image.y() + image.height())).abs() < 0.01,
+        "both children start at the vertical principal flow inline-start: blue={blue:?}, image={image:?}"
+    );
+    assert!(
+        ((image.x() + image.width()) - (blue.x() - 12.0)).abs() < 0.01,
+        "the paragraph's 1em logical block-start margin must move the image once: blue={blue:?}, image={image:?}"
+    );
+}
+
 const GREEN_100_PNG: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAGQAAABkCAIAAAD/gAIDAAAAkElEQVR42u3QMQ0AAAjAsElHOhb4eJpUQWviSoEsWbJkyUKBLFmyZMlCgSxZsmTJQoEsWbJkyUKBLFmyZMlCgSxZsmTJQoEsWbJkyUKBLFmyZMlCgSxZsmTJQoEsWbJkyUKBLFmyZMlCgSxZsmTJQoEsWbJkyUKBLFmyZMlCgSxZsmTJQoEsWbJkyUKBLFnfFhDniR6UCYQPAAAAAElFTkSuQmCC";
 
 #[tokio::test]
@@ -300,6 +388,23 @@ async fn renders_png_data_uri_images() {
         assert!(rendered.contains("/Interpolate false"));
         assert!(rendered.contains("/Im1 Do"));
     }
+}
+
+#[tokio::test]
+async fn visible_overflow_allows_an_inline_replaced_image_to_escape_its_content_box() {
+    let document = Html::from_string(format!(
+        "<style>@page {{ size: 160pt 120pt; margin: 0 }} body {{ margin: 0 }} \
+         img {{ width: 25pt; height: 25pt; object-fit: none; object-position: left top; overflow: visible; border-radius: 50% }}</style>\
+         <img src=\"{GREEN_100_PNG}\">"
+    ))
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let image = &document.pages[0].images()[0];
+    assert_eq!(image.width(), 75.0, "image={image:?}");
+    assert_eq!(image.height(), 75.0, "image={image:?}");
+    assert!(!image.is_clipped(), "image={image:?}");
 }
 
 #[tokio::test]
@@ -945,6 +1050,154 @@ async fn inline_block_before_right_float_stays_on_same_line() {
     assert!(
         ((right.x() + right.width()) - (red.x() + red.width())).abs() < 0.01,
         "right={right:?} red={red:?}"
+    );
+}
+
+/// A non-fragmentable atomic inline that cannot fit in the residual band beside
+/// a float moves to the first later slab where its complete margin box fits.
+/// CSS 2.2 §9.5 requires this line-box retry before `text-align` is applied.
+#[tokio::test]
+async fn atomic_inline_moves_below_float_when_shortened_line_cannot_contain_it() {
+    let document = Html::from_string(
+        "<!DOCTYPE html><meta charset=\"utf-8\">\
+         <style>\
+         @page { size: 200px 120px; margin: 0 }\
+         body { margin: 0 }\
+         .outer { float: left; width: 4px; background: red }\
+         .float { float: right; width: 50px; height: 20px; background: orange }\
+         .center-parent { width: 100px; margin-left: -48px; text-align: center; background: yellow }\
+         .atom { display: inline-block; width: 50px; height: 10px; background: lime }\
+         </style>\
+         <div class=\"outer\"><div class=\"float\"></div><div class=\"center-parent\"><div class=\"atom\"></div></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let float = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(255, 165, 0)))
+        .expect("right float should paint");
+    let parent = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(255, 255, 0)))
+        .expect("center parent should paint");
+    let atom = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(0, 255, 0)))
+        .expect("atomic inline should paint");
+
+    assert!(
+        atom.y() + atom.height() <= float.y() + 0.01,
+        "atomic inline must move below the constraining float: float={float:?}, parent={parent:?}, atom={atom:?}"
+    );
+    assert!(
+        ((atom.x() + atom.width() * 0.5) - (parent.x() + parent.width() * 0.5)).abs() < 0.01,
+        "the retried line must be centered in the parent's full measure: parent={parent:?}, atom={atom:?}"
+    );
+}
+
+/// An atomic inline that does fit in the shortened band remains beside its
+/// preceding float; CSS 2.2's retry is not an unconditional float clear.
+#[tokio::test]
+async fn fitting_atomic_inline_remains_beside_float() {
+    let document = Html::from_string(
+        "<!DOCTYPE html><meta charset=\"utf-8\">\
+         <style>\
+         @page { size: 200px 120px; margin: 0 }\
+         body { margin: 0 }\
+         .outer { float: left; width: 4px; background: red }\
+         .float { float: right; width: 50px; height: 20px; background: orange }\
+         .center-parent { width: 100px; margin-left: -48px; text-align: center; background: yellow }\
+         .atom { display: inline-block; width: 10px; height: 10px; background: lime }\
+         </style>\
+         <div class=\"outer\"><div class=\"float\"></div><div class=\"center-parent\"><div class=\"atom\"></div></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let float = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(255, 165, 0)))
+        .expect("right float should paint");
+    let atom = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(0, 255, 0)))
+        .expect("atomic inline should paint");
+
+    assert!(
+        atom.y() + atom.height() > float.y() + 0.01,
+        "a fitting atomic inline must remain in the shortened band: float={float:?}, atom={atom:?}"
+    );
+}
+
+/// A parent float shortens the outer centered line once, but cannot become an
+/// exclusion while intrinsic sizing the atomic inline-block that line contains.
+/// CSS 2.2 §9.4.1 gives inline-blocks an independent BFC.
+#[tokio::test]
+async fn inline_block_intrinsic_layout_does_not_inherit_parent_float_clearance() {
+    let document = Html::from_string(
+        "<!DOCTYPE html><meta charset=\"utf-8\">\
+         <style>\
+         @page { size: 240px 500px; margin: 0 }\
+         body { margin: 0; font-family: sans-serif; font-size: 10px }\
+         .outer { float: left; width: 4px }\
+         .float, .atom { clear: both; margin: 1px 2px 3px 4px; border-width: 2px 3px 4px 5px; border-style: solid; padding: 3px 4px 5px 6px }\
+         .left { float: left; background: red }\
+         .right { float: right; background: orange }\
+         .big { font-size: 18px; width: 50px }\
+         .center-parent { width: 100px; margin-left: -48px; text-align: center }\
+         .control-parent { clear: both; width: 100px; text-align: center }\
+         .atom { display: inline-block; text-align: left }\
+         #first { background: rgb(10, 20, 30) }\
+         #second { background: rgb(40, 50, 60) }\
+         #control { background: rgb(70, 80, 90) }\
+         </style>\
+         <div class=\"outer\">\
+           <div class=\"float left\">start</div><div class=\"float left big\">a b</div>\
+           <div class=\"float right\">end</div><div class=\"float right big\">a b</div>\
+           <div class=\"center-parent\"><span id=\"first\" class=\"atom\">center</span></div>\
+           <div class=\"center-parent\"><span id=\"second\" class=\"atom\">center</span></div>\
+         </div>\
+         <div class=\"control-parent\"><span id=\"control\" class=\"atom\">center</span></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let rect_with_fill = |fill| {
+        page.rects()
+            .iter()
+            .find(|rect| rect.fill == Some(fill))
+            .expect("expected colored atomic inline-block background")
+    };
+    let first = rect_with_fill(CssColor::new(10, 20, 30));
+    let second = rect_with_fill(CssColor::new(40, 50, 60));
+    let control = rect_with_fill(CssColor::new(70, 80, 90));
+
+    assert!(
+        (first.height() - control.height()).abs() < 0.01,
+        "the parent float must not inflate the first atom's intrinsic height: first={first:?}, control={control:?}"
+    );
+    assert!(
+        (second.height() - control.height()).abs() < 0.01,
+        "the parent float must not inflate the second atom's intrinsic height: second={second:?}, control={control:?}"
+    );
+    // The atom's authored 1px + 3px vertical margins are 3pt in the PDF
+    // coordinate system, so consecutive parent lines advance by its margin box.
+    let first_margin_box_height = first.height() + 3.0;
+    assert!(
+        ((first.y() - second.y()).abs() - first_margin_box_height).abs() < 0.01,
+        "the second in-flow atom must begin after normal single-line progression, without an additional parent-float clearance: first={first:?}, second={second:?}"
     );
 }
 
@@ -2003,5 +2256,53 @@ async fn baseline_shift_length_percentage_places_text_and_replaced_inline_atoms(
     assert!(
         zero.y() - next.y() > 60.0,
         "line advance should include shifted first-line bounds: zero={zero:?}, next={next:?}"
+    );
+}
+
+/// A root pseudo keeps its computed horizontal style, but must still consume
+/// the propagated body's vertical-lr principal block track before the body
+/// starts.
+/// <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
+#[tokio::test]
+async fn root_before_advances_a_propagated_vertical_lr_body() {
+    let document = Html::from_string(format!(
+        "<style>
+           @page {{ size: 300pt 200pt; margin: 0 }}
+           html {{ writing-mode: horizontal-tb }}
+           html::before {{
+             background: orange;
+             content: \"\";
+             display: block;
+             height: 75pt;
+             margin-left: 6pt;
+             margin-right: 12pt;
+             margin-top: 6pt;
+             width: 75pt;
+           }}
+           body {{ margin: 0; writing-mode: vertical-lr }}
+           img {{ display: block; height: 30pt; width: 100pt }}
+         </style>
+         <div><img src=\"{GREEN_100_PNG}\"></div>"
+    ))
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(document.pages.len(), 1, "document={document:?}");
+    let page = &document.pages[0];
+    let pseudo = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(255, 165, 0)))
+        .expect("expected the root ::before block");
+    let image = page
+        .images()
+        .first()
+        .expect("expected propagated body image");
+
+    assert!((pseudo.x() - 6.0).abs() < 0.01, "pseudo={pseudo:?}");
+    assert!(
+        ((image.x() - (pseudo.x() + pseudo.width() + 6.0)).abs()) < 0.01,
+        "the body must begin from the root track advanced by the pseudo's border box and block-end margin: pseudo={pseudo:?}, image={image:?}"
     );
 }
