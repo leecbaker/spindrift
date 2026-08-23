@@ -1,10 +1,18 @@
 pub(crate) mod paint;
 
-pub(crate) use paint::annotations::LinkAnnotation;
-pub(crate) use paint::geometry::PaintStrokeWidth;
+use std::borrow::Cow;
+use std::fmt;
+use std::io::Write;
+use std::ops::Deref;
+use std::str::FromStr;
 
+use fontique::Blob as FontiqueBlob;
+use jiff::civil::Date;
+use jiff::fmt::strtime::BrokenDownTime;
+pub(crate) use paint::annotations::LinkAnnotation;
 use paint::annotations::RenderedLink;
 use paint::display_list::PagePaintTree;
+pub(crate) use paint::geometry::PaintStrokeWidth;
 use paint::geometry::{PaintPoint, PaintSize};
 use paint::images::RenderedImage;
 use paint::page::{OpaqueTextCoverage, PaintOperation};
@@ -13,14 +21,9 @@ use paint::patterns::{RenderedGradientPattern, RenderedImagePattern, RenderedSvg
 use paint::shapes::{RenderedRect, RenderedRoundedRect, RenderedStroke};
 use paint::text::RenderedLine;
 
-use crate::{CssColor, Error, Result, image_store::DocumentImageStore, pdf, timing::DebugTimer};
-use fontique::Blob as FontiqueBlob;
-use jiff::{civil::Date, fmt::strtime::BrokenDownTime};
-use std::borrow::Cow;
-use std::fmt;
-use std::io::Write;
-use std::ops::Deref;
-use std::str::FromStr;
+use crate::image_store::DocumentImageStore;
+use crate::timing::DebugTimer;
+use crate::{CssColor, Error, Result, pdf};
 
 #[derive(Debug, Clone, PartialEq)]
 /// The fully rendered, inspectable document before PDF serialization.
@@ -1320,6 +1323,29 @@ pub(crate) struct CssFontVerticalMetrics {
     pub(crate) line_gap: i16,
 }
 
+/// PDF-visible faux-oblique angle selected while matching a CSS font face.
+///
+/// Fontique reports faux oblique synthesis in whole degrees. Retaining that
+/// representation avoids conflating the requested CSS `font-style` with the
+/// paint-only transform required when no matching face exists.
+/// <https://www.w3.org/TR/css-fonts-4/#font-style-prop>
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct SyntheticObliqueAngle(i8);
+
+impl SyntheticObliqueAngle {
+    pub(crate) const fn from_fontique_degrees(degrees: i8) -> Option<Self> {
+        if degrees == 0 {
+            None
+        } else {
+            Some(Self(degrees))
+        }
+    }
+
+    pub(crate) const fn degrees(self) -> i8 {
+        self.0
+    }
+}
+
 /// PDF-visible synthesis selected while matching a CSS font face.
 ///
 /// CSS Fonts permits a user agent to synthesize a bold face only when font
@@ -1331,6 +1357,24 @@ pub(crate) struct CssFontVerticalMetrics {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub(crate) struct DocumentFontSynthesis {
     pub(crate) embolden: bool,
+    pub(crate) oblique: Option<SyntheticObliqueAngle>,
+}
+
+/// The effective OpenType variation coordinates used to shape one document font.
+///
+/// PDF Type 0 fonts do not retain a portable per-text-run variable-font
+/// location. The PDF writer therefore materializes this exact instance before
+/// embedding it. Values retain their IEEE representation so document-font
+/// identity and the shaping backend cannot merge distinct authored axis
+/// settings.
+/// <https://www.w3.org/TR/css-fonts-4/#font-variation-settings-def>
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub(crate) struct DocumentFontVariationCoordinates(pub(crate) Vec<([u8; 4], u32)>);
+
+impl DocumentFontVariationCoordinates {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 /// An OpenType `BASE` coordinate retained in font design units.
@@ -1392,5 +1436,6 @@ pub(crate) struct DocumentFont {
     pub(crate) italic_angle: i16,
     pub(crate) bbox: [i16; 4],
     pub(crate) baselines: OpenTypeBaselineTable,
+    pub(crate) variation_coordinates: DocumentFontVariationCoordinates,
     pub(crate) synthesis: DocumentFontSynthesis,
 }

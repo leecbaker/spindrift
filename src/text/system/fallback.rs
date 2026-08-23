@@ -78,10 +78,11 @@ impl FontSystem {
 
     /// Resolve the family source supplied to Parley for a CSS style.
     ///
-    /// Generic families are intentionally replaced with Quire's concrete
-    /// system selection. Passing the raw keyword to Parley would invoke its
-    /// platform generic mapping a second time, which can select a different
-    /// font program from the one used for metrics and PDF planning.
+    /// Every resolved family is replaced with Quire's concrete selection.
+    /// Passing a raw named stack or generic keyword to Parley would invoke a
+    /// second platform matcher, which can select a different font program
+    /// from the one used for CSS matching, metrics, and PDF planning.
+    /// <https://www.w3.org/TR/css-fonts-4/#font-family-prop>
     pub(crate) fn resolved_parley_font_family_source(&mut self, style: &ComputedStyle) -> String {
         self.resolved_parley_font_family_source_for_family(
             &style.font_family,
@@ -98,31 +99,46 @@ impl FontSystem {
         style: FontStyle,
         width: FontWidth,
     ) -> String {
+        self.resolved_parley_font_family_source_for_family_optional(family, weight, style, width)
+            .unwrap_or_else(|| {
+                self.resolved_parley_font_family_source_for_family_optional(
+                    &FontFamily::SansSerif,
+                    weight,
+                    style,
+                    width,
+                )
+                .unwrap_or_else(|| parley_font_family_source(&FontFamily::SansSerif))
+            })
+    }
+
+    fn resolved_parley_font_family_source_for_family_optional(
+        &mut self,
+        family: &FontFamily,
+        weight: FontWeight,
+        style: FontStyle,
+        width: FontWidth,
+    ) -> Option<String> {
         match family {
-            FontFamily::List(families) => families
-                .iter()
-                .map(|family| {
-                    self.resolved_parley_font_family_source_for_family(family, weight, style, width)
-                })
-                .collect::<Vec<_>>()
-                .join(", "),
-            FontFamily::Named(name) => {
-                if is_private_standard_ui_family_name(name.as_str()) {
-                    // A missing named family falls through to the UA's sans-serif
-                    // default, rather than exposing a private platform face.
-                    parley_font_family_source(&FontFamily::SansSerif)
-                } else {
-                    parley_font_family_source(family)
-                }
+            FontFamily::List(families) => {
+                let source = families
+                    .iter()
+                    .filter_map(|family| {
+                        self.resolved_parley_font_family_source_for_family_optional(
+                            family, weight, style, width,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                (!source.is_empty()).then_some(source)
             }
+            FontFamily::Named(name) => self
+                .resolve_single_family(name.as_str(), weight, style, width)
+                .and_then(|font_id| self.document_fonts.get(font_id))
+                .map(|font| parley_font_family_source(&FontFamily::named(font.family.clone()))),
             _ => self
                 .resolve_generic_family(family, weight, style, width)
                 .and_then(|font_id| self.document_fonts.get(font_id))
-                .map(|font| parley_font_family_source(&FontFamily::named(font.family.clone())))
-                // Preserve the authored generic as a last resort. The PDF
-                // audit remains responsible for reporting the unsupported
-                // case when no eligible system candidate exists.
-                .unwrap_or_else(|| parley_font_family_source(family)),
+                .map(|font| parley_font_family_source(&FontFamily::named(font.family.clone()))),
         }
     }
 
@@ -185,7 +201,14 @@ impl FontSystem {
             if !DocumentFontRegistry::font_query_has_character(&font, character) {
                 continue;
             }
-            if let Some(font_id) = self.document_font_from_query_font(font, None, &request) {
+            if let Some(font_id) = self.document_font_from_query_font_with_synthesis(
+                font,
+                None,
+                &request,
+                true,
+                true,
+                standard_font_variation_coordinates(weight, style, width),
+            ) {
                 let font = self.document_fonts.get(font_id)?;
                 log::debug!(
                     "resolved platform fallback font for U+{:04X} to {} ({})",
@@ -217,6 +240,8 @@ impl FontSystem {
             style.font_style,
             style.font_width,
         );
+        let variation_coordinates =
+            effective_font_variation_coordinates(&ParleyStyleView::new(style));
         for font in self.query_platform_fallback_fonts(
             character,
             style.font_weight,
@@ -225,7 +250,14 @@ impl FontSystem {
             locale.as_ref(),
         ) {
             if DocumentFontRegistry::font_query_has_character(&font, character)
-                && let Some(font_id) = self.document_font_from_query_font(font, None, &request)
+                && let Some(font_id) = self.document_font_from_query_font_with_synthesis(
+                    font,
+                    None,
+                    &request,
+                    style.font_synthesis.weight,
+                    style.font_synthesis.style,
+                    variation_coordinates.clone(),
+                )
             {
                 return Some(font_id);
             }

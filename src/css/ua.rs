@@ -1,5 +1,6 @@
-use super::{Css, Stylesheet, StylesheetOrigin, parse_stylesheet};
 use std::sync::OnceLock;
+
+use super::{Css, Stylesheet, StylesheetOrigin, parse_stylesheet};
 
 const HTML5_UA_CSS: &str = include_str!("ua/html5_ua.css");
 const HTML5_PH_CSS: &str = include_str!("ua/html5_ph.css");

@@ -1,7 +1,8 @@
-use super::*;
-use crate::layout::assets::FragmentainerOrdinal;
 use std::cell::RefCell;
 use std::rc::Rc;
+
+use super::*;
+use crate::layout::assets::FragmentainerOrdinal;
 
 /// A committed source-to-destination mapping for one container fragment.
 ///

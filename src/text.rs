@@ -1,16 +1,9 @@
-use crate::css::{
-    ComputedStyle, CssFontFace, Direction, FontFaceSource, FontFamily, FontFeatureValue,
-    FontFeatureValues, FontFeatureValuesBlock, FontKerning, FontPalette, FontPaletteValues,
-    FontStyle, FontVariantAlternates, FontVariantCaps, FontVariantEastAsian,
-    FontVariantEastAsianValue, FontVariantEmoji, FontVariantLigatures, FontVariantNumeric,
-    FontVariantNumericValue, FontVariantPosition, FontVariationSettings, FontWeight, FontWidth,
-    HyphenateLimitChars, LineBreak as CssLineBreak, OverflowWrap as CssOverflowWrap,
-    StylesheetCollection, TextLayoutPolicy, TextOrientation, UnicodeBidi, UnicodeRange,
-    WordBreak as CssWordBreak,
-};
-use crate::document::paint::text::{RenderedGlyph, RenderedGlyphKind, RenderedTextRun};
-use crate::document::{DocumentFont, FontProgramKind};
-use crate::units::{LayoutLength, SemanticLengthExt, layout_pt};
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::ops::Range;
+use std::rc::Rc;
+use std::sync::{Arc, Mutex, OnceLock};
+
 use fontique::{
     Attributes as FontiqueAttributes, Blob as FontiqueBlob, FallbackKey as FontiqueFallbackKey,
     FontInfoOverride, FontStyle as FontiqueFontStyle, FontWeight as FontiqueFontWeight,
@@ -19,14 +12,15 @@ use fontique::{
     QueryStatus as FontiqueQueryStatus, Script as FontiqueScript,
 };
 use hyphenation::{Hyphenator, Language, Load, Standard};
+use icu_properties::props::{
+    BidiClass, BidiControl, BidiMirroringGlyph, DefaultIgnorableCodePoint, EastAsianWidth, Emoji,
+    EmojiPresentation, GeneralCategory, GeneralCategoryGroup, JoinControl, JoiningType, LineBreak,
+    Script as IcuScript, VerticalOrientation, WordBreak as IcuWordBreak,
+};
+use icu_properties::script::ScriptWithExtensions;
 use icu_properties::{
     CodePointMapData, CodePointMapDataBorrowed, CodePointSetData, CodePointSetDataBorrowed,
     PropertyNamesShort,
-    props::{
-        BidiClass, BidiControl, BidiMirroringGlyph, DefaultIgnorableCodePoint, EastAsianWidth,
-        Emoji, EmojiPresentation, GeneralCategory, GeneralCategoryGroup, JoinControl, JoiningType,
-        LineBreak, Script as IcuScript, VerticalOrientation, WordBreak as IcuWordBreak,
-    },
 };
 use icu_segmenter::options::{
     LineBreakOptions, LineBreakStrictness, LineBreakWordOption, WordBreakInvariantOptions,
@@ -44,11 +38,20 @@ use parley::{
     WordBreak as ParleyWordBreak,
 };
 use read_fonts::types::Tag as OpenTypeTag;
-use std::borrow::Cow;
-use std::collections::HashMap;
-use std::ops::Range;
-use std::rc::Rc;
-use std::sync::{Arc, Mutex, OnceLock};
+
+use crate::css::{
+    ComputedStyle, CssFontFace, Direction, FontFaceSource, FontFamily, FontFeatureValue,
+    FontFeatureValues, FontFeatureValuesBlock, FontKerning, FontPalette, FontPaletteValues,
+    FontStyle, FontVariantAlternates, FontVariantCaps, FontVariantEastAsian,
+    FontVariantEastAsianValue, FontVariantEmoji, FontVariantLigatures, FontVariantNumeric,
+    FontVariantNumericValue, FontVariantPosition, FontVariationSettings, FontWeight, FontWidth,
+    HyphenateLimitChars, LineBreak as CssLineBreak, OverflowWrap as CssOverflowWrap,
+    StylesheetCollection, TextLayoutPolicy, TextOrientation, UnicodeBidi, UnicodeRange,
+    WordBreak as CssWordBreak,
+};
+use crate::document::paint::text::{RenderedGlyph, RenderedGlyphKind, RenderedTextRun};
+use crate::document::{DocumentFont, DocumentFontVariationCoordinates, FontProgramKind};
+use crate::units::{LayoutLength, SemanticLengthExt, layout_pt};
 
 pub(crate) struct FontSystem {
     parley_font_context: ParleyFontContext,
@@ -234,14 +237,14 @@ pub(crate) use artifacts::{ShapedGlyphRun, ShapedInlineGlyph, ShapedInlineLine, 
 /// <https://www.w3.org/TR/css-text-3/#line-break-details>.
 pub(crate) const OBJECT_REPLACEMENT_CHARACTER: char = '\u{fffc}';
 
-#[cfg(test)]
-pub(crate) use css_text::VisibleControlCharacter;
 pub(crate) use css_text::{
     CssTextScalar, classify_css_text_scalar, css_text_rendering_text,
-    is_css_collapsible_whitespace, is_css_preserved_document_space, line_end_letter_spacing_width,
+    is_css_collapsible_whitespace, is_css_preserved_document_space,
     text_is_css_collapsible_whitespace, trim_css_collapsible_whitespace,
     trim_end_css_collapsible_whitespace, trim_start_css_collapsible_whitespace,
 };
+#[cfg(test)]
+pub(crate) use css_text::{VisibleControlCharacter, line_end_letter_spacing_width};
 #[cfg(test)]
 pub(crate) use css_text::{
     collapse_css_collapsible_whitespace, trim_trailing_css_hanging_space_separators,
@@ -276,13 +279,15 @@ pub(crate) struct GlyphInkBox {
     pub(crate) y_max: f32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct FontKey {
     family_id: fontique::FamilyId,
     family_index: usize,
     face_index: u32,
     request: FontRequestAttributes,
     synthesize_weight: bool,
+    synthesize_style: bool,
+    variation_coordinates: DocumentFontVariationCoordinates,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -293,6 +298,8 @@ struct ResolvedFontFaceKey {
     family_label: Option<String>,
     request: Option<FontRequest>,
     synthesize_weight: bool,
+    synthesize_style: bool,
+    variation_coordinates: DocumentFontVariationCoordinates,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -345,6 +352,8 @@ struct ParleyFontRequestKey {
     face_index: u32,
     request: FontRequest,
     synthesize_weight: bool,
+    synthesize_style: bool,
+    variation_coordinates: DocumentFontVariationCoordinates,
 }
 
 #[derive(Clone)]
@@ -394,16 +403,12 @@ mod vertical_typesetting;
 pub(crate) use bidi::{
     bidi_control_scope_for_style, resolve_bidi_visual_ranges, text_without_bidi_format_controls,
 };
-pub(crate) use breaking::contains_bidi_text;
 pub(crate) use breaking::{
-    DiscretionaryOpportunity, LanguageDiscretionaryReplacement,
-    automatic_hyphenation_opportunities, hyphenator_for_language, manual_hyphenation_opportunities,
-    text_with_hyphenation_controls,
-};
-pub(crate) use breaking::{
-    TextBreakPolicy, collect_auto_phrase_relaxed_wrap_opportunities,
+    DiscretionaryOpportunity, LanguageDiscretionaryReplacement, TextBreakPolicy,
+    automatic_hyphenation_opportunities, collect_auto_phrase_relaxed_wrap_opportunities,
     collect_grapheme_cluster_inner_boundaries, collect_keep_all_relaxed_wrap_opportunities,
-    collect_measured_break_opportunities,
+    collect_measured_break_opportunities, contains_bidi_text, hyphenator_for_language,
+    manual_hyphenation_opportunities, text_with_hyphenation_controls,
 };
 #[cfg(test)]
 pub(crate) use breaking::{
@@ -412,9 +417,8 @@ pub(crate) use breaking::{
 };
 use font_matching::*;
 pub(crate) use phrase::{AutoPhraseLanguage, phrase_boundaries};
-pub(crate) use shaping::InlineBoundaryEffect;
 use shaping::*;
-pub(crate) use shaping::{BidiVisualRange, ResolvedBidiDirection};
+pub(crate) use shaping::{BidiVisualRange, InlineBoundaryEffect, ResolvedBidiDirection};
 /// Read one OpenType name record for PDF resource metadata.
 pub(crate) fn font_program_opentype_name(
     face: &ttf_parser::Face<'_>,
@@ -431,7 +435,7 @@ pub(crate) use typographic_units::{
 use unicode_properties::*;
 pub(crate) use unicode_properties::{
     SegmentBreakContext, TextSpacingPunctuationClass, Uax14BoundaryProtection,
-    bidi_mirroring_glyph, character_has_joining_behavior, character_is_arabic_tatweel,
+    bidi_mirroring_glyph, character_has_cursive_shaping_behavior, character_is_arabic_tatweel,
     character_is_autospace_alpha, character_is_autospace_ideograph, character_is_autospace_numeric,
     character_is_bidi_format_control, character_is_css_other_space_separator,
     character_is_css_word_separator, character_is_currency_symbol,

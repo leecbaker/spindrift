@@ -320,8 +320,8 @@ pub(in crate::layout) fn trim_adjoining_block_start_margin(
 /// CSS 2.2 allows a block's own margins to be adjoining when it has no border,
 /// padding, line boxes, min-height, or in-flow content separating the edges,
 /// and its height is either `auto` or zero.
-/// Layout/paint-contained boxes establish independent formatting contexts and
-/// therefore cannot be self-collapsing through contained descendants.
+/// Formatting-context roots, including `flow-root`, and layout/paint-contained
+/// boxes cannot be self-collapsing through contained descendants.
 ///
 /// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
 /// <https://www.w3.org/TR/css-contain-1/#containment-layout>
@@ -332,10 +332,8 @@ pub(in crate::layout) fn can_collapse_own_block_margins(
     has_direct_inline_content: bool,
     used_overflow: css::Overflow,
 ) -> bool {
-    matches!(
-        style.display.inner,
-        DisplayInner::Flow | DisplayInner::FlowRoot
-    ) && style.float == Float::None
+    style.display.is_flow()
+        && style.float == Float::None
         && !style_establishes_multicol_formatting_context(style)
         && !used_property_containment(element, style).establishes_independent_formatting_context()
         && !has_direct_inline_content
@@ -1095,6 +1093,19 @@ fn dom_inline_element_can_only_create_phantom_line_boxes(
     ancestors: &[ElementSignature],
     resolver: &mut DomStyleResolver<'_>,
 ) -> bool {
+    // Keep the DOM fallback in lockstep with
+    // `formatting_box_can_only_create_phantom_line_boxes`: an atomic inline
+    // (including a replaced element) is an actual participant in its
+    // enclosing line box, even when it owns no text descendants.  Treating
+    // it as phantom lets an ancestor self-collapse after the inline formatter
+    // has painted and advanced that line, so a following block can overlap
+    // the atom.
+    //
+    // <https://www.w3.org/TR/css-display-3/#atomic-inline>
+    // <https://www.w3.org/TR/css-inline-3/#line-box>
+    if style.display.is_atomic_inline() || is_replaced_element(element) {
+        return false;
+    }
     style.display.is_inline_level()
         && style.display.is_flow()
         && inline_box_has_no_nonzero_inline_axis_component(style)
@@ -1584,6 +1595,30 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn flow_root_does_not_self_collapse_margins() {
+        let root = dom::parse("<div></div>");
+        let element = first_element_by_tag(&root, "div").expect("expected block element");
+        let mut style = ComputedStyle::initial();
+
+        assert!(can_collapse_own_block_margins(
+            element,
+            &style,
+            css::Edges::ZERO,
+            false,
+            css::Overflow::Visible,
+        ));
+
+        style.display = Display::BLOCK.with_inner(DisplayInner::FlowRoot);
+        assert!(!can_collapse_own_block_margins(
+            element,
+            &style,
+            css::Edges::ZERO,
+            false,
+            css::Overflow::Visible,
+        ));
+    }
+
     #[tokio::test]
     async fn sized_atomic_inline_blocks_start_margin_collapse_but_empty_inline_does_not() {
         let stylesheets = Stylesheets::for_document(css::html5_user_agent_stylesheet(), None, &[]);
@@ -1654,12 +1689,10 @@ mod tests {
 
     #[test]
     fn deeply_nested_inline_page_values_do_not_repeat_single_child_traversal() {
-        // This follows the CLI render stack size: the formatting tree itself
-        // is recursive, while the regression verifies its named-page summary
-        // no longer branches exponentially.
+        // The formatting tree itself is recursive, while the regression
+        // verifies its named-page summary no longer branches exponentially.
         std::thread::Builder::new()
             .name("deep-page-value-regression".to_string())
-            .stack_size(64 * 1024 * 1024)
             .spawn(|| {
                 // WPT: css/css-zoom/crashtests/zoom-deeply-nested.html. The
                 // CSS declaration is incidental: the regression is a

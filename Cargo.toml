@@ -3,7 +3,7 @@ name = "quire"
 version = "0.1.0"
 edition = "2024"
 license = "BSD-3-Clause"
-description = "A from-scratch Rust HTML/CSS to PDF renderer inspired by WeasyPrint."
+description = "A HTML/CSS to PDF renderer, targeting spec compliance and efficiency"
 repository = "https://github.com/lee/quire"
 readme = "README.md"
 keywords = ["html", "css", "pdf", "renderer", "weasyprint"]
@@ -12,6 +12,10 @@ categories = ["command-line-utilities", "rendering"]
 [lib]
 name = "quire"
 path = "src/lib.rs"
+
+[features]
+layout-profile = []
+stack-profile = []
 
 [[bin]]
 name = "quire"
@@ -55,7 +59,8 @@ log = "0.4"
 moxcms = { version = "0.9", features = ["extended_range"] }
 os_info = { version = "3", default-features = false }
 palette = { version = "0.7.6", default-features = false, features = ["std"] }
-subsetter = { version = "0.2.6", default-features = false }
+parse-srcset = "0.1.1"
+subsetter = { version = "0.2.6", default-features = false, features = ["variable-fonts"] }
 markup5ever_rcdom = "0.39.0"
 miniz_oxide = "0.8.9"
 parley = "0.11"

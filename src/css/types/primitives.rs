@@ -1,8 +1,10 @@
-use super::*;
-use crate::units::{LayoutLength, LayoutSize, layout_pt};
-use cssparser::{BasicParseErrorKind, Parser, ParserInput};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use cssparser::{BasicParseErrorKind, Parser, ParserInput};
+
+use super::*;
+use crate::units::{LayoutLength, LayoutSize, layout_pt};
 
 /// A decoded cascade-layer path.
 ///
@@ -1691,6 +1693,11 @@ pub(crate) enum FontFaceSource {
 pub(crate) struct StyleRule {
     pub selector_text: String,
     pub selector: SelectorList<QuireSelectorImpl>,
+    /// The selector context supplied by the owning stylesheet. It is used by
+    /// CSS Nesting's `&` selector when no enclosing style rule or `@scope`
+    /// rule supplies a closer scope.
+    /// <https://drafts.csswg.org/css-nesting-1/#nest-selector>
+    pub stylesheet_scope_anchor: StylesheetScopeAnchor,
     pub declarations: Declarations,
     /// Maximum selector-list specificity, retained for parser diagnostics and
     /// tests. The cascade uses the specificity of the branch that matched.

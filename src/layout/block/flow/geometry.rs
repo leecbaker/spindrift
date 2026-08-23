@@ -221,7 +221,7 @@ pub(in crate::layout) fn plain_inline_content_needs_inline_items(
         || style.used_letter_spacing() != layout_pt(0.0)
         || style.text_transform != css::TextTransform::NONE
         || style.text_decoration.clone().has_visible_line()
-        || !style.text_decoration_layers.is_empty()
+        || style.text_decoration_origins.has_effective_layers()
         || !matches!(style.text_emphasis_style, css::TextEmphasisStyle::None)
 }
 

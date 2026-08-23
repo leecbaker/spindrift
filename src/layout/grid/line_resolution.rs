@@ -479,7 +479,44 @@ fn definite_grid_track_size(size: css::GridTrackSize, container_size: f32) -> Op
         _ => None,
     }
 }
+/// Return used grid-line offsets from Taffy's final track layout.
+///
+/// CSS Grid absolute static positions are derived from the grid area in the
+/// actual grid, including used track sizes, gutters, and collapsed `auto-fit`
+/// repeated tracks:
+/// <https://www.w3.org/TR/css-grid-1/#abspos-items> and
+/// <https://www.w3.org/TR/css-grid-1/#auto-repeat>.
+pub(super) fn grid_line_offsets_from_track_layout(sizes: &[f32], gutters: &[f32]) -> Vec<f32> {
+    let mut offsets = Vec::with_capacity(sizes.len() + 1);
+    let mut offset = 0.0;
+    offsets.push(offset);
+    for (index, size) in sizes.iter().enumerate() {
+        offset += *size;
+        if index + 1 < sizes.len() {
+            offset += gutters.get(index).cloned().unwrap_or(0.0);
+        }
+        offsets.push(offset);
+    }
+    offsets
+}
 
+/// Resolve a Grid gap against a definite content-box dimension.
+///
+/// Track and line-offset algorithms remain scalar coordinate arithmetic; this
+/// CSS used-value boundary retains the semantic layout length until a caller
+/// enters one of those algorithms.
+/// <https://www.w3.org/TR/css-grid-1/#gutters>
+pub(super) fn definite_grid_gap_size(
+    gap: css::ComputedGap,
+    container_size: LayoutLength,
+) -> LayoutLength {
+    match gap {
+        css::ComputedGap::Normal => layout_pt(0.0),
+        css::ComputedGap::LengthPercentage(value) => value
+            .used_length_with_percentage_basis(PercentageBasis::definite(container_size))
+            .unwrap_or_else(|| layout_pt(value.length_points())),
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

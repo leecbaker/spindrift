@@ -1,9 +1,10 @@
+use std::sync::{Arc, Mutex, OnceLock};
+
+use cssparser::{Parser, ParserInput, Token};
+
 use super::*;
 use crate::css::html5_user_agent_stylesheet;
 use crate::css::parse::LayerRegistry;
-use cssparser::{Parser, ParserInput, Token};
-use std::sync::Arc;
-use std::sync::{Mutex, OnceLock};
 
 /// Whether an attribute-free element with `tag` has a block-level default
 /// display in Quire's HTML UA stylesheet.
@@ -657,6 +658,7 @@ impl<'a> ElementCascadeContext<'a> {
                     crate::css::selector::selector_matches_with_scope_proximity_in_chain_with_link_matching(
                         &rule.selector,
                         &rule.scopes,
+                        rule.stylesheet_scope_anchor,
                         &self.chain,
                         self.current_index(),
                         &mut self.selector_caches,
@@ -870,6 +872,30 @@ fn style_for_element_with_signature_inner(
     if display_contents_computes_to_none_for_html_element(&current, &style) {
         style.display = Display::NONE;
     }
+    // A `flow` box whose writing mode differs from the nearest box-generating
+    // parent establishes an independent formatting context.  The parent
+    // context deliberately crosses `display: contents`, which contributes no
+    // principal box.
+    // <https://drafts.csswg.org/css-display-3/#transformations>
+    if style.display.inner == DisplayInner::Flow
+        && !matches!(
+            style.display.outer,
+            DisplayOuter::None | DisplayOuter::Contents
+        )
+        && parent.is_some_and(|parent| style.writing_mode != parent.nearest_box_parent_writing_mode)
+    {
+        style.display.inner = DisplayInner::FlowRoot;
+    }
+    style.nearest_box_parent_writing_mode = if matches!(
+        style.display.outer,
+        DisplayOuter::None | DisplayOuter::Contents
+    ) {
+        parent
+            .map(|parent| parent.nearest_box_parent_writing_mode)
+            .unwrap_or(style.writing_mode)
+    } else {
+        style.writing_mode
+    };
     let quotes_auto_language = match parent {
         Some(parent) => parent.language.as_deref(),
         None => style.language.as_deref(),
@@ -1388,7 +1414,7 @@ fn apply_forced_color_used_values(
         style.text_decoration.color =
             CssColorOrCurrentColor::Color(resolve_or(color, palette.canvas_text));
     }
-    for layer in &mut style.text_decoration_layers {
+    for layer in style.text_decoration_origins.effective_layers_mut() {
         if let CssColorOrCurrentColor::Color(color) = layer.decoration.color {
             layer.decoration.color =
                 CssColorOrCurrentColor::Color(resolve_or(color, palette.canvas_text));
@@ -2152,14 +2178,15 @@ fn push_dynamic_replaced_element_dimension_hint_declarations<'a>(
         return;
     }
 
-    let width = element
-        .attrs
-        .get("width")
-        .and_then(|value| html_non_negative_length_property_value(value));
-    let height = element
-        .attrs
-        .get("height")
-        .and_then(|value| html_non_negative_length_property_value(value));
+    let dimension_attributes = element.selected_image_dimensions.as_ref();
+    let selected_width = dimension_attributes
+        .map(|attributes| attributes.width.as_deref())
+        .unwrap_or_else(|| element.attrs.get("width").map(String::as_str));
+    let selected_height = dimension_attributes
+        .map(|attributes| attributes.height.as_deref())
+        .unwrap_or_else(|| element.attrs.get("height").map(String::as_str));
+    let width = selected_width.and_then(html_non_negative_length_property_value);
+    let height = selected_height.and_then(html_non_negative_length_property_value);
     if let Some(width) = &width {
         push_dynamic_html_presentational_hint_declaration(
             output,
@@ -2184,27 +2211,17 @@ fn push_dynamic_replaced_element_dimension_hint_declarations<'a>(
     // HTML maps the paired dimensions to `auto <ratio>` only for image and
     // video elements (and image buttons). Percentages cannot form that hint.
     if matches!(element.tag.as_str(), "img" | "video") || is_image_button {
-        let ratio =
-            element
-                .attrs
-                .get("width")
-                .and_then(|value| html_dimension_number(value))
-                .zip(
-                    element
-                        .attrs
-                        .get("height")
-                        .and_then(|value| html_dimension_number(value)),
-                )
-                .filter(|(width, height)| {
-                    *width > 0.0
-                        && *height > 0.0
-                        && element.attrs.get("width").is_some_and(|value| {
-                            !value.trim_start_matches(is_html_space).contains('%')
-                        })
-                        && element.attrs.get("height").is_some_and(|value| {
-                            !value.trim_start_matches(is_html_space).contains('%')
-                        })
-                });
+        let ratio = selected_width
+            .and_then(html_dimension_number)
+            .zip(selected_height.and_then(html_dimension_number))
+            .filter(|(width, height)| {
+                *width > 0.0
+                    && *height > 0.0
+                    && selected_width
+                        .is_some_and(|value| !value.trim_start_matches(is_html_space).contains('%'))
+                    && selected_height
+                        .is_some_and(|value| !value.trim_start_matches(is_html_space).contains('%'))
+            });
         if let Some((width, height)) = ratio {
             push_dynamic_html_presentational_hint_declaration(
                 output,
@@ -2685,7 +2702,7 @@ fn is_html_space(character: char) -> bool {
 /// computed longhands while preserving the decorating box's used values:
 /// <https://drafts.csswg.org/css-text-decor-4/#line-decoration>.
 pub(super) fn finalize_text_decoration_layers(style: &mut ComputedStyle) {
-    style.rebuild_own_text_decoration_layer();
+    style.rebuild_own_text_decoration_origin();
 }
 
 /// Add HTML `dir=auto`/`bdi` directionality as a UA cascade declaration.

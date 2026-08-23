@@ -1,4 +1,37 @@
-use super::*;
+use crate::css::{
+    self, ComputedStyle, PageBreak, SemanticLengthExt, Stylesheets, WritingMode, layout_pt,
+};
+use crate::layout::table::layout::split_3::{
+    HorizontalTableContinuationInlineOffset, TableBodyFragmentCommitContext, TableBodyRowsInput,
+    TableBodyRowsOutcome, TableRootFinalBodyFragment,
+};
+use crate::layout::table::layout::{
+    CollapsedTableGeometry, PendingTableBreakCandidate,
+    TABLE_AVOID_UNFRAGMENTED_OVERFLOW_TOLERANCE, TableAvoidBreakCandidateState, TableAvoidRowGroup,
+    TableAvoidRowGroupKeepState, TableAvoidRunBreakDecision, TableAvoidRunBreakInput,
+    TableBodyPaintFragment, TableBreakCandidateMeta, TableForcedBreakCarryState,
+    TableForcedBreakDecision, TableForcedBreakInput, TableFragmentBoundaryDecision,
+    TableFragmentBreakReason, TableFragmentChromeContext, TableFragmentFooterAction,
+    TableFragmentRepeatPolicy, TableFragmentStartDecision, TableFragmentTransitionDecision,
+    TableFragmentTransitionInput, TableFragmentainerBlockStart, TableFragmentainerPlacement,
+    TableNamedPageBreakDecision, TableNamedPageBreakInput, TableOversizedRowSliceDecision,
+    TableOversizedRowSliceInput, TableRowFragmentDecision, TableRowFragmentMode,
+    TableRowGroupAvoidDecision, TableRowGroupAvoidDecisionInput, TableRowGroupFragmentRequirement,
+    TableRowOverflowBreakDecision, TableRowOverflowBreakInput, TableRowSourceFragment,
+    TableWrapperFragmentChrome, TableWrapperFragmentTimeline, table_fragment_repeat_policy,
+};
+use crate::layout::table::{
+    TableCellPadding, TableColumnPlan, TableGrid, TableGridPlacement, TableMetrics, TableRow,
+    TableRowBaselineOffset, UsedTableWidth, table_row_group_end_indices, table_row_is_collapsed,
+    table_vertical_edge_spacing,
+};
+use crate::layout::{
+    AssignmentPlacement, FragmentBreakOpportunity, FragmentainerAdvance, FragmentainerKind,
+    LayoutBuilder, LogicalBlockContentSize, PageInlinePosition, PageTopBlockPosition, PageTopRect,
+    ResolvedPageBoundaryValues, html_table_rowspan, page_value_sources_from_style_and_children,
+    resolved_page_boundary_values_from_style_and_children, style_is_in_normal_flow,
+};
+use crate::units::{NonContentLength, content_box_pt, non_content_pt};
 
 /// Geometry consumed at the start of one destination table fragment.
 ///
@@ -237,12 +270,7 @@ impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout::table) fn layout_table_body_rows(
         &mut self,
         input: TableBodyRowsInput<'_, '_>,
-    ) -> (
-        Option<TableBodyPaintFragment>,
-        PageBreak,
-        TableFragmentRepeatPolicy,
-        HorizontalTableContinuationInlineOffset,
-    ) {
+    ) -> TableBodyRowsOutcome {
         let TableBodyRowsInput {
             fragmentainer_kind,
             rows,
@@ -255,6 +283,7 @@ impl<'a> LayoutBuilder<'a> {
             source_grid_placement,
             root_background_source_grid_placement,
             initial_destination_grid_placement,
+            initial_grid_content_top,
             wrapper_timeline,
             logical_inline_extent,
             physical_grid_width,
@@ -283,11 +312,15 @@ impl<'a> LayoutBuilder<'a> {
         // fragmentainer after a top caption has fragmented. In vertical
         // writing modes this value is the physical inline-axis origin used by
         // the body fragment placement.
-        let table_inline_origin = PageTopBlockPosition::new(
-            initial_destination_grid_placement
-                .full_page_top_rect()
-                .top_y(),
-        );
+        let table_inline_origin = if style.writing_mode.has_vertical_lines() {
+            initial_grid_content_top
+        } else {
+            PageTopBlockPosition::new(
+                initial_destination_grid_placement
+                    .full_page_top_rect()
+                    .top_y(),
+            )
+        };
         debug_assert!(
             (logical_inline_extent.points() - column_plan.total_width().points()).abs() <= 0.01,
             "body rows must retain the column plan's logical inline extent"
@@ -553,7 +586,7 @@ impl<'a> LayoutBuilder<'a> {
                     forced_break,
                     source_row_has_occupied_cell,
                 ) {
-                    logical_block_cursor = destination_cursor;
+                    logical_block_cursor = destination_cursor.points();
                     start_chrome_replayed_after_break = true;
                 } else {
                     logical_block_cursor = self
@@ -1256,12 +1289,20 @@ impl<'a> LayoutBuilder<'a> {
             avoid_row_group_keep_state.finish_row(row_index);
         }
 
-        (
+        let final_body_fragment =
+            table_body_fragment
+                .as_ref()
+                .map(|fragment| TableRootFinalBodyFragment {
+                    placement: fragment.plan.placement,
+                    body_bottom: PageTopBlockPosition::new(fragment.bottom()),
+                });
+        TableBodyRowsOutcome {
             table_body_fragment,
-            forced_break_carry.outgoing_source_break(),
+            final_body_fragment,
+            forced_break_after_table_rows: forced_break_carry.outgoing_source_break(),
             current_fragment_repeat_policy,
             continuation_inline_offset,
-        )
+        }
     }
 
     /// Commit the current table-body page fragment before starting another one.
@@ -1412,7 +1453,7 @@ impl<'a> LayoutBuilder<'a> {
             context,
             pending_fragmentainer_placement,
             transition.start,
-            cursor_top,
+            cursor_top.points(),
             source_row_has_occupied_cell,
         )
     }
@@ -1564,19 +1605,19 @@ impl<'a> LayoutBuilder<'a> {
         pending_fragmentainer_placement: &mut TableFragmentainerPlacement,
         decision: TableForcedBreakDecision,
         source_row_has_occupied_cell: bool,
-    ) -> Option<f32> {
+    ) -> Option<PageTopBlockPosition> {
         self.commit_table_body_fragment_boundary(fragment, context, decision.boundary);
         let cursor_top = self.materialize_table_fragmentainer_advance(
             decision.fragmentainer_kind,
             FragmentainerAdvance::Forced(decision.page_break),
         )?;
-        Some(self.start_table_body_fragment(
+        Some(PageTopBlockPosition::new(self.start_table_body_fragment(
             context,
             pending_fragmentainer_placement,
             decision.start,
-            cursor_top,
+            cursor_top.points(),
             source_row_has_occupied_cell,
-        ))
+        )))
     }
 
     /// Advance a table body to a committed destination fragmentainer.
@@ -1590,14 +1631,14 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         fragmentainer_kind: FragmentainerKind,
         advance: FragmentainerAdvance,
-    ) -> Option<f32> {
+    ) -> Option<PageTopBlockPosition> {
         let continuation = (fragmentainer_kind == FragmentainerKind::Page)
             .then(|| self.fragment_continuation_context());
         self.materialize_fragmentainer_advance(fragmentainer_kind, advance)?;
         if let Some(continuation) = continuation {
             self.replay_fragment_continuation_on_page(&continuation, self.current_page_context);
         }
-        Some(self.cursor_y)
+        Some(PageTopBlockPosition::new(self.cursor_y))
     }
 
     fn effective_table_row_break_before(
@@ -1702,7 +1743,7 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &Stylesheets<'_>,
         table_x: f32,
         used_table_width: f32,
-        table_cellpadding: Option<f32>,
+        table_cellpadding: Option<TableCellPadding>,
         column_plan: &TableColumnPlan,
         planned_row_heights: &[f32],
         source_row_heights: &[f32],
@@ -1710,7 +1751,7 @@ impl<'a> LayoutBuilder<'a> {
         table_height_is_definite: bool,
         table_metrics: TableMetrics,
         collapsed_geometry: Option<&CollapsedTableGeometry>,
-        row_baseline_offset: Option<f32>,
+        row_baseline_offset: Option<TableRowBaselineOffset>,
         source_grid_placement: TableGridPlacement,
         root_background_source_grid_placement: TableGridPlacement,
         wrapper_timeline: TableWrapperFragmentTimeline,

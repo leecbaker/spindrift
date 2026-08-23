@@ -101,7 +101,7 @@ impl<'a> LayoutBuilder<'a> {
             return;
         }
         let mut emphasis_style = style.clone();
-        emphasis_style.text_decoration_layers.clear();
+        emphasis_style.text_decoration_origins.clear();
         emphasis_style.text_decoration = ComputedStyle::initial().text_decoration;
         emphasis_style.text_shadow.clear();
         emphasis_style.text_emphasis_style = TextEmphasisStyle::None;
@@ -185,7 +185,7 @@ impl<'a> LayoutBuilder<'a> {
             self.paint_text_decoration_layer(
                 x,
                 baseline_y,
-                width,
+                text_decoration_physical_inline_span(x, baseline_y, width, style),
                 style,
                 runs,
                 decoration,
@@ -201,7 +201,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         x: f32,
         baseline_y: f32,
-        width: f32,
+        inline_span: TextInlineSpan,
         style: &ComputedStyle,
         runs: &[RenderedTextRun],
         decoration: &TextDecorationLayer,
@@ -209,7 +209,7 @@ impl<'a> LayoutBuilder<'a> {
         color_override: Option<CssColor>,
         line_geometry: Option<&TextDecorationOriginLineGeometry>,
     ) {
-        if !decoration.decoration.has_visible_line() || width <= 0.0 {
+        if !decoration.decoration.has_visible_line() || inline_span.length() <= 0.0 {
             return;
         }
         // A line decoration's declared values belong to its origin. The
@@ -233,7 +233,7 @@ impl<'a> LayoutBuilder<'a> {
                     .decoration
                     .inset
                     .clone()
-                    .used(layout_pt(width), origin_style.font_size)
+                    .used(layout_pt(inline_span.length()), origin_style.font_size)
             });
         let (baseline, geometry) = if let Some(line_geometry) = line_geometry {
             let baseline = match style.writing_mode {
@@ -265,10 +265,14 @@ impl<'a> LayoutBuilder<'a> {
             line_geometry.map(|geometry| geometry.glyph_sequence.glyphs.as_slice());
         for stroke in prepare_text_decoration_strokes(TextDecorationPreparationInput {
             baseline,
-            inline_span: TextInlineSpan::from_start_and_length(x, width),
+            inline_span,
             inset_start,
             inset_end,
             style,
+            inset_style: origin_style,
+            inset_inline_axis: line_geometry
+                .and_then(|geometry| geometry.origin_inline_axis)
+                .or_else(|| VerticalInlineAxis::for_style(origin_style)),
             decoration: decoration.decoration.clone(),
             phase,
             color,
@@ -526,4 +530,19 @@ impl<'a> LayoutBuilder<'a> {
             ),
         );
     }
+}
+
+/// Convert the legacy text-paint `(origin, width)` boundary into an ordered
+/// physical inline span. Prepared vertical decoration receivers bypass this
+/// helper because they retain their logical inline-start provenance.
+fn text_decoration_physical_inline_span(
+    x: f32,
+    baseline_y: f32,
+    width: f32,
+    style: &ComputedStyle,
+) -> TextInlineSpan {
+    let local_span = TextInlineSpan::from_start_and_length(0.0, width);
+    VerticalInlineAxis::for_style(style)
+        .map(|axis| axis.project_span_from_start(layout_pt(baseline_y), local_span))
+        .unwrap_or_else(|| TextInlineSpan::from_start_and_length(x, width))
 }

@@ -1,6 +1,7 @@
-use super::*;
 use std::num::NonZeroUsize;
 use std::rc::Rc;
+
+use super::*;
 
 /// Computed CSS value for `row-gap` and `column-gap`.
 ///

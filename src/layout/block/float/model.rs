@@ -1905,11 +1905,91 @@ pub(in crate::layout) enum UsedFloatSide {
     Bottom,
 }
 
+/// The containing flow axes used to resolve line-relative float and clear
+/// sides.
+///
+/// CSS Writing Modes resolves legacy `left` and `right` for `float` and
+/// `clear` as line-relative sides of the containing block. Keeping this as a
+/// distinct type prevents an orthogonal floated child from supplying its own
+/// writing mode during placement:
+/// <https://www.w3.org/TR/css-writing-modes-4/#line-mappings> and
+/// <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) struct FloatPlacementAxes(FlowAxes);
+
+impl FloatPlacementAxes {
+    pub(in crate::layout) const fn new(
+        containing_writing_mode: WritingMode,
+        containing_direction: Direction,
+    ) -> Self {
+        Self(FlowAxes::new(containing_writing_mode, containing_direction))
+    }
+
+    pub(in crate::layout) fn for_style(containing_style: &ComputedStyle) -> Self {
+        Self(FlowAxes::for_style(containing_style))
+    }
+
+    pub(in crate::layout) fn writing_mode(self) -> WritingMode {
+        self.0.writing_mode()
+    }
+
+    pub(in crate::layout) fn direction(self) -> Direction {
+        self.0.direction()
+    }
+
+    pub(in crate::layout) fn inline_start_side(self) -> PhysicalSide {
+        self.0.inline_start_side()
+    }
+
+    fn line_left_side(self) -> PhysicalSide {
+        self.0.line_left_side()
+    }
+
+    fn line_right_side(self) -> PhysicalSide {
+        self.0.line_right_side()
+    }
+
+    fn inline_end_side(self) -> PhysicalSide {
+        self.0.inline_end_side()
+    }
+}
+
+/// Signed paint-space origin adjustment used while replaying a physically
+/// placed float in its own formatting axes.
+///
+/// A bottom-origin vertical containing block expresses its inline coordinates
+/// relative to the containing content bottom. Isolated replay uses the page's
+/// top-based block cursor instead, so crossing that boundary requires one
+/// explicit paint translation. Keeping the adjustment typed prevents it from
+/// escaping into the containing flow's committed layout geometry.
+/// <https://www.w3.org/TR/css-writing-modes-4/#logical-to-physical>
+/// <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct FloatReplayBlockOriginAdjustment(LayoutLength);
+
+impl FloatReplayBlockOriginAdjustment {
+    pub(in crate::layout) fn for_containing_inline_axis(
+        axes: FloatPlacementAxes,
+        containing_physical_top: PageTopBlockPosition,
+        containing_logical_inline_size: LogicalInlineContentSize,
+    ) -> Self {
+        let adjustment = if axes.inline_start_side() == PhysicalSide::Bottom {
+            containing_physical_top.points() - containing_logical_inline_size.points()
+        } else {
+            0.0
+        };
+        Self(layout_pt(adjustment))
+    }
+
+    pub(in crate::layout) fn paint_translation(self) -> PaintTranslation {
+        PaintTranslation::new(0.0, self.0.points())
+    }
+}
+
 impl UsedFloatSide {
     pub(in crate::layout) fn from_float(
         float: Float,
-        writing_mode: WritingMode,
-        direction: Direction,
+        placement_axes: FloatPlacementAxes,
     ) -> Option<Self> {
         match float {
             Float::None => None,
@@ -1917,16 +1997,12 @@ impl UsedFloatSide {
             // not as an ordinary float-exclusion side. The footnote layout
             // phase consumes them before they can enter this model.
             Float::Footnote => None,
-            Float::Left => Some(Self::Left),
-            Float::Right => Some(Self::Right),
-            Float::InlineStart => Some(Self::from_physical_side(inline_start_side(
-                writing_mode,
-                direction,
-            ))),
-            Float::InlineEnd => Some(Self::from_physical_side(inline_end_side(
-                writing_mode,
-                direction,
-            ))),
+            Float::Left => Some(Self::from_physical_side(placement_axes.line_left_side())),
+            Float::Right => Some(Self::from_physical_side(placement_axes.line_right_side())),
+            Float::InlineStart => {
+                Some(Self::from_physical_side(placement_axes.inline_start_side()))
+            }
+            Float::InlineEnd => Some(Self::from_physical_side(placement_axes.inline_end_side())),
         }
     }
 
@@ -1942,18 +2018,15 @@ impl UsedFloatSide {
     pub(in crate::layout) fn matches_clear(
         self,
         clear: Clear,
-        writing_mode: WritingMode,
-        direction: Direction,
+        placement_axes: FloatPlacementAxes,
     ) -> bool {
         let clear_side = match clear {
             Clear::None => return false,
             Clear::Both => return true,
-            Clear::Left => Self::Left,
-            Clear::Right => Self::Right,
-            Clear::InlineStart => {
-                Self::from_physical_side(inline_start_side(writing_mode, direction))
-            }
-            Clear::InlineEnd => Self::from_physical_side(inline_end_side(writing_mode, direction)),
+            Clear::Left => Self::from_physical_side(placement_axes.line_left_side()),
+            Clear::Right => Self::from_physical_side(placement_axes.line_right_side()),
+            Clear::InlineStart => Self::from_physical_side(placement_axes.inline_start_side()),
+            Clear::InlineEnd => Self::from_physical_side(placement_axes.inline_end_side()),
         };
         self == clear_side
     }

@@ -1,10 +1,11 @@
+use std::rc::Rc;
+
 use super::*;
 use crate::text::{
     CssTextScalar, SegmentBreakContext, character_is_currency_symbol, classify_css_text_scalar,
     segment_break_is_removable,
 };
 use crate::units::glyph_baseline_displacement_pt;
-use std::rc::Rc;
 
 /// Push CSS Text-normalized inline words into the shared inline item stream.
 ///
@@ -50,7 +51,6 @@ pub(in crate::layout) fn push_inline_words_for_style(
 mod tests {
     use super::*;
     use crate::css::ContentLanguage;
-    use std::rc::Rc;
 
     fn word_styles(items: &[InlineItem]) -> Vec<InlineStyle> {
         items
@@ -85,62 +85,78 @@ mod tests {
 
     #[test]
     fn equal_nested_decoration_values_retain_distinct_origins() {
-        let ancestor_style = ComputedStyle::initial();
-        let mut ancestor_decoration = ancestor_style.text_decoration.clone();
-        ancestor_decoration.underline = true;
-        let ancestor_layer = css::TextDecorationLayer {
-            decoration: ancestor_decoration.clone(),
-            origin_style: Rc::new(ancestor_style.clone()),
-        };
+        let mut ancestor_style = ComputedStyle::initial();
+        ancestor_style.text_decoration.underline = true;
+        ancestor_style.rebuild_own_text_decoration_origin();
+        let ancestor_layer = ancestor_style
+            .text_decoration_origins
+            .effective_layers_vec();
 
         let mut child_style = ComputedStyle::initial();
-        child_style
-            .text_decoration_layers
-            .push(css::TextDecorationLayer {
-                decoration: ancestor_decoration,
-                origin_style: Rc::new(ancestor_style),
-            });
+        child_style.text_decoration.underline = true;
+        child_style.rebuild_own_text_decoration_origin();
 
-        let chain = propagated_decoration_layers_for_child(&[ancestor_layer], &child_style);
+        let chain = propagated_decoration_layers_for_child(&ancestor_layer, &child_style);
         assert_eq!(chain.len(), 2);
-        assert!(!Rc::ptr_eq(&chain[0].origin_style, &chain[1].origin_style,));
+        assert!(!std::rc::Rc::ptr_eq(
+            &chain[0].origin_style,
+            &chain[1].origin_style,
+        ));
     }
 
     #[test]
-    fn propagation_context_carries_in_flow_layers_but_stops_at_abspos() {
+    fn propagation_context_carries_in_flow_layers_and_stops_at_boundaries() {
         let mut ancestor_style = ComputedStyle::initial();
-        let mut decoration = ancestor_style.text_decoration.clone();
-        decoration.underline = true;
-        ancestor_style
-            .text_decoration_layers
-            .push(css::TextDecorationLayer {
-                decoration: decoration.clone(),
-                origin_style: Rc::new(ancestor_style.clone()),
-            });
+        ancestor_style.text_decoration.underline = true;
+        ancestor_style.rebuild_own_text_decoration_origin();
         let context = TextDecorationPropagationContext::from_style(&ancestor_style);
 
         let in_flow_style = ComputedStyle::initial();
         let propagated = context.used_child_style(&in_flow_style);
-        assert_eq!(propagated.text_decoration_layers.len(), 1);
-        assert!(Rc::ptr_eq(
-            &propagated.text_decoration_layers[0].origin_style,
-            &ancestor_style.text_decoration_layers[0].origin_style,
+        let propagated_layers = propagated.text_decoration_origins.effective_layers_vec();
+        let ancestor_layers = ancestor_style
+            .text_decoration_origins
+            .effective_layers_vec();
+        assert_eq!(propagated_layers.len(), 1);
+        assert!(std::rc::Rc::ptr_eq(
+            &propagated_layers[0].origin_style,
+            &ancestor_layers[0].origin_style,
         ));
 
         let mut nested_style = ComputedStyle::initial();
-        nested_style
-            .text_decoration_layers
-            .push(css::TextDecorationLayer {
-                decoration,
-                origin_style: Rc::new(ComputedStyle::initial()),
-            });
+        nested_style.text_decoration.underline = true;
+        nested_style.rebuild_own_text_decoration_origin();
         let nested = context.used_child_style(&nested_style);
-        assert_eq!(nested.text_decoration_layers.len(), 2);
+        let nested_layers = nested.text_decoration_origins.effective_layers_vec();
+        let nested_own_origin = std::rc::Rc::clone(
+            &nested_style
+                .text_decoration_origins
+                .own_layer()
+                .unwrap()
+                .origin_style,
+        );
+        assert_eq!(nested_layers.len(), 2);
+        assert!(std::rc::Rc::ptr_eq(
+            &nested_layers[0].origin_style,
+            &ancestor_layers[0].origin_style,
+        ));
+        assert!(std::rc::Rc::ptr_eq(
+            &nested_layers[1].origin_style,
+            &nested_own_origin,
+        ));
 
-        let mut positioned_style = ComputedStyle::initial();
-        positioned_style.position = Position::Absolute;
-        let positioned = context.used_child_style(&positioned_style);
-        assert!(positioned.text_decoration_layers.is_empty());
+        let mut absolute = ComputedStyle::initial();
+        absolute.position = Position::Absolute;
+        let mut floated = ComputedStyle::initial();
+        floated.float = Float::Left;
+        let mut atomic = ComputedStyle::initial();
+        atomic.display = Display::INLINE_BLOCK;
+        for boundary in [&mut absolute, &mut floated, &mut atomic] {
+            boundary.text_decoration.underline = true;
+            boundary.rebuild_own_text_decoration_origin();
+            let used = context.used_child_style(boundary);
+            assert_eq!(used.text_decoration_origins.effective_layers().count(), 1);
+        }
     }
 
     #[test]
@@ -516,6 +532,50 @@ mod tests {
             .collect::<String>();
         assert_eq!(text, "ab");
         assert!(!text.contains('\u{3000}'));
+    }
+
+    #[test]
+    fn word_space_transform_requires_text_on_both_sides() {
+        let mut style = ComputedStyle::initial();
+        style.white_space = WhiteSpace::Pre;
+        style.word_space_transform = css::WordSpaceTransform {
+            replacement: Some(css::WordSpaceReplacement::IdeographicSpace),
+            auto_phrase: false,
+        };
+        let mut items = Vec::new();
+        push_inline_text_run(
+            "\u{200b}a\u{200b}b\n\u{200b}c",
+            &style,
+            None,
+            0.0,
+            InlineVisualOffset::zero(),
+            &mut items,
+        );
+
+        normalize_inline_whitespace_items(&mut items);
+
+        let text = items
+            .iter()
+            .filter_map(|item| match item {
+                InlineItem::Word(word) => Some(word.text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(text, "\u{200b}a\u{3000}bc");
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| matches!(
+                    item,
+                    InlineItem::Word(word)
+                        if word.source
+                            == InlineTextSource::WordSpaceTransform(
+                                ExplicitWordSeparatorSource::AuthoredZeroWidthSpace
+                            )
+                ))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1086,7 +1146,7 @@ pub(in crate::layout) fn propagated_decoration_layers_for_child(
     // values: two nested boxes with identical declarations are distinct line
     // origins and must both paint.
     // <https://drafts.csswg.org/css-text-decor-4/#line-decoration>
-    for child_layer in &child_style.text_decoration_layers {
+    for child_layer in child_style.text_decoration_origins.effective_layers() {
         if !layers.iter().any(|ancestor_layer| {
             Rc::ptr_eq(&ancestor_layer.origin_style, &child_layer.origin_style)
         }) {
@@ -1114,7 +1174,18 @@ pub(in crate::layout) struct TextDecorationPropagationContext {
 impl TextDecorationPropagationContext {
     pub(in crate::layout) fn from_style(style: &ComputedStyle) -> Self {
         Self {
-            layers: style.text_decoration_layers.clone(),
+            layers: style.text_decoration_origins.effective_layers_vec(),
+        }
+    }
+
+    fn from_own_origin(style: &ComputedStyle) -> Self {
+        Self {
+            layers: style
+                .text_decoration_origins
+                .own_layer()
+                .cloned()
+                .into_iter()
+                .collect(),
         }
     }
 
@@ -1126,7 +1197,7 @@ impl TextDecorationPropagationContext {
     /// child's computed style rather than an empty used style.
     pub(in crate::layout) fn for_child(&self, child_style: &ComputedStyle) -> Self {
         if text_decoration_propagation_stops_at(child_style) {
-            return Self::from_style(child_style);
+            return Self::from_own_origin(child_style);
         }
         Self {
             layers: propagated_decoration_layers_for_child(&self.layers, child_style),
@@ -1158,7 +1229,9 @@ pub(in crate::layout) fn apply_propagated_decoration_layers(
     style: &mut ComputedStyle,
     layers: &[css::TextDecorationLayer],
 ) {
-    style.text_decoration_layers = layers.to_vec();
+    style
+        .text_decoration_origins
+        .set_propagated_from_effective(layers);
 }
 
 impl InlineWhitespaceProcessor {
@@ -1275,6 +1348,10 @@ impl InlineWhitespaceProcessor {
             };
             if character == '\u{200b}'
                 && let Some(replacement) = meta.style.word_space_transform.replacement
+                // An unexpanded U+200B at an inline-context boundary remains
+                // in the source stream but cannot make the following
+                // separator eligible for expansion.
+                && self.last_text_character.is_some_and(|previous| previous != '\u{200b}')
             {
                 self.resolve_pending_word_space_transform_before_text();
                 self.pending_word_space_transform = Some(PendingWordSpaceTransform {

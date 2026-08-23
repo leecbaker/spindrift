@@ -1,6 +1,7 @@
+use std::rc::Rc;
+
 use super::positioning::positioned_rendered_runs_for_writing_mode;
 use super::*;
-use std::rc::Rc;
 
 /// The decoration paint inputs for one shaped text group.
 ///
@@ -11,6 +12,7 @@ use std::rc::Rc;
 #[derive(Debug, Clone)]
 struct PreparedTextDecorationPaint {
     baseline: PaintPoint,
+    vertical_inline_start: Option<VerticalInlineStart>,
     receivers: Vec<PreparedTextDecorationReceiverPaint>,
 }
 
@@ -36,7 +38,7 @@ struct PreparedInlineTextPaint {
     rendered_line: RenderedLine,
     glyph_paths: Vec<RenderedPath>,
     glyph_images: Vec<RenderedImage>,
-    opaque_text_coverage_paths: Vec<RenderedPath>,
+    opaque_text_coverages: Vec<OpaqueTextGlyphCoverage>,
     decorations: PreparedTextDecorationPaint,
     text_style: ComputedStyle,
     link: Option<RenderedLink>,
@@ -219,20 +221,18 @@ impl<'a> LayoutBuilder<'a> {
         for image in raster_glyph_images {
             self.push_image_in_band(PaintBand::Inline, image);
         }
-        let full_em_rect_coverage_paths = self.font_system.full_em_rect_glyph_coverage_paths(
+        let full_em_rect_coverages = self.font_system.full_em_rect_glyph_coverages(
             origin,
             &rendered_line.runs,
             style.text_fill_color.unwrap_or(style.color),
         );
-        if full_em_rect_coverage_paths.is_empty() {
-            self.push_line_in_band(PaintBand::Inline, rendered_line.clone());
-        } else {
-            self.current_page.push_opaque_text_coverage_in_band(
-                PaintBand::Inline,
+        self.current_page.push_text_paint_segments_in_band(
+            PaintBand::Inline,
+            split_rendered_line_for_opaque_text_coverage(
                 rendered_line.clone(),
-                full_em_rect_coverage_paths,
-            );
-        }
+                full_em_rect_coverages,
+            ),
+        );
         self.paint_prepared_text_emphasis_marks_for_line(&rendered_line, style);
         self.paint_text_decoration_lines_for_phase(
             rendered_line.x(),
@@ -268,7 +268,8 @@ impl<'a> LayoutBuilder<'a> {
         // the prepared product so each copied source slice uses the same
         // lexical effect chain.
         let paint_opacity = prepared_inline_text_group_paint_opacity(group);
-        if paint_opacity >= 1.0 {
+        let positioned_stacking_context = group.positioned_paint_style.is_some();
+        if paint_opacity >= 1.0 && !positioned_stacking_context {
             self.paint_prepared_inline_text_group_unscoped(group, source, decoration_geometries);
             return;
         }
@@ -293,15 +294,46 @@ impl<'a> LayoutBuilder<'a> {
         // <https://drafts.csswg.org/css-color-4/#transparency>
         let links = std::mem::take(&mut fragment.links);
         let bounds = PaintClip::from_paint_rect(group.link_paint_rect());
-        let context = PaintStackingContext::from_banded_fragment(fragment, Vec::new())
-            .with_source_order(self.next_paint_source_order())
-            .with_effects(PaintEffects {
-                opacity: paint_opacity,
-                ..PaintEffects::default()
-            })
-            .with_bounds(bounds);
+        let (parent_band, stack_level, effects) = if positioned_stacking_context {
+            // A relatively positioned non-atomic inline is a real stacking
+            // context when its z-index is non-auto.  Its shaped glyphs are
+            // collected as a text group rather than as a positioned box, so
+            // lower the captured group into the selected Appendix-E band at
+            // this paint boundary.  In particular, a negative descendant
+            // must paint below an enclosing inline's background.
+            // <https://www.w3.org/TR/CSS22/zindex.html>
+            let mut policy = StackingContextPolicy::for_non_positioned_style_effect(
+                group
+                    .positioned_paint_style
+                    .as_ref()
+                    .expect("positioned text group retains its owning inline style"),
+                bounds,
+            );
+            // The lexical ancestry has already composed opacity for this
+            // prepared group.  Keep that resolved product when its positioned
+            // context is emitted rather than reusing only the direct style.
+            policy.effects.opacity = paint_opacity;
+            (policy.parent_band, policy.stack_level, policy.effects)
+        } else {
+            (
+                PaintBand::Inline,
+                StackLevel::Auto,
+                PaintEffects {
+                    opacity: paint_opacity,
+                    ..PaintEffects::default()
+                },
+            )
+        };
+        let context = PaintStackingContext::from_banded_fragment_with_stack_level(
+            stack_level,
+            fragment,
+            Vec::new(),
+        )
+        .with_source_order(self.next_paint_source_order())
+        .with_effects(effects)
+        .with_bounds(bounds);
         self.current_page.append_paint_fragment_owned(
-            PaintFragment::from_stacking_context_in_band(PaintBand::Inline, context),
+            PaintFragment::from_stacking_context_in_band(parent_band, context),
             PaintTranslation::identity(),
         );
         if !links.is_empty() {
@@ -424,14 +456,19 @@ impl<'a> LayoutBuilder<'a> {
                         WritingMode::VerticalRl
                         | WritingMode::VerticalLr
                         | WritingMode::SidewaysRl
-                        | WritingMode::SidewaysLr => {
-                            (prepared.decorations.baseline.x, receiver.inline_span.start)
-                        }
+                        | WritingMode::SidewaysLr => (
+                            prepared.decorations.baseline.x,
+                            prepared
+                                .decorations
+                                .vertical_inline_start
+                                .expect("vertical decoration paint retains its logical start")
+                                .y(),
+                        ),
                     };
                     self.paint_text_decoration_layer(
                         x,
                         baseline_y,
-                        receiver.inline_span.length(),
+                        receiver.inline_span,
                         &receiver.style,
                         &prepared.rendered_line.runs,
                         &geometry.layer,
@@ -464,14 +501,19 @@ impl<'a> LayoutBuilder<'a> {
                         WritingMode::VerticalRl
                         | WritingMode::VerticalLr
                         | WritingMode::SidewaysRl
-                        | WritingMode::SidewaysLr => {
-                            (prepared.decorations.baseline.x, receiver.inline_span.start)
-                        }
+                        | WritingMode::SidewaysLr => (
+                            prepared.decorations.baseline.x,
+                            prepared
+                                .decorations
+                                .vertical_inline_start
+                                .expect("vertical decoration paint retains its logical start")
+                                .y(),
+                        ),
                     };
                     self.paint_text_decoration_layer(
                         x,
                         baseline_y,
-                        receiver.inline_span.length(),
+                        receiver.inline_span,
                         &receiver.style,
                         &prepared.rendered_line.runs,
                         decoration,
@@ -540,28 +582,45 @@ impl<'a> LayoutBuilder<'a> {
             group.shaped.baseline_adjustment,
         ))
         .with_source_run(Rc::clone(&group.source_run));
-        apply_word_space_transform_actual_text(&mut rendered_line, group.source);
+        apply_word_space_transform_actual_text(
+            &mut rendered_line,
+            group.actual_text.as_deref(),
+            group.source,
+        );
         let glyph_ink_bounds =
             glyph_ink_bounds_for_rendered_line(&self.font_system, &rendered_line);
         rendered_line = rendered_line.with_glyph_ink_bounds(glyph_ink_bounds);
         let mut decoration_style = group.style.clone();
-        let (decoration_baseline, decoration_width) =
+        let vertical_inline_axis = VerticalInlineAxis::for_style(&group.style);
+        let (decoration_baseline, decoration_width, vertical_inline_start) =
             if let Some(rect) = group.decoration_paint_rect {
                 match group.style.writing_mode {
                     WritingMode::HorizontalTb => {
                         decoration_style.font_size = rect.height().max(1.0);
-                        (rect.origin, rect.width())
+                        (rect.origin, rect.width(), None)
                     }
                     WritingMode::VerticalRl
                     | WritingMode::VerticalLr
                     | WritingMode::SidewaysRl
                     | WritingMode::SidewaysLr => {
                         decoration_style.font_size = rect.width().max(1.0);
-                        (rect.origin, rect.height())
+                        let inline_start = vertical_inline_axis
+                            .expect("vertical writing modes have a vertical inline axis")
+                            .logical_start_for_paint_rect(rect);
+                        (
+                            PaintPoint::new(rect.origin.x, inline_start.y()),
+                            rect.height(),
+                            Some(inline_start),
+                        )
                     }
                 }
             } else {
-                (PaintPoint::new(group.x(), group.y()), group.width())
+                let baseline = PaintPoint::new(group.x(), group.y());
+                (
+                    baseline,
+                    group.width(),
+                    vertical_inline_axis.map(|_| VerticalInlineStart::new(baseline.y)),
+                )
             };
         // A selected line edge is a glyph-sequence edge, not the fitted line
         // measure.  In particular, `break-spaces` retains trailing advances
@@ -572,13 +631,6 @@ impl<'a> LayoutBuilder<'a> {
         let decoration_width = decoration_width.max(rendered_text_line_width(&rendered_line));
         let source_inline_length = group.width().max(group.shaped.advance_width());
         let receiver_scale = (decoration_width / source_inline_length).max(0.0);
-        let decoration_inline_start = match group.style.writing_mode {
-            WritingMode::HorizontalTb => decoration_baseline.x,
-            WritingMode::VerticalRl
-            | WritingMode::VerticalLr
-            | WritingMode::SidewaysRl
-            | WritingMode::SidewaysLr => decoration_baseline.y,
-        };
         let decoration_receivers = group
             .decoration_provenance
             .iter()
@@ -588,18 +640,29 @@ impl<'a> LayoutBuilder<'a> {
                     if group.decoration_paint_rect.is_some() {
                         style.font_size = decoration_style.font_size;
                     }
+                    let local_span = TextInlineSpan::new(
+                        receiver.inline_span.start * receiver_scale,
+                        receiver.inline_span.end * receiver_scale,
+                    );
                     PreparedTextDecorationReceiverPaint {
-                        inline_span: TextInlineSpan::new(
-                            decoration_inline_start + receiver.inline_span.start * receiver_scale,
-                            decoration_inline_start + receiver.inline_span.end * receiver_scale,
-                        ),
+                        inline_span: vertical_inline_axis
+                            .zip(vertical_inline_start)
+                            .map(|(axis, start)| {
+                                axis.project_span_from_start(start.as_layout_length(), local_span)
+                            })
+                            .unwrap_or_else(|| {
+                                TextInlineSpan::new(
+                                    decoration_baseline.x + local_span.start,
+                                    decoration_baseline.x + local_span.end,
+                                )
+                            }),
                         style,
                         layers: segment.layers.clone(),
                     }
                 })
             })
             .collect();
-        let opaque_text_coverage_paths = self.font_system.full_em_rect_glyph_coverage_paths(
+        let opaque_text_coverages = self.font_system.full_em_rect_glyph_coverages(
             text_origin,
             &rendered_line.runs,
             group.style.text_fill_color.unwrap_or(group.style.color),
@@ -612,9 +675,10 @@ impl<'a> LayoutBuilder<'a> {
             rendered_line,
             glyph_paths: color_glyph_paths,
             glyph_images: raster_glyph_images,
-            opaque_text_coverage_paths,
+            opaque_text_coverages,
             decorations: PreparedTextDecorationPaint {
                 baseline: decoration_baseline,
+                vertical_inline_start,
                 receivers: decoration_receivers,
             },
             text_style: group.style.clone(),
@@ -643,16 +707,14 @@ impl<'a> LayoutBuilder<'a> {
                 for image in std::mem::take(&mut prepared.glyph_images) {
                     self.push_image_in_band(PaintBand::Inline, image);
                 }
-                let coverage_paths = std::mem::take(&mut prepared.opaque_text_coverage_paths);
-                if coverage_paths.is_empty() {
-                    self.push_line_in_band(PaintBand::Inline, prepared.rendered_line.clone());
-                } else {
-                    self.current_page.push_opaque_text_coverage_in_band(
-                        PaintBand::Inline,
+                let coverages = std::mem::take(&mut prepared.opaque_text_coverages);
+                self.current_page.push_text_paint_segments_in_band(
+                    PaintBand::Inline,
+                    split_rendered_line_for_opaque_text_coverage(
                         prepared.rendered_line.clone(),
-                        coverage_paths,
-                    );
-                }
+                        coverages,
+                    ),
+                );
             }
             InlineTextPaintPhase::Emphasis => {
                 self.paint_prepared_text_emphasis_marks_for_line(
@@ -690,6 +752,11 @@ impl<'a> LayoutBuilder<'a> {
     ) {
         if fragment.style().visibility != Visibility::Visible
             || (!fragment.style().display.is_inline_level()
+                // Ruby text/base containers participate in ruby layout, but
+                // their generated boxes still paint CSS backgrounds and
+                // borders around their inline contents.
+                // <https://drafts.csswg.org/css-ruby-1/#anon-gen-ruby>
+                && !fragment.style().display.is_ruby_internal()
                 && !fragment.force_inline_background_paint())
             || fragment.style().display.is_atomic_inline()
             || rect.width() <= 0.0
@@ -731,11 +798,20 @@ impl<'a> LayoutBuilder<'a> {
 /// paint, and decoration use its advance. PDF `/ActualText` instead exposes
 /// the source U+200B or no text for HTML `<wbr>`.
 /// <https://drafts.csswg.org/css-text-4/#word-space-transform>
-fn apply_word_space_transform_actual_text(line: &mut RenderedLine, source: InlineTextSource) {
-    let InlineTextSource::WordSpaceTransform(separator) = source else {
+fn apply_word_space_transform_actual_text(
+    line: &mut RenderedLine,
+    group_actual_text: Option<&str>,
+    source: InlineTextSource,
+) {
+    let actual_text = group_actual_text.map(Rc::<str>::from).or_else(|| {
+        let InlineTextSource::WordSpaceTransform(separator) = source else {
+            return None;
+        };
+        Some(Rc::<str>::from(separator.extraction_text().unwrap_or("")))
+    });
+    let Some(actual_text) = actual_text else {
         return;
     };
-    let actual_text = Rc::<str>::from(separator.extraction_text().unwrap_or(""));
     for run in &mut line.runs {
         run.actual_text = Some(Rc::from(""));
     }
@@ -814,6 +890,7 @@ mod tests {
         let mut line = line();
         apply_word_space_transform_actual_text(
             &mut line,
+            None,
             InlineTextSource::WordSpaceTransform(
                 ExplicitWordSeparatorSource::AuthoredZeroWidthSpace,
             ),
@@ -827,10 +904,24 @@ mod tests {
         let mut line = line();
         apply_word_space_transform_actual_text(
             &mut line,
+            None,
             InlineTextSource::WordSpaceTransform(ExplicitWordSeparatorSource::HtmlWbr),
         );
         assert_eq!(line.text, " ");
         assert_eq!(line.runs[0].actual_text.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn word_space_transform_group_restores_mixed_source_text_for_extraction() {
+        let mut line = line();
+        apply_word_space_transform_actual_text(
+            &mut line,
+            Some("a\u{200b}b"),
+            InlineTextSource::Normal,
+        );
+
+        assert_eq!(line.text, " ");
+        assert_eq!(line.runs[0].actual_text.as_deref(), Some("a\u{200b}b"));
     }
 
     #[test]
@@ -857,14 +948,16 @@ mod tests {
 
         assert!(!receiver_style.text_decoration.has_visible_line());
         receiver_style
-            .text_decoration_layers
-            .push(TextDecorationLayer {
+            .text_decoration_origins
+            .set_propagated(vec![TextDecorationLayer {
                 decoration: origin_style.text_decoration.clone(),
                 origin_style: Rc::clone(&origin_style),
-            });
+            }]);
 
         assert!(text_decoration_layers_receive_origin(
-            &receiver_style.text_decoration_layers,
+            &receiver_style
+                .text_decoration_origins
+                .effective_layers_vec(),
             &origin_style
         ));
     }
@@ -876,7 +969,7 @@ mod tests {
         let outer_origin = Rc::new(declaration.clone());
         let inner_origin = Rc::new(declaration);
         let mut receiver_style = ComputedStyle::initial();
-        receiver_style.text_decoration_layers = vec![
+        receiver_style.text_decoration_origins.set_propagated(vec![
             TextDecorationLayer {
                 decoration: outer_origin.text_decoration.clone(),
                 origin_style: Rc::clone(&outer_origin),
@@ -885,15 +978,19 @@ mod tests {
                 decoration: inner_origin.text_decoration.clone(),
                 origin_style: Rc::clone(&inner_origin),
             },
-        ];
+        ]);
 
         assert!(!Rc::ptr_eq(&outer_origin, &inner_origin));
         assert!(text_decoration_layers_receive_origin(
-            &receiver_style.text_decoration_layers,
+            &receiver_style
+                .text_decoration_origins
+                .effective_layers_vec(),
             &outer_origin
         ));
         assert!(text_decoration_layers_receive_origin(
-            &receiver_style.text_decoration_layers,
+            &receiver_style
+                .text_decoration_origins
+                .effective_layers_vec(),
             &inner_origin
         ));
     }

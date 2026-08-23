@@ -1,5 +1,3 @@
-use crate::document::Page;
-
 use super::annotations::RenderedLink;
 use super::effects::{
     PaintBlendMode, PaintEffectScope, PaintEffects, PaintFragmentation, RenderedClipPathPolygon,
@@ -13,6 +11,7 @@ use super::geometry::{
 use super::page::{PaintOperation, PaintPrimitive};
 use super::paths::{RenderedPath, RenderedPathCommand, RenderedPathFillRule};
 use super::stacking::PaintStackingContext;
+use crate::document::Page;
 
 impl PagePaintTree {
     pub(crate) fn new() -> Self {
@@ -1978,8 +1977,9 @@ pub(crate) struct PagePaintTree {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::document::paint::contours::OverflowClipEffect;
+    use crate::document::paint::shapes::RenderedRect;
     use crate::document::paint::stacking::StackLevel;
-    use crate::document::paint::{contours::OverflowClipEffect, shapes::RenderedRect};
 
     fn test_plane(transform: Affine3dPaintTransform) -> Affine3dScenePlane {
         let bounds = PaintClip::new(-10.0, -10.0, 20.0, 20.0);

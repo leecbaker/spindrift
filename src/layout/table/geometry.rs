@@ -1,4 +1,12 @@
-use super::*;
+use super::{
+    CollapsedBorderSegment, ComputedStyle, ContainerPoint, ContainerRect, ContainingBlock,
+    ContentBoxLength, Direction, FlowAxes, LayoutLength, LogicalAxis, LogicalBlockContentSize,
+    LogicalInlineContentSize, LogicalPoint, LogicalRect, LogicalSide, LogicalSize,
+    NonContentLength, OverflowClip, PageTopPoint, PageTopRect, PercentageBasis, PhysicalAxis,
+    PhysicalContentWidth, PhysicalSide, SemanticLengthExt, TableCellPlacement, WritingMode,
+    WritingModeAxes, constrain_content_height, constrain_content_width, content_box_pt, css,
+    non_content_pt,
+};
 
 /// Logical coordinates inside a CSS table grid box.
 ///
@@ -18,6 +26,97 @@ pub(super) enum TableGridSpace {}
 /// or border-box length:
 /// <https://drafts.csswg.org/css-tables-3/#table-layout-algorithm>.
 pub(super) type TableGridLength = euclid::Length<f32, TableGridSpace>;
+
+/// Legacy HTML `cellpadding` expressed in Quire's layout unit.
+///
+/// This is a one-edge padding input, not a padding-plus-border contribution.
+/// Keeping it separate from ordinary CSS edges prevents an attribute value
+/// from being used as a resolved grid extent before CSS padding resolution.
+/// <https://html.spec.whatwg.org/multipage/obsolete.html#attr-tdth-cellpadding>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout::table) struct TableCellPadding(LayoutLength);
+
+impl TableCellPadding {
+    pub(in crate::layout::table) fn new(value: LayoutLength) -> Self {
+        Self(value)
+    }
+
+    pub(in crate::layout::table) fn points(self) -> f32 {
+        self.0.points()
+    }
+}
+
+/// A physical-Y distance from a table-cell border-box block start to a baseline.
+///
+/// CSS table baseline alignment uses this displacement only after a cell has
+/// been projected into the physical-Y row-alignment path.
+/// <https://www.w3.org/TR/CSS22/tables.html#height-layout>
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub(in crate::layout::table) struct TableCellBaselineOffset(LayoutLength);
+
+impl TableCellBaselineOffset {
+    pub(in crate::layout::table) fn new(value: LayoutLength) -> Self {
+        Self(value)
+    }
+
+    pub(in crate::layout::table) fn points(self) -> f32 {
+        self.0.points()
+    }
+}
+
+/// A physical-Y distance from a table-row border-box block start to its baseline.
+///
+/// A row baseline and a cell baseline are intentionally distinct origins even
+/// when their current numeric offsets match.
+/// <https://www.w3.org/TR/CSS22/tables.html#height-layout>
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub(in crate::layout::table) struct TableRowBaselineOffset(LayoutLength);
+
+impl TableRowBaselineOffset {
+    pub(in crate::layout::table) fn new(value: LayoutLength) -> Self {
+        Self(value)
+    }
+
+    pub(in crate::layout::table) fn points(self) -> f32 {
+        self.0.points()
+    }
+}
+
+/// A measured margin-box block extent of a table-cell child.
+///
+/// This remains separate from a CSS content-box height because the table row
+/// sizing algorithm accumulates borders, padding, and margins at this point.
+/// <https://drafts.csswg.org/css-tables-3/#row-layout>
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub(in crate::layout::table) struct TableCellOuterBlockSize(LayoutLength);
+
+impl TableCellOuterBlockSize {
+    pub(in crate::layout::table) fn new(value: LayoutLength) -> Self {
+        Self(value)
+    }
+
+    pub(in crate::layout::table) fn points(self) -> f32 {
+        self.0.points()
+    }
+}
+
+/// A resolved collapsed-border width in table-grid coordinates.
+///
+/// It becomes a paint stroke only after table-grid geometry is projected to
+/// the document paint coordinate system.
+/// <https://www.w3.org/TR/CSS22/tables.html#collapsing-borders>
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub(super) struct TableGridBorderWidth(TableGridLength);
+
+impl TableGridBorderWidth {
+    pub(super) fn new(value: TableGridLength) -> Self {
+        Self(value)
+    }
+
+    pub(super) fn points(self) -> f32 {
+        self.0.get()
+    }
+}
 
 /// A distance along the table grid's logical inline axis.
 ///
@@ -61,6 +160,28 @@ pub(super) type TableGridPoint = euclid::Point2D<f32, TableGridSpace>;
 pub(super) type TableGridSize = euclid::Size2D<f32, TableGridSpace>;
 /// An axis-aligned rectangle in table-grid logical coordinates.
 pub(super) type TableGridRect = euclid::Rect<f32, TableGridSpace>;
+
+/// The physical top-left corner of a table grid's CSS content box.
+///
+/// A table root's border box and a fragmentainer edge are both represented by
+/// [`PageTopPoint`], but neither is interchangeable with the grid content
+/// box: borders and padding must be crossed exactly once before table slots
+/// are projected. Keeping this conversion explicit prevents a vertical root
+/// from treating its wrapper border top as the logical inline start of rows.
+/// <https://www.w3.org/TR/CSS22/tables.html#model>
+/// <https://drafts.csswg.org/css-writing-modes-4/#orthogonal-flows>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout::table) struct TableGridContentBoxTopLeft(PageTopPoint);
+
+impl TableGridContentBoxTopLeft {
+    pub(in crate::layout::table) fn new(point: PageTopPoint) -> Self {
+        Self(point)
+    }
+
+    pub(in crate::layout::table) fn page_top_point(self) -> PageTopPoint {
+        self.0
+    }
+}
 
 /// The table root grid's CSS content-box size in its own logical axes.
 ///
@@ -450,11 +571,13 @@ impl TableGridArea {
     }
 }
 
-/// Physical inline bounds for a logical table-column span.
+/// Logical inline bounds for a table-column span.
 ///
-/// `start` is an `x` offset in [`TableGridSpace`] after applying the table's
+/// `start` is an offset in [`TableGridSpace`] after applying the table's
 /// `direction`; `size` is the border-box inline size consumed by the cell,
-/// column, or collapsed-border segment:
+/// column, or collapsed-border segment. Neither value is a page-space X
+/// coordinate: callers must combine these bounds with [`TableRowBounds`] and
+/// project the resulting [`TableGridRect`] through [`TableGridPlacement`].
 /// <https://www.w3.org/TR/CSS22/tables.html#width-layout>.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct TableInlineBounds {
@@ -470,18 +593,23 @@ impl TableInlineBounds {
         }
     }
 
-    /// Project the inline-start grid offset onto a legacy page x coordinate.
-    ///
-    /// Table layout keeps this scalar in table-grid space until the final
-    /// page/paint API boundary, which currently represents coordinates as raw
-    /// `f32` values.
-    pub(super) fn page_x(self, table_x: f32) -> f32 {
-        table_x + self.start.get()
+    /// Return the logical inline-start offset in the root table grid.
+    pub(super) fn logical_start(self) -> TableGridLength {
+        self.start
     }
 
-    /// Return the span width for a legacy page/paint API.
-    pub(super) fn page_width(self) -> f32 {
-        self.size.get()
+    /// Return the logical inline size in the root table grid.
+    pub(super) fn logical_size(self) -> TableGridLength {
+        self.size
+    }
+
+    /// Construct the logical grid rectangle covered by this inline span and
+    /// one resolved row/row-fragment block span.
+    pub(super) fn rect_for_block(self, block: TableRowBounds) -> TableGridRect {
+        TableGridRect::new(
+            TableGridPoint::from_lengths(self.start, TableGridLength::new(block.start)),
+            TableGridSize::from_lengths(self.size, TableGridLength::new(block.size)),
+        )
     }
 }
 
@@ -521,10 +649,7 @@ pub(super) struct TableCellBorderBox {
 impl TableCellBorderBox {
     pub(super) fn from_bounds(inline: TableInlineBounds, row: TableRowBounds) -> Self {
         Self {
-            rect: TableGridRect::new(
-                TableGridPoint::from_lengths(inline.start, TableGridLength::new(row.start)),
-                TableGridSize::from_lengths(inline.size, TableGridLength::new(row.size)),
-            ),
+            rect: inline.rect_for_block(row),
         }
     }
 
@@ -532,8 +657,8 @@ impl TableCellBorderBox {
         self.rect
     }
 
-    pub(super) fn width(self) -> f32 {
-        self.rect.size.width
+    pub(super) fn logical_inline_size(self) -> TableGridLength {
+        TableGridLength::new(self.rect.size.width)
     }
 
     pub(super) fn x(self, placement: TableGridPlacement) -> f32 {
@@ -794,7 +919,7 @@ impl TableGridFrames {
             };
             let block = (wrapper_grid.logical_block_grid_extent().get() - edge * 2.0).max(0.0);
             TableGridPlacement::with_axes(
-                origin,
+                TableGridContentBoxTopLeft::new(origin),
                 wrapper_grid.axes,
                 TableGridLogicalSize::new(
                     wrapper_grid.logical_size.inline(),
@@ -834,7 +959,7 @@ impl TableGridFrames {
         };
         let block = cell_grid.logical_block_grid_extent().get() + edge * 2.0;
         let wrapper_grid = TableGridPlacement::with_axes(
-            origin,
+            TableGridContentBoxTopLeft::new(origin),
             cell_grid.axes,
             TableGridLogicalSize::new(
                 cell_grid.logical_size.inline(),
@@ -902,7 +1027,7 @@ impl TableFragmentainerFrame {
 }
 
 impl TableGridPlacement {
-    pub(super) fn new(origin: PageTopPoint) -> Self {
+    pub(super) fn new(origin: TableGridContentBoxTopLeft) -> Self {
         Self::with_axes(
             origin,
             TableAxes {
@@ -924,12 +1049,12 @@ impl TableGridPlacement {
     /// `vertical-rl` locate rows from the opposite physical edge.
     /// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
     pub(super) fn with_axes(
-        origin: PageTopPoint,
+        origin: TableGridContentBoxTopLeft,
         axes: TableAxes,
         logical_size: TableGridLogicalSize,
     ) -> Self {
         Self {
-            origin,
+            origin: origin.page_top_point(),
             axes,
             logical_size,
         }
@@ -1054,6 +1179,19 @@ impl TableGridPlacement {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::css::layout_pt;
+    use crate::layout::{ContainerSize, paint_space_rect};
+
+    #[test]
+    fn typed_cell_padding_and_baselines_preserve_zero_and_absence() {
+        let padding = TableCellPadding::new(layout_pt(12.0));
+        assert_eq!(padding.points(), 12.0);
+
+        let absent: Option<TableCellBaselineOffset> = None;
+        let zero = Some(TableCellBaselineOffset::new(layout_pt(0.0)));
+        assert_ne!(absent, zero);
+        assert!(absent.is_none());
+    }
 
     fn grid_length(value: f32) -> TableGridLength {
         TableGridLength::new(value)
@@ -1276,7 +1414,9 @@ mod tests {
 
     #[test]
     fn projects_row_bounds_to_page_coordinates() {
-        let placement = TableGridPlacement::new(PageTopPoint::new(20.0, 200.0));
+        let placement = TableGridPlacement::new(TableGridContentBoxTopLeft::new(
+            PageTopPoint::new(20.0, 200.0),
+        ));
         let border_box = TableCellBorderBox::from_bounds(
             TableInlineBounds::new(grid_length(15.0), grid_length(60.0)),
             TableRowBounds::new(25.0, 30.0),
@@ -1294,9 +1434,47 @@ mod tests {
     }
 
     #[test]
+    fn cell_border_boxes_project_logical_inline_and_block_spans_in_every_flow() {
+        let inline = TableInlineBounds::new(grid_length(10.0), grid_length(30.0));
+        let block = TableRowBounds::new(20.0, 40.0);
+        let border_box = TableCellBorderBox::from_bounds(inline, block);
+
+        for writing_mode in [
+            WritingMode::HorizontalTb,
+            WritingMode::VerticalRl,
+            WritingMode::VerticalLr,
+            WritingMode::SidewaysRl,
+            WritingMode::SidewaysLr,
+        ] {
+            for direction in [Direction::Ltr, Direction::Rtl] {
+                let axes = TableAxes {
+                    flow: FlowAxes::new(writing_mode, direction),
+                    direction,
+                };
+                let placement = TableGridPlacement::with_axes(
+                    TableGridContentBoxTopLeft::new(PageTopPoint::new(100.0, 200.0)),
+                    axes,
+                    TableGridLogicalSize::new(
+                        LogicalInlineContentSize::new(content_box_pt(100.0)),
+                        LogicalBlockContentSize::new(content_box_pt(300.0)),
+                    ),
+                );
+
+                let expected = placement.page_top_rect_for(inline.rect_for_block(block));
+                assert_eq!(border_box.page_top_rect(placement), expected);
+                assert_eq!(
+                    border_box.logical_inline_size(),
+                    inline.logical_size(),
+                    "{writing_mode:?} {direction:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn vertical_row_source_rect_keeps_the_unfragmented_logical_block_range() {
         let placement = TableGridPlacement::with_axes(
-            PageTopPoint::new(20.0, 200.0),
+            TableGridContentBoxTopLeft::new(PageTopPoint::new(20.0, 200.0)),
             TableAxes {
                 flow: FlowAxes::new(WritingMode::VerticalRl, Direction::Rtl),
                 direction: Direction::Rtl,
@@ -1328,7 +1506,7 @@ mod tests {
         ] {
             for direction in [Direction::Ltr, Direction::Rtl] {
                 let placement = TableGridPlacement::with_axes(
-                    PageTopPoint::new(20.0, 200.0),
+                    TableGridContentBoxTopLeft::new(PageTopPoint::new(20.0, 200.0)),
                     TableAxes {
                         flow: FlowAxes::new(writing_mode, direction),
                         direction,
@@ -1367,7 +1545,7 @@ mod tests {
         ] {
             for direction in [Direction::Ltr, Direction::Rtl] {
                 let wrapper = TableGridPlacement::with_axes(
-                    PageTopPoint::new(20.0, 200.0),
+                    TableGridContentBoxTopLeft::new(PageTopPoint::new(20.0, 200.0)),
                     TableAxes {
                         flow: FlowAxes::new(writing_mode, direction),
                         direction,

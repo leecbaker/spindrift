@@ -1,4 +1,43 @@
-use super::*;
+use crate::css::{
+    self, CaptionSide, ComputedStyle, DisplayInner, ElementSignature, EmptyCells, PercentageBasis,
+    Position, SemanticLengthExt, Stylesheets, Visibility, layout_pt,
+};
+use crate::document::paint::display_list::PaintBand;
+use crate::document::paint::geometry::PaintTranslation;
+use crate::document::paint::shapes::RenderedRect;
+use crate::dom::{Element, NodeKind};
+use crate::layout::table::layout::split_3::{
+    collapsed_cell_decoration_style, table_columns_paint_in_reverse_page_order,
+};
+use crate::layout::table::layout::{
+    CollapsedTableGeometry, TableCaptionContainingBlock, TableCaptionOuterWidth,
+    TableCellBaselineAlignmentContext, TableCellClipRegion, TableWrapperBorderBoxOrigin,
+    TableWrapperMarginBoxFootprint, TableWrapperPaintBox, table_atomic_stacking_policy,
+    table_box_overflow_clip, table_column_fragment_background_image_primitives,
+    table_column_fragment_background_primitives, table_outlines_use_in_flow_phase,
+    table_padding_box_clip_from_border_box, table_wrapper_border_box_height,
+    table_wrapper_collision_height, table_wrapper_positioning_containing_block,
+};
+use crate::layout::table::{
+    TableAxes, TableCaption, TableCellAxisAdapter, TableCellPadding, TableColumn, TableColumnPlan,
+    TableGrid, TableGridContentBoxTopLeft, TableGridLength, TableGridLogicalSize,
+    TableGridPlacement, TableInlineBounds, TableMetrics, TableRow, TableRowBounds, UsedTableWidth,
+    paint_table_border_edges, repeated_table_rows_height, table_cell_href,
+    table_column_group_spans, table_grid_height, table_row_block_start, table_row_group_spans,
+    table_row_is_collapsed, table_row_span_height, used_empty_table_grid_height,
+    used_empty_table_grid_width,
+};
+use crate::layout::{
+    AbsoluteStaticPosition, ContainingBlock, LayoutBuilder, LogicalBlockContentSize,
+    LogicalInlineContentSize, PageInlinePosition, PageInlineSpan, PageTopBlockPosition,
+    PageTopPoint, PageTopRect, PhysicalContentWidth, PositionedContainingBlockMode, RelativeOffset,
+    assets, block_paint_ops_with_border_insets, element_sibling_signature_list,
+    paint_containment_applies_to_element, paint_space_rect,
+    resolve_normal_flow_auto_margins_for_known_width,
+};
+use crate::units::{
+    BorderBoxLength, border_box_pt, content_box_pt, margin_box_pt, margin_box_size_pt,
+};
 
 impl<'a> LayoutBuilder<'a> {
     /// Estimate the block-axis size of a table whose row grid has no rows.
@@ -129,8 +168,6 @@ impl<'a> LayoutBuilder<'a> {
                 collision_height,
             ),
             style.clear,
-            style.writing_mode,
-            style.direction,
             self.containing_block_direction,
         );
         self.cursor_y = placement.origin.top_y();
@@ -248,6 +285,9 @@ impl<'a> LayoutBuilder<'a> {
         };
 
         let table_box_top = top_caption_destination.paint_top().points();
+        // This is also authoritative for a rowless table: an absent top
+        // caption does not make the wrapper's opening cursor a root origin.
+        let table_root_border_top = table_box_top;
 
         let table_structure_paint_checkpoint = self.current_page.paint_checkpoint();
         let table_structure_paint_page_index = self.pages.len();
@@ -274,39 +314,31 @@ impl<'a> LayoutBuilder<'a> {
                 );
             }
         }
-        let table_paint_box = TableWrapperPaintBox {
-            grid_origin: if style.writing_mode.has_vertical_lines()
-                && top_caption_outcome.vertical_block_progress().get() > 0.0
-            {
-                top_caption_destination.destination_grid_origin()
-            } else if style.writing_mode.has_vertical_lines() {
-                TableFragmentainerGridOrigin::for_continuation(
-                    style,
-                    self.content_left,
-                    self.content_right,
-                    HorizontalTableContinuationInlineOffset::capture(table_x, self.content_left),
-                    TableGridLength::new(content_height),
-                    PageTopBlockPosition::new(table_box_top),
-                )
-                .page_top_point()
-            } else {
-                PageTopPoint::new(
-                    table_x,
-                    table_box_top - table_width.border_widths.top - table_width.padding.top,
-                )
-            },
+        let table_root_paint_box = TableWrapperPaintBox {
+            grid_origin: TableWrapperBorderBoxOrigin::new(PageTopPoint::new(
+                border_box_x,
+                table_root_border_top,
+            ))
+            .grid_content_box_top_left(TableAxes::for_style(style), table_width),
             axes: TableAxes::for_style(style),
             grid_size,
             table_width,
             table_metrics,
             block_edge_spacing: TableGridLength::new(0.0),
         };
-        self.paint_separated_table_wrapper_border(style, table_paint_box.clone());
+        let table_wrapper_margin_box = TableWrapperMarginBoxFootprint::from_table_root_border_box(
+            table_root_paint_box.clone().border_box(),
+            PageTopBlockPosition::new(table_wrapper_top),
+            layout_pt(top_caption_height),
+            layout_pt(bottom_caption_height),
+            &style.margin,
+        );
+        self.paint_separated_table_root_border(style, table_root_paint_box.clone());
         if !paint_containment_applies && self.pages.len() == table_structure_paint_page_index {
-            let bounds = table_paint_box.clone().border_box().paint_clip();
+            let bounds = table_root_paint_box.clone().border_box().paint_clip();
             let overflow_clip = table_box_overflow_clip(
                 style,
-                table_paint_box.padding_box().paint_clip(),
+                table_root_paint_box.clone().padding_box().paint_clip(),
                 table_is_document_canvas,
             );
             let policy =
@@ -320,7 +352,7 @@ impl<'a> LayoutBuilder<'a> {
             );
         }
 
-        self.cursor_y -= border_box_height;
+        self.cursor_y = table_root_paint_box.border_box().bottom_y();
         self.layout_table_captions(
             captions,
             style,
@@ -337,13 +369,7 @@ impl<'a> LayoutBuilder<'a> {
             let fragment = self
                 .current_page
                 .take_paint_fragment_since(top_caption_paint_checkpoint);
-            let wrapper_clip = PageTopRect::new(
-                table_x - table_width.padding.left,
-                table_wrapper_top,
-                physical_grid_width.points() + table_width.padding.left + table_width.padding.right,
-                top_caption_height + border_box_height + bottom_caption_height,
-            )
-            .paint_clip();
+            let wrapper_clip = table_wrapper_margin_box.page_top_rect().paint_clip();
             let fragment = fragment.with_effect_scoped_to_rect_all_bands(wrapper_clip);
             self.current_page
                 .append_paint_fragment_owned(fragment, PaintTranslation::identity());
@@ -371,20 +397,14 @@ impl<'a> LayoutBuilder<'a> {
         }
         self.pop_float_context();
         self.last_principal_transform_box = Some(assets::TransformReferenceBox::table_wrapper(
-            PageTopRect::new(
-                table_x - table_width.padding.left - table_width.border_widths.left,
-                table_wrapper_top,
-                physical_grid_width.points()
-                    + table_width.padding.left
-                    + table_width.padding.right
-                    + table_width.border_widths.left
-                    + table_width.border_widths.right,
-                top_caption_height + border_box_height + bottom_caption_height,
-            )
-            .paint_clip()
-            .paint_rect(),
+            table_wrapper_margin_box
+                .page_top_rect()
+                .paint_clip()
+                .paint_rect(),
         ));
-        self.cursor_y -= style.margin.bottom;
+        self.cursor_y = table_wrapper_margin_box
+            .horizontal_parent_block_end()
+            .points();
         if matches!(style.position, Position::Relative | Position::Sticky) {
             self.cursor_y -= relative_offset.y();
         }
@@ -446,22 +466,22 @@ impl<'a> LayoutBuilder<'a> {
         }
     }
 
-    /// Paint the border of a separated-border table wrapper.
+    /// Paint the border of a separated-border table-root grid box.
     ///
     /// CSS 2.2's separated border model gives the table-root its own ordinary
     /// border box, distinct from row and cell borders. Collapsed borders are
     /// resolved through the collapsed-border grid instead:
     /// <https://www.w3.org/TR/CSS22/tables.html#separated-borders> and
     /// <https://www.w3.org/TR/CSS22/tables.html#collapsing-borders>.
-    pub(in crate::layout::table) fn paint_separated_table_wrapper_border(
+    pub(in crate::layout::table) fn paint_separated_table_root_border(
         &mut self,
         style: &ComputedStyle,
-        wrapper: TableWrapperPaintBox,
+        root: TableWrapperPaintBox,
     ) {
-        if wrapper.table_metrics.border_collapse == css::BorderCollapse::Collapse {
+        if root.table_metrics.border_collapse == css::BorderCollapse::Collapse {
             return;
         }
-        let border_box = wrapper.border_box();
+        let border_box = root.border_box();
         let border_box_x = border_box.x();
         let border_box_width = border_box.width();
         let border_box_height = border_box.height();
@@ -503,7 +523,7 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &Stylesheets<'_>,
         table_x: f32,
         used_table_width: f32,
-        table_cellpadding: Option<f32>,
+        table_cellpadding: Option<TableCellPadding>,
         column_plan: &TableColumnPlan,
         planned_row_heights: &[f32],
         planned_row_occupancy: &[bool],
@@ -561,7 +581,7 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &Stylesheets<'_>,
         table_x: f32,
         used_table_width: f32,
-        table_cellpadding: Option<f32>,
+        table_cellpadding: Option<TableCellPadding>,
         column_plan: &TableColumnPlan,
         planned_row_heights: &[f32],
         planned_row_occupancy: &[bool],
@@ -595,8 +615,8 @@ impl<'a> LayoutBuilder<'a> {
                 TableGridLength::new(used_table_width),
             )
         });
-        let occupied_x = occupied_inline_bounds.page_x(table_x);
-        let occupied_width = occupied_inline_bounds.page_width();
+        let occupied_x = table_x + occupied_inline_bounds.logical_start().get();
+        let occupied_width = occupied_inline_bounds.logical_size().get();
         self.paint_repeated_table_fragment_structural_layers(
             rows,
             repeated_rows,
@@ -697,7 +717,9 @@ impl<'a> LayoutBuilder<'a> {
                     table_metrics.clone(),
                 )
                 .max(metrics.border_box_height);
-                let cell_placement = TableGridPlacement::new(PageTopPoint::new(table_x, row_top));
+                let cell_placement = TableGridPlacement::new(TableGridContentBoxTopLeft::new(
+                    PageTopPoint::new(table_x, row_top),
+                ));
                 let cell_border_box = column_plan
                     .cell_border_box(prepared.area, TableRowBounds::new(0.0, cell_height));
                 let text = prepared.text;
@@ -938,7 +960,7 @@ impl<'a> LayoutBuilder<'a> {
                 })
                 .collect::<Vec<_>>();
             let placement = TableGridPlacement::with_axes(
-                PageTopPoint::new(table_x, fragment_top),
+                TableGridContentBoxTopLeft::new(PageTopPoint::new(table_x, fragment_top)),
                 TableAxes::for_style(table_style),
                 TableGridLogicalSize::new(
                     column_plan.total_width(),
@@ -951,10 +973,10 @@ impl<'a> LayoutBuilder<'a> {
             );
             let (rects, paths) = geometry.grid.paint_fragment_rows(
                 placement,
-                TableGridPlacement::new(PageTopPoint::new(
+                TableGridPlacement::new(TableGridContentBoxTopLeft::new(PageTopPoint::new(
                     table_x,
                     repeated_row_tops.iter().copied().fold(0.0_f32, f32::max),
-                )),
+                ))),
                 column_plan,
                 repeated_rows,
                 &repeated_row_tops,
@@ -1078,8 +1100,8 @@ impl<'a> LayoutBuilder<'a> {
                 TableGridLength::new(used_table_width),
             )
         });
-        let occupied_x = occupied_inline_bounds.page_x(table_x);
-        let occupied_width = occupied_inline_bounds.page_width();
+        let occupied_x = table_x + occupied_inline_bounds.logical_start().get();
+        let occupied_width = occupied_inline_bounds.logical_size().get();
         for (position, row_index) in repeated_rows.iter().cloned().enumerate() {
             local_row_tops.push(cursor_y);
             let row_height = planned_row_heights[row_index];

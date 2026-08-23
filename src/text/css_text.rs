@@ -201,17 +201,19 @@ pub(crate) fn trim_trailing_css_hanging_space_separators<'a>(
     &text[..end]
 }
 
-/// Return the inline-end `letter-spacing` advance excluded from line measure.
+/// Return the inline-end shaper tracking used by legacy text-only tests.
 ///
-/// CSS Text defines `letter-spacing` as tracking between typographic character
-/// units and explicitly excludes tracking at the start or end of a line:
-/// <https://www.w3.org/TR/css-text-3/#letter-spacing-property>.
+/// Production inline layout shapes without backend-owned tracking and resolves
+/// line-edge suppression in `MeasuredInlineAdvance`; this helper remains only
+/// for the isolated computed-spacing shaping assertions.
+#[cfg(test)]
 pub(crate) fn line_end_letter_spacing_width(text: &str, style: &ComputedStyle) -> LayoutLength {
     let letter_spacing = style.used_letter_spacing().points();
     if letter_spacing == 0.0
         || text.is_empty()
         || text.chars().any(|character| {
-            character_has_joining_behavior(character) && !character_is_join_control(character)
+            character_has_cursive_shaping_behavior(character)
+                && !character_is_join_control(character)
         })
     {
         return layout_pt(0.0);

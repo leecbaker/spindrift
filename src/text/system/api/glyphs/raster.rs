@@ -1,7 +1,8 @@
+use std::rc::Rc;
+
 use super::super::*;
 use crate::document::paint::geometry::{PaintRect, PaintSize, PaintTransform};
 use crate::document::paint::images::RenderedImage;
-use std::rc::Rc;
 
 impl FontSystem {
     pub(crate) fn take_raster_glyph_images(

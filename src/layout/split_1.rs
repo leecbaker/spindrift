@@ -1,7 +1,8 @@
+use std::collections::HashSet;
+
 use super::*;
 use crate::layout::assets::{DocumentPageIndex, PendingPositionedFragmentation};
 use crate::layout::block::DirectBlockLayoutConstraint;
-use std::collections::HashSet;
 
 /// Cache key for a table wrapper height probe. The three optional values are
 /// the resolved preferred, minimum, and maximum block-size constraints.
@@ -653,6 +654,8 @@ pub(crate) fn layout_prepared_dom(config: PreparedDomLayout<'_>) -> Document {
         mut font_system,
     } = config;
     let _timer = DebugTimer::start("layout pipeline");
+    #[cfg(feature = "layout-profile")]
+    let _layout_profile_document = super::layout_profile::begin_document();
     // Fragment targeting is resolved while preparing the DOM.  From this
     // point onward selector-relevant source metadata is immutable, so share a
     // single snapshot tree across all formatting-tree and layout replays.
@@ -2004,7 +2007,7 @@ pub(in crate::layout) struct LayoutBuilder<'a> {
     /// It consumes this record instead of laying out and painting the float a
     /// second time.  The record retains the marker, selected source row, and
     /// the durable page-local exclusion that owns the captured paint subtree.
-    pub(in crate::layout) committed_inline_floats: HashMap<ElementId, CommittedInlineFloat>,
+    pub(in crate::layout) committed_inline_floats: HashMap<InlineFloatId, CommittedInlineFloat>,
     pub(in crate::layout) footnote_reservations: HashMap<usize, f32>,
     pub(in crate::layout) footnote_layout_mode: FootnoteLayoutMode,
     pub(in crate::layout) footnote_measurement_depth: usize,

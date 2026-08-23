@@ -17,6 +17,8 @@ pub(in crate::layout) fn prepare_text_decoration_strokes(
         inset_start,
         inset_end,
         style,
+        inset_style,
+        inset_inline_axis,
         decoration,
         phase,
         color,
@@ -32,9 +34,14 @@ pub(in crate::layout) fn prepare_text_decoration_strokes(
     } else {
         TextDecorationStrokeAxis::Vertical
     };
-    let Some(inline_span) =
-        text_decoration_inline_span(axis, baseline, inline_span, inset_start, inset_end, style)
-    else {
+    let Some(inline_span) = text_decoration_inline_span(
+        axis,
+        inline_span,
+        inset_start,
+        inset_end,
+        inset_style,
+        inset_inline_axis,
+    ) else {
         return Vec::new();
     };
 
@@ -208,11 +215,11 @@ fn decoration_thickness_font_size(
 
 pub(in crate::layout) fn text_decoration_inline_span(
     axis: TextDecorationStrokeAxis,
-    baseline: PaintPoint,
     span: TextInlineSpan,
     inset_start: f32,
     inset_end: f32,
-    style: &ComputedStyle,
+    inset_style: &ComputedStyle,
+    inset_inline_axis: Option<VerticalInlineAxis>,
 ) -> Option<TextInlineSpan> {
     let length = (span.length() - inset_start - inset_end).max(0.0);
     if length <= 0.0 {
@@ -220,24 +227,22 @@ pub(in crate::layout) fn text_decoration_inline_span(
     }
     match axis {
         TextDecorationStrokeAxis::Horizontal => {
-            let start = match style.direction {
-                Direction::Ltr => baseline.x + inset_start,
-                Direction::Rtl => baseline.x + inset_end,
+            let (start, end) = match inset_style.direction {
+                Direction::Ltr => (span.start + inset_start, span.end - inset_end),
+                Direction::Rtl => (span.start + inset_end, span.end - inset_start),
             };
-            Some(TextInlineSpan::from_start_and_length(start, length))
+            Some(TextInlineSpan::new(start, end))
         }
         TextDecorationStrokeAxis::Vertical => {
-            if vertical_text_advance_sign(style) < 0.0 {
-                Some(TextInlineSpan::from_start_and_length(
-                    baseline.y - span.length() + inset_end,
-                    length,
-                ))
+            let inline_axis = inset_inline_axis
+                .or_else(|| VerticalInlineAxis::for_style(inset_style))
+                .expect("vertical decoration strokes require a vertical inline axis");
+            let (start, end) = if inline_axis.advance_sign() < 0.0 {
+                (span.start + inset_end, span.end - inset_start)
             } else {
-                Some(TextInlineSpan::from_start_and_length(
-                    baseline.y + inset_start,
-                    length,
-                ))
-            }
+                (span.start + inset_start, span.end - inset_end)
+            };
+            Some(TextInlineSpan::new(start, end))
         }
     }
 }
@@ -304,22 +309,6 @@ pub(in crate::layout) fn text_decoration_block_position(
                 TextDecorationPreparedLineKind::LineThrough => x + considered_font_size * 0.5,
             }
         }
-    }
-}
-
-pub(in crate::layout) fn vertical_text_advance_sign(style: &ComputedStyle) -> f32 {
-    let placement_direction = if matches!(
-        style.text_layout_policy(),
-        css::TextLayoutPolicy::Vertical(TextOrientation::Upright)
-    ) {
-        Direction::Ltr
-    } else {
-        style.direction
-    };
-    match inline_start_side(style.writing_mode, placement_direction) {
-        PhysicalSide::Top => -1.0,
-        PhysicalSide::Bottom => 1.0,
-        PhysicalSide::Left | PhysicalSide::Right => 0.0,
     }
 }
 

@@ -1,6 +1,7 @@
+use std::rc::Rc;
+
 use super::*;
 use crate::layout::asset_helpers::CssImageNaturalDimensions;
-use std::rc::Rc;
 
 /// A positioned box's source style and its normalized layout style.
 ///
@@ -434,6 +435,14 @@ impl<'a> LayoutBuilder<'a> {
         let border_paint_rect =
             paint_space_rect(border_x, border_y, border_box_width, border_box_height);
         let content_contour = replaced_content_contour(border_paint_rect, style, border_widths);
+        let overflow_edge = resolve_overflow_clip_edge(
+            border_paint_rect,
+            style,
+            border_widths,
+            UsedOverflowAxes::from_svg_viewport_style(style),
+            style.contain.paint,
+            None,
+        );
         self.paint_replaced_box_decoration(border_paint_rect, style, PaintBand::BackgroundBorder);
         if style.visibility == Visibility::Visible
             && content_width > 0.0
@@ -455,11 +464,16 @@ impl<'a> LayoutBuilder<'a> {
                 asset.with_replaced_viewport(content_box_size_pt(content_width, content_height));
             let mut group = viewport_asset.paint_inline_group(
                 paint_space_rect(content_x, content_y, content_width, content_height),
-                style_clips_overflow(style),
+                false,
             );
-            if let Some(clip) = content_contour
+            if let Some(clip) = overflow_edge
                 .as_ref()
-                .and_then(ResolvedBoxContentClip::path_clip)
+                .and_then(|edge| edge.clip.path_clip())
+                .or_else(|| {
+                    content_contour
+                        .as_ref()
+                        .and_then(ResolvedBoxContentClip::path_clip)
+                })
             {
                 group = group.with_clip(clip);
             }
@@ -469,6 +483,17 @@ impl<'a> LayoutBuilder<'a> {
             &paint_checkpoint,
             PaintBand::InFlowBlock,
             PaintClip::from_paint_rect(border_paint_rect),
+            overflow_edge.as_ref().map_or_else(
+                || PaintClip::from_paint_rect(border_paint_rect),
+                |edge| {
+                    let edge = edge.clip.bounds;
+                    let x = border_paint_rect.min_x().min(edge.x());
+                    let y = border_paint_rect.min_y().min(edge.y());
+                    let right = border_paint_rect.max_x().max(edge.x() + edge.width());
+                    let top = border_paint_rect.max_y().max(edge.y() + edge.height());
+                    PaintClip::new(x, y, right - x, top - y)
+                },
+            ),
             style,
         );
         self.cursor_y -= border_box_height + style.margin.bottom;
@@ -488,8 +513,6 @@ impl<'a> LayoutBuilder<'a> {
             PageTopBlockPosition::new(self.cursor_y),
             margin_box_size_pt(margin_box_width, margin_box_height),
             style.clear,
-            style.writing_mode,
-            style.direction,
             self.containing_block_direction,
         );
         self.cursor_y = placement.origin.top_y();

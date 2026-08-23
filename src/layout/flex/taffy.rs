@@ -242,11 +242,9 @@ pub(super) struct FlexStretchFitContext {
 }
 
 fn taffy_stretch_fit_dimension(context: FlexStretchFitContext) -> taffy_layout::Dimension {
-    let Some(available) = context.available_margin_box_size else {
+    let Some(content_size) = resolved_stretch_fit_content_box_size(context) else {
         return taffy_layout::Dimension::auto();
     };
-    let content_size =
-        stretch_fit_content_box_size(available, context.margin_size, context.non_content_size);
     let size = match context.box_sizing {
         BoxSizing::ContentBox => content_size.points(),
         BoxSizing::BorderBox => {
@@ -254,6 +252,21 @@ fn taffy_stretch_fit_dimension(context: FlexStretchFitContext) -> taffy_layout::
         }
     };
     taffy_layout::Dimension::length(size.max(0.0))
+}
+
+/// Resolves a definite stretch-fit margin-box slot into the item's content-box
+/// size.
+///
+/// This is shared by normal `stretch` sizing and Flexbox's automatic-minimum
+/// transferred-size suggestion, which both need the same box-model conversion:
+/// <https://drafts.csswg.org/css-sizing-4/#stretch-fit-sizing> and
+/// <https://drafts.csswg.org/css-flexbox-1/#min-size-auto>.
+fn resolved_stretch_fit_content_box_size(
+    context: FlexStretchFitContext,
+) -> Option<ContentBoxLength> {
+    context.available_margin_box_size.map(|available| {
+        stretch_fit_content_box_size(available, context.margin_size, context.non_content_size)
+    })
 }
 
 /// Converts a CSS size to Taffy, resolving mixed length-percentages when possible.
@@ -512,6 +525,33 @@ pub(super) fn taffy_min_dimension(
         .unwrap_or_else(|| taffy_layout::Dimension::length(0.0))
 }
 
+/// Resolve a table flex item's authored length/percentage minimum without
+/// discarding the table grid's intrinsic minimum.
+///
+/// CSS Tables makes the used table minimum at least its min-content width,
+/// while a definite (including percentage-resolved) authored `min-width` can
+/// raise that floor.  Taffy has no `max(length, percent)` dimension, so this
+/// adapter resolves the author value at the Flex percentage-basis boundary.
+/// An indefinite percentage basis leaves the intrinsic table floor in place.
+/// <https://drafts.csswg.org/css-tables-3/#computing-the-table-width>
+/// <https://www.w3.org/TR/css-sizing-3/#min-size-properties>
+pub(super) fn table_length_percentage_min_dimension(
+    value: css::ComputedLengthPercentageOrAuto,
+    percentage_basis: FlexAvailablePercentageBasis,
+    table_min_content: ContentBoxLength,
+) -> taffy_layout::Dimension {
+    debug_assert!(matches!(
+        value,
+        css::ComputedLengthPercentageOrAuto::LengthPercentage(_)
+    ));
+    let table_min_content = table_min_content.max(content_box_pt(0.0));
+    let table_min_layout = layout_pt(table_min_content.points());
+    let authored = used_length_percentage_or_auto(value, percentage_basis)
+        .unwrap_or(table_min_layout)
+        .max(table_min_layout);
+    taffy_layout::Dimension::length(authored.points())
+}
+
 /// Computes Taffy's automatic minimum size for a flex item.
 ///
 /// CSS Flexbox section 4.5 defines the automatic minimum size of flex items as
@@ -632,7 +672,7 @@ pub(super) fn resolve_automatic_flex_minimum(
     // contribution or a ratio-only replaced item. `calc-size(auto, …)` must
     // still peel back an estimate's raised floor before substituting `auto`.
     // <https://drafts.csswg.org/css-values-5/#calc-size>.
-    let content_size_suggestion = if specified.calc_size_with_auto_basis().is_some() {
+    let intrinsic_content_size_suggestion = if specified.calc_size_with_auto_basis().is_some() {
         inputs
             .content_size_source
             .content_size_suggestion()
@@ -640,18 +680,55 @@ pub(super) fn resolve_automatic_flex_minimum(
     } else {
         inputs.content_size_source.content_size_suggestion()
     };
+    let authored_stretch_fit_cross_size = authored_cross_stretch_fit_content_box_size(
+        context.style,
+        context.direction,
+        context.cross_stretch,
+    );
     let transferred_size_suggestion = automatic_minimum_transferred_size_suggestion(
         context.style,
         context.direction,
-        context.available_cross_size,
-        context.stretched_cross_size,
-        inputs.automatic_preferred_cross_size.content_box_size(),
         inputs.preferred_aspect_ratio,
-        FlexCrossIntrinsicContributions {
-            min_content: inputs.cross_intrinsic.min_content,
-            max_content: inputs.cross_intrinsic.max_content,
+        FlexCrossSizeSuggestionContext {
+            available_cross_size: context.available_cross_size,
+            authored_stretch_fit_cross_size,
+            stretched_cross_size: context.stretched_cross_size,
+            automatic_preferred_cross_size: inputs
+                .automatic_preferred_cross_size
+                .content_box_size(),
+            intrinsic: FlexCrossIntrinsicContributions {
+                min_content: inputs.cross_intrinsic.min_content,
+                max_content: inputs.cross_intrinsic.max_content,
+            },
         },
-    );
+    )
+    .map(|suggestion| {
+        inputs
+            .aspect_ratio_sizing
+            .map(|sizing| {
+                if context.direction.is_row_axis() {
+                    sizing.constraints.constrain_width(suggestion)
+                } else {
+                    sizing.constraints.constrain_height(suggestion)
+                }
+            })
+            .unwrap_or(suggestion)
+    });
+    // A replaced item's automatic preferred main size is itself derived from
+    // its definite preferred cross size and ratio. In particular, an authored
+    // cross-axis `stretch` is not merely an additional minimum constraint on
+    // the intrinsic object: it establishes the replaced item's used content
+    // contribution before Flexbox compares content and transferred
+    // suggestions. Otherwise the replaced-element `min()` rule would retain
+    // the natural object size and defeat a larger stretch-fit cross size.
+    // <https://drafts.csswg.org/css-sizing-4/#stretch-fit-sizing> and
+    // <https://drafts.csswg.org/css-flexbox-1/#min-size-auto>.
+    let content_size_suggestion = if inputs.is_replaced && authored_stretch_fit_cross_size.is_some()
+    {
+        transferred_size_suggestion.unwrap_or(intrinsic_content_size_suggestion)
+    } else {
+        intrinsic_content_size_suggestion
+    };
     let selection = AutomaticFlexMinimum::from_suggestions(
         content_size_suggestion,
         transferred_size_suggestion,
@@ -695,6 +772,10 @@ pub(super) struct FlexMinSizeDimensionContext<'a> {
     pub(super) direction: FlexDirection,
     pub(super) automatic_minimum_inputs: Option<FlexAutomaticMinimumInputs>,
     pub(super) available_cross_size: Option<FlexCrossSize>,
+    /// The cross-axis stretch-fit context for an authored `width`/`height:
+    /// `stretch`. This is distinct from `stretched_cross_size`, which records
+    /// Flexbox self-alignment stretch after line sizing.
+    pub(super) cross_stretch: FlexStretchFitContext,
     pub(super) stretched_cross_size: Option<FlexCrossSize>,
     pub(super) is_main_axis: bool,
     pub(super) overflow: css::Overflow,
@@ -1021,6 +1102,16 @@ impl FlexMainSizeProvenance {
     pub(super) fn permits_final_normal_flow_block_span(self) -> bool {
         matches!(self, Self::NormalFlowContent)
     }
+
+    /// Whether Flexbox 9.8 treats the resulting post-flexing main size as
+    /// definite for descendant percentage sizing.
+    /// <https://www.w3.org/TR/css-flexbox-1/#definite-sizes>
+    pub(super) fn is_definite(self) -> bool {
+        matches!(
+            self,
+            Self::AspectRatioTransfer | Self::MainSizeProperty | Self::DefiniteFlexBasis
+        )
+    }
 }
 
 /// A Taffy basis and the CSS sizing rule that produced it.
@@ -1058,6 +1149,16 @@ impl ResolvedFlexBasis {
             provenance: FlexMainSizeProvenance::DefiniteFlexBasis,
         }
     }
+
+    /// Reports definiteness independently of the scalar Taffy dimension.
+    ///
+    /// A basis transferred through a preferred aspect ratio is definite when
+    /// its determining cross size is definite, just like an authored definite
+    /// basis or a definite main-size property:
+    /// <https://www.w3.org/TR/css-flexbox-1/#definite-sizes>.
+    pub(super) fn is_definite(self) -> bool {
+        self.provenance.is_definite()
+    }
 }
 
 /// Computes the flex base-size transfer from a definite cross size.
@@ -1075,27 +1176,69 @@ fn aspect_ratio_transferred_flex_basis(
     stretched_cross_size: Option<FlexCrossSize>,
     preferred_aspect_ratio: Option<f32>,
 ) -> Option<LayoutLength> {
-    aspect_ratio_transferred_content_main_size_with_cross_constraints(
+    let transferred = aspect_ratio_transferred_content_main_size_with_cross_constraints(
         style,
         direction,
-        available_cross_size,
-        stretched_cross_size,
-        None,
         preferred_aspect_ratio,
-        FlexCrossIntrinsicContributions {
-            min_content: if direction.is_row_axis() {
-                estimate.min_height
-            } else {
-                estimate.min_width
-            },
-            max_content: if direction.is_row_axis() {
-                estimate.content_height
-            } else {
-                estimate.content_width
+        FlexCrossSizeSuggestionContext {
+            available_cross_size,
+            authored_stretch_fit_cross_size: None,
+            stretched_cross_size,
+            automatic_preferred_cross_size: None,
+            intrinsic: FlexCrossIntrinsicContributions {
+                min_content: if direction.is_row_axis() {
+                    estimate.min_height
+                } else {
+                    estimate.min_width
+                },
+                max_content: if direction.is_row_axis() {
+                    estimate.content_height
+                } else {
+                    estimate.content_width
+                },
             },
         },
     )
-    .map(|size| flex_aspect_ratio_basis_from_content_box(style, size, direction))
+    .map(|size| {
+        estimate
+            .aspect_ratio_sizing
+            .map(|sizing| {
+                if direction.is_row_axis() {
+                    sizing.constraints.constrain_width(size)
+                } else {
+                    sizing.constraints.constrain_height(size)
+                }
+            })
+            .unwrap_or(size)
+    });
+    let transferred = transferred.or_else(|| {
+        let sizing = estimate.aspect_ratio_sizing?;
+        if !style.box_values.width.is_auto() || !style.box_values.height.is_auto() {
+            return None;
+        }
+        // Flexbox 9.2 Part E lays an auto/auto ratio item into its
+        // fit-content cross size while ignoring min/max constraints in the
+        // main axis. Apply only the authored cross-axis constraints here;
+        // using the fully transferred result would reflect `min-height` into
+        // a column item's fit-content width and inflate its flex base.
+        // <https://www.w3.org/TR/css-flexbox-1/#algo-main-item>
+        Some(if direction.is_row_axis() {
+            let cross = sizing
+                .authored_height_constraints
+                .constrain(sizing.intrinsic_height);
+            sizing.ratio.width_from_height(cross)
+        } else {
+            let cross = sizing
+                .authored_width_constraints
+                .constrain(sizing.intrinsic_width);
+            sizing.ratio.height_from_width(cross)
+        })
+    })?;
+    Some(flex_aspect_ratio_basis_from_content_box(
+        style,
+        transferred,
+        direction,
+    ))
 }
 
 /// Intrinsic cross-axis contributions used while resolving a transferred
@@ -1104,6 +1247,21 @@ fn aspect_ratio_transferred_flex_basis(
 pub(super) struct FlexCrossIntrinsicContributions {
     pub(super) min_content: ContentBoxLength,
     pub(super) max_content: ContentBoxLength,
+}
+
+/// Cross-axis inputs that can establish a Flexbox ratio transfer.
+///
+/// These suggestions are one conceptual unit: they all describe the item's
+/// used cross-size contribution before it transfers through the preferred
+/// aspect ratio. Keeping them together prevents a caller from accidentally
+/// pairing intrinsic contributions with an unrelated percentage basis.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct FlexCrossSizeSuggestionContext {
+    pub(super) available_cross_size: Option<FlexCrossSize>,
+    pub(super) authored_stretch_fit_cross_size: Option<ContentBoxLength>,
+    pub(super) stretched_cross_size: Option<FlexCrossSize>,
+    pub(super) automatic_preferred_cross_size: Option<ContentBoxLength>,
+    pub(super) intrinsic: FlexCrossIntrinsicContributions,
 }
 
 /// Computes a transferred main size after cross-axis min/max constraints.
@@ -1116,11 +1274,8 @@ pub(super) struct FlexCrossIntrinsicContributions {
 pub(super) fn aspect_ratio_transferred_content_main_size_with_cross_constraints(
     style: &ComputedStyle,
     direction: FlexDirection,
-    available_cross_size: Option<FlexCrossSize>,
-    stretched_cross_size: Option<FlexCrossSize>,
-    automatic_preferred_cross_size: Option<ContentBoxLength>,
     preferred_aspect_ratio: Option<f32>,
-    cross_intrinsic: FlexCrossIntrinsicContributions,
+    cross: FlexCrossSizeSuggestionContext,
 ) -> Option<ContentBoxLength> {
     let ratio = preferred_aspect_ratio?;
     let cross_non_content = if direction.is_row_axis() {
@@ -1131,22 +1286,24 @@ pub(super) fn aspect_ratio_transferred_content_main_size_with_cross_constraints(
     let specified_cross_size = if direction.is_row_axis() {
         used_content_box_height_or_auto_with_basis(
             style,
-            percentage_basis_from_points(available_cross_size.map(FlexCrossSize::points)),
+            percentage_basis_from_points(cross.available_cross_size.map(FlexCrossSize::points)),
             cross_non_content,
         )
     } else {
         used_content_box_width_or_auto_with_basis(
             style,
-            percentage_basis_from_points(available_cross_size.map(FlexCrossSize::points)),
+            percentage_basis_from_points(cross.available_cross_size.map(FlexCrossSize::points)),
             cross_non_content,
         )
     };
     let cross_content_size = specified_cross_size
+        .or(cross.authored_stretch_fit_cross_size)
         .or_else(|| {
-            stretched_cross_size
+            cross
+                .stretched_cross_size
                 .map(|size| content_box_pt((size.points() - cross_non_content.points()).max(0.0)))
         })
-        .or(automatic_preferred_cross_size)?;
+        .or(cross.automatic_preferred_cross_size)?;
 
     // The definite cross size used for aspect-ratio transfer is a used size:
     // it is constrained by the item's cross-axis min/max properties before it
@@ -1156,13 +1313,13 @@ pub(super) fn aspect_ratio_transferred_content_main_size_with_cross_constraints(
     // the flex base size through the preferred aspect ratio:
     // <https://www.w3.org/TR/css-flexbox-1/#algo-main-item>.
     let cross_percentage_basis =
-        percentage_basis_from_points(available_cross_size.map(FlexCrossSize::points));
+        percentage_basis_from_points(cross.available_cross_size.map(FlexCrossSize::points));
     let constrained_cross = if direction.is_row_axis() {
         constrain_height_with_intrinsic(
             style,
             cross_content_size,
-            cross_intrinsic.min_content,
-            cross_intrinsic.max_content,
+            cross.intrinsic.min_content,
+            cross.intrinsic.max_content,
             cross_percentage_basis,
             non_content_pt(style.padding.top + style.padding.bottom + vertical_border_width(style)),
         )
@@ -1170,8 +1327,8 @@ pub(super) fn aspect_ratio_transferred_content_main_size_with_cross_constraints(
         constrain_width_with_intrinsic(
             style,
             cross_content_size,
-            cross_intrinsic.min_content,
-            cross_intrinsic.max_content,
+            cross.intrinsic.min_content,
+            cross.intrinsic.max_content,
             cross_percentage_basis,
             non_content_pt(
                 style.padding.left + style.padding.right + horizontal_border_width(style),
@@ -1198,33 +1355,27 @@ pub(super) fn aspect_ratio_transferred_content_main_size_with_cross_constraints(
 pub(super) fn automatic_minimum_transferred_size_suggestion(
     style: &ComputedStyle,
     direction: FlexDirection,
-    available_cross_size: Option<FlexCrossSize>,
-    stretched_cross_size: Option<FlexCrossSize>,
-    automatic_preferred_cross_size: Option<ContentBoxLength>,
     preferred_aspect_ratio: Option<f32>,
-    cross_intrinsic: FlexCrossIntrinsicContributions,
+    cross: FlexCrossSizeSuggestionContext,
 ) -> Option<ContentBoxLength> {
     if let Some(transferred) = aspect_ratio_transferred_content_main_size_with_cross_constraints(
         style,
         direction,
-        available_cross_size,
-        stretched_cross_size,
-        automatic_preferred_cross_size,
         preferred_aspect_ratio,
-        cross_intrinsic,
+        cross,
     ) {
         return Some(transferred);
     }
 
     let ratio = preferred_aspect_ratio?;
     let percentage_basis =
-        percentage_basis_from_points(available_cross_size.map(FlexCrossSize::points));
+        percentage_basis_from_points(cross.available_cross_size.map(FlexCrossSize::points));
     let constrained_minimum_cross = if direction.is_row_axis() {
         constrain_height_with_intrinsic(
             style,
             content_box_pt(0.0),
-            cross_intrinsic.min_content,
-            cross_intrinsic.max_content,
+            cross.intrinsic.min_content,
+            cross.intrinsic.max_content,
             percentage_basis,
             non_content_pt(style.padding.top + style.padding.bottom + vertical_border_width(style)),
         )
@@ -1232,8 +1383,8 @@ pub(super) fn automatic_minimum_transferred_size_suggestion(
         constrain_width_with_intrinsic(
             style,
             content_box_pt(0.0),
-            cross_intrinsic.min_content,
-            cross_intrinsic.max_content,
+            cross.intrinsic.min_content,
+            cross.intrinsic.max_content,
             percentage_basis,
             non_content_pt(
                 style.padding.left + style.padding.right + horizontal_border_width(style),
@@ -1248,6 +1399,30 @@ pub(super) fn automatic_minimum_transferred_size_suggestion(
             ratio,
         )
     })
+}
+
+/// Resolves an authored cross-axis `stretch` preferred size for Flexbox's
+/// transferred-size suggestion.
+///
+/// This is intentionally separate from self-alignment stretch: the latter is
+/// established after flex-line sizing, whereas CSS Sizing's `stretch` value
+/// is itself a definite preferred cross size whenever its stretch-fit slot is
+/// definite.
+/// <https://drafts.csswg.org/css-sizing-4/#stretch-fit-sizing> and
+/// <https://drafts.csswg.org/css-flexbox-1/#min-size-auto>.
+fn authored_cross_stretch_fit_content_box_size(
+    style: &ComputedStyle,
+    direction: FlexDirection,
+    stretch: FlexStretchFitContext,
+) -> Option<ContentBoxLength> {
+    let cross_size = if direction.is_row_axis() {
+        &style.box_values.height
+    } else {
+        &style.box_values.width
+    };
+    matches!(cross_size, css::ComputedLengthPercentageOrAuto::Stretch)
+        .then(|| resolved_stretch_fit_content_box_size(stretch))
+        .flatten()
 }
 
 /// Return a replaced item's CSS automatic preferred size on Flexbox's
@@ -1338,6 +1513,7 @@ pub(super) fn flex_automatic_minimum_inputs(
         ),
         cross_intrinsic,
         preferred_aspect_ratio,
+        aspect_ratio_sizing: estimate.aspect_ratio_sizing,
         is_replaced,
         definite_preferred_content_size,
     }
@@ -1577,23 +1753,31 @@ pub(in crate::layout::flex) fn flex_aspect_ratio_transferred_content_main_size(
     direction: FlexDirection,
     ratio: f32,
 ) -> ContentBoxLength {
-    let uses_content_box = style.aspect_ratio.uses_content_box_for_non_replaced()
-        || style.box_sizing == BoxSizing::ContentBox;
-    if uses_content_box {
-        if direction.is_row_axis() {
-            content_box_pt(cross_content_size.points() * ratio)
-        } else {
-            content_box_pt(cross_content_size.points() / ratio)
-        }
+    let border_widths = used_border_widths(style);
+    let horizontal_non_content = non_content_pt(
+        style.padding.left + style.padding.right + border_widths.left + border_widths.right,
+    );
+    let vertical_non_content = non_content_pt(
+        style.padding.top + style.padding.bottom + border_widths.top + border_widths.bottom,
+    );
+    let calculation_box = if style.aspect_ratio.uses_content_box_for_non_replaced()
+        || style.box_sizing == BoxSizing::ContentBox
+    {
+        AspectRatioCalculationBox::ContentBox
     } else {
-        let cross_border_box =
-            cross_content_size.points() + cross_axis_extras(style, direction).points();
-        let main_border_box = if direction.is_row_axis() {
-            cross_border_box * ratio
-        } else {
-            cross_border_box / ratio
-        };
-        content_box_pt((main_border_box - main_axis_extras(style, direction).points()).max(0.0))
+        AspectRatioCalculationBox::BorderBox
+    };
+    let resolved = ResolvedAspectRatio::new(
+        ratio,
+        calculation_box,
+        horizontal_non_content,
+        vertical_non_content,
+    )
+    .expect("preferred aspect ratios are positive and finite");
+    if direction.is_row_axis() {
+        resolved.width_from_height(cross_content_size)
+    } else {
+        resolved.height_from_width(cross_content_size)
     }
 }
 
@@ -1603,15 +1787,6 @@ fn main_axis_extras(style: &ComputedStyle, direction: FlexDirection) -> NonConte
         style.padding.left + style.padding.right + border_widths.left + border_widths.right
     } else {
         style.padding.top + style.padding.bottom + border_widths.top + border_widths.bottom
-    })
-}
-
-fn cross_axis_extras(style: &ComputedStyle, direction: FlexDirection) -> NonContentLength {
-    let border_widths = used_border_widths(style);
-    non_content_pt(if direction.is_row_axis() {
-        style.padding.top + style.padding.bottom + border_widths.top + border_widths.bottom
-    } else {
-        style.padding.left + style.padding.right + border_widths.left + border_widths.right
     })
 }
 
@@ -2234,6 +2409,57 @@ mod tests {
             resolve_taffy_flex_basis(&transferred, &estimate, context).provenance,
             FlexMainSizeProvenance::AspectRatioTransfer,
         );
+        assert!(resolve_taffy_flex_basis(&transferred, &estimate, context).is_definite());
+    }
+
+    #[test]
+    fn auto_auto_ratio_column_basis_uses_fit_content_cross_and_ignores_main_minimum() {
+        let mut style = ComputedStyle::initial();
+        style.aspect_ratio = css::AspectRatio::from_ratio(1.0).unwrap();
+        let ratio = ResolvedAspectRatio::new(
+            1.0,
+            AspectRatioCalculationBox::ContentBox,
+            non_content_pt(0.0),
+            non_content_pt(0.0),
+        )
+        .unwrap();
+        let authored_width_constraints = AspectRatioAxisConstraints {
+            minimum: Some(content_box_pt(100.0)),
+            ..Default::default()
+        };
+        let authored_height_constraints = AspectRatioAxisConstraints {
+            minimum: Some(content_box_pt(200.0)),
+            ..Default::default()
+        };
+        let mut estimate = FlexItemEstimate::fixed(
+            PhysicalContentWidth::new(content_box_pt(100.0)),
+            PhysicalContentHeight::new(content_box_pt(100.0)),
+        );
+        estimate.set_aspect_ratio_sizing(FlexAspectRatioSizing {
+            ratio,
+            authored_width_constraints,
+            authored_height_constraints,
+            constraints: ResolvedAspectRatioConstraints::resolve(
+                ratio,
+                authored_width_constraints,
+                authored_height_constraints,
+            ),
+            intrinsic_width: content_box_pt(1.0),
+            intrinsic_height: content_box_pt(0.0),
+        });
+        let context = FlexBasisContext {
+            direction: FlexDirection::Column,
+            preferred_aspect_ratio: Some(1.0),
+            ..test_flex_basis_context()
+        };
+
+        let resolved = resolve_taffy_flex_basis(&style, &estimate, context);
+
+        assert_eq!(resolved.dimension, taffy_layout::Dimension::length(100.0));
+        assert_eq!(
+            resolved.provenance,
+            FlexMainSizeProvenance::AspectRatioTransfer
+        );
     }
 
     #[test]
@@ -2246,13 +2472,16 @@ mod tests {
         let transferred = automatic_minimum_transferred_size_suggestion(
             &style,
             FlexDirection::Row,
-            None,
-            None,
-            None,
             Some(1.0),
-            FlexCrossIntrinsicContributions {
-                min_content: content_box_pt(10.0),
-                max_content: content_box_pt(100.0),
+            FlexCrossSizeSuggestionContext {
+                available_cross_size: None,
+                authored_stretch_fit_cross_size: None,
+                stretched_cross_size: None,
+                automatic_preferred_cross_size: None,
+                intrinsic: FlexCrossIntrinsicContributions {
+                    min_content: content_box_pt(10.0),
+                    max_content: content_box_pt(100.0),
+                },
             },
         )
         .expect("a definite cross minimum supplies a transferred suggestion");
@@ -2269,13 +2498,16 @@ mod tests {
         let column_transferred = automatic_minimum_transferred_size_suggestion(
             &column_style,
             FlexDirection::Column,
-            None,
-            None,
-            Some(content_box_pt(225.0)),
             Some(1.0),
-            FlexCrossIntrinsicContributions {
-                min_content: content_box_pt(0.0),
-                max_content: content_box_pt(225.0),
+            FlexCrossSizeSuggestionContext {
+                available_cross_size: None,
+                authored_stretch_fit_cross_size: None,
+                stretched_cross_size: None,
+                automatic_preferred_cross_size: Some(content_box_pt(225.0)),
+                intrinsic: FlexCrossIntrinsicContributions {
+                    min_content: content_box_pt(0.0),
+                    max_content: content_box_pt(225.0),
+                },
             },
         )
         .expect("automatic width transfers through max-width");
@@ -2288,13 +2520,16 @@ mod tests {
         let row_transferred = automatic_minimum_transferred_size_suggestion(
             &row_style,
             FlexDirection::Row,
-            None,
-            None,
-            Some(content_box_pt(225.0)),
             Some(1.0),
-            FlexCrossIntrinsicContributions {
-                min_content: content_box_pt(0.0),
-                max_content: content_box_pt(225.0),
+            FlexCrossSizeSuggestionContext {
+                available_cross_size: None,
+                authored_stretch_fit_cross_size: None,
+                stretched_cross_size: None,
+                automatic_preferred_cross_size: Some(content_box_pt(225.0)),
+                intrinsic: FlexCrossIntrinsicContributions {
+                    min_content: content_box_pt(0.0),
+                    max_content: content_box_pt(225.0),
+                },
             },
         )
         .expect("automatic height transfers through max-height");
@@ -2316,6 +2551,7 @@ mod tests {
                 max_content: content_box_pt(225.0),
             },
             preferred_aspect_ratio: Some(1.0),
+            aspect_ratio_sizing: None,
             is_replaced: true,
             definite_preferred_content_size: None,
         };
@@ -2326,6 +2562,12 @@ mod tests {
                 direction: FlexDirection::Row,
                 automatic_minimum_inputs: Some(inputs),
                 available_cross_size: None,
+                cross_stretch: FlexStretchFitContext {
+                    available_margin_box_size: None,
+                    margin_size: layout_pt(0.0),
+                    non_content_size: non_content_pt(0.0),
+                    box_sizing: BoxSizing::ContentBox,
+                },
                 stretched_cross_size: None,
                 is_main_axis: true,
                 overflow: flex_item_main_axis_overflow(&style, FlexDirection::Row),
@@ -2365,6 +2607,7 @@ mod tests {
                 max_content: content_box_pt(0.0),
             },
             preferred_aspect_ratio: None,
+            aspect_ratio_sizing: None,
             is_replaced: true,
             definite_preferred_content_size: None,
         };
@@ -2375,6 +2618,12 @@ mod tests {
                 direction: FlexDirection::Row,
                 automatic_minimum_inputs: Some(inputs),
                 available_cross_size: None,
+                cross_stretch: FlexStretchFitContext {
+                    available_margin_box_size: None,
+                    margin_size: layout_pt(0.0),
+                    non_content_size: non_content_pt(0.0),
+                    box_sizing: BoxSizing::ContentBox,
+                },
                 stretched_cross_size: None,
                 is_main_axis: true,
                 overflow: flex_item_main_axis_overflow(&style, FlexDirection::Row),
@@ -2407,6 +2656,7 @@ mod tests {
                 max_content: content_box_pt(0.0),
             },
             preferred_aspect_ratio: None,
+            aspect_ratio_sizing: None,
             is_replaced: true,
             definite_preferred_content_size: None,
         };
@@ -2415,6 +2665,12 @@ mod tests {
             direction: FlexDirection::Column,
             automatic_minimum_inputs: Some(inputs),
             available_cross_size: None,
+            cross_stretch: FlexStretchFitContext {
+                available_margin_box_size: None,
+                margin_size: layout_pt(0.0),
+                non_content_size: non_content_pt(0.0),
+                box_sizing: BoxSizing::ContentBox,
+            },
             stretched_cross_size: None,
             is_main_axis: true,
             overflow: flex_item_main_axis_overflow(&style, FlexDirection::Column),

@@ -89,6 +89,33 @@ async fn rtl_row_justify_content_left_uses_the_physical_left_edge() {
 }
 
 #[tokio::test]
+async fn vertical_rl_inline_flex_central_baseline_matches_empty_inline_block_line_extent() {
+    let document = Html::from_string(
+        "<style>@page { size: 140px 140px; margin: 0 }\
+         body { margin: 0 }\
+         #container { width: 100px; height: 100px; line-height: 0; writing-mode: vertical-rl; background: rgb(255 0 0) }\
+         #inline-block { display: inline-block; width: 100px; height: 50px; background: rgb(0 0 255) }\
+         #inline-flex { display: inline-flex }\
+         #inline-flex > div { width: 100px; height: 50px; background: rgb(0 128 0) }\
+         </style><div id=container><span id=inline-block></span><span id=inline-flex><div></div></span></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let container = page_rect_with_fill(page, CssColor::new(255, 0, 0));
+    let inline_block = page_rect_with_fill(page, CssColor::new(0, 0, 255));
+    let inline_flex = page_rect_with_fill(page, CssColor::new(0, 128, 0));
+
+    assert_eq!(container.width(), 75.0);
+    assert_eq!(inline_block.width(), 75.0);
+    assert_eq!(inline_flex.width(), 75.0);
+    assert_eq!(inline_block.x(), container.x());
+    assert_eq!(inline_flex.x(), container.x());
+}
+
+#[tokio::test]
 async fn static_flex_and_grid_items_paint_after_container_decorations() {
     for layout in ["flex", "grid"] {
         let document = Html::from_string(format!(
@@ -2572,7 +2599,7 @@ async fn baseline_aligned_row_items_use_nested_wrap_reverse_startmost_line_basel
     let nested_startmost = page
         .lines()
         .iter()
-        .find(|line| line.text == "A")
+        .find(|line| line.text == "B")
         .expect("nested wrap-reverse startmost line baseline participant should render");
     let peer = page
         .lines()
@@ -2802,7 +2829,7 @@ async fn last_baseline_aligned_row_items_use_nested_wrap_reverse_endmost_line_ba
     let nested_endmost = page
         .lines()
         .iter()
-        .find(|line| line.text == "B")
+        .find(|line| line.text == "A")
         .expect("nested wrap-reverse endmost line baseline participant should render");
     let peer = page
         .lines()
@@ -3034,7 +3061,7 @@ async fn baseline_aligned_vertical_row_items_use_nested_wrap_reverse_exported_ba
     let nested_first = page
         .lines()
         .iter()
-        .find(|line| line.text == "A")
+        .find(|line| line.text == "B")
         .expect("nested vertical wrap-reverse first baseline participant should render");
     let peer = page
         .lines()
@@ -3067,7 +3094,7 @@ async fn last_baseline_aligned_vertical_row_items_use_nested_wrap_reverse_export
     let nested_last = page
         .lines()
         .iter()
-        .find(|line| line.text == "B")
+        .find(|line| line.text == "A")
         .expect("nested vertical wrap-reverse last baseline participant should render");
     let peer = page
         .lines()
@@ -3099,7 +3126,7 @@ async fn baseline_aligned_vertical_row_items_use_auto_width_nested_wrap_reverse_
 
     let page = &document.pages[0];
     let nested_first =
-        page.lines().iter().find(|line| line.text == "A").expect(
+        page.lines().iter().find(|line| line.text == "B").expect(
             "auto-width nested vertical wrap-reverse first baseline participant should render",
         );
     let peer = page
@@ -3132,7 +3159,7 @@ async fn last_baseline_aligned_vertical_row_items_use_auto_width_nested_wrap_rev
 
     let page = &document.pages[0];
     let nested_last =
-        page.lines().iter().find(|line| line.text == "B").expect(
+        page.lines().iter().find(|line| line.text == "A").expect(
             "auto-width nested vertical wrap-reverse last baseline participant should render",
         );
     let peer = page
@@ -3296,7 +3323,7 @@ async fn baseline_aligned_vertical_row_items_use_indefinite_percentage_width_nes
     .unwrap();
 
     let page = &document.pages[0];
-    let nested_first = page.lines().iter().find(|line| line.text == "A").expect(
+    let nested_first = page.lines().iter().find(|line| line.text == "B").expect(
         "indefinite percentage-width nested vertical wrap-reverse first baseline participant should render",
     );
     let peer = page
@@ -3328,7 +3355,7 @@ async fn last_baseline_aligned_vertical_row_items_use_indefinite_percentage_widt
     .unwrap();
 
     let page = &document.pages[0];
-    let nested_last = page.lines().iter().find(|line| line.text == "B").expect(
+    let nested_last = page.lines().iter().find(|line| line.text == "A").expect(
         "indefinite percentage-width nested vertical wrap-reverse last baseline participant should render",
     );
     let peer = page
@@ -3360,7 +3387,7 @@ async fn baseline_aligned_vertical_row_items_use_percentage_width_nested_wrap_re
     .unwrap();
 
     let page = &document.pages[0];
-    let nested_first = page.lines().iter().find(|line| line.text == "A").expect(
+    let nested_first = page.lines().iter().find(|line| line.text == "B").expect(
         "percentage-width nested vertical wrap-reverse first baseline participant should render",
     );
     let peer = page
@@ -3392,7 +3419,7 @@ async fn last_baseline_aligned_vertical_row_items_use_percentage_width_nested_wr
     .unwrap();
 
     let page = &document.pages[0];
-    let nested_last = page.lines().iter().find(|line| line.text == "B").expect(
+    let nested_last = page.lines().iter().find(|line| line.text == "A").expect(
         "percentage-width nested vertical wrap-reverse last baseline participant should render",
     );
     let peer = page

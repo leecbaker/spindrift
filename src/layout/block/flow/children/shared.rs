@@ -1,26 +1,32 @@
 use super::*;
 
-/// The physical constraints exported to one normal-flow child by a vertical
-/// principal flow.
+/// The physical placement exported to one normal-flow child by a vertical
+/// containing flow.
 ///
 /// The legacy block traversal stores a physical top-to-bottom cursor, whereas
-/// a vertical principal flow keeps its inline origin on that axis and advances
-/// its children through the physical horizontal block track.  Keeping those
+/// a vertical containing flow keeps its inline origin on that axis and
+/// advances its children through the physical horizontal block track. Keeping those
 /// values together prevents physical page width from being used as an inline
 /// percentage basis, or a vertical cursor from being advanced as though it
 /// were the logical block cursor.
 ///
-/// <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
+/// This representation is used both by the document's principal vertical
+/// flow and by nested orthogonal block formatting contexts. It keeps child
+/// logical geometry separate from the outer fragmentainer's physical block
+/// consumption, as required by Writing Modes and CSS Fragmentation.
+///
+/// <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
 /// <https://www.w3.org/TR/css-writing-modes-4/#logical-to-physical>
+/// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(in crate::layout) struct PrincipalVerticalChildPlacement {
+pub(in crate::layout) struct OrthogonalBlockPlacement {
     page_inline_origin: PageTopBlockPosition,
     horizontal_block_track: PageInlineSpan,
     logical_inline_percentage_basis: LogicalInlineContentSize,
     block_start: PhysicalSide,
 }
 
-impl PrincipalVerticalChildPlacement {
+impl OrthogonalBlockPlacement {
     pub(in crate::layout) fn new(
         writing_mode: WritingMode,
         direction: Direction,
@@ -78,7 +84,6 @@ impl PrincipalVerticalChildPlacement {
         }
     }
 
-    #[cfg(test)]
     pub(in crate::layout) fn child_block_start_margin(self, child_style: &ComputedStyle) -> f32 {
         match self.block_start {
             PhysicalSide::Left => child_style.margin.left,
@@ -89,12 +94,32 @@ impl PrincipalVerticalChildPlacement {
         }
     }
 
-    pub(in crate::layout) fn track_after_committed_child(
+    /// Return the child's complete signed margin-box contribution on the
+    /// containing flow's logical block axis.
+    ///
+    /// The horizontal track starts at the margin edge, so advancing only by
+    /// the border box and block-end margin would apply the next child's
+    /// block-start margin at the previous child's border edge. Keeping the
+    /// complete contribution typed prevents that duplicated-origin error.
+    /// <https://www.w3.org/TR/css-writing-modes-4/#logical-to-physical>
+    /// <https://www.w3.org/TR/CSS22/box.html#margin-properties>
+    pub(in crate::layout) fn child_margin_box_block_extent(
         self,
         child_border_box_block_span: BorderBoxLength,
-        child_block_end_margin: f32,
+        child_style: &ComputedStyle,
+    ) -> MarginBoxLength {
+        margin_box_pt(
+            self.child_block_start_margin(child_style)
+                + child_border_box_block_span.points()
+                + self.child_block_end_margin(child_style),
+        )
+    }
+
+    pub(in crate::layout) fn track_after_committed_child(
+        self,
+        child_margin_box_block_extent: MarginBoxLength,
     ) -> PageInlineSpan {
-        let advance = (child_border_box_block_span.points() + child_block_end_margin).max(0.0);
+        let advance = child_margin_box_block_extent.points().max(0.0);
         match self.block_start {
             PhysicalSide::Left => PageInlineSpan::from_edges(
                 (self.horizontal_block_track.left_x() + advance)
@@ -114,8 +139,8 @@ impl PrincipalVerticalChildPlacement {
 }
 
 impl<'a> LayoutBuilder<'a> {
-    /// Selects the physical page-inline origin for a direct child of the
-    /// principal vertical root flow.
+    /// Selects the physical inline origin for direct children of a vertical
+    /// containing flow.
     ///
     /// The document-canvas source supplies the root's used principal flow.
     /// A `sideways-lr` or bottom-to-top vertical inline axis therefore starts
@@ -126,18 +151,21 @@ impl<'a> LayoutBuilder<'a> {
     /// containing-block coordinate systems.
     /// <https://drafts.csswg.org/css-writing-modes-4/#principal-flow>
     /// <https://drafts.csswg.org/css-writing-modes-4/#logical-to-physical>
-    pub(in crate::layout) fn principal_vertical_child_inline_origin(
+    pub(in crate::layout) fn vertical_child_inline_origin(
         &self,
         parent: &Element,
         parent_writing_mode: WritingMode,
         parent_direction: Direction,
     ) -> PageTopBlockPosition {
-        if self.element_supplies_document_principal_flow(parent)
-            && inline_start_side(parent_writing_mode, parent_direction) == PhysicalSide::Bottom
-        {
+        if inline_start_side(parent_writing_mode, parent_direction) != PhysicalSide::Bottom {
+            return PageTopBlockPosition::new(self.cursor_y);
+        }
+        if self.element_supplies_document_principal_flow(parent) {
             PageTopBlockPosition::new(self.page_bottom())
         } else {
-            PageTopBlockPosition::new(self.cursor_y)
+            PageTopBlockPosition::new(
+                self.cursor_y - self.current_content_logical_inline_size().max(0.0),
+            )
         }
     }
 
@@ -148,7 +176,7 @@ impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn replace_direct_block_layout_constraint(
         &mut self,
         element: &Element,
-        placement: Option<PrincipalVerticalChildPlacement>,
+        placement: Option<OrthogonalBlockPlacement>,
     ) -> Option<DirectBlockLayoutConstraint> {
         std::mem::replace(
             &mut self.direct_block_layout_constraint,
@@ -184,10 +212,10 @@ mod tests {
     #[test]
     fn vertical_principal_child_placement_projects_inline_and_block_axes() {
         for (writing_mode, expected_left, expected_right) in [
-            (WritingMode::VerticalRl, 20.0, 135.0),
-            (WritingMode::VerticalLr, 65.0, 180.0),
+            (WritingMode::VerticalRl, 20.0, 123.0),
+            (WritingMode::VerticalLr, 77.0, 180.0),
         ] {
-            let placement = PrincipalVerticalChildPlacement::new(
+            let placement = OrthogonalBlockPlacement::new(
                 writing_mode,
                 Direction::Ltr,
                 PageTopBlockPosition::new(260.0),
@@ -237,13 +265,15 @@ mod tests {
                 expected_end_margin
             );
 
-            let remaining = placement.track_after_committed_child(border_box_pt(40.0), 5.0);
+            let remaining = placement.track_after_committed_child(
+                placement.child_margin_box_block_extent(border_box_pt(40.0), &child_style),
+            );
             assert_eq!(remaining.left_x(), expected_left);
             assert_eq!(remaining.right_x(), expected_right);
         }
 
         assert!(
-            PrincipalVerticalChildPlacement::new(
+            OrthogonalBlockPlacement::new(
                 WritingMode::HorizontalTb,
                 Direction::Ltr,
                 PageTopBlockPosition::new(260.0),
@@ -311,8 +341,9 @@ impl BlockEndMarginTrim {
 
 #[cfg(test)]
 mod block_end_margin_trim_tests {
-    use super::*;
     use std::cell::Cell;
+
+    use super::*;
 
     #[test]
     fn later_sibling_query_is_evaluated_only_for_a_trimmed_in_flow_block_child() {
@@ -415,7 +446,9 @@ impl<'a> LayoutBuilder<'a> {
                 baseline_shift: 0.0,
                 visual_offset: InlineVisualOffset::zero(),
                 block_style,
-                propagated_decoration_layers: block_style.text_decoration_layers.clone(),
+                propagated_decoration_layers: block_style
+                    .text_decoration_origins
+                    .effective_layers_vec(),
             },
             &mut items,
         );
@@ -716,13 +749,13 @@ impl<'a> LayoutBuilder<'a> {
         }
 
         let snapshot = replay.snapshot();
-        if snapshot.pages.len() != self.pages.len()
-            || snapshot.float_contexts.len() != self.float_contexts.len()
+        if snapshot.page_count() != self.pages.len()
+            || snapshot.float_contexts().len() != self.float_contexts.len()
         {
             return AdjoiningFloatReplaySeparation::IndependentFormattingContext;
         }
 
-        let Some(snapshot_context) = snapshot.float_contexts.last() else {
+        let Some(snapshot_context) = snapshot.float_contexts().last() else {
             return AdjoiningFloatReplaySeparation::IndependentFormattingContext;
         };
         let Some(current_context) = self.float_contexts.last() else {
@@ -737,8 +770,10 @@ impl<'a> LayoutBuilder<'a> {
                 .filter(|shape| {
                     shape.side.matches_clear(
                         child_style.clear,
-                        child_style.writing_mode,
-                        child_style.direction,
+                        FloatPlacementAxes::new(
+                            snapshot.containing_block_writing_mode(),
+                            snapshot.containing_block_direction(),
+                        ),
                     )
                 })
                 .map(|shape| shape.margin_box_block_span().bottom_y())
@@ -753,13 +788,13 @@ impl<'a> LayoutBuilder<'a> {
             return AdjoiningFloatReplaySeparation::None;
         }
 
-        if snapshot.containing_block_writing_mode != WritingMode::HorizontalTb
+        if snapshot.containing_block_writing_mode() != WritingMode::HorizontalTb
             || child_style.writing_mode != WritingMode::HorizontalTb
         {
             return AdjoiningFloatReplaySeparation::IndependentFormattingContext;
         }
 
-        let delta_y = replay_origin_y - snapshot.cursor_y;
+        let delta_y = replay_origin_y - snapshot.cursor_y();
         let mut replayed_context = snapshot_context.clone();
         replayed_context.shapes.extend(
             current_context.shapes[snapshot_context.shapes.len()..]
@@ -768,16 +803,18 @@ impl<'a> LayoutBuilder<'a> {
                 .map(|shape| shape.translated_block(layout_pt(delta_y))),
         );
 
-        let containing_left = snapshot.content_left;
-        let containing_right = snapshot.content_right;
+        let containing_left = snapshot.content_left();
+        let containing_right = snapshot.content_right();
         let containing_inline_size = (containing_right - containing_left).max(0.0);
-        let page_index = snapshot.pages.len();
+        let page_index = snapshot.page_count();
         let placement = replayed_context.avoiding_bfc_root_position(
             page_index,
             PageTopBlockPosition::new(replay_origin_y),
             child_style.clear,
-            child_style.writing_mode,
-            child_style.direction,
+            FloatPlacementAxes::new(
+                snapshot.containing_block_writing_mode(),
+                snapshot.containing_block_direction(),
+            ),
             containing_left,
             containing_right,
             |band, _candidate_top| {

@@ -655,6 +655,15 @@ pub(in crate::layout::flex) enum FlexBaselineSet {
     Last,
 }
 
+impl FlexBaselineSet {
+    pub(in crate::layout::flex) fn opposite(self) -> Self {
+        match self {
+            Self::First => Self::Last,
+            Self::Last => Self::First,
+        }
+    }
+}
+
 /// The origin of an item baseline used for flex baseline alignment.
 ///
 /// Keeping this distinction through final placement makes it explicit that a

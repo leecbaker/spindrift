@@ -1,9 +1,12 @@
-use super::*;
-use crate::css::CounterStyleRangeInterval;
-use crate::text::is_css_preserved_document_space;
-use icu_segmenter::GraphemeClusterSegmenter;
 use std::collections::HashSet;
 use std::rc::Rc;
+
+use icu_segmenter::GraphemeClusterSegmenter;
+
+use super::*;
+use crate::css::CounterStyleRangeInterval;
+use crate::layout::assets::DocumentPageIndex;
+use crate::text::is_css_preserved_document_space;
 
 /// The writing context needed by predefined styles whose representation
 /// depends on the element's inline and block directions.
@@ -109,21 +112,39 @@ impl<'a> LayoutBuilder<'a> {
             .as_deref()
             .cloned()
             .unwrap_or_else(|| style.clone());
-        let planned_stacks = self
-            .counter_plan
-            .values_at_origin
-            .get(&CounterOriginKey::new(
-                element,
-                box_tree::CounterEventSource::Marker,
-            ))
-            .or_else(|| {
+        let planned_stacks = match style.marker_counter_origin {
+            css::MarkerCounterOrigin::Principal => self
+                .counter_plan
+                .values_at_origin
+                .get(&CounterOriginKey::new(
+                    element,
+                    box_tree::CounterEventSource::Marker,
+                ))
+                .or_else(|| {
+                    self.counter_plan
+                        .values_at_origin
+                        .get(&CounterOriginKey::new(
+                            element,
+                            box_tree::CounterEventSource::Principal,
+                        ))
+                }),
+            css::MarkerCounterOrigin::Before => {
                 self.counter_plan
                     .values_at_origin
                     .get(&CounterOriginKey::new(
                         element,
-                        box_tree::CounterEventSource::Principal,
+                        box_tree::CounterEventSource::Before,
                     ))
-            });
+            }
+            css::MarkerCounterOrigin::After => {
+                self.counter_plan
+                    .values_at_origin
+                    .get(&CounterOriginKey::new(
+                        element,
+                        box_tree::CounterEventSource::After,
+                    ))
+            }
+        };
         let ordinal = planned_stacks
             .and_then(|stacks| stacks.get(LIST_ITEM_COUNTER_NAME))
             .and_then(|values| values.last())
@@ -329,7 +350,7 @@ impl<'a> LayoutBuilder<'a> {
                     ),
                     alphabetic_baseline: fallback_alphabetic_baseline,
                 },
-                painted: false,
+                paint: DeferredOutsideMarkerPaintState::AwaitingAnchor,
             });
         true
     }
@@ -340,11 +361,81 @@ impl<'a> LayoutBuilder<'a> {
         let Some(pending) = self.pending_outside_marker_anchors.pop() else {
             return;
         };
-        if pending.painted {
-            return;
+        let paint = match pending.paint {
+            DeferredOutsideMarkerPaintState::Resolved(paint) => *paint,
+            DeferredOutsideMarkerPaintState::PaintedInPlace => return,
+            DeferredOutsideMarkerPaintState::AwaitingAnchor => {
+                let anchor = self.resolve_float_adjacent_outside_marker_fallback(pending.fallback);
+                let paint = self.capture_outside_marker_paint(
+                    &pending.marker,
+                    &pending.list_item_style,
+                    anchor,
+                );
+                self.commit_deferred_outside_marker_paint(paint);
+                return;
+            }
+            DeferredOutsideMarkerPaintState::Capturing => {
+                debug_assert!(
+                    false,
+                    "outside marker capture must complete before finalization"
+                );
+                return;
+            }
+        };
+        self.commit_deferred_outside_marker_paint(paint);
+    }
+
+    /// Paint an outside marker into an isolated fragment at the anchor line,
+    /// then restore the active descendant paint tree.
+    ///
+    /// An outside marker is the list item's first generated child. A nested
+    /// relatively positioned block may expose the first principal line, but
+    /// must not capture the marker in its own auto-level pseudo stacking
+    /// context. The owner commits this fragment only after descendant layout
+    /// completes.
+    /// <https://drafts.csswg.org/css-lists-3/#markers>
+    /// <https://www.w3.org/TR/CSS22/zindex.html>
+    fn capture_outside_marker_paint(
+        &mut self,
+        marker: &ListMarker,
+        style: &ComputedStyle,
+        anchor: OutsideMarkerAnchor,
+    ) -> ResolvedOutsideMarkerPaint {
+        let page = DocumentPageIndex::new(self.pages.len());
+        let checkpoint = self.current_page.paint_checkpoint();
+        self.paint_outside_marker(marker, style, anchor);
+        let fragment = self.current_page.take_paint_fragment_since(checkpoint);
+        ResolvedOutsideMarkerPaint {
+            marker: marker.clone(),
+            list_item_style: style.clone(),
+            anchor,
+            page,
+            fragment,
         }
-        let anchor = self.resolve_float_adjacent_outside_marker_fallback(pending.fallback);
-        self.paint_outside_marker(&pending.marker, &pending.list_item_style, anchor);
+    }
+
+    /// Attach a marker fragment to the list item's page-level paint owner.
+    ///
+    /// The target can be a page already closed by descendant fragmentation;
+    /// that page still contains the enclosing list item's unfinalized paint
+    /// suffix, so this remains part of the owner's later fragment capture.
+    /// CSS Appendix E's paint bands then put owner inline paint below the
+    /// relatively positioned descendant's auto/zero stacking context.
+    /// <https://www.w3.org/TR/CSS22/zindex.html>
+    fn commit_deferred_outside_marker_paint(&mut self, paint: ResolvedOutsideMarkerPaint) {
+        let page_index = paint.page.get();
+        if page_index < self.pages.len() {
+            self.pages[page_index]
+                .append_paint_fragment_owned(paint.fragment, PaintTranslation::identity());
+        } else {
+            debug_assert_eq!(
+                page_index,
+                self.pages.len(),
+                "a deferred marker must target a materialized document page"
+            );
+            self.current_page
+                .append_paint_fragment_owned(paint.fragment, PaintTranslation::identity());
+        }
     }
 
     pub(in crate::layout) fn outside_marker_anchor_is_pending(&self, marker: &ListMarker) -> bool {
@@ -407,13 +498,19 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         formatted_line_block_start: PageTopBlockPosition,
         baseline_offset: LayoutLength,
+        paint_owner: OutsideMarkerPaintOwner,
     ) {
         let alphabetic_baseline = formatted_line_block_start.toward_block_end(baseline_offset);
         let anchors = self
             .pending_outside_marker_anchors
             .iter()
             .enumerate()
-            .filter(|(_, pending)| !pending.painted)
+            .filter(|(_, pending)| {
+                matches!(
+                    pending.paint,
+                    DeferredOutsideMarkerPaintState::AwaitingAnchor
+                )
+            })
             .map(|(index, pending)| {
                 (
                     index,
@@ -431,8 +528,17 @@ impl<'a> LayoutBuilder<'a> {
             // Mark this before marker-line layout re-enters the shared line
             // painter. The marker's own generated line is not the list
             // item's principal line and must not recursively re-anchor it.
-            self.pending_outside_marker_anchors.mark_painted(index);
-            self.paint_outside_marker(&marker, &list_item_style, anchor);
+            if paint_owner == OutsideMarkerPaintOwner::ListItem {
+                self.pending_outside_marker_anchors
+                    .begin_paint_capture(index);
+                let paint = self.capture_outside_marker_paint(&marker, &list_item_style, anchor);
+                self.pending_outside_marker_anchors
+                    .finish_paint_capture(index, paint);
+            } else {
+                self.pending_outside_marker_anchors
+                    .mark_painted_in_place(index);
+                self.paint_outside_marker(&marker, &list_item_style, anchor);
+            }
         }
     }
 

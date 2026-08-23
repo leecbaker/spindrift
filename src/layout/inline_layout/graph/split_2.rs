@@ -1,9 +1,12 @@
+use std::rc::Rc;
+
 use super::*;
-use crate::text::character_is_css_other_space_separator;
-use crate::text::{Uax14BoundaryProtection, uax14_atomic_boundary_protection};
+use crate::text::{
+    Uax14BoundaryProtection, character_is_css_other_space_separator,
+    uax14_atomic_boundary_protection,
+};
 #[cfg(test)]
 use crate::text::{keep_all_suppresses_break_between, manual_suppresses_break_between};
-use std::rc::Rc;
 
 /// Reusable temporary storage for one inline opportunity-graph build.
 ///
@@ -142,12 +145,12 @@ pub(in crate::layout) fn remeasure_materialized_item(
             fragment.style().line_height,
         )
         .map(Rc::new);
-    item.width = item
+    let base_advance = item
         .shaped
         .as_deref()
         .map(ShapedInlineLine::advance_width)
         .unwrap_or(0.0);
-    fragment.mark_terminal_tracking_normalized();
+    item.advance.replace_base_points(base_advance);
 }
 
 pub(in crate::layout) fn text_for_measured_items(items: &[MeasuredInlineItem]) -> String {
@@ -186,6 +189,15 @@ pub(in crate::layout) fn inline_break_opportunities_for_runs(
             opportunities.push(opportunity);
         }
     }
+    // A `pre-wrap` sequence remains one CSS Text whitespace sequence through
+    // transparent inline-box edges. The ordinary boundary builder only sees
+    // adjacent graph runs, so normalize its candidates after collection and
+    // then add the single legal boundary after each complete sequence.
+    // <https://drafts.csswg.org/css-text-3/#white-space-phase-2>
+    opportunities.retain(|opportunity| {
+        !pre_wrap_preserved_space_follows_graph_position(runs, opportunity.position)
+    });
+    append_pre_wrap_preserved_space_sequence_break_opportunities(runs, &mut opportunities);
     if !runs.is_empty() {
         opportunities.push(InlineBreakOpportunity {
             position: InlineGraphPosition::at_run_start(runs.len()),
@@ -207,6 +219,101 @@ pub(in crate::layout) fn inline_break_opportunities_for_runs(
             && left.availability == right.availability
     });
     opportunities
+}
+
+/// Return whether a logical `pre-wrap` preserved-space sequence begins at a
+/// graph position, looking through transparent inline edges.
+fn pre_wrap_preserved_space_follows_graph_position(
+    runs: &[InlineParagraphRun],
+    position: InlineGraphPosition,
+) -> bool {
+    let mut run_index = position.run_index;
+    if let Some(InlineParagraphRun {
+        item: InlineLineItem::Fragment(fragment),
+        ..
+    }) = runs.get(run_index)
+        && position.byte_offset > 0
+        && position.byte_offset < fragment.text().len()
+    {
+        return fragment.style().white_space == WhiteSpace::PreWrap
+            && fragment
+                .text()
+                .get(position.byte_offset..)
+                .and_then(|suffix| suffix.chars().next())
+                .is_some_and(is_css_preserved_document_space);
+    }
+    if let Some(InlineParagraphRun {
+        item: InlineLineItem::Fragment(fragment),
+        ..
+    }) = runs.get(run_index)
+        && position.byte_offset == fragment.text().len()
+    {
+        run_index += 1;
+    }
+    while let Some(run) = runs.get(run_index) {
+        match &run.item {
+            InlineLineItem::Atom(_)
+                if inline_line_item_is_transparent_to_text_continuity(&run.item) =>
+            {
+                run_index += 1;
+            }
+            InlineLineItem::Fragment(fragment) => {
+                return fragment.style().white_space == WhiteSpace::PreWrap
+                    && fragment
+                        .text()
+                        .chars()
+                        .next()
+                        .is_some_and(is_css_preserved_document_space);
+            }
+            InlineLineItem::Atom(_) | InlineLineItem::Float(_) => return false,
+        }
+    }
+    false
+}
+
+/// Add the sole post-sequence break for each logical `pre-wrap` space run.
+///
+/// Graph box-edge atoms have no CSS Text content, so a run such as
+/// `text <span>   </span> next` must expose the break after the spaces even
+/// though its source position is before the span's end-edge marker.
+fn append_pre_wrap_preserved_space_sequence_break_opportunities(
+    runs: &[InlineParagraphRun],
+    opportunities: &mut Vec<InlineBreakOpportunity>,
+) {
+    for (run_index, run) in runs.iter().enumerate() {
+        let InlineLineItem::Fragment(fragment) = &run.item else {
+            continue;
+        };
+        if !inline_fragment_is_pre_wrap_hanging_space(fragment) {
+            continue;
+        }
+        let mut next = run_index + 1;
+        while runs
+            .get(next)
+            .is_some_and(|run| inline_line_item_is_transparent_to_text_continuity(&run.item))
+        {
+            next += 1;
+        }
+        if runs.get(next).is_some_and(|run| {
+            matches!(
+                &run.item,
+                InlineLineItem::Fragment(next_fragment)
+                    if inline_fragment_is_pre_wrap_hanging_space(next_fragment)
+            )
+        }) {
+            continue;
+        }
+        if next == runs.len() {
+            continue;
+        }
+        opportunities.push(InlineBreakOpportunity {
+            position: InlineGraphPosition::at_run_start(run_index + 1),
+            kind: InlineBreakKind::PreservedSpace,
+            availability: BreakAvailability::Ordinary,
+            whitespace_edge: SelectedWhitespaceEdge::PreWrapHang,
+            discretionary: None,
+        });
+    }
 }
 
 fn append_inline_break_opportunities_inside_run(
@@ -924,8 +1031,7 @@ fn inline_boundary_owner_allows_soft_wrap(
 ) -> bool {
     match (left, right) {
         (Some(left), Some(right)) => {
-            InlineTrackingScope::lowest_common(left.as_ref(), right.as_ref())
-                .boundary_policy()
+            InlineTrackingScope::common_boundary_policy(left.as_ref(), right.as_ref())
                 .allows_soft_wrap()
         }
         _ => fallback.allows_soft_wrap(),
@@ -938,8 +1044,7 @@ fn inline_fragment_boundary_owner_allows_soft_wrap(
 ) -> bool {
     match (previous.tracking_scope(), next.tracking_scope()) {
         (Some(left), Some(right)) => {
-            InlineTrackingScope::lowest_common(left.as_ref(), right.as_ref())
-                .boundary_policy()
+            InlineTrackingScope::common_boundary_policy(left.as_ref(), right.as_ref())
                 .allows_soft_wrap()
         }
         // Unit tests and synthetic consumers can build fragments directly,
@@ -1197,7 +1302,7 @@ mod tests {
     fn text_autospace_edge(style: &ComputedStyle) -> InlineAtom {
         InlineAtom::new(
             InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace(
-                InlineTextBoundarySpacing::new(layout_pt(0.0), false),
+                InlineTextBoundarySpacing::new(layout_pt(0.0)),
             )),
             style.clone(),
             None,
@@ -1495,6 +1600,53 @@ mod tests {
         );
         assert!(opportunities.iter().any(|opportunity| {
             opportunity.position == InlineGraphPosition::at_run_start(2)
+                && matches!(opportunity.kind, InlineBreakKind::PreservedSpace)
+                && opportunity.whitespace_edge == SelectedWhitespaceEdge::PreWrapHang
+        }));
+    }
+
+    #[test]
+    fn pre_wrap_space_sequence_crosses_transparent_inline_edges() {
+        let mut style = ComputedStyle::initial();
+        style.white_space = WhiteSpace::PreWrap;
+        let runs = vec![
+            InlineParagraphRun {
+                item: InlineLineItem::Fragment(fragment("one", style.clone())),
+                width: 0.0,
+                shaped: None,
+            },
+            InlineParagraphRun {
+                item: InlineLineItem::Atom(box_edge(&style)),
+                width: 0.0,
+                shaped: None,
+            },
+            InlineParagraphRun {
+                item: InlineLineItem::Fragment(fragment("  ", style.clone())),
+                width: 0.0,
+                shaped: None,
+            },
+            InlineParagraphRun {
+                item: InlineLineItem::Atom(box_edge(&style)),
+                width: 0.0,
+                shaped: None,
+            },
+            InlineParagraphRun {
+                item: InlineLineItem::Fragment(fragment("two", style.clone())),
+                width: 0.0,
+                shaped: None,
+            },
+        ];
+
+        let opportunities = inline_break_opportunities_for_runs(&runs, &style);
+        for boundary in [1, 2] {
+            assert!(
+                !opportunities.iter().any(|opportunity| opportunity.position
+                    == InlineGraphPosition::at_run_start(boundary)),
+                "pre-wrap spaces must stay with the preceding source through boundary {boundary}: {opportunities:?}"
+            );
+        }
+        assert!(opportunities.iter().any(|opportunity| {
+            opportunity.position == InlineGraphPosition::at_run_start(3)
                 && matches!(opportunity.kind, InlineBreakKind::PreservedSpace)
                 && opportunity.whitespace_edge == SelectedWhitespaceEdge::PreWrapHang
         }));

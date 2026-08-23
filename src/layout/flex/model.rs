@@ -1,3 +1,6 @@
+use std::num::NonZeroUsize;
+use std::ops::{Add, Deref, DerefMut, Sub};
+
 use super::*;
 use crate::document::paint::geometry::AxisSelectivePaintClip;
 use crate::layout::assets::FragmentainerOrdinal;
@@ -6,8 +9,6 @@ use crate::layout::baseline::{
     PhysicalTopBaselineAxis, PhysicalTopBaselineOffset,
 };
 use crate::layout::block::DefinitePhysicalContentHeight;
-use std::num::NonZeroUsize;
-use std::ops::{Add, Deref, DerefMut, Sub};
 
 /// A computed style after the flex formatting-context used-value boundary.
 ///
@@ -458,6 +459,40 @@ impl FlexItemReplayDimensions {
         PhysicalContentHeight::new(content_box_pt(self.height.points()))
     }
 
+    /// Convert the frozen physical border-box rectangle to the item's logical
+    /// inline content size at the replay boundary.
+    ///
+    /// Taffy returns a border box. Inline layout consumes a content-box
+    /// measure, so padding and borders must be removed exactly once before
+    /// projecting the physical axis through the item's writing mode. Keeping
+    /// this conversion on the typed replay record prevents a border-box width
+    /// from being silently relabeled as a logical inline content size.
+    /// <https://www.w3.org/TR/css-flexbox-1/#flex-items>
+    /// <https://www.w3.org/TR/css-writing-modes-4/#dimension-mapping>
+    /// <https://www.w3.org/TR/css-sizing-3/#box-sizing>
+    pub(super) fn logical_inline_content_size_for_replay(
+        self,
+        style: &ComputedStyle,
+    ) -> LogicalInlineContentSize {
+        let borders = used_border_widths(style);
+        let (border_box, extras) = if style.writing_mode.has_vertical_lines() {
+            (
+                self.border_box_height(),
+                non_content_pt(
+                    style.padding.top + style.padding.bottom + borders.top + borders.bottom,
+                ),
+            )
+        } else {
+            (
+                self.border_box_width(),
+                non_content_pt(
+                    style.padding.left + style.padding.right + borders.left + borders.right,
+                ),
+            )
+        };
+        LogicalInlineContentSize::new(border_box_to_content_box_length(border_box, extras))
+    }
+
     /// Project the final physical replay geometry onto the item's logical
     /// inline axis.
     ///
@@ -776,6 +811,10 @@ pub(super) enum FlexAvailableSizeSource {
     PostFlexingMainSize,
     DefinitePreferredMainSize,
     DefinitePreferredCrossSize,
+    /// An automatic axis resolved from a definite perpendicular size through
+    /// the box's preferred aspect ratio. CSS Sizing makes the result definite.
+    /// <https://drafts.csswg.org/css-sizing-4/#aspect-ratio-size-transfers>
+    AspectRatioDerived,
 }
 
 pub(super) type FlexAvailablePercentageBasis =
@@ -2281,12 +2320,27 @@ pub(in crate::layout::flex) struct FlexItemBaselineEstimate {
 /// reconciled flex lines and final item placement. Both preserve the same
 /// physical-axis invariant required by CSS Flexbox baseline export:
 /// <https://www.w3.org/TR/css-flexbox-1/#flex-baselines>.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub(in crate::layout) struct FlexContainerBaselineSets {
     pub(in crate::layout) vertical: FlexItemBaselinePair<FlexVerticalBaselineAxis>,
     // Parent inline layout projects this physical record only after its
     // writing mode selects a compatible logical block axis.
     pub(in crate::layout) horizontal: FlexItemBaselinePair<FlexHorizontalBaselineAxis>,
+    /// Named baseline represented by the vertical physical coordinates.
+    pub(in crate::layout) vertical_metric: BaselineMetric,
+    /// Named baseline represented by the horizontal physical coordinates.
+    pub(in crate::layout) horizontal_metric: BaselineMetric,
+}
+
+impl Default for FlexContainerBaselineSets {
+    fn default() -> Self {
+        Self {
+            vertical: FlexItemBaselinePair::default(),
+            horizontal: FlexItemBaselinePair::default(),
+            vertical_metric: BaselineMetric::Alphabetic,
+            horizontal_metric: BaselineMetric::Alphabetic,
+        }
+    }
 }
 
 impl FlexContainerBaselineSets {
@@ -2323,7 +2377,33 @@ impl FlexContainerBaselineSets {
                     )
                 }),
             },
+            vertical_metric: self.vertical_metric,
+            horizontal_metric: self.horizontal_metric,
         }
+    }
+}
+
+/// Return the baseline named by a Flex container's generated baseline set.
+///
+/// CSS Flexbox generates the container set from an item's alignment baseline,
+/// and CSS Inline selects that alignment baseline from the container's
+/// dominant baseline.  `auto` therefore selects central in vertical mixed or
+/// upright text and alphabetic otherwise:
+/// <https://www.w3.org/TR/css-flexbox-1/#flex-baselines> and
+/// <https://www.w3.org/TR/css-inline-3/#valdef-dominant-baseline-auto>.
+pub(in crate::layout::flex) fn flex_container_baseline_metric(
+    style: &ComputedStyle,
+) -> BaselineMetric {
+    match style.vertical_align.dominant_baseline {
+        DominantBaseline::Metric(metric) => metric,
+        DominantBaseline::Auto => match style.text_layout_policy() {
+            css::TextLayoutPolicy::Vertical(
+                css::TextOrientation::Mixed | css::TextOrientation::Upright,
+            ) => BaselineMetric::Central,
+            css::TextLayoutPolicy::Horizontal
+            | css::TextLayoutPolicy::Vertical(css::TextOrientation::Sideways)
+            | css::TextLayoutPolicy::Sideways(_) => BaselineMetric::Alphabetic,
+        },
     }
 }
 
@@ -2433,10 +2513,33 @@ pub(super) struct FlexAutomaticMinimumInputs {
     pub(super) automatic_preferred_cross_size: FlexAutomaticMinimumAutomaticPreferredCrossSize,
     pub(super) cross_intrinsic: FlexAutomaticMinimumCrossIntrinsicContributions,
     pub(super) preferred_aspect_ratio: Option<f32>,
+    pub(super) aspect_ratio_sizing: Option<FlexAspectRatioSizing>,
     pub(super) is_replaced: bool,
     /// An authored definite preferred main size. A temporary flex base never
     /// occupies this field.
     pub(super) definite_preferred_content_size: Option<ContentBoxLength>,
+}
+
+/// The aspect-ratio sizing state selected during the item's intrinsic pass.
+///
+/// Flexbox reuses the same preferred-ratio transfer while resolving the flex
+/// base, automatic minimum, hypothetical size, and final percentage replay.
+/// Retaining the typed conversion and CSS Sizing 4 constraint result on the
+/// estimate prevents those phases from reconstructing different box-space or
+/// min/max arithmetic:
+/// <https://drafts.csswg.org/css-sizing-4/#aspect-ratio-minimum> and
+/// <https://www.w3.org/TR/css-flexbox-1/#algo-main-item>.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct FlexAspectRatioSizing {
+    pub(super) ratio: ResolvedAspectRatio,
+    /// Definite constraints before CSS Sizing transfers them across axes.
+    pub(super) authored_width_constraints: AspectRatioAxisConstraints,
+    pub(super) authored_height_constraints: AspectRatioAxisConstraints,
+    pub(super) constraints: ResolvedAspectRatioConstraints,
+    /// Raw max-content contributions used by Flexbox 9.2 Part E, which
+    /// explicitly ignores main-axis min/max constraints for the flex base.
+    pub(super) intrinsic_width: ContentBoxLength,
+    pub(super) intrinsic_height: ContentBoxLength,
 }
 
 impl RatioOnlyReplacedFlexBaseSize {
@@ -2477,6 +2580,8 @@ pub(super) struct FlexItemEstimate {
     /// Inputs selected once for this flex pass's automatic main-axis minimum.
     /// They are shared by Taffy and the post-layout minimum safeguard.
     pub(super) automatic_main_minimum_inputs: Option<FlexAutomaticMinimumInputs>,
+    /// The shared two-axis ratio conversion and transferred constraints.
+    pub(super) aspect_ratio_sizing: Option<FlexAspectRatioSizing>,
     /// Descendant content extent measured from the flex item's border-box
     /// block start that must remain available to CSS Fragmentation replay.
     ///
@@ -2516,6 +2621,7 @@ impl FlexItemEstimate {
             automatic_preferred_physical_size: None,
             main_size_provenance: FlexMainSizeProvenance::NormalFlowContent,
             automatic_main_minimum_inputs: None,
+            aspect_ratio_sizing: None,
             fragmentable_overflow_height,
             baselines,
             normal_flow_line_box_span: None,
@@ -2580,6 +2686,10 @@ impl FlexItemEstimate {
     /// flexible-length allocation and Quire's final guard.
     pub(super) fn set_automatic_main_minimum_inputs(&mut self, inputs: FlexAutomaticMinimumInputs) {
         self.automatic_main_minimum_inputs = Some(inputs);
+    }
+
+    pub(super) fn set_aspect_ratio_sizing(&mut self, sizing: FlexAspectRatioSizing) {
+        self.aspect_ratio_sizing = Some(sizing);
     }
 
     /// Retain a replaced item's automatic preferred physical size for the
@@ -3681,6 +3791,21 @@ mod tests {
         assert_eq!(
             replay.logical_inline_size_for_replay(WritingMode::VerticalRl, height),
             Some(LogicalInlineContentSize::new(content_box_pt(32.0)))
+        );
+
+        let mut style = ComputedStyle::initial();
+        style.padding.left = 2.0;
+        style.padding.right = 3.0;
+        assert_eq!(
+            replay.logical_inline_content_size_for_replay(&style),
+            LogicalInlineContentSize::new(content_box_pt(11.0))
+        );
+        style.writing_mode = WritingMode::VerticalLr;
+        style.padding.top = 4.0;
+        style.padding.bottom = 6.0;
+        assert_eq!(
+            replay.logical_inline_content_size_for_replay(&style),
+            LogicalInlineContentSize::new(content_box_pt(22.0))
         );
     }
 

@@ -3,8 +3,7 @@ use crate::css::component_values::{
     css_leading_function_matching, css_leading_ident, parse_css_string_token,
     split_css_top_level_delimiter,
 };
-use crate::text::is_css_collapsible_whitespace;
-use crate::text::trim_css_collapsible_whitespace;
+use crate::text::{is_css_collapsible_whitespace, trim_css_collapsible_whitespace};
 
 #[derive(Debug, Clone, PartialEq)]
 enum PageContentPart {

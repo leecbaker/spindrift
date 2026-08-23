@@ -221,11 +221,9 @@ async fn clipped_positioned_multicolumn_tail_does_not_materialize_pages() {
 /// <https://drafts.csswg.org/css-position/#abspos-breaking>
 #[test]
 fn nested_clipped_ancestor_bounds_deferred_multicolumn_positioned_replay() {
-    // This intentionally 30,000px nested-fragmentation case exceeds Rust's
-    // 2MiB test-thread stack before the renderer can prove its clipped output.
+    // This intentionally exercises a 30,000px nested-fragmentation case.
     std::thread::Builder::new()
         .name("nested-clipped-positioned-replay".into())
-        .stack_size(4 * 1024 * 1024)
         .spawn(|| {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()

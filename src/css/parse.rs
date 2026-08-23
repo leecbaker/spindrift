@@ -1,3 +1,12 @@
+use std::collections::HashMap;
+use std::rc::Rc;
+
+use cssparser::{
+    BasicParseErrorKind, CowRcStr, Parser, ParserInput, ParserState, RuleBodyItemParser,
+    RuleBodyParser, StyleSheetParser,
+};
+use selectors::parser::{ParseRelative, SelectorList, SelectorParseErrorKind};
+
 use super::component_values::{parse_css_string_token, split_css_component_values, trim_css_value};
 use super::selector::{QuireSelectorImpl, QuireSelectorParser};
 use super::types::{
@@ -11,13 +20,6 @@ use super::values::{
     parse_color, parse_display, parse_font_family_names, parse_font_style, parse_font_weight,
     parse_font_width,
 };
-use cssparser::{
-    BasicParseErrorKind, CowRcStr, Parser, ParserInput, ParserState, RuleBodyItemParser,
-    RuleBodyParser, StyleSheetParser,
-};
-use selectors::parser::{ParseRelative, SelectorList, SelectorParseErrorKind};
-use std::collections::HashMap;
-use std::rc::Rc;
 
 pub(crate) fn parse_stylesheet(css: &Css) -> Stylesheet {
     parse_stylesheet_with_media_environment(css, &MediaEnvironment::default())
@@ -48,6 +50,7 @@ pub(crate) fn parse_stylesheet_with_media_environment(
         namespaces,
         current_layer: css.import_layer_name().cloned(),
         current_scopes: Vec::new(),
+        selector_scope_anchor: css.selector_scope_anchor(),
         scope_anchor: css.scope_anchor(),
         origin: css.origin(),
         media_environment: *media_environment,
@@ -346,14 +349,14 @@ use font_face::*;
 use nesting::*;
 pub(crate) use page_margin::cascade_page_declarations;
 use page_margin::*;
-pub(in crate::css) use rule_parser::LayerRegistry;
-pub(in crate::css) use rule_parser::cascaded_declaration_is_valid;
 use rule_parser::*;
+pub(in crate::css) use rule_parser::{
+    LayerRegistry, cascaded_declaration_is_valid, parse_layer_name, parse_layer_name_list,
+};
 pub(crate) use rule_parser::{
     custom_property_value_is_valid, is_custom_property_name, media_rule_applies,
     media_rule_applies_in_environment, supports_condition_applies,
 };
-pub(in crate::css) use rule_parser::{parse_layer_name, parse_layer_name_list};
 
 /// Parses a declaration at specified-value time and returns the canonical
 /// property/value operation the cascade should apply.

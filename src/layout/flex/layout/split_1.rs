@@ -369,8 +369,8 @@ pub(in crate::layout::flex) fn placed_flex_item_style(
     // CSS used-value setters remain scalar legacy APIs. The flex layout
     // boundary nevertheless records the final dimensions as border-box
     // extents, so extract only after entering this style adapter.
-    let item_width = item_width.points();
-    let item_height = item_height.points();
+    let item_border_box_width = item_width;
+    let item_border_box_height = item_height;
     let mut placed_style =
         replayed_item_fragmentation_base_style(child_style, ReplayedItemFragmentationPolicy::Flex);
     let borders = used_border_widths(child_style);
@@ -378,32 +378,24 @@ pub(in crate::layout::flex) fn placed_flex_item_style(
         child_style.padding.left + child_style.padding.right + borders.left + borders.right;
     let vertical_non_content =
         child_style.padding.top + child_style.padding.bottom + borders.top + borders.bottom;
-    let table_content_box =
-        child_style.display.is_table() && matches!(child_style.box_sizing, BoxSizing::ContentBox);
-    // Taffy's resolved cross size is an outer size, while the flex main-size
-    // adapter records a content-box main size for ordinary content-box items.
-    // In particular, a physical column's resolved main height is already an
-    // outer size after its automatic minimum transferred through a replaced
-    // item's aspect ratio. Do not add the vertical decoration a second time
-    // while freezing that replay size. A content-box table wrapper remains a
-    // separate adapter because table replay consumes its grid content box.
+    let horizontal_content_size = border_box_to_content_box_length(
+        item_border_box_width,
+        non_content_pt(horizontal_non_content),
+    );
+    let vertical_content_size = border_box_to_content_box_length(
+        item_border_box_height,
+        non_content_pt(vertical_non_content),
+    );
+    // Taffy's final layout rectangle is a physical border box. Convert it
+    // once, explicitly, to the content-box properties consumed by ordinary
+    // block replay. This avoids relying on a later `box-sizing` interpretation
+    // and keeps vertical auto block-size reconstruction from treating the
+    // border box as its intrinsic content width.
     // <https://www.w3.org/TR/css-flexbox-1/#flex-item-sizing>
     // <https://drafts.csswg.org/css-flexbox-1/#definite-sizes> and
     // <https://drafts.csswg.org/css-tables-3/#computing-the-table-height>.
-    let main_size_is_content_box =
-        !table_content_box && matches!(child_style.box_sizing, BoxSizing::ContentBox);
-    let used_width = if table_content_box && !physical_direction.is_row_axis() {
-        (item_width - horizontal_non_content).max(0.0)
-    } else if main_size_is_content_box && physical_direction.is_row_axis() {
-        item_width + horizontal_non_content
-    } else {
-        item_width
-    };
-    let used_height = if table_content_box && physical_direction.is_row_axis() {
-        (item_height - vertical_non_content).max(0.0)
-    } else {
-        item_height
-    };
+    let used_width = horizontal_content_size.points();
+    let used_height = vertical_content_size.points();
     set_style_used_width(&mut placed_style, used_width);
     set_style_used_height(&mut placed_style, used_height);
     // Preserve the resolved main-axis bound while replaying the item. The
@@ -412,21 +404,11 @@ pub(in crate::layout::flex) fn placed_flex_item_style(
     // already resolved the item's used main size.
     // <https://www.w3.org/TR/css-flexbox-1/#resolve-flexible-lengths>
     if physical_direction.is_row_axis() {
-        set_style_used_content_width_bounds(
-            &mut placed_style,
-            border_box_to_content_box_length(
-                border_box_pt(item_width),
-                non_content_pt(horizontal_non_content),
-            ),
-        );
+        set_style_used_content_box_width_bounds(&mut placed_style, horizontal_content_size);
     } else {
-        set_style_used_height_bounds(&mut placed_style, used_height);
+        set_style_used_content_box_height_bounds(&mut placed_style, vertical_content_size);
     }
-    placed_style.box_sizing = if table_content_box {
-        BoxSizing::ContentBox
-    } else {
-        BoxSizing::BorderBox
-    };
+    placed_style.box_sizing = BoxSizing::ContentBox;
     placed_style
 }
 
@@ -834,7 +816,7 @@ mod tests {
     }
 
     #[test]
-    fn placed_column_item_does_not_duplicate_its_border_box_decoration() {
+    fn placed_column_item_converts_taffy_border_box_height_to_content_box() {
         let mut child = ComputedStyle::initial();
         child.box_sizing = BoxSizing::ContentBox;
         child.padding.top = 2.0;
@@ -852,18 +834,57 @@ mod tests {
             PercentageBasis::<ContentBoxLength>::indefinite(),
         )
         .expect("the replayed physical main size is definite");
-        assert_eq!(height.points(), 20.0);
+        assert_eq!(height.points(), 15.0);
+        assert_eq!(
+            used_content_box_height_or_auto_with_basis(
+                &placed,
+                PercentageBasis::<ContentBoxLength>::indefinite(),
+                non_content_pt(5.0),
+            ),
+            Some(content_box_pt(15.0)),
+        );
+    }
+
+    #[test]
+    fn placed_row_item_keeps_taffy_border_box_width() {
+        let mut child = ComputedStyle::initial();
+        child.box_sizing = BoxSizing::ContentBox;
+        child.padding.left = 2.0;
+        child.padding.right = 3.0;
+
+        let placed = placed_flex_item_style(
+            &child,
+            border_box_pt(20.0),
+            border_box_pt(40.0),
+            PhysicalFlexDirection::new(FlexDirection::RowReverse),
+        );
+
+        let width = used_content_box_width_or_auto_with_basis(
+            &placed,
+            PercentageBasis::<ContentBoxLength>::indefinite(),
+            non_content_pt(5.0),
+        )
+        .expect("the replayed physical main size is definite");
+        assert_eq!(width, content_box_pt(15.0));
     }
 
     #[test]
     fn vertical_logical_row_projects_item_main_intervals_to_fragmentainers() {
         let mut style = ComputedStyle::initial();
-        style.writing_mode = WritingMode::VerticalLr;
         style.flex_direction = FlexDirection::Row;
-        assert_eq!(
-            FlexFragmentationBoundaryProjection::for_style(&style),
-            FlexFragmentationBoundaryProjection::ItemMainAxis,
-        );
+        for writing_mode in [
+            WritingMode::VerticalRl,
+            WritingMode::VerticalLr,
+            WritingMode::SidewaysRl,
+            WritingMode::SidewaysLr,
+        ] {
+            style.writing_mode = writing_mode;
+            assert_eq!(
+                FlexFragmentationBoundaryProjection::for_style(&style),
+                FlexFragmentationBoundaryProjection::ItemMainAxis,
+                "{writing_mode:?} logical row fragments along physical Y"
+            );
+        }
 
         style.writing_mode = WritingMode::HorizontalTb;
         assert_eq!(

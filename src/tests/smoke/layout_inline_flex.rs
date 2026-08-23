@@ -9156,7 +9156,7 @@ async fn fragmented_float_preserves_generated_image_content() {
 }
 
 #[tokio::test]
-async fn vertical_writing_inline_start_float_does_not_match_physical_clear_left() {
+async fn vertical_writing_clear_left_matches_line_left_inline_start_float() {
     let document = Html::from_string(
         "<style>@page { size: 140pt 100pt; margin: 10pt } body { margin: 0; writing-mode: vertical-rl; direction: ltr }\
          .float { float: inline-start; width: 30pt; height: 20pt; background: green }\
@@ -9179,8 +9179,8 @@ async fn vertical_writing_inline_start_float_does_not_match_physical_clear_left(
         .unwrap();
 
     assert!(
-        red.y() + red.height() > green.y(),
-        "physical clear:left should not match a vertical inline-start top-side float: green={green:?}, red={red:?}"
+        red.y() + red.height() <= green.y() + 0.01,
+        "line-relative clear:left should clear a vertical inline-start top-side float: green={green:?}, red={red:?}"
     );
 }
 

@@ -1,6 +1,6 @@
-use super::{LinkMatching, QuireSelectorImpl, StyleElement};
-use crate::css::types::{ElementSignature, ScopeRule};
-use crate::css::{ScopeRoot, StylesheetScopeAnchor};
+use std::borrow::Cow;
+use std::rc::Rc;
+
 use selectors::OpaqueElement;
 use selectors::context::{
     MatchingContext, MatchingForInvalidation, MatchingMode, NeedsSelectorFlags, QuirksMode,
@@ -8,8 +8,10 @@ use selectors::context::{
 };
 use selectors::matching::{matches_selector, matches_selector_list};
 use selectors::parser::SelectorList;
-use std::borrow::Cow;
-use std::rc::Rc;
+
+use super::{LinkMatching, QuireSelectorImpl, StyleElement};
+use crate::css::types::{ElementSignature, ScopeRule};
+use crate::css::{ScopeRoot, StylesheetScopeAnchor};
 
 /// Matches a style rule selector against a prebuilt selector chain.
 ///
@@ -21,17 +23,30 @@ use std::rc::Rc;
 pub(in crate::css) fn selector_matches_with_scope_proximity_in_chain_with_link_matching<'a>(
     selector: &SelectorList<QuireSelectorImpl>,
     scopes: &[ScopeRule],
+    stylesheet_scope_anchor: StylesheetScopeAnchor,
     chain: &Rc<Vec<Cow<'a, ElementSignature>>>,
     current_index: usize,
     caches: &mut SelectorCaches,
     link_matching: LinkMatching,
 ) -> Option<(usize, u32)> {
     if scopes.is_empty() {
+        let scope_index = if selector
+            .slice()
+            .iter()
+            .any(|branch| branch.has_parent_selector() || branch.has_scope_selector())
+        {
+            Some(stylesheet_scope_anchor_index(
+                stylesheet_scope_anchor,
+                chain,
+            )?)
+        } else {
+            None
+        };
         return selector_matching_specificity_at(
             selector,
             chain,
             current_index,
-            None,
+            scope_index,
             caches,
             link_matching,
         )
@@ -62,6 +77,23 @@ pub(in crate::css) fn selector_matches_with_scope_proximity_in_chain_with_link_m
         link_matching,
     )
     .map(|specificity| (proximity, specificity))
+}
+
+/// Returns the `:scope` element for an unscoped stylesheet rule.
+///
+/// CSS Nesting defines `&` outside a nested style rule as the `:scope` of its
+/// current stylesheet context.
+/// <https://drafts.csswg.org/css-nesting-1/#nest-selector>
+fn stylesheet_scope_anchor_index(
+    scope_anchor: StylesheetScopeAnchor,
+    chain: &[Cow<'_, ElementSignature>],
+) -> Option<usize> {
+    match scope_anchor {
+        StylesheetScopeAnchor::DocumentRoot => Some(0),
+        StylesheetScopeAnchor::Element(owner) => chain
+            .iter()
+            .position(|element| element.source_element_id == Some(owner)),
+    }
 }
 
 pub(in crate::css) fn selector_chain<'a>(

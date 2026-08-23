@@ -1,6 +1,7 @@
+use std::rc::Rc;
+
 use super::*;
 use crate::css::ComputedLengthPercentage;
-use std::rc::Rc;
 
 fn glyph(unicode: &str, advance: f32) -> RenderedGlyph {
     RenderedGlyph {
@@ -55,12 +56,23 @@ fn prepared_decoration_strokes_for_style(
     decoration: TextDecoration,
     phase: TextDecorationPaintPhase,
 ) -> Vec<PreparedTextDecorationStroke> {
+    let baseline = PaintPoint::new(10.0, 20.0);
+    let inline_span = VerticalInlineAxis::for_style(style)
+        .map(|axis| {
+            axis.project_span_from_start(
+                layout_pt(baseline.y),
+                TextInlineSpan::from_start_and_length(0.0, 40.0),
+            )
+        })
+        .unwrap_or_else(|| TextInlineSpan::from_start_and_length(baseline.x, 40.0));
     prepare_text_decoration_strokes(TextDecorationPreparationInput {
-        baseline: PaintPoint::new(10.0, 20.0),
-        inline_span: TextInlineSpan::from_start_and_length(10.0, 40.0),
+        baseline,
+        inline_span,
         inset_start: 0.0,
         inset_end: 0.0,
         style,
+        inset_style: style,
+        inset_inline_axis: VerticalInlineAxis::for_style(style),
         decoration,
         phase,
         color: CssColor::BLACK,
@@ -88,6 +100,8 @@ fn decoration_uses_its_origin_font_size_for_auto_thickness() {
         inset_start: 0.0,
         inset_end: 0.0,
         style: &decorated_style,
+        inset_style: &origin_style,
+        inset_inline_axis: VerticalInlineAxis::for_style(&origin_style),
         decoration,
         phase: TextDecorationPaintPhase::BeforeText,
         color: CssColor::BLACK,
@@ -217,15 +231,66 @@ fn sideways_inline_advance_uses_its_directional_inline_start_side() {
     let mut style = ComputedStyle::initial();
     style.writing_mode = WritingMode::SidewaysRl;
     style.direction = Direction::Ltr;
-    assert_eq!(vertical_text_advance_sign(&style), -1.0);
+    assert_eq!(
+        VerticalInlineAxis::for_style(&style)
+            .unwrap()
+            .advance_sign(),
+        -1.0
+    );
     style.direction = Direction::Rtl;
-    assert_eq!(vertical_text_advance_sign(&style), 1.0);
+    assert_eq!(
+        VerticalInlineAxis::for_style(&style)
+            .unwrap()
+            .advance_sign(),
+        1.0
+    );
 
     style.writing_mode = WritingMode::SidewaysLr;
     style.direction = Direction::Ltr;
-    assert_eq!(vertical_text_advance_sign(&style), 1.0);
+    assert_eq!(
+        VerticalInlineAxis::for_style(&style)
+            .unwrap()
+            .advance_sign(),
+        1.0
+    );
     style.direction = Direction::Rtl;
-    assert_eq!(vertical_text_advance_sign(&style), -1.0);
+    assert_eq!(
+        VerticalInlineAxis::for_style(&style)
+            .unwrap()
+            .advance_sign(),
+        -1.0
+    );
+}
+
+#[test]
+fn vertical_decoration_insets_follow_the_origin_logical_start_edge() {
+    let mut top_start = ComputedStyle::initial();
+    top_start.writing_mode = WritingMode::SidewaysRl;
+    top_start.direction = Direction::Ltr;
+    let top_span = text_decoration_inline_span(
+        TextDecorationStrokeAxis::Vertical,
+        TextInlineSpan::new(60.0, 100.0),
+        10.0,
+        -5.0,
+        &top_start,
+        VerticalInlineAxis::for_style(&top_start),
+    )
+    .unwrap();
+    assert_eq!(top_span, TextInlineSpan::new(55.0, 90.0));
+
+    let mut bottom_start = ComputedStyle::initial();
+    bottom_start.writing_mode = WritingMode::SidewaysLr;
+    bottom_start.direction = Direction::Ltr;
+    let bottom_span = text_decoration_inline_span(
+        TextDecorationStrokeAxis::Vertical,
+        TextInlineSpan::new(60.0, 100.0),
+        10.0,
+        -5.0,
+        &bottom_start,
+        VerticalInlineAxis::for_style(&bottom_start),
+    )
+    .unwrap();
+    assert_eq!(bottom_span, TextInlineSpan::new(70.0, 105.0));
 }
 
 #[test]

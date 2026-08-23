@@ -199,8 +199,12 @@ impl<'a> LayoutBuilder<'a> {
                     );
                     &built_child_boxes
                 };
-                let fragment =
-                    box_tree::build_frozen_table_fragment(element, signature, child_boxes);
+                let fragment = box_tree::build_frozen_table_fragment(
+                    element,
+                    signature,
+                    &child.style,
+                    child_boxes,
+                );
                 // A table wrapper exposes the grid's min-content floor and
                 // independent max-content contribution to intrinsic flex
                 // sizing. Generic block measurement only sees the first
@@ -216,7 +220,9 @@ impl<'a> LayoutBuilder<'a> {
                 );
                 inline_layout::InlineIntrinsicContribution::new(
                     sizing.grid_min_content_inline,
-                    sizing.grid_max_content_inline,
+                    sizing
+                        .grid_max_content_inline
+                        .resolve_against(containing_inline_size),
                 )
             });
         }
@@ -298,6 +304,7 @@ impl<'a> LayoutBuilder<'a> {
                     let fragment = box_tree::build_frozen_table_fragment(
                         child_element,
                         signature,
+                        child_style,
                         child_children,
                     );
                     let (min_content, _) = layout
@@ -396,6 +403,7 @@ impl<'a> LayoutBuilder<'a> {
                     let fragment = box_tree::build_frozen_table_fragment(
                         child_element,
                         &signature,
+                        &child_style,
                         &child_boxes,
                     );
                     let (min_content, _) = layout
@@ -736,7 +744,7 @@ impl<'a> LayoutBuilder<'a> {
                 .current_child_available_space()
                 .available_physical_height(),
         };
-        Some(PhysicalContentHeight::new(content_box_pt(
+        Some(PhysicalContentHeight::new(
             self.measure_auto_positioned_block_height(
                 element,
                 &measured_style,
@@ -745,7 +753,7 @@ impl<'a> LayoutBuilder<'a> {
                 child_boxes,
                 None,
             ),
-        )))
+        ))
     }
 }
 

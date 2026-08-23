@@ -370,6 +370,13 @@ impl<'a> LayoutBuilder<'a> {
     ) {
         let replayed_flex_item_percentage_height_basis =
             self.take_replayed_flex_item_percentage_height_basis();
+        let replayed_item_logical_inline_size = replayed_flex_item_percentage_height_basis
+            .is_some()
+            .then(|| {
+                LogicalInlineContentSize::new(content_box_pt(
+                    self.current_content_logical_inline_size(),
+                ))
+            });
         match layout_kind {
             ElementLayoutKind::None => (),
             ElementLayoutKind::Positioned
@@ -451,8 +458,12 @@ impl<'a> LayoutBuilder<'a> {
                         .last()
                         .cloned()
                         .unwrap_or_else(|| element_signature(element));
-                    built_fragment =
-                        box_tree::build_frozen_table_fragment(element, &signature, table_children);
+                    built_fragment = box_tree::build_frozen_table_fragment(
+                        element,
+                        &signature,
+                        style,
+                        table_children,
+                    );
                     &built_fragment
                 };
                 self.layout_table(element, style, stylesheets, fragment)
@@ -494,6 +505,7 @@ impl<'a> LayoutBuilder<'a> {
                     run_in_children,
                     child_boxes,
                     replayed_flex_item_percentage_height_basis,
+                    replayed_item_logical_inline_size,
                     principal_box_paint_mode,
                 );
             }
@@ -911,12 +923,20 @@ impl<'a> LayoutBuilder<'a> {
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
     ) {
-        if self.absolute_static_position.is_none() && style.abspos_static_source.is_inline_level() {
+        let has_formatting_context_static_alignment = self
+            .absolute_static_position
+            .is_some_and(AbsoluteStaticPosition::has_formatting_context_static_alignment);
+        if style.abspos_static_source.is_inline_level() && !has_formatting_context_static_alignment
+        {
             // A direct inline-level positioned child of a block formatting
             // context still has an inline hypothetical box.  Measuring it
             // against the previous committed page line loses the current
             // float exclusions (and therefore `direction`/`text-align`)
             // whenever no ordinary inline sibling has painted a line yet.
+            // An ambient block-flow static rectangle can likewise describe
+            // an earlier in-flow sibling, never this inline-origin source.
+            // Inline provenance therefore takes precedence over any saved
+            // block-source rectangle.
             // Reuse the same non-painting placeholder path as collected
             // inline descendants so the hypothetical static position is
             // selected by the current line formatting context.
@@ -955,9 +975,6 @@ impl<'a> LayoutBuilder<'a> {
         // and axes, including Grid's RTL and orthogonal-flow semantics.
         // <https://drafts.csswg.org/css-position-3/#staticpos-rect>
         // <https://drafts.csswg.org/css-align-3/#align-abspos>
-        let has_formatting_context_static_alignment = self
-            .absolute_static_position
-            .is_some_and(AbsoluteStaticPosition::has_formatting_context_static_alignment);
         if !style.abspos_static_source.is_inline_level()
             && !has_formatting_context_static_alignment
             && (self
@@ -1158,7 +1175,7 @@ impl<'a> LayoutBuilder<'a> {
             0.0,
             InlineVisualOffset::zero(),
             style,
-            style.text_decoration_layers.clone(),
+            style.text_decoration_origins.effective_layers_vec(),
             &mut items,
         );
         if let Some(marker) = marker
@@ -1323,6 +1340,7 @@ impl<'a> LayoutBuilder<'a> {
         child_children: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
         stylesheets: &Stylesheets<'_>,
+        placement_axes: FloatPlacementAxes,
         run: &mut FloatRunState,
         split_inline_block_offset: Option<f32>,
     ) -> bool {
@@ -1338,6 +1356,7 @@ impl<'a> LayoutBuilder<'a> {
             child_children,
             table_fragment,
             stylesheets,
+            placement_axes,
             run,
         );
         if pushed_containing_block {

@@ -287,6 +287,12 @@ or writing-mode behavior.
   Simple indefinite percentage grid item block sizes behave as automatic sizes
   instead of resolving against the grid inline size during min-content row
   sizing.
+  Standard Grid and inline-grid now run CSS Grid's bounded row-to-column and
+  column-to-row intrinsic-contribution feedback sequence. Each corrected pass
+  uses the resolved grid area, including crossed gutters, as the item's
+  definite percentage containing block; final replay uses the same area while
+  preserving cyclic-percentage behavior during intrinsic sizing. Grid Lanes'
+  distinct Level 3 packing path remains separate.
   Complete grid intrinsic sizing, grid-aware absolute static positions, full
   inline-grid baseline behavior, and fragmentation are not yet complete for
   grid.

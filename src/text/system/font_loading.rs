@@ -1,8 +1,15 @@
-use super::*;
-use sha2::{Digest, Sha256};
 use std::future::Future;
 use std::sync::Mutex;
+
+use sha2::{Digest, Sha256};
 use tokio::sync::OnceCell;
+
+use super::*;
+use crate::document::DocumentFontVariationCoordinates;
+use crate::text::font_matching::{
+    effective_font_variation_coordinates, standard_font_variation_coordinates,
+};
+use crate::text::system::api::SelectedFaceStyleView;
 
 type SharedFontSourceCache =
     Arc<tokio::sync::Mutex<HashMap<FontSourceCacheKey, Arc<OnceCell<FontiqueBlob<u8>>>>>>;
@@ -646,6 +653,7 @@ impl FontSystem {
         family_override: Option<&str>,
         request: &FontRequest,
     ) -> Option<usize> {
+        let variation_coordinates = standard_font_variation_coordinates(weight, style, width);
         log::trace!(
             "querying document font families {:?} weight={} style={:?} width={} override={:?}",
             families,
@@ -661,12 +669,26 @@ impl FontSystem {
             fonts.len()
         );
         for font in fonts.iter().filter(|font| !font.synthesis.any()).cloned() {
-            if let Some(id) = self.document_font_from_query_font(font, family_override, request) {
+            if let Some(id) = self.document_font_from_query_font_with_synthesis(
+                font,
+                family_override,
+                request,
+                true,
+                true,
+                variation_coordinates.clone(),
+            ) {
                 return Some(id);
             }
         }
         for font in fonts {
-            if let Some(id) = self.document_font_from_query_font(font, family_override, request) {
+            if let Some(id) = self.document_font_from_query_font_with_synthesis(
+                font,
+                family_override,
+                request,
+                true,
+                true,
+                variation_coordinates.clone(),
+            ) {
                 return Some(id);
             }
         }
@@ -686,6 +708,7 @@ impl FontSystem {
         width: FontWidth,
         request: &FontRequest,
     ) -> Option<usize> {
+        let variation_coordinates = standard_font_variation_coordinates(weight, style, width);
         let fonts = self.query_fonts(families, weight, style, width);
         for font in fonts
             .iter()
@@ -693,7 +716,14 @@ impl FontSystem {
             .filter(|font| DocumentFontRegistry::font_query_allows_outline_embedding(font))
             .cloned()
         {
-            if let Some(id) = self.document_font_from_query_font(font, None, request) {
+            if let Some(id) = self.document_font_from_query_font_with_synthesis(
+                font,
+                None,
+                request,
+                true,
+                true,
+                variation_coordinates.clone(),
+            ) {
                 return Some(id);
             }
         }
@@ -701,7 +731,14 @@ impl FontSystem {
             .into_iter()
             .filter(DocumentFontRegistry::font_query_allows_outline_embedding)
         {
-            if let Some(id) = self.document_font_from_query_font(font, None, request) {
+            if let Some(id) = self.document_font_from_query_font_with_synthesis(
+                font,
+                None,
+                request,
+                true,
+                true,
+                variation_coordinates.clone(),
+            ) {
                 return Some(id);
             }
         }
@@ -772,17 +809,26 @@ impl FontSystem {
         family_override: Option<&str>,
         request: &FontRequest,
     ) -> Option<usize> {
-        self.document_font_from_query_font_with_synthesis(font, family_override, request, true)
+        self.document_font_from_query_font_with_synthesis(
+            font,
+            family_override,
+            request,
+            true,
+            true,
+            DocumentFontVariationCoordinates::default(),
+        )
     }
 
     /// Resolve one Fontique result for PDF emission, retaining only CSS
-    /// weight synthesis that the computed style permits.
+    /// synthesis that the computed style permits.
     pub(crate) fn document_font_from_query_font_with_synthesis(
         &mut self,
         font: FontiqueQueryFont,
         family_override: Option<&str>,
         request: &FontRequest,
         synthesize_weight: bool,
+        synthesize_style: bool,
+        variation_coordinates: DocumentFontVariationCoordinates,
     ) -> Option<usize> {
         self.document_fonts.document_font_from_query(
             &mut self.parley_font_context.collection,
@@ -790,14 +836,9 @@ impl FontSystem {
             family_override,
             request,
             synthesize_weight,
+            synthesize_style,
+            variation_coordinates,
         )
-    }
-
-    pub(super) fn document_font_from_parley_font_data(
-        &mut self,
-        font_data: &parley::FontData,
-    ) -> Option<usize> {
-        self.document_fonts.document_font_from_parley(font_data)
     }
 
     pub(super) fn document_font_from_parley_font_data_for_style(
@@ -821,6 +862,12 @@ impl FontSystem {
         family: &FontFamily,
         fallback_character: char,
     ) -> Option<usize> {
+        let selected_style = SelectedFaceStyleView::new(
+            style,
+            (family != &style.font_family).then(|| family.clone()),
+        );
+        let shaping_style = self.shaping_style_for_selected_face_view(&selected_style);
+        let variation_coordinates = effective_font_variation_coordinates(&shaping_style);
         let request = FontRequest::from_family(
             family,
             style.font_weight,
@@ -828,10 +875,14 @@ impl FontSystem {
             style.font_width,
         );
         let synthesize_weight = style.font_synthesis.weight;
-        if let Some(font_id) =
-            self.document_fonts
-                .cached_parley_font(font_data, &request, synthesize_weight)
-        {
+        let synthesize_style = style.font_synthesis.style;
+        if let Some(font_id) = self.document_fonts.cached_parley_font(
+            font_data,
+            &request,
+            synthesize_weight,
+            synthesize_style,
+            &variation_coordinates,
+        ) {
             return Some(font_id);
         }
 
@@ -848,9 +899,17 @@ impl FontSystem {
                 None,
                 &request,
                 synthesize_weight,
+                synthesize_style,
+                variation_coordinates.clone(),
             )?;
-            self.document_fonts
-                .cache_parley_font(font_data, &request, synthesize_weight, font_id);
+            self.document_fonts.cache_parley_font(
+                font_data,
+                &request,
+                synthesize_weight,
+                synthesize_style,
+                &variation_coordinates,
+                font_id,
+            );
             return Some(font_id);
         }
 
@@ -866,18 +925,36 @@ impl FontSystem {
                 None,
                 &request,
                 synthesize_weight,
+                synthesize_style,
+                variation_coordinates.clone(),
             )?;
-            self.document_fonts
-                .cache_parley_font(font_data, &request, synthesize_weight, font_id);
+            self.document_fonts.cache_parley_font(
+                font_data,
+                &request,
+                synthesize_weight,
+                synthesize_style,
+                &variation_coordinates,
+                font_id,
+            );
             return Some(font_id);
         }
 
         // Preserve an unknown platform fallback rather than scanning every
-        // installed family. This is only reached when the backend did not
-        // expose a matching fallback face for the run's script.
-        let font_id = self.document_font_from_parley_font_data(font_data)?;
-        self.document_fonts
-            .cache_parley_font(font_data, &request, synthesize_weight, font_id);
+        // installed family. The preceding stack match covers every concrete
+        // named or generic CSS face supplied to Parley, so this is only for a
+        // backend fallback face that Fontique could not expose for the run's
+        // script.
+        let font_id = self
+            .document_fonts
+            .document_font_from_parley(font_data, variation_coordinates.clone())?;
+        self.document_fonts.cache_parley_font(
+            font_data,
+            &request,
+            synthesize_weight,
+            synthesize_style,
+            &variation_coordinates,
+            font_id,
+        );
         Some(font_id)
     }
 

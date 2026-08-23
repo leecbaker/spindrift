@@ -1,13 +1,12 @@
-use std::ops::Deref;
-use std::ops::Range;
+use std::ops::{Deref, Range};
 use std::rc::Rc;
-
-use crate::CssColor;
-use crate::css::FontPalette;
 
 use super::geometry::{
     PaintClip, PaintDisplacement, PaintPoint, PaintRect, PaintSize, PaintTranslation,
 };
+use super::paths::RenderedPath;
+use crate::CssColor;
+use crate::css::FontPalette;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderedLine {
@@ -30,6 +29,34 @@ pub struct RenderedLine {
     /// single authored run while keeping separately painted artifacts such as
     /// text-emphasis marks distinct.
     pub(crate) source_run: Option<Rc<()>>,
+}
+
+/// One full-em glyph whose normal PDF text ink is replaced by an equivalent
+/// opaque vector path.
+///
+/// The indices are into the source [`RenderedLine`]'s visual run and glyph
+/// streams. They make the ownership boundary explicit before layout partitions
+/// the line into independent text-paint records.
+#[derive(Debug)]
+pub(crate) struct OpaqueTextGlyphCoverage {
+    pub(crate) run_index: usize,
+    pub(crate) glyph_index: usize,
+    pub(crate) path: RenderedPath,
+}
+
+/// An ordered slice of a logical text line at the PDF paint boundary.
+///
+/// CSS layout, line breaking, and decorations retain the original
+/// [`RenderedLine`]. Only glyph realization is partitioned: ordinary slices
+/// remain visible PDF text, while an opaque-coverage slice owns every glyph
+/// replaced by its vector paths.
+#[derive(Debug)]
+pub(crate) enum RenderedTextPaintSegment {
+    Text(RenderedLine),
+    OpaqueCoverage {
+        line: RenderedLine,
+        paths: Vec<RenderedPath>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +196,155 @@ impl RenderedLine {
             run
         }));
     }
+}
+
+/// Partition a rendered line into ordered normal-text and opaque-coverage
+/// slices.
+///
+/// A coverage path may replace only the glyph it was derived from. Keeping
+/// this relation at glyph granularity prevents a full-em glyph in one fallback
+/// run from making unrelated glyphs in a sibling run invisible in the PDF.
+/// CSS 2.2 Appendix E defines the retained paint order; ISO 32000-2:2020,
+/// 9.3.6 defines the invisible-text realization used by the coverage slice.
+pub(crate) fn split_rendered_line_for_opaque_text_coverage(
+    line: RenderedLine,
+    coverages: Vec<OpaqueTextGlyphCoverage>,
+) -> Vec<RenderedTextPaintSegment> {
+    if coverages.is_empty() {
+        return vec![RenderedTextPaintSegment::Text(line)];
+    }
+
+    let mut coverage_paths = line
+        .runs
+        .iter()
+        .map(|run| {
+            (run.actual_text.is_none())
+                .then(|| run.glyphs.as_ref().map(|glyphs| vec![None; glyphs.len()]))
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    for coverage in coverages {
+        let Some(glyphs) = coverage_paths
+            .get_mut(coverage.run_index)
+            .and_then(Option::as_mut)
+        else {
+            continue;
+        };
+        let Some(slot) = glyphs.get_mut(coverage.glyph_index) else {
+            continue;
+        };
+        if slot.is_none() {
+            *slot = Some(coverage.path);
+        }
+    }
+
+    let mut segments = Vec::new();
+    for (run_index, run) in line.runs.iter().enumerate() {
+        let Some(glyph_paths) = coverage_paths.get_mut(run_index).and_then(Option::as_mut) else {
+            segments.push(RenderedTextPaintSegment::Text(rendered_line_slice(
+                &line,
+                vec![run.clone()],
+            )));
+            continue;
+        };
+        let Some(glyphs) = run.glyphs.as_ref() else {
+            segments.push(RenderedTextPaintSegment::Text(rendered_line_slice(
+                &line,
+                vec![run.clone()],
+            )));
+            continue;
+        };
+
+        let mut start = 0usize;
+        while start < glyphs.len() {
+            let is_coverage = glyph_paths[start].is_some();
+            let mut end = start + 1;
+            while end < glyphs.len() && glyph_paths[end].is_some() == is_coverage {
+                end += 1;
+            }
+            let Some(slice) = rendered_text_run_glyph_slice(run, start..end) else {
+                // A run with incomplete glyph storage cannot prove a
+                // per-glyph ownership boundary. Retain it as ordinary text.
+                segments.push(RenderedTextPaintSegment::Text(rendered_line_slice(
+                    &line,
+                    vec![run.clone()],
+                )));
+                break;
+            };
+            let segment_line = rendered_line_slice(&line, vec![slice]);
+            if is_coverage {
+                let paths = glyph_paths[start..end]
+                    .iter_mut()
+                    .map(|path| path.take().expect("coverage slice owns every glyph path"))
+                    .collect();
+                segments.push(RenderedTextPaintSegment::OpaqueCoverage {
+                    line: segment_line,
+                    paths,
+                });
+            } else {
+                segments.push(RenderedTextPaintSegment::Text(segment_line));
+            }
+            start = end;
+        }
+    }
+    segments
+}
+
+fn rendered_line_slice(source: &RenderedLine, runs: Vec<RenderedTextRun>) -> RenderedLine {
+    let text = runs.iter().map(|run| run.text.as_ref()).collect();
+    RenderedLine {
+        text,
+        origin: source.origin,
+        font_size: source.font_size,
+        font_id: runs.first().and_then(|run| run.font_id),
+        color: source.color,
+        runs,
+        // A paint-only slice must not inherit the source line's full ink
+        // bounds: PDF hidden-ink elision requires bounds proved for this
+        // exact slice, and the coverage paths provide that proof separately.
+        glyph_ink_bounds: None,
+        glyph_origin_adjustment: source.glyph_origin_adjustment,
+        source: source.source,
+        source_run: source.source_run.clone(),
+    }
+}
+
+fn rendered_text_run_glyph_slice(
+    source: &RenderedTextRun,
+    glyph_range: Range<usize>,
+) -> Option<RenderedTextRun> {
+    debug_assert!(source.actual_text.is_none());
+    let glyphs = source.glyphs.as_ref()?;
+    let glyph_slice = glyphs.get(glyph_range.clone())?;
+    let preceding_advance: f32 = glyphs[..glyph_range.start]
+        .iter()
+        .map(|glyph| glyph.x_advance)
+        .sum();
+    let text = glyph_slice
+        .iter()
+        .map(|glyph| glyph.unicode.as_str())
+        .collect::<String>();
+    let glyph_source_ranges = source.glyph_source_ranges.as_ref().map(|ranges| {
+        Rc::from(
+            ranges
+                .get(glyph_range.clone())
+                .expect("glyph provenance stays aligned with glyph storage")
+                .to_vec()
+                .into_boxed_slice(),
+        )
+    });
+    Some(RenderedTextRun {
+        text: Rc::from(text),
+        actual_text: None,
+        x_offset: source.x_offset + preceding_advance,
+        y_offset: source.y_offset,
+        text_matrix: source.text_matrix,
+        font_size: source.font_size,
+        font_id: source.font_id,
+        font_palette: source.font_palette.clone(),
+        glyphs: Some(glyph_slice.to_vec().into()),
+        glyph_source_ranges,
+    })
 }
 
 /// Return whether adjacent rendered text groups are fragments of one inline line.
@@ -580,10 +756,13 @@ mod tests {
     use std::rc::Rc;
 
     use super::{
-        RenderedGlyph, RenderedGlyphKind, RenderedLine, RenderedTextMatrix, RenderedTextRun,
+        OpaqueTextGlyphCoverage, RenderedGlyph, RenderedGlyphKind, RenderedLine,
+        RenderedTextMatrix, RenderedTextPaintSegment, RenderedTextRun,
+        split_rendered_line_for_opaque_text_coverage,
     };
-    use crate::CssColor;
     use crate::document::paint::geometry::PaintPoint;
+    use crate::document::paint::paths::{RenderedPath, RenderedPathFillRule};
+    use crate::{CssColor, PaintStrokeWidth};
 
     fn test_rendered_glyph(unicode: &str) -> RenderedGlyph {
         RenderedGlyph {
@@ -655,5 +834,98 @@ mod tests {
             Vec::new(),
         );
         assert_eq!(line.origin(), PaintPoint::new(5.0, 6.0));
+    }
+
+    fn opaque_coverage_path() -> RenderedPath {
+        RenderedPath::new(
+            Vec::new(),
+            Some(CssColor::BLACK),
+            RenderedPathFillRule::NonZero,
+            None,
+            PaintStrokeWidth::ZERO,
+            None,
+        )
+    }
+
+    #[test]
+    fn opaque_text_coverage_splits_only_the_glyphs_it_owns() {
+        let mut run = test_rendered_text_run();
+        run.text = Rc::from("AbC");
+        run.glyphs = Some(
+            vec![
+                test_rendered_glyph("A"),
+                test_rendered_glyph("b"),
+                test_rendered_glyph("C"),
+            ]
+            .into(),
+        );
+        let line = RenderedLine::from_paint_origin(
+            "AbC".to_string(),
+            PaintPoint::new(10.0, 20.0),
+            12.0,
+            Some(0),
+            CssColor::BLACK,
+            vec![run],
+        );
+
+        let segments = split_rendered_line_for_opaque_text_coverage(
+            line,
+            vec![
+                OpaqueTextGlyphCoverage {
+                    run_index: 0,
+                    glyph_index: 0,
+                    path: opaque_coverage_path(),
+                },
+                OpaqueTextGlyphCoverage {
+                    run_index: 0,
+                    glyph_index: 2,
+                    path: opaque_coverage_path(),
+                },
+            ],
+        );
+
+        assert_eq!(segments.len(), 3);
+        let segment_text = |segment: &RenderedTextPaintSegment| match segment {
+            RenderedTextPaintSegment::Text(line) => {
+                (false, line.text.clone(), line.runs[0].x_offset)
+            }
+            RenderedTextPaintSegment::OpaqueCoverage { line, .. } => {
+                (true, line.text.clone(), line.runs[0].x_offset)
+            }
+        };
+        assert_eq!(segment_text(&segments[0]), (true, "A".to_string(), 0.0));
+        assert_eq!(segment_text(&segments[1]), (false, "b".to_string(), 7.0));
+        assert_eq!(segment_text(&segments[2]), (true, "C".to_string(), 14.0));
+    }
+
+    #[test]
+    fn opaque_text_coverage_preserves_unsplittable_actual_text_runs() {
+        let mut run = test_rendered_text_run();
+        run.actual_text = Some(Rc::from("ab"));
+        run.text = Rc::from("ab");
+        run.glyphs = Some(vec![test_rendered_glyph("a"), test_rendered_glyph("b")].into());
+        let line = RenderedLine::from_paint_origin(
+            "ab".to_string(),
+            PaintPoint::new(10.0, 20.0),
+            12.0,
+            Some(0),
+            CssColor::BLACK,
+            vec![run],
+        );
+
+        let segments = split_rendered_line_for_opaque_text_coverage(
+            line,
+            vec![OpaqueTextGlyphCoverage {
+                run_index: 0,
+                glyph_index: 0,
+                path: opaque_coverage_path(),
+            }],
+        );
+
+        assert_eq!(segments.len(), 1);
+        let RenderedTextPaintSegment::Text(line) = &segments[0] else {
+            panic!("ActualText-bearing runs must remain ordinary text");
+        };
+        assert_eq!(line.runs[0].actual_text.as_deref(), Some("ab"));
     }
 }

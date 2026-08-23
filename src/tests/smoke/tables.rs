@@ -1189,14 +1189,17 @@ async fn upright_vertical_rowspan_text_applies_each_glyph_origin_once() {
     .await
     .unwrap();
 
-    let line = document.pages[0]
+    // Upright vertical shaping materializes one typographic unit per line
+    // record; collect the three source units before checking their advances.
+    let label_lines = document.pages[0]
         .lines()
         .iter()
-        .find(|line| line.text == "AAA")
-        .expect("upright rowspan label should paint");
-    let glyph_origins = line
-        .runs
+        .filter(|line| line.text == "A")
+        .collect::<Vec<_>>();
+    assert_eq!(label_lines.len(), 3, "upright rowspan label should paint");
+    let glyph_origins = label_lines
         .iter()
+        .flat_map(|line| line.runs.iter())
         .map(|run| {
             let glyph = run
                 .glyphs
@@ -1211,7 +1214,7 @@ async fn upright_vertical_rowspan_text_applies_each_glyph_origin_once() {
     for (index, origin) in glyph_origins.iter().enumerate() {
         assert!(
             (*origin - (-(index as f32) * 12.0)).abs() < 0.01,
-            "glyph {index} must receive its normal-flow vertical advance once: line={line:?}"
+            "glyph {index} must receive its normal-flow vertical advance once: lines={label_lines:?}"
         );
     }
 }
@@ -6467,6 +6470,75 @@ async fn auto_table_definite_width_clamps_content_box_to_min_content() {
 }
 
 #[tokio::test]
+async fn vertical_intrinsic_table_inline_constraints_include_root_inline_decoration_in_parent_flow()
+{
+    // CSS Tables constrains the table grid to its intrinsic inline minimum,
+    // while the anonymous wrapper must still contain the table-root border
+    // box. In a vertical writing mode that logical inline decoration is a
+    // physical top/bottom contribution in the horizontal parent flow.
+    // <https://drafts.csswg.org/css-tables/#table-structure>
+    // <https://drafts.csswg.org/css-writing-modes/#abstract-box>
+    for (writing_mode, direction, inline_constraint, decoration) in [
+        (
+            "vertical-rl",
+            "ltr",
+            "inline-size:30px",
+            "border-inline:10px solid green",
+        ),
+        (
+            "vertical-rl",
+            "ltr",
+            "max-inline-size:30px",
+            "border-inline:10px solid green",
+        ),
+        (
+            "vertical-lr",
+            "rtl",
+            "inline-size:30px",
+            "border-inline:10px solid green",
+        ),
+        (
+            "vertical-lr",
+            "ltr",
+            "inline-size:30px",
+            "padding-inline:10px",
+        ),
+    ] {
+        let document = Html::from_string(format!(
+            "<!DOCTYPE html><meta charset=\"utf-8\">\
+             <style>@page{{size:160px 160px;margin:0}}body{{margin:0}}\
+             .outer{{width:min-content;background:green}}\
+             .table{{writing-mode:{writing_mode};direction:{direction};display:table;\
+             {inline_constraint};block-size:100px;{decoration}}}\
+             .content{{inline-size:80px;block-size:100px}}</style>\
+             <div class=\"outer\"><div class=\"table\"><div class=\"content\"></div></div></div>"
+        ))
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+
+        let page = &document.pages[0];
+        let green = CssColor::new(0, 128, 0);
+        let outer_background = page
+            .rects()
+            .iter()
+            .filter(|rect| rect.fill == Some(green))
+            .max_by(|left, right| {
+                left.width()
+                    .mul_add(left.height(), 0.0)
+                    .total_cmp(&right.width().mul_add(right.height(), 0.0))
+            })
+            .unwrap_or_else(|| panic!("expected a green table wrapper: {:?}", page.rects()));
+
+        assert!(
+            (outer_background.width() - 75.0).abs() < 0.01
+                && (outer_background.height() - 75.0).abs() < 0.01,
+            "{writing_mode} {direction} {inline_constraint} {decoration} should produce a continuous 100px table-wrapper extent: {outer_background:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn plans_table_columns_from_fixed_percentage_and_auto_cells() {
     let document = Html::from_string(
         "<table style=\"margin:0;width:500pt;border-spacing:0\"><tr><td style=\"width:30pt;border:1pt solid black\">S</td><td style=\"width:195pt;border:1pt solid black\">Label</td><td style=\"width:45%;border:1pt solid black\">Fill</td><td style=\"border:1pt solid black\">Auto</td></tr></table>",
@@ -6684,13 +6756,10 @@ async fn applies_table_min_and_max_width_before_column_planning() {
     .render(&RenderOptions::default()).await
     .unwrap();
 
+    let min_widths = horizontal_table_border_widths(&min_document);
     assert!(
-        (horizontal_table_border_widths(&min_document)
-            .iter()
-            .sum::<f32>()
-            - 80.0)
-            .abs()
-            < 0.01
+        (min_widths.iter().sum::<f32>() - 80.0).abs() < 0.01,
+        "min widths={min_widths:?}"
     );
     assert!(
         (horizontal_table_border_widths(&max_document)
@@ -7515,11 +7584,9 @@ async fn orphan_table_cell_wrapper_lays_out_block_cell_contents() {
 
 #[test]
 fn anonymous_table_cell_splits_an_inline_around_an_in_flow_block() {
-    // This exercises a nested table formatting context. Match the CLI render
-    // stack, rather than the test harness's smaller worker stack.
+    // This exercises a nested table formatting context.
     std::thread::Builder::new()
         .name("anonymous-table-cell-block-in-inline".to_string())
-        .stack_size(32 * 1024 * 1024)
         .spawn(|| {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()

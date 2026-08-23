@@ -97,8 +97,33 @@ impl<'a> LayoutBuilder<'a> {
             return inline_layout::InlineIntrinsicMeasurement::default();
         }
         self.with_positioned_layout_suppressed(|layout| {
-            let items =
+            let mut items =
                 layout.intrinsic_inline_items_for_element(element, style, stylesheets, child_boxes);
+            // A block-level list item's principal inline flow is measured
+            // here for intrinsic sizing, but its marker is deliberately not
+            // part of `intrinsic_inline_items_for_element`: that generic
+            // collector also serves vertical and atomic-inline paths which
+            // already inject their marker elsewhere. In horizontal writing,
+            // an inside marker contributes to the list item's min/max
+            // content sizes just as it does to its first formatted line.
+            //
+            // The marker is inserted only into the list item's own measured
+            // stream. Recursive block sizing consumes that contribution for
+            // floats and ancestors without making the marker inline content
+            // of a parent block.
+            // <https://drafts.csswg.org/css-lists-3/#list-style-position-property>
+            if style.writing_mode == WritingMode::HorizontalTb
+                && style.display.is_list_item()
+                && style.display.is_block_level()
+                && let Some(marker) =
+                    layout.marker_for_list_item(element, style, layout.containing_block_direction)
+                && marker.participates_in_first_line()
+            {
+                let mut marker_items = Vec::new();
+                layout.push_inside_marker_items(&marker, style, None, &mut marker_items);
+                marker_items.append(&mut items);
+                items = marker_items;
+            }
             layout.intrinsic_inline_measurement_for_items(items, style, available_width)
         })
     }
@@ -135,7 +160,9 @@ impl<'a> LayoutBuilder<'a> {
                     baseline_shift: 0.0,
                     visual_offset: InlineVisualOffset::zero(),
                     block_style: style,
-                    propagated_decoration_layers: style.text_decoration_layers.clone(),
+                    propagated_decoration_layers: style
+                        .text_decoration_origins
+                        .effective_layers_vec(),
                 },
                 &mut items,
             );
@@ -172,7 +199,7 @@ impl<'a> LayoutBuilder<'a> {
         if block_bidi_scope_needs_inline_controls(style) {
             self.push_bidi_scope_start(style, None, 0.0, InlineVisualOffset::zero(), &mut items);
         }
-        // An inline-level list-item has an inside marker.  The marker is part
+        // An inline-level list-item has an inside marker. The marker is part
         // of its shrink-to-fit contribution just as it is part of the line
         // sequence used to paint the atomic inline box.
         // <https://drafts.csswg.org/css-lists-3/#list-style-position-property>
@@ -197,7 +224,24 @@ impl<'a> LayoutBuilder<'a> {
             );
         }
         if let Some(child_boxes) = child_boxes {
-            if style.content.is_generated() {
+            if style.content.is_generated() && child_boxes.is_empty() {
+                // A generated pseudo can have no frozen formatting children
+                // even though its `content` still supplies literal generated
+                // text.  Measure that content from the originating style so
+                // an inside marker's separator remains followed by the
+                // pseudo's generated run instead of being treated as a
+                // trailing collapsible space.  This matters for a
+                // shrink-to-fit generated `display: list-item` float.
+                // <https://drafts.csswg.org/css-content-3/#content-property>
+                self.push_intrinsic_element_content_items_from_dom(
+                    element,
+                    style,
+                    stylesheets,
+                    None,
+                    InlinePlacement::zero(),
+                    &mut items,
+                );
+            } else if style.content.is_generated() {
                 self.push_intrinsic_element_content_items_from_boxes(
                     element,
                     style,
@@ -206,7 +250,7 @@ impl<'a> LayoutBuilder<'a> {
                     None,
                     0.0,
                     InlineVisualOffset::zero(),
-                    style.text_decoration_layers.clone(),
+                    style.text_decoration_origins.effective_layers_vec(),
                     &mut items,
                 );
             } else {
@@ -218,7 +262,9 @@ impl<'a> LayoutBuilder<'a> {
                         baseline_shift: 0.0,
                         visual_offset: InlineVisualOffset::zero(),
                         block_style: style,
-                        propagated_decoration_layers: style.text_decoration_layers.clone(),
+                        propagated_decoration_layers: style
+                            .text_decoration_origins
+                            .effective_layers_vec(),
                     },
                     &mut items,
                 );
@@ -266,7 +312,7 @@ impl<'a> LayoutBuilder<'a> {
                 baseline_shift: 0.0,
                 visual_offset: InlineVisualOffset::zero(),
                 block_style: style,
-                propagated_decoration_layers: style.text_decoration_layers.clone(),
+                propagated_decoration_layers: style.text_decoration_origins.effective_layers_vec(),
             },
             &mut items,
         );
@@ -321,10 +367,11 @@ impl<'a> LayoutBuilder<'a> {
         for item in items {
             match inline_item_boundary_role(&item) {
                 InlineBoundaryRole::ForcedBreak => {
+                    let force_empty_line = true;
                     self.flush_intrinsic_inline_measurement_paragraph(
                         &mut paragraph,
                         context,
-                        true,
+                        force_empty_line,
                         starts_after_forced_break,
                         &mut output,
                     );
@@ -741,7 +788,7 @@ impl<'a> LayoutBuilder<'a> {
                     0.0,
                     InlineVisualOffset::zero(),
                     style,
-                    style.text_decoration_layers.clone(),
+                    style.text_decoration_origins.effective_layers_vec(),
                     &mut items,
                 );
             } else {
@@ -752,7 +799,7 @@ impl<'a> LayoutBuilder<'a> {
                     0.0,
                     InlineVisualOffset::zero(),
                     style,
-                    style.text_decoration_layers.clone(),
+                    style.text_decoration_origins.effective_layers_vec(),
                     &mut items,
                 );
             }
@@ -937,7 +984,7 @@ impl<'a> LayoutBuilder<'a> {
                     0.0,
                     InlineVisualOffset::zero(),
                     style,
-                    style.text_decoration_layers.clone(),
+                    style.text_decoration_origins.effective_layers_vec(),
                     &mut items,
                 );
             } else {
@@ -948,7 +995,7 @@ impl<'a> LayoutBuilder<'a> {
                     0.0,
                     InlineVisualOffset::zero(),
                     style,
-                    style.text_decoration_layers.clone(),
+                    style.text_decoration_origins.effective_layers_vec(),
                     &mut items,
                 );
             }
@@ -1081,7 +1128,7 @@ impl<'a> LayoutBuilder<'a> {
             0.0,
             InlineVisualOffset::zero(),
             style,
-            style.text_decoration_layers.clone(),
+            style.text_decoration_origins.effective_layers_vec(),
             &mut items,
         );
         if let Some(marker) = marker
@@ -1101,7 +1148,7 @@ impl<'a> LayoutBuilder<'a> {
                 0.0,
                 InlineVisualOffset::zero(),
                 style,
-                style.text_decoration_layers.clone(),
+                style.text_decoration_origins.effective_layers_vec(),
                 &mut items,
             );
         } else {
@@ -1112,7 +1159,7 @@ impl<'a> LayoutBuilder<'a> {
                 0.0,
                 InlineVisualOffset::zero(),
                 style,
-                style.text_decoration_layers.clone(),
+                style.text_decoration_origins.effective_layers_vec(),
                 &mut items,
             );
         }
@@ -1231,7 +1278,9 @@ impl<'a> LayoutBuilder<'a> {
                             &child_style,
                             link.clone(),
                             child_placement,
-                            InlineElementScopeOptions::DOM_INTRINSIC,
+                            InlineElementScopeOptions::DOM_INTRINSIC.with_preserved_empty_metrics(
+                                empty_inline_scope_has_distinct_metrics(style, &child_style),
+                            ),
                             output,
                         );
                         layout.push_generated_pseudo_items(
@@ -1621,6 +1670,24 @@ impl<'a> LayoutBuilder<'a> {
         // <https://www.w3.org/TR/css-values-4/#font-relative-lengths> and
         // <https://www.w3.org/TR/CSS22/visuren.html#inline-formatting>
         let mut edge_style = self.style_with_current_used_lengths(style);
+        // The zero-width edge is the lexical owner of the inline box's line
+        // relative alignment. Its `normal` line-height must use the same
+        // selected font metrics as its text descendants; preserving `normal`
+        // on this detached style can instead select the provisional fallback
+        // metric. Materialize the text-used height at this layout boundary so
+        // `vertical-align: bottom` cannot enlarge an otherwise identical
+        // line and move adjacent text. Other used edge geometry still comes
+        // from the current formatting context below.
+        // <https://www.w3.org/TR/CSS22/visudet.html#propdef-line-height>
+        if style.line_height_is_normal() {
+            let used_line_height = self
+                .font_system
+                .resolved_inline_text_metrics(style)
+                .line_block_size()
+                .points();
+            edge_style.line_height = used_line_height;
+            edge_style.line_height_value = css::ComputedLineHeight::from_points(used_line_height);
+        }
         let edge_percentage_basis = if options.push_page_scope {
             self.current_content_logical_inline_content_size()
         } else {
@@ -1645,13 +1712,9 @@ impl<'a> LayoutBuilder<'a> {
         } else {
             options.fragment_edges
         };
-        let positioning_containing_block_source =
-            inline_scope_establishes_positioning_containing_block(&edge_style).then(|| {
-                InlinePositioningContainingBlockSource {
-                    id: InlinePositioningContainingBlockId(inline_box_start),
-                    style: edge_style.clone(),
-                }
-            });
+        let positioning_containing_block_id =
+            inline_scope_establishes_positioning_containing_block(&edge_style)
+                .then_some(InlinePositioningContainingBlockId(inline_box_start));
         // CSS Paged Media applies `page` only to boxes that establish a
         // class-A break opportunity. Inline boxes stay inside their enclosing
         // inline formatting context, so their declarations must not split a
@@ -1671,9 +1734,7 @@ impl<'a> LayoutBuilder<'a> {
             link_target.clone(),
             placement.baseline_shift(),
             placement.visual_offset,
-            positioning_containing_block_source
-                .as_ref()
-                .map(|source| source.id),
+            positioning_containing_block_id,
             fragment_edges.owns_start,
             output,
         );
@@ -1691,10 +1752,11 @@ impl<'a> LayoutBuilder<'a> {
             link_target,
             baseline_shift: placement.baseline_shift(),
             visual_offset: placement.visual_offset,
-            edge_style: edge_style.clone(),
-            positioning_containing_block_source,
+            edge_style: Box::new(edge_style),
+            positioning_containing_block_id,
             pushed_page_scope,
             mark_hanging_edges: options.mark_hanging_edges,
+            preserve_empty_metrics: options.preserve_empty_metrics,
             fragment_edges,
             counter_scope,
             counter_snapshot,
@@ -1713,9 +1775,10 @@ impl<'a> LayoutBuilder<'a> {
             baseline_shift,
             visual_offset,
             edge_style,
-            positioning_containing_block_source,
+            positioning_containing_block_id,
             pushed_page_scope,
             mark_hanging_edges,
+            preserve_empty_metrics,
             fragment_edges,
             counter_scope,
             counter_snapshot,
@@ -1725,9 +1788,7 @@ impl<'a> LayoutBuilder<'a> {
             link_target,
             baseline_shift,
             visual_offset,
-            positioning_containing_block_source
-                .as_ref()
-                .map(|source| source.id),
+            positioning_containing_block_id,
             fragment_edges.owns_end,
             output,
         );
@@ -1746,10 +1807,21 @@ impl<'a> LayoutBuilder<'a> {
                 output,
                 inline_box_start,
                 &edge_style,
-                positioning_containing_block_source
-                    .as_ref()
-                    .map(|source| source.id),
+                positioning_containing_block_id,
             );
+        }
+        if preserve_empty_metrics
+            && inline_scope_has_only_structural_items(&output[inline_box_start..])
+            && let Some(atom) = output[inline_box_start..].iter_mut().find_map(|item| {
+                let InlineItem::Atom(atom) = item else {
+                    return None;
+                };
+                matches!(atom.content(), InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge))
+                    if edge.advance == 0.0 && edge.paint_extent == 0.0 && !edge.is_positioning_marker())
+                .then_some(atom)
+            })
+        {
+            atom.mark_metrics_only_strut();
         }
         self.end_counter_scope(counter_scope);
         if let Some(counter_snapshot) = counter_snapshot {
@@ -1786,6 +1858,23 @@ impl<'a> LayoutBuilder<'a> {
             );
         }
     }
+}
+
+/// Whether a scope contains only bookkeeping for an otherwise empty inline
+/// box. Bidi controls remain structural; text, markers, floats, and atomic
+/// descendants make the scope non-empty.
+fn inline_scope_has_only_structural_items(items: &[InlineItem]) -> bool {
+    items.iter().all(|item| match item {
+        InlineItem::Atom(atom) => matches!(
+            atom.content(),
+            InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(_))
+        ),
+        InlineItem::Word(word) => word.source == InlineTextSource::BidiControl,
+        InlineItem::Float(_)
+        | InlineItem::Break(_)
+        | InlineItem::PageScopeStart(_)
+        | InlineItem::PageScopeEnd => false,
+    })
 }
 
 fn mark_inline_text_items_as_run_in(items: &mut [InlineItem]) {

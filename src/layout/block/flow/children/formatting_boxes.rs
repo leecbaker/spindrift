@@ -1,10 +1,27 @@
+use std::num::NonZeroUsize;
+
 use super::shared::*;
 use super::state::{
-    BlockFlowChildTraversalState, ChildFlowTraversalOutcome, RenderedLegendGeometry,
+    AutomaticBlockSizeReplayState, BlockFlowChildTraversalState, ChildFlowTraversalOutcome,
+    FormattingBoxAutomaticBlockSizeReplayCheckpoint, RenderedLegendGeometry,
 };
 use super::*;
 use crate::layout::inline_collect::TextDecorationPropagationContext;
-use std::num::NonZeroUsize;
+
+#[inline(never)]
+fn rendered_legend_layout_style(style: &css::ComputedStyle) -> Box<css::ComputedStyle> {
+    let mut style = Box::new(style.clone());
+    style.box_values.width = css::ComputedLengthPercentageOrAuto::MaxContent;
+    style
+}
+
+#[inline(never)]
+fn generated_pseudo_image_layout_style(style: &css::ComputedStyle) -> Box<css::ComputedStyle> {
+    let mut style = Box::new(style.clone());
+    style.object_fit = css::ObjectFit::None;
+    style.object_position = css::BackgroundPosition::INITIAL;
+    style
+}
 
 impl<'a> LayoutBuilder<'a> {
     #[allow(clippy::too_many_arguments)]
@@ -25,6 +42,8 @@ impl<'a> LayoutBuilder<'a> {
         run_in_inline_items_laid_out: bool,
         traversal_state: &mut BlockFlowChildTraversalState,
     ) -> ChildFlowTraversalOutcome {
+        #[cfg(all(feature = "stack-profile", target_os = "macos"))]
+        let mut stack_profile_scope = stack_profile::enter("layout_formatting_box_flow_children");
         let permits_parent_start_collapse =
             start_margin_arrangement.permits_parent_start_collapse();
         let mut collapsed_end_margin = false;
@@ -70,7 +89,9 @@ impl<'a> LayoutBuilder<'a> {
         // replayed with its final eligible inline line as the marker host.
         // <https://drafts.csswg.org/css-overflow-4/#line-clamp-containers>
         let mut automatic_marker_replay_target = None;
-        let mut automatic_marker_candidate = None;
+        let mut automatic_marker_candidate: Option<
+            Box<FormattingBoxAutomaticBlockSizeReplayCheckpoint>,
+        > = None;
         // `line-clamp` limits the generated line boxes of the block
         // container, including line boxes formed by its anonymous
         // inline runs and nested in-flow blocks. Carry the remaining
@@ -94,22 +115,26 @@ impl<'a> LayoutBuilder<'a> {
             .flatten();
         let mut child_box_index = 0usize;
         while child_box_index < child_boxes.len() {
+            #[cfg(all(feature = "stack-profile", target_os = "macos"))]
+            stack_profile_scope.set_source_index(child_box_index);
             let automatic_replay_before_child =
                 traversal_state.has_automatic_block_size_clamp().then(|| {
-                    (
-                        self.snapshot(),
+                    Box::new(FormattingBoxAutomaticBlockSizeReplayCheckpoint {
+                        state: AutomaticBlockSizeReplayState {
+                            snapshot: self.snapshot(),
+                            previous_flow_bottom_margin,
+                            seen_flow_child,
+                            trim_block_start_adjoining_margins,
+                            collapsed_end_margin,
+                            pending_end_margin_collapse,
+                            previous_child_page_end: previous_child_page_end.clone(),
+                            float_run,
+                            previous_break_after,
+                            first_formatted_line,
+                            traversal_state: traversal_state.clone(),
+                        },
                         child_box_index,
-                        previous_flow_bottom_margin,
-                        seen_flow_child,
-                        trim_block_start_adjoining_margins,
-                        collapsed_end_margin,
-                        pending_end_margin_collapse,
-                        previous_child_page_end.clone(),
-                        float_run,
-                        previous_break_after,
-                        first_formatted_line,
-                        traversal_state.clone(),
-                    )
+                    })
                 });
             if traversal_state.has_reached_discard_region_limit(self.pages.len()) {
                 let child_count = NonZeroUsize::new(child_box_index);
@@ -307,6 +332,8 @@ impl<'a> LayoutBuilder<'a> {
                 // back to the canvas edge just as for block children.
                 // <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
                 let bottom_inline_start = !consuming_root_canvas
+                    && (root_principal_inline_pseudo
+                        || self.element_supplies_document_principal_flow(element))
                     && WritingModeAxes::new(style.writing_mode, style.used_direction())
                         .swaps_physical_axes()
                     && self.active_fragmentainer_kind() == FragmentainerKind::Page
@@ -395,12 +422,23 @@ impl<'a> LayoutBuilder<'a> {
                     first_formatted_line.consume_next_formatted_line();
                 }
                 traversal_state.debit_inline_outcome(inline_outcome);
-                self.flush_float_run(&mut float_run);
                 if inline_outcome.has_flow_effects {
+                    // An anonymous inline run that committed in-flow source
+                    // ends any adjoining float placement inherited from the
+                    // preceding block boundary.  Reset both the replay
+                    // origin and the immediate run view at the resulting
+                    // source-order position.  Inline floats discovered while
+                    // the run is active have already used the inline marker
+                    // transaction and are intentionally unaffected.
+                    // <https://drafts.csswg.org/css2/#float-position>
+                    self.adjoining_float_origin_y = None;
+                    self.flush_float_run(&mut float_run);
                     trim_block_start_adjoining_margins = false;
                     previous_flow_bottom_margin = None;
                     avoid_run_candidate = None;
                     previous_break_after = PageBreak::Auto;
+                } else {
+                    self.flush_float_run(&mut float_run);
                 }
                 if zero_height_page_boundary {
                     if let Some(child_page_start) = effective_child_page_start {
@@ -533,7 +571,10 @@ impl<'a> LayoutBuilder<'a> {
                     stylesheets,
                 )
             });
-            if let Some(committed) = self.committed_inline_floats.remove(&child_element.id) {
+            if let Some(committed) = self
+                .committed_inline_floats
+                .remove(&InlineFloatId::Element(child_element.id))
+            {
                 // The selected inline source row owns this float's exclusion
                 // and paint capture.  Do not replay the same formatting box
                 // as an independent block-child float.
@@ -551,6 +592,7 @@ impl<'a> LayoutBuilder<'a> {
                     Some(child_children),
                     child_table_fragment,
                     stylesheets,
+                    FloatPlacementAxes::for_style(style),
                     &mut float_run,
                     split_inline_float_block_offset,
                 )
@@ -562,6 +604,7 @@ impl<'a> LayoutBuilder<'a> {
                     Some(child_children),
                     child_table_fragment,
                     stylesheets,
+                    FloatPlacementAxes::for_style(style),
                     &mut float_run,
                 )
             };
@@ -1037,23 +1080,21 @@ impl<'a> LayoutBuilder<'a> {
                         )
                     })
                     .flatten();
-            // Block traversal's legacy cursor is physical top-to-bottom.
-            // The principal vertical flow instead advances through the page's
-            // horizontal span; preserve the inline cursor while consuming the
-            // completed child fragment from logical block-start.
-            let principal_vertical_placement = (is_flow_child
-                && self.active_fragmentainer_kind() == FragmentainerKind::Page
-                // The root supplies the principal document canvas when
-                // containment blocks body propagation; otherwise the
-                // eligible body does. Nested vertical formatting contexts
-                // retain a local block axis and do not advance page progress.
-                // <https://drafts.csswg.org/css-writing-modes-4/#principal-flow>
-                && self.element_supplies_document_principal_flow(element))
+            // Block traversal's legacy cursor is physical top-to-bottom. A
+            // vertical containing flow instead advances through its physical
+            // horizontal block track; preserve the physical-y inline origin
+            // while consuming each completed child from logical block-start.
+            // Nested placement remains local, while only the document's
+            // principal flow is allowed to advance fragmentainers.
+            // <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
+            // <https://www.w3.org/TR/css-writing-modes-4/#logical-to-physical>
+            let orthogonal_block_placement = (is_flow_child
+                && style.writing_mode.has_vertical_lines())
             .then(|| {
-                PrincipalVerticalChildPlacement::new(
+                OrthogonalBlockPlacement::new(
                     style.writing_mode,
                     style.used_direction(),
-                    self.principal_vertical_child_inline_origin(
+                    self.vertical_child_inline_origin(
                         element,
                         style.writing_mode,
                         style.used_direction(),
@@ -1065,10 +1106,10 @@ impl<'a> LayoutBuilder<'a> {
                 )
             })
             .flatten();
-            let principal_flow_page_index = self.pages.len();
-            let principal_flow_paint_checkpoint =
-                principal_vertical_placement.map(|_| self.current_page.paint_checkpoint());
-            if let Some(placement) = principal_vertical_placement {
+            let orthogonal_placement_page_index = self.pages.len();
+            let orthogonal_placement_paint_checkpoint =
+                orthogonal_block_placement.map(|_| self.current_page.paint_checkpoint());
+            if let Some(placement) = orthogonal_block_placement {
                 debug_assert_eq!(
                     placement.logical_inline_percentage_basis().points(),
                     self.current_content_logical_inline_size(),
@@ -1088,8 +1129,9 @@ impl<'a> LayoutBuilder<'a> {
             // at the block-start edge of a fresh page area.
             // <https://www.w3.org/TR/css-writing-modes-4/#block-flow>
             // <https://www.w3.org/TR/css-break-3/#fragmentation-model>
-            if principal_vertical_placement
-                .is_some_and(|placement| placement.block_track_is_exhausted())
+            if self.element_supplies_document_principal_flow(element)
+                && orthogonal_block_placement
+                    .is_some_and(|placement| placement.block_track_is_exhausted())
                 && self.current_page_has_content()
             {
                 self.push_page();
@@ -1101,9 +1143,9 @@ impl<'a> LayoutBuilder<'a> {
             // inline box (such as `html::after`) starts after the whole
             // viewport instead of after the body's actual document flow.
             // <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
-            let source_body_canvas = principal_vertical_placement.is_some()
+            let source_body_canvas = orthogonal_block_placement.is_some()
                 && self.principal_flow.is_source_body(child_element);
-            let bottom_origin_canvas_child = principal_vertical_placement.is_some()
+            let bottom_origin_canvas_child = orthogonal_block_placement.is_some()
                 && self.element_supplies_document_principal_flow(element)
                 && inline_start_side(style.writing_mode, style.used_direction())
                     == PhysicalSide::Bottom;
@@ -1123,27 +1165,17 @@ impl<'a> LayoutBuilder<'a> {
             .then_some(self.cursor_y);
             self.last_block_layout_outcome = BlockLayoutOutcome::default();
             let previous_direct_block_layout_constraint = self
-                .replace_direct_block_layout_constraint(
-                    child_element,
-                    principal_vertical_placement,
-                );
-            let mut rendered_legend_style;
-            let child_layout_style =
-                if rendered_fieldset_legend && child_style.box_values.width.is_auto() {
-                    rendered_legend_style = child_style.clone();
-                    rendered_legend_style.box_values.width =
-                        css::ComputedLengthPercentageOrAuto::MaxContent;
-                    &rendered_legend_style
-                } else {
-                    child_style
-                };
+                .replace_direct_block_layout_constraint(child_element, orthogonal_block_placement);
+            let rendered_legend_style = (rendered_fieldset_legend
+                && child_style.box_values.width.is_auto())
+            .then(|| rendered_legend_layout_style(child_style));
+            let child_layout_style = rendered_legend_style.as_deref().unwrap_or(child_style);
             // A generated pseudo with a sole image is a decorated container
             // for anonymous replaced content, not a replacement of the
             // originating element. Keep its payload at natural size while
             // preserving the pseudo's own authored background and dimensions.
             // <https://www.w3.org/TR/css-content-3/#content-property>
-            let mut generated_pseudo_image_style;
-            let child_layout_style = if matches!(
+            let generated_pseudo_image_style = (matches!(
                 child_box.element_core().map(|core| &core.source),
                 Some(box_tree::BoxSource::GeneratedPseudo(_))
             ) && matches!(
@@ -1152,14 +1184,11 @@ impl<'a> LayoutBuilder<'a> {
                     image: css::GeneratedContentPart::Image { .. },
                     ..
                 }
-            ) {
-                generated_pseudo_image_style = child_layout_style.clone();
-                generated_pseudo_image_style.object_fit = css::ObjectFit::None;
-                generated_pseudo_image_style.object_position = css::BackgroundPosition::INITIAL;
-                &generated_pseudo_image_style
-            } else {
-                child_layout_style
-            };
+            ))
+            .then(|| generated_pseudo_image_layout_style(child_layout_style));
+            let child_layout_style = generated_pseudo_image_style
+                .as_deref()
+                .unwrap_or(child_layout_style);
             if child_layout_style.display.is_block_level() {
                 let previous_block_static_position_y_offset =
                     if matches!(child_style.position, Position::Absolute | Position::Fixed) {
@@ -1431,9 +1460,9 @@ impl<'a> LayoutBuilder<'a> {
             }
             self.restore_direct_block_layout_constraint(previous_direct_block_layout_constraint);
             if let (Some(checkpoint), Some(placement)) = (
-                principal_flow_paint_checkpoint,
-                principal_vertical_placement,
-            ) && self.pages.len() == principal_flow_page_index
+                orthogonal_placement_paint_checkpoint,
+                orthogonal_block_placement,
+            ) && self.pages.len() == orthogonal_placement_page_index
             {
                 let fragment = self.current_page.take_paint_fragment_since(checkpoint);
                 // A logical block sibling consumes the preceding child's used
@@ -1443,11 +1472,13 @@ impl<'a> LayoutBuilder<'a> {
                 // placement according to incidental ink.
                 // <https://www.w3.org/TR/css-writing-modes-4/#logical-to-physical>
                 let child_block_end_margin = placement.child_block_end_margin(child_style);
-                let remaining_block_track = placement.track_after_committed_child(
+                let child_margin_box_block_extent = placement.child_margin_box_block_extent(
                     self.last_block_layout_outcome
                         .physical_border_box_inline_span,
-                    child_block_end_margin,
+                    child_style,
                 );
+                let remaining_block_track =
+                    placement.track_after_committed_child(child_margin_box_block_extent);
                 if is_flow_child && self.principal_flow.is_source_body(element) {
                     // The body's ordinary child cursor is local to the
                     // document canvas. Retain only its trailing logical
@@ -1528,7 +1559,7 @@ impl<'a> LayoutBuilder<'a> {
                 } else {
                     child_style.margin.bottom
                 };
-                previous_flow_bottom_margin = if principal_vertical_placement.is_some() {
+                previous_flow_bottom_margin = if orthogonal_block_placement.is_some() {
                     // This traversal cursor is physical top-to-bottom, but
                     // a principal vertical flow advances along the physical
                     // horizontal block axis. The child's physical bottom
@@ -1620,21 +1651,26 @@ impl<'a> LayoutBuilder<'a> {
                 && self.last_block_layout_outcome.has_local_continuation_cutoff
                 && automatic_marker_replay_target != Some(child_box_index);
             if replay_preceding_child_for_empty_automatic_cutoff
-                && let Some((
-                    snapshot,
-                    saved_child_box_index,
-                    saved_previous_flow_bottom_margin,
-                    saved_seen_flow_child,
-                    saved_trim_block_start_adjoining_margins,
-                    saved_collapsed_end_margin,
-                    saved_pending_end_margin_collapse,
-                    saved_previous_child_page_end,
-                    saved_float_run,
-                    saved_previous_break_after,
-                    saved_first_formatted_line,
-                    saved_traversal_state,
-                )) = automatic_marker_candidate.take()
+                && let Some(checkpoint) = automatic_marker_candidate.take()
             {
+                let FormattingBoxAutomaticBlockSizeReplayCheckpoint {
+                    state:
+                        AutomaticBlockSizeReplayState {
+                            snapshot,
+                            previous_flow_bottom_margin: saved_previous_flow_bottom_margin,
+                            seen_flow_child: saved_seen_flow_child,
+                            trim_block_start_adjoining_margins:
+                                saved_trim_block_start_adjoining_margins,
+                            collapsed_end_margin: saved_collapsed_end_margin,
+                            pending_end_margin_collapse: saved_pending_end_margin_collapse,
+                            previous_child_page_end: saved_previous_child_page_end,
+                            float_run: saved_float_run,
+                            previous_break_after: saved_previous_break_after,
+                            first_formatted_line: saved_first_formatted_line,
+                            traversal_state: saved_traversal_state,
+                        },
+                    child_box_index: saved_child_box_index,
+                } = *checkpoint;
                 self.restore(snapshot);
                 child_box_index = saved_child_box_index;
                 previous_flow_bottom_margin = saved_previous_flow_bottom_margin;
@@ -1662,21 +1698,26 @@ impl<'a> LayoutBuilder<'a> {
                 && !self.last_block_layout_outcome.has_local_continuation_cutoff
                 && automatic_marker_replay_target != Some(child_box_index);
             if replay_current_child_as_automatic_marker
-                && let Some((
-                    snapshot,
-                    _,
-                    saved_previous_flow_bottom_margin,
-                    saved_seen_flow_child,
-                    saved_trim_block_start_adjoining_margins,
-                    saved_collapsed_end_margin,
-                    saved_pending_end_margin_collapse,
-                    saved_previous_child_page_end,
-                    saved_float_run,
-                    saved_previous_break_after,
-                    saved_first_formatted_line,
-                    saved_traversal_state,
-                )) = automatic_replay_before_child
+                && let Some(checkpoint) = automatic_replay_before_child
             {
+                let FormattingBoxAutomaticBlockSizeReplayCheckpoint {
+                    state:
+                        AutomaticBlockSizeReplayState {
+                            snapshot,
+                            previous_flow_bottom_margin: saved_previous_flow_bottom_margin,
+                            seen_flow_child: saved_seen_flow_child,
+                            trim_block_start_adjoining_margins:
+                                saved_trim_block_start_adjoining_margins,
+                            collapsed_end_margin: saved_collapsed_end_margin,
+                            pending_end_margin_collapse: saved_pending_end_margin_collapse,
+                            previous_child_page_end: saved_previous_child_page_end,
+                            float_run: saved_float_run,
+                            previous_break_after: saved_previous_break_after,
+                            first_formatted_line: saved_first_formatted_line,
+                            traversal_state: saved_traversal_state,
+                        },
+                    child_box_index: _,
+                } = *checkpoint;
                 self.restore(snapshot);
                 previous_flow_bottom_margin = saved_previous_flow_bottom_margin;
                 seen_flow_child = saved_seen_flow_child;

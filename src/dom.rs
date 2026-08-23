@@ -3,11 +3,14 @@ use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use html5ever::parse_document as parse_html_document;
 use html5ever::tendril::TendrilSink;
-use html5ever::tree_builder::QuirksMode as HtmlParserQuirksMode;
+use html5ever::tree_builder::{QuirksMode as HtmlParserQuirksMode, TreeBuilderOpts};
+use html5ever::{ParseOpts as HtmlParseOptions, parse_document as parse_html_document};
 use markup5ever_rcdom::{Handle, NodeData as RcNodeData, RcDom};
 use xml5ever::driver::parse_document as parse_xml_document;
+
+use crate::css::ResolveViewportLengths;
+use crate::units::{LayoutSize, PercentageBasis, SemanticLengthExt, layout_pt};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DocumentSyntax {
@@ -44,6 +47,7 @@ pub(crate) struct Node {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum NodeKind {
     Text(String),
     Element(Element),
@@ -71,6 +75,21 @@ pub(crate) struct Element {
     /// CSS box construction, so all layout paths observe the same result.
     /// <https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-object-element>
     pub object_rendering: ObjectRendering,
+    /// The image candidate selected before visual-resource preloading.
+    ///
+    /// `<picture>` source selection must be shared by preloading, static
+    /// availability selection, and layout so every stage observes the same
+    /// resource and density.
+    /// <https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>
+    pub selected_image_source: Option<SelectedImageSource>,
+    /// Static rendering outcome selected for an HTML `<img>` element.
+    ///
+    /// A failed image with non-empty alternative text is rendered as ordinary
+    /// fallback text, rather than as a replaced element. This is resolved
+    /// after optional visual resources have been preloaded and before CSS box
+    /// construction, so layout never has to infer resource availability.
+    /// <https://html.spec.whatwg.org/multipage/rendering.html>
+    pub image_rendering: ImageRendering,
 }
 
 /// The static renderer's selected representation for an HTML `<object>`.
@@ -86,6 +105,98 @@ pub(crate) enum ObjectRendering {
     Fallback,
     /// Render a successfully decoded raster or SVG resource as a replaced image.
     Image,
+}
+
+/// The static renderer's selected representation for an HTML `<img>`.
+///
+/// A live browser can transition through loading and failure states. Quire
+/// performs one deterministic paged layout, so it selects the decoded image,
+/// its alternative text fallback, or an empty fallback once visual resources
+/// have been preloaded.
+/// <https://html.spec.whatwg.org/multipage/rendering.html>
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ImageRendering {
+    /// Render a decoded raster or SVG resource as a replaced image.
+    #[default]
+    Image,
+    /// Render the non-empty `alt` attribute through ordinary text layout.
+    AltText,
+    /// Render no fallback text; the image keeps zero natural dimensions.
+    Empty,
+}
+
+/// A fixed-resolution image candidate selected for an HTML `<img>` element.
+///
+/// The density is finite and strictly positive by construction, making its
+/// equality relation reflexive despite its floating-point representation.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SelectedImageSource {
+    pub(crate) url: String,
+    pub(crate) density: ImageDensity,
+    /// The dimension attributes that HTML selected with this source, if a
+    /// `<picture>` source supplied either dimension.
+    pub(crate) dimensions: Option<ImageDimensionAttributes>,
+}
+
+impl Eq for SelectedImageSource {}
+
+/// A selected image's effective pixel density.
+///
+/// A width candidate with a zero source size has an infinite density; HTML
+/// gives that resource zero density-corrected natural dimensions rather than
+/// allowing an IEEE infinity into layout arithmetic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImageDensity {
+    Finite(OrderedImageDensity),
+    Infinite,
+}
+
+/// A finite, strictly-positive image density.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct OrderedImageDensity(f32);
+
+impl Eq for OrderedImageDensity {}
+
+impl OrderedImageDensity {
+    fn new(value: f32) -> Option<Self> {
+        (value.is_finite() && value > 0.0).then_some(Self(value))
+    }
+
+    pub(crate) fn value(self) -> f32 {
+        self.0
+    }
+}
+
+impl ImageDensity {
+    pub(crate) fn one() -> Self {
+        Self::Finite(OrderedImageDensity::new(1.0).expect("1x is valid"))
+    }
+}
+
+/// Raw HTML dimension attributes selected for an `<img>` resource.
+///
+/// These are deliberately not selector attributes: a selected `<source>` can
+/// supply presentational dimensions without changing what CSS selectors or
+/// `attr()` see on the actual `<img>` element.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ImageDimensionAttributes {
+    pub(crate) width: Option<String>,
+    pub(crate) height: Option<String>,
+}
+
+impl SelectedImageSource {
+    fn new(url: impl Into<String>, density: ImageDensity) -> Self {
+        Self {
+            url: url.into(),
+            density,
+            dimensions: None,
+        }
+    }
+
+    pub(crate) fn with_dimensions(mut self, dimensions: ImageDimensionAttributes) -> Self {
+        self.dimensions = Some(dimensions);
+        self
+    }
 }
 
 /// Stable identity for a source DOM element, preserved by layout clones.
@@ -107,6 +218,13 @@ pub(crate) struct NamespacedAttribute {
 }
 
 impl Element {
+    /// Returns the HTML dimension attributes selected with this image source.
+    pub(crate) fn selected_image_dimensions(&self) -> Option<&ImageDimensionAttributes> {
+        self.selected_image_source
+            .as_ref()
+            .and_then(|source| source.dimensions.as_ref())
+    }
+
     /// Return the null-namespace attribute addressed by an unprefixed CSS
     /// `attr()` name on this element.
     ///
@@ -145,6 +263,8 @@ impl Node {
                 is_target: false,
                 selector_snapshot: OnceCell::new(),
                 object_rendering: ObjectRendering::Fallback,
+                selected_image_source: None,
+                image_rendering: ImageRendering::Image,
             }),
         }
     }
@@ -164,12 +284,217 @@ impl Node {
         }
     }
 
-    fn as_element_mut(&mut self) -> Option<&mut Element> {
+    pub(crate) fn as_element_mut(&mut self) -> Option<&mut Element> {
         match &mut self.kind {
             NodeKind::Element(element) => Some(element),
             NodeKind::Text(_) => None,
         }
     }
+}
+
+/// Select the fixed-resolution source used by Quire for an HTML `<img>`.
+///
+/// The paged renderer has a fixed 1dppx output resolution. Density candidates
+/// follow Quire's fixed-resolution selection policy and preserve source order
+/// for equal densities.
+/// <https://html.spec.whatwg.org/multipage/images.html#attr-img-srcset>
+/// <https://drafts.csswg.org/css-images-4/#image-set-resolution>
+pub(crate) fn selected_img_source(element: &Element) -> Option<(&str, ImageDensity)> {
+    debug_assert_eq!(element.tag, "img");
+    element
+        .selected_image_source
+        .as_ref()
+        .map(|source| (source.url.as_str(), source.density))
+        // DOM preparation always sets the stored value before resource
+        // discovery. Keep the attribute fallback for isolated layout tests
+        // and internal callers that construct an element without that pass.
+        .or_else(|| {
+            element
+                .attrs
+                .get("src")
+                .map(|src| (src.as_str(), ImageDensity::one()))
+        })
+}
+
+/// Resolve this renderer's fixed-resolution candidate from an image-like
+/// element's own attributes. `<picture>` ownership is resolved separately by
+/// the HTML preparation pass and stored on its child `<img>`.
+pub(crate) fn selected_image_source_from_attributes(
+    element: &Element,
+    media_environment: &crate::css::MediaEnvironment,
+) -> Option<SelectedImageSource> {
+    selected_source_set_candidate(
+        element.attrs.get("src").map(String::as_str),
+        element.attrs.get("srcset").map(String::as_str),
+        element.attrs.get("sizes").map(String::as_str),
+        media_environment,
+    )
+}
+
+/// Resolve one static HTML source set at the renderer's output density.
+///
+/// This owns source-set parsing, width-descriptor normalization, and the
+/// deterministic static choice shared by image preloading and layout.
+/// <https://html.spec.whatwg.org/multipage/images.html#creating-a-source-set>
+pub(crate) fn selected_source_set_candidate(
+    src: Option<&str>,
+    srcset: Option<&str>,
+    sizes: Option<&str>,
+    media_environment: &crate::css::MediaEnvironment,
+) -> Option<SelectedImageSource> {
+    let mut candidates = srcset
+        .filter(|value| !value.is_empty())
+        .map(parse_srcset_candidates)
+        .unwrap_or_default();
+    let has_width_descriptor = candidates
+        .iter()
+        .any(|candidate| matches!(candidate.descriptor, ImageCandidateDescriptor::Width(_)));
+    if !has_width_descriptor && let Some(src) = src.filter(|value| !value.is_empty()) {
+        candidates.push(ParsedImageCandidate {
+            url: src.to_owned(),
+            descriptor: ImageCandidateDescriptor::Density(
+                OrderedImageDensity::new(1.0).expect("1x is valid"),
+            ),
+        });
+    }
+    let source_size = source_size_from_sizes(sizes, media_environment);
+    let target = media_environment.resolution_dppx;
+    candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            let density = match candidate.descriptor {
+                ImageCandidateDescriptor::Density(density) => ImageDensity::Finite(density),
+                ImageCandidateDescriptor::Width(width) => {
+                    if source_size == 0.0 {
+                        ImageDensity::Infinite
+                    } else {
+                        ImageDensity::Finite(OrderedImageDensity::new(width as f32 / source_size)?)
+                    }
+                }
+            };
+            Some(SelectedImageSource::new(candidate.url, density))
+        })
+        .fold(None, |selected: Option<SelectedImageSource>, candidate| {
+            let candidate_density = image_density_order(candidate.density);
+            match selected {
+                None => Some(candidate),
+                Some(selected) => {
+                    let selected_density = image_density_order(selected.density);
+                    let candidate_is_sufficient = candidate_density >= target;
+                    let selected_is_sufficient = selected_density >= target;
+                    if (candidate_is_sufficient
+                        && (!selected_is_sufficient || candidate_density < selected_density))
+                        || (!candidate_is_sufficient
+                            && !selected_is_sufficient
+                            && candidate_density > selected_density)
+                    {
+                        Some(candidate)
+                    } else {
+                        Some(selected)
+                    }
+                }
+            }
+        })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedImageCandidate {
+    url: String,
+    descriptor: ImageCandidateDescriptor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageCandidateDescriptor {
+    Density(OrderedImageDensity),
+    Width(u32),
+}
+
+fn parse_srcset_candidates(srcset: &str) -> Vec<ParsedImageCandidate> {
+    parse_srcset::parse_srcset(srcset)
+        .into_iter()
+        .filter_map(|candidate| {
+            // `h` is not a current HTML image-candidate descriptor.
+            if candidate.height.is_some() {
+                return None;
+            }
+            let descriptor = match (candidate.width, candidate.density) {
+                (Some(width), None) => ImageCandidateDescriptor::Width(u32::try_from(width).ok()?),
+                (None, Some(density)) => {
+                    ImageCandidateDescriptor::Density(OrderedImageDensity::new(density as f32)?)
+                }
+                (None, None) => ImageCandidateDescriptor::Density(
+                    OrderedImageDensity::new(1.0).expect("1x is valid"),
+                ),
+                (Some(_), Some(_)) => return None,
+            };
+            Some(ParsedImageCandidate {
+                url: candidate.url,
+                descriptor,
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn image_density_order(density: ImageDensity) -> f32 {
+    match density {
+        ImageDensity::Finite(density) => density.value(),
+        ImageDensity::Infinite => f32::INFINITY,
+    }
+}
+
+fn source_size_from_sizes(
+    sizes: Option<&str>,
+    media_environment: &crate::css::MediaEnvironment,
+) -> f32 {
+    let fallback = media_environment.viewport.width.max(0.0);
+    let Some(sizes) = sizes else {
+        return fallback;
+    };
+    let entries = crate::css::component_values::split_css_top_level_delimiter(sizes, ',');
+    for entry in entries {
+        let components = crate::css::split_css_component_values(entry);
+        let Some((length, condition)) = components.split_last() else {
+            return fallback;
+        };
+        if length.eq_ignore_ascii_case("auto") {
+            continue;
+        }
+        if !condition.is_empty()
+            && !crate::css::media_rule_applies_in_environment(
+                &condition.join(" "),
+                media_environment,
+            )
+        {
+            continue;
+        }
+        let Some(mut length) =
+            crate::css::parse_computed_length_percentage(length, crate::css::ROOT_FONT_SIZE_PT)
+        else {
+            return fallback;
+        };
+        if length.contains_percentage() {
+            return fallback;
+        }
+        let viewport = LayoutSize::new(
+            media_environment.viewport.width * crate::css::CSS_PX_TO_PT,
+            media_environment.viewport.height * crate::css::CSS_PX_TO_PT,
+        );
+        length.resolve_viewport_lengths(crate::css::ViewportLengthBasis::for_writing_mode(
+            viewport,
+            crate::css::WritingMode::HorizontalTb,
+        ));
+        let value = length
+            .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(0.0)))
+            .map(SemanticLengthExt::points)
+            .unwrap_or(0.0)
+            / crate::css::CSS_PX_TO_PT;
+        return if value.is_finite() && value >= 0.0 {
+            value
+        } else {
+            fallback
+        };
+    }
+    fallback
 }
 
 #[cfg(test)]
@@ -185,7 +510,18 @@ pub(crate) fn parse_with_syntax(source: &str, syntax: DocumentSyntax) -> crate::
 }
 
 fn parse_html(source: &str) -> Node {
-    let dom = parse_html_document(RcDom::default(), Default::default()).one(source);
+    // Quire is a static renderer and never runs document scripts. Select the
+    // corresponding HTML parser mode so `<noscript>` fallback markup is built
+    // as DOM content instead of being retained as raw text.
+    // https://html.spec.whatwg.org/multipage/scripting.html#the-noscript-element
+    let options = HtmlParseOptions {
+        tree_builder: TreeBuilderOpts {
+            scripting_enabled: false,
+            ..TreeBuilderOpts::default()
+        },
+        ..HtmlParseOptions::default()
+    };
+    let dom = parse_html_document(RcDom::default(), options).one(source);
     convert_document(
         &dom.document,
         DocumentSyntax::Html,
@@ -531,9 +867,11 @@ fn collapse_whitespace(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DocumentCompatibilityMode, DocumentSyntax, NodeKind, StylesheetSource,
-        collect_descendant_text, first_element_text, parse, parse_with_syntax,
-        stylesheet_sources_in_document_order, without_xml_doctype,
+        DocumentCompatibilityMode, DocumentSyntax, ImageDensity, Node, NodeKind, StylesheetSource,
+        collect_descendant_text, first_element_text, image_density_order, parse,
+        parse_srcset_candidates, parse_with_syntax, selected_image_source_from_attributes,
+        selected_img_source, selected_source_set_candidate, stylesheet_sources_in_document_order,
+        without_xml_doctype,
     };
 
     #[test]
@@ -547,6 +885,109 @@ mod tests {
             panic!("expected element");
         };
         assert_eq!(root.children.len(), 1);
+    }
+
+    #[test]
+    fn html_noscript_fallback_markup_is_parsed_as_dom_content() {
+        let root = parse("<noscript><span>fallback</span></noscript>");
+        let mut text = String::new();
+        collect_descendant_text(&root, &mut text);
+
+        assert_eq!(
+            first_element_text(&root, "span"),
+            Some("fallback".to_string())
+        );
+        assert!(
+            !text.contains("<span>"),
+            "scripting-enabled parsing would retain fallback markup as raw text: {text:?}"
+        );
+    }
+
+    #[test]
+    fn image_source_selection_merges_src_with_density_candidates() {
+        let mut image = Node::element("img");
+        let image = image.as_element_mut().expect("image element");
+        image.attrs.insert(
+            "srcset".to_string(),
+            "small.png 0.5x, normal.png 1x, large.png 2x".to_string(),
+        );
+
+        image.selected_image_source =
+            selected_image_source_from_attributes(image, &crate::css::MediaEnvironment::default());
+        assert_eq!(
+            selected_img_source(image).map(|(url, density)| (url, image_density_order(density))),
+            Some(("normal.png", 1.0))
+        );
+
+        image
+            .attrs
+            .insert("src".to_string(), "fallback.png".to_string());
+        image.selected_image_source =
+            selected_image_source_from_attributes(image, &crate::css::MediaEnvironment::default());
+        assert_eq!(
+            selected_img_source(image).map(|(url, density)| (url, image_density_order(density))),
+            Some(("normal.png", 1.0))
+        );
+    }
+
+    #[test]
+    fn width_descriptors_normalize_against_the_default_source_size() {
+        let environment = crate::css::MediaEnvironment::new(
+            crate::css::MediaType::Print,
+            crate::css::CssViewportSize::new(300.0, 200.0),
+        );
+        let selected = selected_source_set_candidate(
+            None,
+            Some("red.png 1w, green.png 200w"),
+            None,
+            &environment,
+        )
+        .expect("width candidates select an image");
+
+        assert_eq!(selected.url, "green.png");
+        assert_eq!(image_density_order(selected.density), 200.0 / 300.0);
+    }
+
+    #[test]
+    fn sizes_uses_the_first_matching_media_condition() {
+        let environment = crate::css::MediaEnvironment::new(
+            crate::css::MediaType::Print,
+            crate::css::CssViewportSize::new(500.0, 200.0),
+        );
+        let selected = selected_source_set_candidate(
+            None,
+            Some("small.png 200w, large.png 500w"),
+            Some("(min-width: 400px) 50vw, 100vw"),
+            &environment,
+        )
+        .expect("width candidates select an image");
+
+        assert_eq!(selected.url, "large.png");
+        assert_eq!(image_density_order(selected.density), 2.0);
+    }
+
+    #[test]
+    fn zero_source_size_keeps_infinite_density_out_of_layout_scalars() {
+        let environment = crate::css::MediaEnvironment::new(
+            crate::css::MediaType::Print,
+            crate::css::CssViewportSize::new(500.0, 200.0),
+        );
+        let selected =
+            selected_source_set_candidate(None, Some("green.png 200w"), Some("0px"), &environment)
+                .expect("zero source size still selects its candidate");
+
+        assert_eq!(selected.density, ImageDensity::Infinite);
+    }
+
+    #[test]
+    fn srcset_adapter_preserves_data_url_commas_and_rejects_height_descriptors() {
+        let candidates = parse_srcset_candidates(
+            "data:image/svg+xml,%3Csvg%3E 1x, rejected.png 20w 10h, selected.png 2x",
+        );
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].url, "data:image/svg+xml,%3Csvg%3E");
+        assert_eq!(candidates[1].url, "selected.png");
     }
 
     #[test]

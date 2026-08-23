@@ -1,5 +1,11 @@
 # Filter Effects parity
 
+For CSS `filter`, Quire proves visual identity for the exact lowering's
+identity result (`grayscale(0)`, `saturate(1)`, `brightness(1)`, and
+`opacity(1)`) and for `blur(0)`, `contrast(1)`, `invert(0)`, `sepia(0)`, and
+whole-turn `hue-rotate()` values. These non-`none` filters retain their CSS
+stacking behavior, but do not create a redundant PDF transparency group.
+
 Quire has no raster SVG filter backend. Most SVG filter graphs are therefore
 suppressed rather than painted as unfiltered source content, because a
 partial vector substitute would not be equivalent to the filtered result.

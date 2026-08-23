@@ -1,8 +1,9 @@
+use std::collections::HashSet;
+
 use super::*;
 use crate::layout::assets::PendingPositionedFragmentation;
 use crate::layout::inline_collect::TextDecorationPropagationContext;
 use crate::units::LayoutSize;
-use std::collections::HashSet;
 
 impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn new(config: LayoutBuilderConfig<'a>) -> Self {
@@ -364,6 +365,10 @@ impl<'a> LayoutBuilder<'a> {
                     Some(children),
                     None,
                     stylesheets,
+                    FloatPlacementAxes::new(
+                        self.initial_containing_block_writing_mode,
+                        root_layout_style.used_direction(),
+                    ),
                     &mut float_run,
                 );
             } else if is_document_root
@@ -538,7 +543,7 @@ impl<'a> LayoutBuilder<'a> {
         if box_edges_require_ch_advance {
             synchronize_resolved_fixed_box_edge_cache(style);
         }
-        style.rebuild_own_text_decoration_layer();
+        style.rebuild_own_text_decoration_origin();
         let font_metrics =
             css::FontRelativeLengthBasis::new(layout_pt(style.font_size), ch_advance)
                 .with_selected_font_metrics(layout_pt(x_height), layout_pt(cap_height), ic_advance)
@@ -1359,7 +1364,7 @@ impl<'a> LayoutBuilder<'a> {
         if box_edges_require_ch_advance {
             synchronize_resolved_fixed_box_edge_cache(style);
         }
-        style.rebuild_own_text_decoration_layer();
+        style.rebuild_own_text_decoration_origin();
         if let Some(style) = &mut style.marker_style {
             self.resolve_style_font_metric_lengths(style);
         }
@@ -1473,7 +1478,7 @@ impl<'a> LayoutBuilder<'a> {
         if box_edges_require_ch_advance {
             synchronize_resolved_fixed_box_edge_cache(style);
         }
-        style.rebuild_own_text_decoration_layer();
+        style.rebuild_own_text_decoration_origin();
         if let Some(style) = &mut style.marker_style {
             self.resolve_style_font_metric_lengths(style);
         }
@@ -1900,6 +1905,11 @@ impl<'a> LayoutBuilder<'a> {
         let consuming_root_canvas =
             !style.display.is_block_level() && self.begin_root_inline_canvas_continuation(element);
         let previous_root_pseudo_block_projection = self.root_pseudo_block_projection;
+        let root_before_principal_track_start = (element.tag.eq_ignore_ascii_case("html")
+            && source == box_tree::CounterEventSource::Before
+            && style.writing_mode == WritingMode::HorizontalTb
+            && self.principal_flow.writing_mode == WritingMode::VerticalLr)
+            .then_some(self.content_left);
         if element.tag.eq_ignore_ascii_case("html") {
             self.root_pseudo_block_projection =
                 match (style.writing_mode, self.principal_flow.writing_mode) {
@@ -1949,16 +1959,19 @@ impl<'a> LayoutBuilder<'a> {
         {
             // The generated root pseudo is laid out directly rather than as a
             // normal child traversal entry. It therefore must explicitly
-            // consume its committed border-box span and projected logical
-            // block-end margin from the propagated body's horizontal track.
+            // consume its committed margin-box span from the propagated
+            // body's horizontal track. The outcome span already includes the
+            // projected logical block-end margin; adding a physical margin
+            // here would count the horizontal pseudo's margin twice.
             // <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
             let advance = self
                 .last_block_layout_outcome
                 .physical_border_box_inline_span
-                .points()
-                + style.margin.left
-                + style.margin.top;
-            self.content_left = (self.content_left + advance).min(self.content_right);
+                .points();
+            self.content_left = (root_before_principal_track_start
+                .expect("the vertical principal-track start was captured")
+                + advance)
+                .min(self.content_right);
         }
         if consuming_root_canvas {
             self.finish_root_inline_canvas_continuation();

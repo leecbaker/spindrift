@@ -1,9 +1,10 @@
-use super::*;
-use crate::css::{LayerName, LayerOrder};
 use cssparser::{
     AtRuleParser, BasicParseErrorKind, CowRcStr, DeclarationParser, Parser, ParserState,
     RuleBodyItemParser, Token,
 };
+
+use super::*;
+use crate::css::{LayerName, LayerOrder};
 
 /// A syntactically parsed `@page` rule before stylesheet-level cascade metadata
 /// has been assigned. Origin, layer order, and rule order belong to the

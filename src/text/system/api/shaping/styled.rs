@@ -1,8 +1,11 @@
+use std::borrow::Cow;
+
+use icu_segmenter::GraphemeClusterSegmenter;
+
 use super::super::*;
 use crate::css::WhiteSpace;
 use crate::document::paint::text::RenderedTextMatrix;
 use crate::units::SemanticLengthExt;
-use std::borrow::Cow;
 
 pub(in crate::text) struct FontSizeAdjustmentRange {
     pub(in crate::text) range: Range<usize>,
@@ -40,6 +43,15 @@ struct MappedStyledShapingText<'span, 'source> {
     metric_ranges: Vec<(Range<usize>, &'source ComputedStyle)>,
     shaping_contexts: ShapingContextMap,
     source_positions: Vec<StyledTextSourcePosition>,
+}
+
+/// A concrete family selected for one emoji-presentation grapheme cluster.
+///
+/// The range remains in shaping-input coordinates, so synthesized presentation
+/// selectors stay with their preceding base through Parley cluster matching.
+pub(in crate::text) struct EmojiPresentationFamilyRange {
+    pub(in crate::text) range: Range<usize>,
+    pub(in crate::text) source: String,
 }
 
 fn unicode_range_resolved_span(
@@ -126,16 +138,28 @@ impl FontSystem {
         &mut self,
         style: &ComputedStyle,
         request: ControlFallbackRehomeRequest,
+        letter_spacing: ShapingLetterSpacing,
     ) -> Option<(ShapedGlyphRun, ShaperInlineAdvance)> {
-        self.rehome_control_fallback_run_for_family(style, &style.font_family, request)
+        self.rehome_control_fallback_run_for_family(
+            style,
+            &style.font_family,
+            request,
+            letter_spacing,
+        )
     }
 
     fn rehome_control_fallback_run_for_selected_face(
         &mut self,
         style: &SelectedFaceStyleView<'_>,
         request: ControlFallbackRehomeRequest,
+        letter_spacing: ShapingLetterSpacing,
     ) -> Option<(ShapedGlyphRun, ShaperInlineAdvance)> {
-        self.rehome_control_fallback_run_for_family(style.authored(), style.font_family(), request)
+        self.rehome_control_fallback_run_for_family(
+            style.authored(),
+            style.font_family(),
+            request,
+            letter_spacing,
+        )
     }
 
     fn rehome_control_fallback_run_for_family(
@@ -143,6 +167,7 @@ impl FontSystem {
         style: &ComputedStyle,
         family: &FontFamily,
         request: ControlFallbackRehomeRequest,
+        letter_spacing: ShapingLetterSpacing,
     ) -> Option<(ShapedGlyphRun, ShaperInlineAdvance)> {
         let selected_font_id =
             self.font_for_character_in_family(style, family, request.character)?;
@@ -158,7 +183,7 @@ impl FontSystem {
         if glyphs.len() != 1 {
             return None;
         }
-        glyphs[0].x_advance += style.used_letter_spacing().points();
+        glyphs[0].x_advance += letter_spacing.requested_for(style);
         let dropped_advance = ShaperInlineAdvance::from_parley(
             (request.shaper_advance.points() - glyphs[0].x_advance).max(0.0),
         );
@@ -183,6 +208,7 @@ impl FontSystem {
         text: &str,
         line: parley::Line<'_, B>,
         style: &ComputedStyle,
+        letter_spacing: ShapingLetterSpacing,
     ) -> Vec<ShapedGlyphRun> {
         let run_count = line.runs().size_hint().0;
         let mut rendered_runs = Vec::with_capacity(run_count);
@@ -243,6 +269,7 @@ impl FontSystem {
                         shaper_advance: ShaperInlineAdvance::from_parley(run.advance()),
                         source_range: Some(run_range.clone()),
                     },
+                    letter_spacing,
                 )
             {
                 if !dropped_advance.is_zero() {
@@ -275,7 +302,7 @@ impl FontSystem {
                     fallback_font,
                     run_text.as_ref(),
                     run.font_size(),
-                    style.used_letter_spacing().points(),
+                    letter_spacing.requested_for(style),
                     style.used_word_spacing().points(),
                 )
                 && !glyphs.is_empty()
@@ -436,13 +463,13 @@ impl FontSystem {
             )
             .points();
         }
-        // `break-spaces` retains each preserved separator as its own CSS text
-        // processing unit.  Do not let a glyph-placement adjustment on the
-        // first following text glyph pull that glyph back into the retained
-        // separator's physical advance; the same source split at an inline
-        // boundary must keep the identical visible edge.
-        // <https://www.w3.org/TR/css-text-3/#white-space-phase-2>
         if style.white_space == WhiteSpace::BreakSpaces {
+            // `break-spaces` retains each preserved separator as its own CSS text
+            // processing unit.  Do not let a glyph-placement adjustment on the
+            // first following text glyph pull that glyph back into the retained
+            // separator's physical advance; the same source split at an inline
+            // boundary must keep the identical visible edge.
+            // <https://www.w3.org/TR/css-text-3/#white-space-phase-2>
             let mut previous_was_spacer = false;
             for run in &mut rendered_runs {
                 for glyph in &mut run.glyphs {
@@ -464,7 +491,7 @@ impl FontSystem {
                 tab_contexts.remove(index + 1);
             }
         }
-        self.apply_css_tab_stops(&mut rendered_runs, &tab_contexts, 0.0);
+        self.apply_css_tab_stops(&mut rendered_runs, &tab_contexts, 0.0, letter_spacing);
         rendered_runs
     }
 
@@ -598,7 +625,31 @@ impl FontSystem {
         runs: &mut [ShapedInlineRun],
         typesetting_plan: &TextTypesettingPlan,
     ) {
-        for run in runs {
+        // Shaping spans need not be stored in visual order: neutral punctuation
+        // can split an LTR sequence into runs that Parley returns in source
+        // order. Their offsets, however, are visual-inline positions. Apply
+        // each preceding metric delta in that coordinate order.
+        let mut visual_run_order = (0..runs.len()).collect::<Vec<_>>();
+        visual_run_order.sort_by(|&left, &right| {
+            runs[left]
+                .x_offset
+                .total_cmp(&runs[right].x_offset)
+                .then_with(|| left.cmp(&right))
+        });
+        let mut preceding_advance_delta = 0.0;
+        for run_index in visual_run_order {
+            let run = &mut runs[run_index];
+            // Parley records every visual run origin in the horizontal
+            // shaping coordinate system. Rebase a later run after converting
+            // an earlier upright unit to its vertical advance, otherwise a
+            // font/style boundary retains the old horizontal pen position.
+            // <https://www.w3.org/TR/css-writing-modes-4/#vertical-font-features>
+            run.x_offset += preceding_advance_delta;
+            let original_advance = run
+                .glyphs
+                .iter()
+                .map(|glyph| glyph.rendered.x_advance)
+                .sum::<f32>();
             let Some(font_id) = run.font_id else {
                 continue;
             };
@@ -614,11 +665,11 @@ impl FontSystem {
                 let Some(VerticalUnitTypesetting::UprightVertical) = glyph
                     .source_range
                     .as_ref()
-                    .and_then(|range| typesetting_plan.typesetting_for_range(range))
+                    .and_then(|range| typesetting_plan.unanimous_typesetting_for_range(range))
                 else {
                     continue;
                 };
-                if glyph.source_text() == "\t" {
+                if glyph.rendered.unicode == "\t" {
                     continue;
                 }
                 let Some(glyph_id) = glyph.rendered.painted_id() else {
@@ -627,26 +678,12 @@ impl FontSystem {
                 let glyph_id = ttf_parser::GlyphId(glyph_id);
                 let synthesized_vertical_advance =
                     (i32::from(face.ascender()) - i32::from(face.descender())).max(1) as f32;
-                // CSS Text gives several Unicode space separators a used
-                // advance independent of the selected glyph. In particular,
-                // U+3000 IDEOGRAPHIC SPACE is one em even when a font's
-                // vertical substitute is a narrow blank glyph. Preserve that
-                // CSS advance before consulting OpenType vertical metrics.
-                // <https://www.w3.org/TR/css-text-3/#white-space-processing>
-                let source_text = glyph.source_text();
-                let vertical_advance = (source_text.chars().count() == 1)
-                    .then(|| source_text.chars().next())
-                    .flatten()
-                    .and_then(|character| {
-                        css_space_separator_advance(&face, character, run.font_size, scale)
-                    })
-                    .unwrap_or_else(|| {
-                        face.glyph_ver_advance(glyph_id)
-                            .map(|advance| advance as f32)
-                            .filter(|advance| *advance > 0.0)
-                            .unwrap_or(synthesized_vertical_advance)
-                            * scale
-                    });
+                let vertical_advance = face
+                    .glyph_ver_advance(glyph_id)
+                    .map(|advance| advance as f32)
+                    .filter(|advance| *advance > 0.0)
+                    .unwrap_or(synthesized_vertical_advance)
+                    * scale;
                 // Parley shapes this stream on a horizontal baseline. CSS
                 // Writing Modes instead positions upright glyphs from their
                 // OpenType vertical origin. Convert the shaped baseline
@@ -681,6 +718,12 @@ impl FontSystem {
                 glyph.rendered.nominal_x_advance = vertical_advance;
                 glyph.rendered.x_advance = vertical_advance + extra_spacing;
             }
+            let used_advance = run
+                .glyphs
+                .iter()
+                .map(|glyph| glyph.rendered.x_advance)
+                .sum::<f32>();
+            preceding_advance_delta += used_advance - original_advance;
         }
     }
 
@@ -725,6 +768,7 @@ impl FontSystem {
     /// Preserved tabs advance to stops measured from the block content edge,
     /// not from text alignment, indentation, or a fragment boundary:
     /// <https://drafts.csswg.org/css-text-3/#white-space-phase-2>.
+    #[allow(dead_code)] // Computed mode remains available for legacy artifacts.
     pub(crate) fn shape_styled_text_runs_with_parley_at_tab_origin(
         &mut self,
         spans: &[StyledTextSpan<'_>],
@@ -739,7 +783,7 @@ impl FontSystem {
         )
     }
 
-    fn shape_styled_text_runs_with_parley_at_tab_origin_with_letter_spacing(
+    pub(in crate::text) fn shape_styled_text_runs_with_parley_at_tab_origin_with_letter_spacing(
         &mut self,
         spans: &[StyledTextSpan<'_>],
         tab_origin: f32,
@@ -778,17 +822,13 @@ impl FontSystem {
                 .collect::<Vec<_>>();
             let mut font_family_sources = Vec::<String>::with_capacity(ranges.len());
             for (range, style) in &ranges {
-                let selected = this
-                    .emoji_presentation_family_source_for_selected_face(&text[range.clone()], style)
-                    .unwrap_or_else(|| {
-                        let authored = style.authored();
-                        this.resolved_parley_font_family_source_for_family(
-                            style.font_family(),
-                            authored.font_weight,
-                            authored.font_style,
-                            authored.font_width,
-                        )
-                    });
+                let authored = style.authored();
+                let selected = this.resolved_parley_font_family_source_for_family(
+                    style.font_family(),
+                    authored.font_weight,
+                    authored.font_style,
+                    authored.font_width,
+                );
                 // A closing bidi formatting control has no glyph or family
                 // choice of its own. Keeping the preceding selected source
                 // prevents it from merging the final visible cluster into an
@@ -804,6 +844,22 @@ impl FontSystem {
                     font_family_sources.push(selected);
                 }
             }
+            let emoji_family_ranges = ranges
+                .iter()
+                .flat_map(|(style_range, style)| {
+                    this.emoji_presentation_family_ranges(
+                        &text[style_range.clone()],
+                        style.authored(),
+                        style.font_family(),
+                    )
+                    .into_iter()
+                    .map(|mut emoji_range| {
+                        emoji_range.range.start += style_range.start;
+                        emoji_range.range.end += style_range.start;
+                        emoji_range
+                    })
+                })
+                .collect::<Vec<_>>();
             // RangedBuilder uses the default properties at the zero-length
             // boundary before applying the first explicit range. Keep the
             // default family source in sync with the first selected range so
@@ -844,6 +900,12 @@ impl FontSystem {
                     range.clone(),
                     letter_spacing.requested_for(style.authored()),
                     feature_context.as_ref(),
+                );
+            }
+            for emoji_range in &emoji_family_ranges {
+                builder.push(
+                    StyleProperty::FontFamily(ParleyFontFamily::from(emoji_range.source.as_str())),
+                    emoji_range.range.clone(),
                 );
             }
             builder.build_into(layout, shaping_text);
@@ -894,6 +956,14 @@ impl FontSystem {
                         range.clone(),
                         letter_spacing.requested_for(style.authored()),
                         feature_context.as_ref(),
+                    );
+                }
+                for emoji_range in &emoji_family_ranges {
+                    builder.push(
+                        StyleProperty::FontFamily(ParleyFontFamily::from(
+                            emoji_range.source.as_str(),
+                        )),
+                        emoji_range.range.clone(),
                     );
                 }
                 for adjustment in &adjustment_ranges {
@@ -976,6 +1046,7 @@ impl FontSystem {
                                     &source_positions,
                                 ),
                             },
+                            letter_spacing,
                         )
                 {
                     if !dropped_advance.is_zero() {
@@ -1008,7 +1079,7 @@ impl FontSystem {
                         fallback_font,
                         raw_run_text,
                         run.font_size(),
-                        run_style.authored().used_letter_spacing().points(),
+                        letter_spacing.requested_for(run_style.authored()),
                         run_style.authored().used_word_spacing().points(),
                     )
                     && !glyphs.is_empty()
@@ -1052,6 +1123,11 @@ impl FontSystem {
                 let rendered_run_start = rendered_runs.len();
                 let mut glyphs = Vec::new();
                 let mut glyph_source_ranges = Vec::new();
+                // Parley may retain a single shaping run across authored
+                // inline boundaries when the changed property does not affect
+                // glyph shaping. Keep the style associated with every emitted
+                // glyph so a preserved tab can retain its own `tab-size`.
+                let mut glyph_tab_styles = Vec::new();
                 // Parley keeps paint-only style transitions on glyphs rather
                 // than splitting the underlying shaping run. Retain the
                 // palette selected by each cluster so CSS `font-palette`
@@ -1059,6 +1135,9 @@ impl FontSystem {
                 let mut glyph_palettes = Vec::new();
                 for cluster in run.visual_clusters() {
                     let cluster_range = cluster.text_range();
+                    let cluster_style = style_for_text_range(&ranges, cluster_range.clone())
+                        .unwrap_or(run_style)
+                        .authored();
                     let cluster_palette = cluster.first_style().brush.clone();
                     let source_range =
                         styled_cluster_source_range(cluster_range.clone(), &source_positions);
@@ -1096,6 +1175,7 @@ impl FontSystem {
                         glyphs.push(synthesized_tab_glyph(provisional_advance));
                         glyph_source_ranges.push(source_range);
                         glyph_palettes.push(cluster_palette);
+                        glyph_tab_styles.push(cluster_style);
                         continue;
                     }
                     let mut first_cluster_glyph = true;
@@ -1173,6 +1253,7 @@ impl FontSystem {
                         });
                         glyph_source_ranges.push(source_range.clone());
                         glyph_palettes.push(cluster_palette.clone());
+                        glyph_tab_styles.push(cluster_style);
                     }
                 }
                 if glyphs.is_empty() {
@@ -1188,64 +1269,72 @@ impl FontSystem {
                 );
                 debug_assert_eq!(glyphs.len(), glyph_source_ranges.len());
                 debug_assert_eq!(glyphs.len(), glyph_palettes.len());
+                debug_assert_eq!(glyphs.len(), glyph_tab_styles.len());
                 let mut group_palette = glyph_palettes[0].clone();
+                let mut group_style = glyph_tab_styles[0];
                 let mut group_glyphs = Vec::new();
                 let mut group_source_ranges = Vec::new();
                 let mut group_text = String::new();
                 let mut group_x_offset = x_offset;
                 let mut next_x_offset = x_offset;
-                let mut push_group = |glyphs: &mut Vec<RenderedGlyph>,
-                                      source_ranges: &mut Vec<Option<Range<usize>>>,
-                                      text: &mut String,
-                                      palette: &FontPalette,
-                                      x_offset| {
-                    if glyphs.is_empty() {
-                        return;
-                    }
-                    rendered_runs.push(ShapedGlyphRun {
-                        text: std::mem::take(text).into(),
-                        x_offset,
-                        y_offset: 0.0,
-                        text_matrix: RenderedTextMatrix::IDENTITY,
-                        font_size,
-                        font_id: Some(font_id),
-                        font_palette: palette.clone(),
-                        glyphs: std::mem::take(glyphs),
-                        glyph_source_ranges: std::mem::take(source_ranges),
-                    });
-                    tab_contexts.push(RenderedRunTabContext {
-                        style: run_style.authored(),
-                        metric_style: tab_metric_style,
-                    });
-                };
-                for ((glyph, source_range), palette) in glyphs
+                let mut group_has_tab = false;
+                for (((glyph, source_range), palette), glyph_style) in glyphs
                     .into_iter()
                     .zip(glyph_source_ranges)
                     .zip(glyph_palettes)
+                    .zip(glyph_tab_styles)
                 {
-                    if palette != group_palette {
-                        push_group(
-                            &mut group_glyphs,
-                            &mut group_source_ranges,
-                            &mut group_text,
-                            &group_palette,
-                            group_x_offset,
-                        );
+                    // A tab's `tab-size` belongs to the style which owns the
+                    // tab, but ordinary paint-equivalent style boundaries do
+                    // not split the durable shaping run. In particular, a
+                    // join control may have a distinct authored font family
+                    // while remaining part of its neighbours' one shaping
+                    // context.
+                    if palette != group_palette
+                        || (!std::ptr::eq(glyph_style, group_style)
+                            && (glyph.unicode == "\t" || group_has_tab))
+                    {
+                        rendered_runs.push(ShapedGlyphRun {
+                            text: std::mem::take(&mut group_text).into(),
+                            x_offset: group_x_offset,
+                            y_offset: 0.0,
+                            text_matrix: RenderedTextMatrix::IDENTITY,
+                            font_size,
+                            font_id: Some(font_id),
+                            font_palette: group_palette.clone(),
+                            glyphs: std::mem::take(&mut group_glyphs),
+                            glyph_source_ranges: std::mem::take(&mut group_source_ranges),
+                        });
+                        tab_contexts.push(RenderedRunTabContext {
+                            style: group_style,
+                            metric_style: tab_metric_style,
+                        });
                         group_palette = palette.clone();
+                        group_style = glyph_style;
                         group_x_offset = next_x_offset;
+                        group_has_tab = false;
                     }
                     next_x_offset += glyph.x_advance;
                     group_text.push_str(&glyph.unicode);
+                    group_has_tab |= glyph.unicode == "\t";
                     group_glyphs.push(glyph);
                     group_source_ranges.push(source_range);
                 }
-                push_group(
-                    &mut group_glyphs,
-                    &mut group_source_ranges,
-                    &mut group_text,
-                    &group_palette,
-                    group_x_offset,
-                );
+                rendered_runs.push(ShapedGlyphRun {
+                    text: group_text.into(),
+                    x_offset: group_x_offset,
+                    y_offset: 0.0,
+                    text_matrix: RenderedTextMatrix::IDENTITY,
+                    font_size,
+                    font_id: Some(font_id),
+                    font_palette: group_palette,
+                    glyphs: group_glyphs,
+                    glyph_source_ranges: group_source_ranges,
+                });
+                tab_contexts.push(RenderedRunTabContext {
+                    style: group_style,
+                    metric_style: tab_metric_style,
+                });
                 // Glyph Unicode is a PDF ToUnicode summary, not the complete
                 // CSS source stream. A ligature can be attached only to its
                 // first source cluster, and U+200C/U+200D affect shaping
@@ -1279,7 +1368,12 @@ impl FontSystem {
                     tab_contexts.remove(index + 1);
                 }
             }
-            this.apply_css_tab_stops(&mut rendered_runs, &tab_contexts, tab_origin);
+            this.apply_css_tab_stops(
+                &mut rendered_runs,
+                &tab_contexts,
+                tab_origin,
+                letter_spacing,
+            );
             rendered_runs
         })
     }
@@ -1382,6 +1476,15 @@ impl FontSystem {
                     .shaping_style
                     .has_same_effective_style(&span.shaping_style)
                 && previous.metric_style == span.metric_style
+                // Equal shaping inputs do not imply that there was no CSS
+                // inline boundary. Keep independently authored styles as
+                // separate shaping spans so boundary shaping can add its
+                // synthetic context before the backend sees a flat string.
+                // Unicode-range resolution may split one authored style; its
+                // pieces retain the same style identity and may still merge.
+                // <https://drafts.csswg.org/css-text-3/#boundary-shaping>
+                && std::ptr::eq(previous.shaping_style.authored(), span.shaping_style.authored())
+                && std::ptr::eq(previous.metric_style, span.metric_style)
             {
                 previous.text.push_str(&text);
             } else {
@@ -1445,76 +1548,88 @@ impl FontSystem {
         })
     }
 
-    /// Resolve an emoji face by the effective Unicode presentation selector.
-    /// Both monochrome and color fonts can cover the same base scalar, so
-    /// ordinary cmap fallback alone cannot implement `font-variant-emoji`.
+    /// Select concrete families for presentation-sensitive grapheme clusters.
     ///
-    /// The candidate order is the CSS family list followed by the platform
-    /// fallback for the scalar. In particular, a generic family such as
-    /// `serif` can provide the text presentation while the platform emoji
-    /// fallback provides the color presentation.
+    /// CSS Fonts matches a variation selector with its preceding base, rather
+    /// than selecting one face for an entire text run. This is observable when
+    /// a keycap or emoji occurs after ordinary text in the same run.
     /// <https://www.w3.org/TR/css-fonts-4/#font-variant-emoji-prop>
-    pub(in crate::text) fn emoji_presentation_family_source(
-        &mut self,
-        text: &str,
-        style: &ComputedStyle,
-    ) -> Option<String> {
-        self.emoji_presentation_family_source_for_family(text, style, &style.font_family)
-    }
-
-    pub(in crate::text) fn emoji_presentation_family_source_for_selected_face(
-        &mut self,
-        text: &str,
-        style: &SelectedFaceStyleView<'_>,
-    ) -> Option<String> {
-        self.emoji_presentation_family_source_for_family(
-            text,
-            style.authored(),
-            style.font_family(),
-        )
-    }
-
-    fn emoji_presentation_family_source_for_family(
+    /// <https://www.w3.org/TR/css-fonts-4/#cluster-matching>
+    pub(in crate::text) fn emoji_presentation_family_ranges(
         &mut self,
         text: &str,
         style: &ComputedStyle,
         family: &FontFamily,
-    ) -> Option<String> {
-        // CSS bidi isolation may wrap the first authored scalar in a
-        // directional formatting control. That control participates in UAX
-        // #9 but cannot select an emoji face; retain variation selectors so
-        // their presentation override remains observable.
-        let mut characters = text
-            .chars()
-            .filter(|character| !character_is_bidi_format_control(*character))
-            .peekable();
-        let base = characters.next()?;
-        if !character_is_emoji(base) {
-            return None;
-        }
-        let requested_color = match characters.peek().copied() {
-            Some('\u{fe0f}') => true,
-            Some('\u{fe0e}') => false,
-            _ => match style.font_variant_emoji {
-                FontVariantEmoji::Emoji => true,
-                FontVariantEmoji::Text => false,
-                FontVariantEmoji::Normal | FontVariantEmoji::Unicode => {
-                    character_has_emoji_presentation(base)
+    ) -> Vec<EmojiPresentationFamilyRange> {
+        let boundaries = GraphemeClusterSegmenter::new()
+            .segment_str(text)
+            .collect::<Vec<_>>();
+        let mut ranges = Vec::new();
+        for range in boundaries.windows(2).map(|pair| pair[0]..pair[1]) {
+            let cluster = &text[range.clone()];
+            let characters = cluster
+                .chars()
+                .filter(|character| !character_is_bidi_format_control(*character))
+                .collect::<Vec<_>>();
+            let Some((base_index, base)) =
+                characters
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .find(|(_, character)| {
+                        emoji_presentation_participating_code_point(*character)
+                            || character_is_emoji(*character)
+                    })
+            else {
+                continue;
+            };
+            let selector = characters[base_index + 1..]
+                .iter()
+                .copied()
+                .find(|character| matches!(character, '\u{fe0e}' | '\u{fe0f}'));
+            let requested = match selector {
+                Some('\u{fe0e}') => EmojiPresentationCapability::Text,
+                Some('\u{fe0f}') => EmojiPresentationCapability::Emoji,
+                None if style.font_variant_emoji == FontVariantEmoji::Unicode => {
+                    if character_has_emoji_presentation(base) {
+                        EmojiPresentationCapability::Emoji
+                    } else {
+                        EmojiPresentationCapability::Text
+                    }
                 }
-            },
-        };
-        let base_text = base.to_string();
-        self.emoji_presentation_font_candidates_for_family(style, family, base)
-            .into_iter()
-            .find(|font_id| {
-                self.document_fonts.font_has_character(*font_id, base)
-                    && self
-                        .document_fonts
-                        .run_has_emoji_presentation_glyph(*font_id, &base_text)
-                        == requested_color
-            })
-            .and_then(|font_id| self.document_fonts.get(font_id))
-            .map(|font| parley_font_family_source(&FontFamily::named(font.family.clone())))
+                None => {
+                    // `normal` deliberately leaves presentation to ordinary
+                    // platform matching when no author selector is present.
+                    continue;
+                }
+                Some(_) => unreachable!("only emoji presentation selectors are selected"),
+            };
+            let selected = self
+                .emoji_presentation_font_candidates_for_family(style, family, base)
+                .into_iter()
+                .find(|font_id| {
+                    self.document_fonts
+                        .emoji_presentation_capability(*font_id, base, selector)
+                        == Some(requested)
+                })
+                .or_else(|| {
+                    // CSS Fonts falls back to the base glyph when no face
+                    // supports the selector. Do not force a presentation face
+                    // in that case.
+                    self.emoji_presentation_font_candidates_for_family(style, family, base)
+                        .into_iter()
+                        .find(|font_id| self.document_fonts.font_has_character(*font_id, base))
+                });
+            if let Some(font_id) = selected
+                && let Some(font) = self.document_fonts.get(font_id)
+            {
+                ranges.push(EmojiPresentationFamilyRange {
+                    range,
+                    source: parley_font_family_source(&FontFamily::named(font.family.clone())),
+                });
+            }
+        }
+        ranges
     }
 
     /// Return the CSS stack's usable faces in precedence order, then the

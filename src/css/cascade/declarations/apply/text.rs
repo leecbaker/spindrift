@@ -1,5 +1,6 @@
-use super::*;
 use std::num::NonZeroU32;
+
+use super::*;
 
 pub(in crate::css) fn apply_cascaded_text_declaration(
     style: &mut ComputedStyle,
@@ -731,8 +732,8 @@ fn parse_continue(value: &str) -> Option<Continue> {
 
 /// Parse the Level 3 `overflow-clip-margin` shorthand.
 ///
-/// The visual-box keyword and non-negative length may appear in either order;
-/// percentages and negative lengths are invalid for this Level 3 shorthand.
+/// The visual-box keyword and signed length may appear in either order;
+/// percentages are invalid for this Level 3 shorthand.
 /// <https://www.w3.org/TR/css-overflow-3/#overflow-clip-margin>
 fn parse_overflow_clip_margin(value: &str, font_size: f32) -> Option<OverflowClipMargin> {
     let mut reference_box = None;
@@ -750,17 +751,13 @@ fn parse_overflow_clip_margin(value: &str, font_size: f32) -> Option<OverflowCli
                 reference_box = Some(OverflowClipMarginBox::Content)
             }
             _ if length.is_none() => {
-                let parsed = parse_length_with_font_size(&component, font_size)?;
-                if parsed < 0.0 {
-                    return None;
-                }
-                length = Some(parsed);
+                length = Some(parse_length_with_font_size(&component, font_size)?);
             }
             _ => return None,
         }
     }
     (reference_box.is_some() || length.is_some()).then_some(OverflowClipMargin {
         reference_box: reference_box.unwrap_or(OverflowClipMarginBox::Padding),
-        length: length.unwrap_or(0.0),
+        offset: layout_pt(length.unwrap_or(0.0)),
     })
 }

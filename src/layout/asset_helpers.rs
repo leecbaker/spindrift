@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use super::*;
 use crate::LayoutSize;
 use crate::document::paint::patterns::RenderedImageSourceRect;
@@ -5,7 +7,6 @@ use crate::image_store::RasterOrientationPolicy;
 use crate::layout::assets::rasterize_generated_css_image;
 use crate::svg::SvgImageContext;
 use crate::units::{IntoLayoutLength, LayoutLength, layout_px};
-use std::rc::Rc;
 
 /// High-precision displacement of a background tile in page-local paint space.
 ///
@@ -737,19 +738,19 @@ pub(super) fn intrinsic_image_size(
     resource_cache: &ResourceCache,
 ) -> Option<IntrinsicImageSize> {
     let (src, intrinsic_resolution) = match element.tag.as_str() {
-        "object" => element.attrs.get("data").map(|src| (src.as_str(), 1.0))?,
-        "video" => element.attrs.get("poster").map(|src| (src.as_str(), 1.0))?,
-        "img" => element
+        "object" => element
+            .attrs
+            .get("data")
+            .map(|src| (src.as_str(), crate::dom::ImageDensity::one()))?,
+        "video" => element
+            .attrs
+            .get("poster")
+            .map(|src| (src.as_str(), crate::dom::ImageDensity::one()))?,
+        "img" => crate::dom::selected_img_source(element)?,
+        _ => element
             .attrs
             .get("src")
-            .map(|src| (src.as_str(), 1.0))
-            .or_else(|| {
-                element
-                    .attrs
-                    .get("srcset")
-                    .and_then(|srcset| selected_srcset_candidate(srcset))
-            })?,
-        _ => element.attrs.get("src").map(|src| (src.as_str(), 1.0))?,
+            .map(|src| (src.as_str(), crate::dom::ImageDensity::one()))?,
     };
     let request_modifiers = html_image_request_modifiers(element);
     let asset = load_resolved_image_source_with_request(
@@ -767,8 +768,13 @@ pub(super) fn intrinsic_image_size(
     };
     let view_box = resolved_object_view_box_for_asset(style.object_view_box.clone(), &asset);
     let intrinsic_size = view_box.effective_natural_size(intrinsic_size);
-    let width = intrinsic_size.width / intrinsic_resolution;
-    let height = intrinsic_size.height / intrinsic_resolution;
+    let (width, height) = match intrinsic_resolution {
+        crate::dom::ImageDensity::Finite(density) => (
+            intrinsic_size.width / density.value(),
+            intrinsic_size.height / density.value(),
+        ),
+        crate::dom::ImageDensity::Infinite => (0.0, 0.0),
+    };
     if width <= 0.0 || height <= 0.0 {
         return None;
     }
@@ -785,6 +791,34 @@ pub(super) fn intrinsic_image_size(
         width: content_box_pt(width),
         height: content_box_pt(height),
     })
+}
+
+/// Return whether the preloaded static renderer can decode an HTML image.
+///
+/// This shares image candidate selection and request modifiers with
+/// [`intrinsic_image_size`], so DOM rendering-state selection cannot disagree
+/// with the later replaced-image layout path.
+/// <https://html.spec.whatwg.org/multipage/rendering.html>
+pub(crate) fn static_html_img_is_available(
+    element: &Element,
+    base_url: Option<&url::Url>,
+    root_url: Option<&url::Url>,
+    resource_cache: &ResourceCache,
+) -> bool {
+    debug_assert_eq!(element.tag, "img");
+    let Some((src, _density)) = crate::dom::selected_img_source(element) else {
+        return false;
+    };
+    load_resolved_image_source_with_request(
+        src,
+        base_url,
+        root_url,
+        resource_cache,
+        RasterOrientationPolicy::Encoded,
+        SvgImageContext::default(),
+        &html_image_request_modifiers(element),
+    )
+    .is_some()
 }
 
 /// Translate HTML's CORS settings attribute into the common image-request
@@ -806,30 +840,6 @@ pub(super) fn html_image_request_modifiers(element: &Element) -> css::RequestUrl
     }
 }
 
-/// Select the 1dppx `srcset` candidate used by this fixed-resolution renderer.
-///
-/// This accepts density descriptors and preserves source order for equal
-/// densities, matching CSS Images candidate selection's tie-break rule.
-fn selected_srcset_candidate(srcset: &str) -> Option<(&str, f32)> {
-    let mut selected = None;
-    for candidate in srcset.split(',') {
-        let mut parts = candidate.split_ascii_whitespace();
-        let src = parts.next()?;
-        let density = parts
-            .next()
-            .and_then(|value| value.strip_suffix('x'))
-            .and_then(|value| value.parse::<f32>().ok())
-            .filter(|value| value.is_finite() && *value > 0.0)
-            .unwrap_or(1.0);
-        selected = match selected {
-            Some((_, best)) if best >= 1.0 && density >= 1.0 => selected,
-            Some((_, best)) if density < 1.0 && density <= best => selected,
-            _ => Some((src, density)),
-        };
-    }
-    selected
-}
-
 pub(super) fn used_image(
     element: &Element,
     style: &ComputedStyle,
@@ -849,6 +859,11 @@ pub(super) fn used_image(
         // has no media-frame decoder, so represent its unavailable frame with
         // one transparent pixel while retaining its CSS object geometry.
         // <https://html.spec.whatwg.org/multipage/media.html#the-video-element>
+        None if element.image_rendering == crate::dom::ImageRendering::Empty => (
+            transparent_replaced_fallback_pixel(),
+            None,
+            intrinsic_empty_image_size(),
+        ),
         None if unavailable_image_establishes_replaced_box(element, style) => (
             transparent_replaced_fallback_pixel(),
             None,
@@ -865,6 +880,20 @@ pub(super) fn used_image(
     Some(UsedImage::from_geometry(decoded, geometry).with_svg(svg))
 }
 
+/// The zero natural dimensions of an unavailable image without alternative
+/// text. Explicit CSS dimensions still apply through ordinary replaced sizing.
+/// <https://html.spec.whatwg.org/multipage/rendering.html>
+fn intrinsic_empty_image_size() -> IntrinsicReplacedSize {
+    IntrinsicReplacedSize {
+        width: content_box_pt(0.0),
+        height: content_box_pt(0.0),
+        preferred_aspect_ratio: None,
+        has_intrinsic_size: false,
+        attr_width: None,
+        attr_height: None,
+    }
+}
+
 /// The Flexbox operation that established an intrinsic descendant block
 /// basis.  This is deliberately narrower than a generic available-size
 /// source: each variant represents a Flexbox operation that CSS allows to
@@ -878,6 +907,7 @@ pub(super) enum FlexIntrinsicBlockBasisSource {
     DefinitePreferredSize,
     BalancedLineSlot,
     DefiniteSingleLineStretch,
+    AspectRatioTransfer,
 }
 
 /// The explicit bound that won while constraining an otherwise automatic
@@ -984,6 +1014,16 @@ pub(super) fn used_image_with_intrinsic_sizing_context(
             let replaced_size = intrinsic.replaced_size();
             (intrinsic.decoded, intrinsic.svg, replaced_size)
         }
+        // Intrinsic probes run while building table column measures, before
+        // the document-wide static image-state pass necessarily records an
+        // empty image. A missing selected source is already sufficient to
+        // establish the HTML zero-natural-dimension state.
+        // <https://html.spec.whatwg.org/multipage/images.html#the-img-element>
+        None if element.tag == "img" && crate::dom::selected_img_source(element).is_none() => (
+            transparent_replaced_fallback_pixel(),
+            None,
+            intrinsic_empty_image_size(),
+        ),
         None if unavailable_image_establishes_replaced_box(element, style) => (
             transparent_replaced_fallback_pixel(),
             None,
@@ -2579,8 +2619,9 @@ mod tests {
             RasterOrientationPolicy::Encoded
         );
     }
-    use crate::units::{border_box_size_pt, border_box_to_content_box_size};
     use std::rc::Rc;
+
+    use crate::units::{border_box_size_pt, border_box_to_content_box_size};
 
     fn transparent_decoded_image() -> DecodedPngImage {
         DecodedPngImage::new(1, 1, vec![0, 0, 0], Some(vec![0]))

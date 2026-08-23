@@ -1,9 +1,10 @@
+use std::num::NonZeroUsize;
+
 use super::{
     ComputedLengthPercentage, ResolveViewportLengths, RootFontMetricLengthBasis,
     ViewportLengthBasis,
 };
 use crate::units::LayoutLength;
-use std::num::NonZeroUsize;
 
 /// Computed CSS `column-count`.
 /// <https://www.w3.org/TR/css-multicol-1/#cc>

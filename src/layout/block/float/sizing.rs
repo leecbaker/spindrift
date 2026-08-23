@@ -1,6 +1,7 @@
-use super::super::super::*;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+
+use super::super::super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(in crate::layout) struct AutoFloatMeasurementKey {
@@ -26,6 +27,25 @@ pub(in crate::layout) struct ResolvedFloatInlineSize {
     pub(in crate::layout) content_width: ContentBoxLength,
     pub(in crate::layout) border_box_width: BorderBoxLength,
     pub(in crate::layout) margin_box_width: MarginBoxLength,
+}
+
+/// A float's content size retained in its own logical axes before projection
+/// into the containing block's physical float-placement geometry.
+///
+/// This distinction is essential for orthogonal floats: their definite
+/// logical inline size is physical height, while shrink-to-fit physical width
+/// is their measured logical block contribution.
+/// <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct FloatLogicalContentSize {
+    inline: LogicalInlineContentSize,
+    block: LogicalBlockContentSize,
+}
+
+impl FloatLogicalContentSize {
+    fn physical_width(self, axes: FlowAxes) -> PhysicalContentWidth {
+        axes.physical_width_from_logical_content_sizes(self.inline, self.block)
+    }
 }
 
 /// Freeze a float's temporary replay style to the used inline size.
@@ -153,6 +173,8 @@ impl<'a> LayoutBuilder<'a> {
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
     ) -> ResolvedFloatInlineSize {
+        #[cfg(feature = "layout-profile")]
+        let _profile = crate::layout::layout_profile::float_intrinsic_width_scope();
         let collapsed_table =
             style.display.is_table() && style.border_collapse == css::BorderCollapse::Collapse;
         let border_widths = if collapsed_table {
@@ -188,8 +210,12 @@ impl<'a> LayoutBuilder<'a> {
                     .last()
                     .cloned()
                     .unwrap_or_else(|| element_signature(element));
-                built_table_fragment =
-                    box_tree::build_frozen_table_fragment(element, &signature, table_children);
+                built_table_fragment = box_tree::build_frozen_table_fragment(
+                    element,
+                    &signature,
+                    style,
+                    table_children,
+                );
                 Some(&built_table_fragment)
             }
         } else {
@@ -212,36 +238,59 @@ impl<'a> LayoutBuilder<'a> {
             .last()
             .cloned()
             .unwrap_or_else(PercentageBasis::indefinite);
-        let intrinsic_height_basis = used_content_box_size_with_basis(
+        let specified_content_height = used_content_box_size_with_basis(
             style.box_values.height.value().clone(),
             style.box_sizing,
             containing_block_height_basis,
             vertical_non_content,
-        )
-        .map(|height| PercentageBasis::definite_from(height, BlockSizeBasisSource::ContainingBlock))
-        .or_else(|| {
-            // Browsers retain a definite ancestor height through an
-            // auto-height float while calculating percentage heights in a
-            // quirks document. HTML intentionally leaves much quirks layout
-            // behavior undocumented; retain this as a narrow compatibility
-            // rule rather than treating it as ordinary CSS percentage sizing.
-            // <https://html.spec.whatwg.org/multipage/parsing.html>
-            (element.document_compatibility_mode == dom::DocumentCompatibilityMode::Quirks
-                && containing_block_height_basis.is_definite())
-            .then_some(containing_block_height_basis)
-        });
+        );
+        let intrinsic_height_basis = specified_content_height
+            .map(|height| {
+                PercentageBasis::definite_from(height, BlockSizeBasisSource::ContainingBlock)
+            })
+            .or_else(|| {
+                // Browsers retain a definite ancestor height through an
+                // auto-height float while calculating percentage heights in a
+                // quirks document. HTML intentionally leaves much quirks layout
+                // behavior undocumented; retain this as a narrow compatibility
+                // rule rather than treating it as ordinary CSS percentage sizing.
+                // <https://html.spec.whatwg.org/multipage/parsing.html>
+                (element.document_compatibility_mode == dom::DocumentCompatibilityMode::Quirks
+                    && containing_block_height_basis.is_definite())
+                .then_some(containing_block_height_basis)
+            });
         let measure_intrinsic_widths = |layout: &mut Self, available_width: f32| {
             if let Some(basis) = intrinsic_height_basis {
                 layout.definite_block_size_stack.push(basis);
             }
-            let sizes = layout.formatting_context_intrinsic_widths(
-                element,
-                style,
-                stylesheets,
-                available_width,
-                child_boxes,
-                resolved_table_fragment,
-            );
+            let sizes = if style.writing_mode.has_vertical_lines()
+                && !style.display.is_flex()
+                && !style.display.is_table()
+                && let Some(content_height) = specified_content_height
+            {
+                let logical_size = FloatLogicalContentSize {
+                    inline: LogicalInlineContentSize::new(content_height),
+                    block: layout.block_logical_block_size_at_inline_size(
+                        element,
+                        style,
+                        stylesheets,
+                        child_boxes,
+                        LogicalInlineContentSize::new(content_height),
+                        available_width,
+                    ),
+                };
+                let physical_width = logical_size.physical_width(FlowAxes::for_style(style));
+                (physical_width.points(), physical_width.points())
+            } else {
+                layout.formatting_context_intrinsic_widths(
+                    element,
+                    style,
+                    stylesheets,
+                    available_width,
+                    child_boxes,
+                    resolved_table_fragment,
+                )
+            };
             if intrinsic_height_basis.is_some() {
                 layout.definite_block_size_stack.pop();
             }
@@ -351,6 +400,7 @@ impl<'a> LayoutBuilder<'a> {
                 stylesheets,
                 resolved_table_fragment,
             )
+            .map(NonContentLength::points)
             .unwrap_or(0.0)
         } else {
             0.0
@@ -476,8 +526,12 @@ impl<'a> LayoutBuilder<'a> {
             .speculative_auto_float_margin_box_heights
             .get(&cache_key)
         {
+            #[cfg(feature = "layout-profile")]
+            crate::layout::layout_profile::record_float_auto_height_cache_hit();
             return *height;
         }
+        #[cfg(feature = "layout-profile")]
+        crate::layout::layout_profile::record_float_auto_height_cache_miss();
 
         if !self.active_auto_float_measurements.is_empty() {
             let height = self.nested_auto_float_margin_box_height(
@@ -493,6 +547,8 @@ impl<'a> LayoutBuilder<'a> {
             }
             return height;
         }
+        #[cfg(feature = "layout-profile")]
+        let _profile = crate::layout::layout_profile::float_auto_height_measurement_scope();
         self.active_auto_float_measurements.push(element_key);
         // This replay measures a float's own BFC. Its lines cannot select an
         // anchor for an outside marker owned by the surrounding principal

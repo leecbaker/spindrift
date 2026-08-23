@@ -1,7 +1,8 @@
 use super::*;
-use crate::layout::flex::compute::estimated_outer_cross_size;
 use crate::layout::flex::compute::{
-    flex_baseline_set, flex_item_baseline_axis_is_parallel_to_main_axis,
+    FlexBaselineSet, estimated_outer_cross_size, flex_baseline_line_axis, flex_baseline_set,
+    flex_item_baseline_axis_is_parallel_to_main_axis, line_over_side, line_under_side,
+    synthesis_writing_mode, vertical_typographic_mode_uses_central_baseline,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -37,7 +38,7 @@ impl FlexIntrinsicContainerPhysicalSizes {
         }
     }
 
-    fn include_multiline_cross_size(
+    fn include_line_cross_size(
         &mut self,
         physical_direction: FlexDirection,
         cross_size: FlexCrossSize,
@@ -294,11 +295,8 @@ impl<'a> LayoutBuilder<'a> {
             intrinsic_item_available,
             &estimated_baseline_items,
         );
-        if let Some(metrics) = line_metrics
-            && style.flex_wrap != FlexWrap::NoWrap
-            && metrics.line_count > 1
-        {
-            physical_sizes.include_multiline_cross_size(physical_direction, metrics.cross_size);
+        if let Some(metrics) = line_metrics {
+            physical_sizes.include_line_cross_size(physical_direction, metrics.cross_size);
         }
 
         let (first_baseline, last_baseline) = line_metrics
@@ -404,14 +402,40 @@ impl<'a> LayoutBuilder<'a> {
             let item = FlexIntrinsicItem::new(child, size, physical_direction, available, style);
             let (first_baseline, last_baseline) =
                 estimated_flex_item_cross_axis_baselines(size, physical_direction);
+            let outer_cross_size = item.max_cross_contribution;
+            let (margin_cross_start, margin_cross_end) = if physical_direction.is_row_axis() {
+                (
+                    FlexCrossLength::new(child.style.margin.top),
+                    FlexCrossLength::new(child.style.margin.bottom),
+                )
+            } else {
+                (
+                    FlexCrossLength::new(child.style.margin.left),
+                    FlexCrossLength::new(child.style.margin.right),
+                )
+            };
+            let border_cross_size =
+                (outer_cross_size - margin_cross_start - margin_cross_end).non_negative_size();
+            let synthesized_baseline = |baseline_set| {
+                let synthesis_mode =
+                    synthesis_writing_mode(&child.style, style, flex_baseline_line_axis(style));
+                if vertical_typographic_mode_uses_central_baseline(&child.style, synthesis_mode) {
+                    return FlexCrossOffset::new(border_cross_size.points() * 0.5);
+                }
+                let side = match baseline_set {
+                    FlexBaselineSet::First => line_under_side(synthesis_mode),
+                    FlexBaselineSet::Last => line_over_side(synthesis_mode),
+                };
+                let from_start = match side {
+                    PhysicalSide::Top | PhysicalSide::Left => 0.0,
+                    PhysicalSide::Right | PhysicalSide::Bottom => border_cross_size.points(),
+                };
+                FlexCrossOffset::new(from_start)
+            };
             estimated_baseline_items.push(EstimatedFlexBaselineItem {
                 outer_main_size: item.flex_base_size,
-                outer_cross_size: item.max_cross_contribution,
-                margin_cross_start: if physical_direction.is_row_axis() {
-                    FlexCrossLength::new(child.style.margin.top)
-                } else {
-                    FlexCrossLength::new(child.style.margin.left)
-                },
+                outer_cross_size,
+                margin_cross_start,
                 cross_alignment: estimated_flex_item_cross_alignment(&child.style, style),
                 baseline_set: flex_baseline_set(&child.style, style).filter(|_| {
                     flex_item_baseline_axis_is_parallel_to_main_axis(
@@ -424,6 +448,8 @@ impl<'a> LayoutBuilder<'a> {
                 }),
                 first_baseline,
                 last_baseline,
+                synthesized_first_baseline: synthesized_baseline(FlexBaselineSet::First),
+                synthesized_last_baseline: synthesized_baseline(FlexBaselineSet::Last),
             });
             intrinsic_items.push(item);
         }

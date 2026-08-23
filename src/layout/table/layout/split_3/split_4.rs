@@ -1,8 +1,55 @@
-use super::*;
-use crate::layout::block::DefinitePhysicalContentHeight;
-use crate::layout::block::child_available_space_for_formatting_context;
-use crate::layout::block::suppress_fragmented_box_edges;
+use crate::css::{
+    ComputedStyle, EmptyCells, PercentageBasis, Position, Stylesheets, Visibility, layout_pt,
+};
+use crate::document::paint::display_list::PaintBand;
+use crate::document::paint::effects::PaintEffects;
+use crate::document::paint::fragments::PaintFragment;
+use crate::document::paint::geometry::{PaintClip, PaintClipUnion, PaintTranslation};
+use crate::document::paint::page::{PaintCheckpoint, PaintPrimitive};
+use crate::document::paint::shapes::RenderedRect;
+use crate::document::paint::stacking::PaintStackingContext;
+use crate::layout::block::{
+    DefinitePhysicalContentHeight, child_available_space_for_formatting_context,
+    suppress_fragmented_box_edges,
+};
 use crate::layout::inline_collect::{InlinePlacement, TextDecorationPropagationContext};
+use crate::layout::table::layout::split_3::collapsed_cell_decoration_style;
+use crate::layout::table::layout::{
+    CollapsedTableGeometry, TableBodyPaintFragment, TableCellBaselineAlignmentContext,
+    TableCellChildFragmentKind, TableCellChildFragmentPlan, TableCellClipRegion,
+    TableCellContentPlan, TableCellFragmentPlan, TableCellFragmentRange,
+    TableCellNestedInlineSequencePlan, TableFragmentBreakReason, TableFragmentStartDecision,
+    TableFragmentainerPlacement, TableRowFragmentMode, table_atomic_stacking_policy,
+    table_box_overflow_clip, table_cell_block_size_depends_on_parent_percentage,
+    table_cell_child_fragment_kind, table_cell_children_can_use_inline_line_sequence,
+    table_cell_content_pass, table_cell_formatting_child_has_parent_percentage_block_size,
+    table_cell_has_in_flow_layout_child, table_cell_participates_in_baseline,
+    table_fragment_row_span_bounds, table_outlines_use_in_flow_phase,
+    table_padding_box_clip_from_border_box, table_parent_paint_band,
+};
+use crate::layout::table::{
+    TableAxes, TableCell, TableCellAxisAdapter, TableCellContentGeometry, TableCellPadding,
+    TableColumn, TableColumnPlan, TableGrid, TableGridBlockOffset, TableGridContentBoxTopLeft,
+    TableGridLength, TableGridLogicalSize, TableGridPlacement, TableGridPoint, TableGridRect,
+    TableGridSize, TableMetrics, TableRow, TableRowBaselineOffset, TableRowBounds, UsedTableWidth,
+    paint_table_border_edges, repeated_table_rows_height, table_cell_href,
+    table_cell_root_block_track_contribution, table_grid_height, table_row_block_start,
+    table_row_span_height, table_vertical_edge_spacing,
+};
+use crate::layout::{
+    AssignmentPlacement, BlockSizePercentageBasis, ContainingBlock, EscapedAtomTranslation,
+    FragmentPageMetadata, FragmentainerKind, GeneratedPseudoCounterMode, InlineItem,
+    InlineVisualOffset, LayoutBuilder, LogicalBlockContentSize, PageInlineSpan, PageTopPoint,
+    PageTopRect, PaintBackgroundArea, PhysicalContentHeight, PhysicalContentWidth,
+    PositionedContainingBlockMode, PositionedPaintLayer, RelativeOffset, ReplayFloatScope,
+    StackingContextPolicy, UsedOverflowAxes,
+    background_image_primitives_for_style_with_paint_areas, block_paint_ops_with_phases,
+    box_content_contour_is_non_rectangular, box_tree, effective_overflow_for_style, inline_layout,
+    paint_space_rect, property_containment_establishes_independent_formatting_context,
+    relative_position_offset_with_bases, resolve_overflow_clip_edge,
+};
+use crate::units::content_box_pt;
+use crate::{CssColor, css};
 
 /// Resolve a table part's relative offset against its immediate table parent.
 ///
@@ -52,7 +99,7 @@ impl<'a> LayoutBuilder<'a> {
         grid: &TableGrid,
         row_index: usize,
         stylesheets: &Stylesheets<'_>,
-        table_cellpadding: Option<f32>,
+        table_cellpadding: Option<TableCellPadding>,
         column_plan: &TableColumnPlan,
         table_metrics: TableMetrics,
         collapsed_geometry: Option<&CollapsedTableGeometry>,
@@ -420,7 +467,7 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &Stylesheets<'_>,
         _table_x: f32,
         used_table_width: f32,
-        _table_cellpadding: Option<f32>,
+        _table_cellpadding: Option<TableCellPadding>,
         column_plan: &TableColumnPlan,
         table_width: UsedTableWidth,
         table_metrics: TableMetrics,
@@ -761,20 +808,16 @@ impl<'a> LayoutBuilder<'a> {
         );
         let contoured_overflow_clip = overflow_clip
             .filter(|_| box_content_contour_is_non_rectangular(table_style))
-            .and_then(|overflow_bounds| {
-                resolve_box_content_contour(
+            .and_then(|_| {
+                resolve_overflow_clip_edge(
                     bounds.paint_rect(),
                     table_style,
                     table_width.border_widths,
-                    BoxContentContourRequest::Overflow {
-                        reference_box: css::BackgroundBox::Padding,
-                        outset: 0.0,
-                    },
+                    UsedOverflowAxes::from_style(table_style),
+                    table_style.contain.paint,
+                    None,
                 )
-                .map(|mut contour| {
-                    contour.bounds = overflow_bounds;
-                    contour
-                })
+                .map(|edge| edge.clip)
             });
         // A table nested in a table cell is foreground cell content. Keep it
         // in the cell's inline paint phase so the enclosing table's
@@ -867,7 +910,7 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &Stylesheets<'_>,
         table_x: f32,
         used_table_width: f32,
-        table_cellpadding: Option<f32>,
+        table_cellpadding: Option<TableCellPadding>,
         column_plan: &TableColumnPlan,
         planned_row_heights: &[f32],
         source_row_heights: &[f32],
@@ -883,7 +926,7 @@ impl<'a> LayoutBuilder<'a> {
         row_fragment_mode: TableRowFragmentMode,
         follows_repeated_header: bool,
         collapsed_geometry: Option<&CollapsedTableGeometry>,
-        row_baseline_offset: Option<f32>,
+        row_baseline_offset: Option<TableRowBaselineOffset>,
     ) {
         let row_paint_checkpoint = self.current_page.paint_checkpoint();
         let row_paint_page_index = self.pages.len();
@@ -892,18 +935,58 @@ impl<'a> LayoutBuilder<'a> {
             row_fragment_mode != TableRowFragmentMode::Sliced
                 || (piece_height > 0.0 && row_height > 0.0)
         );
+        // Horizontal row layout already commits a fragmentainer-local physical
+        // Y interval in `row_top`; rebuilding that interval from the table
+        // grid would discard nested column continuation progress. A vertical
+        // row piece, by contrast, is a physical X span and must be projected
+        // from the typed logical table grid.
+        // <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+        let table_axes = TableAxes::for_style(table_style);
+        let logical_inline_extent = column_plan.total_width();
+        let logical_block_extent = table_grid_height(
+            planned_row_heights,
+            planned_row_occupancy,
+            table_metrics.clone(),
+        );
+        let row_block_start = table_row_block_start(
+            planned_row_heights,
+            planned_row_occupancy,
+            row_index,
+            table_metrics.clone(),
+        );
+        let destination_row_block_start = destination_row_block_start
+            .map(|offset| offset.length().get())
+            .unwrap_or(row_block_start);
+        let root_grid_placement = grid_placement.unwrap_or_else(|| {
+            TableGridPlacement::with_axes(
+                TableGridContentBoxTopLeft::new(PageTopPoint::new(table_x, row_top)),
+                table_axes,
+                TableGridLogicalSize::new(
+                    logical_inline_extent,
+                    LogicalBlockContentSize::new(content_box_pt(logical_block_extent)),
+                ),
+            )
+        });
+        let row_piece_rect = if table_style.writing_mode.has_vertical_lines() {
+            root_grid_placement.page_top_rect_for(TableGridRect::new(
+                TableGridPoint::from_lengths(
+                    TableGridLength::new(0.0),
+                    TableGridLength::new(destination_row_block_start + piece_offset.max(0.0)),
+                ),
+                TableGridSize::from_lengths(
+                    logical_inline_extent.content_box_length().cast_unit(),
+                    TableGridLength::new(piece_height.max(0.0)),
+                ),
+            ))
+        } else {
+            PageTopRect::new(table_x, row_top, used_table_width, piece_height)
+        };
         let row_piece_clip_active = if row_fragment_mode.clips_to_row_piece() {
-            self.push_overflow_clip(
-                PageTopRect::new(table_x, row_top, used_table_width, piece_height).overflow_clip(),
-            );
+            self.push_overflow_clip(row_piece_rect.overflow_clip());
             true
         } else {
             false
         };
-        // `row_top` is already in the destination fragmentainer. Source
-        // continuation progress belongs only to child-slice selection, not
-        // to positioned containing blocks in this page fragment.
-        let content_row_top = row_top;
         // CSS Containment does not apply to table row tracks or row groups:
         // they have no containment principal box. Their positioned and
         // transformed principal boxes still establish containing blocks for
@@ -944,12 +1027,7 @@ impl<'a> LayoutBuilder<'a> {
                 .unwrap_or(false)
             || row_group_has_applicable_containment;
         let row_group_containing_block_scope = if row_group_establishes_containing_block {
-            let containing_block = ContainingBlock::from_page_top_rect(PageTopRect::new(
-                table_x,
-                row_top,
-                used_table_width,
-                piece_height,
-            ));
+            let containing_block = ContainingBlock::from_page_top_rect(row_piece_rect);
             Some(self.push_positioned_containing_block(
                 PositionedContainingBlockMode::FixedAndAbsolute,
                 containing_block,
@@ -962,20 +1040,6 @@ impl<'a> LayoutBuilder<'a> {
         // single boundary where those tracks become physical page geometry.
         // <https://drafts.csswg.org/css-tables-3/#table-layout>
         // <https://drafts.csswg.org/css-writing-modes-4/#abstract-box>
-        let table_axes = TableAxes::for_style(table_style);
-        let logical_inline_extent = column_plan.total_width();
-        let logical_block_extent = table_grid_height(
-            planned_row_heights,
-            planned_row_occupancy,
-            table_metrics.clone(),
-        );
-        let row_block_start = table_row_block_start(
-            planned_row_heights,
-            planned_row_occupancy,
-            row_index,
-            table_metrics.clone(),
-        );
-        let grid_origin_top = content_row_top + row_block_start;
         let row_group_positioning_style = row
             .row_groups
             .last()
@@ -1043,21 +1107,9 @@ impl<'a> LayoutBuilder<'a> {
             let cell_height = row_span_block_size.max(cell_min_block_size);
             // Keep the fragment's root placement through the cell boundary.
             // In vertical and RTL tables a row track is not a physical-Y
-            // offset, so reconstructing an LTR page origin here loses the
-            // root's logical block direction.
-            let cell_placement = grid_placement.unwrap_or_else(|| {
-                TableGridPlacement::with_axes(
-                    PageTopPoint::new(table_x, grid_origin_top),
-                    table_axes,
-                    TableGridLogicalSize::new(
-                        logical_inline_extent,
-                        LogicalBlockContentSize::new(content_box_pt(logical_block_extent)),
-                    ),
-                )
-            });
-            let destination_row_block_start = destination_row_block_start
-                .map(|offset| offset.length().get())
-                .unwrap_or(row_block_start);
+            // offset, so rebuilding a page origin here would lose the root's
+            // logical block direction.
+            let cell_placement = root_grid_placement;
             let cell_border_box = column_plan.cell_border_box(
                 prepared.area,
                 // The fragment viewport owns the destination grid origin.
@@ -1129,7 +1181,9 @@ impl<'a> LayoutBuilder<'a> {
                     // A cell whose percentage-dependent content was relaid out
                     // has a new in-flow baseline. Use that committed content
                     // metric instead of the provisional row-minimum baseline.
-                    Some(final_metrics.baseline_offset)
+                    Some(TableRowBaselineOffset::new(layout_pt(
+                        final_metrics.baseline_offset.points(),
+                    )))
                 } else {
                     self.table_cell_row_baseline_offset_for_alignment(
                         &baseline_context,
@@ -1560,12 +1614,7 @@ impl<'a> LayoutBuilder<'a> {
                 cell,
                 row,
                 positioned_table_part_style,
-                Some(ContainingBlock::from_page_top_rect(PageTopRect::new(
-                    table_x,
-                    content_row_top,
-                    used_table_width,
-                    piece_height,
-                ))),
+                Some(ContainingBlock::from_page_top_rect(row_piece_rect)),
                 cell_style,
                 stylesheets,
                 cell_borders,
@@ -1705,7 +1754,7 @@ impl<'a> LayoutBuilder<'a> {
                 row_positioned_layer_start,
                 relative_style,
                 offset,
-                PageTopRect::new(table_x, row_top, used_table_width, piece_height).paint_clip(),
+                row_piece_rect.paint_clip(),
             );
         }
         if let Some(scope) = row_group_containing_block_scope {
@@ -1720,10 +1769,7 @@ impl<'a> LayoutBuilder<'a> {
             && self.pages.len() == row_paint_page_index
         {
             let (effect_style, bounds): (&ComputedStyle, PaintClip) = if row_style.has_transform() {
-                (
-                    row_style,
-                    PageTopRect::new(table_x, row_top, used_table_width, piece_height).paint_clip(),
-                )
+                (row_style, row_piece_rect.paint_clip())
             } else {
                 let start = row
                     .row_groups
@@ -1854,7 +1900,7 @@ impl<'a> LayoutBuilder<'a> {
                         0.0,
                         InlineVisualOffset::zero(),
                         cell_style,
-                        cell_style.text_decoration_layers.clone(),
+                        cell_style.text_decoration_origins.effective_layers_vec(),
                         &mut items,
                     );
                     (!items.is_empty()).then(|| {
@@ -2116,7 +2162,7 @@ impl<'a> LayoutBuilder<'a> {
                     0.0,
                     InlineVisualOffset::zero(),
                     style,
-                    style.text_decoration_layers.clone(),
+                    style.text_decoration_origins.effective_layers_vec(),
                     &mut items,
                 );
                 layout.collect_inline_line_sequence_for_text_box_trimmed_style(

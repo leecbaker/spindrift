@@ -1319,6 +1319,55 @@ impl<'a> LayoutBuilder<'a> {
         sequence.total_height().max(0.0)
     }
 
+    /// Measure a vertical block container's logical block contribution at a
+    /// definite logical inline size.
+    ///
+    /// A vertical float with a definite `inline-size` wraps its inline
+    /// contents at that measure before shrink-to-fit resolves its automatic
+    /// physical width. Measuring at max-content inline size would collapse
+    /// the text into one column and understate that physical width:
+    /// <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>,
+    /// <https://www.w3.org/TR/css-sizing-3/#intrinsic-sizes>, and
+    /// <https://www.w3.org/TR/CSS22/visudet.html#float-width>.
+    pub(in crate::layout) fn block_logical_block_size_at_inline_size(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &Stylesheets<'_>,
+        child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
+        logical_inline_size: LogicalInlineContentSize,
+        available_outer_width: f32,
+    ) -> LogicalBlockContentSize {
+        debug_assert!(style.writing_mode.has_vertical_lines());
+        if let Some(selected) = self.select_orthogonal_inline_layout(
+            element,
+            style,
+            stylesheets,
+            child_boxes,
+            logical_inline_size,
+        ) {
+            return selected.logical_block_contribution;
+        }
+        let items =
+            self.intrinsic_inline_items_for_element(element, style, stylesheets, child_boxes);
+        if items.is_empty() {
+            return LogicalBlockContentSize::new(content_box_pt(
+                self.estimate_block_child_intrinsic_logical_block_size(
+                    element,
+                    style,
+                    stylesheets,
+                    child_boxes,
+                    available_outer_width,
+                ),
+            ));
+        }
+        LogicalBlockContentSize::new(content_box_pt(self.inline_items_logical_block_size(
+            items,
+            style,
+            logical_inline_size.points(),
+        )))
+    }
+
     /// Select the exact simple vertical line stack that gives an orthogonal
     /// auto-sized block both its logical block contribution and final paint.
     ///
@@ -1351,7 +1400,7 @@ impl<'a> LayoutBuilder<'a> {
             0.0,
             InlineVisualOffset::zero(),
             style,
-            style.text_decoration_layers.clone(),
+            style.text_decoration_origins.effective_layers_vec(),
         );
         if !frozen_replay_input.is_replay_safe() {
             return None;

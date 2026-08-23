@@ -321,8 +321,19 @@ impl CounterPlanBuilder {
                 .iter()
                 .find(|change| change.name == name)
                 .map(|change| change.value);
+            let had_visible_instance = state.current(&name, mutation_floor).is_some();
             let instance = self.ensure(&mut state, &name, origin, current_scope, mutation_floor);
-            let reversed_start_instance = reversed_start_scopes.ensure(&name, instance);
+            let reversed_start_instance = if !had_visible_instance && mutation_floor != 0 {
+                // Style containment makes the enclosing counter invisible to
+                // this subtree. Its first local mutation must therefore own a
+                // separate reversed-start accumulator, while ordinary nested
+                // reversed resets retain the shared-scope behavior below.
+                // <https://drafts.csswg.org/css-contain-2/#containment-style>
+                reversed_start_scopes.reset_for_node(&name, instance);
+                instance
+            } else {
+                reversed_start_scopes.ensure(&name, instance)
+            };
             self.observe(reversed_start_instance.id, increment, set);
         }
 

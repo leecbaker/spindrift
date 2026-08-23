@@ -24,9 +24,16 @@ pub(in crate::layout) fn inline_text_sources_are_layout_compatible(
         (InlineTextSource::BidiControl, _) | (_, InlineTextSource::BidiControl) => false,
         (InlineTextSource::BlockEllipsis, InlineTextSource::BlockEllipsis) => true,
         (InlineTextSource::BlockEllipsis, _) | (_, InlineTextSource::BlockEllipsis) => false,
-        (InlineTextSource::WordSpaceTransform(_), InlineTextSource::WordSpaceTransform(_)) => true,
+        // An explicit transformed separator owns its source-text extraction
+        // and line-break behavior, but it does not establish a CSS shaping
+        // boundary with the text on either side. The paint group carries an
+        // explicit ActualText replacement for it instead of splitting the
+        // glyph stream into independently rounded fragments.
+        // <https://drafts.csswg.org/css-text-4/#word-space-transform>
+        (InlineTextSource::WordSpaceTransform(_), InlineTextSource::RunIn)
+        | (InlineTextSource::RunIn, InlineTextSource::WordSpaceTransform(_)) => false,
         (InlineTextSource::WordSpaceTransform(_), _)
-        | (_, InlineTextSource::WordSpaceTransform(_)) => false,
+        | (_, InlineTextSource::WordSpaceTransform(_)) => true,
         (InlineTextSource::RunIn, InlineTextSource::RunIn) => true,
         (InlineTextSource::RunIn, _) | (_, InlineTextSource::RunIn) => false,
         _ => true,
@@ -197,17 +204,6 @@ pub(in crate::layout) fn inline_boundary_effect(
     }
 }
 
-pub(in crate::layout) fn style_boundary_effect(
-    left: &ComputedStyle,
-    right: &ComputedStyle,
-) -> InlineBoundaryEffect {
-    if styles_have_equivalent_text_shaping_inputs(left, right) {
-        InlineBoundaryEffect::PaintOnly
-    } else {
-        InlineBoundaryEffect::ShapingInputChange
-    }
-}
-
 pub(in crate::layout) fn inline_fragment_is_join_control_only(
     fragment: &(impl InlineFragmentAccess + ?Sized),
 ) -> bool {
@@ -226,7 +222,7 @@ pub(in crate::layout) fn inline_fragment_contains_joining_context(
     fragment.text().chars().any(|character| {
         character_is_join_control(character)
             || character_is_arabic_tatweel(character)
-            || character_has_joining_behavior(character)
+            || character_has_cursive_shaping_behavior(character)
     })
 }
 

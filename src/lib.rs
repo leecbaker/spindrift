@@ -81,6 +81,7 @@ mod error;
 mod html;
 mod image_store;
 mod layout;
+mod mime;
 mod pdf;
 mod resource;
 mod svg;

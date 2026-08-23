@@ -752,7 +752,7 @@ pub(crate) fn flush_anonymous_table<'a>(
     if parent_style.display.is_inline_level() {
         style.display = Display::INLINE_TABLE;
     }
-    let fragment = build_table_fragment(element, signature, &children);
+    let fragment = build_table_fragment(element, signature, &style, &children);
     // CSS 2.2 table model: internal table boxes that lack a table parent
     // generate an anonymous `table` wrapper, or an `inline-table` wrapper when
     // the missing parent is generated inside an inline box.

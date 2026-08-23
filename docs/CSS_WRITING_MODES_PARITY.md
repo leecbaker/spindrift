@@ -11,6 +11,21 @@ than text shaping alone.
   used by CSS Logical Properties and layout adapters. This covers all five
   supported writing modes and both `direction` values, including the distinct
   `sideways-lr` inline progression.
+- A box whose `writing-mode` differs from its nearest box-generating ancestor
+  computes `flow` to `flow-root`. The comparison skips `display: contents`
+  while ordinary inheritance still passes through it, covering parallel
+  sideways/vertical as well as orthogonal writing-mode changes.
+- Float sizing stays in the floated box's logical axes, while `float`,
+  `clear`, exclusion bands, and placement resolve through the containing
+  block's `FloatPlacementAxes`. Legacy `left`/`right` use line-relative sides;
+  vertical block-track search starts at physical right for `vertical-rl` and
+  physical left for `vertical-lr`. Vertical line boxes use the same typed
+  block-start projection when selecting their float-exclusion slab, so a
+  `vertical-rl` line no longer samples the containing box's leftmost column.
+- Bottom-origin anonymous-block scratch projection is confined to the
+  document principal flow. Ordinary fixed-size nested vertical containers
+  retain their local inline origin, so their descendants advance in physical
+  X without translating local overflow into page-Y consumption.
 - Inline `text-align: left` and `right` now resolve through the writing
   mode's line-left and line-right sides before physical placement, including
   vertical and sideways line directions.
@@ -28,6 +43,12 @@ than text shaping alone.
   emission. Transformed-rotated (`Tr`) typographic units select those forms
   and are typeset upright, matching CSS Writing Modes' mixed-orientation
   policy; only `R` units are sideways.
+- Vertical paint placement groups glyphs by their preserved shaping source
+  ranges, not their PDF-facing Unicode summaries. A glyph with an empty
+  ToUnicode summary therefore remains in its resolved typographic unit and
+  retains its advance and vertical origin. A shaping range that spans several
+  units uses vertical metrics and placement when every covered unit resolves
+  to the same mode; mixed upright/sideways ranges remain conservative.
 - Mongolian and Phags-pa are resolved as complete sideways-horizontal units
   where their intrinsic vertical presentation requires that composition.
   Their feature selection, font metrics, and PDF matrix now share one
@@ -161,12 +182,17 @@ than text shaping alone.
 - Table cells now derive their row and column rectangles from logical table
   tracks and project those rectangles through the table root's flow axes. This
   keeps table slot progression distinct from the writing mode used to lay out
-  a cell's own contents. Final vertical cell content now uses that projected
-  content box as its sole block-start origin rather than applying a second
-  right-to-left offset, and resolves table-cell alignment subjects on the
-  cell's logical block axis rather than its inline progression axis. The
-  table-cell alignment, legacy `vertical-align`, and table-progression WPT
-  matrix now passes under its existing fuzzy metadata.
+  a cell's own contents. Final vertical cell content uses that projected
+  content box as its sole block-start origin, and table-cell alignment subjects
+  resolve on the cell's logical block axis rather than its inline progression
+  axis. The table wrapper enters row paint at the projected grid-content edge,
+  so root border chrome is not applied again to floated vertical or sideways
+  tables. Axis-aligned hard-stop cell backgrounds also retain vector edges,
+  keeping them coincident with Ahem alignment masks. Verified coverage is the
+  26-reftest `table-*` subset in `css/css-writing-modes`, including
+  `table-cell-align-*`, `table-cell-valign-*`, and the horizontal, vertical,
+  and sideways `table-progression-*` cases. This is scoped WPT coverage, not
+  a claim of complete vertical-table behavior.
 - Orthogonal table-cell row measurement preserves a definite logical
   `inline-size` as a horizontal table-row constraint, while a physical
   `height` derived from `ch` is resolved through the table's column track.
@@ -197,6 +223,11 @@ than text shaping alone.
   for vertical roots (rather than through physical-width constraints and
   left/right edges). The corresponding horizontal path continues to use width
   constraints and left/right decoration.
+- Table-body layout now exports one typed physical parent-flow endpoint before
+  wrapper trailing chrome is consumed. This prevents a completed vertical grid
+  from applying its logical-to-physical projection twice before the following
+  horizontal-flow sibling is placed; table-cell baseline sizing remains wholly
+  within the logical table-row pass.
 - Empty vertical float-avoidance scopes preserve the hypothetical physical
   top for both inline directions. In particular, a bottom-to-top nested BFC
   no longer jumps by the full available page-inline span before table layout.
@@ -272,15 +303,11 @@ than text shaping alone.
   `wm-propagation-body-047.html`, the propagated body canvas is correctly
   bottom-originated, but `html::after` is still laid out as narrow
   one-character columns.
-- Table wrapper origin placement for RTL vertical roots, structural
-  backgrounds, collapsed borders, alignment, and fragmentation still retain
-  physical horizontal-grid assumptions after the primary cell-grid projection;
-  vertical and sideways table WPTs therefore remain incomplete.
-- `css/css-tables/table-intrinsic-size-003.html` and
-  `table-intrinsic-size-004.html` still differ by the same wrapper-paint
-  projection (a 100px green square plus a separate border stripe). Their
-  logical inline preferred/min/max resolution is now shared and typed, but the
-  remaining physical wrapper projection is outside that sizing boundary.
+- Complex table-wrapper fragmentation, collapsed borders, alignment, and
+  repeated-row replay still need broader mixed-writing-mode coverage. Normal
+  table grid rectangles, structural paint clips, and row/row-group containing
+  blocks project through the table root exactly once; the horizontal, vertical,
+  and sideways `table-progression-*` WPT matrix passes.
 - `text-combine-upright` now parses, cascades, and inherits `none`, `all`, and
   `digits 2..4`; normalized eligible runs form horizontal child sequences in a
   one-em atomic inline and their captured paint subtree is compressed and

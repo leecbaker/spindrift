@@ -20,48 +20,46 @@ pub(in crate::layout) fn grid_area_occupies_quadrant(
     occupies_column && occupies_row
 }
 
-pub(in crate::layout) fn segment_start_endpoint(
+pub(in crate::layout) fn resolved_junction_affects_segments(
     context: AxisRuleContext<'_>,
-    gap: GapBand,
-    cursor: f32,
-    crossing_gap: GapBand,
-    crossing_rule_width: GapRuleWidth,
-    crossing_rule_can_paint: bool,
-) -> GapRuleEndpoint {
-    if cursor <= GAP_RULE_EPSILON {
-        GapRuleEndpoint::cap(0.0)
-    } else {
-        segment_junction_endpoint(
-            context,
-            gap,
-            cursor,
-            crossing_gap,
-            crossing_rule_width,
-            crossing_rule_can_paint,
-        )
-    }
+    junction: &ResolvedGapJunction,
+) -> bool {
+    context.container_kind == GapContainerKind::Grid
+        || junction
+            .members
+            .iter()
+            .copied()
+            .any(|crossing_gap| crossing_can_paint_for_gap(context, crossing_gap).unwrap_or(false))
 }
 
 pub(in crate::layout) fn segment_junction_endpoint(
     context: AxisRuleContext<'_>,
     gap: GapBand,
     position: f32,
-    crossing_gap: GapBand,
-    crossing_rule_width: GapRuleWidth,
-    crossing_rule_can_paint: bool,
+    junction: &ResolvedGapJunction,
 ) -> GapRuleEndpoint {
     // A geometric crossing is a junction only when its crossing decoration
     // exists. In particular, a hidden/zero-width flex rule leaves a cap;
     // its inset must not acquire `overlap-join` behavior merely because the
     // two resolved gutter rectangles meet.
     // <https://drafts.csswg.org/css-gaps-1/#gap-decoration-segments>
-    let crossing_segment_absent = !crossing_rule_can_paint
-        || grid_crossing_segment_present_at_junction(context, gap, crossing_gap)
-            .is_some_and(|present| !present);
-    if crossing_segment_absent {
-        GapRuleEndpoint::cap(position)
+    let crossing_rule_width = junction
+        .members
+        .iter()
+        .copied()
+        .filter(|crossing_gap| {
+            crossing_can_paint_for_gap(context, *crossing_gap).unwrap_or(false)
+                && grid_crossing_segment_present_at_junction(context, gap, *crossing_gap)
+                    .is_none_or(|present| present)
+        })
+        .filter_map(|crossing_gap| crossing_width_for_gap(context, crossing_gap))
+        .fold(None, |width: Option<GapRuleWidth>, candidate| {
+            Some(width.map_or(candidate, |width| width.max(candidate)))
+        });
+    if let Some(crossing_rule_width) = crossing_rule_width {
+        GapRuleEndpoint::junction(position, junction.width(), crossing_rule_width)
     } else {
-        GapRuleEndpoint::junction(position, crossing_gap, crossing_rule_width)
+        GapRuleEndpoint::cap_at_junction(position, junction.width())
     }
 }
 
@@ -247,11 +245,11 @@ pub(in crate::layout) fn offset_gap_rule_segment(
     GapDecorationSegment {
         start: GapRuleEndpoint {
             position: segment.start.position + start_inset,
-            kind: segment.start.kind,
+            ..segment.start
         },
         end: GapRuleEndpoint {
             position: segment.end.position - end_inset,
-            kind: segment.end.kind,
+            ..segment.end
         },
     }
 }
@@ -261,22 +259,19 @@ pub(in crate::layout) fn used_gap_rule_endpoint_inset(
     endpoint: GapRuleEndpoint,
 ) -> f32 {
     match value {
-        css::GapRuleInsetValue::LengthPercentage(value) => match endpoint.kind {
-            GapRuleEndpointKind::Cap => value.length_points(),
-            GapRuleEndpointKind::Junction(junction) => value
-                .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(
-                    junction.crossing_gap.size(),
-                )))
-                .map(layout_points)
-                .unwrap_or_else(|| value.length_points()),
-        },
+        css::GapRuleInsetValue::LengthPercentage(value) => value
+            .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(
+                endpoint.junction_width.points(),
+            )))
+            .map(layout_points)
+            .unwrap_or_else(|| value.length_points()),
         css::GapRuleInsetValue::OverlapJoin
             if matches!(endpoint.kind, GapRuleEndpointKind::Junction(_)) =>
         {
             match endpoint.kind {
                 GapRuleEndpointKind::Junction(junction) => junction
                     .crossing_rule_width
-                    .overlap_join_inset(junction.crossing_gap),
+                    .overlap_join_inset(endpoint.junction_width),
                 GapRuleEndpointKind::Cap => unreachable!("junction match retains junction data"),
             }
         }
@@ -878,14 +873,8 @@ mod tests {
 
     #[test]
     fn junction_insets_retain_crossing_gap_geometry() {
-        let crossing_gap = GapBand {
-            start: 10.0,
-            end: 30.0,
-            grid_line: None,
-            segment_range: None,
-            rule_index: None,
-        };
-        let junction = GapRuleEndpoint::junction(20.0, crossing_gap, GapRuleWidth::new(4.0));
+        let junction =
+            GapRuleEndpoint::junction(20.0, GapJunctionWidth::new(20.0), GapRuleWidth::new(4.0));
         let percentage = css::GapRuleInsetValue::LengthPercentage(
             css::ComputedLengthPercentage::from_percent(0.5),
         );
@@ -899,10 +888,20 @@ mod tests {
             -12.0
         );
 
-        let cap = GapRuleEndpoint::cap(20.0);
-        assert_eq!(used_gap_rule_endpoint_inset(percentage, cap), 0.0);
+        let junction_cap = GapRuleEndpoint::cap_at_junction(20.0, GapJunctionWidth::new(20.0));
         assert_eq!(
-            used_gap_rule_endpoint_inset(css::GapRuleInsetValue::OverlapJoin, cap),
+            used_gap_rule_endpoint_inset(percentage.clone(), junction_cap),
+            10.0
+        );
+        assert_eq!(
+            used_gap_rule_endpoint_inset(css::GapRuleInsetValue::OverlapJoin, junction_cap),
+            0.0
+        );
+
+        let boundary_cap = GapRuleEndpoint::cap(20.0);
+        assert_eq!(used_gap_rule_endpoint_inset(percentage, boundary_cap), 0.0);
+        assert_eq!(
+            used_gap_rule_endpoint_inset(css::GapRuleInsetValue::OverlapJoin, boundary_cap),
             0.0
         );
     }

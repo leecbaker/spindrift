@@ -14,6 +14,8 @@ pub(in crate::layout::flex) struct EstimatedFlexBaselineItem {
     pub(in crate::layout::flex) baseline_set: Option<FlexBaselineSet>,
     pub(in crate::layout::flex) first_baseline: Option<FlexCrossOffset>,
     pub(in crate::layout::flex) last_baseline: Option<FlexCrossOffset>,
+    pub(in crate::layout::flex) synthesized_first_baseline: FlexCrossOffset,
+    pub(in crate::layout::flex) synthesized_last_baseline: FlexCrossOffset,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -24,7 +26,6 @@ pub(in crate::layout::flex) enum EstimatedFlexItemCrossAlignment {
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::layout::flex) struct EstimatedFlexLineMetrics {
-    pub(in crate::layout::flex) line_count: usize,
     pub(in crate::layout::flex) cross_size: FlexCrossSize,
     pub(in crate::layout::flex) first_baseline: Option<FlexCrossOffset>,
     pub(in crate::layout::flex) last_baseline: Option<FlexCrossOffset>,
@@ -35,6 +36,22 @@ pub(in crate::layout::flex) struct EstimatedFlexLine {
     pub(in crate::layout::flex) item_indices: Vec<usize>,
     pub(in crate::layout::flex) cross_start: FlexCrossOffset,
     pub(in crate::layout::flex) cross_size: FlexCrossSize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EstimatedFlexContainerBaselineSource {
+    Shared {
+        line_index: usize,
+        baseline_set: FlexBaselineSet,
+    },
+    Item {
+        index: usize,
+        baseline_set: FlexBaselineSet,
+    },
+    SynthesizedItem {
+        index: usize,
+        baseline_set: FlexBaselineSet,
+    },
 }
 
 pub(in crate::layout::flex) fn estimated_flex_item_cross_axis_baselines(
@@ -164,8 +181,7 @@ pub(in crate::layout::flex) fn estimate_row_flex_container_line_metrics(
     if style.flex_wrap.reverses_cross_axis() {
         reverse_estimated_flex_line_cross_positions(&mut lines, container_cross_size);
     }
-    let first_line = lines.first()?;
-    let last_line = lines.last()?;
+    let (first_line, last_line) = estimated_flex_container_baseline_lines(&lines, style)?;
     let cross_size = lines
         .iter()
         .map(|line| line.cross_start + line.cross_size)
@@ -174,15 +190,16 @@ pub(in crate::layout::flex) fn estimate_row_flex_container_line_metrics(
         .non_negative_size();
 
     Some(EstimatedFlexLineMetrics {
-        line_count: lines.len(),
         cross_size,
-        first_baseline: estimated_flex_line_baseline(
+        first_baseline: estimated_flex_container_main_axis_baseline(
+            &lines,
             first_line,
             items,
             physical_direction,
             FlexBaselineSet::First,
         ),
-        last_baseline: estimated_flex_line_baseline(
+        last_baseline: estimated_flex_container_main_axis_baseline(
+            &lines,
             last_line,
             items,
             physical_direction,
@@ -451,11 +468,7 @@ pub(in crate::layout::flex) fn estimated_flex_line(
     items: &[EstimatedFlexBaselineItem],
 ) -> EstimatedFlexLine {
     let item_indices = (start..end).collect::<Vec<_>>();
-    let cross_size = item_indices
-        .iter()
-        .cloned()
-        .map(|index| items[index].outer_cross_size)
-        .fold(FlexCrossSize::new(0.0), FlexCrossSize::max);
+    let cross_size = estimated_flex_line_cross_size(&item_indices, items);
     EstimatedFlexLine {
         item_indices,
         cross_start,
@@ -463,44 +476,253 @@ pub(in crate::layout::flex) fn estimated_flex_line(
     }
 }
 
-pub(in crate::layout::flex) fn estimated_flex_line_baseline(
-    line: &EstimatedFlexLine,
+/// Calculate an estimated flex line's used cross size with the same
+/// baseline-sharing contribution used by final layout.
+///
+/// CSS Flexbox 9.4 sums the greatest distance before and after the shared
+/// baseline, then compares that sum with every non-participant's hypothetical
+/// outer cross size and zero:
+/// <https://www.w3.org/TR/css-flexbox-1/#algo-cross-line>.
+fn estimated_flex_line_cross_size(
+    item_indices: &[usize],
     items: &[EstimatedFlexBaselineItem],
-    physical_direction: FlexDirection,
-    baseline_set: FlexBaselineSet,
-) -> Option<FlexCrossOffset> {
-    // Keep the intrinsic adapter in lockstep with final flex layout: the
-    // shared baseline set wins, and only a line without participants falls
-    // back to its startmost/endmost item. Nested flex containers depend on
-    // this estimate before their final item geometry is available.
-    let shared_baseline = line
-        .item_indices
-        .iter()
-        .copied()
-        .filter(|&index| items[index].baseline_set == Some(baseline_set))
-        .filter_map(|index| estimated_flex_item_line_baseline(line, items[index], baseline_set))
-        .reduce(FlexCrossOffset::max);
-    if shared_baseline.is_some() {
-        return shared_baseline;
+) -> FlexCrossSize {
+    let mut largest_baseline_start = FlexCrossSize::new(0.0);
+    let mut largest_baseline_end = FlexCrossSize::new(0.0);
+    let mut has_baseline_participant = false;
+    let mut largest_other = FlexCrossSize::new(0.0);
+
+    for &index in item_indices {
+        let item = items[index];
+        let Some(baseline_set) = item.baseline_set else {
+            largest_other = largest_other.max(item.outer_cross_size);
+            continue;
+        };
+        has_baseline_participant = true;
+        let baseline = estimated_flex_item_baseline(item, baseline_set);
+        let distance_from_start = (item.margin_cross_start
+            + baseline.relative_to(FlexCrossOffset::new(0.0)))
+        .non_negative_size();
+        let distance_from_end = (item.outer_cross_size - distance_from_start).non_negative_size();
+        largest_baseline_start = largest_baseline_start.max(distance_from_start);
+        largest_baseline_end = largest_baseline_end.max(distance_from_end);
     }
 
-    estimated_flex_line_baseline_item_index(line, physical_direction, baseline_set)
-        .and_then(|index| estimated_flex_item_line_baseline(line, items[index], baseline_set))
+    let baseline_size = if has_baseline_participant {
+        largest_baseline_start + largest_baseline_end
+    } else {
+        FlexCrossSize::new(0.0)
+    };
+    baseline_size.max(largest_other)
+}
+
+fn estimated_flex_item_baseline(
+    item: EstimatedFlexBaselineItem,
+    baseline_set: FlexBaselineSet,
+) -> FlexCrossOffset {
+    match baseline_set {
+        FlexBaselineSet::First => item
+            .first_baseline
+            .unwrap_or(item.synthesized_first_baseline),
+        FlexBaselineSet::Last => item.last_baseline.unwrap_or(item.synthesized_last_baseline),
+    }
+}
+
+/// Select physical startmost/endmost estimated lines after packing.
+/// `wrap-reverse` changes their positions, but CSS baseline export still uses
+/// the container's ordinary writing-mode cross-start/end edges.
+fn estimated_flex_container_baseline_lines<'a>(
+    lines: &'a [EstimatedFlexLine],
+    style: &ComputedStyle,
+) -> Option<(&'a EstimatedFlexLine, &'a EstimatedFlexLine)> {
+    let cross_start = estimated_flex_base_cross_start_side(style);
+    let (first, last) = if cross_start.is_start_edge() {
+        (
+            lines.iter().min_by(|left, right| {
+                left.cross_start
+                    .partial_cmp(&right.cross_start)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }),
+            lines.iter().max_by(|left, right| {
+                (left.cross_start + left.cross_size)
+                    .partial_cmp(&(right.cross_start + right.cross_size))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }),
+        )
+    } else {
+        (
+            lines.iter().max_by(|left, right| {
+                (left.cross_start + left.cross_size)
+                    .partial_cmp(&(right.cross_start + right.cross_size))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }),
+            lines.iter().min_by(|left, right| {
+                left.cross_start
+                    .partial_cmp(&right.cross_start)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }),
+        )
+    };
+    Some((first?, last?))
+}
+
+#[cfg(test)]
+fn estimated_flex_line_baseline(
+    line: &EstimatedFlexLine,
+    items: &[EstimatedFlexBaselineItem],
+    _physical_direction: FlexDirection,
+    baseline_set: FlexBaselineSet,
+) -> Option<FlexCrossOffset> {
+    estimated_flex_container_main_axis_baseline(
+        std::slice::from_ref(line),
+        line,
+        items,
+        _physical_direction,
+        baseline_set,
+    )
+}
+
+fn estimated_flex_container_main_axis_baseline(
+    lines: &[EstimatedFlexLine],
+    fallback_line: &EstimatedFlexLine,
+    items: &[EstimatedFlexBaselineItem],
+    _physical_direction: FlexDirection,
+    baseline_set: FlexBaselineSet,
+) -> Option<FlexCrossOffset> {
+    let source =
+        estimated_flex_container_baseline_source(lines, fallback_line, items, baseline_set)?;
+    match source {
+        EstimatedFlexContainerBaselineSource::Shared {
+            line_index,
+            baseline_set: source_set,
+        } => lines[line_index]
+            .item_indices
+            .iter()
+            .copied()
+            .filter(|&index| items[index].baseline_set == Some(source_set))
+            .map(|index| {
+                estimated_flex_item_line_baseline(&lines[line_index], items[index], source_set)
+            })
+            .reduce(FlexCrossOffset::max),
+        EstimatedFlexContainerBaselineSource::Item {
+            index,
+            baseline_set,
+        } => Some(estimated_flex_item_line_baseline(
+            fallback_line,
+            items[index],
+            baseline_set,
+        )),
+        EstimatedFlexContainerBaselineSource::SynthesizedItem {
+            index,
+            baseline_set,
+        } => Some(estimated_flex_item_synthesized_line_baseline(
+            fallback_line,
+            items[index],
+            baseline_set,
+        )),
+    }
+}
+
+fn estimated_flex_container_baseline_source(
+    lines: &[EstimatedFlexLine],
+    fallback_line: &EstimatedFlexLine,
+    items: &[EstimatedFlexBaselineItem],
+    baseline_set: FlexBaselineSet,
+) -> Option<EstimatedFlexContainerBaselineSource> {
+    let has_participants = |line: &EstimatedFlexLine, set| {
+        line.item_indices
+            .iter()
+            .any(|&index| items[index].baseline_set == Some(set))
+    };
+    // Estimated lines retain order-modified line order even when their final
+    // cross positions are reversed. Sharing-group priority is confined to
+    // that first/last line, while `fallback_line` independently represents
+    // the ordinary finalized cross-start/end fallback used by final layout.
+    // <https://www.w3.org/TR/css-flexbox-1/#flex-baselines>
+    let participant_line_index = match baseline_set {
+        FlexBaselineSet::First => (!lines.is_empty()).then_some(0),
+        FlexBaselineSet::Last => lines.len().checked_sub(1),
+    };
+    if let Some(line_index) = participant_line_index
+        && has_participants(&lines[line_index], baseline_set)
+    {
+        return Some(EstimatedFlexContainerBaselineSource::Shared {
+            line_index,
+            baseline_set,
+        });
+    }
+    let opposite_set = baseline_set.opposite();
+    if let Some(line_index) = participant_line_index
+        && has_participants(&lines[line_index], opposite_set)
+    {
+        return Some(EstimatedFlexContainerBaselineSource::Shared {
+            line_index,
+            baseline_set: opposite_set,
+        });
+    }
+
+    let measured_set = |index: usize| {
+        [baseline_set, opposite_set]
+            .into_iter()
+            .find(|set| match set {
+                FlexBaselineSet::First => items[index].first_baseline.is_some(),
+                FlexBaselineSet::Last => items[index].last_baseline.is_some(),
+            })
+            .map(|set| EstimatedFlexContainerBaselineSource::Item {
+                index,
+                baseline_set: set,
+            })
+    };
+    let item_source = match baseline_set {
+        FlexBaselineSet::First => fallback_line
+            .item_indices
+            .iter()
+            .copied()
+            .find_map(measured_set),
+        FlexBaselineSet::Last => fallback_line
+            .item_indices
+            .iter()
+            .rev()
+            .copied()
+            .find_map(measured_set),
+    };
+    if item_source.is_some() {
+        return item_source;
+    }
+
+    let index =
+        estimated_flex_line_baseline_item_index(fallback_line, FlexDirection::Row, baseline_set)?;
+    Some(EstimatedFlexContainerBaselineSource::SynthesizedItem {
+        index,
+        baseline_set,
+    })
 }
 
 fn estimated_flex_item_line_baseline(
     line: &EstimatedFlexLine,
     item: EstimatedFlexBaselineItem,
     baseline_set: FlexBaselineSet,
-) -> Option<FlexCrossOffset> {
-    let baseline = match baseline_set {
-        FlexBaselineSet::First => item.first_baseline,
-        FlexBaselineSet::Last => item.last_baseline,
-    }?;
+) -> FlexCrossOffset {
+    let baseline = estimated_flex_item_baseline(item, baseline_set);
     let position = line.cross_start
         + estimated_flex_item_cross_start_offset(line, item)
         + item.margin_cross_start;
-    Some(position + baseline.relative_to(FlexCrossOffset::new(0.0)))
+    position + baseline.relative_to(FlexCrossOffset::new(0.0))
+}
+
+fn estimated_flex_item_synthesized_line_baseline(
+    line: &EstimatedFlexLine,
+    item: EstimatedFlexBaselineItem,
+    baseline_set: FlexBaselineSet,
+) -> FlexCrossOffset {
+    let baseline = match baseline_set {
+        FlexBaselineSet::First => item.synthesized_first_baseline,
+        FlexBaselineSet::Last => item.synthesized_last_baseline,
+    };
+    let position = line.cross_start
+        + estimated_flex_item_cross_start_offset(line, item)
+        + item.margin_cross_start;
+    position + baseline.relative_to(FlexCrossOffset::new(0.0))
 }
 
 pub(in crate::layout::flex) fn estimated_flex_item_cross_start_offset(
@@ -978,6 +1200,8 @@ mod tests {
             baseline_set,
             first_baseline: Some(FlexCrossOffset::new(first_baseline)),
             last_baseline: Some(FlexCrossOffset::new(first_baseline)),
+            synthesized_first_baseline: FlexCrossOffset::new(16.0),
+            synthesized_last_baseline: FlexCrossOffset::new(0.0),
         };
 
         // The first item has a 9px baseline, but the second participates in
@@ -992,5 +1216,28 @@ mod tests {
             ),
             Some(FlexCrossOffset::new(12.0)),
         );
+    }
+
+    #[test]
+    fn estimated_line_cross_size_includes_baseline_depths() {
+        let item = |outer_cross_size, baseline, baseline_set| EstimatedFlexBaselineItem {
+            outer_main_size: FlexMainSize::new(20.0),
+            outer_cross_size: FlexCrossSize::new(outer_cross_size),
+            margin_cross_start: FlexCrossLength::new(0.0),
+            cross_alignment: EstimatedFlexItemCrossAlignment::Side(PhysicalSide::Top),
+            baseline_set,
+            first_baseline: Some(FlexCrossOffset::new(baseline)),
+            last_baseline: Some(FlexCrossOffset::new(baseline)),
+            synthesized_first_baseline: FlexCrossOffset::new(outer_cross_size),
+            synthesized_last_baseline: FlexCrossOffset::new(0.0),
+        };
+        let items = [
+            item(16.0, 12.0, Some(FlexBaselineSet::First)),
+            item(28.0, 6.0, Some(FlexBaselineSet::First)),
+        ];
+
+        let line = estimated_flex_line(0, items.len(), FlexCrossOffset::new(0.0), &items);
+
+        assert_eq!(line.cross_size, FlexCrossSize::new(34.0));
     }
 }

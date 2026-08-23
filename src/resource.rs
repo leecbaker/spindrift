@@ -1,10 +1,3 @@
-use crate::dom::{self, DocumentSyntax, Element, ElementId, Node, NodeKind};
-use crate::image_store::{DocumentImageStore, ImageId, ImageMetadata, RasterOrientationPolicy};
-use crate::layout::IframeEmbeddingContext;
-use crate::svg::{
-    SharedSvgAsset, SvgImageContext, SvgPresentationOverrides,
-    parse_inline_svg_with_presentation_overrides, parse_svg_bytes_with_image_context,
-};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -16,6 +9,14 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use url::Url;
+
+use crate::dom::{self, DocumentSyntax, Element, ElementId, Node, NodeKind};
+use crate::image_store::{DocumentImageStore, ImageId, ImageMetadata, RasterOrientationPolicy};
+use crate::layout::IframeEmbeddingContext;
+use crate::svg::{
+    SharedSvgAsset, SvgImageContext, SvgPresentationOverrides,
+    parse_inline_svg_with_presentation_overrides, parse_svg_bytes_with_image_context,
+};
 
 /// Controls how a resource fetch failure affects rendering.
 ///

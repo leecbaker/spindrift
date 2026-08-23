@@ -1,12 +1,14 @@
+use std::io::Write;
+use std::time::Duration;
+
+use pdf_writer::types::{FunctionShadingType, MaskType, PaintType, TilingType};
+use pdf_writer::{Content, Filter, Pdf, Rect, Settings};
+
 use super::colors::{
     PdfBlendColorSpace, PdfColorPlan, PdfColorRequirements, PdfLoweringColorPolicy, PdfPaintColor,
 };
 use super::*;
 use crate::timing::DebugTimer;
-use pdf_writer::types::{FunctionShadingType, MaskType, PaintType, TilingType};
-use pdf_writer::{Content, Filter, Pdf, Rect, Settings};
-use std::io::Write;
-use std::time::Duration;
 
 pub(crate) fn write_document<W: Write>(
     document: &Document,

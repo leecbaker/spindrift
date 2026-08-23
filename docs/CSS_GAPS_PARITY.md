@@ -68,6 +68,12 @@ decorations, plus complex intersection and writing-mode cases.
   `*-rule-visibility-items`, honors `rule-overlap`, and paints the CSS line
   styles used by borders. Double gap rules paint two symmetric stripes around
   the gap-rule centerline rather than reusing a box-edge border orientation.
+- Overlapping or abutting crossing-gap portions form one union junction for
+  endpoint construction and percentage inset resolution. Individual portions
+  retain their rule-list identities, while cap-versus-junction classification
+  remains independent from the junction-width percentage basis; an interior
+  cap therefore resolves percentages against its junction and treats
+  `overlap-join` as zero.
 - For wrapped flex intersections, the shared painter preserves CSS flex order
   for rule-list assignment while traversing crossing portions in physical
   centerline order. Non-uniform main-axis gaps therefore form the required

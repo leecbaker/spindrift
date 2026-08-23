@@ -368,23 +368,26 @@ fn svg_replaced_group_with_overflow(
 /// the content-box intersection. External SVG image overflow is handled by
 /// [`svg_replaced_group`] instead.
 /// <https://www.w3.org/TR/SVG2/render.html#OverflowAndClipProperties>
-pub(in crate::layout) fn svg_replaced_group_with_viewport_clip(
+pub(in crate::layout) fn svg_replaced_group_with_overflow_clip(
     asset: &SharedSvgAsset,
     destination: PaintRect,
     object_fit: ObjectFit,
     object_position: css::BackgroundPosition,
     object_view_box: css::ObjectViewBox,
-    clip_viewport: bool,
+    overflow_edge: Option<&ResolvedOverflowClipEdge>,
 ) -> crate::svg::SvgPaintGroup {
-    svg_replaced_group_with_geometry_policy(
+    let group = svg_replaced_group_with_geometry_policy(
         asset,
         destination,
         object_fit,
         object_position,
         object_view_box,
-        ReplacedObjectOverflow::ClipToContentBox,
-        clip_viewport,
-    )
+        ReplacedObjectOverflow::Visible,
+        false,
+    );
+    overflow_edge
+        .and_then(|edge| edge.clip.path_clip())
+        .map_or(group.clone(), |clip| group.with_clip(clip))
 }
 
 fn svg_replaced_group_with_geometry_policy(
@@ -424,11 +427,24 @@ fn svg_replaced_group_with_geometry_policy(
     else {
         return crate::svg::SvgPaintGroup::empty();
     };
-    let group = viewport_asset.paint_group_for_source_rect_with_viewport_clip(
+    let mut group = viewport_asset.paint_group_for_source_rect_with_viewport_clip(
         mapping.destination,
         mapping.source,
         clip_viewport,
     );
+    if let Some(background) = asset.viewport_background() {
+        group.items.insert(
+            0,
+            crate::svg::SvgPaintItem::Path(Box::new(RenderedPath::new(
+                paint_rect_path_commands(mapping.destination),
+                Some(background.color),
+                RenderedPathFillRule::NonZero,
+                None,
+                PaintStrokeWidth::ZERO,
+                None,
+            ))),
+        );
+    }
     // The SVG painter owns the CSS-overflow viewport clip. Re-applying that
     // same rectangular edge would introduce an additional antialiased edge.
     // An effective `object-view-box` is different: it can add a source-crop
@@ -462,12 +478,7 @@ pub(in crate::layout) fn replaced_content_contour(
     if style.border_radius.clone().is_zero() && !shaped_border {
         return None;
     }
-    resolve_box_content_contour(
-        border_rect,
-        style,
-        border_insets,
-        BoxContentContourRequest::ReplacedContent,
-    )
+    resolve_replaced_content_contour(border_rect, style, border_insets)
 }
 
 /// Emit tiled vector paths for one CSS border-image slice.
@@ -536,8 +547,9 @@ mod tests {
             image.pixel_height() as f32 * css::CSS_PX_TO_PT,
         )
     }
-    use crate::css::{ComputedLengthPercentage, ObjectViewBox};
     use std::rc::Rc;
+
+    use crate::css::{ComputedLengthPercentage, ObjectViewBox};
 
     fn first_svg_path(group: &crate::svg::SvgPaintGroup) -> Option<&RenderedPath> {
         group.items.iter().find_map(|item| match item {
@@ -547,6 +559,34 @@ mod tests {
             }
             crate::svg::SvgPaintItem::RasterImage(_) => None,
         })
+    }
+
+    #[test]
+    fn external_svg_root_background_fills_the_concrete_object_viewport() {
+        let asset = Rc::new(
+            crate::svg::parse_svg_bytes(
+                br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 5 1" background-color="red" style="background-color: green"/>"#,
+            )
+            .expect("valid SVG"),
+        );
+        let destination = paint_space_rect(10.0, 20.0, 75.0, 75.0);
+        let group = svg_replaced_group(
+            &asset,
+            destination,
+            ObjectFit::Fill,
+            css::BackgroundPosition::INITIAL,
+            ObjectViewBox::None,
+            ReplacedObjectOverflow::ClipToContentBox,
+        );
+
+        let path = first_svg_path(&group).expect("viewport background path");
+        assert_eq!(path.fill, crate::css::parse_color("green"));
+        assert_eq!(path.bounds(), Some(destination));
+        assert_eq!(
+            group.items.len(),
+            1,
+            "usvg must not retain an SVG-space background path"
+        );
     }
 
     #[test]

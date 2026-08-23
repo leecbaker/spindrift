@@ -1,11 +1,276 @@
+use std::collections::{HashMap, HashSet};
+
 use super::*;
-use crate::layout::assets::DocumentPageIndex;
-use crate::layout::assets::fixed_background_page_margin_box;
+use crate::layout::assets::{
+    DocumentPageIndex, PositionedPaginationState, fixed_background_page_margin_box,
+};
+
+/// Opaque checkpoint for one speculative layout pass.
+///
+/// The checkpoint owns the complete speculative state, but exposes only the
+/// read-only boundary facts that replay consumers need.  Keeping the payload
+/// private prevents a caller from manufacturing an incomplete checkpoint or
+/// coupling new rollback fields to arbitrary layout modules.
+#[derive(Debug, Clone)]
+pub(in crate::layout) struct LayoutSnapshot {
+    speculative: SpeculativeLayoutState,
+}
+
+impl LayoutSnapshot {
+    pub(in crate::layout) fn page_count(&self) -> usize {
+        self.speculative.pages.len()
+    }
+
+    pub(in crate::layout) fn current_page_context(&self) -> PageContext {
+        self.speculative.current_page_context
+    }
+
+    pub(in crate::layout) fn cursor_y(&self) -> f32 {
+        self.speculative.cursor_y
+    }
+
+    pub(in crate::layout) fn content_left(&self) -> f32 {
+        self.speculative.content_left
+    }
+
+    pub(in crate::layout) fn content_right(&self) -> f32 {
+        self.speculative.content_right
+    }
+
+    pub(in crate::layout) fn current_page_has_flow_content(&self) -> bool {
+        self.speculative.current_page_has_flow_content
+    }
+
+    pub(in crate::layout) fn float_contexts(&self) -> &[FloatContext] {
+        &self.speculative.float_contexts
+    }
+
+    pub(in crate::layout) fn has_page_anchor(&self, target: &str) -> bool {
+        self.speculative.page_anchors.contains_key(target)
+    }
+
+    pub(in crate::layout) fn has_page_anchor_source_position(&self, target: &str) -> bool {
+        self.speculative
+            .page_anchor_source_positions
+            .contains_key(target)
+    }
+
+    pub(in crate::layout) fn has_page_anchor_text(&self, target: &str) -> bool {
+        self.speculative.page_anchor_text.contains_key(target)
+    }
+
+    pub(in crate::layout) fn has_page_anchor_counters(&self, target: &str) -> bool {
+        self.speculative.page_anchor_counters.contains_key(target)
+    }
+
+    pub(in crate::layout) fn bookmark_count(&self) -> usize {
+        self.speculative.bookmarks.len()
+    }
+
+    pub(in crate::layout) fn current_page_named_strings(
+        &self,
+    ) -> &HashMap<String, Vec<NamedStringAssignment>> {
+        &self.speculative.current_page_named_strings
+    }
+
+    pub(in crate::layout) fn current_page_running_elements(
+        &self,
+    ) -> &HashMap<String, Vec<NamedStringAssignment>> {
+        &self.speculative.current_page_running_elements
+    }
+
+    pub(in crate::layout) fn current_page_links(&self) -> &Vec<RenderedLink> {
+        &self.speculative.current_page.links
+    }
+
+    pub(in crate::layout) fn fragmentainer_override(&self) -> Option<FragmentainerOverride> {
+        self.speculative.fragmentainer_override
+    }
+
+    pub(in crate::layout) fn containing_block_direction(&self) -> Direction {
+        self.speculative.containing_block_direction
+    }
+
+    pub(in crate::layout) fn containing_block_writing_mode(&self) -> WritingMode {
+        self.speculative.containing_block_writing_mode
+    }
+
+    pub(in crate::layout) fn fragment_top_offsets(&self) -> &[FragmentTopOffset] {
+        &self.speculative.fragment_top_offsets
+    }
+
+    fn into_speculative(self) -> SpeculativeLayoutState {
+        self.speculative
+    }
+}
+
+/// Moves durable document output out of a builder before a discard-only
+/// layout replay.
+///
+/// A [`LayoutSnapshot`] clones rollback state, which is suitable for small
+/// probes that cannot retain aliases into the existing document paint tree.
+/// This transaction instead gives the replay fresh pagination and paint
+/// ownership, then restores the document artifacts verbatim. Use it when a
+/// speculative replay may lay out floats, tables, or positioned descendants
+/// that can attach paint to the current page.
+#[must_use]
+pub(in crate::layout) struct DetachedLayoutReplayTransaction {
+    pagination: PositionedPaginationState,
+    rollback: LayoutSnapshot,
+    pending_outside_marker_anchors: SuspendedOutsideMarkerAnchors,
+    speculative_table_height_estimates: HashMap<TableHeightEstimateCacheKey, f32>,
+    speculative_table_height_plans: HashMap<TableHeightPlanCacheKey, table::TableHeightPlan>,
+    speculative_auto_float_margin_box_heights: HashMap<AutoFloatMeasurementKey, MarginBoxLength>,
+    fragmentainer_transition_recorders: Vec<FragmentainerTransitionRecorder>,
+    committed_inline_floats: HashMap<InlineFloatId, CommittedInlineFloat>,
+    positioned_layers: Vec<PositionedPaintLayer>,
+    fixed_layers: Vec<FixedPaintLayer>,
+    committed_positioned_paint_identities: HashSet<(DocumentPageIndex, PositionedPaintCommitKey)>,
+    deferred_multicol_positioned_children: Vec<DeferredMulticolPositionedChild>,
+    multicol_positioned_containing_block_spans: Vec<MulticolPositionedContainingBlockSpan>,
+    next_multicol_positioned_containing_block_span_id: u64,
+    multicol_positioned_replay_capture_depth: usize,
+    page_value_scope_depth: usize,
+    containing_block_depth: usize,
+    assignment_capture_depth: usize,
+}
+
+impl DetachedLayoutReplayTransaction {
+    /// Start a replay whose output is discarded when [`Self::restore`] is
+    /// called. The caller may read geometry from the scratch replay, but may
+    /// not retain its paint or deferred side effects.
+    pub(in crate::layout) fn begin(layout: &mut LayoutBuilder<'_>) -> Self {
+        let page_value_scope_depth = layout.page_value_scope_stack.len();
+        let containing_block_depth = layout.containing_blocks.len();
+        let assignment_capture_depth = layout.assignment_capture_stack.len();
+        let pagination = layout.take_positioned_pagination_state();
+        let speculative_table_height_estimates =
+            std::mem::take(&mut layout.speculative_table_height_estimates);
+        let speculative_table_height_plans =
+            std::mem::take(&mut layout.speculative_table_height_plans);
+        let speculative_auto_float_margin_box_heights =
+            std::mem::take(&mut layout.speculative_auto_float_margin_box_heights);
+        let fragmentainer_transition_recorders =
+            std::mem::take(&mut layout.fragmentainer_transition_recorders);
+        let committed_inline_floats = std::mem::take(&mut layout.committed_inline_floats);
+        let positioned_layers = std::mem::take(&mut layout.positioned_layers);
+        let fixed_layers = std::mem::take(&mut layout.fixed_layers);
+        let committed_positioned_paint_identities =
+            std::mem::take(&mut layout.committed_positioned_paint_identities);
+        let deferred_multicol_positioned_children =
+            std::mem::take(&mut layout.deferred_multicol_positioned_children);
+        let multicol_positioned_containing_block_spans =
+            std::mem::take(&mut layout.multicol_positioned_containing_block_spans);
+        let next_multicol_positioned_containing_block_span_id =
+            layout.next_multicol_positioned_containing_block_span_id;
+        let multicol_positioned_replay_capture_depth =
+            layout.multicol_positioned_replay_capture_depth;
+        debug_assert!(layout.pages.is_empty());
+        debug_assert!(layout.committed_inline_floats.is_empty());
+        debug_assert!(layout.positioned_layers.is_empty());
+        debug_assert!(layout.fixed_layers.is_empty());
+        debug_assert!(layout.deferred_multicol_positioned_children.is_empty());
+        // A discarded replay can generate descendant lines, but none is an
+        // accepted principal line of the surrounding document.
+        let pending_outside_marker_anchors = layout.pending_outside_marker_anchors.suspend();
+        let rollback = layout.snapshot();
+        Self {
+            pagination,
+            rollback,
+            pending_outside_marker_anchors,
+            speculative_table_height_estimates,
+            speculative_table_height_plans,
+            speculative_auto_float_margin_box_heights,
+            fragmentainer_transition_recorders,
+            committed_inline_floats,
+            positioned_layers,
+            fixed_layers,
+            committed_positioned_paint_identities,
+            deferred_multicol_positioned_children,
+            multicol_positioned_containing_block_spans,
+            next_multicol_positioned_containing_block_span_id,
+            multicol_positioned_replay_capture_depth,
+            page_value_scope_depth,
+            containing_block_depth,
+            assignment_capture_depth,
+        }
+    }
+
+    /// Discard scratch output and restore the document state that preceded
+    /// [`Self::begin`].
+    pub(in crate::layout) fn restore(self, layout: &mut LayoutBuilder<'_>) {
+        layout.restore(self.rollback);
+        layout
+            .pending_outside_marker_anchors
+            .restore(self.pending_outside_marker_anchors);
+        debug_assert!(layout.committed_inline_floats.is_empty());
+        debug_assert!(layout.positioned_layers.is_empty());
+        debug_assert!(layout.fixed_layers.is_empty());
+        debug_assert!(layout.committed_positioned_paint_identities.is_empty());
+        debug_assert!(layout.deferred_multicol_positioned_children.is_empty());
+        // Scratch replay can establish multicol positioned containing blocks.
+        // They belong to discarded output and must not resolve a later
+        // committed descendant against a non-existent fragmentainer.
+        let discarded_scratch_spans =
+            std::mem::take(&mut layout.multicol_positioned_containing_block_spans);
+        debug_assert!(
+            layout
+                .active_multicol_positioned_containing_block_spans
+                .is_empty()
+        );
+        drop(discarded_scratch_spans);
+        layout.restore_positioned_pagination_state(self.pagination);
+        layout.speculative_table_height_estimates = self.speculative_table_height_estimates;
+        layout.speculative_table_height_plans = self.speculative_table_height_plans;
+        layout.speculative_auto_float_margin_box_heights =
+            self.speculative_auto_float_margin_box_heights;
+        debug_assert!(layout.fragmentainer_transition_recorders.is_empty());
+        layout.fragmentainer_transition_recorders = self.fragmentainer_transition_recorders;
+        layout.committed_inline_floats = self.committed_inline_floats;
+        layout.positioned_layers = self.positioned_layers;
+        layout.fixed_layers = self.fixed_layers;
+        layout.committed_positioned_paint_identities = self.committed_positioned_paint_identities;
+        layout.deferred_multicol_positioned_children = self.deferred_multicol_positioned_children;
+        layout.multicol_positioned_containing_block_spans =
+            self.multicol_positioned_containing_block_spans;
+        layout.next_multicol_positioned_containing_block_span_id =
+            self.next_multicol_positioned_containing_block_span_id;
+        layout.multicol_positioned_replay_capture_depth =
+            self.multicol_positioned_replay_capture_depth;
+        debug_assert_eq!(
+            layout.page_value_scope_stack.len(),
+            self.page_value_scope_depth,
+            "discarded replay must restore page-value scopes"
+        );
+        debug_assert_eq!(
+            layout.containing_blocks.len(),
+            self.containing_block_depth,
+            "discarded replay must restore containing-block scopes"
+        );
+        debug_assert_eq!(
+            layout.assignment_capture_stack.len(),
+            self.assignment_capture_depth,
+            "discarded replay must restore assignment-capture scopes"
+        );
+    }
+}
 
 impl<'a> LayoutBuilder<'a> {
+    /// Run a replay that may inspect layout geometry but must not retain any
+    /// document output.
+    pub(in crate::layout) fn with_discarded_layout_replay<T>(
+        &mut self,
+        replay: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let transaction = DetachedLayoutReplayTransaction::begin(self);
+        let result = replay(self);
+        transaction.restore(self);
+        result
+    }
+
     pub(in crate::layout) fn snapshot(&self) -> LayoutSnapshot {
         LayoutSnapshot {
-            rollback: RollbackLayoutState {
+            speculative: SpeculativeLayoutState {
                 pages: self.pages.clone(),
                 page_names: self.page_names.clone(),
                 page_blanks: self.page_blanks.clone(),
@@ -84,6 +349,7 @@ impl<'a> LayoutBuilder<'a> {
                 escaped_atom_positioning_depth: self.escaped_atom_positioning_depth,
                 escaped_atom_containing_block: self.escaped_atom_containing_block,
                 escaped_atom_positioning_context: self.escaped_atom_positioning_context,
+                containing_block_direction: self.containing_block_direction,
                 containing_block_writing_mode: self.containing_block_writing_mode,
                 fragment_top_offsets: self.fragment_top_offsets.clone(),
                 child_available_space_stack: self.child_available_space_stack.clone(),
@@ -148,7 +414,7 @@ impl<'a> LayoutBuilder<'a> {
     }
 
     pub(in crate::layout) fn restore(&mut self, snapshot: LayoutSnapshot) {
-        let LayoutSnapshot { rollback: snapshot } = snapshot;
+        let snapshot = snapshot.into_speculative();
         self.pages = snapshot.pages;
         self.page_names = snapshot.page_names;
         self.page_blanks = snapshot.page_blanks;
@@ -232,6 +498,7 @@ impl<'a> LayoutBuilder<'a> {
         self.escaped_atom_positioning_depth = snapshot.escaped_atom_positioning_depth;
         self.escaped_atom_containing_block = snapshot.escaped_atom_containing_block;
         self.escaped_atom_positioning_context = snapshot.escaped_atom_positioning_context;
+        self.containing_block_direction = snapshot.containing_block_direction;
         self.containing_block_writing_mode = snapshot.containing_block_writing_mode;
         self.fragment_top_offsets = snapshot.fragment_top_offsets;
         self.child_available_space_stack = snapshot.child_available_space_stack;

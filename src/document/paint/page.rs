@@ -1,8 +1,5 @@
 use std::borrow::Cow;
 
-use crate::document::Page;
-use crate::{Error, Result};
-
 use super::annotations::RenderedLink;
 use super::display_list::{PagePaintTree, PaintBand, PaintDisplayItem, PaintDisplayList};
 use super::effects::{PaintEffectScope, PaintEffects};
@@ -14,10 +11,12 @@ use super::patterns::{RenderedGradientPattern, RenderedImagePattern, RenderedSvg
 use super::shapes::{RenderedRect, RenderedRoundedRect, RenderedStroke};
 use super::stacking::PaintStackingContext;
 use super::text::{
-    RenderedLine, rendered_lines_can_merge_as_inline_continuation,
+    RenderedLine, RenderedTextPaintSegment, rendered_lines_can_merge_as_inline_continuation,
     rendered_lines_can_merge_as_tracking_continuation, rendered_lines_can_merge_with_word_gap,
     split_rendered_line_at_font_run_boundaries,
 };
+use crate::document::Page;
+use crate::{Error, Result};
 
 impl Page {
     /// Paint a document-canvas rectangle beneath every document stacking
@@ -469,6 +468,17 @@ impl Page {
         debug_assert!(
             !paths.is_empty() && paths.iter().all(|path| path.opaque_coverage_rect.is_some())
         );
+        let painted_glyph_count = line
+            .runs
+            .iter()
+            .filter_map(|run| run.glyphs.as_ref())
+            .flat_map(|glyphs| glyphs.iter())
+            .filter(|glyph| glyph.painted_id().is_some())
+            .count();
+        debug_assert!(
+            painted_glyph_count == 0 || painted_glyph_count == paths.len(),
+            "an opaque text coverage record must own every paintable glyph in its line"
+        );
         let (line_index, _) = self.record_line(line);
         let path_indices = paths
             .into_iter()
@@ -484,6 +494,25 @@ impl Page {
             PaintOperation::OpaqueTextCoverage(coverage_index),
         );
         line_index
+    }
+
+    /// Record ordered PDF text-paint slices without changing the CSS line's
+    /// layout or decoration ownership.
+    pub(crate) fn push_text_paint_segments_in_band(
+        &mut self,
+        band: PaintBand,
+        segments: Vec<RenderedTextPaintSegment>,
+    ) {
+        for segment in segments {
+            match segment {
+                RenderedTextPaintSegment::Text(line) => {
+                    self.push_line_in_band(band, line);
+                }
+                RenderedTextPaintSegment::OpaqueCoverage { line, paths } => {
+                    self.push_opaque_text_coverage_in_band(band, line, paths);
+                }
+            }
+        }
     }
 
     pub(crate) fn push_image_pattern_in_band(
@@ -1137,10 +1166,9 @@ impl PaintPrimitive {
 
 #[cfg(test)]
 mod tests {
+    use super::{PaintOperation, PaintPrimitive};
     use crate::CssColor;
     use crate::document::Page;
-
-    use super::{PaintOperation, PaintPrimitive};
     use crate::document::paint::display_list::PaintBand;
     use crate::document::paint::geometry::{
         PaintClip, PaintPoint, PaintRect, PaintSize, PaintStrokeWidth, PaintTransform,

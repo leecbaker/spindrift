@@ -1,5 +1,6 @@
-use super::*;
 use std::borrow::Cow;
+
+use super::*;
 
 /// Child box generated for a flex or grid formatting context.
 ///

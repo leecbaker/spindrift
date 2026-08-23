@@ -1,4 +1,10 @@
-use super::*;
+use super::{
+    BorderEdge, BorderStyle, ComputedStyle, CssColor, Direction, DoubleBorderBands, LayoutLength,
+    PageTopRect, PaintStrokeWidth, PhysicalSide, RenderedPath, RenderedRect, TableAxes,
+    TableColumnPlan, TableGridBlockOffset, TableGridBorderWidth, TableGridEdge,
+    TableGridInlineOffset, TableGridLength, TableGridPlacement, TableRowBounds, UsedBorderSide,
+    css, layout_pt,
+};
 
 pub(super) struct CollapsedBorderGrid {
     /// Winners on logical block boundaries, indexed by row boundary then
@@ -695,7 +701,12 @@ impl CollapsedBorderGrid {
         let after = (horizontal_boundary < row_count)
             .then(|| self.inline_boundary_width(horizontal_boundary, vertical_boundary))
             .flatten();
-        before.into_iter().chain(after).fold(0.0_f32, f32::max) / 2.0
+        before
+            .into_iter()
+            .chain(after)
+            .map(TableGridBorderWidth::points)
+            .fold(0.0_f32, f32::max)
+            / 2.0
     }
 
     /// Return half of the widest horizontal border touching a vertical segment end.
@@ -713,21 +724,30 @@ impl CollapsedBorderGrid {
             .checked_sub(1)
             .and_then(|column| self.block_boundary_width(horizontal_boundary, column));
         let after = self.block_boundary_width(horizontal_boundary, vertical_boundary);
-        before.into_iter().chain(after).fold(0.0_f32, f32::max) / 2.0
+        before
+            .into_iter()
+            .chain(after)
+            .map(TableGridBorderWidth::points)
+            .fold(0.0_f32, f32::max)
+            / 2.0
     }
 
-    fn inline_boundary_width(&self, row: usize, boundary: usize) -> Option<f32> {
+    fn inline_boundary_width(&self, row: usize, boundary: usize) -> Option<TableGridBorderWidth> {
         self.inline_boundaries
             .get(row)?
             .get(boundary)?
-            .map(|border| border.used_side().used_width.get())
+            .map(|border| {
+                TableGridBorderWidth::new(TableGridLength::new(border.used_side().used_width.get()))
+            })
     }
 
-    fn block_boundary_width(&self, boundary: usize, column: usize) -> Option<f32> {
+    fn block_boundary_width(&self, boundary: usize, column: usize) -> Option<TableGridBorderWidth> {
         self.block_boundaries
             .get(boundary)?
             .get(column)?
-            .map(|border| border.used_side().used_width.get())
+            .map(|border| {
+                TableGridBorderWidth::new(TableGridLength::new(border.used_side().used_width.get()))
+            })
     }
 
     /// Return the cell border insets contributed by the resolved collapsed grid.
@@ -747,18 +767,22 @@ impl CollapsedBorderGrid {
         let column_end = (column + colspan.max(1)).min(self.column_count);
         let block_start = (column..column_end)
             .filter_map(|segment_column| self.block_boundary_width(row, segment_column))
+            .map(TableGridBorderWidth::points)
             .fold(0.0_f32, f32::max)
             / 2.0;
         let block_end = (column..column_end)
             .filter_map(|segment_column| self.block_boundary_width(row_end, segment_column))
+            .map(TableGridBorderWidth::points)
             .fold(0.0_f32, f32::max)
             / 2.0;
         let inline_start = (row..row_end)
             .filter_map(|segment_row| self.inline_boundary_width(segment_row, column))
+            .map(TableGridBorderWidth::points)
             .fold(0.0_f32, f32::max)
             / 2.0;
         let inline_end = (row..row_end)
             .filter_map(|segment_row| self.inline_boundary_width(segment_row, column_end))
+            .map(TableGridBorderWidth::points)
             .fold(0.0_f32, f32::max)
             / 2.0;
 
@@ -1137,6 +1161,14 @@ fn collapsed_border_paint_style(style: BorderStyle) -> BorderStyle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::css::WritingMode;
+    use crate::layout::{FlowAxes, paint_space_rect};
+
+    #[test]
+    fn typed_grid_border_width_keeps_collapsed_half_width() {
+        let width = TableGridBorderWidth::new(TableGridLength::new(6.0));
+        assert_eq!(width.points() / 2.0, 3.0);
+    }
 
     fn style_with_solid_border(width_css_px: f32, color: CssColor) -> ComputedStyle {
         let mut style = ComputedStyle::initial();

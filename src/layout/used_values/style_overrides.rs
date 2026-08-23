@@ -83,15 +83,14 @@ pub(in crate::layout) fn set_style_used_height(style: &mut ComputedStyle, height
     );
 }
 
-/// Freezes a temporary replay style to a resolved content-box width bound.
+/// Freeze a temporary content-box replay style to a resolved content width.
 ///
-/// Flexbox resolves the item's outer size before normal-flow replay, while
-/// replaced sizing consumes min/max constraints in content-box space. The
-/// semantic input prevents callers from freezing a border-box size without
-/// first converting its padding and border contribution:
-/// <https://www.w3.org/TR/css-flexbox-1/#layout-algorithm> and
-/// <https://www.w3.org/TR/css-sizing-3/#box-sizing>.
-pub(in crate::layout) fn set_style_used_content_width_bounds(
+/// This adapter is paired with an explicit border-to-content conversion at
+/// the flex replay boundary; the temporary style therefore remains in
+/// `box-sizing: content-box` space throughout normal-flow reconstruction.
+/// <https://www.w3.org/TR/css-flexbox-1/#flex-items>
+/// <https://www.w3.org/TR/css-sizing-3/#box-sizing>
+pub(in crate::layout) fn set_style_used_content_box_width_bounds(
     style: &mut ComputedStyle,
     width: ContentBoxLength,
 ) {
@@ -102,17 +101,13 @@ pub(in crate::layout) fn set_style_used_content_width_bounds(
     style.box_values.max_width = width;
 }
 
-/// Freezes a temporary replay style to a resolved border-box height.
-///
-/// Replaced sizing consumes min/max constraints in content-box space, so
-/// convert the supplied border-box size before freezing the replay bounds.
-/// <https://www.w3.org/TR/css-flexbox-1/#layout-algorithm> and
-/// <https://www.w3.org/TR/css-sizing-3/#box-sizing>.
-pub(in crate::layout) fn set_style_used_height_bounds(style: &mut ComputedStyle, height: f32) {
-    let borders = used_border_widths(style);
-    let non_content = borders.top + borders.bottom + style.padding.top + style.padding.bottom;
+/// See [`set_style_used_content_box_width_bounds`].
+pub(in crate::layout) fn set_style_used_content_box_height_bounds(
+    style: &mut ComputedStyle,
+    height: ContentBoxLength,
+) {
     let height = css::ComputedLengthPercentageOrAuto::LengthPercentage(
-        css::ComputedLengthPercentage::from_points((height - non_content).max(0.0)),
+        css::ComputedLengthPercentage::from_points(height.points().max(0.0)),
     );
     style.box_values.min_height = height.clone();
     style.box_values.max_height = height;

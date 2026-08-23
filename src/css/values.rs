@@ -1,6 +1,7 @@
+use cssparser::{Parser, ParserInput};
+
 use super::component_values::{parse_css_string_token, trim_css_value};
 use super::types::*;
-use cssparser::{Parser, ParserInput};
 
 pub(crate) const CSS_PX_TO_PT: f32 = 72.0 / 96.0;
 

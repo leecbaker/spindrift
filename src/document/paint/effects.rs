@@ -1,5 +1,3 @@
-use crate::document::Page;
-
 use super::annotations::RenderedLink;
 use super::contours::{OverflowClipEffect, ResolvedBoxContentClip};
 use super::display_list::PaintDisplayItem;
@@ -9,6 +7,7 @@ use super::geometry::{
 };
 use super::page::{PaintOperation, PaintPrimitive};
 use super::paths::RenderedPathClip;
+use crate::document::Page;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PaintEffectScope {
@@ -403,7 +402,7 @@ impl PaintEffects {
 
     pub(crate) fn needs_group(&self) -> bool {
         self.opacity < 1.0
-            || self.filter.is_active()
+            || self.filter.requires_compositing_group()
             || self.mask.is_active()
             || self.blend_mode != PaintBlendMode::Normal
             || self.isolation
@@ -530,6 +529,16 @@ pub(crate) enum PaintFilterEffect {
 impl PaintFilterEffect {
     pub(crate) const fn is_active(self) -> bool {
         !matches!(self, Self::None)
+    }
+
+    /// CSS filter activity establishes paint-tree semantics independently of
+    /// whether its exact output needs a PDF transparency group.
+    pub(crate) fn requires_compositing_group(self) -> bool {
+        match self {
+            Self::None => false,
+            Self::Exact(lowering) => !lowering.is_visual_identity(),
+            Self::RequiresRasterBackend | Self::WillChange => true,
+        }
     }
 }
 
@@ -669,7 +678,8 @@ impl RenderedClipPathPolygon {
 
 #[cfg(test)]
 mod tests {
-    use super::{PaintEffectStep, PaintEffects, RenderedClipPathPolygon};
+    use super::{PaintEffectStep, PaintEffects, PaintFilterEffect, RenderedClipPathPolygon};
+    use crate::css::{BoundedSrgbColorTransform, ExactFilterLowering, UnitFilterAmount};
     use crate::document::paint::geometry::{PaintClip, PaintPoint, PaintTransform};
 
     #[test]
@@ -698,5 +708,31 @@ mod tests {
         .expect("three points form a polygon");
 
         assert_eq!(polygon.bounds(), PaintClip::new(-5.0, -2.0, 16.0, 9.0));
+    }
+
+    #[test]
+    fn identity_filter_remains_active_without_a_transparency_group() {
+        let filter = PaintFilterEffect::Exact(ExactFilterLowering {
+            color: BoundedSrgbColorTransform::IDENTITY,
+            alpha: UnitFilterAmount::ONE,
+        });
+        let effects = PaintEffects {
+            filter,
+            ..PaintEffects::default()
+        };
+
+        assert!(filter.is_active());
+        assert!(!filter.requires_compositing_group());
+        assert!(!effects.needs_group());
+    }
+
+    #[test]
+    fn nonidentity_exact_filter_still_requires_a_transparency_group() {
+        let filter = PaintFilterEffect::Exact(ExactFilterLowering {
+            color: BoundedSrgbColorTransform::grayscale(UnitFilterAmount::ONE),
+            alpha: UnitFilterAmount::ONE,
+        });
+
+        assert!(filter.requires_compositing_group());
     }
 }

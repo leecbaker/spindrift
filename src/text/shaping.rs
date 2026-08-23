@@ -165,7 +165,7 @@ pub(super) fn css_space_separator_advance(
 /// <https://www.w3.org/TR/css-text-3/#letter-spacing-property> and
 /// <https://www.unicode.org/reports/tr44/#Joining_Type>.
 pub(super) fn used_letter_spacing_for_text(text: &str, letter_spacing: f32) -> f32 {
-    if letter_spacing == 0.0 || text.chars().any(character_has_joining_behavior) {
+    if letter_spacing == 0.0 || text.chars().any(character_has_cursive_shaping_behavior) {
         0.0
     } else {
         letter_spacing

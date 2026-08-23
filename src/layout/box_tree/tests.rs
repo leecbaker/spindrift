@@ -1,10 +1,11 @@
+use std::collections::HashMap;
+use std::rc::Rc;
+
 use super::*;
 use crate::css::{
     ComputedLengthPercentage, ComputedLengthPercentageOrAuto, ComputedLineHeight, Css, Edges,
     FontFamily, Stylesheet, TextOrientation, WhiteSpace,
 };
-use std::collections::HashMap;
-use std::rc::Rc;
 
 fn parent_style() -> ComputedStyle {
     ComputedStyle {
@@ -41,6 +42,63 @@ async fn build_test_page_with_font_metrics<'a>(
 
 fn test_signature(tag: &str) -> ElementSignature {
     ElementSignature::new(tag, HashMap::new())
+}
+
+#[test]
+fn deeply_nested_box_tree_build_uses_a_small_native_stack() {
+    const DEPTH: usize = 256;
+    let result = std::thread::Builder::new()
+        .name("deep-box-tree".to_string())
+        .stack_size(1024 * 1024)
+        .spawn(|| {
+            let source = format!(
+                "<body>{}text{}</body>",
+                "<span>".repeat(DEPTH),
+                "</span>".repeat(DEPTH),
+            );
+            let root = dom::parse(&source);
+            let stylesheets =
+                Stylesheets::for_document(css::html5_user_agent_stylesheet(), None, &[]);
+            let page = build_page_box(&root, &stylesheets, &parent_style());
+
+            assert_eq!(page.children.len(), 1);
+        })
+        .expect("small-stack box-tree test thread must start")
+        .join();
+    assert!(
+        result.is_ok(),
+        "box-tree construction must not overflow its worker stack"
+    );
+}
+
+#[test]
+fn deeply_nested_box_tree_freeze_and_thaw_use_a_small_native_stack() {
+    const DEPTH: usize = 64;
+    let result = std::thread::Builder::new()
+        .name("deep-box-tree-conversion".to_string())
+        .stack_size(1024 * 1024)
+        .spawn(|| {
+            let source = format!(
+                "<body>{}text{}</body>",
+                "<span>".repeat(DEPTH),
+                "</span>".repeat(DEPTH),
+            );
+            let root = dom::parse(&source);
+            let stylesheets =
+                Stylesheets::for_document(css::html5_user_agent_stylesheet(), None, &[]);
+            let mutable = build_page_box(&root, &stylesheets, &parent_style());
+            let frozen = freeze_page_box(build_page_box(&root, &stylesheets, &parent_style()));
+            let thawed = clone_frozen_child_boxes_as_mutable(&frozen.children);
+
+            assert_eq!(mutable.children.len(), frozen.children.len());
+            assert_eq!(thawed.len(), frozen.children.len());
+        })
+        .expect("small-stack box-tree test thread must start")
+        .join();
+    assert!(
+        result.is_ok(),
+        "box-tree traversal must not overflow its worker stack"
+    );
 }
 
 #[test]

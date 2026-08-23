@@ -215,7 +215,7 @@ impl<'a> LayoutBuilder<'a> {
         principal_box_paint_mode: PrincipalBoxPaintMode,
     ) {
         let snapshot = self.snapshot();
-        let pages_before = snapshot.pages.len();
+        let pages_before = snapshot.page_count();
         self.layout_element_inner_with_principal_effect_context(
             element,
             style,

@@ -2,6 +2,7 @@ use super::super::*;
 use crate::document::PaintStrokeWidth;
 use crate::document::paint::geometry::{PaintPoint, PaintSpace, PaintTransform};
 use crate::document::paint::paths::{RenderedPath, RenderedPathCommand, RenderedPathFillRule};
+use crate::document::paint::text::OpaqueTextGlyphCoverage;
 
 ///
 /// A glyph outline is not page-local paint geometry. Its conversion to
@@ -14,18 +15,23 @@ pub(super) type GlyphOutlinePoint = euclid::Point2D<f32, GlyphOutlineSpace>;
 pub(super) type GlyphOutlineToPaint = euclid::ScaleOffset2D<f32, GlyphOutlineSpace, PaintSpace>;
 
 impl FontSystem {
-    pub(crate) fn full_em_rect_glyph_coverage_paths(
+    /// Return one owned opaque-coverage path for each qualifying glyph.
+    ///
+    /// Callers must retain the returned run/glyph indices when partitioning
+    /// text paint. A path for one full-em glyph is not evidence that an entire
+    /// line, run, or fallback sibling can be made invisible.
+    pub(crate) fn full_em_rect_glyph_coverages(
         &self,
         origin: PaintPoint,
         runs: &[RenderedTextRun],
         color: CssColor,
-    ) -> Vec<RenderedPath> {
+    ) -> Vec<OpaqueTextGlyphCoverage> {
         if !color.is_opaque() {
             return Vec::new();
         }
 
         let mut paths = Vec::new();
-        for run in runs {
+        for (run_index, run) in runs.iter().enumerate() {
             let Some(font_id) = run.font_id else {
                 continue;
             };
@@ -48,7 +54,7 @@ impl FontSystem {
             let transform =
                 PaintTransform::new(a, b, c, d, origin.x + run.x_offset, origin.y + run.y_offset);
             let mut cursor = 0.0;
-            for glyph in glyphs.iter() {
+            for (glyph_index, glyph) in glyphs.iter().enumerate() {
                 let Some(glyph_id) = glyph.painted_id().map(ttf_parser::GlyphId) else {
                     cursor += glyph.x_advance;
                     continue;
@@ -81,7 +87,11 @@ impl FontSystem {
                     let coverage = path
                         .bounds()
                         .expect("full-em rectangle outline has finite bounds");
-                    paths.push(path.with_opaque_coverage_rect(coverage));
+                    paths.push(OpaqueTextGlyphCoverage {
+                        run_index,
+                        glyph_index,
+                        path: path.with_opaque_coverage_rect(coverage),
+                    });
                 }
                 cursor += glyph.x_advance;
             }

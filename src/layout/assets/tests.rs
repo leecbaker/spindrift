@@ -1,5 +1,6 @@
-use super::*;
 use std::rc::Rc;
+
+use super::*;
 
 #[test]
 fn generated_gradient_pixel_size_preserves_asymmetric_paint_size() {
@@ -30,7 +31,9 @@ fn parsed_zero_length_conic_gradient_rasterizes_as_a_border_image_source() {
     assert!(
         image
             .rgb
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .all(|pixel| pixel[0] == 0 && pixel[1] > 0 && pixel[2] == 0)
     );
 }
@@ -285,10 +288,17 @@ fn abspos_stretch_does_not_size_an_axis_with_an_auto_inset() {
     style.align_self = css::SelfAlignment::new(SelfAlignmentKeyword::Stretch);
     style.box_values.inset_top = length(0.0);
 
-    let axis = resolve_absolute_vertical(&style, containing_block(100.0), 0.0, None, 0.0, 0.0);
+    let axis = resolve_absolute_vertical(
+        &style,
+        containing_block(100.0),
+        content_box_pt(0.0),
+        None,
+        0.0,
+        0.0,
+    );
 
-    assert_eq!(axis.start, 0.0);
-    assert_eq!(axis.size, 0.0);
+    assert_eq!(axis.start.points(), 0.0);
+    assert_eq!(axis.size.points(), 0.0);
 }
 
 #[test]
@@ -298,10 +308,188 @@ fn abspos_stretch_fills_an_axis_with_two_definite_insets() {
     style.box_values.inset_top = length(10.0);
     style.box_values.inset_bottom = length(20.0);
 
-    let axis = resolve_absolute_vertical(&style, containing_block(100.0), 0.0, None, 0.0, 0.0);
+    let axis = resolve_absolute_vertical(
+        &style,
+        containing_block(100.0),
+        content_box_pt(0.0),
+        None,
+        0.0,
+        0.0,
+    );
 
-    assert_eq!(axis.start, 10.0);
-    assert_eq!(axis.size, 70.0);
+    assert_eq!(axis.start.points(), 10.0);
+    assert_eq!(axis.size.points(), 70.0);
+}
+
+#[test]
+fn abspos_explicit_intrinsic_block_sizes_are_definite_before_margin_resolution() {
+    for height in [
+        css::ComputedLengthPercentageOrAuto::MinContent,
+        css::ComputedLengthPercentageOrAuto::MaxContent,
+        css::ComputedLengthPercentageOrAuto::FitContent(None),
+    ] {
+        let mut style = ComputedStyle::initial();
+        style.box_values.height.replace_with_used(height);
+        style.box_values.inset_top = length(0.0);
+        style.box_values.inset_bottom = length(0.0);
+
+        let axis = resolve_absolute_vertical(
+            &style,
+            containing_block_size(100.0, 600.0),
+            content_box_pt(200.0),
+            None,
+            0.0,
+            0.0,
+        );
+
+        assert_eq!(axis.size.points(), 200.0, "{axis:?}");
+    }
+}
+
+#[test]
+fn abspos_intrinsic_block_size_distributes_two_auto_margins() {
+    let mut style = ComputedStyle::initial();
+    style
+        .box_values
+        .height
+        .replace_with_used(css::ComputedLengthPercentageOrAuto::MaxContent);
+    style.box_values.inset_top = length(0.0);
+    style.box_values.inset_bottom = length(0.0);
+    style.box_values.margin.top = css::ComputedLengthPercentageOrAuto::Auto;
+    style.box_values.margin.bottom = css::ComputedLengthPercentageOrAuto::Auto;
+
+    let axis = resolve_absolute_vertical(
+        &style,
+        containing_block_size(100.0, 600.0),
+        content_box_pt(200.0),
+        None,
+        0.0,
+        0.0,
+    );
+
+    assert_eq!(axis.size.points(), 200.0);
+    assert_eq!(axis.margin_start.points(), 200.0);
+    assert_eq!(axis.margin_end.points(), 200.0);
+}
+
+#[test]
+fn abspos_intrinsic_block_size_distributes_one_auto_margin() {
+    let mut style = ComputedStyle::initial();
+    style
+        .box_values
+        .height
+        .replace_with_used(css::ComputedLengthPercentageOrAuto::FitContent(None));
+    style.box_values.inset_top = length(0.0);
+    style.box_values.inset_bottom = length(0.0);
+    style.box_values.margin.top = css::ComputedLengthPercentageOrAuto::Auto;
+    style.box_values.margin.bottom = length(10.0);
+    style.margin.bottom = 10.0;
+
+    let axis = resolve_absolute_vertical(
+        &style,
+        containing_block_size(100.0, 600.0),
+        content_box_pt(200.0),
+        None,
+        0.0,
+        0.0,
+    );
+
+    assert_eq!(axis.margin_start.points(), 390.0);
+    assert_eq!(axis.margin_end.points(), 10.0);
+}
+
+#[test]
+fn abspos_auto_table_block_size_is_intrinsic_unless_explicitly_stretched() {
+    let mut style = ComputedStyle::initial();
+    style.display = css::Display::TABLE;
+    style.box_values.inset_top = length(0.0);
+    style.box_values.inset_bottom = length(0.0);
+
+    let intrinsic = resolve_absolute_vertical(
+        &style,
+        containing_block_size(100.0, 600.0),
+        content_box_pt(200.0),
+        None,
+        0.0,
+        0.0,
+    );
+    assert_eq!(intrinsic.size.points(), 200.0);
+
+    style.align_self = css::SelfAlignment::new(SelfAlignmentKeyword::Stretch);
+    let stretched = resolve_absolute_vertical(
+        &style,
+        containing_block_size(100.0, 600.0),
+        content_box_pt(200.0),
+        None,
+        0.0,
+        0.0,
+    );
+    assert_eq!(stretched.size.points(), 600.0);
+}
+
+#[test]
+fn abspos_intrinsic_calc_size_cannot_enter_the_auto_stretch_branch() {
+    let mut style = ComputedStyle::initial();
+    style
+        .box_values
+        .height
+        .replace_with_used(css::ComputedLengthPercentageOrAuto::CalcSize(
+            css::CalcSize {
+                basis: css::CalcSizeBasis::Auto,
+                size_multiplier: 1.0,
+                additive: css::ComputedLengthPercentage::ZERO,
+                lower_bound: None,
+                upper_bound: None,
+            },
+        ));
+    style.box_values.inset_top = length(0.0);
+    style.box_values.inset_bottom = length(0.0);
+
+    let axis = resolve_absolute_vertical(
+        &style,
+        containing_block_size(100.0, 600.0),
+        content_box_pt(200.0),
+        None,
+        0.0,
+        0.0,
+    );
+
+    assert_eq!(axis.size.points(), 200.0);
+}
+
+#[test]
+fn abspos_intrinsic_size_resolution_is_equivalent_on_physical_axes() {
+    let mut horizontal_style = ComputedStyle::initial();
+    horizontal_style.box_values.width = css::ComputedLengthPercentageOrAuto::MaxContent;
+    horizontal_style.box_values.inset_left = length(0.0);
+    horizontal_style.box_values.inset_right = length(0.0);
+    let horizontal = resolve_absolute_horizontal(
+        &horizontal_style,
+        containing_block_size(600.0, 600.0),
+        200.0,
+        PhysicalStaticAxisFallback::new(0.0, 0.0),
+        Direction::Ltr,
+    );
+
+    let mut vertical_style = ComputedStyle::initial();
+    vertical_style.writing_mode = WritingMode::VerticalRl;
+    vertical_style
+        .box_values
+        .height
+        .replace_with_used(css::ComputedLengthPercentageOrAuto::MaxContent);
+    vertical_style.box_values.inset_top = length(0.0);
+    vertical_style.box_values.inset_bottom = length(0.0);
+    let vertical = resolve_absolute_vertical(
+        &vertical_style,
+        containing_block_size(600.0, 600.0),
+        content_box_pt(200.0),
+        None,
+        0.0,
+        0.0,
+    );
+
+    assert_eq!(horizontal.size.points(), vertical.size.points());
+    assert_eq!(horizontal.start.points(), vertical.start.points());
 }
 
 #[test]
@@ -315,8 +503,8 @@ fn rtl_auto_width_absolute_horizontal_uses_static_right() {
         Direction::Rtl,
     );
 
-    assert!((axis.start - 70.0).abs() < 0.01, "{axis:?}");
-    assert!((axis.size - 30.0).abs() < 0.01, "{axis:?}");
+    assert!((axis.start.points() - 70.0).abs() < 0.01, "{axis:?}");
+    assert!((axis.size.points() - 30.0).abs() < 0.01, "{axis:?}");
 }
 
 #[test]
@@ -333,8 +521,8 @@ fn rtl_definite_width_absolute_horizontal_uses_static_right() {
         Direction::Rtl,
     );
 
-    assert!((axis.start - 75.0).abs() < 0.01, "{axis:?}");
-    assert!((axis.size - 25.0).abs() < 0.01, "{axis:?}");
+    assert!((axis.start.points() - 75.0).abs() < 0.01, "{axis:?}");
+    assert!((axis.size.points() - 25.0).abs() < 0.01, "{axis:?}");
 }
 
 #[test]
@@ -361,7 +549,7 @@ fn repeated_border_image_tiles_share_decoded_pixel_storage() {
 
     assert!(images.len() > 1, "{images:?}");
     assert!(images.iter().all(|image| image.source_rect().is_some()));
-    assert!(images.iter().all(|image| !image.is_clipped()));
+    assert!(images.iter().all(|image| image.is_clipped()));
     assert!(
         images[1..]
             .iter()
@@ -612,8 +800,8 @@ fn ltr_absolute_horizontal_static_left_can_fall_after_containing_block() {
         Direction::Ltr,
     );
 
-    assert!((axis.start - 130.0).abs() < 0.01, "{axis:?}");
-    assert!((axis.size - 30.0).abs() < 0.01, "{axis:?}");
+    assert!((axis.start.points() - 130.0).abs() < 0.01, "{axis:?}");
+    assert!((axis.size.points() - 30.0).abs() < 0.01, "{axis:?}");
 }
 
 #[test]
@@ -627,8 +815,8 @@ fn rtl_absolute_horizontal_static_right_can_fall_after_containing_block() {
         Direction::Rtl,
     );
 
-    assert!((axis.start + 60.0).abs() < 0.01, "{axis:?}");
-    assert!((axis.size - 30.0).abs() < 0.01, "{axis:?}");
+    assert!((axis.start.points() + 60.0).abs() < 0.01, "{axis:?}");
+    assert!((axis.size.points() - 30.0).abs() < 0.01, "{axis:?}");
 }
 
 #[test]

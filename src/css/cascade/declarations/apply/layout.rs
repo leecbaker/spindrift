@@ -1,5 +1,6 @@
-use super::*;
 use std::num::NonZeroUsize;
+
+use super::*;
 
 pub(in crate::css) fn apply_cascaded_layout_declaration(
     style: &mut ComputedStyle,

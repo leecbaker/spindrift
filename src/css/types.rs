@@ -1,45 +1,74 @@
+use std::collections::{HashMap, HashSet};
+
+use ::selectors::parser::SelectorList;
+
 use super::selector::QuireSelectorImpl;
 use super::values::CSS_PX_TO_PT;
 pub(crate) use crate::units::{
     LayoutLength, PercentageBasis, SemanticLengthExt, layout_points, layout_pt,
 };
-use selectors::parser::SelectorList;
-use std::collections::HashMap;
-use std::collections::HashSet;
 
 mod background;
 mod border_image;
 mod box_model;
 mod columns;
+mod compositing;
 mod computed;
+mod containment;
 mod counters;
 mod display;
 mod fonts;
 mod gaps;
+mod generated_content;
 mod grid;
+mod images;
+mod language;
 mod lengths;
 mod line;
-mod misc;
+mod lists;
+mod paged_media;
+mod positioning;
 mod primitives;
+mod selectors;
+mod shadows;
+mod shapes;
 mod sides;
+mod sizing;
 mod source;
+mod text;
+mod text_decoration;
+mod transforms;
 
 pub(crate) use background::*;
 pub(crate) use border_image::*;
 pub(crate) use box_model::*;
 pub(crate) use columns::*;
+pub(crate) use compositing::*;
 pub(crate) use computed::*;
+pub(crate) use containment::*;
 pub(crate) use counters::*;
 pub(crate) use display::*;
 pub(crate) use fonts::*;
 pub(crate) use gaps::*;
+pub(crate) use generated_content::*;
 pub(crate) use grid::*;
+pub(crate) use images::*;
+pub(crate) use language::*;
 pub(crate) use lengths::*;
 pub(crate) use line::*;
-pub(crate) use misc::*;
+pub(crate) use lists::*;
+pub(crate) use paged_media::*;
+pub(crate) use positioning::*;
 pub use primitives::*;
+pub(crate) use selectors::*;
+pub(crate) use shadows::*;
+pub(crate) use shapes::*;
 pub(crate) use sides::*;
+pub(crate) use sizing::*;
 pub use source::*;
+pub(crate) use text::*;
+pub(crate) use text_decoration::*;
+pub(crate) use transforms::*;
 
 /// Projects deferred viewport-relative CSS lengths into layout lengths.
 ///

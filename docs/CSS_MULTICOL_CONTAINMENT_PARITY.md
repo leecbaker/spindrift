@@ -85,6 +85,10 @@ Containment Level 1, and their shared CSS Fragmentation behavior.
   normal-flow block whose automatic height is clamped by min/max sizing owns
   only that final fixed principal-box extent; its visible in-flow overflow
   continues through later anonymous columns as a parallel fragmented flow.
+  Before a min/max constraint wins, nested auto-height multicol and float
+  content remains content-sized: its child-driven continuation cannot be
+  mistaken for fixed-principal fragmentation merely because it has a numeric
+  used height.
   Column rules span only columns that actually receive inline content, and
   descendant inline-axis overflow remains visible across anonymous column
   boundaries until the multicol container's own overflow clips it.
@@ -281,11 +285,12 @@ failures are classified below rather than excluded.
 - Fragmented paint-containment effect-group semantics and non-polygon
   `clip-path` shapes remain part of the separate paint-effects work.
 - CSS Multicol Level 2 `column-height` and `column-wrap` support fixed row
-  geometry and forced-break wrapping, but nested row continuation,
-  spanner/page-row interactions, and the `column-height-008` family remain
-  incomplete. CSS Containment Level 2 `inline-size`, style containment, and
-  `content-visibility` are likewise outside this document's implemented Level
-  1 scope and account for a visible subset of unfiltered directory failures.
+  geometry, forced-break wrapping, and nested row continuation. Promoted
+  wrapper decoration across spanners, one forced-break gap edge, and nested
+  spanner paint continuation remain incomplete. CSS Containment Level 2
+  `inline-size`, style containment, and `content-visibility` are likewise
+  outside this document's implemented Level 1 scope and account for a visible
+  subset of unfiltered directory failures.
 
 ## Specifications
 

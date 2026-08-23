@@ -1,11 +1,12 @@
+use cssparser::{
+    AtRuleParser, BasicParseErrorKind, DeclarationParser, Parser, ParserState, RuleBodyItemParser,
+    RuleBodyParser, Token,
+};
+
 use super::*;
 use crate::css::{
     LayerName, LayerSegment, PropertyRegistrationRule, RegisteredCustomProperty, ScopeRoot,
     StylesheetScopeAnchor,
-};
-use cssparser::{
-    AtRuleParser, BasicParseErrorKind, DeclarationParser, Parser, ParserState, RuleBodyItemParser,
-    RuleBodyParser, Token,
 };
 
 pub(super) fn collect_container_style_rules(
@@ -309,16 +310,6 @@ fn nesting_scope_limit_parent<'i>(
     let selector = SelectorList::parse(selector_parser, &mut parser, ParseRelative::No)?;
     parser.expect_exhausted()?;
     Ok(selector)
-}
-
-pub(in crate::css) fn parse_parenthesized_selector(value: &str) -> Option<(&str, &str)> {
-    let value = value.trim_start();
-    if !value.starts_with('(') {
-        return None;
-    }
-    let close = matching_parenthesis(value, 0)?;
-    let selector = value[1..close].trim();
-    (!selector.is_empty()).then_some((selector, &value[close + 1..]))
 }
 
 pub(in crate::css) fn parse_scope_selector(

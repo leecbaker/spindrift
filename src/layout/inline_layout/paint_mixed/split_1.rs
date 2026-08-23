@@ -1,16 +1,18 @@
+use std::rc::Rc;
+
 use super::super::items::InlineLineSequenceSlice;
 use super::*;
 use crate::layout::assets::{
     ReplacedObjectOverflow, apply_object_fit, native_generated_gradient_primitive,
-    raster_image_sampling, replaced_content_contour, svg_replaced_group_with_viewport_clip,
+    raster_image_sampling, replaced_content_contour, svg_replaced_group_with_overflow_clip,
 };
 use crate::layout::text_paint::{
     TextDecorationLineGeometry, TextDecorationLineGlyphCoverage, TextDecorationLineGlyphSequence,
     TextDecorationLineKind, TextDecorationOriginFragmentGeometry, TextDecorationOriginLineGeometry,
-    TextDecorationStrokeAxis, TextInlineSpan, positioned_rendered_runs_for_writing_mode,
-    text_decoration_positioned_glyphs, text_decoration_skip_self_suppresses,
+    TextDecorationStrokeAxis, TextInlineSpan, VerticalInlineAxis,
+    positioned_rendered_runs_for_writing_mode, text_decoration_positioned_glyphs,
+    text_decoration_skip_self_suppresses,
 };
-use std::rc::Rc;
 
 /// Whether a shaped text group owns the initial-letter pseudo itself.
 ///
@@ -21,6 +23,40 @@ fn first_inline_fragment_is_initial_letter<F: InlineFragmentAccess>(fragments: &
     fragments
         .first()
         .is_some_and(|fragment| !fragment.style().initial_letter.is_normal())
+}
+
+/// Anchor a vertical glyph run at the same physical visual span selected by
+/// its containing line, even when the run's bidi direction advances from the
+/// opposite physical inline edge.
+///
+/// Inline line layout resolves visual order and allocates a physical span
+/// using the containing block's writing-mode axes. Text painting then applies
+/// the run style's own vertical advance direction. If those directions
+/// differ, retaining the containing-line glyph origin makes the run advance
+/// outside its allocated span. This is the sole line-to-glyph projection
+/// boundary; callers retain logical inline positions until the line geometry
+/// has chosen the physical span.
+/// <https://www.w3.org/TR/css-writing-modes-4/#unicode-bidi>
+/// <https://www.w3.org/TR/css-writing-modes-4/#logical-to-physical>
+fn reposition_vertical_text_group_at_visual_inline_span(
+    group: &mut PreparedInlineTextGroup,
+    line_style: &ComputedStyle,
+) {
+    if !line_style.writing_mode.has_vertical_lines()
+        || !group.style.writing_mode.has_vertical_lines()
+    {
+        return;
+    }
+    let Some(line_axis) = VerticalInlineAxis::for_style(line_style) else {
+        return;
+    };
+    let Some(run_axis) = VerticalInlineAxis::for_style(&group.style) else {
+        return;
+    };
+    // The two signs are +/-1. Their half-difference is exactly the signed
+    // shift from the line-selected glyph edge to the run's own advance edge.
+    let origin_shift = (line_axis.advance_sign() - run_axis.advance_sign()) * group.width() * 0.5;
+    group.set_y(group.y() + origin_shift);
 }
 
 impl<'a> LayoutBuilder<'a> {
@@ -59,12 +95,17 @@ impl<'a> LayoutBuilder<'a> {
             // Arabic run and lose its joining context.
             // <https://www.w3.org/TR/css-text-3/#boundary-shaping> and
             // <https://www.w3.org/TR/css-pseudo-4/#first-letter-pseudo>.
-            // The graph has already split the first-letter fragment for line
-            // fitting. Apply its cascaded style again after the first-line
-            // delta so `::first-letter` retains precedence without changing
-            // the graph's shaping boundary.
+            // The graph has already materialized every selected first-letter
+            // stream fragment for fitting. Reopening selection here would
+            // select from an already-split item list, so apply only the
+            // first-line delta.
             // <https://www.w3.org/TR/css-pseudo-4/#first-letter-pseudo>
-            apply_first_line_pseudos_to_line_items(&mut source_items, block_style, true);
+            apply_first_line_pseudos_to_line_items(
+                &mut source_items,
+                block_style,
+                false,
+                &mut self.font_system,
+            );
             let source_items = if split_for_inter_character {
                 split_mixed_line_into_inter_character_units(&source_items)
             } else if split_for_auto_justification {
@@ -77,7 +118,7 @@ impl<'a> LayoutBuilder<'a> {
                 .map(|item| {
                     let shaped = match &item {
                         InlineLineItem::Fragment(fragment) => {
-                            self.font_system.shape_unwrapped_line(
+                            self.font_system.shape_untracked_inline_line(
                                 fragment.text(),
                                 fragment.style(),
                                 fragment.style().line_height,
@@ -96,11 +137,7 @@ impl<'a> LayoutBuilder<'a> {
                         InlineLineItem::Float(_) => 0.0,
                     };
                     let shaped = shaped.map(Rc::new);
-                    MeasuredInlineItem {
-                        item,
-                        width,
-                        shaped,
-                    }
+                    MeasuredInlineItem::new(item, width, shaped)
                 })
                 .collect::<Vec<_>>()
         } else if split_for_inter_character || split_for_auto_justification {
@@ -115,7 +152,7 @@ impl<'a> LayoutBuilder<'a> {
                 .map(|item| {
                     let shaped = match &item {
                         InlineLineItem::Fragment(fragment) => {
-                            self.font_system.shape_unwrapped_line(
+                            self.font_system.shape_untracked_inline_line(
                                 fragment.text(),
                                 fragment.style(),
                                 fragment.style().line_height,
@@ -134,11 +171,7 @@ impl<'a> LayoutBuilder<'a> {
                         InlineLineItem::Float(_) => 0.0,
                     };
                     let shaped = shaped.map(Rc::new);
-                    MeasuredInlineItem {
-                        item,
-                        width,
-                        shaped,
-                    }
+                    MeasuredInlineItem::new(item, width, shaped)
                 })
                 .collect::<Vec<_>>()
         } else {
@@ -156,20 +189,24 @@ impl<'a> LayoutBuilder<'a> {
             crate::layout::inline_layout::graph::inline_content_width_for_line_items(
                 &line,
                 &mut self.font_system,
-                |item| item.width,
+                |item| item.used_advance().points(),
             );
         let final_painted_width = self.final_painted_inline_width(&line, block_style);
         let final_content_width = (final_painted_width
-            - visual_widths.trailing_space_width
-            - visual_widths.trailing_tracking_width)
+            - line_fragment.edge_effects.pre_wrap_hanging_width
+            - visual_widths.trailing_space_width)
             .max(0.0);
         let mut line_metrics = line_fragment.metrics;
         // Align using the final visual paint sequence. The source-selection
         // metric can differ from this width not only for CSS bidi controls,
         // but also after fallback shaping or shared boundary-cluster
-        // ownership. CSS alignment applies to the used inline content, not a
-        // pre-paint source estimate.
+        // ownership. Preserve the selected Phase II `pre-wrap` hanging
+        // advance while reconciling that final paint width: its source stays
+        // paintable, but CSS Text excludes it from alignment.
+        // CSS alignment applies to the used inline content, not a pre-paint
+        // source estimate.
         // <https://www.w3.org/TR/css-text-3/#text-align-property>
+        // <https://www.w3.org/TR/css-text-3/#white-space-phase-2>
         line_metrics.width = final_content_width;
         // The final visual width still includes a punctuation glyph which
         // CSS Text lets hang outside the line measure.  The selected record
@@ -297,7 +334,54 @@ impl<'a> LayoutBuilder<'a> {
         for (item_index, measured_item) in line.iter().enumerate() {
             match &measured_item.item {
                 InlineLineItem::Fragment(fragment) => {
-                    let leading_tracking = fragment.leading_tracking().points();
+                    let leading_tracking = measured_item.advance.boundary_before().points();
+                    // Tracking is a boundary between visual text groups.  A
+                    // pending group owns its final shaped advance, so flush
+                    // it before crossing that boundary instead of first
+                    // moving the provisional source-measure cursor.
+                    // <https://www.w3.org/TR/css-text-3/#letter-spacing-property>
+                    if leading_tracking != 0.0 && !pending_fragments.is_empty() {
+                        if let Some(group) = if justification_plan.justifies_inter_word() {
+                            self.prepare_justified_inline_text_group_at_inline_position(
+                                &pending_fragments,
+                                block_style,
+                                line_geometry,
+                                line_layout_baseline_y,
+                                line_logical_inline_start,
+                                line_physical_origin,
+                                pending_inline_position,
+                                pending_visual_offset,
+                                pending_horizontal_content_bottom_y,
+                                extra_space_width,
+                                pending_preserve_leading_summary_space,
+                            )
+                        } else {
+                            self.prepare_inline_text_group_at_inline_position(
+                                &pending_fragments,
+                                block_style,
+                                line_geometry,
+                                line_layout_baseline_y,
+                                line_logical_inline_start,
+                                line_physical_origin,
+                                pending_inline_position,
+                                pending_visual_offset,
+                                pending_horizontal_content_bottom_y,
+                                pending_preserve_leading_summary_space,
+                            )
+                        } {
+                            inline_position = pending_inline_position + group.width();
+                            Self::update_line_rendered_baseline_shift(
+                                &mut line_rendered_baseline_shift,
+                                line_layout_baseline_y,
+                                &group,
+                            );
+                            paint_items.push(PreparedInlinePaintItem::TextGroup(group));
+                        }
+                        pending_fragments.clear();
+                        pending_horizontal_content_bottom_y = None;
+                        pending_visual_offset = InlineVisualOffset::zero();
+                        pending_preserve_leading_summary_space = false;
+                    }
                     inline_position += leading_tracking;
                     let out_of_flow_paint_inline_advance = fragment
                         .out_of_flow_paint_inline_advance()
@@ -339,7 +423,7 @@ impl<'a> LayoutBuilder<'a> {
                             - fragment_content_block_size
                     });
                     let width = out_of_flow_paint_inline_advance
-                        .unwrap_or(measured_item.width - leading_tracking)
+                        .unwrap_or(measured_item.base_advance().points())
                         .max(0.0);
                     let fragment_expansion_count =
                         justification_plan.expansion_count_after_item(item_index);
@@ -459,6 +543,12 @@ impl<'a> LayoutBuilder<'a> {
                                 pending_preserve_leading_summary_space,
                             )
                         } {
+                            // The final visual group is the authoritative
+                            // inline advance.  The selected line's measured
+                            // slices can differ after bidi reordering and
+                            // boundary shaping, so subsequent visual items
+                            // must not retain their provisional source cursor.
+                            inline_position = pending_inline_position + group.width();
                             Self::update_line_rendered_baseline_shift(
                                 &mut line_rendered_baseline_shift,
                                 line_layout_baseline_y,
@@ -505,6 +595,7 @@ impl<'a> LayoutBuilder<'a> {
                                 pending_horizontal_content_bottom_y,
                                 pending_preserve_leading_summary_space,
                             ) {
+                                inline_position = pending_inline_position + group.width();
                                 Self::update_line_rendered_baseline_shift(
                                     &mut line_rendered_baseline_shift,
                                     line_layout_baseline_y,
@@ -543,7 +634,8 @@ impl<'a> LayoutBuilder<'a> {
                     }
                     let preserves_pending_shaping =
                         inline_atom_preserves_pending_text_shaping(atom);
-                    if (!preserves_pending_shaping || atom.leading_tracking().points() != 0.0)
+                    let boundary_before = measured_item.advance.boundary_before().points();
+                    if (!preserves_pending_shaping || boundary_before != 0.0)
                         && let Some(group) = if justification_plan.justifies_inter_word() {
                             self.prepare_justified_inline_text_group_at_inline_position(
                                 &pending_fragments,
@@ -573,6 +665,7 @@ impl<'a> LayoutBuilder<'a> {
                             )
                         }
                     {
+                        inline_position = pending_inline_position + group.width();
                         Self::update_line_rendered_baseline_shift(
                             &mut line_rendered_baseline_shift,
                             line_layout_baseline_y,
@@ -580,13 +673,13 @@ impl<'a> LayoutBuilder<'a> {
                         );
                         paint_items.push(PreparedInlinePaintItem::TextGroup(group));
                     }
-                    if !preserves_pending_shaping || atom.leading_tracking().points() != 0.0 {
+                    if !preserves_pending_shaping || boundary_before != 0.0 {
                         pending_fragments.clear();
                         pending_horizontal_content_bottom_y = None;
                         pending_visual_offset = InlineVisualOffset::zero();
                         pending_preserve_leading_summary_space = false;
                     }
-                    inline_position += atom.leading_tracking().points();
+                    inline_position += boundary_before;
                     if let InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge)) =
                         atom.content()
                     {
@@ -725,7 +818,7 @@ impl<'a> LayoutBuilder<'a> {
                     // paint both sides at a single inline origin.
                     // <https://www.w3.org/TR/css-text-3/#white-space-phase-2>
                     // <https://www.w3.org/TR/CSS22/visuren.html#float-position>
-                    if measured_item.width > 0.0 {
+                    if measured_item.used_advance().points() > 0.0 {
                         if let Some(group) = if justification_plan.justifies_inter_word() {
                             self.prepare_justified_inline_text_group_at_inline_position(
                                 &pending_fragments,
@@ -754,6 +847,7 @@ impl<'a> LayoutBuilder<'a> {
                                 pending_preserve_leading_summary_space,
                             )
                         } {
+                            inline_position = pending_inline_position + group.width();
                             Self::update_line_rendered_baseline_shift(
                                 &mut line_rendered_baseline_shift,
                                 line_layout_baseline_y,
@@ -764,8 +858,8 @@ impl<'a> LayoutBuilder<'a> {
                         pending_fragments.clear();
                         pending_horizontal_content_bottom_y = None;
                     }
-                    inline_position += measured_item.width;
-                    if measured_item.width > 0.0 {
+                    inline_position += measured_item.used_advance().points();
+                    if measured_item.used_advance().points() > 0.0 {
                         pending_inline_position = inline_position;
                         pending_visual_offset = InlineVisualOffset::zero();
                     }
@@ -874,7 +968,7 @@ impl<'a> LayoutBuilder<'a> {
         for (item_index, measured_item) in line.iter().enumerate() {
             match &measured_item.item {
                 InlineLineItem::Fragment(fragment) => {
-                    let leading_tracking = fragment.leading_tracking().points();
+                    let leading_tracking = measured_item.advance.boundary_before().points();
                     if leading_tracking != 0.0 && !pending_fragments.is_empty() {
                         flush_pending(
                             self,
@@ -938,7 +1032,7 @@ impl<'a> LayoutBuilder<'a> {
                         pending_fragments.push(fragment);
                     } else {
                         let width = out_of_flow_paint_inline_advance
-                            .unwrap_or(measured_item.width - leading_tracking)
+                            .unwrap_or(measured_item.base_advance().points())
                             .max(0.0);
                         inline_position += width;
                         natural_width = natural_width.max(inline_position);
@@ -950,7 +1044,7 @@ impl<'a> LayoutBuilder<'a> {
                         continue;
                     }
                     if !inline_atom_preserves_pending_text_shaping(atom)
-                        || atom.leading_tracking().points() != 0.0
+                        || measured_item.advance.boundary_before().points() != 0.0
                     {
                         flush_pending(
                             self,
@@ -962,7 +1056,7 @@ impl<'a> LayoutBuilder<'a> {
                         );
                         pending_preserve_leading_summary_space = false;
                     }
-                    inline_position += atom.leading_tracking().points();
+                    inline_position += measured_item.advance.boundary_before().points();
 
                     if let InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge)) =
                         atom.content()
@@ -996,7 +1090,7 @@ impl<'a> LayoutBuilder<'a> {
                         &mut inline_position,
                         &mut natural_width,
                     );
-                    inline_position += measured_item.width;
+                    inline_position += measured_item.used_advance().points();
                     natural_width = natural_width.max(inline_position);
                     previous_item_was_opaque_atom = false;
                 }
@@ -1049,7 +1143,7 @@ impl<'a> LayoutBuilder<'a> {
             }
             match &measured_item.item {
                 InlineLineItem::Fragment(fragment) => {
-                    let leading_tracking = fragment.leading_tracking().points();
+                    let leading_tracking = measured_item.advance.boundary_before().points();
                     inline_position += leading_tracking;
                     let out_of_flow_paint_inline_advance = fragment
                         .out_of_flow_paint_inline_advance()
@@ -1067,7 +1161,7 @@ impl<'a> LayoutBuilder<'a> {
                     }
 
                     let width = out_of_flow_paint_inline_advance
-                        .unwrap_or(measured_item.width - leading_tracking)
+                        .unwrap_or(measured_item.base_advance().points())
                         .max(0.0);
 
                     let can_append = pending_fragments
@@ -1123,7 +1217,7 @@ impl<'a> LayoutBuilder<'a> {
                     pending_fragments.clear();
                     pending_preserve_leading_summary_space = false;
 
-                    inline_position += atom.leading_tracking().points();
+                    inline_position += measured_item.advance.boundary_before().points();
 
                     if let InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge)) =
                         atom.content()
@@ -1156,7 +1250,7 @@ impl<'a> LayoutBuilder<'a> {
                         inline_atom_content_preserves_adjacent_space_summary(atom.content());
                 }
                 InlineLineItem::Float(_) => {
-                    inline_position += measured_item.width;
+                    inline_position += measured_item.used_advance().points();
                     natural_width = natural_width.max(inline_position);
                     previous_item_was_opaque_atom = false;
                 }
@@ -1244,6 +1338,7 @@ impl<'a> LayoutBuilder<'a> {
             line_physical_origin,
             visual_inline_start,
         );
+        reposition_vertical_text_group_at_visual_inline_span(&mut group, tab_metric_style);
         group.set_x(group.x() + visual_offset.x());
         group.set_y(group.y() + visual_offset.y());
         self.apply_inline_text_group_text_box_trim_link_rect(&mut group, line_geometry);
@@ -1301,6 +1396,7 @@ impl<'a> LayoutBuilder<'a> {
             line_physical_origin,
             visual_inline_start,
         );
+        reposition_vertical_text_group_at_visual_inline_span(&mut group, tab_metric_style);
         group.set_x(group.x() + visual_offset.x());
         group.set_y(group.y() + visual_offset.y());
         self.apply_inline_text_group_text_box_trim_link_rect(&mut group, line_geometry);
@@ -1381,7 +1477,7 @@ impl<'a> LayoutBuilder<'a> {
                         group.style.opacity.value() < 1.0
                     } else {
                         group.paint_opacity < 1.0
-                    };
+                    } || group.positioned_paint_style.is_some();
                     if has_paint_effect {
                         if !phaseable_text_groups.is_empty() {
                             self.paint_prepared_inline_text_groups_in_phases(
@@ -1460,10 +1556,16 @@ impl<'a> LayoutBuilder<'a> {
             if group.decoration_provenance.is_empty() {
                 continue;
             }
-            let reference = group
+            let mut reference = group
                 .decoration_paint_rect
                 .map(|rect| rect.origin)
                 .unwrap_or_else(|| PaintPoint::new(group.x(), group.y()));
+            if let (Some(rect), Some(inline_axis)) = (
+                group.decoration_paint_rect,
+                VerticalInlineAxis::for_style(&group.style),
+            ) {
+                reference.y = inline_axis.logical_start_for_paint_rect(rect).y();
+            }
             let axis = if group.style.writing_mode == WritingMode::HorizontalTb {
                 TextDecorationStrokeAxis::Horizontal
             } else {
@@ -1490,10 +1592,14 @@ impl<'a> LayoutBuilder<'a> {
                             WritingMode::VerticalRl
                             | WritingMode::VerticalLr
                             | WritingMode::SidewaysRl
-                            | WritingMode::SidewaysLr => TextInlineSpan::new(
-                                reference.y + receiver.inline_span.start,
-                                reference.y + receiver.inline_span.end,
-                            ),
+                            | WritingMode::SidewaysLr => {
+                                VerticalInlineAxis::for_style(&receiver.style)
+                                    .expect("vertical writing modes have a vertical inline axis")
+                                    .project_span_from_start(
+                                        layout_pt(reference.y),
+                                        receiver.inline_span,
+                                    )
+                            }
                         },
                     };
                     let positioned_glyphs = text_decoration_positioned_glyphs(
@@ -1578,6 +1684,9 @@ impl<'a> LayoutBuilder<'a> {
                                 decoration.origin_style.as_ref(),
                                 &receiver.style,
                                 metrics,
+                            ),
+                            origin_inline_axis: VerticalInlineAxis::for_style(
+                                decoration.origin_style.as_ref(),
                             ),
                             selected_inline_span: Some(coverage.span),
                             receiver_spans: vec![coverage.span],
@@ -1684,6 +1793,16 @@ impl<'a> LayoutBuilder<'a> {
                     PaintBand::Inline,
                     bounds,
                 ),
+                // A non-atomic inline's `InlineBox` atom is only a retained
+                // line-layout sequence. Do not give it the atomic replay
+                // policy: that would retain a negative positioned descendant
+                // inside the inline's own background fragment.
+                // <https://www.w3.org/TR/CSS22/zindex.html>
+                InlineAtomContent::InlineBox { .. }
+                    if !property_containment_applies_to_style(atom.style()) =>
+                {
+                    StackingContextPolicy::for_non_positioned_style_effect(atom.style(), bounds)
+                }
                 _ => StackingContextPolicy::for_atomic(atom.style(), PaintBand::Inline, bounds),
             };
             // A replaced atom's CSS content clip is attached directly to its
@@ -1958,10 +2077,14 @@ impl<'a> LayoutBuilder<'a> {
             InlineAtomContent::Svg { asset } => {
                 if let Some(asset) = asset {
                     let borders = used_border_widths(atom.style());
-                    let content_contour = replaced_content_contour(
-                        paint_space_rect(content_x, y, content_width, content_height),
+                    let border_rect = paint_space_rect(content_x, y, content_width, content_height);
+                    let overflow_edge = resolve_overflow_clip_edge(
+                        border_rect,
                         atom.style(),
                         borders,
+                        UsedOverflowAxes::from_svg_viewport_style(atom.style()),
+                        atom.style().contain.paint,
+                        None,
                     );
                     let svg_x = content_x + borders.left + atom.style().padding.left;
                     let svg_y = y + borders.bottom + atom.style().padding.bottom;
@@ -1982,20 +2105,14 @@ impl<'a> LayoutBuilder<'a> {
                     // asset, however, an embedded SVG's root viewport obeys
                     // the element's computed CSS overflow.
                     if svg_width > 0.0 && svg_height > 0.0 {
-                        let mut group = svg_replaced_group_with_viewport_clip(
+                        let group = svg_replaced_group_with_overflow_clip(
                             asset,
                             paint_space_rect(svg_x, svg_y, svg_width, svg_height),
                             atom.style().object_fit,
                             atom.style().object_position.clone(),
                             atom.style().object_view_box.clone(),
-                            style_clips_overflow(atom.style()),
+                            overflow_edge.as_ref(),
                         );
-                        if let Some(clip) = content_contour
-                            .as_ref()
-                            .and_then(ResolvedBoxContentClip::path_clip)
-                        {
-                            group = group.with_clip(clip);
-                        }
                         self.push_svg_group_in_band(PaintBand::Inline, group);
                     }
                 }
@@ -2144,12 +2261,38 @@ impl<'a> LayoutBuilder<'a> {
                             baseline
                         }
                     };
+                    let annotation_block_top = annotation_baseline + annotation_line_box_baseline;
+                    // A ruby-text container owns a generated principal box;
+                    // its child sequence retains only descendant fragments.
+                    // Paint its decoration even when no direct text fragment
+                    // exists, such as an `rt` containing a positioned span.
+                    // <https://drafts.csswg.org/css-ruby-1/#ruby-text-container>
+                    let annotation_height = annotation_block_size
+                        .max(annotation.style.line_height)
+                        .max(0.0);
+                    let annotation_width = annotation.paint_inline_size.points().max(0.0);
+                    if annotation.style.visibility == Visibility::Visible
+                        && annotation_width > 0.0
+                        && annotation_height > 0.0
+                    {
+                        for primitive in self.box_background_primitives(
+                            paint_space_rect(
+                                annotation_x,
+                                annotation_block_top - annotation_height,
+                                annotation_width,
+                                annotation_height,
+                            ),
+                            &annotation.style,
+                        ) {
+                            self.push_primitive_in_band(PaintBand::Inline, primitive);
+                        }
+                    }
                     self.paint_inline_box_sequence(
                         &annotation.sequence,
                         &annotation.style,
                         annotation_x,
                         annotation_available_width,
-                        annotation_baseline + annotation_line_box_baseline,
+                        annotation_block_top,
                     );
                 }
             }

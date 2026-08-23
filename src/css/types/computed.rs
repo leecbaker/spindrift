@@ -1,94 +1,10 @@
-use super::*;
-use crate::units::{ContentBoxLength, LayoutSize};
-use icu_locale_core::Locale;
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 use std::sync::Arc;
 
-/// One text-decoration origin carried through eligible in-flow descendants.
-///
-/// CSS text decorations do not inherit, but their lines propagate through
-/// in-flow descendants. The source font context must therefore accompany the
-/// decoration: `auto`, `from-font`, and percentage values are resolved using
-/// the decorating box, never a descendant that merely supplies glyphs.
-///
-/// The retained snapshot has an empty layer list, making this provenance
-/// finite rather than a recursively nested computed-style tree.
-/// <https://drafts.csswg.org/css-text-decor-4/#line-decoration>
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct TextDecorationLayer {
-    pub(crate) decoration: TextDecoration,
-    pub(crate) origin_style: Rc<ComputedStyle>,
-}
-
-/// A custom identifier used to select a named `@page` rule.
-/// <https://www.w3.org/TR/css-page-3/#page-property>
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct PageName(String);
-
-impl PageName {
-    pub(crate) fn new(value: String) -> Self {
-        Self(value)
-    }
-
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// Computed `page` state, including the distinction between an omitted
-/// declaration and an explicit `page: auto` needed by named-page propagation.
-/// <https://www.w3.org/TR/css-page-3/#using-named-pages>
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PageAssignment {
-    Unspecified,
-    Auto,
-    Named(PageName),
-}
-
-/// The computed `break-inside` avoidance target.
-///
-/// `avoid` applies to every fragmentainer; the page and column variants are
-/// deliberately retained as distinct computed values rather than collapsed
-/// into independent booleans.
-/// <https://www.w3.org/TR/css-break-3/#propdef-break-inside>
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum BreakInsideAvoidance {
-    #[default]
-    Auto,
-    Avoid,
-    AvoidPage,
-    AvoidColumn,
-}
-
-impl BreakInsideAvoidance {
-    pub(crate) const fn avoids_page(self) -> bool {
-        matches!(self, Self::Avoid | Self::AvoidPage)
-    }
-
-    pub(crate) const fn avoids_column(self) -> bool {
-        matches!(self, Self::Avoid | Self::AvoidColumn)
-    }
-
-    pub(crate) fn parse_modern(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "auto" => Some(Self::Auto),
-            "avoid" => Some(Self::Avoid),
-            "avoid-page" => Some(Self::AvoidPage),
-            "avoid-column" => Some(Self::AvoidColumn),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn parse_legacy_page(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "auto" => Some(Self::Auto),
-            "avoid" => Some(Self::AvoidPage),
-            _ => None,
-        }
-    }
-}
+use super::*;
+use crate::units::{ContentBoxLength, LayoutLength, LayoutSize};
 
 macro_rules! non_negative_css_factor {
     ($name:ident, $doc:literal) => {
@@ -204,115 +120,6 @@ macro_rules! nonzero_line_count {
 
 nonzero_line_count!(Orphans, "The nonzero computed CSS `orphans` line count.");
 nonzero_line_count!(Widows, "The nonzero computed CSS `widows` line count.");
-
-impl PageAssignment {
-    pub(crate) const fn is_specified(&self) -> bool {
-        !matches!(self, Self::Unspecified)
-    }
-
-    pub(crate) fn specified_name(&self) -> Option<&PageName> {
-        match self {
-            Self::Named(name) => Some(name),
-            Self::Unspecified | Self::Auto => None,
-        }
-    }
-
-    pub(crate) fn effective_name(&self, inherited: Option<String>) -> Option<String> {
-        match self {
-            Self::Unspecified => inherited,
-            Self::Auto => None,
-            Self::Named(name) => Some(name.0.clone()),
-        }
-    }
-}
-
-/// A custom identifier for a GCPM running element.
-/// <https://www.w3.org/TR/css-gcpm-3/#running-elements>
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct RunningElementName(String);
-
-impl RunningElementName {
-    pub(crate) fn new(value: String) -> Self {
-        Self(value)
-    }
-
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// A document content-language value after the host-language inheritance
-/// algorithm has run.
-///
-/// HTML distinguishes an explicitly unknown language from a tagged language
-/// whose tag is not recognized by the user agent.  The latter must retain its
-/// spelling for selectors and round-tripping, while typography may use only a
-/// well-formed BCP 47 value.
-/// <https://html.spec.whatwg.org/multipage/dom.html#the-lang-and-xml:lang-attributes>
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) enum ContentLanguage {
-    #[default]
-    Unknown,
-    Tagged(LanguageTag),
-}
-
-impl ContentLanguage {
-    pub(crate) fn from_html_attribute(value: &str) -> Self {
-        let value = value.trim();
-        if value.is_empty() {
-            Self::Unknown
-        } else {
-            Self::Tagged(LanguageTag::new(value))
-        }
-    }
-
-    /// The valid tag available to typography consumers. Malformed authored
-    /// tags intentionally have no typography language.
-    pub(crate) fn as_deref(&self) -> Option<&str> {
-        match self {
-            Self::Unknown => None,
-            Self::Tagged(tag) => tag.locale().map(|_| tag.as_str()),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn shares_tag_storage_with(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Unknown, Self::Unknown) => true,
-            (Self::Tagged(left), Self::Tagged(right)) => Arc::ptr_eq(&left.source, &right.source),
-            _ => false,
-        }
-    }
-}
-
-/// An authored BCP 47 language tag together with its one-time syntax check.
-///
-/// The raw spelling is retained because HTML requires an unrecognized tag to
-/// remain distinct from every other tag.  Underscores are deliberately not
-/// normalized here: they are not BCP 47 separators for HTML's `lang` value.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LanguageTag {
-    source: Arc<str>,
-    locale: Option<Locale>,
-}
-
-impl LanguageTag {
-    pub(crate) fn new(value: impl AsRef<str>) -> Self {
-        let source: Arc<str> = Arc::from(value.as_ref());
-        let locale = (!source.contains('_'))
-            .then(|| source.parse::<Locale>().ok())
-            .flatten();
-        Self { source, locale }
-    }
-
-    pub(crate) fn as_str(&self) -> &str {
-        &self.source
-    }
-
-    pub(crate) fn locale(&self) -> Option<&Locale> {
-        self.locale.as_ref()
-    }
-}
 
 /// Computed `background-color`, retaining symbolic forms until the owning
 /// element's foreground color is known.
@@ -548,14 +355,6 @@ impl SvgStrokeWidth {
     }
 }
 
-/// Computed CSS `z-index`.
-/// <https://www.w3.org/TR/css-position-3/#propdef-z-index>
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ZIndex {
-    Auto,
-    StackLevel(i32),
-}
-
 /// Computed value of CSS Ruby's interlinear annotation positioning.
 ///
 /// `ruby-position` inherits through `::first-line`, even though most Ruby
@@ -612,19 +411,6 @@ pub(crate) enum RubyAnnotationSide {
     Under,
 }
 
-/// Whether a used box may establish transform behavior.
-///
-/// CSS Transforms only applies to transformable elements. Ruby containers and
-/// their internal role boxes are layout-internal inline structure rather than
-/// independently transformable boxes; carrying this as an enum avoids
-/// repeatedly treating `has_transform()` as the applicability decision.
-/// <https://drafts.csswg.org/css-transforms-1/#transformable-element>
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TransformApplicability {
-    Transformable,
-    NonTransformableRubyInternal,
-}
-
 impl RubyPosition {
     /// Resolve the supported interlinear forms. `inter-character` remains
     /// visibly equivalent to the initial interlinear placement until its
@@ -635,34 +421,6 @@ impl RubyPosition {
             Self::Alternate | Self::Over | Self::InterCharacter => RubyAnnotationSide::Over,
         }
     }
-}
-
-impl ZIndex {
-    pub(crate) const fn stack_level(self) -> Option<i32> {
-        match self {
-            Self::Auto => None,
-            Self::StackLevel(level) => Some(level),
-        }
-    }
-
-    pub(crate) const fn establishes_stacking_context(self) -> bool {
-        matches!(self, Self::StackLevel(_))
-    }
-
-    pub(crate) const fn unwrap_or(self, default: i32) -> i32 {
-        match self {
-            Self::Auto => default,
-            Self::StackLevel(level) => level,
-        }
-    }
-}
-
-/// Computed GCPM bookmark level.
-/// <https://www.w3.org/TR/css-gcpm-3/#bookmarks>
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BookmarkLevel {
-    None,
-    Level(NonZeroU32),
 }
 
 /// The maximum number of line boxes a continuation mode may use.
@@ -1289,7 +1047,7 @@ pub(crate) enum UsedContinuation<'a> {
     Discard(DiscardFragmentationContainer<'a>),
 }
 
-/// Reference box and non-negative expansion for an `overflow:clip` edge.
+/// Reference box and signed offset for an overflow clip edge.
 ///
 /// The Level 3 shorthand is deliberately a single value. Future Level 4
 /// physical and logical longhands can expand this into per-side values without
@@ -1298,13 +1056,13 @@ pub(crate) enum UsedContinuation<'a> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct OverflowClipMargin {
     pub(crate) reference_box: OverflowClipMarginBox,
-    pub(crate) length: f32,
+    pub(crate) offset: LayoutLength,
 }
 
 impl OverflowClipMargin {
     pub(crate) const ZERO: Self = Self {
         reference_box: OverflowClipMarginBox::Padding,
-        length: 0.0,
+        offset: LayoutLength::new(0.0),
     };
 }
 
@@ -1350,23 +1108,23 @@ impl ComputedStyle {
     /// retained origin must own the decorating box's resolved values. In
     /// particular, selected-font metric units such as `ch` cannot remain in a
     /// cascade-time snapshot after the owning style has resolved them.
-    /// Call this only for a raw cascaded style before ancestor decoration
-    /// layers have been propagated into a used inline style.
+    /// This preserves any propagated ancestor origins already present on a
+    /// used inline style.
     ///
     /// CSS Text Decoration Level 4 § 2 and § 2.9.1; CSS Values Level 4 § 5.1:
     /// <https://drafts.csswg.org/css-text-decor-4/#line-decoration>
     /// <https://drafts.csswg.org/css-text-decor-4/#text-decoration-inset-property>
     /// <https://drafts.csswg.org/css-values-4/#font-relative-lengths>
-    pub(crate) fn rebuild_own_text_decoration_layer(&mut self) {
-        self.text_decoration_layers.clear();
+    pub(crate) fn rebuild_own_text_decoration_origin(&mut self) {
+        self.text_decoration_origins.clear_own();
         if !self.text_decoration.has_visible_line() {
             return;
         }
 
         let decoration = self.text_decoration.clone();
         let mut origin_style = self.clone();
-        origin_style.text_decoration_layers.clear();
-        self.text_decoration_layers.push(TextDecorationLayer {
+        origin_style.text_decoration_origins.clear();
+        self.text_decoration_origins.set_own(TextDecorationLayer {
             decoration,
             origin_style: Rc::new(origin_style),
         });
@@ -1587,73 +1345,6 @@ impl<'a> InlineLineClamp<'a> {
             Self::Used(clamp) => clamp.continuation,
             Self::Automatic(_) => ClampContinuation::None,
         }
-    }
-}
-
-/// Computed [`object-fit`](https://www.w3.org/TR/css-images-3/#the-object-fit)
-/// value for replaced elements.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum ObjectFit {
-    #[default]
-    Fill,
-    Contain,
-    Cover,
-    None,
-    ScaleDown,
-}
-
-pub(crate) fn parse_object_fit(value: &str) -> Option<ObjectFit> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "fill" => Some(ObjectFit::Fill),
-        "contain" => Some(ObjectFit::Contain),
-        "cover" => Some(ObjectFit::Cover),
-        "none" => Some(ObjectFit::None),
-        "scale-down" => Some(ObjectFit::ScaleDown),
-        _ => None,
-    }
-}
-
-/// Computed CSS Images metadata-orientation policy for raster image sources.
-/// <https://drafts.csswg.org/css-images-3/#propdef-image-orientation>
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum ImageOrientation {
-    #[default]
-    FromImage,
-    None,
-}
-
-pub(crate) fn parse_image_orientation(value: &str) -> Option<ImageOrientation> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "from-image" => Some(ImageOrientation::FromImage),
-        "none" => Some(ImageOrientation::None),
-        _ => None,
-    }
-}
-
-/// Sampling policy for raster CSS images.
-/// <https://drafts.csswg.org/css-images-4/#propdef-image-rendering>
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum ImageRendering {
-    #[default]
-    Auto,
-    Smooth,
-    HighQuality,
-    Pixelated,
-    CrispEdges,
-}
-
-pub(crate) fn parse_image_rendering(value: &str) -> Option<ImageRendering> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "auto" => Some(ImageRendering::Auto),
-        "smooth" => Some(ImageRendering::Smooth),
-        "high-quality" => Some(ImageRendering::HighQuality),
-        "pixelated" => Some(ImageRendering::Pixelated),
-        "crisp-edges" => Some(ImageRendering::CrispEdges),
-        // CSS Images retains these legacy spellings as required aliases.
-        // <https://drafts.csswg.org/css-images-3/#the-image-rendering>
-        "optimizespeed" => Some(ImageRendering::CrispEdges),
-        "optimizequality" => Some(ImageRendering::Smooth),
-        _ => None,
     }
 }
 
@@ -1902,6 +1593,19 @@ impl ComputedAnimationSnapshot {
     };
 }
 
+/// Identifies the counter event that supplies a list marker's ordinal.
+///
+/// This is layout provenance rather than a CSS property. Principal boxes have
+/// their own marker event; tree-abiding generated list items use their
+/// `::before` or `::after` event instead.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum MarkerCounterOrigin {
+    #[default]
+    Principal,
+    Before,
+    After,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ComputedStyle {
     pub custom_properties: HashMap<String, ComputedCustomPropertyValue>,
@@ -2047,6 +1751,15 @@ pub(crate) struct ComputedStyle {
     pub direction: Direction,
     pub unicode_bidi: UnicodeBidi,
     pub writing_mode: WritingMode,
+    /// Writing mode of the nearest flat-tree ancestor that generates a box.
+    ///
+    /// This is layout-tree context rather than a CSS longhand. CSS Display 3
+    /// requires an element whose `flow` inner display type has a different
+    /// writing mode from its box parent to establish an independent formatting
+    /// context. `display: contents` ancestors do not generate a box and must
+    /// therefore be skipped.
+    /// <https://drafts.csswg.org/css-display-3/#transformations>
+    pub(crate) nearest_box_parent_writing_mode: WritingMode,
     pub text_orientation: TextOrientation,
     pub text_combine_upright: TextCombineUpright,
     pub text_align: TextAlign,
@@ -2130,6 +1843,13 @@ pub(crate) struct ComputedStyle {
     /// <https://drafts.csswg.org/css-images-4/#image-set-notation>
     pub list_style_image: ComputedImage,
     pub marker_side: MarkerSide,
+    /// The counter snapshot that owns a tree-abiding list item's marker.
+    ///
+    /// A generated `::before`/`::after` list item shares its originating DOM
+    /// element but has a distinct counter event. Keep that identity on the
+    /// layout style so marker construction can select the pseudo's snapshot
+    /// after the box tree has detached it from the originating element.
+    pub(crate) marker_counter_origin: MarkerCounterOrigin,
     pub marker_content: MarkerContent,
     pub marker_style: Option<Box<ComputedStyle>>,
     pub content: Content,
@@ -2154,7 +1874,7 @@ pub(crate) struct ComputedStyle {
     pub break_inside: BreakInsideAvoidance,
     pub orphans: Orphans,
     pub widows: Widows,
-    pub text_decoration_layers: Vec<TextDecorationLayer>,
+    pub text_decoration_origins: TextDecorationOrigins,
     pub text_decoration: TextDecoration,
     pub text_shadow: Vec<TextShadow>,
     pub text_emphasis_style: TextEmphasisStyle,
@@ -2643,6 +2363,7 @@ impl ComputedStyle {
             direction: Direction::Ltr,
             unicode_bidi: UnicodeBidi::Normal,
             writing_mode: WritingMode::HorizontalTb,
+            nearest_box_parent_writing_mode: WritingMode::HorizontalTb,
             text_orientation: TextOrientation::Mixed,
             text_combine_upright: TextCombineUpright::None,
             text_align: TextAlign::Start,
@@ -2712,6 +2433,7 @@ impl ComputedStyle {
             list_style_position: ListStylePosition::Outside,
             list_style_image: ComputedImage::None,
             marker_side: MarkerSide::MatchSelf,
+            marker_counter_origin: MarkerCounterOrigin::Principal,
             marker_content: MarkerContent::Auto,
             marker_style: None,
             content: Content::Normal,
@@ -2732,7 +2454,7 @@ impl ComputedStyle {
             break_inside: BreakInsideAvoidance::Auto,
             orphans: Orphans::TWO,
             widows: Widows::TWO,
-            text_decoration_layers: Vec::new(),
+            text_decoration_origins: TextDecorationOrigins::default(),
             text_decoration: TextDecoration {
                 underline: false,
                 overline: false,

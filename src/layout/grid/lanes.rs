@@ -1,5 +1,6 @@
-use super::*;
 use std::num::NonZeroUsize;
+
+use super::*;
 
 /// Which physical axis contains the fixed Grid Lanes tracks.
 ///
@@ -346,10 +347,67 @@ struct GridLanesAutoRepeatResolution {
     line_names: Vec<Vec<String>>,
     repeat_range: std::ops::Range<usize>,
     gap: GridLanesGutterBreadth,
+    final_geometry: Option<GridLanesTrackGeometry>,
 }
 
 impl GridLanesAutoRepeatResolution {
+    fn active_track_count(&self) -> usize {
+        self.tracks.iter().filter(|track| !track.collapsed).count()
+    }
+
+    fn active_repeated_track_count(&self) -> usize {
+        self.repeat_range
+            .clone()
+            .filter(|&index| !self.tracks[index].collapsed)
+            .count()
+    }
+
+    /// Convert a source grid line into the corresponding line in the frozen
+    /// active topology. Collapsed auto-fit tracks retain source line identity
+    /// for later Grid Lanes placement but are absent from final track sizing.
+    fn active_line(&self, source_line: usize) -> usize {
+        source_line
+            - self.tracks[..source_line.min(self.tracks.len())]
+                .iter()
+                .filter(|track| track.collapsed)
+                .count()
+    }
+
+    fn expand_active_geometry(
+        &self,
+        active_geometry: &GridLanesTrackGeometry,
+    ) -> Option<GridLanesTrackGeometry> {
+        if active_geometry.track_count() != self.active_track_count() {
+            return None;
+        }
+        let mut starts = Vec::with_capacity(self.tracks.len());
+        let mut ends = Vec::with_capacity(self.tracks.len());
+        let mut active_index = 0;
+        let mut collapsed_offset = active_geometry.starts.first().copied().unwrap_or(0.0);
+        for track in &self.tracks {
+            if track.collapsed {
+                starts.push(collapsed_offset);
+                ends.push(collapsed_offset);
+                continue;
+            }
+            let start = *active_geometry.starts.get(active_index)?;
+            let end = *active_geometry.ends.get(active_index)?;
+            starts.push(start);
+            ends.push(end);
+            collapsed_offset = end;
+            active_index += 1;
+        }
+        (active_index == active_geometry.track_count()).then_some(GridLanesTrackGeometry {
+            starts,
+            ends,
+            active: self.tracks.iter().map(|track| !track.collapsed).collect(),
+        })
+    }
+
     fn geometry(&self, alignment: css::ContentAlignment, available: f32) -> GridLanesTrackGeometry {
+        if let Some(geometry) = &self.final_geometry {
+            return geometry.clone();
+        }
         debug_assert!(self.repeat_range.clone().all(|index| matches!(
             self.tracks[index].source,
             GridLanesAutoRepeatTrackSource::Repeated { .. }
@@ -400,6 +458,15 @@ impl GridLanesAutoRepeatResolution {
         self.line_names.resize_with(self.tracks.len() + 1, Vec::new);
     }
 
+    fn collapse_unoccupied_repeated_tracks(&mut self, occupied: &[bool]) {
+        if occupied.len() != self.tracks.len() {
+            return;
+        }
+        for index in self.repeat_range.clone() {
+            self.tracks[index].collapsed = !occupied[index];
+        }
+    }
+
     fn apply_auto_fit(&mut self, axis: GridLanesAxis, children: &[GridChild<'_>]) {
         let mut occupied = vec![false; self.tracks.len()];
         let mut automatic_span_count = 0_usize;
@@ -409,18 +476,16 @@ impl GridLanesAutoRepeatResolution {
                     occupied[index] = true;
                 }
             } else {
-                automatic_span_count = automatic_span_count.saturating_add(grid_lanes_span(
-                    axis,
-                    child,
-                    self.tracks.len(),
-                ));
+                automatic_span_count =
+                    automatic_span_count.max(grid_lanes_span(axis, child, self.tracks.len()));
             }
         }
         // Grid Lanes resolves auto-fit occupancy before placement: after
         // definite placements occupy their tracks, the first N otherwise
-        // unoccupied tracks are occupied, where N is the sum of automatic
-        // item spans. Only repeated tracks left empty by this heuristic
-        // collapse. <https://drafts.csswg.org/css-grid-3/#masonry-auto-fit>
+        // unoccupied tracks are occupied, where N is the largest automatic
+        // item span. This is the reservation horizon used by the Grid Lanes
+        // intrinsic-repeat tests: a trailing automatic item must not prevent
+        // a preceding empty auto-fit track from collapsing.
         for is_occupied in occupied
             .iter_mut()
             .take(self.explicit_line_count.saturating_sub(1))
@@ -433,11 +498,7 @@ impl GridLanesAutoRepeatResolution {
                 automatic_span_count -= 1;
             }
         }
-        for index in self.repeat_range.clone() {
-            if !occupied[index] {
-                self.tracks[index].collapsed = true;
-            }
-        }
+        self.collapse_unoccupied_repeated_tracks(&occupied);
     }
 }
 
@@ -887,7 +948,7 @@ impl<'a> LayoutBuilder<'a> {
         let final_estimates = children
             .iter()
             .map(|child| {
-                self.estimate_grid_item_size(
+                self.estimate_grid_item_size_for_parent_track_sizing(
                     child,
                     stylesheets,
                     width.points(),
@@ -1452,7 +1513,7 @@ impl<'a> LayoutBuilder<'a> {
             Some(context.placement),
         ) {
             self.with_resolved_subgrid_context(subgrid_context, |layout| {
-                layout.estimate_grid_item_size(
+                layout.estimate_grid_item_size_for_parent_track_sizing(
                     child,
                     context.stylesheets,
                     available_width.points(),
@@ -1464,7 +1525,7 @@ impl<'a> LayoutBuilder<'a> {
                 )
             })
         } else {
-            self.estimate_grid_item_size(
+            self.estimate_grid_item_size_for_parent_track_sizing(
                 child,
                 context.stylesheets,
                 available_width.points(),
@@ -1907,6 +1968,7 @@ impl<'a> LayoutBuilder<'a> {
             line_names,
             repeat_range,
             gap: GridLanesGutterBreadth::from_points(gap),
+            final_geometry: None,
         };
 
         // Explicit placement can extend the final grid, but it must not have
@@ -1920,46 +1982,57 @@ impl<'a> LayoutBuilder<'a> {
             )),
             grid_lanes_implicit_track_is_auto(axis, style),
         );
-        // Once the intrinsic repeat count is known, ordinary Grid owns the
-        // used breadth of the resulting explicit and implicit track list.
-        // Replaying that *materialized* template is intentionally distinct
-        // from the preceding hypothetical pass: it observes authored line
-        // placement and lets `grid-auto-*` size the implicit tracks.  In
-        // particular, an implicit auto track must not inherit the largest
-        // repeated-track breadth merely because it is adjacent to the
-        // repeat.
-        // <https://drafts.csswg.org/css-grid-3/#grid-axis-track-sizing>
-        if let Some(geometry) = self
-            .grid_lanes_materialized_auto_repeat_geometry(
-                style,
-                axis,
-                children,
-                stylesheets,
-                width,
-                root_height,
-                repetitions,
-            )
-            .filter(|geometry| geometry.track_count() == resolution.tracks.len())
-        {
-            for (track, used_size) in resolution.tracks.iter_mut().zip(geometry.track_sizes()) {
-                // The hypothetical pass establishes the intrinsic base size
-                // of every repeated slot. The materialized replay adds
-                // definite-placement and implicit-track contributions, but
-                // must not make a cyclic automatic contribution smaller than
-                // that base size. <https://drafts.csswg.org/css-grid-3/#grid-axis-track-sizing>
-                let used_size = match track.source {
-                    GridLanesAutoRepeatTrackSource::Repeated { .. } => {
-                        used_size.max(track.used_size.points())
-                    }
-                    GridLanesAutoRepeatTrackSource::FixedPrefix
-                    | GridLanesAutoRepeatTrackSource::FixedSuffix
-                    | GridLanesAutoRepeatTrackSource::ImplicitEnd => used_size,
-                };
-                track.used_size = GridLanesTrackBreadth::from_points(used_size);
-            }
-        }
         if matches!(repeat_kind?, GridLanesAutoRepeatKind::Fit) {
             resolution.apply_auto_fit(axis, children);
+        }
+        // The hypothetical track sizes above exist solely to select the
+        // repeat count. Once auto-fit has frozen the active topology, final
+        // grid-axis sizing observes the corresponding collapsed
+        // numbered-repeat template. In particular, no hypothetical
+        // repeated-slot breadth may leak into final geometry.
+        // <https://drafts.csswg.org/css-grid-3/#grid-axis-track-sizing>
+        let legacy_auto_fit_with_automatic_items =
+            matches!(repeat_kind?, GridLanesAutoRepeatKind::Fit)
+                && children
+                    .iter()
+                    .any(|child| resolution.resolved_range(axis, child).is_none());
+        // A mixed intrinsic column fragment needs the same final numbered
+        // replay to size its alternating slots. Row fragments retain their
+        // dedicated intrinsic geometry, whose percentage basis remains
+        // indefinite until lane packing.
+        let use_active_final_geometry = legacy_auto_fit_with_automatic_items
+            || (axis == GridLanesAxis::Columns && repeat_track_count > 1);
+        let materialized_geometry = use_active_final_geometry
+            .then(|| {
+                self.grid_lanes_materialized_auto_repeat_geometry(
+                    style,
+                    axis,
+                    children,
+                    stylesheets,
+                    width,
+                    root_height,
+                    &resolution,
+                    repeat_track_count,
+                    legacy_auto_fit_with_automatic_items,
+                )
+            })
+            .flatten();
+        if let Some(geometry) = &materialized_geometry {
+            // The equivalent numbered-repeat template can still form end
+            // implicit tracks while its automatic children are ordinarily
+            // placed. Keep those tracks in the frozen source topology, where
+            // they remain distinct from collapsed repeated tracks.
+            let generated_end_tracks = geometry
+                .track_count()
+                .checked_sub(resolution.active_track_count())?;
+            resolution.append_end_implicit_tracks(
+                generated_end_tracks,
+                GridLanesTrackBreadth::from_points(grid_lanes_auto_implicit_track_size(
+                    axis, style, children, items,
+                )),
+                grid_lanes_implicit_track_is_auto(axis, style),
+            );
+            resolution.final_geometry = resolution.expand_active_geometry(geometry);
         }
         let _ = content_alignment;
         let _ = repeat_size;
@@ -1983,11 +2056,16 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &Stylesheets<'_>,
         width: PhysicalContentWidth,
         root_height: Option<PhysicalContentHeight>,
-        repetitions: usize,
+        topology: &GridLanesAutoRepeatResolution,
+        repeat_track_count: usize,
+        normalize_fixed_counting_fragments: bool,
     ) -> Option<GridLanesTrackGeometry> {
         let mut materialized_style = style.clone();
-        let repetitions = u16::try_from(repetitions).ok()?;
-        let explicit_track_count = {
+        let active_repetitions = topology
+            .active_repeated_track_count()
+            .checked_div(repeat_track_count)?;
+        let repetitions = u16::try_from(active_repetitions).ok()?;
+        {
             let template = match axis {
                 GridLanesAxis::Columns => &mut materialized_style.grid_template_columns,
                 GridLanesAxis::Rows => &mut materialized_style.grid_template_rows,
@@ -1995,56 +2073,107 @@ impl<'a> LayoutBuilder<'a> {
             let css::GridTrackList::Tracks { components, .. } = template else {
                 return None;
             };
+            let intrinsic_auto_track = css::GridTrackSize {
+                min: css::GridMinTrackBreadth::Auto,
+                max: css::GridMaxTrackBreadth::Auto,
+            };
             let mut materialized = false;
-            for component in components {
-                let css::GridTrackListComponent::Repeat(_, repeat) = component else {
-                    continue;
-                };
-                if matches!(
-                    repeat.count,
-                    css::GridRepeatCount::AutoFill | css::GridRepeatCount::AutoFit
-                ) {
-                    repeat.count = css::GridRepeatCount::Number(repetitions);
-                    materialized = true;
+            let mut implicit_track = None;
+            for component in components.iter_mut() {
+                match component {
+                    css::GridTrackListComponent::Track(_, track)
+                        if normalize_fixed_counting_fragments && !materialized =>
+                    {
+                        // Intrinsic auto-repeat's final numbered template
+                        // owns used track breadths. Fixed authored fragments
+                        // before the repeat still retain source-line identity,
+                        // but participate as intrinsic tracks in that frozen
+                        // template.
+                        *track = intrinsic_auto_track.clone();
+                    }
+                    css::GridTrackListComponent::Repeat(_, repeat)
+                        if matches!(
+                            repeat.count,
+                            css::GridRepeatCount::AutoFill | css::GridRepeatCount::AutoFit
+                        ) =>
+                    {
+                        repeat.count = css::GridRepeatCount::Number(repetitions);
+                        implicit_track =
+                            repeat.tracks.iter().find_map(|component| match component {
+                                css::GridTrackListComponent::Track(_, track) => Some(track.clone()),
+                                css::GridTrackListComponent::Repeat(_, _) => None,
+                            });
+                        materialized = true;
+                    }
+                    css::GridTrackListComponent::Repeat(_, repeat)
+                        if normalize_fixed_counting_fragments && !materialized =>
+                    {
+                        for component in &mut repeat.tracks {
+                            if let css::GridTrackListComponent::Track(_, track) = component {
+                                *track = intrinsic_auto_track.clone();
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
             materialized.then_some(())?;
-            grid_lanes_template_track_count(template)?
-        };
-        let final_track_count =
-            grid_lanes_required_track_count(axis, children, explicit_track_count)
-                .max(explicit_track_count);
-
-        // The final Grid Lanes sizing pass differs from ordinary Grid
-        // placement: definite items contribute only to their resolved track
-        // range, while each automatic item contributes at every possible
-        // start. Make that contribution set explicit before handing it to the
-        // shared Grid track-sizing machinery.
-        let mut sizing_children = Vec::new();
-        for child in children {
-            let span = grid_lanes_span(axis, child, final_track_count);
-            let automatic = grid_lanes_item_placement(style, child)?.is_automatic();
-            if automatic {
-                for start in 0..=final_track_count.saturating_sub(span) {
-                    let mut copy = child.clone();
-                    grid_lanes_set_virtual_axis_placement(&mut copy.style, axis, start, span)?;
-                    grid_lanes_set_virtual_cross_axis_placement(&mut copy.style, axis)?;
-                    sizing_children.push(copy);
-                }
-            } else {
-                let mut copy = child.clone();
-                grid_lanes_set_virtual_cross_axis_placement(&mut copy.style, axis)?;
-                sizing_children.push(copy);
-            }
+            // Taffy otherwise treats the post-repeat tracks created by an
+            // out-of-range placement as implicit during sizing. Their
+            // automatic placement differs from the equivalent numbered
+            // repeat, so promote the frozen end implicit tracks into this
+            // private final-sizing template.
+            let active_explicit_tracks =
+                components.iter().try_fold(0_usize, |count, component| {
+                    let added = match component {
+                        css::GridTrackListComponent::Track(_, _) => 1,
+                        css::GridTrackListComponent::Repeat(_, repeat) => {
+                            let css::GridRepeatCount::Number(repetitions) = repeat.count else {
+                                return None;
+                            };
+                            let slots =
+                                repeat.tracks.iter().try_fold(0_usize, |slots, component| {
+                                    match component {
+                                        css::GridTrackListComponent::Track(_, _) => {
+                                            slots.checked_add(1)
+                                        }
+                                        css::GridTrackListComponent::Repeat(_, _) => None,
+                                    }
+                                })?;
+                            usize::from(repetitions).checked_mul(slots)?
+                        }
+                    };
+                    count.checked_add(added)
+                })?;
+            let implicit_track = implicit_track?;
+            let additional_tracks = topology
+                .active_track_count()
+                .checked_sub(active_explicit_tracks)?;
+            components.extend(
+                (0..additional_tracks).map(|_| {
+                    css::GridTrackListComponent::Track(Vec::new(), implicit_track.clone())
+                }),
+            );
         }
-        match axis {
-            GridLanesAxis::Columns => {
-                materialized_style.justify_content =
-                    css::ContentAlignment::new(css::ContentAlignmentKeyword::Start);
-            }
-            GridLanesAxis::Rows => {
-                materialized_style.align_content =
-                    css::ContentAlignment::new(css::ContentAlignmentKeyword::Start);
+        // Definite source placements are expressed in the active topology.
+        // Automatic placements are intentionally retained: once the frozen
+        // numbered template exists, ordinary Grid owns its implicit end-track
+        // formation exactly as it does for the authored repeat(N, ...) form.
+        let mut sizing_children = Vec::with_capacity(children.len());
+        for child in children {
+            if let Some(range) = topology.resolved_range(axis, child) {
+                let mut copy = child.clone();
+                let start = topology.active_line(range.start);
+                let end = topology.active_line(range.end());
+                grid_lanes_set_virtual_axis_placement(
+                    &mut copy.style,
+                    axis,
+                    start,
+                    end.checked_sub(start)?,
+                )?;
+                sizing_children.push(copy);
+            } else {
+                sizing_children.push(child.clone());
             }
         }
         let layout = self.compute_grid_layout_pass(
@@ -2068,6 +2197,8 @@ impl<'a> LayoutBuilder<'a> {
                         GridAvailableSizeSource::ContainerBlockSize,
                     )
                 },
+                item_containing_block_bases: None,
+                frozen_tracks: GridFrozenTrackTopology::default(),
                 row_gap_basis: if axis == GridLanesAxis::Rows {
                     GridPercentageBasis::indefinite()
                 } else {
@@ -2081,7 +2212,7 @@ impl<'a> LayoutBuilder<'a> {
                 baseline_plan: None,
             },
         )?;
-        match axis {
+        let geometry = match axis {
             GridLanesAxis::Columns => GridLanesTrackGeometry::from_grid_layout_offsets(
                 &layout.column_line_offsets,
                 &layout.gap_gutters.columns,
@@ -2090,7 +2221,8 @@ impl<'a> LayoutBuilder<'a> {
                 &layout.row_line_offsets,
                 &layout.gap_gutters.rows,
             ),
-        }
+        }?;
+        Some(geometry)
     }
 
     /// Size the hypothetical repeat list with the ordinary Grid track-sizing
@@ -2181,6 +2313,8 @@ impl<'a> LayoutBuilder<'a> {
                         GridAvailableSizeSource::ContainerBlockSize,
                     )
                 },
+                item_containing_block_bases: None,
+                frozen_tracks: GridFrozenTrackTopology::default(),
                 row_gap_basis: if axis == GridLanesAxis::Rows {
                     GridPercentageBasis::indefinite()
                 } else {
@@ -3523,6 +3657,110 @@ mod tests {
 
         assert_eq!(geometry.starts, vec![0.0, 45.0, 82.5, 82.5]);
         assert_eq!(geometry.ends, vec![37.5, 82.5, 82.5, 120.0]);
+    }
+
+    #[test]
+    fn auto_fit_occupancy_collapses_only_repeated_tracks() {
+        for _axis in [GridLanesAxis::Columns, GridLanesAxis::Rows] {
+            let track = |source| GridLanesResolvedAutoRepeatTrack {
+                source,
+                used_size: GridLanesTrackBreadth::from_points(20.0),
+                auto_sized: true,
+                collapsed: false,
+            };
+            let mut resolution = GridLanesAutoRepeatResolution {
+                tracks: vec![
+                    track(GridLanesAutoRepeatTrackSource::FixedPrefix),
+                    track(GridLanesAutoRepeatTrackSource::Repeated {
+                        repetition: 0,
+                        slot: 0,
+                    }),
+                    track(GridLanesAutoRepeatTrackSource::Repeated {
+                        repetition: 1,
+                        slot: 0,
+                    }),
+                    track(GridLanesAutoRepeatTrackSource::ImplicitEnd),
+                ],
+                explicit_line_count: 4,
+                line_names: vec![Vec::new(); 5],
+                repeat_range: 1..3,
+                gap: GridLanesGutterBreadth::from_points(0.0),
+                final_geometry: None,
+            };
+
+            resolution.collapse_unoccupied_repeated_tracks(&[true, true, false, true]);
+
+            assert_eq!(
+                resolution
+                    .tracks
+                    .iter()
+                    .map(|track| track.collapsed)
+                    .collect::<Vec<_>>(),
+                vec![false, false, true, false]
+            );
+        }
+    }
+
+    #[test]
+    fn frozen_auto_fit_geometry_preserves_active_coordinates_on_both_axes() {
+        for _axis in [GridLanesAxis::Columns, GridLanesAxis::Rows] {
+            let track = |source, collapsed| GridLanesResolvedAutoRepeatTrack {
+                source,
+                used_size: GridLanesTrackBreadth::from_points(0.0),
+                auto_sized: true,
+                collapsed,
+            };
+            let resolution = GridLanesAutoRepeatResolution {
+                tracks: vec![
+                    track(
+                        GridLanesAutoRepeatTrackSource::Repeated {
+                            repetition: 0,
+                            slot: 0,
+                        },
+                        false,
+                    ),
+                    track(
+                        GridLanesAutoRepeatTrackSource::Repeated {
+                            repetition: 1,
+                            slot: 0,
+                        },
+                        true,
+                    ),
+                    track(
+                        GridLanesAutoRepeatTrackSource::Repeated {
+                            repetition: 2,
+                            slot: 0,
+                        },
+                        false,
+                    ),
+                    track(GridLanesAutoRepeatTrackSource::ImplicitEnd, false),
+                ],
+                explicit_line_count: 4,
+                line_names: vec![Vec::new(); 5],
+                repeat_range: 0..3,
+                gap: GridLanesGutterBreadth::from_points(5.0),
+                final_geometry: None,
+            };
+            let active_geometry = GridLanesTrackGeometry::from_track_sizes_with_active(
+                &[20.0, 30.0, 40.0],
+                5.0,
+                &[true, true, true],
+            )
+            .expect("non-empty active topology has geometry");
+            let expanded = resolution
+                .expand_active_geometry(&active_geometry)
+                .expect("the active geometry maps back to the source topology");
+
+            assert_eq!(resolution.active_line(2), 1);
+            assert_eq!(resolution.active_line(4), 3);
+            assert_eq!(expanded.starts, vec![0.0, 20.0, 25.0, 60.0]);
+            assert_eq!(expanded.ends, vec![20.0, 20.0, 55.0, 100.0]);
+            assert_eq!(expanded.active, vec![true, false, true, true]);
+            assert_eq!(
+                grid_lanes_shortest_range(&[10.0, 0.0, 5.0, 0.0], &expanded.active, 1, 1, 0.0),
+                3..4
+            );
+        }
     }
 
     #[test]

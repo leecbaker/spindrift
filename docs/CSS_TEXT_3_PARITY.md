@@ -68,10 +68,16 @@ except where existing code already implements draft properties.
   forced line breaks. Those atoms participate in fitting, preserve lexical
   bidi/positioning metadata, and resolve `currentcolor` after `::first-line`
   selection.
-- Paint-only inline style changes such as `color` retain a shared cursive
-  shaping group across a transparent inline boundary. The resulting glyph runs
-  preserve Arabic joining while their independent paint state remains separate
-  through PDF emission. Alignment and justification use the final visual
+- Glyph-neutral inline style changes such as `color` and `text-decoration`
+  retain a shared cursive shaping group across a transparent inline boundary,
+  as required by CSS Text. The resulting glyph runs preserve context for all
+  CSS Text cursive scripts (Arabic, Hanifi Rohingya, Mandaic, Mongolian, N'Ko,
+  Phags Pa, and Syriac) while their independent paint state remains separate
+  through PDF emission. Synthetic join context stays outside authored source
+  geometry, so vertical source slices retain the same resolved typesetting as
+  their explicit-ZWJ equivalent. For glyph-affecting changes such as `font-style`,
+  Quire preserves compatible selected-face context with synthetic shaping-only
+  joiners where possible. Alignment and justification use final visual
   advances, so source-preserved default-ignorable join controls do not shift an
   RTL line's inline origin.
 - Horizontal mixed inline bidi reordering now operates on measured inline
@@ -164,12 +170,13 @@ except where existing code already implements draft properties.
   allows `break-spaces` to use its legal preserved-space breaks inside a fixed
   cell rather than widening an auto table to the cell's unwrapped max-content
   width.
-- Preserved tab stops are re-shaped against the selected line's content edge
-  before graph fitting and intrinsic measurement as well as during paint.
-  Numeric `tab-size` values measure U+0020 using the nearest block container's
-  font and text spacing, while the tab's own computed value selects the
-  multiplier. Font matching treats glyph zero (`.notdef`) as missing coverage,
-  and preserved tabs are advance-only records: they affect layout and PDF text
+- Preserved tab stops are resolved as one selected-line grid from the nearest
+  block container's content edge before graph fitting, intrinsic measurement,
+  and paint. Numeric `tab-size` values shape U+0020 through the block's normal
+  font fallback, then add its letter- and word-spacing; each tab's own computed
+  value selects its period. Tab advances below `0.5ch` use the subsequent stop.
+  Font matching treats glyph zero (`.notdef`) as missing coverage, and
+  preserved tabs are advance-only records: they affect layout and PDF text
   positioning without painting or subsetting a synthetic missing glyph. Break
   selection therefore sees the same tab advances as the resulting line.
 - Selected justified lines containing preserved tabs retain their tab-stop
@@ -205,6 +212,9 @@ except where existing code already implements draft properties.
   selected logical line-end space gets bidi-only context before UAX #9 visual
   ordering, keeping it at the visual inline start without changing source
   text, extraction, or the formatted measure.
+- When no boundary fits, line selection chooses the first overflowing
+  `break-spaces` after-space opportunity in source order. This retains the
+  required overflowing separator without consuming later preserved spaces.
 - A collapsible document-space suffix is traversed as already removed before
   the same scan identifies a preceding Unicode other-space separator. That
   exposes the remaining visual line edge to Phase II hanging for fitting,
@@ -302,13 +312,19 @@ except where existing code already implements draft properties.
   U+00AD fragment itself, so a styled control retains its `hyphenate-character`
   and advance through fitting, vertical writing, and shaping.
 - Selected authored U+00AD controls use the same resolved marker text as
-  dictionary hyphenation. In vertical writing, `hyphenate-character: auto`
-  therefore materializes U+2010 while an explicit author string is retained.
-- Graph-backed `letter-spacing` retains shaper glyph selection while resolving
-  all advances at final visual typographic boundaries. Terminal backend
-  advances are removed from both fitting and durable glyph data; nested inline
-  ownership uses the tracking-scope LCA, and UAX #9 visual order, controls,
-  Arabic joining, and Indic grapheme clusters share the same boundary policy.
+  dictionary hyphenation. `hyphenate-character: auto` materializes U+2010
+  unless the language has a more specific convention; an explicit author
+  string is retained in every writing mode.
+- Graph-backed `letter-spacing` retains tracking-free shaper glyph selection
+  while resolving spacing at final visual typographic boundaries. Each side
+  contributes half of its own used value, so differently styled adjacent
+  units use their average without consulting a common inline ancestor. Typed
+  measured advances keep shaped/atomic base geometry separate from the signed
+  boundary advance used by fitting and cursor movement. UAX #9 visual order,
+  ignored formatting controls, atomic-inline runs, Arabic joining, and Indic
+  grapheme clusters share this boundary policy. Ruby columns remain distinct
+  base-text units, so annotations align to base geometry while inter-column
+  tracking advances only the following column.
 - Reused source-shaped slices validate that their glyph provenance covers every
   paintable selected character. A conditional-hyphen control can otherwise
   leave a truncated backend slice that under-measures the remaining source;
@@ -320,10 +336,12 @@ except where existing code already implements draft properties.
   and distinguishes the two effects.
 - A selected `pre-wrap` soft break retains its authored spaces in graph line
   records while excluding their advance at the visual line end after bidi
-  ordering. RTL paint starts before aligned content when that logical suffix is
-  first in visual order, so hanging spaces no longer shift centered, start,
-  end, left, or right aligned content. This keeps ordinary alignment and RTL
-  `pre-wrap` hanging-space geometry on the same graph-backed path.
+  ordering. Final paint-width reconciliation preserves that selected hanging
+  advance while remeasuring the reshaped visual stream. RTL paint starts before
+  aligned content when that logical suffix is first in visual order, so hanging
+  spaces no longer shift centered, start, end, left, or right aligned content.
+  The local `pre-wrap-align-*` LTR/RTL and `bidi-override` matrix is 15/15 exact
+  raster matches.
 - A preserved `pre-wrap` run immediately before an unconditionally hanging
   Unicode space separator now hangs with that separator even when the selected
   line ends at a forced break. The graph records this Phase II condition
@@ -333,6 +351,11 @@ except where existing code already implements draft properties.
   materialization retains their alignment geometry. This prevents a
   shrink-to-fit float from acquiring a trailing-space-only line without
   changing right-aligned final lines.
+- Preserved `pre-wrap` document-space runs now remain one breakable sequence
+  through transparent inline-box edges. A selected soft wrap hangs the full
+  suffix; at a forced or paragraph edge, only the suffix advance that exceeds
+  the available line width hangs. The fitting portion remains in the
+  `text-align` measure while all source spaces remain paintable.
 - Graph-selected inline lines are collected into an internal
   `InlineLineSequence` that carries paragraph-local line metadata, forced
   empty lines, available widths, indents, hanging punctuation reserves, and line
@@ -381,6 +404,9 @@ except where existing code already implements draft properties.
   baselines from their margin boxes when needed. Forced inline breaks in
   vertical writing modes stack subsequent atomic-inline line boxes along the
   physical block axis, including `vertical-rl` right-to-left line progression.
+- A normal-flow block containing an atomic inline or inline replaced element
+  retains that line box's used block-size: it neither self-collapses nor places
+  a following in-flow block inside the atom's painted area.
 - Mixed inline line metrics support CSS 2.2 `vertical-align` keywords plus
   CSS Inline 3 `dominant-baseline`, `alignment-baseline`, `baseline-source`,
   and `baseline-shift` longhands. Percentages resolve against the aligned

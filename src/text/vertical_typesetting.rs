@@ -99,14 +99,86 @@ impl TextTypesettingPlan {
         }
     }
 
+    /// Returns the resolved typographic unit that fully contains `range`.
+    ///
+    /// CSS Writing Modes resolves vertical orientation per typographic
+    /// character unit. A shaped glyph can therefore be assigned to a unit
+    /// only when its source provenance is wholly contained by that unit.
+    ///
+    /// <https://www.w3.org/TR/css-writing-modes-4/#vertical-orientations>
+    pub(crate) fn resolved_unit_for_range(
+        &self,
+        range: &Range<usize>,
+    ) -> Option<&ResolvedVerticalUnit> {
+        self.units()
+            .iter()
+            .find(|unit| unit.range.start <= range.start && range.end <= unit.range.end)
+    }
+
     pub(crate) fn typesetting_for_range(
         &self,
         range: &Range<usize>,
     ) -> Option<VerticalUnitTypesetting> {
+        self.resolved_unit_for_range(range)
+            .map(|unit| unit.typesetting)
+    }
+
+    /// Return one mode when `range` is fully covered by resolved units that
+    /// all agree on their vertical typesetting.
+    ///
+    /// A shaping cluster can cover several CSS typographic character units.
+    /// The cluster has no single unit identity in that case, but its font
+    /// metrics and paint matrix are still unambiguous when each covered unit
+    /// resolves to the same mode. A range crossing upright and sideways units
+    /// deliberately remains unresolved.
+    /// <https://www.w3.org/TR/css-writing-modes-4/#vertical-orientations>
+    pub(crate) fn unanimous_typesetting_for_range(
+        &self,
+        range: &Range<usize>,
+    ) -> Option<VerticalUnitTypesetting> {
+        if let Some(typesetting) = self.typesetting_for_range(range) {
+            return Some(typesetting);
+        }
+        if range.start >= range.end {
+            return None;
+        }
+        let mut covered_until = range.start;
+        let mut typesetting = None;
+        for unit in self.units() {
+            if unit.range.end <= range.start {
+                continue;
+            }
+            if range.end <= unit.range.start {
+                break;
+            }
+            let overlap_start = unit.range.start.max(range.start);
+            let overlap_end = unit.range.end.min(range.end);
+            if overlap_start != covered_until {
+                return None;
+            }
+            match typesetting {
+                Some(previous) if previous != unit.typesetting => return None,
+                Some(_) => {}
+                None => typesetting = Some(unit.typesetting),
+            }
+            covered_until = overlap_end;
+        }
+        (covered_until == range.end)
+            .then_some(typesetting)
+            .flatten()
+    }
+
+    /// Returns the common typesetting mode when every resolved unit agrees.
+    ///
+    /// This is a fallback for a rendered run with no source provenance.
+    /// PDF-facing Unicode summaries cannot safely reconstruct CSS
+    /// typographic character-unit boundaries.
+    pub(crate) fn uniform_typesetting(&self) -> Option<VerticalUnitTypesetting> {
+        let first = self.units().first()?.typesetting;
         self.units()
             .iter()
-            .find(|unit| unit.range.start <= range.start && range.end <= unit.range.end)
-            .map(|unit| unit.typesetting)
+            .all(|unit| unit.typesetting == first)
+            .then_some(first)
     }
 
     pub(crate) fn upright_vertical_ranges(&self) -> Vec<Range<usize>> {
@@ -138,11 +210,24 @@ impl TextTypesettingPlan {
                     if unit.range.end <= range.start || range.end <= unit.range.start {
                         continue;
                     }
-                    if unit.range.start < range.start || range.end < unit.range.end {
+                    let cuts_unit = unit.range.start < range.start || range.end < unit.range.end;
+                    if cuts_unit
+                        && !matches!(
+                            unit.typesetting,
+                            VerticalUnitTypesetting::SidewaysHorizontal
+                        )
+                    {
                         return None;
                     }
                     selected.push(ResolvedVerticalUnit {
-                        range: unit.range.start - range.start..unit.range.end - range.start,
+                        // Native vertical cursive shaping may establish one
+                        // sideways-horizontal unit across several authored
+                        // inline fragments. A source slice must retain that
+                        // unit's already-resolved mode for its selected
+                        // intersection rather than re-shaping without its
+                        // synthetic context.
+                        range: unit.range.start.max(range.start) - range.start
+                            ..unit.range.end.min(range.end) - range.start,
                         typesetting: unit.typesetting,
                     });
                 }
@@ -223,6 +308,41 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn unanimous_typesetting_handles_multi_unit_clusters_without_crossing_modes() {
+        let upright = vertical_style(TextOrientation::Upright);
+        let upright_plan = TextTypesettingPlan::resolve("AB", &upright);
+        assert_eq!(
+            upright_plan.unanimous_typesetting_for_range(&(0..2)),
+            Some(VerticalUnitTypesetting::UprightVertical)
+        );
+
+        let mixed = vertical_style(TextOrientation::Mixed);
+        let mixed_plan = TextTypesettingPlan::resolve("a、", &mixed);
+        assert_eq!(
+            mixed_plan.unanimous_typesetting_for_range(&(0..4)),
+            None,
+            "a sideways and an upright ideographic comma are ambiguous together"
+        );
+    }
+
+    #[test]
+    fn source_slice_projects_a_contextual_native_vertical_unit() {
+        let text = "ᠨᠨᠨ";
+        let plan = TextTypesettingPlan::resolve(text, &vertical_style(TextOrientation::Upright));
+        let slice = plan
+            .source_slice('ᠨ'.len_utf8()..'ᠨ'.len_utf8() * 2)
+            .expect("a source fragment may reuse its contextual vertical mode");
+
+        assert_eq!(
+            slice.units(),
+            [ResolvedVerticalUnit {
+                range: 0..'ᠨ'.len_utf8(),
+                typesetting: VerticalUnitTypesetting::SidewaysHorizontal,
+            }]
+        );
     }
 
     #[test]

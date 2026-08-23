@@ -1,4 +1,11 @@
-use super::*;
+use super::{
+    ComputedStyle, SemanticLengthExt, TableColumnMeasures, TableHeightPlan, TableHeightTarget,
+    TableInlineTrackSizing, TableMetrics, TableRowHeightPlan,
+    constrain_table_intrinsic_width_with_floor, declared_table_column_track_size,
+    declared_table_track_size_is_non_percentage, declared_table_track_size_length_floor,
+    declared_table_track_size_percentage, distribute_table_excess_width,
+    intrinsic_percentage_contribution, layout_pt, table_content_height, table_row_span_height,
+};
 
 pub(in crate::layout::table) fn table_plan_height(
     row: &TableRowHeightPlan,

@@ -1,10 +1,9 @@
 use std::rc::Rc;
 
-use crate::image_store::ImageId;
-
 use super::geometry::{PaintPoint, PaintRect, PaintSize, PaintTransform, PaintTranslation};
 use super::images::{InlineRasterImage, RasterSampling, RenderedImageSource};
 use super::paths::{RenderedGradient, RenderedPath, RenderedPathClip};
+use crate::image_store::ImageId;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PaintPatternTiling {

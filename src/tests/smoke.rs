@@ -1,6 +1,7 @@
+use base64::Engine as _;
+
 use crate as quire;
 use crate::{BookmarkState, Css, CssColor, Document, Html, PdfOptions, RenderOptions};
-use base64::Engine as _;
 
 trait PdfBytesForTest {
     fn write_pdf_bytes(&self, options: &PdfOptions) -> crate::Result<Vec<u8>>;
@@ -44,6 +45,10 @@ const ROW_SUBGRID_AUTO_FILL_WPT_REFERENCE: &str = include_str!(
 const CUSTOM_HIGHLIGHT_PAINTING_IFRAME_REFERENCE: &str = include_str!(
     "../../tests/fixtures/wpt/css/css-highlight-api/painting/custom-highlight-painting-iframe-001-ref.html"
 );
+const TABLE_WITH_FLOAT_PAINT_WPT: &str =
+    include_str!("../../tests/fixtures/wpt/css/css-flexbox/table-with-float-paint.html");
+const FILLED_GREEN_SQUARE_REFERENCE: &str =
+    include_str!("../../tests/fixtures/wpt/css/reference/ref-filled-green-100px-square-only.html");
 
 /// Local Grid Lanes regression derived from upstream
 /// `row-subgrid-auto-fill-002`. Keeping both inputs in the repository makes
@@ -58,6 +63,30 @@ async fn grid_lanes_row_subgrid_auto_fill_matches_local_reference() {
         .render(&RenderOptions::default())
         .await
         .unwrap();
+    assert_eq!(actual.pages.len(), reference.pages.len());
+    assert_eq!(actual.pages[0].rects(), reference.pages[0].rects());
+    assert_eq!(
+        actual.pages[0].rounded_rects(),
+        reference.pages[0].rounded_rects()
+    );
+}
+
+/// WPT regression: `css/css-flexbox/table-with-float-paint.html`.
+///
+/// Flex's final normal-flow line-box measurement replays the already-sized
+/// table item. That replay must be detached from the committed document so a
+/// floated table descendant paints only during the final item replay.
+#[tokio::test]
+async fn flex_table_float_paint_matches_local_reference() {
+    let actual = Html::from_string(TABLE_WITH_FLOAT_PAINT_WPT)
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+    let reference = Html::from_string(FILLED_GREEN_SQUARE_REFERENCE)
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+
     assert_eq!(actual.pages.len(), reference.pages.len());
     assert_eq!(actual.pages[0].rects(), reference.pages[0].rects());
     assert_eq!(

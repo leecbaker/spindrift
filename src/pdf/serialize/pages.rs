@@ -1,12 +1,13 @@
 //! Catalog, page-tree, page-content, annotation, and outline serialization.
 
+use pdf_writer::types::{ActionType, AnnotationType, OutputIntentSubtype};
+use pdf_writer::{Filter, Pdf, Rect, Str, TextStr};
+
 use super::super::*;
 use super::primitives::{i32_from_usize, pdf_ref};
 use super::resources::write_resource_dictionary;
 use super::stream::encode_pdf_stream;
 use crate::pdf::colors::{PdfColorMode, PdfColorPlan};
-use pdf_writer::types::{ActionType, AnnotationType, OutputIntentSubtype};
-use pdf_writer::{Filter, Pdf, Rect, Str, TextStr};
 
 pub(crate) fn write_catalog(
     pdf: &mut Pdf,

@@ -1,4 +1,49 @@
-use super::*;
+use crate::Page;
+use crate::css::{
+    ComputedStyle, PercentageBasis, Position, SemanticLengthExt, Stylesheets, Visibility, layout_pt,
+};
+use crate::document::paint::display_list::PaintBand;
+use crate::document::paint::effects::PaintEffects;
+use crate::document::paint::fragments::PaintFragment;
+use crate::document::paint::geometry::{
+    PaintClip, PaintPoint, PaintRect, PaintSize, PaintTranslation,
+};
+use crate::document::paint::page::PaintPrimitive;
+use crate::document::paint::shapes::RenderedRect;
+use crate::document::paint::stacking::PaintStackingContext;
+use crate::dom::Element;
+use crate::layout::table::layout::split_3::{
+    table_column_group_has_explicit_columns, table_columns_paint_in_reverse_page_order,
+};
+use crate::layout::table::layout::{
+    CollapsedTableGeometry, RelativeTablePartStructuralPaint, TableBodyPaintFragment,
+    TableCellChildFragmentKind, TableCellChildFragmentPlan, TableCellContentPlan,
+    TableCellNestedFragmentPlan, TableCellNestedInlineSequencePlan, TableGridLayoutContext,
+    TableHeightDistributionTarget, TableHeightTarget, TableRowHeightPlan,
+    TableWrapperDecorationViewport, distribute_table_span_constraint,
+    push_table_fragment_row_span_background, table_cell_participates_in_physical_y_row_baseline,
+    table_column_fragment_background_image_primitives, table_column_fragment_background_primitives,
+    table_column_grid_background_primitives, table_fragment_row_span_bounds,
+    table_row_fragment_background_primitives, table_row_grid_background_primitives,
+    table_row_group_grid_background_primitives,
+};
+use crate::layout::table::{
+    TableCell, TableCellAxisAdapter, TableCellContentGeometry, TableColumn, TableColumnPlan,
+    TableGrid, TableGridLength, TableGridPlacement, TableGridPoint, TableGridRect, TableGridSize,
+    TableHeightPlan, TableInlineBounds, TableMetrics, TableRootTrackAxis, TableRow, UsedTableWidth,
+    table_cell_root_block_track_contribution, table_column_group_spans, table_root_block_size,
+    table_row_group_spans, table_row_is_collapsed, table_vertical_edge_spacing,
+};
+use crate::layout::{
+    BlockSizeBasisSource, ContainingBlock, FragmentPageMetadata, LayoutBuilder, OverflowClip,
+    PageInlineSpan, PageTopRect, PaintBackgroundArea, RelativeOffset, ReplacedElementKind,
+    TableHeightPlanCacheKey, apply_used_box_metrics,
+    background_image_primitives_for_style_with_paint_areas, box_tree, horizontal_border_width,
+    normalized_text_for_style, paint_space_rect, percentage_basis_from_points,
+    relative_position_offset, replaced_element_kind, used_border_widths, used_content_box_width,
+    used_length_percentage_or_auto_with_basis,
+};
+use crate::units::non_content_pt;
 
 impl<'a> LayoutBuilder<'a> {
     /// Pre-render a nested table/flex formatting context for split table-cell
@@ -41,7 +86,7 @@ impl<'a> LayoutBuilder<'a> {
                 PageTopRect::new(0.0, top, width, top),
                 None,
                 layout.table_cell_child_ancestors(cell, row),
-                None,
+                PercentageBasis::indefinite(),
             );
 
             layout.layout_formatting_box_with_parent_decoration(
@@ -63,7 +108,7 @@ impl<'a> LayoutBuilder<'a> {
                 fragment,
                 width,
                 height,
-                metadata: FragmentPageMetadata::empty(snapshot.rollback.pages.len()),
+                metadata: FragmentPageMetadata::empty(snapshot.page_count()),
                 assignments,
             })
         })
@@ -619,6 +664,7 @@ impl<'a> LayoutBuilder<'a> {
             let root_background_viewport = TableWrapperDecorationViewport::new(
                 projection,
                 fragmentainer_placement,
+                fragment.plan.page_index,
                 root_source_placement,
                 wrapper_timeline,
                 table_style,
@@ -885,8 +931,8 @@ impl<'a> LayoutBuilder<'a> {
                 TableGridLength::new(used_table_width),
             )
         });
-        let occupied_x = occupied_inline_bounds.page_x(table_x);
-        let occupied_width = occupied_inline_bounds.page_width();
+        let occupied_x = table_x + occupied_inline_bounds.logical_start().get();
+        let occupied_width = occupied_inline_bounds.logical_size().get();
         // Relative offsets of table rows and row groups resolve against the
         // table grid's physical containing block. The grid remains in normal
         // table coordinates; only the generated structural paint below is
@@ -1278,9 +1324,9 @@ impl<'a> LayoutBuilder<'a> {
                 )
             {
                 has_baseline_cells = true;
-                max_baseline = max_baseline.max(baseline);
+                max_baseline = max_baseline.max(baseline.points());
                 max_after_baseline = max_after_baseline
-                    .max((prepared.metrics.border_box_height - baseline).max(0.0));
+                    .max((prepared.metrics.border_box_height - baseline.points()).max(0.0));
             }
         }
         if has_baseline_cells {

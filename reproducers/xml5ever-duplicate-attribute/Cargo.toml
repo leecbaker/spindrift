@@ -1,0 +1,9 @@
+[package]
+name = "xml5ever-duplicate-attribute-repro"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+markup5ever_rcdom = "0.39.0"
+xml5ever = "0.39.0"

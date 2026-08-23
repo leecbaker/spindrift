@@ -1,10 +1,7 @@
 use super::super::super::*;
-use super::{
-    exclusions::FLOAT_EPSILON,
-    model::*,
-    sizing::{float_replay_style, freeze_float_replay_height, freeze_float_replay_width},
-};
-
+use super::exclusions::FLOAT_EPSILON;
+use super::model::*;
+use super::sizing::{float_replay_style, freeze_float_replay_height, freeze_float_replay_width};
 use crate::layout::assets::rasterize_generated_css_image;
 use crate::layout::inline_collect::has_out_of_flow_formatting_box;
 
@@ -26,6 +23,7 @@ impl<'a> LayoutBuilder<'a> {
         child_children: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
         stylesheets: &Stylesheets<'_>,
+        placement_axes: FloatPlacementAxes,
         run: &mut FloatRunState,
     ) -> bool {
         if child_style.float == Float::None
@@ -45,11 +43,13 @@ impl<'a> LayoutBuilder<'a> {
         // sibling float must still paint above it in source order.
         // <https://www.w3.org/TR/CSS22/zindex.html>
         let paint_source_order = self.next_paint_source_order();
-        let Some(float_side) = UsedFloatSide::from_float(
-            specified_side,
-            placed_style.writing_mode,
-            placed_style.direction,
-        ) else {
+        // Intrinsic measurement and isolated replay temporarily enter the
+        // floated child's formatting context. Preserve the containing block's
+        // logical inline extent beside its axes so a vertical inline-end
+        // float cannot later anchor against the child's measured inline size.
+        // <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
+        let placement_logical_inline_size = self.current_content_logical_inline_content_size();
+        let Some(float_side) = UsedFloatSide::from_float(specified_side, placement_axes) else {
             return false;
         };
         self.push_ancestor_signature(child_signature);
@@ -114,7 +114,8 @@ impl<'a> LayoutBuilder<'a> {
         // floated child is moved to a fresh page while its ordinary text fits
         // beside the preceding float on this page.
         let mut deferred_destination_snapshot = None;
-        if self.adjoining_float_origin_y.is_none()
+        if placement_axes.writing_mode() == WritingMode::HorizontalTb
+            && self.adjoining_float_origin_y.is_none()
             && margin_box_height.points() > FLOAT_EPSILON
             && margin_box_height.points() <= self.page_area_height() + FLOAT_EPSILON
             && self.cursor_y - margin_box_height.points() < self.page_bottom() - FLOAT_EPSILON
@@ -134,6 +135,13 @@ impl<'a> LayoutBuilder<'a> {
         }
         let placement_top =
             PageTopBlockPosition::new(self.adjoining_float_origin_y.unwrap_or(self.cursor_y));
+        let replay_paint_translation =
+            FloatReplayBlockOriginAdjustment::for_containing_inline_axis(
+                placement_axes,
+                placement_top,
+                placement_logical_inline_size,
+            )
+            .paint_translation();
         // Negative block-start/end margins can make a float's mathematical
         // margin-box height zero or negative while its border box still
         // occupies a substantial exclusion slab. Float placement must test
@@ -155,8 +163,8 @@ impl<'a> LayoutBuilder<'a> {
                         placement_top,
                         margin_box_size,
                         placed_style.clear,
-                        placed_style.writing_mode,
-                        placed_style.direction,
+                        placement_axes,
+                        placement_logical_inline_size,
                         Some(float_side),
                     );
                     (placement.origin.x(), placement.origin.top_y())
@@ -166,8 +174,7 @@ impl<'a> LayoutBuilder<'a> {
                     placement_top,
                     margin_box_size,
                     placed_style.clear,
-                    placed_style.writing_mode,
-                    placed_style.direction,
+                    placement_axes,
                     float_side,
                 );
                 let margin_box_left = placement
@@ -176,8 +183,8 @@ impl<'a> LayoutBuilder<'a> {
             };
         let mut logical_placement = LogicalFloatPlacement::from_physical_margin_box(
             self.current_float_page_index(),
-            self.containing_block_writing_mode,
-            self.containing_block_direction,
+            placement_axes.writing_mode(),
+            placement_axes.direction(),
             float_side,
             PageTopRect::new(
                 self.content_left,
@@ -208,7 +215,8 @@ impl<'a> LayoutBuilder<'a> {
         // out of flow.
         // <https://www.w3.org/TR/CSS22/visuren.html#floats>
         // <https://www.w3.org/TR/css-break-3/#fragmentation-model>
-        if deferred_destination_snapshot.is_none()
+        if placement_axes.writing_mode() == WritingMode::HorizontalTb
+            && deferred_destination_snapshot.is_none()
             && self.fragmentation_suppression_depth == 0
             && margin_box_height.points() <= self.page_area_height() + FLOAT_EPSILON
             && top - margin_box_height.points() < self.page_bottom() - FLOAT_EPSILON
@@ -235,8 +243,8 @@ impl<'a> LayoutBuilder<'a> {
                             next_placement_top,
                             margin_box_size,
                             placed_style.clear,
-                            placed_style.writing_mode,
-                            placed_style.direction,
+                            placement_axes,
+                            placement_logical_inline_size,
                             Some(float_side),
                         );
                         (placement.origin.x(), placement.origin.top_y())
@@ -246,8 +254,7 @@ impl<'a> LayoutBuilder<'a> {
                         next_placement_top,
                         margin_box_size,
                         placed_style.clear,
-                        placed_style.writing_mode,
-                        placed_style.direction,
+                        placement_axes,
                         float_side,
                     );
                     let margin_box_left = placement
@@ -256,8 +263,8 @@ impl<'a> LayoutBuilder<'a> {
                 };
             logical_placement = LogicalFloatPlacement::from_physical_margin_box(
                 self.current_float_page_index(),
-                self.containing_block_writing_mode,
-                self.containing_block_direction,
+                placement_axes.writing_mode(),
+                placement_axes.direction(),
                 float_side,
                 PageTopRect::new(
                     self.content_left,
@@ -292,18 +299,15 @@ impl<'a> LayoutBuilder<'a> {
         self.content_left = margin_box_left + placed_style.margin.left;
         self.content_right = self.content_left + inline_size.border_box_width.points().max(1.0);
         self.cursor_y = top - placed_style.margin.top;
-        // Keep the parent flow until the floated root enters block layout.
-        // That entry records the parent/child relationship before changing
-        // the containing flow for descendants; vertical floats need it to
-        // resolve their auto logical inline size into a physical height.
+        // Placement has already projected the floated margin box through the
+        // parent's axes, and sizing has frozen both physical replay
+        // dimensions. Enter the isolated BFC in the float's own axes so block
+        // replay cannot treat its already-physical origin as another
+        // orthogonal normal-flow placement (which would apply the scratch
+        // coordinate translation twice for bottom-to-top inline flow).
         // <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
-        if !crate::layout::block::writing_modes_are_orthogonal(
-            previous_writing_mode,
-            placed_style.writing_mode,
-        ) {
-            self.containing_block_direction = placed_style.used_direction();
-            self.containing_block_writing_mode = placed_style.writing_mode;
-        }
+        self.containing_block_direction = placed_style.used_direction();
+        self.containing_block_writing_mode = placed_style.writing_mode;
         let paint_checkpoint = self.current_page.paint_checkpoint();
         let paint_page_index = self.pages.len();
         let positioned_layer_start = self.positioned_layers.len();
@@ -321,6 +325,9 @@ impl<'a> LayoutBuilder<'a> {
             child_children,
             table_fragment,
         );
+        let replayed_border_box_height = (top - placed_style.margin.top - self.cursor_y).max(0.0);
+        let actual_bottom = top
+            - (placed_style.margin.top + replayed_border_box_height + placed_style.margin.bottom);
         self.preserve_scoped_paint_public_order = previous_preserve_scoped_paint_public_order;
         self.float_paint_capture_depth = self.float_paint_capture_depth.saturating_sub(1);
         self.pop_float_context();
@@ -344,9 +351,6 @@ impl<'a> LayoutBuilder<'a> {
         // of comparing two differently scoped cursors.
         // <https://www.w3.org/TR/CSS22/visudet.html#root-height>
         // <https://www.w3.org/TR/CSS22/visuren.html#floats>
-        let replayed_border_box_height = (top - placed_style.margin.top - self.cursor_y).max(0.0);
-        let actual_bottom = top
-            - (placed_style.margin.top + replayed_border_box_height + placed_style.margin.bottom);
         let float_margin_box = PageTopRect::new(
             margin_box_left,
             top,
@@ -402,7 +406,10 @@ impl<'a> LayoutBuilder<'a> {
                 .iter()
                 .filter(|layer| layer.page_index == paint_page_index)
                 .cloned()
-                .map(|layer| layer.context.with_links(layer.links))
+                .map(|layer| {
+                    let layer = layer.translated(replay_paint_translation);
+                    layer.context.with_links(layer.links)
+                })
                 .collect::<Vec<_>>();
             if let Some(mut float_fragment) = self.build_float_paint_fragment(
                 float_id,
@@ -441,7 +448,10 @@ impl<'a> LayoutBuilder<'a> {
                     .iter()
                     .filter(|layer| layer.page_index == page_index)
                     .cloned()
-                    .map(|layer| layer.context.with_links(layer.links))
+                    .map(|layer| {
+                        let layer = layer.translated(replay_paint_translation);
+                        layer.context.with_links(layer.links)
+                    })
                     .collect::<Vec<_>>();
                 if let Some(float_fragment) = self.build_float_paint_fragment(
                     float_id,
@@ -474,7 +484,7 @@ impl<'a> LayoutBuilder<'a> {
                 let mut remaining_block_size = float_margin_box.height();
                 for fragment_page_index in paint_page_index..=self.pages.len() {
                     let fragment_context = if fragment_page_index == paint_page_index {
-                        layout_snapshot.current_page_context
+                        layout_snapshot.current_page_context()
                     } else {
                         self.fragmentainer_override
                             .map(|override_| {

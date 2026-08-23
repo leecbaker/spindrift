@@ -1,8 +1,10 @@
-use super::{CssAtom, LanguageRange, QuirePseudoClass, QuirePseudoElement, QuireSelectorImpl};
-use crate::css::types::Direction;
+use std::collections::HashMap;
+
 use cssparser::{CowRcStr, Parser as CssParser, SourceLocation};
 use selectors::parser::{Parser as SelectorParser, SelectorParseErrorKind};
-use std::collections::HashMap;
+
+use super::{CssAtom, LanguageRange, QuirePseudoClass, QuirePseudoElement, QuireSelectorImpl};
+use crate::css::types::Direction;
 
 #[derive(Debug, Clone, Default)]
 pub(in crate::css) struct QuireSelectorParser {

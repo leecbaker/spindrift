@@ -1,13 +1,14 @@
 //! Raster-image and raster-tiling-pattern serialization.
 
+use pdf_writer::types::{PaintType, TilingType};
+use pdf_writer::{Filter, Name, Pdf, Rect};
+
 use super::super::*;
 use super::primitives::{i32_from_u32, pdf_ref};
 use super::resources::write_resource_dictionary;
 use super::stream::encode_pdf_stream;
 use crate::pdf::colors::PdfColorPlan;
 use crate::timing::DebugTimer;
-use pdf_writer::types::{PaintType, TilingType};
-use pdf_writer::{Filter, Name, Pdf, Rect};
 
 pub(crate) fn write_images(
     pdf: &mut Pdf,

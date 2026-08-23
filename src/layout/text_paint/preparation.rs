@@ -1,6 +1,7 @@
+use std::rc::Rc;
+
 use super::*;
 use crate::text::TextTypesettingPlan;
-use std::rc::Rc;
 
 struct InlineTextPrepSpan<'a, F: InlineFragmentAccess> {
     fragment: &'a F,
@@ -14,6 +15,29 @@ impl<'a, F: InlineFragmentAccess> InlineTextPrepSpan<'a, F> {
             text: fragment.text(),
         }
     }
+}
+
+/// Reconstruct plain text for a paint group that shares a transformed
+/// separator's glyph stream with adjacent text.
+///
+/// CSS Text transforms the separator only for styling. PDF output therefore
+/// needs one group-level ActualText value whenever the group contains an
+/// explicit replacement, even though its shaped text contains U+0020 or
+/// U+3000 instead.
+/// <https://drafts.csswg.org/css-text-4/#word-space-transform>
+fn word_space_transform_actual_text<F: InlineFragmentAccess>(fragments: &[F]) -> Option<Rc<str>> {
+    let mut actual_text = String::new();
+    let mut has_transformed_separator = false;
+    for fragment in fragments {
+        match fragment.source() {
+            InlineTextSource::WordSpaceTransform(separator) => {
+                actual_text.push_str(separator.extraction_text().unwrap_or(""));
+                has_transformed_separator = true;
+            }
+            _ => actual_text.push_str(fragment.text()),
+        }
+    }
+    has_transformed_separator.then(|| Rc::from(actual_text))
 }
 
 fn inline_text_prep_span_is_join_control_only<F: InlineFragmentAccess>(
@@ -99,7 +123,11 @@ fn append_text_decoration_provenance<F: InlineFragmentAccess>(
             if group.len() != 1 || shaped.advance_width() <= 0.0 {
                 continue;
             }
-            let layers = span.fragment.style().text_decoration_layers.clone();
+            let layers = span
+                .fragment
+                .style()
+                .text_decoration_origins
+                .effective_layers_vec();
             provenance.push(PreparedTextDecorationProvenanceSegment {
                 layers,
                 receivers: vec![PreparedTextDecorationReceiver {
@@ -115,7 +143,11 @@ fn append_text_decoration_provenance<F: InlineFragmentAccess>(
         if end <= start {
             continue;
         }
-        let layers = span.fragment.style().text_decoration_layers.clone();
+        let layers = span
+            .fragment
+            .style()
+            .text_decoration_origins
+            .effective_layers_vec();
         let receiver = PreparedTextDecorationReceiver {
             inline_span: TextInlineSpan::new(
                 group_inline_offset + start,
@@ -342,7 +374,7 @@ impl<'a> LayoutBuilder<'a> {
                 .any(crate::text::character_is_join_control);
             let has_joining_behavior = group_text
                 .chars()
-                .any(crate::text::character_has_joining_behavior);
+                .any(crate::text::character_has_cursive_shaping_behavior);
             // Visual reordering reverses the order of the separate inline
             // fragments in an RTL run, while retaining the source order
             // inside each fragment. Keep join controls as their own spans so
@@ -436,15 +468,16 @@ impl<'a> LayoutBuilder<'a> {
                 }
             });
             let shaped = reused_selected_shape.or_else(|| {
-                self.font_system.shape_visually_ordered_inline_fragments(
-                    shaping_spans,
-                    group_text,
-                    0.0,
-                    first.style().line_height,
-                    tab_origin + width,
-                    tab_metric_style,
-                    resolved_direction,
-                )
+                self.font_system
+                    .shape_untracked_visually_ordered_inline_fragments(
+                        shaping_spans,
+                        group_text,
+                        0.0,
+                        first.style().line_height,
+                        tab_origin + width,
+                        tab_metric_style,
+                        resolved_direction,
+                    )
             });
             if let Some(mut shaped) = shaped {
                 let group_width = shaped.advance_width();
@@ -510,6 +543,25 @@ impl<'a> LayoutBuilder<'a> {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
         );
+        // Inline descendants inherit their text style, but their lexical
+        // inline owner's `position` and `z-index` stay on the zero-width
+        // scope edges. Preserve the innermost positioned scope so the paint
+        // phase can place this otherwise ordinary text run in its stacking
+        // band.
+        // <https://www.w3.org/TR/CSS22/zindex.html>
+        let positioned_paint_style =
+            inline_style_establishes_positioned_stacking_context(first.style())
+                .then(|| first.style().clone())
+                .or_else(|| {
+                    first
+                        .ancestor_inline_decorations()
+                        .iter()
+                        .rev()
+                        .find(|decoration| {
+                            inline_style_establishes_positioned_stacking_context(&decoration.style)
+                        })
+                        .map(|decoration| decoration.style.clone())
+                });
         let text_box_trim = self
             .inline_text_box_content_trim_for_style(first.style(), metrics)
             .is_empty()
@@ -537,10 +589,12 @@ impl<'a> LayoutBuilder<'a> {
             text_box_trim,
             paint_opacity,
             paint_scope_ancestry,
+            positioned_paint_style,
             link_target: first.link_target().map(ToOwned::to_owned),
             link_paint_rect: None,
             decoration_paint_rect: None,
             shaped,
+            actual_text: word_space_transform_actual_text(fragments),
             source: first.source(),
             source_run: Rc::clone(first.source_run()),
         })
@@ -610,7 +664,9 @@ mod tests {
         origin.text_decoration.underline = true;
         let origin = Rc::new(origin);
         let mut receiver_style = ComputedStyle::initial();
-        receiver_style.text_decoration_layers = vec![decoration_layer(Rc::clone(&origin))];
+        receiver_style
+            .text_decoration_origins
+            .set_propagated(vec![decoration_layer(Rc::clone(&origin))]);
         let left = provenance_fragment("a", receiver_style.clone());
         let right = provenance_fragment("b", receiver_style.clone());
         let plain = provenance_fragment("c", ComputedStyle::initial());
@@ -637,9 +693,13 @@ mod tests {
         let outer_origin = Rc::new(declaration.clone());
         let inner_origin = Rc::new(declaration);
         let mut outer_receiver = ComputedStyle::initial();
-        outer_receiver.text_decoration_layers = vec![decoration_layer(Rc::clone(&outer_origin))];
+        outer_receiver
+            .text_decoration_origins
+            .set_propagated(vec![decoration_layer(Rc::clone(&outer_origin))]);
         let mut inner_receiver = ComputedStyle::initial();
-        inner_receiver.text_decoration_layers = vec![decoration_layer(Rc::clone(&inner_origin))];
+        inner_receiver
+            .text_decoration_origins
+            .set_propagated(vec![decoration_layer(Rc::clone(&inner_origin))]);
         let left = provenance_fragment("a", outer_receiver.clone());
         let right = provenance_fragment("b", inner_receiver);
         let spans = vec![

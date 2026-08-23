@@ -214,9 +214,12 @@ fn inline_shaping_boundary_requires_bidi_join_control(
             Box::new(items.iter())
         };
         iterator.find_map(|item| match &item.item {
-            InlineLineItem::Fragment(fragment) => {
-                Some(fragment.text().chars().any(character_has_joining_behavior))
-            }
+            InlineLineItem::Fragment(fragment) => Some(
+                fragment
+                    .text()
+                    .chars()
+                    .any(character_has_cursive_shaping_behavior),
+            ),
             InlineLineItem::Atom(_) if measured_item_is_transparent_mixed_inline_edge(item) => None,
             InlineLineItem::Atom(_) | InlineLineItem::Float(_) => Some(false),
         })
@@ -527,15 +530,16 @@ pub(in crate::layout) fn transparent_inline_edge_precedes_visual_content(
                 }
             })
         }
-        // Autospace belongs to the visual side of its logical predecessor.
-        // UAX #9 reverses that side in an RTL run, but the two autospace
-        // boundary directions need not occupy the same visual side once the
-        // surrounding typographic units have reordered.
+        // The source marker belongs to the logical boundary immediately
+        // before its following text fragment. The logical following edge is
+        // visual-leading for an LTR range and visual-trailing for an RTL
+        // range. This maps the already selected boundary through UAX #9
+        // without guessing from either character's script class.
         // <https://drafts.csswg.org/css-text-4/#text-autospace-property>
-        InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace(spacing)) => Some(
-            matches!(visual_direction, ResolvedBidiDirection::Rtl)
-                && spacing.predecessor_is_ideograph(),
-        ),
+        InlineAtomContent::InlineEdge(InlineEdgeRole::MetricsOnlyStrut) => Some(false),
+        InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace(_)) => {
+            Some(matches!(visual_direction, ResolvedBidiDirection::Ltr))
+        }
         InlineAtomContent::Canvas
         | InlineAtomContent::Iframe(_)
         | InlineAtomContent::Image(_)
@@ -807,8 +811,8 @@ mod tests {
         style: ComputedStyle,
         source: InlineTextSource,
     ) -> MeasuredInlineItem {
-        MeasuredInlineItem {
-            item: InlineLineItem::Fragment(InlineFragment::new(
+        MeasuredInlineItem::new(
+            InlineLineItem::Fragment(InlineFragment::new(
                 text,
                 style,
                 0.0,
@@ -819,9 +823,9 @@ mod tests {
                 InlineHangingEdges::default(),
                 Vec::new(),
             )),
-            width: 0.0,
-            shaped: None,
-        }
+            0.0,
+            None,
+        )
     }
 
     #[test]
@@ -911,6 +915,36 @@ mod tests {
         assert_eq!(
             expand_visual_slice_with_owned_join_controls(text, owner, 8..letter_end),
             8..(8 + text.len())
+        );
+    }
+
+    #[test]
+    fn autospace_marker_uses_the_following_visual_boundary() {
+        let style = ComputedStyle::initial();
+        let item = MeasuredInlineItem::new(
+            InlineLineItem::Atom(InlineAtom::new(
+                InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace(
+                    InlineTextBoundarySpacing::new(layout_pt(1.0)),
+                )),
+                style,
+                None,
+                InlineSize::new(1.0, 0.0),
+                0.0,
+                0.0,
+                None,
+                None,
+            )),
+            1.0,
+            None,
+        );
+
+        assert_eq!(
+            transparent_inline_edge_precedes_visual_content(&item, ResolvedBidiDirection::Ltr),
+            Some(true)
+        );
+        assert_eq!(
+            transparent_inline_edge_precedes_visual_content(&item, ResolvedBidiDirection::Rtl),
+            Some(false)
         );
     }
 }

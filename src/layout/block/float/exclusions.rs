@@ -1,6 +1,7 @@
+use std::num::NonZeroUsize;
+
 use super::super::super::*;
 use super::model::*;
-use std::num::NonZeroUsize;
 
 pub(in crate::layout) const FLOAT_EPSILON: f32 = 0.01;
 
@@ -154,8 +155,7 @@ impl ClearedFloatOuterBlockEnd {
 #[derive(Clone, Copy, Debug)]
 pub(in crate::layout) struct BlockClearanceRequest {
     pub(in crate::layout) clear: Clear,
-    pub(in crate::layout) writing_mode: WritingMode,
-    pub(in crate::layout) direction: Direction,
+    pub(in crate::layout) placement_axes: FloatPlacementAxes,
     hypothetical_border_edge: HypotheticalClearBorderEdge,
     uncleared_border_edge: UnclearedBorderEdge,
     margin_edge_before_top_margin: MarginEdgeBeforeClearance,
@@ -168,14 +168,12 @@ impl BlockClearanceRequest {
     /// block-start margin relationship to re-resolve.
     pub(in crate::layout) fn coincident_edges(
         clear: Clear,
-        writing_mode: WritingMode,
-        direction: Direction,
+        placement_axes: FloatPlacementAxes,
         edge: PageTopBlockPosition,
     ) -> Self {
         Self {
             clear,
-            writing_mode,
-            direction,
+            placement_axes,
             hypothetical_border_edge: HypotheticalClearBorderEdge::new(edge),
             uncleared_border_edge: UnclearedBorderEdge::new(edge),
             margin_edge_before_top_margin: MarginEdgeBeforeClearance::new(edge),
@@ -188,8 +186,7 @@ impl BlockClearanceRequest {
     /// the counterfactual parent edge explicitly.
     pub(in crate::layout) fn block_flow(
         clear: Clear,
-        writing_mode: WritingMode,
-        direction: Direction,
+        placement_axes: FloatPlacementAxes,
         uncleared_border_edge: PageTopBlockPosition,
         margin_edge_before_top_margin: PageTopBlockPosition,
         used_top_margin: LayoutLength,
@@ -197,8 +194,7 @@ impl BlockClearanceRequest {
     ) -> Self {
         Self {
             clear,
-            writing_mode,
-            direction,
+            placement_axes,
             hypothetical_border_edge: parent_start_hypothesis.map_or_else(
                 || HypotheticalClearBorderEdge::new(uncleared_border_edge),
                 ParentStartClearanceHypothesis::border_edge,
@@ -216,16 +212,14 @@ impl BlockClearanceRequest {
     /// used top margin.
     pub(in crate::layout) fn bfc_root(
         clear: Clear,
-        writing_mode: WritingMode,
-        direction: Direction,
+        placement_axes: FloatPlacementAxes,
         margin_edge_before_top_margin: PageTopBlockPosition,
         uncleared_border_edge: PageTopBlockPosition,
         used_top_margin: LayoutLength,
     ) -> Self {
         Self {
             clear,
-            writing_mode,
-            direction,
+            placement_axes,
             hypothetical_border_edge: HypotheticalClearBorderEdge::new(
                 margin_edge_before_top_margin,
             ),
@@ -458,6 +452,16 @@ impl FloatRunState {
 }
 
 impl FloatContext {
+    /// Whether this block formatting context currently owns a CSS float.
+    ///
+    /// This is deliberately independent of a particular fragmentainer: a
+    /// following cleared in-flow box may establish a class-C break opportunity
+    /// at a column boundary after the float's own page-local exclusion ended.
+    /// <https://drafts.csswg.org/css-break-3/#possible-breaks>
+    pub(in crate::layout) fn has_css_float(&self) -> bool {
+        self.shapes.iter().any(FloatShape::is_css_float)
+    }
+
     /// Whether this fragmentainer contains a CSS float in this block
     /// formatting context.
     ///
@@ -914,10 +918,10 @@ impl FloatContext {
                     continue;
                 };
                 match edge {
-                    VerticalShapeBandEdge::InlineStart => {
+                    VerticalShapeBandEdge::PhysicalTop => {
                         band_top = band_top.min(shape.margin_box_block_span().bottom_y())
                     }
-                    VerticalShapeBandEdge::InlineEnd => {
+                    VerticalShapeBandEdge::PhysicalBottom => {
                         band_bottom = band_bottom.max(shape.margin_box_block_span().top_y())
                     }
                 }
@@ -989,10 +993,10 @@ impl FloatContext {
                     continue;
                 };
                 match edge {
-                    VerticalShapeBandEdge::InlineStart => {
+                    VerticalShapeBandEdge::PhysicalTop => {
                         band_top = band_top.min(shape_span.bottom_y())
                     }
-                    VerticalShapeBandEdge::InlineEnd => {
+                    VerticalShapeBandEdge::PhysicalBottom => {
                         band_bottom = band_bottom.max(shape_span.top_y())
                     }
                 }
@@ -1020,21 +1024,14 @@ impl FloatContext {
     pub(in crate::layout) fn clearance_top(
         &self,
         clear: Clear,
-        writing_mode: WritingMode,
-        direction: Direction,
+        placement_axes: FloatPlacementAxes,
         page_index: usize,
         hypothetical_border_edge: HypotheticalClearBorderEdge,
     ) -> PageTopBlockPosition {
-        self.clearance_target(
-            clear,
-            writing_mode,
-            direction,
-            page_index,
-            hypothetical_border_edge,
-        )
-        .lowest_matching_outer_block_end
-        .map(ClearedFloatOuterBlockEnd::position)
-        .unwrap_or_else(|| hypothetical_border_edge.position())
+        self.clearance_target(clear, placement_axes, page_index, hypothetical_border_edge)
+            .lowest_matching_outer_block_end
+            .map(ClearedFloatOuterBlockEnd::position)
+            .unwrap_or_else(|| hypothetical_border_edge.position())
     }
 
     /// Resolve page-local clearance against matching floats.
@@ -1049,8 +1046,7 @@ impl FloatContext {
     pub(in crate::layout) fn clearance_target(
         &self,
         clear: Clear,
-        writing_mode: WritingMode,
-        direction: Direction,
+        placement_axes: FloatPlacementAxes,
         page_index: usize,
         hypothetical_border_edge: HypotheticalClearBorderEdge,
     ) -> FloatClearanceTarget {
@@ -1065,7 +1061,7 @@ impl FloatContext {
         for shape in self.shapes.iter().filter(|shape| {
             shape.is_css_float()
                 && shape.page_index == page_index
-                && shape.side.matches_clear(clear, writing_mode, direction)
+                && shape.side.matches_clear(clear, placement_axes)
                 && shape.margin_box_block_span().bottom_y()
                     < hypothetical_border_edge.position().points() + FLOAT_EPSILON
         }) {
@@ -1130,8 +1126,8 @@ impl FloatContext {
 /// <https://drafts.csswg.org/css-writing-modes-4/#logical-to-physical>
 /// <https://drafts.csswg.org/TR/css-shapes-1/#relation-to-box-model-and-float-behavior>
 enum VerticalShapeBandEdge {
-    InlineStart,
-    InlineEnd,
+    PhysicalTop,
+    PhysicalBottom,
 }
 
 fn vertical_writing_shape_band_edge(
@@ -1153,16 +1149,23 @@ fn vertical_writing_shape_band_edge(
     // vertical writing, rather than treating them as absent from the line.
     // <https://www.w3.org/TR/css-writing-modes-4/#logical-to-physical>
     // <https://drafts.csswg.org/css-shapes-1/#relation-to-box-model-and-float-behavior>
-    if physical_side == axes.physical_side(LogicalSide::InlineStart)
+    let logical_edge = if physical_side == axes.physical_side(LogicalSide::InlineStart)
         || physical_side == axes.physical_side(LogicalSide::BlockStart)
     {
-        Some(VerticalShapeBandEdge::InlineStart)
+        LogicalSide::InlineStart
     } else if physical_side == axes.physical_side(LogicalSide::InlineEnd)
         || physical_side == axes.physical_side(LogicalSide::BlockEnd)
     {
-        Some(VerticalShapeBandEdge::InlineEnd)
+        LogicalSide::InlineEnd
     } else {
         unreachable!("physical sides cover both logical axes")
+    };
+    match axes.physical_side(logical_edge) {
+        PhysicalSide::Top => Some(VerticalShapeBandEdge::PhysicalTop),
+        PhysicalSide::Bottom => Some(VerticalShapeBandEdge::PhysicalBottom),
+        PhysicalSide::Left | PhysicalSide::Right => {
+            unreachable!("a vertical logical inline edge maps to top or bottom")
+        }
     }
 }
 
@@ -1388,8 +1391,7 @@ impl<'a> LayoutBuilder<'a> {
                 .expect("root float context exists")
                 .clearance_target(
                     request.clear,
-                    request.writing_mode,
-                    request.direction,
+                    request.placement_axes,
                     self.current_float_page_index(),
                     clearance_query_edge,
                 );

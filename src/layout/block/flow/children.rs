@@ -34,6 +34,8 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         input: Box<BlockFlowChildrenPhaseInput<'_, '_>>,
     ) -> BlockFlowChildrenPhaseOutcome {
+        #[cfg(all(feature = "stack-profile", target_os = "macos"))]
+        let _stack_profile_scope = stack_profile::enter("layout_block_flow_children_phase");
         let BlockFlowChildrenPhaseInput {
             fragmentainer_kind,
             element,

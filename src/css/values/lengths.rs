@@ -1,5 +1,6 @@
-use super::*;
 use cssparser::Token;
+
+use super::*;
 
 mod baselines;
 pub(crate) use self::baselines::*;

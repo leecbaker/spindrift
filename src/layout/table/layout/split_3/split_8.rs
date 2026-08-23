@@ -1,6 +1,45 @@
-use super::*;
-use crate::layout::block::DefinitePhysicalContentHeight;
-use crate::layout::block::child_available_space_for_formatting_context;
+use crate::css::{
+    self, ComputedStyle, ContentAlignmentKeyword, Display, ElementSignature, PercentageBasis,
+    SemanticLengthExt, Stylesheets, TableCellVerticalAlign, TableLayout, Visibility,
+    WritingModeAxes, layout_pt,
+};
+use crate::document::paint::display_list::PaintBand;
+use crate::dom::NodeKind;
+use crate::layout::block::{
+    DefinitePhysicalContentHeight, child_available_space_for_formatting_context,
+};
+use crate::layout::table::layout::{
+    CollapsedTableGeometry, TableCellContentScope, apply_table_column_style_measures,
+    auto_table_column_widths, cap_intrinsic_percentages, distribute_spanned_measure,
+    distribute_spanned_percentage, table_cell_border_insets, table_cell_has_in_flow_layout_child,
+    table_content_width_clamped_to_min_content, table_displayed_horizontal_spacing,
+    table_internal_horizontal_spacing,
+};
+use crate::layout::table::{
+    ResolvedTableWrapperInsets, TableAxes, TableCaption, TableCell, TableCellBaselineOffset,
+    TableCellContentBox, TableCellContentCoordinateContext, TableCellContentGeometry,
+    TableCellPadding, TableColumn, TableColumnGroup, TableColumnMeasures, TableColumnPlan,
+    TableGrid, TableGridLength, TableInlineTrackSizing, TableLayoutInput, TableMetrics, TableRow,
+    TableRowBaselineOffset, TableRowGroup, TableStyleSource, TableUsedStyle,
+    UsedTableWrapperGeometry, apply_table_cell_used_padding, constrain_declared_table_track_size,
+    constrain_table_intrinsic_width_with_floor, constrain_table_root_inline_size,
+    declared_table_cell_track_border_box_size, declared_table_cell_track_size,
+    declared_table_cell_width, declared_table_cell_width_length_floor,
+    declared_table_column_track_size, declared_table_track_size_is_non_percentage,
+    declared_table_track_size_percentage, distribute_first_row_fixed_width, distribute_fixed_width,
+    intrinsic_percentage_contribution, table_cell_content_max_width,
+    table_cell_content_table_inline_size, table_cell_inline_intrinsic_measure, table_grid,
+    table_root_distributes_extra_inline_space, table_root_inline_content_box_size,
+    table_root_inline_size, table_root_min_inline_size,
+};
+use crate::layout::{
+    BlockSizePercentageBasis, LayoutBuilder, LogicalInlineContentSize, OverflowClip, PageTopPoint,
+    PageTopRect, PhysicalContentHeight, PhysicalContentWidth, ReplacedElementKind,
+    apply_used_box_metrics, block_align_content_defaults_to_safe_overflow, box_tree,
+    content_alignment_offset_toward_end, intrinsic, normal_flow_block_available_outer_width,
+    replaced_element_kind, set_style_auto_height, set_style_auto_width, used_content_box_width,
+};
+use crate::units::{NonContentLength, content_box_pt};
 
 /// The intrinsic state contributed to one CSS table track distribution.
 ///
@@ -121,7 +160,7 @@ impl<'a> LayoutBuilder<'a> {
         style: &ComputedStyle,
         stylesheets: &Stylesheets<'_>,
         fragment: Option<&box_tree::TableFragment<'_>>,
-    ) -> Option<f32> {
+    ) -> Option<NonContentLength> {
         self.resolved_collapsed_table_wrapper_insets(style, stylesheets, fragment)
             .map(ResolvedTableWrapperInsets::vertical_non_content)
     }
@@ -137,7 +176,7 @@ impl<'a> LayoutBuilder<'a> {
         style: &ComputedStyle,
         stylesheets: &Stylesheets<'_>,
         fragment: Option<&box_tree::TableFragment<'_>>,
-    ) -> Option<f32> {
+    ) -> Option<NonContentLength> {
         self.resolved_collapsed_table_wrapper_insets(style, stylesheets, fragment)
             .map(ResolvedTableWrapperInsets::horizontal_non_content)
     }
@@ -157,7 +196,7 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &Stylesheets<'_>,
         columns: &[TableColumn<'_>],
         _table_width: f32,
-        table_cellpadding: Option<f32>,
+        table_cellpadding: Option<TableCellPadding>,
         table_metrics: TableMetrics,
         collapsed_geometry: Option<&CollapsedTableGeometry>,
     ) -> TableColumnMeasures {
@@ -385,7 +424,7 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &Stylesheets<'_>,
         columns: &[TableColumn<'_>],
         available_outer_inline: f32,
-        table_cellpadding: Option<f32>,
+        table_cellpadding: Option<TableCellPadding>,
         table_metrics: TableMetrics,
         collapsed_geometry: Option<&CollapsedTableGeometry>,
         table_geometry: &mut UsedTableWrapperGeometry,
@@ -466,7 +505,7 @@ impl<'a> LayoutBuilder<'a> {
         columns: &[TableColumn<'_>],
         table_width: LogicalInlineContentSize,
         distribute_extra_width: bool,
-        table_cellpadding: Option<f32>,
+        table_cellpadding: Option<TableCellPadding>,
         table_metrics: TableMetrics,
         collapsed_geometry: Option<&CollapsedTableGeometry>,
     ) -> TableColumnPlan {
@@ -543,7 +582,7 @@ impl<'a> LayoutBuilder<'a> {
         columns: &[TableColumn<'_>],
         table_width: LogicalInlineContentSize,
         distribute_extra_width: bool,
-        table_cellpadding: Option<f32>,
+        table_cellpadding: Option<TableCellPadding>,
         table_metrics: TableMetrics,
         collapsed_geometry: Option<&CollapsedTableGeometry>,
         column_count: usize,
@@ -986,17 +1025,14 @@ impl<'a> LayoutBuilder<'a> {
         content_rect: PageTopRect,
         overflow_clip: Option<OverflowClip>,
         ancestors: Vec<ElementSignature>,
-        definite_block_size: Option<f32>,
+        definite_block_size: BlockSizePercentageBasis,
     ) -> TableCellContentScope {
         self.enter_table_cell_content_scope(
             cell_style,
             TableCellContentBox::from_page_top_rect(content_rect),
             overflow_clip,
             ancestors,
-            block_size_percentage_basis_from_points(
-                definite_block_size,
-                BlockSizeBasisSource::TableCell,
-            ),
+            definite_block_size,
         )
     }
 
@@ -1038,8 +1074,8 @@ impl<'a> LayoutBuilder<'a> {
         cell_style: &ComputedStyle,
         content_geometry: TableCellContentGeometry,
         subject_block_size: f32,
-        row_baseline_offset: Option<f32>,
-        cell_baseline_offset: f32,
+        row_baseline_offset: Option<TableRowBaselineOffset>,
+        cell_baseline_offset: TableCellBaselineOffset,
     ) -> f32 {
         let free_space = content_geometry.block_size().points() - subject_block_size;
         if cell_style.align_content.keyword == ContentAlignmentKeyword::Normal {
@@ -1049,7 +1085,7 @@ impl<'a> LayoutBuilder<'a> {
                 TableCellVerticalAlign::Middle => extra / 2.0,
                 TableCellVerticalAlign::Bottom => extra,
                 TableCellVerticalAlign::Baseline => row_baseline_offset
-                    .map(|baseline| (baseline - cell_baseline_offset).max(0.0))
+                    .map(|baseline| (baseline.points() - cell_baseline_offset.points()).max(0.0))
                     .unwrap_or(0.0)
                     .min(extra),
             };
@@ -1059,7 +1095,7 @@ impl<'a> LayoutBuilder<'a> {
             ContentAlignmentKeyword::Baseline | ContentAlignmentKeyword::LastBaseline
         ) && let Some(baseline) = row_baseline_offset
         {
-            return (baseline - cell_baseline_offset).max(0.0);
+            return (baseline.points() - cell_baseline_offset.points()).max(0.0);
         }
         content_alignment_offset_toward_end(
             cell_style.align_content,
@@ -1279,6 +1315,23 @@ fn table_internal_flow_style(style: &ComputedStyle, table_style: &ComputedStyle)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::BlockSizeBasisSource;
+
+    #[test]
+    fn table_cell_percentage_basis_preserves_definite_and_indefinite_paths() {
+        let definite: BlockSizePercentageBasis =
+            PercentageBasis::definite_from(content_box_pt(24.0), BlockSizeBasisSource::TableCell);
+        let indefinite: BlockSizePercentageBasis = PercentageBasis::indefinite();
+
+        assert!(matches!(
+            definite,
+            PercentageBasis::Definite {
+                value,
+                source: BlockSizeBasisSource::TableCell,
+            } if value.points() == 24.0
+        ));
+        assert!(matches!(indefinite, PercentageBasis::Indefinite));
+    }
 
     #[test]
     fn table_track_measure_keeps_intrinsic_minimum_above_a_zero_preference() {

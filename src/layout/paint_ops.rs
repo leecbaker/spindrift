@@ -378,6 +378,7 @@ impl<'a> LayoutBuilder<'a> {
         checkpoint: &PaintCheckpoint,
         band: PaintBand,
         bounds: PaintClip,
+        fragmentation_bounds: PaintClip,
         style: &ComputedStyle,
     ) -> bool {
         if self.float_paint_capture_depth > 0 {
@@ -386,8 +387,15 @@ impl<'a> LayoutBuilder<'a> {
         let fragment = self
             .current_page
             .paint_tree_fragment_since(checkpoint)
-            .with_monolithic_fragmentation_scope(bounds);
-        let mut policy = StackingContextPolicy::for_inline_svg_root(style, band, bounds);
+            .with_monolithic_fragmentation_scope(fragmentation_bounds);
+        let mut policy = StackingContextPolicy::for_inline_svg_root_with_geometry(
+            style,
+            band,
+            assets::PrincipalPaintGeometry::with_transform_box(
+                fragmentation_bounds,
+                assets::TransformReferenceBox::css_layout(bounds.paint_rect()),
+            ),
+        );
         // Overflow clips a box's contents, not its own background and border.
         // The inline SVG scene owns its viewport clip before it enters this
         // root compositing group.
@@ -395,7 +403,7 @@ impl<'a> LayoutBuilder<'a> {
         self.scope_current_page_fragment_with_policy(
             checkpoint,
             policy,
-            bounds,
+            fragmentation_bounds,
             fragment,
             Vec::new(),
         )
@@ -815,19 +823,12 @@ impl<'a> LayoutBuilder<'a> {
             return false;
         }
         let used_overflow = UsedOverflowAxes::from_style(style);
-        let (clip_edge_x, clip_edge_y) = overflow_clip_edge_axes(style);
-        let (clip_x, clip_y) = overflow_clipping_axes(style);
-        let margin = if clip_edge_x || clip_edge_y {
-            style.overflow_clip_margin.length
-        } else {
-            0.0
-        };
         let clip_height = content_height + style.padding.top + style.padding.bottom;
         let padding_box = PageTopRect::new(
-            outer_x + border_widths.left - margin,
-            block_top - border_widths.top + margin,
-            content_width + style.padding.left + style.padding.right + margin * 2.0,
-            clip_height + margin * 2.0,
+            outer_x + border_widths.left,
+            block_top - border_widths.top,
+            content_width + style.padding.left + style.padding.right,
+            clip_height,
         )
         .paint_clip();
         let scrollport = scrollbar_reservation.map_or_else(
@@ -836,13 +837,33 @@ impl<'a> LayoutBuilder<'a> {
                 ScrollportGeometry::for_padding_box_with_reservation(padding_box, reservation)
             },
         );
-        self.push_overflow_clip(OverflowClip::from_paint_rect_with_axes_and_non_scrollable(
-            scrollport.scrollport.paint_rect(),
-            clip_x || containment.clips_descendant_paint(),
-            clip_y || containment.clips_descendant_paint(),
-            used_overflow.non_scrollable_clip_x(),
-            used_overflow.non_scrollable_clip_y(),
-        ));
+        let border_box = PageTopRect::new(
+            outer_x,
+            block_top,
+            content_width
+                + style.padding.left
+                + style.padding.right
+                + border_widths.left
+                + border_widths.right,
+            content_height
+                + style.padding.top
+                + style.padding.bottom
+                + border_widths.top
+                + border_widths.bottom,
+        )
+        .paint_rect();
+        let edge = resolve_overflow_clip_edge(
+            border_box,
+            style,
+            border_widths,
+            used_overflow,
+            containment.clips_descendant_paint(),
+            (used_overflow.horizontal.is_scroll_container()
+                || used_overflow.vertical.is_scroll_container())
+            .then_some(scrollport.scrollport),
+        )
+        .expect("overflow or paint containment requires a resolved clip edge");
+        self.push_overflow_clip(edge.eager_clip());
         true
     }
 
@@ -979,8 +1000,9 @@ fn rendered_line_width(line: &RenderedLine) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::rc::Rc;
+
+    use super::*;
 
     #[test]
     fn expanded_outline_rect_preserves_nonzero_paint_origin() {

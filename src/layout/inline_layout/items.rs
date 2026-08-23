@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use super::super::*;
 use super::graph::{
     InlineFragmentContinuation, InlineGraphPosition, InlineLineFragment, MeasuredInlineItem,
@@ -9,7 +11,6 @@ use crate::layout::inline_collect::{
 };
 use crate::layout::text_paint::TextDecorationOriginFragmentGeometry;
 use crate::units::{ContentBoxLength, content_box_pt, layout_points, layout_pt};
-use std::rc::Rc;
 
 /// The content-box extent occupied by a selected line sequence along the
 /// physical inline axis.
@@ -460,7 +461,14 @@ impl<'a> LayoutBuilder<'a> {
             match inline_item_boundary_role(&item) {
                 InlineBoundaryRole::ForcedBreak => {
                     let clear = inline_break_clear(&item);
+                    // A break with no preceding inline source creates the
+                    // forced empty line. When real in-flow source already
+                    // committed the line, the break terminates that line; it
+                    // does not manufacture a second empty line merely because
+                    // the following source is an out-of-flow float.
+                    // <https://drafts.csswg.org/css2/#inline-formatting>
                     let force_empty_line = clear == Clear::None;
+                    let source_line_index = line_index;
                     let paragraph_outcome = self.flush_inline_item_paragraph(
                         &mut paragraph,
                         context_before_boundary,
@@ -472,6 +480,19 @@ impl<'a> LayoutBuilder<'a> {
                     line_index = paragraph_outcome.next_line_index;
                     outcome.include(paragraph_outcome);
                     line_index = self.apply_inline_break_clearance(clear, context, line_index);
+                    if line_index > source_line_index {
+                        // CSS 2.2 float rule 6 prevents a later float's outer
+                        // top from rising above an earlier line box.  A
+                        // forced break ends that in-flow source line even
+                        // though the following source is selected in a new
+                        // opportunity graph, so an adjoining-float replay
+                        // origin from before the break is no longer valid.
+                        // Floats encountered inside an active source line do
+                        // not pass through this boundary and retain the
+                        // ordinary inline-float marker transaction.
+                        // <https://drafts.csswg.org/css2/#float-position>
+                        self.adjoining_float_origin_y = None;
+                    }
                     if context.block_style.unicode_bidi == UnicodeBidi::Plaintext {
                         plaintext_direction_state = None;
                     }
@@ -1147,8 +1168,13 @@ impl<'a> LayoutBuilder<'a> {
                         mark_last_visible_inline_word_clone_end(&mut paragraph);
                     }
                     let clear = inline_break_clear(item);
+                    // Preserve an empty forced line only when the break has no
+                    // preceding in-flow inline source. A later float does not
+                    // itself generate a line box.
+                    // <https://drafts.csswg.org/css2/#inline-formatting>
                     let force_empty_line = clear == Clear::None;
                     let record_count_before_break = records.len();
+                    let source_line_index = cursor.line_index;
                     cursor = self.collect_inline_paragraph_lines(
                         &mut paragraph,
                         context_before_boundary,
@@ -1163,6 +1189,25 @@ impl<'a> LayoutBuilder<'a> {
                             }
                         } else {
                             records.push(clearance_only_inline_line_record(cursor, context, clear));
+                        }
+                    }
+                    if cursor.line_index > source_line_index {
+                        // The committed line before this forced break is the
+                        // source-order floor for a following float.  Do not
+                        // let an adjoining-float replay origin from an
+                        // earlier block position override the new collected
+                        // line cursor.
+                        // <https://drafts.csswg.org/css2/#float-position>
+                        self.adjoining_float_origin_y = None;
+                        for record in &mut records[record_count_before_break..] {
+                            if let Some(fragment) = &mut record.fragment {
+                                // Later-source floats are placed while the
+                                // complete collected sequence is built. Keep
+                                // their live exclusions from being replayed
+                                // onto the already-committed line before the
+                                // forced break when that sequence is painted.
+                                fragment.freeze_float_band();
+                            }
                         }
                     }
                     cursor.paragraph_index += 1;
@@ -2481,6 +2526,7 @@ impl<'a> LayoutBuilder<'a> {
             self.anchor_pending_outside_markers_to_in_flow_line(
                 PageTopBlockPosition::new(self.cursor_y),
                 layout_pt(baseline_offset),
+                OutsideMarkerPaintOwner::for_principal_line_block(block_style),
             );
         }
     }
@@ -2787,7 +2833,7 @@ impl<'a> LayoutBuilder<'a> {
     fn apply_inline_break_clearance(
         &mut self,
         clear: Clear,
-        context: InlineParagraphContext<'_>,
+        _context: InlineParagraphContext<'_>,
         line_index: usize,
     ) -> usize {
         if clear == Clear::None {
@@ -2795,8 +2841,10 @@ impl<'a> LayoutBuilder<'a> {
         }
         let clearance = self.resolve_block_clearance(BlockClearanceRequest::coincident_edges(
             clear,
-            context.block_style.writing_mode,
-            context.block_style.used_direction(),
+            FloatPlacementAxes::new(
+                self.containing_block_writing_mode,
+                self.containing_block_direction,
+            ),
             PageTopBlockPosition::new(self.cursor_y),
         ));
         // Clearance places the following line at the cleared float edge.
@@ -2921,8 +2969,8 @@ mod tests {
     use super::*;
 
     fn measured_fragment(text: &str, style: &ComputedStyle) -> MeasuredInlineItem {
-        MeasuredInlineItem {
-            item: InlineLineItem::Fragment(InlineFragment::new(
+        MeasuredInlineItem::new(
+            InlineLineItem::Fragment(InlineFragment::new(
                 text,
                 style.clone(),
                 0.0,
@@ -2933,14 +2981,14 @@ mod tests {
                 InlineHangingEdges::default(),
                 Vec::new(),
             )),
-            width: 0.0,
-            shaped: None,
-        }
+            0.0,
+            None,
+        )
     }
 
     fn measured_box_edge(style: &ComputedStyle) -> MeasuredInlineItem {
-        MeasuredInlineItem {
-            item: InlineLineItem::Atom(InlineAtom::new(
+        MeasuredInlineItem::new(
+            InlineLineItem::Atom(InlineAtom::new(
                 InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(InlineBoxEdgeFragment {
                     logical_edge: InlineLogicalEdge::End,
                     physical_side: PhysicalSide::Right,
@@ -2956,9 +3004,9 @@ mod tests {
                 None,
                 None,
             )),
-            width: 0.0,
-            shaped: None,
-        }
+            0.0,
+            None,
+        )
     }
 
     fn fragment_text(item: &MeasuredInlineItem) -> Option<&str> {
@@ -3864,7 +3912,7 @@ impl InlineLineSequence {
                 let InlineLineItem::Fragment(fragment) = &item.item else {
                     continue;
                 };
-                for layer in &fragment.style().text_decoration_layers {
+                for layer in fragment.style().text_decoration_origins.effective_layers() {
                     let origin = origins
                         .iter_mut()
                         .find(|candidate| Rc::ptr_eq(&candidate.origin_style, &layer.origin_style));
@@ -3886,7 +3934,7 @@ impl InlineLineSequence {
                         // source advances.
                         origin.per_record[record_index] = line_fragment.metrics.width;
                     } else {
-                        origin.per_record[record_index] += item.width;
+                        origin.per_record[record_index] += item.used_advance().points();
                     }
                 }
             }
@@ -4559,8 +4607,11 @@ fn inline_line_fragment_has_principal_content(fragment: &InlineLineFragment) -> 
     fragment.items().iter().any(|item| match &item.item {
         InlineLineItem::Fragment(fragment) => !inline_fragment_is_phantom(fragment),
         InlineLineItem::Atom(atom) => {
-            !matches!(atom.content(), InlineAtomContent::InlineEdge(_))
-                && !inline_atom_is_phantom(atom)
+            matches!(
+                atom.content(),
+                InlineAtomContent::InlineEdge(InlineEdgeRole::MetricsOnlyStrut)
+            ) || (!matches!(atom.content(), InlineAtomContent::InlineEdge(_))
+                && !inline_atom_is_phantom(atom))
         }
         InlineLineItem::Float(_) => false,
     })
@@ -4608,6 +4659,7 @@ fn inline_fragment_is_phantom(fragment: &InlineFragment) -> bool {
 fn inline_atom_is_phantom(atom: &InlineAtom) -> bool {
     match atom.content() {
         InlineAtomContent::StaticPositionPlaceholder => true,
+        InlineAtomContent::InlineEdge(InlineEdgeRole::MetricsOnlyStrut) => false,
         InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge)) => {
             edge.advance.abs() <= 0.001 && edge.paint_extent <= 0.001
         }
@@ -4766,8 +4818,9 @@ fn trim_visual_line_end_collapsible_spaces(
 
 #[cfg(test)]
 mod text_combine_upright_tests {
-    use super::*;
     use std::rc::Rc;
+
+    use super::*;
 
     fn vertical_style(value: css::TextCombineUpright) -> ComputedStyle {
         let mut style = ComputedStyle::initial();

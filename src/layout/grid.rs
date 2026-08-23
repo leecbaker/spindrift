@@ -1,24 +1,39 @@
 use super::*;
 
+mod baseline;
 mod children;
+mod container;
 mod contributions;
 mod fragmentation;
+mod gap_decorations;
 mod intrinsic;
+mod item_adjustment;
 mod lanes;
 mod line_resolution;
+mod model;
 mod replay;
 use replay::SplitGridItemSourceReplay;
 mod resolved;
+mod sizing;
 mod static_position;
 mod taffy_adapter;
 
+use baseline::{GridBaselineResolution, GridBaselineSet};
 use children::*;
 use contributions::*;
 use fragmentation::*;
 use intrinsic::*;
+use item_adjustment::{
+    apply_grid_replaced_item_size_corrections, grid_subject_self_end_side,
+    grid_subject_self_start_side, resolve_grid_item_final_percentage_size,
+};
 use line_resolution::*;
+use model::{
+    GridItemArea, GridItemLayout, GridItemReplayDimensions, GridLayout, GridLayoutPurpose,
+};
 pub(in crate::layout) use resolved::ResolvedSubgridContext;
 use resolved::{ResolvedSubgridAxis, ResolvedSubgridPlacement};
+use sizing::{GridFrozenTrackTopology, GridLayoutPassConfig};
 pub(in crate::layout) use static_position::GridPositioningScope;
 use static_position::*;
 use taffy_adapter::*;
@@ -36,6 +51,12 @@ use taffy_adapter::*;
 pub(in crate::layout) enum GridAvailableSizeSource {
     ContainerInlineSize,
     ContainerBlockSize,
+    /// A grid item's definite inline containing-block size, derived from its
+    /// resolved grid area.
+    GridItemContainingBlockInline,
+    /// A grid item's definite block containing-block size, derived from its
+    /// resolved grid area.
+    GridItemContainingBlockBlock,
 }
 
 pub(in crate::layout) type GridPercentageBasis =
@@ -179,7 +200,3 @@ mod tests {
         assert_eq!(bases.for_axis(GridAxis::Row).points(), Some(80.0));
     }
 }
-
-mod split_1;
-pub(in crate::layout) use self::split_1::*;
-mod split_2;

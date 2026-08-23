@@ -1,8 +1,37 @@
-use super::*;
-use crate::layout::block::suppress_fragmented_box_edges;
-use crate::layout::paint_ops::FragmentedDecorationSlice;
 use std::cell::RefCell;
 use std::rc::Rc;
+
+use super::{
+    AssignmentPlacement, BlockSizePercentageBasis, BorderBoxLength, CapturedPageAssignment,
+    ChildAvailableSpace, CollapsedBorderGrid, ComputedStyle, ContentBoxLength, CssColor, Direction,
+    ElementSignature, ForcedBreakCarryState, FragmentAdvanceDecision, FragmentAdvanceInput,
+    FragmentAvoidBoundarySide, FragmentAvoidRunStartDecision, FragmentAvoidRunStartInput,
+    FragmentBreakContext, FragmentBreakOpportunity, FragmentPageMetadata, FragmentPrebreakDecision,
+    FragmentPrebreakInput, FragmentSourceSliceDecision, FragmentSourceSliceInput, Fragmentainer,
+    FragmentainerKind, LayoutBuilder, LayoutLength, LayoutSnapshot, LogicalBlockContentSize,
+    LogicalInlineContentSize, LogicalSide, LogicalSize, NonContentLength, OverflowClip, PageBreak,
+    PageContext, PageInlinePosition, PageInlineSpan, PageTopBlockPosition, PageTopPoint,
+    PageTopRect, PaintBackgroundArea, PaintBand, PaintCheckpoint, PaintClip, PaintFragment,
+    PaintPrimitive, PaintRect, PaintTranslation, PercentageBasis, PhysicalContentWidth,
+    PhysicalSide, RenderedRect, ResourceCache, SemanticLengthExt, StackingContextPolicy,
+    Stylesheets, TableAxes, TableCellBaselineOffset, TableCellBorderBox, TableCellContentBox,
+    TableCellContentGeometry, TableCellPadding, TableCellPlacement, TableColumnPlan,
+    TableDestinationCellGridFrame, TableFragmentainerFrame, TableGrid, TableGridArea,
+    TableGridBlockOffset, TableGridContentBoxTopLeft, TableGridFrames, TableGridLength,
+    TableGridLogicalSize, TableGridPlacement, TableGridPoint, TableGridRect, TableGridSize,
+    TableInlineBounds, TableLayout, TableMetrics, TableRow, TableRowBaselineOffset, TableRowBounds,
+    TableSourceGridFrame, TableUsedStyle, UsedOverflowAxes, UsedTableWidth, WritingMode,
+    WritingModeAxes, background_rect_clip_area_for_box, border_box_pt, content_box_pt, css,
+    effective_overflow_for_style, fragmented_table_root_background_image_primitives, inline_layout,
+    intersect_paint_rect_or_empty, layout_pt, non_content_pt, paint_space_rect,
+    percentage_basis_from_points, resolve_overflow_clip_edge,
+    structural_table_background_image_primitives, table_grid_height, table_root_inline_size,
+    table_row_block_start, table_row_span_height, table_vertical_edge_spacing, used_border_widths,
+    used_content_box_height_or_auto_with_basis, used_length_percentage_or_auto,
+    used_length_percentage_or_auto_with_basis,
+};
+use crate::layout::block::suppress_fragmented_box_edges;
+use crate::layout::paint_ops::FragmentedDecorationSlice;
 
 /// Physical width available to a table caption's outer border box.
 ///
@@ -108,11 +137,6 @@ pub(in crate::layout::table) struct TableCaptionLayoutOutcome {
     /// following wrapper part must select a successor rather than inheriting
     /// an exhausted zero-width track.
     next_part_requires_successor: bool,
-    /// Actual wrapper-flow block progress committed by vertical captions.
-    /// Horizontal callers retain their established physical block estimate;
-    /// vertical callers must never substitute that physical-Y quantity for
-    /// the root's logical block extent.
-    vertical_block_progress: TableGridLength,
 }
 
 /// One retained caption slice in caption-local source coordinates.
@@ -141,14 +165,12 @@ impl TableCaptionLayoutOutcome {
         final_destination: TableFragmentainerPlacement,
         caption_paint_slices: Vec<TableCaptionPaintSlice>,
         consumed_wrapper_interval: TableWrapperBlockInterval,
-        vertical_block_progress: TableGridLength,
         next_part_requires_successor: bool,
     ) -> Self {
         Self {
             final_destination,
             caption_paint_slices,
             consumed_wrapper_interval,
-            vertical_block_progress,
             next_part_requires_successor,
         }
     }
@@ -165,31 +187,80 @@ impl TableCaptionLayoutOutcome {
         self.consumed_wrapper_interval
     }
 
-    /// The logical block extent actually consumed by vertical caption boxes.
-    /// This is measured at the generic layout boundary, after CSS sizing and
-    /// borders resolve, and can therefore seed the table-wrapper timeline
-    /// without rebuilding progress from a physical cursor.
-    pub(in crate::layout::table) fn vertical_block_progress(&self) -> TableGridLength {
-        self.vertical_block_progress
-    }
-
     /// Whether the next wrapper-flow part needs a fresh fragmentainer.
     pub(in crate::layout::table) fn next_part_requires_successor(&self) -> bool {
         self.next_part_requires_successor
     }
 }
 
-/// Used geometry for painting a CSS table wrapper box.
+/// The physical top-left corner of the anonymous table wrapper's table-root
+/// border box.
 ///
-/// CSS 2.2's separated-border model gives the table-root a wrapper border box
-/// around the table grid, padding, and table border:
-/// <https://www.w3.org/TR/CSS22/tables.html#separated-borders>.
+/// CSS assigns the table's border and padding to the table-root, not the
+/// anonymous wrapper. This type is intentionally distinct from
+/// [`TableGridContentBoxTopLeft`]: a caller must explicitly project the table
+/// root's chrome before constructing a grid placement. The wrapper supplies
+/// this origin to its table-root child; it is not a fragmentainer edge or a
+/// grid origin.
+/// <https://www.w3.org/TR/CSS22/tables.html#model>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout::table) struct TableWrapperBorderBoxOrigin(PageTopPoint);
+
+impl TableWrapperBorderBoxOrigin {
+    pub(in crate::layout::table) fn new(point: PageTopPoint) -> Self {
+        Self(point)
+    }
+
+    /// Project the table root's border/padding edges to the physical top-left
+    /// corner of its grid content box.
+    ///
+    /// The resulting point is physical because `TableGridPlacement` projects
+    /// the grid's logical axes only after this box-model boundary. The
+    /// physical top and left edges are not always the root's logical
+    /// inline-start and block-start edges (notably in `vertical-rl` and RTL
+    /// vertical text). Select those edges through [`TableAxes`] instead of
+    /// assuming physical left/top chrome is logically start-side chrome.
+    ///
+    /// <https://www.w3.org/TR/CSS22/tables.html#model>
+    /// <https://www.w3.org/TR/css-writing-modes-4/#logical-to-physical>
+    pub(in crate::layout::table) fn grid_content_box_top_left(
+        self,
+        axes: TableAxes,
+        table_width: UsedTableWidth,
+    ) -> TableGridContentBoxTopLeft {
+        let chrome_for_physical_side = |side| {
+            let edge = axes.grid_edge_for_physical_side(side);
+            let physical_side = axes.physical_side_for_grid_edge(edge);
+            match physical_side {
+                PhysicalSide::Top => table_width.border_widths.top + table_width.padding.top,
+                PhysicalSide::Right => table_width.border_widths.right + table_width.padding.right,
+                PhysicalSide::Bottom => {
+                    table_width.border_widths.bottom + table_width.padding.bottom
+                }
+                PhysicalSide::Left => table_width.border_widths.left + table_width.padding.left,
+            }
+        };
+        TableGridContentBoxTopLeft::new(PageTopPoint::new(
+            self.0.x() + chrome_for_physical_side(PhysicalSide::Left),
+            self.0.top_y() - chrome_for_physical_side(PhysicalSide::Top),
+        ))
+    }
+}
+
+/// Used geometry for painting a CSS table-root grid box.
+///
+/// The anonymous table wrapper contains captions, while the table-root owns
+/// the grid, padding, border, and associated paint areas. This record is
+/// intentionally restricted to the latter; parent-flow and transform bounds
+/// that include captions are constructed separately at the wrapper boundary.
+/// <https://drafts.csswg.org/css-tables/#table-structure>
+/// <https://drafts.csswg.org/css-tables/#drawing-backgrounds-and-borders>
 #[derive(Debug, Clone)]
 pub(in crate::layout::table) struct TableWrapperPaintBox {
     /// The complete grid's physical page origin. This is established once at
     /// the wrapper-to-grid boundary; callers must not rebase it for padding,
     /// borders, or separated-border spacing.
-    pub(in crate::layout::table) grid_origin: PageTopPoint,
+    pub(in crate::layout::table) grid_origin: TableGridContentBoxTopLeft,
     /// The root table flow used to project the logical grid before adding the
     /// wrapper's physical padding and border edges.
     pub(in crate::layout::table) axes: TableAxes,
@@ -219,6 +290,24 @@ impl TableWrapperPaintBox {
 
     pub(in crate::layout::table) fn grid_content_box(self) -> PageTopRect {
         self.grid_placement().full_page_top_rect()
+    }
+
+    /// Return the physical top-edge coordinate used when the first body
+    /// fragment is attached to the wrapper's active fragmentainer.
+    ///
+    /// This is always the projected grid-content edge. The table root's
+    /// border and padding have already been consumed when
+    /// [`TableWrapperBorderBoxOrigin::grid_content_box_top_left`] constructs
+    /// this box. Re-entering a vertical grid at its border edge would apply
+    /// the physical top inset a second time, separating cell paint from its
+    /// background and from the wrapper's float footprint.
+    ///
+    /// <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
+    /// <https://drafts.csswg.org/css-tables-3/#positioning-cells-captions-and-other-internal-table-boxes>
+    pub(in crate::layout::table) fn initial_destination_grid_paint_top(
+        self,
+    ) -> PageTopBlockPosition {
+        PageTopBlockPosition::new(self.grid_content_box().top_y())
     }
 
     pub(in crate::layout::table) fn physical_grid_width(self) -> PhysicalContentWidth {
@@ -254,6 +343,51 @@ impl TableWrapperPaintBox {
             content_box.width() + table_width.padding.left + table_width.padding.right,
             content_box.height() + table_width.padding.top + table_width.padding.bottom,
         )
+    }
+}
+
+/// The anonymous table-wrapper's physical flow bounds.
+///
+/// The wrapper has no table-root padding or border of its own. Instead, it
+/// contains the table-root border box and the margin boxes of its captions.
+/// Keeping this box distinct from [`TableWrapperPaintBox`] prevents transforms
+/// and parent-flow consumers from mistaking the table-root paint area for the
+/// wrapper's complete principal box.
+/// <https://drafts.csswg.org/css-tables/#table-structure>
+/// <https://drafts.csswg.org/css-tables/#positioning-cells-captions-and-other-internal-table-boxes>
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout::table) struct TableWrapperMarginBoxFootprint(PageTopRect);
+
+impl TableWrapperMarginBoxFootprint {
+    /// Construct the wrapper bounds after caption layout has established the
+    /// root border box and the wrapper-owned caption extents.
+    pub(in crate::layout::table) fn from_table_root_border_box(
+        table_root_border_box: PageTopRect,
+        wrapper_top: PageTopBlockPosition,
+        top_caption_height: LayoutLength,
+        bottom_caption_height: LayoutLength,
+        margins: &css::Edges,
+    ) -> Self {
+        let border_box_height = top_caption_height.points()
+            + table_root_border_box.height()
+            + bottom_caption_height.points();
+        Self(PageTopRect::new(
+            table_root_border_box.x() - margins.left,
+            wrapper_top.points() + margins.top,
+            table_root_border_box.width() + margins.left + margins.right,
+            border_box_height + margins.top + margins.bottom,
+        ))
+    }
+
+    pub(in crate::layout::table) fn page_top_rect(self) -> PageTopRect {
+        self.0
+    }
+
+    /// Return the following parent block cursor for a horizontal containing
+    /// formatting context. This is intentionally a wrapper-margin-box result;
+    /// table-grid logical progress is not parent-flow progress.
+    pub(in crate::layout::table) fn horizontal_parent_block_end(self) -> PageTopBlockPosition {
+        PageTopBlockPosition::new(self.0.top_y() - self.0.height())
     }
 }
 
@@ -422,6 +556,10 @@ struct TableWrapperFragmentSlice {
     /// do not.
     grid_source_start: Option<TableGridBlockOffset>,
     destination: TableFragmentainerPlacement,
+    /// The concrete destination page/column instance. Horizontal page
+    /// fragments can share identical geometry, so placement alone cannot
+    /// distinguish their separate table-root decoration clips.
+    destination_page_index: Option<usize>,
     destination_grid_start: TableGridBlockOffset,
 }
 
@@ -466,6 +604,7 @@ impl TableWrapperFragmentTimeline {
 
     /// The grid's actual starting placement in the fragmentainer which
     /// contains the tail of a split top caption.
+    #[cfg(test)]
     pub(in crate::layout::table) fn initial_destination_grid_placement(
         &self,
     ) -> TableGridPlacement {
@@ -541,6 +680,7 @@ impl TableWrapperFragmentTimeline {
                         ),
                         grid_source_start: None,
                         destination,
+                        destination_page_index: None,
                         destination_grid_start,
                     },
                 );
@@ -558,6 +698,7 @@ impl TableWrapperFragmentTimeline {
                             ),
                             grid_source_start: None,
                             destination: caption.destination,
+                            destination_page_index: None,
                             destination_grid_start: TableGridBlockOffset::new(
                                 TableGridLength::new(0.0),
                             ),
@@ -578,6 +719,7 @@ impl TableWrapperFragmentTimeline {
                     ),
                     grid_source_start: None,
                     destination,
+                    destination_page_index: None,
                     destination_grid_start,
                 },
             );
@@ -594,6 +736,7 @@ impl TableWrapperFragmentTimeline {
     fn record_grid_body_slice(
         &self,
         destination: TableFragmentainerPlacement,
+        destination_page_index: usize,
         source_start: TableGridBlockOffset,
         source_size: TableGridLength,
         destination_grid_start: TableGridBlockOffset,
@@ -613,6 +756,7 @@ impl TableWrapperFragmentTimeline {
             ),
             grid_source_start: Some(source_start),
             destination,
+            destination_page_index: Some(destination_page_index),
             destination_grid_start,
         };
         Self::push_slice(&mut self.state.borrow_mut(), slice);
@@ -647,6 +791,7 @@ impl TableWrapperFragmentTimeline {
                 source,
                 grid_source_start: None,
                 destination,
+                destination_page_index: None,
                 destination_grid_start,
             },
         );
@@ -704,6 +849,7 @@ impl TableWrapperFragmentTimeline {
                     source: TableWrapperBlockInterval::new(caption_start, source_size),
                     grid_source_start: None,
                     destination,
+                    destination_page_index: None,
                     destination_grid_start,
                 },
             );
@@ -720,6 +866,7 @@ impl TableWrapperFragmentTimeline {
                         ),
                         grid_source_start: None,
                         destination: caption.destination,
+                        destination_page_index: None,
                         destination_grid_start: TableGridBlockOffset::new(TableGridLength::new(
                             0.0,
                         )),
@@ -739,6 +886,7 @@ impl TableWrapperFragmentTimeline {
                 && previous.source == slice.source
                 && previous.grid_source_start == slice.grid_source_start
                 && previous.destination == slice.destination
+                && previous.destination_page_index == slice.destination_page_index
                 && previous.destination_grid_start == slice.destination_grid_start
             {
                 return;
@@ -752,22 +900,32 @@ impl TableWrapperFragmentTimeline {
         state.slices.push(slice);
     }
 
-    /// Return the grid-body intersections committed in one destination
+    /// Return every grid-body intersection committed in one destination
     /// fragmentainer. Root decoration deliberately ignores caption entries:
     /// captions affect placement, not the table-root positioning area.
-    fn current_grid_body_slice_for(
+    ///
+    /// A final page can contain both the tail of a sliced row and a following
+    /// row. Table-root decoration must cover both source intervals rather
+    /// than only the last one recorded before the fragment is finalized.
+    ///
+    /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+    /// <https://drafts.csswg.org/css-tables-3/#drawing-backgrounds>
+    fn grid_body_slices_for(
         &self,
         destination: TableFragmentainerPlacement,
-    ) -> Option<TableWrapperFragmentSlice> {
+        destination_page_index: usize,
+    ) -> Vec<TableWrapperFragmentSlice> {
         self.state
             .borrow()
             .slices
             .iter()
-            .rev()
-            .find(|slice| {
-                slice.kind == TableWrapperTimelineKind::GridBody && slice.destination == destination
+            .filter(|slice| {
+                slice.kind == TableWrapperTimelineKind::GridBody
+                    && slice.destination == destination
+                    && slice.destination_page_index == Some(destination_page_index)
             })
             .copied()
+            .collect()
     }
 
     /// Whether this wrapper has committed any grid-body source interval.
@@ -964,7 +1122,7 @@ impl TableFragmentainerPlacement {
         logical_size: TableGridLogicalSize,
     ) -> TableGridPlacement {
         TableGridPlacement::with_axes(
-            self.destination_grid_origin,
+            TableGridContentBoxTopLeft::new(self.destination_grid_origin),
             axes,
             // The destination placement supplies a fragment-local origin;
             // it does not change the table grid's logical extent.  Retaining
@@ -3200,6 +3358,7 @@ impl TableWrapperDecorationViewport {
     pub(in crate::layout::table) fn new(
         projection: &TableGridFragmentProjection,
         fragmentainer_placement: TableFragmentainerPlacement,
+        destination_page_index: usize,
         root_source_placement: TableGridPlacement,
         wrapper_timeline: TableWrapperFragmentTimeline,
         style: &ComputedStyle,
@@ -3252,7 +3411,9 @@ impl TableWrapperDecorationViewport {
         // current timeline entry is therefore exactly this paint call's
         // visible grid intersection; replaying all earlier entries would
         // paint their root backgrounds again for every subsequent row.
-        if let Some(slice) = wrapper_timeline.current_grid_body_slice_for(fragmentainer_placement) {
+        for slice in
+            wrapper_timeline.grid_body_slices_for(fragmentainer_placement, destination_page_index)
+        {
             let row_height = slice.source.size().get();
             debug_assert!(row_height > 0.0);
             let block_start = slice
@@ -3525,7 +3686,11 @@ impl TableGridFragmentViewport {
         &self.source_row_bounds
     }
 
-    fn record_source_row_slice(&mut self, decision: TableRowFragmentDecision) {
+    fn record_source_row_slice(
+        &mut self,
+        decision: TableRowFragmentDecision,
+        destination_page_index: usize,
+    ) {
         let Some(row) = self.source_row_bounds.get(decision.row_index).copied() else {
             return;
         };
@@ -3533,6 +3698,7 @@ impl TableGridFragmentViewport {
         if let Some(slice) = self.projection.source_row_slices().last().copied() {
             self.wrapper_timeline.record_grid_body_slice(
                 self.destination_frame.placement(),
+                destination_page_index,
                 slice.block_start,
                 slice.block_size,
                 slice.destination_block_start,
@@ -3633,7 +3799,7 @@ pub(in crate::layout::table) struct RelativeTablePartStructuralPaint {
 pub(in crate::layout::table) struct TableCellLayoutMetrics {
     pub(in crate::layout::table) content_height: f32,
     pub(in crate::layout::table) border_box_height: f32,
-    pub(in crate::layout::table) baseline_offset: f32,
+    pub(in crate::layout::table) baseline_offset: TableCellBaselineOffset,
 }
 
 pub(in crate::layout::table) struct PreparedTableCell {
@@ -3648,7 +3814,7 @@ pub(in crate::layout::table) struct PreparedTableCell {
 
 impl PreparedTableCell {
     pub(in crate::layout::table) fn width(&self) -> f32 {
-        self.inline_bounds.page_width()
+        self.inline_bounds.logical_size().get()
     }
 }
 
@@ -3691,7 +3857,7 @@ pub(in crate::layout::table) struct TableGridLayoutContext<'table, 'ctx> {
     pub(in crate::layout::table) grid: &'ctx TableGrid,
     pub(in crate::layout::table) table_style: &'ctx TableUsedStyle,
     pub(in crate::layout::table) stylesheets: &'ctx Stylesheets<'ctx>,
-    pub(in crate::layout::table) table_cellpadding: Option<f32>,
+    pub(in crate::layout::table) table_cellpadding: Option<TableCellPadding>,
     pub(in crate::layout::table) column_plan: &'ctx TableColumnPlan,
     pub(in crate::layout::table) table_metrics: TableMetrics,
     pub(in crate::layout::table) collapsed_geometry: Option<&'ctx CollapsedTableGeometry>,
@@ -3717,13 +3883,13 @@ pub(in crate::layout::table) struct TableCellBaselineAlignmentContext<'a> {
     pub(in crate::layout::table) rows: &'a [TableRow<'a>],
     pub(in crate::layout::table) grid: &'a TableGrid,
     pub(in crate::layout::table) stylesheets: &'a Stylesheets<'a>,
-    pub(in crate::layout::table) table_cellpadding: Option<f32>,
+    pub(in crate::layout::table) table_cellpadding: Option<TableCellPadding>,
     pub(in crate::layout::table) column_plan: &'a TableColumnPlan,
     pub(in crate::layout::table) planned_row_heights: &'a [f32],
     pub(in crate::layout::table) planned_row_occupancy: &'a [bool],
     pub(in crate::layout::table) table_metrics: TableMetrics,
     pub(in crate::layout::table) collapsed_geometry: Option<&'a CollapsedTableGeometry>,
-    pub(in crate::layout::table) row_baseline_offset: Option<f32>,
+    pub(in crate::layout::table) row_baseline_offset: Option<TableRowBaselineOffset>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4020,7 +4186,7 @@ impl TableBodyPaintFragment {
         decision: TableRowFragmentDecision,
     ) {
         if let Some(viewport) = &mut self.grid_viewport {
-            viewport.record_source_row_slice(decision);
+            viewport.record_source_row_slice(decision, self.plan.page_index);
         }
     }
 
@@ -4164,12 +4330,30 @@ pub(in crate::layout::table) fn table_box_overflow_clip(
     if table_is_document_canvas {
         return None;
     }
-    (style.contain.paint
+    let clips = style.contain.paint
         || matches!(
             effective_overflow_for_style(style),
             css::Overflow::Hidden | css::Overflow::Clip
-        ))
-    .then_some(padding_box)
+        );
+    if !clips {
+        return None;
+    }
+    let borders = used_border_widths(style);
+    let border_box = paint_space_rect(
+        padding_box.x() - borders.left,
+        padding_box.y() - borders.bottom,
+        padding_box.width() + borders.left + borders.right,
+        padding_box.height() + borders.top + borders.bottom,
+    );
+    resolve_overflow_clip_edge(
+        border_box,
+        style,
+        borders,
+        UsedOverflowAxes::from_style(style),
+        style.contain.paint,
+        None,
+    )
+    .map(|edge| edge.clip.bounds)
 }
 
 pub(in crate::layout::table) fn table_padding_box_clip_from_border_box(
@@ -4844,9 +5028,9 @@ fn table_column_fragment_cell_clips(
             let cell_inline =
                 column_plan.inline_bounds_for_span(placement.column, placement.colspan);
             let cell_rect = paint_space_rect(
-                cell_inline.page_x(table_x),
+                table_x + cell_inline.logical_start().get(),
                 cell_bottom,
-                cell_inline.page_width(),
+                cell_inline.logical_size().get(),
                 (cell_top - cell_bottom).max(0.0),
             );
             if cell_rect.size.width > 0.0 && cell_rect.size.height > 0.0 {
@@ -5195,9 +5379,9 @@ fn table_row_fragment_cell_clips(
         };
         let cell_inline = column_plan.inline_bounds_for_span(placement.column, placement.colspan);
         clips.push(paint_space_rect(
-            cell_inline.page_x(table_x),
+            table_x + cell_inline.logical_start().get(),
             cell_bottom,
-            cell_inline.page_width(),
+            cell_inline.logical_size().get(),
             (cell_top - cell_bottom).max(0.0),
         ));
     }
@@ -5241,7 +5425,7 @@ fn table_column_background_rect(
         TableGridSize::from_lengths(inline_bounds.size, TableGridLength::new(block_size)),
     );
     let placement = TableGridPlacement::with_axes(
-        PageTopPoint::new(table_x, grid_top),
+        TableGridContentBoxTopLeft::new(PageTopPoint::new(table_x, grid_top)),
         column_plan.axes,
         TableGridLogicalSize::new(
             column_plan.total_width(),
@@ -5437,6 +5621,8 @@ pub(in crate::layout::table) enum TableHeightTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::css::Position;
+    use crate::layout::{FlowAxes, PageBoxEdges, PageMargins, PageSize};
 
     #[test]
     fn auto_width_fixed_table_keeps_its_intrinsic_grid_floor() {
@@ -5552,7 +5738,7 @@ mod tests {
             direction: Direction::Rtl,
         };
         let source = TableGridPlacement::with_axes(
-            PageTopPoint::new(20.0, 200.0),
+            TableGridContentBoxTopLeft::new(PageTopPoint::new(20.0, 200.0)),
             axes,
             TableGridLogicalSize::new(
                 LogicalInlineContentSize::new(content_box_pt(100.0)),
@@ -5560,7 +5746,7 @@ mod tests {
             ),
         );
         let destination = TableGridPlacement::with_axes(
-            PageTopPoint::new(400.0, 500.0),
+            TableGridContentBoxTopLeft::new(PageTopPoint::new(400.0, 500.0)),
             axes,
             TableGridLogicalSize::new(
                 LogicalInlineContentSize::new(content_box_pt(100.0)),
@@ -5605,7 +5791,7 @@ mod tests {
             direction: Direction::Rtl,
         };
         let source = TableGridPlacement::with_axes(
-            PageTopPoint::new(100.0, 500.0),
+            TableGridContentBoxTopLeft::new(PageTopPoint::new(100.0, 500.0)),
             axes,
             TableGridLogicalSize::new(
                 LogicalInlineContentSize::new(content_box_pt(80.0)),
@@ -5613,7 +5799,7 @@ mod tests {
             ),
         );
         let destination = TableGridPlacement::with_axes(
-            PageTopPoint::new(360.0, 500.0),
+            TableGridContentBoxTopLeft::new(PageTopPoint::new(360.0, 500.0)),
             axes,
             TableGridLogicalSize::new(
                 LogicalInlineContentSize::new(content_box_pt(80.0)),
@@ -5655,7 +5841,7 @@ mod tests {
     fn column_originating_cell_clips_exclude_separated_edge_spacing() {
         let axes = TableAxes::for_direction(Direction::Ltr);
         let source = TableGridPlacement::with_axes(
-            PageTopPoint::new(100.0, 500.0),
+            TableGridContentBoxTopLeft::new(PageTopPoint::new(100.0, 500.0)),
             axes,
             TableGridLogicalSize::new(
                 LogicalInlineContentSize::new(content_box_pt(70.0)),
@@ -5700,7 +5886,7 @@ mod tests {
     fn row_originating_cell_clip_includes_internal_row_span_spacing() {
         let axes = TableAxes::for_direction(Direction::Ltr);
         let source = TableGridPlacement::with_axes(
-            PageTopPoint::new(100.0, 500.0),
+            TableGridContentBoxTopLeft::new(PageTopPoint::new(100.0, 500.0)),
             axes,
             TableGridLogicalSize::new(
                 LogicalInlineContentSize::new(content_box_pt(20.0)),
@@ -5750,7 +5936,7 @@ mod tests {
     fn column_background_selects_originating_cells_not_overlapping_cells() {
         let axes = TableAxes::for_direction(Direction::Ltr);
         let source = TableGridPlacement::with_axes(
-            PageTopPoint::new(100.0, 500.0),
+            TableGridContentBoxTopLeft::new(PageTopPoint::new(100.0, 500.0)),
             axes,
             TableGridLogicalSize::new(
                 LogicalInlineContentSize::new(content_box_pt(50.0)),
@@ -5804,7 +5990,7 @@ mod tests {
     fn separate_originating_cells_leave_border_spacing_outside_clips() {
         let axes = TableAxes::for_direction(Direction::Ltr);
         let source = TableGridPlacement::with_axes(
-            PageTopPoint::new(100.0, 500.0),
+            TableGridContentBoxTopLeft::new(PageTopPoint::new(100.0, 500.0)),
             axes,
             TableGridLogicalSize::new(
                 LogicalInlineContentSize::new(content_box_pt(50.0)),
@@ -5857,7 +6043,7 @@ mod tests {
     fn collapsed_border_geometry_has_no_separated_spacing_between_cells() {
         let axes = TableAxes::for_direction(Direction::Ltr);
         let source = TableGridPlacement::with_axes(
-            PageTopPoint::new(100.0, 500.0),
+            TableGridContentBoxTopLeft::new(PageTopPoint::new(100.0, 500.0)),
             axes,
             TableGridLogicalSize::new(
                 LogicalInlineContentSize::new(content_box_pt(40.0)),
@@ -5913,7 +6099,7 @@ mod tests {
             direction: Direction::Rtl,
         };
         let source = TableGridPlacement::with_axes(
-            PageTopPoint::new(100.0, 500.0),
+            TableGridContentBoxTopLeft::new(PageTopPoint::new(100.0, 500.0)),
             axes,
             TableGridLogicalSize::new(
                 LogicalInlineContentSize::new(content_box_pt(20.0)),
@@ -5921,7 +6107,7 @@ mod tests {
             ),
         );
         let destination = TableGridPlacement::with_axes(
-            PageTopPoint::new(300.0, 200.0),
+            TableGridContentBoxTopLeft::new(PageTopPoint::new(300.0, 200.0)),
             axes,
             TableGridLogicalSize::new(
                 LogicalInlineContentSize::new(content_box_pt(20.0)),
@@ -6216,13 +6402,6 @@ mod tests {
             horizontal_second_column.destination_grid_origin().x(),
             306.0
         );
-        assert_eq!(
-            horizontal.trailing_paint_top(
-                PageTopBlockPosition::new(512.0),
-                LogicalInlineContentSize::new(content_box_pt(400.0)),
-            ),
-            PageTopBlockPosition::new(512.0)
-        );
 
         let vertical_lr = TableFragmentainerPlacement::vertical_lr(
             PageInlinePosition::new(72.0),
@@ -6244,13 +6423,6 @@ mod tests {
             306.0
         );
         assert_eq!(vertical_lr_second_column.wrapper_table_x().points(), 72.0);
-        assert_eq!(
-            vertical_lr.trailing_paint_top(
-                PageTopBlockPosition::new(512.0),
-                LogicalInlineContentSize::new(content_box_pt(400.0)),
-            ),
-            PageTopBlockPosition::new(248.0)
-        );
 
         let vertical_rl = TableFragmentainerPlacement::vertical_rl(
             PageInlinePosition::new(72.0),
@@ -6272,12 +6444,106 @@ mod tests {
             306.0
         );
         assert_eq!(vertical_rl_second_column.wrapper_table_x().points(), 72.0);
+    }
+
+    #[test]
+    fn table_root_origin_uses_the_resolved_no_caption_destination() {
+        let resolved_destination = TableFragmentainerPlacement::horizontal(
+            PageInlinePosition::new(72.0),
+            PageTopBlockPosition::new(648.0),
+            LogicalBlockContentSize::new(content_box_pt(100.0)),
+        );
+        // A normal-flow wrapper cursor may be different after float avoidance
+        // or a preceding sibling. No caption means the root still begins at
+        // the resolved fragmentainer destination, not at that stale cursor.
+        let wrapper_parent_flow_top = PageTopBlockPosition::new(720.0);
+        let axes = TableAxes::for_direction(Direction::Ltr);
+        let table_width = UsedTableWidth {
+            grid_inline: LogicalInlineContentSize::new(content_box_pt(80.0)),
+            axes,
+            content_width: content_box_pt(80.0),
+            border_widths: css::Edges {
+                top: 3.0,
+                right: 0.0,
+                bottom: 0.0,
+                left: 5.0,
+            },
+            padding: css::Edges {
+                top: 7.0,
+                right: 0.0,
+                bottom: 0.0,
+                left: 11.0,
+            },
+        };
+
+        let grid_origin =
+            TableWrapperBorderBoxOrigin::new(resolved_destination.destination_grid_origin())
+                .grid_content_box_top_left(axes, table_width)
+                .page_top_point();
+
+        assert_eq!(grid_origin, PageTopPoint::new(88.0, 638.0));
+        assert_ne!(grid_origin.top_y(), wrapper_parent_flow_top.points());
+    }
+
+    #[test]
+    fn table_fragment_trailing_paint_top_keeps_logical_axes_separate() {
+        let inline_span = LogicalInlineContentSize::new(content_box_pt(80.0));
+        let horizontal = TableFragmentainerPlacement::horizontal(
+            PageInlinePosition::new(72.0),
+            PageTopBlockPosition::new(648.0),
+            LogicalBlockContentSize::new(content_box_pt(100.0)),
+        );
         assert_eq!(
-            vertical_rl.trailing_paint_top(
-                PageTopBlockPosition::new(512.0),
-                LogicalInlineContentSize::new(content_box_pt(400.0)),
+            horizontal.trailing_paint_top(PageTopBlockPosition::new(512.0), inline_span),
+            PageTopBlockPosition::new(512.0),
+        );
+
+        for placement in [
+            TableFragmentainerPlacement::vertical_lr(
+                PageInlinePosition::new(72.0),
+                PageTopBlockPosition::new(648.0),
+                TableFragmentainerBlockStart::new(-72.0),
+                LogicalBlockContentSize::new(content_box_pt(100.0)),
             ),
-            PageTopBlockPosition::new(248.0)
+            TableFragmentainerPlacement::vertical_rl(
+                PageInlinePosition::new(72.0),
+                PageTopBlockPosition::new(648.0),
+                TableFragmentainerBlockStart::new(540.0),
+                LogicalBlockContentSize::new(content_box_pt(100.0)),
+            ),
+            TableFragmentainerPlacement {
+                destination_grid_origin: PageTopPoint::new(72.0, 648.0),
+                wrapper_table_x: PageInlinePosition::new(72.0),
+                block_start: TableFragmentainerBlockStart::new(-72.0),
+                block_span: LogicalBlockContentSize::new(content_box_pt(100.0)),
+                writing_mode: WritingMode::SidewaysLr,
+            },
+        ] {
+            assert_eq!(
+                placement.trailing_paint_top(PageTopBlockPosition::new(512.0), inline_span),
+                PageTopBlockPosition::new(568.0),
+            );
+        }
+    }
+
+    #[test]
+    fn table_wrapper_margin_footprint_projects_parent_block_end() {
+        let footprint = TableWrapperMarginBoxFootprint::from_table_root_border_box(
+            PageTopRect::new(30.0, 180.0, 60.0, 80.0),
+            PageTopBlockPosition::new(200.0),
+            layout_pt(10.0),
+            layout_pt(15.0),
+            &css::Edges {
+                top: 5.0,
+                right: 0.0,
+                bottom: 7.0,
+                left: 0.0,
+            },
+        );
+
+        assert_eq!(
+            footprint.horizontal_parent_block_end(),
+            PageTopBlockPosition::new(88.0)
         );
     }
 
@@ -6674,7 +6940,7 @@ mod tests {
         origin: PageTopPoint,
     ) -> TableGridPlacement {
         TableGridPlacement::with_axes(
-            origin,
+            TableGridContentBoxTopLeft::new(origin),
             TableAxes {
                 flow: FlowAxes::new(writing_mode, direction),
                 direction,
@@ -6693,7 +6959,7 @@ mod tests {
         top: f32,
     ) -> TableWrapperPaintBox {
         TableWrapperPaintBox {
-            grid_origin: PageTopPoint::new(table_x, top),
+            grid_origin: TableGridContentBoxTopLeft::new(PageTopPoint::new(table_x, top)),
             axes: TableAxes {
                 flow: FlowAxes::new(writing_mode, direction),
                 direction,
@@ -6717,6 +6983,107 @@ mod tests {
                 spacing: css::BorderSpacing::ZERO,
             },
             block_edge_spacing: TableGridLength::new(0.0),
+        }
+    }
+
+    #[test]
+    fn table_root_border_origin_consumes_asymmetric_chrome_in_every_writing_mode() {
+        let border_box_top_left = TableWrapperBorderBoxOrigin::new(PageTopPoint::new(30.0, 240.0));
+
+        for writing_mode in [
+            WritingMode::HorizontalTb,
+            WritingMode::VerticalLr,
+            WritingMode::VerticalRl,
+        ] {
+            let axes = TableAxes {
+                flow: FlowAxes::new(writing_mode, Direction::Ltr),
+                direction: Direction::Ltr,
+            };
+            let table_width = UsedTableWidth {
+                grid_inline: LogicalInlineContentSize::new(content_box_pt(80.0)),
+                axes,
+                content_width: content_box_pt(80.0),
+                border_widths: css::Edges {
+                    top: 3.0,
+                    right: 5.0,
+                    bottom: 7.0,
+                    left: 11.0,
+                },
+                padding: css::Edges {
+                    top: 13.0,
+                    right: 17.0,
+                    bottom: 19.0,
+                    left: 23.0,
+                },
+            };
+
+            assert_eq!(
+                border_box_top_left
+                    .grid_content_box_top_left(axes, table_width)
+                    .page_top_point(),
+                PageTopPoint::new(64.0, 224.0),
+                "{writing_mode:?} must consume the physical root chrome before grid projection",
+            );
+        }
+    }
+
+    #[test]
+    fn vertical_grid_paint_entry_uses_content_edge_after_root_chrome_projection() {
+        let border_box_origin = TableWrapperBorderBoxOrigin::new(PageTopPoint::new(30.0, 240.0));
+        for writing_mode in [
+            WritingMode::VerticalLr,
+            WritingMode::VerticalRl,
+            WritingMode::SidewaysLr,
+            WritingMode::SidewaysRl,
+        ] {
+            let axes = TableAxes {
+                flow: FlowAxes::new(writing_mode, Direction::Ltr),
+                direction: Direction::Ltr,
+            };
+            let table_width = UsedTableWidth {
+                grid_inline: LogicalInlineContentSize::new(content_box_pt(80.0)),
+                axes,
+                content_width: content_box_pt(80.0),
+                border_widths: css::Edges {
+                    top: 3.0,
+                    right: 0.0,
+                    bottom: 0.0,
+                    left: 0.0,
+                },
+                padding: css::Edges {
+                    top: 7.0,
+                    right: 0.0,
+                    bottom: 0.0,
+                    left: 0.0,
+                },
+            };
+            let paint_box = TableWrapperPaintBox {
+                grid_origin: border_box_origin.grid_content_box_top_left(axes, table_width),
+                axes,
+                grid_size: TableGridLogicalSize::new(
+                    LogicalInlineContentSize::new(content_box_pt(80.0)),
+                    LogicalBlockContentSize::new(content_box_pt(120.0)),
+                ),
+                table_width,
+                table_metrics: TableMetrics {
+                    border_collapse: css::BorderCollapse::Separate,
+                    spacing: css::BorderSpacing::ZERO,
+                },
+                block_edge_spacing: TableGridLength::new(0.0),
+            };
+            let grid_content_top =
+                PageTopBlockPosition::new(paint_box.clone().grid_content_box().top_y());
+            let border_box_top = PageTopBlockPosition::new(paint_box.clone().border_box().top_y());
+            let grid_paint_top = paint_box.initial_destination_grid_paint_top();
+
+            assert_eq!(
+                grid_paint_top, grid_content_top,
+                "{writing_mode:?} must not reapply its physical top root chrome",
+            );
+            assert_ne!(
+                grid_paint_top, border_box_top,
+                "{writing_mode:?} has non-zero top chrome in this regression fixture",
+            );
         }
     }
 
@@ -6745,13 +7112,16 @@ mod tests {
         );
         viewport.record_grid_body_slice(
             destination,
+            0,
             TableGridBlockOffset::new(TableGridLength::new(45.0)),
             TableGridLength::new(50.0),
             TableGridBlockOffset::new(TableGridLength::new(0.0)),
         );
         assert_eq!(
             viewport
-                .current_grid_body_slice_for(destination)
+                .grid_body_slices_for(destination, 0)
+                .into_iter()
+                .next()
                 .unwrap()
                 .grid_source_start
                 .unwrap(),
@@ -6827,7 +7197,6 @@ mod tests {
                     TableWrapperBlockOffset::zero(),
                     TableGridLength::new(50.0),
                 ),
-                TableGridLength::new(50.0),
                 requires_successor,
             );
 
@@ -6872,6 +7241,7 @@ mod tests {
         );
         timeline.record_grid_body_slice(
             destination,
+            0,
             TableGridBlockOffset::new(TableGridLength::new(0.0)),
             TableGridLength::new(225.0),
             TableGridBlockOffset::new(TableGridLength::new(0.0)),
@@ -6976,6 +7346,7 @@ mod tests {
         );
         timeline.record_grid_body_slice(
             second_destination,
+            0,
             TableGridBlockOffset::new(TableGridLength::new(0.0)),
             TableGridLength::new(20.0),
             TableGridBlockOffset::new(TableGridLength::new(0.0)),
@@ -7129,5 +7500,32 @@ mod tests {
                 -100.0
             );
         }
+    }
+
+    #[test]
+    fn wrapper_margin_footprint_includes_caption_space_and_margins() {
+        let table_root_border_box = PageTopRect::new(24.0, 190.0, 80.0, 40.0);
+        let wrapper = TableWrapperMarginBoxFootprint::from_table_root_border_box(
+            table_root_border_box,
+            PageTopBlockPosition::new(200.0),
+            layout_pt(10.0),
+            layout_pt(15.0),
+            &css::Edges {
+                top: 4.0,
+                right: 5.0,
+                bottom: 6.0,
+                left: 7.0,
+            },
+        )
+        .page_top_rect();
+
+        assert_eq!(table_root_border_box.x(), 24.0);
+        assert_eq!(table_root_border_box.top_y(), 190.0);
+        assert_eq!(table_root_border_box.width(), 80.0);
+        assert_eq!(table_root_border_box.height(), 40.0);
+        assert_eq!(wrapper.x(), 17.0);
+        assert_eq!(wrapper.top_y(), 204.0);
+        assert_eq!(wrapper.width(), 92.0);
+        assert_eq!(wrapper.height(), 75.0);
     }
 }

@@ -1,10 +1,9 @@
+use palette::convert::FromColorUnclamped;
+use palette::white_point::{D50, D65};
+use palette::{Lab, Oklab, Xyz};
+
 use super::*;
 use crate::css::component_values::split_css_component_values;
-use palette::{
-    Lab, Oklab, Xyz,
-    convert::FromColorUnclamped,
-    white_point::{D50, D65},
-};
 
 /// Whether a parsed CSS color value contains the `currentcolor` keyword.
 ///

@@ -1,5 +1,6 @@
-use super::*;
 use std::ops::{Deref, DerefMut};
+
+use super::*;
 
 /// A grid container style after the Grid used-value boundary.
 ///
@@ -140,7 +141,20 @@ impl<'a> LayoutBuilder<'a> {
             .into_iter()
             .map(|mut source| {
                 self.resolve_style_current_viewport_lengths(&mut source.style);
-                let style = css::LayoutStyle::from_computed(&source.style).into_zoomed();
+                let mut style = css::LayoutStyle::from_computed(&source.style).into_zoomed();
+                // Layout and paint containment inhibit subgridding at the
+                // used-value boundary. Do this before intrinsic sizing,
+                // placement, and replay receive the item style; normalizing
+                // only when the child later enters its own grid root leaves
+                // inherited subgrid percentage bases alive in those phases.
+                // <https://drafts.csswg.org/css-contain-1/#containment-layout>
+                // <https://drafts.csswg.org/css-grid-2/#subgrid-listing>
+                if property_containment_applies_to_style(&style)
+                    && (style.contain.layout || style.contain.paint)
+                {
+                    style.grid_template_rows.resolve_contained_subgrid();
+                    style.grid_template_columns.resolve_contained_subgrid();
+                }
                 GridUsedItem::from_source(source, style)
             })
             .collect()

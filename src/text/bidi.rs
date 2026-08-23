@@ -1,7 +1,9 @@
-use super::*;
-use icu_segmenter::GraphemeClusterSegmenter;
 use std::ops::Range;
+
+use icu_segmenter::GraphemeClusterSegmenter;
 use unicode_bidi::{BidiInfo, Level};
+
+use super::*;
 
 /// Return the Unicode controls that model an inline CSS `unicode-bidi` scope.
 ///

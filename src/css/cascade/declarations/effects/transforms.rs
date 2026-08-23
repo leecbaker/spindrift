@@ -42,6 +42,39 @@ pub(crate) fn parse_filter(value: &str) -> Option<FilterValue> {
             "saturate" => FilterFunction::Saturate(parsed_amount(1.0)?),
             "brightness" => FilterFunction::Brightness(parsed_amount(1.0)?),
             "opacity" => FilterFunction::Opacity(parsed_amount(1.0)?.clamped_unit_interval()),
+            // These functions currently need a raster backend for every
+            // non-identity result.  Retain a typed identity instead of an
+            // opaque source string so the PDF backend can avoid a redundant
+            // transparency group without losing the non-`none` filter's CSS
+            // stacking behavior.
+            // <https://www.w3.org/TR/filter-effects-1/#filter-functions>
+            "blur" => match arguments.as_slice() {
+                [length] if crate::css::values::parse_length(length) == Some(0.0) => {
+                    FilterFunction::VisualIdentity
+                }
+                [_] => FilterFunction::RequiresRasterBackend(format!(
+                    "{name}({})",
+                    arguments.join(" ")
+                )),
+                _ => return None,
+            },
+            "contrast" => filter_identity_or_raster(parsed_amount(1.0)?, 1.0, &name, &arguments),
+            "invert" | "sepia" => {
+                filter_identity_or_raster(parsed_amount(1.0)?, 0.0, &name, &arguments)
+            }
+            "hue-rotate" => match arguments.as_slice() {
+                [angle] => match parse_css_angle_radians(angle) {
+                    Some(angle) if filter_angle_is_identity(angle) => {
+                        FilterFunction::VisualIdentity
+                    }
+                    Some(_) => FilterFunction::RequiresRasterBackend(format!(
+                        "{name}({})",
+                        arguments.join(" ")
+                    )),
+                    None => return None,
+                },
+                _ => return None,
+            },
             // Preserve complete, token-validated unsupported function source
             // until a raster filter backend can execute it.
             _ => FilterFunction::RequiresRasterBackend(format!("{name}({})", arguments.join(" "))),
@@ -53,6 +86,28 @@ pub(crate) fn parse_filter(value: &str) -> Option<FilterValue> {
 
 fn parse_filter_number_percentage(value: &str) -> Option<f32> {
     parse_percentage(value).or_else(|| parse_css_number(value))
+}
+
+/// Preserve a proved no-op as typed filter data; all other valid values stay
+/// on the raster-only path.
+fn filter_identity_or_raster(
+    amount: NonNegativeFilterAmount,
+    identity: f32,
+    name: &str,
+    arguments: &[&str],
+) -> FilterFunction {
+    if amount.value() == identity {
+        FilterFunction::VisualIdentity
+    } else {
+        FilterFunction::RequiresRasterBackend(format!("{name}({})", arguments.join(" ")))
+    }
+}
+
+/// CSS angles that differ by a whole turn have the same hue-rotation result.
+/// This exact remainder test intentionally does not approximate a near-zero
+/// angle into an identity filter.
+fn filter_angle_is_identity(radians: f32) -> bool {
+    radians.is_finite() && radians.rem_euclid(std::f32::consts::TAU) == 0.0
 }
 
 /// Parses CSS 2D and 3D transform functions into typed matrix operations.
@@ -1179,5 +1234,36 @@ mod tests {
     fn filter_parser_rejects_negative_amounts() {
         assert!(parse_filter("brightness(-1)").is_none());
         assert!(parse_filter("grayscale(-1%)").is_none());
+    }
+
+    #[test]
+    fn filter_parser_proves_every_supported_visual_identity() {
+        let filter = parse_filter(
+            "grayscale(0) saturate(100%) brightness(1) opacity(1) blur(0px) contrast(1) invert(0%) sepia(0) hue-rotate(1turn)",
+        )
+        .expect("valid filter list");
+
+        assert!(
+            filter
+                .exact_lowering()
+                .is_some_and(ExactFilterLowering::is_visual_identity)
+        );
+    }
+
+    #[test]
+    fn filter_parser_keeps_nearby_nonidentity_values_raster_only() {
+        for filter in [
+            "blur(1px)",
+            "contrast(99%)",
+            "invert(1%)",
+            "sepia(1%)",
+            "hue-rotate(1deg)",
+        ] {
+            assert_eq!(
+                parse_filter(filter).and_then(|filter| filter.exact_lowering()),
+                None,
+                "{filter}"
+            );
+        }
     }
 }

@@ -517,6 +517,70 @@ async fn vertical_block_estimate_and_final_layout_agree_on_auto_width() {
     );
 }
 
+/// An inline static-position placeholder must advance by its hypothetical
+/// source text, rather than by the positioned source's physical width (the
+/// logical block extent in a vertical writing mode).  The green abspos
+/// background must consequently cover the following red in-flow text.
+#[tokio::test]
+async fn vertical_rtl_static_position_placeholders_cover_the_hypothetical_source() {
+    for writing_mode in ["vertical-lr", "vertical-rl"] {
+        for container_direction in ["ltr", "rtl"] {
+            for source_direction in ["ltr", "rtl"] {
+                for (source_display, text_indent, relative_inline_ancestor) in [
+                    ("inline", "0", ""),
+                    ("inline", "20pt", ""),
+                    ("inline", "0", "position: relative; inset-inline-start: 2pt"),
+                    (
+                        "inline",
+                        "20pt",
+                        "position: relative; inset-inline-start: 2pt",
+                    ),
+                    ("block", "0", ""),
+                    ("block", "20pt", ""),
+                    ("block", "0", "position: relative; inset-inline-start: 2pt"),
+                    (
+                        "block",
+                        "20pt",
+                        "position: relative; inset-inline-start: 2pt",
+                    ),
+                ] {
+                    let source_break = if source_display == "block" {
+                        "<br>"
+                    } else {
+                        ""
+                    };
+                    let document = Html::from_string(format!(
+            r#"<style>
+                @page {{ size: 180pt 140pt; margin: 0 }}
+                html, body {{ margin: 0 }}
+                .container {{ position: relative; writing-mode: {writing_mode}; direction: {container_direction};
+                    font: 16pt/1 Ahem; height: 120pt; color: green }}
+                .ancestor {{ direction: {source_direction}; {relative_inline_ancestor} }}
+                .abs {{ position: absolute; display: {source_display}; background: green; color: green }}
+                .red {{ background: red; color: red }}
+                .indented {{ text-indent: {text_indent} }}
+            </style>
+            <div class=\"container indented\">XXX<span class=\"ancestor\">XX<div class=\"abs\">XXXXX</div>{source_break}<span class=\"red\">XXXXX</span></span></div>"#
+                    ))
+                    .render(&RenderOptions::default())
+                    .await
+                    .unwrap();
+
+                    let red = CssColor::new(255, 0, 0);
+                    assert!(
+                        document.pages[0]
+                            .rects()
+                            .iter()
+                            .all(|rect| rect.fill != Some(red)),
+                        "{writing_mode} container={container_direction} source={source_direction} {source_display} static placeholder with indent={text_indent:?} and relative ancestor={relative_inline_ancestor:?} must cover its red hypothetical source: rects={:?}",
+                        document.pages[0].rects(),
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn propagated_vertical_body_auto_width_remains_the_document_canvas() {
     let document = Html::from_string(

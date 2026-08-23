@@ -1,5 +1,6 @@
-use super::*;
 use std::borrow::Cow;
+
+use super::*;
 
 /// Selects which positioned-descendant containing-block stacks a box establishes.
 ///
@@ -136,6 +137,16 @@ pub(in crate::layout) struct DeferredMulticolPositionedChild {
     style: ComputedStyle,
     replay_context: DeferredMulticolReplayContext,
     fragment: PositionedFragmentReplay,
+}
+
+impl DeferredMulticolPositionedChild {
+    /// Direct children of the principal multicol box use that continuous
+    /// containing block, not a fragmented in-flow ancestor span captured
+    /// while anonymous columns were being measured.
+    pub(in crate::layout) fn with_principal_multicol_ownership(mut self) -> Self {
+        self.replay_context.containing_block_span_id = None;
+        self
+    }
 }
 
 /// Committed destination data for an out-of-flow child emitted by a fragmented
@@ -732,6 +743,35 @@ impl<'a> LayoutBuilder<'a> {
             .push(self.deferred_multicol_positioned_child(element, signature, style, fragment));
     }
 
+    /// Remove scratch-column captures superseded by direct principal-box
+    /// positioned records.
+    ///
+    /// Direct children are encountered once while the anonymous column flow
+    /// is speculative and again when the multicol principal containing block
+    /// is committed. The latter record is authoritative: retaining both
+    /// duplicates the positioned principal, while retaining only the scratch
+    /// record incorrectly clips it through anonymous columns. Descendants
+    /// whose containing blocks live inside fragmented content have different
+    /// element identities and remain queued.
+    /// <https://drafts.csswg.org/css-multicol-2/#multi-column-model>
+    /// <https://drafts.csswg.org/css-position-3/#fragmenting-absolutely-positioned-elements>
+    pub(in crate::layout) fn remove_superseded_direct_multicol_positioned_captures(
+        &mut self,
+        start: usize,
+        replacements: &[DeferredMulticolPositionedChild],
+    ) {
+        if start >= self.deferred_multicol_positioned_children.len() || replacements.is_empty() {
+            return;
+        }
+        let replacement_ids = replacements
+            .iter()
+            .map(|child| child.element.id)
+            .collect::<Vec<_>>();
+        let mut captured = self.deferred_multicol_positioned_children.split_off(start);
+        captured.retain(|child| !replacement_ids.contains(&child.element.id));
+        self.deferred_multicol_positioned_children.extend(captured);
+    }
+
     /// Capture a positioned principal whose containing block was established
     /// while multicolumn layout owns temporary fragmentainer pages.
     ///
@@ -751,9 +791,20 @@ impl<'a> LayoutBuilder<'a> {
         let Some(containing_block_span_id) =
             self.active_multicol_positioned_containing_block_span_id(&style.position)
         else {
-            // Viewport-fixed descendants and absolute descendants whose
-            // containing block escapes the temporary multicolumn subtree are
-            // owned by their existing document-level paths.
+            // Only a positioned containing block that was itself captured by
+            // the temporary multicolumn transaction may be replayed as an
+            // independent positioned fragment.  In particular, opacity and
+            // the other effect scopes establish stacking contexts without
+            // establishing an absolute-position containing block.  Capturing
+            // one of their descendants here would detach its paint from the
+            // ancestor's compositing group.
+            //
+            // A genuine direct principal child is captured explicitly when
+            // the multicol principal is committed.  All other descendants
+            // remain in their captured ancestor paint/effect scope.
+            // <https://drafts.csswg.org/css-multicol-2/#multi-column-model>
+            // <https://drafts.csswg.org/css-position-3/#fragmenting-absolutely-positioned-elements>
+            // <https://drafts.csswg.org/css-color-4/#transparency>
             return false;
         };
         if self
@@ -847,6 +898,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         fragment: &PositionedFragmentReplay,
         source_layers: Vec<PositionedPaintLayer>,
+        monolithic_principal_paint: bool,
     ) {
         let candidates = fragment.candidates_extended_for_source_layers(
             fragment.candidates_for_owner(),
@@ -855,6 +907,15 @@ impl<'a> LayoutBuilder<'a> {
             &self.current_page,
         );
         for (candidate_index, candidate) in candidates.iter().enumerate() {
+            // Size containment makes the principal box monolithic. It is
+            // assigned to its originating fragmentainer as one paint unit;
+            // later candidate slices describe descendant fragmentation, not
+            // independent clipped pieces of the contained principal.
+            // <https://drafts.csswg.org/css-contain-1/#containment-size>
+            // <https://www.w3.org/TR/css-break-3/#monolithic>
+            if monolithic_principal_paint && candidate_index != 0 {
+                break;
+            }
             for layer in &source_layers {
                 // Source replay can still reference recorded page operations.
                 // Materialize those operations while their source page is
@@ -887,12 +948,14 @@ impl<'a> LayoutBuilder<'a> {
                 projected_layer.context =
                     source_context.translated(candidate.continuous_source_to_destination());
                 projected_layer.page_index = self.pages.len();
-                let effective_clip = projected_layer
-                    .context
-                    .effects
-                    .overflow_clip_bounds()
-                    .and_then(|existing| existing.intersect(candidate.destination_clip))
-                    .unwrap_or(candidate.destination_clip);
+                let effective_clip = (!monolithic_principal_paint).then(|| {
+                    projected_layer
+                        .context
+                        .effects
+                        .overflow_clip_bounds()
+                        .and_then(|existing| existing.intersect(candidate.destination_clip))
+                        .unwrap_or(candidate.destination_clip)
+                });
                 // Materialized rectangular ink is cut to the projected
                 // fragmentainer before serialization. The rectangular effect
                 // below still clips complex and deferred ink, but trimming
@@ -900,9 +963,11 @@ impl<'a> LayoutBuilder<'a> {
                 // continuation the same coverage as an independently painted
                 // fragment.
                 // <https://www.w3.org/TR/css-break-3/#fragmentation-model>
-                projected_layer.context = projected_layer
-                    .context
-                    .sliced_primitives_to_fragmentainer_rect(effective_clip);
+                if let Some(effective_clip) = effective_clip {
+                    projected_layer.context = projected_layer
+                        .context
+                        .sliced_primitives_to_fragmentainer_rect(effective_clip);
+                }
                 // The source layer was captured while a scratch column page
                 // was active. Its original paint cursor is consequently
                 // older than normal-flow descendants committed into later
@@ -917,16 +982,18 @@ impl<'a> LayoutBuilder<'a> {
                 // coverage differs from an independently painted rectangle.
                 // Retain the clip for all existing effects, deferred
                 // operations, paths, images, and nested contexts.
-                if projected_layer
-                    .context
-                    .can_elide_overflow_clip_after_materialization(effective_clip)
-                {
-                    projected_layer.context.effects.overflow_clip_effect = None;
-                } else {
-                    projected_layer
+                if let Some(effective_clip) = effective_clip {
+                    if projected_layer
                         .context
-                        .effects
-                        .intersect_overflow_clip_bounds(effective_clip);
+                        .can_elide_overflow_clip_after_materialization(effective_clip)
+                    {
+                        projected_layer.context.effects.overflow_clip_effect = None;
+                    } else {
+                        projected_layer
+                            .context
+                            .effects
+                            .intersect_overflow_clip_bounds(effective_clip);
+                    }
                 }
                 self.positioned_layers
                     .push(projected_layer.with_multicol_fragment_index(candidate_index));
@@ -963,6 +1030,8 @@ impl<'a> LayoutBuilder<'a> {
         );
         let deferred = self.deferred_multicol_positioned_children.split_off(start);
         for child in deferred {
+            let monolithic_principal_paint =
+                used_property_containment(&child.element, &child.style).size;
             let containing_block_span =
                 child
                     .replay_context
@@ -1005,7 +1074,11 @@ impl<'a> LayoutBuilder<'a> {
                     &stylesheets,
                     static_rect,
                 );
-                self.append_multicol_positioned_candidate_layers(&child.fragment, source_layers);
+                self.append_multicol_positioned_candidate_layers(
+                    &child.fragment,
+                    source_layers,
+                    monolithic_principal_paint,
+                );
                 continue;
             }
             if child.fragment.localizes_static_rect_per_candidate() {
@@ -1073,7 +1146,11 @@ impl<'a> LayoutBuilder<'a> {
                 static_rect,
             );
             if child.fragment.has_unresolved_candidates() {
-                self.append_multicol_positioned_candidate_layers(&child.fragment, source_layers);
+                self.append_multicol_positioned_candidate_layers(
+                    &child.fragment,
+                    source_layers,
+                    monolithic_principal_paint,
+                );
             } else {
                 self.positioned_layers.extend(source_layers);
             }

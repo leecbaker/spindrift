@@ -1,7 +1,8 @@
+use std::rc::Rc;
+
 use super::generated_content::annotate_line_break_element_breaks;
 use super::*;
 use crate::layout::inline_layout::InlineLineStackCursor;
-use std::rc::Rc;
 
 impl<'a> LayoutBuilder<'a> {
     #[allow(clippy::too_many_arguments)]
@@ -41,6 +42,19 @@ impl<'a> LayoutBuilder<'a> {
                     IntrinsicInlinePercentageBasisSource::MeasurementAvailableWidth,
                 )
             });
+        // A source-less HTML image has zero natural dimensions. During an
+        // intrinsic probe a percentage width is cyclic, so it cannot use the
+        // probe's available line span to manufacture a table-column
+        // contribution. Final layout revisits the element with the committed
+        // containing-block width.
+        // <https://html.spec.whatwg.org/multipage/images.html#the-img-element>
+        // <https://drafts.csswg.org/css-tables-3/#computing-cell-measures>
+        if element.tag == "img"
+            && crate::dom::selected_img_source(element).is_none()
+            && !inline_percentage_basis.is_definite()
+        {
+            return None;
+        }
         let replaced_sizing = ReplacedIntrinsicSizingContext {
             available_width: content_box_pt(available_width),
             inline_percentage_basis,
@@ -366,6 +380,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         output: &[InlineItem],
         block_style: &ComputedStyle,
+        geometry: BlockStaticPositionPlaceholderGeometry,
         static_position_index: Option<usize>,
     ) -> Option<PageTopRect> {
         // Zero-sized split inline edge atoms preserve decoration boundaries,
@@ -514,19 +529,18 @@ impl<'a> LayoutBuilder<'a> {
                                         // zero-footprint marker supplies the
                                         // logical boundary between the preceding
                                         // anonymous block and the hypothetical
-                                        // block; its inline content extent must
-                                        // not become the latter's block size.
+                                        // block. Its width is the source's
+                                        // measured hypothetical margin-box
+                                        // block extent, not this line's strut.
+                                        let margin_box = geometry
+                                            .vertical_margin_box_inline_span_from_block_end_marker(
+                                                atom.border_box.x(),
+                                                block_style.writing_mode,
+                                            );
                                         PageTopRect::new(
-                                            atom.border_box.x(),
+                                            margin_box.left_x(),
                                             split_boundary_cursor,
-                                            // Diagnostic: the block-start edge
-                                            // of a vertical-rl hypothetical block
-                                            // is its physical right margin edge.
-                                            // Keep this extent out of the line
-                                            // marker itself while proving that the
-                                            // capture needs the block box edge,
-                                            // rather than the marker's left edge.
-                                            block_style.line_height,
+                                            margin_box.width(),
                                             0.0,
                                         )
                                     }
@@ -1106,6 +1120,21 @@ impl<'a> LayoutBuilder<'a> {
                 )
             }
             Some(ReplacedElementKind::Image) => {
+                // Table intrinsic probes collect direct replaced boxes through
+                // this atom constructor. A no-source image with a cyclic
+                // percentage width has no intrinsic inline contribution;
+                // final layout will revisit it with the committed cell width.
+                // <https://html.spec.whatwg.org/multipage/images.html#the-img-element>
+                // <https://drafts.csswg.org/css-tables-3/#computing-cell-measures>
+                if element.tag == "img"
+                    && crate::dom::selected_img_source(element).is_none()
+                    && self
+                        .intrinsic_inline_percentage_basis_stack
+                        .last()
+                        .is_some_and(|basis| !basis.is_definite())
+                {
+                    return None;
+                }
                 let available_width = (self.content_right - self.content_left).max(1.0);
                 let mut used_style = self.style_with_current_viewport_lengths(style);
                 apply_used_box_metrics_for_logical_inline_basis(
@@ -1349,7 +1378,7 @@ impl<'a> LayoutBuilder<'a> {
                         0.0,
                         InlineVisualOffset::zero(),
                         style,
-                        style.text_decoration_layers.clone(),
+                        style.text_decoration_origins.effective_layers_vec(),
                         &mut sequence_items,
                     );
                 } else {
@@ -1360,7 +1389,7 @@ impl<'a> LayoutBuilder<'a> {
                         0.0,
                         InlineVisualOffset::zero(),
                         style,
-                        style.text_decoration_layers.clone(),
+                        style.text_decoration_origins.effective_layers_vec(),
                         &mut sequence_items,
                     );
                 }

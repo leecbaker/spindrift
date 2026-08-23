@@ -1,11 +1,11 @@
+use cssparser::{AtRuleParser, DeclarationParser, ToCss};
+
 use super::at_rules::collect_container_style_rules;
 use super::*;
-use crate::css::PropertyRegistrationRule;
 use crate::css::{
-    FontPaletteDefinition, LayerName, LayerOrder, LayerSegment, StylesheetOrigin,
-    StylesheetScopeAnchor,
+    FontPaletteDefinition, LayerName, LayerOrder, LayerSegment, PropertyRegistrationRule,
+    StylesheetOrigin, StylesheetScopeAnchor,
 };
-use cssparser::{AtRuleParser, DeclarationParser, ToCss};
 
 #[derive(Debug)]
 pub(in crate::css) enum ParsedCssRule {
@@ -54,6 +54,7 @@ pub(in crate::css) struct CssRuleParser<'a> {
     pub(in crate::css) namespaces: SharedNamespaceRegistry,
     pub(in crate::css) current_layer: Option<LayerName>,
     pub(in crate::css) current_scopes: Vec<ScopeRule>,
+    pub(in crate::css) selector_scope_anchor: StylesheetScopeAnchor,
     pub(in crate::css) scope_anchor: StylesheetScopeAnchor,
     pub(in crate::css) origin: StylesheetOrigin,
     pub(in crate::css) media_environment: MediaEnvironment,
@@ -217,6 +218,7 @@ impl<'a> CssRuleParser<'a> {
             namespaces: Rc::clone(&self.namespaces),
             current_layer: self.current_layer.clone(),
             current_scopes: self.current_scopes.clone(),
+            selector_scope_anchor: self.selector_scope_anchor,
             scope_anchor: self.scope_anchor,
             origin: self.origin,
             media_environment: self.media_environment,
@@ -233,10 +235,15 @@ impl<'a> CssRuleParser<'a> {
     ) -> Vec<ParsedCssRule> {
         let routed_rules = split_pseudo_element_rule(
             &selector_text,
-            &self.namespaces.borrow().selector_parser(),
+            &self
+                .namespaces
+                .borrow()
+                .selector_parser()
+                .with_parent_selector(),
             &declarations,
             self.current_layer.clone(),
             self.current_scopes.clone(),
+            self.selector_scope_anchor,
         );
         if !routed_rules.is_empty() {
             return routed_rules;
@@ -250,6 +257,7 @@ impl<'a> CssRuleParser<'a> {
         vec![ParsedCssRule::Style(StyleRule {
             selector_text,
             selector,
+            stylesheet_scope_anchor: self.selector_scope_anchor,
             declarations,
             specificity,
             order: 0,
@@ -277,12 +285,15 @@ impl<'a, 'i> cssparser::QualifiedRuleParser<'i> for CssRuleParser<'a> {
         } else {
             ParseRelative::ForScope
         };
-        let selector_parser = self.namespaces.borrow().selector_parser();
-        let selector_parser = if self.nesting.is_some() {
-            selector_parser.with_parent_selector()
-        } else {
-            selector_parser
-        };
+        // Outside a nested style rule CSS Nesting defines `&` as `:scope`.
+        // Keep the selector crate's parent-selector component in that case;
+        // matching supplies the stylesheet or `@scope` context later.
+        // <https://drafts.csswg.org/css-nesting-1/#nest-selector>
+        let selector_parser = self
+            .namespaces
+            .borrow()
+            .selector_parser()
+            .with_parent_selector();
         let initial_state = input.state();
         match SelectorList::parse(&selector_parser, input, parse_relative) {
             Ok(selector) => {
@@ -678,6 +689,7 @@ impl<'a, 'i> cssparser::AtRuleParser<'i> for CssRuleParser<'a> {
                     namespaces: Rc::clone(&self.namespaces),
                     current_layer: self.current_layer.clone(),
                     current_scopes: self.current_scopes.clone(),
+                    selector_scope_anchor: self.selector_scope_anchor,
                     scope_anchor: self.scope_anchor,
                     origin: self.origin,
                     media_environment: self.media_environment,
@@ -695,6 +707,7 @@ impl<'a, 'i> cssparser::AtRuleParser<'i> for CssRuleParser<'a> {
                     namespaces: Rc::clone(&self.namespaces),
                     current_layer: self.current_layer.clone(),
                     current_scopes: self.current_scopes.clone(),
+                    selector_scope_anchor: self.selector_scope_anchor,
                     scope_anchor: self.scope_anchor,
                     origin: self.origin,
                     media_environment: self.media_environment,
@@ -725,6 +738,7 @@ impl<'a, 'i> cssparser::AtRuleParser<'i> for CssRuleParser<'a> {
                     namespaces: Rc::clone(&self.namespaces),
                     current_layer: Some(layer_name),
                     current_scopes: self.current_scopes.clone(),
+                    selector_scope_anchor: self.selector_scope_anchor,
                     scope_anchor: self.scope_anchor,
                     origin: self.origin,
                     media_environment: self.media_environment,
@@ -744,6 +758,7 @@ impl<'a, 'i> cssparser::AtRuleParser<'i> for CssRuleParser<'a> {
                     namespaces: Rc::clone(&self.namespaces),
                     current_layer: self.current_layer.clone(),
                     current_scopes,
+                    selector_scope_anchor: self.selector_scope_anchor,
                     scope_anchor: self.scope_anchor,
                     origin: self.origin,
                     media_environment: self.media_environment,
@@ -802,6 +817,7 @@ impl<'a, 'i> cssparser::AtRuleParser<'i> for CssRuleParser<'a> {
                     namespaces: Rc::clone(&self.namespaces),
                     current_layer: self.current_layer.clone(),
                     current_scopes: self.current_scopes.clone(),
+                    selector_scope_anchor: self.selector_scope_anchor,
                     scope_anchor: self.scope_anchor,
                     origin: self.origin,
                     media_environment: self.media_environment,

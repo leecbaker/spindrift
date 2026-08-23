@@ -1,15 +1,19 @@
-use super::{CssAtom, CssString, QuirePseudoClass, QuirePseudoElement, QuireSelectorImpl};
-use super::{language_from_attrs, language_matches_any_range};
-use crate::css::html_form_state;
-use crate::css::types::{
-    ContentLanguage, Direction, ElementSignature, LinkState, ResolvedLanguage,
-};
+use std::borrow::Cow;
+use std::rc::Rc;
+
 use selectors::attr::{AttrSelectorOperation, CaseSensitivity, NamespaceConstraint};
 use selectors::context::MatchingContext;
 use selectors::matching::ElementSelectorFlags;
 use selectors::{Element as SelectorElement, OpaqueElement};
-use std::borrow::Cow;
-use std::rc::Rc;
+
+use super::{
+    CssAtom, CssString, QuirePseudoClass, QuirePseudoElement, QuireSelectorImpl,
+    language_from_attrs, language_matches_any_range,
+};
+use crate::css::html_form_state;
+use crate::css::types::{
+    ContentLanguage, Direction, ElementSignature, LinkState, ResolvedLanguage,
+};
 
 pub(in crate::css) const HTML_NAMESPACE_URL: &str = "http://www.w3.org/1999/xhtml";
 

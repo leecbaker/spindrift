@@ -1,6 +1,5 @@
 use super::*;
-use crate::css::LayerOrder;
-use crate::css::is_custom_property_name;
+use crate::css::{LayerOrder, is_custom_property_name};
 
 /// A declaration after selector matching and cascade ordering, with its origin
 /// and URL base preserved for computed-value application.

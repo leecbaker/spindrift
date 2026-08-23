@@ -620,6 +620,25 @@ impl PaintClip {
             .map(Self::from_paint_rect)
     }
 
+    /// Whether two paint rectangles share drawable interior area.
+    ///
+    /// CSS box edges are closed for geometry and raster coverage, but a
+    /// descendant that only touches a containment edge has no interior ink
+    /// inside the clip.  This distinction lets retained paint avoid emitting
+    /// a PDF clip solely for an out-of-bounds primitive at that shared edge.
+    pub(crate) fn intersects_with_positive_area(self, other: Self) -> bool {
+        let left = self.x().max(other.x());
+        let right = (self.x() + self.width()).min(other.x() + other.width());
+        let bottom = self.y().max(other.y());
+        let top = (self.y() + self.height()).min(other.y() + other.height());
+        // Retained paint comes from several layout/replay coordinate spaces.
+        // Treat sub-millipoint arithmetic noise at an otherwise shared CSS
+        // edge as no drawable interior, rather than creating a PDF clip that
+        // changes raster coverage of the preceding fill.
+        const EDGE_EPSILON: f32 = 0.001;
+        right - left > EDGE_EPSILON && top - bottom > EDGE_EPSILON
+    }
+
     /// Exact closed-edge containment for an axis-aligned paint rectangle.
     ///
     /// This intentionally does not use a layout epsilon: the caller uses it

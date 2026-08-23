@@ -1,7 +1,9 @@
-use crate::css::types::{ContentLanguage, ResolvedLanguage};
-use cssparser::{ToCss, serialize_identifier, serialize_string};
 use std::collections::HashMap;
 use std::fmt;
+
+use cssparser::{ToCss, serialize_identifier, serialize_string};
+
+use crate::css::types::{ContentLanguage, ResolvedLanguage};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LanguageRange(pub(in crate::css) String);

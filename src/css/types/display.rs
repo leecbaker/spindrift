@@ -430,6 +430,13 @@ impl Display {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Visibility {
+    Visible,
+    Hidden,
+    Collapse,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

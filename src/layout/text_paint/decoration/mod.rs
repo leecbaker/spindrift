@@ -16,7 +16,7 @@ pub(in crate::layout) fn active_text_decoration_layers(
     // Every decoration origin is finalized when its computed style is
     // created.  Using the raw longhands as a fallback here would let an
     // ancestor's values leak across an atomic inline boundary.
-    style.text_decoration_layers.clone()
+    style.text_decoration_origins.effective_layers_vec()
 }
 
 pub(in crate::layout) fn text_decoration_skip_self_suppresses(

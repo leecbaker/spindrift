@@ -8,6 +8,13 @@
   Phags-pa retain their intrinsic vertical presentation without combining
   sideways placement with OpenType vertical substitutions.
 
+- Vertical paint placement uses preserved shaped-glyph source provenance rather
+  than PDF-facing Unicode summaries. Glyphs without a standalone ToUnicode
+  value remain in their resolved typographic unit with their used advance and
+  vertical origin. A shaping range spanning several units uses vertical
+  metrics and placement when every covered unit resolves to the same mode;
+  mixed upright/sideways ranges remain conservative.
+
 - Replayed table-part styles cross the normal used-length boundary. Font-relative
   box-model lengths such as `td { width: 1em }` are therefore finalized before
   table track sizing and structural background painting.
@@ -20,6 +27,12 @@
   while its normal-flow physical position and margins are resolved in the
   containing block's axes; a vertical child of a horizontal block therefore
   remains at the containing block's inline-start edge.
+- A different `writing-mode` value from the nearest box-generating ancestor
+  promotes a `flow` inner display type to `flow-root`; `display: contents`
+  remains inheritance-only and is skipped for that comparison. This covers
+  parallel sideways/vertical pairs as well as orthogonal flows, so the BFC
+  float-avoidance rule applies to
+  `slr-alongside-vlr-floats.html` and `srl-alongside-vrl-floats.html`.
 - Orthogonal table-cell alignment measures the selected, constrained inline
   fragments. A vertical cell's `height` or `max-height` therefore wraps its
   contents before legacy `vertical-align` distributes logical block-axis free
@@ -44,7 +57,10 @@
   isolate, override, unset, plaintext, block-plaintext, and the positive
   astral Adlam reftest and anti-reference are raster-exact. Explicit LTR
   `isolate-override` retains its resolved visual sequence even for intrinsic
-  RTL astral text.
+  RTL astral text. Final shaped visual-group advances now drive both line
+  measurement and the cursor used for subsequent outer text, while preserving
+  the individual background fragments owned by the reordered isolate. This is
+  raster-exact for `bidi-isolate-override-003.html` and `004.html`.
 - `available-size-018` is raster-exact in the current exact WPT run.
   `available-size-003` and `available-size-012` remain visual mismatches and
   are tracked in `SPEC_DIVERGENCES.md`; the remaining available-size cases

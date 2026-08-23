@@ -1,4 +1,24 @@
-use super::super::*;
+use super::super::{
+    BlockAutoWidthRole, BlockContentWidthInputs, BlockSizeBasisSource, BlockSizePercentageBasis,
+    ComputedStyle, DisplayInner, Element, ElementSignature, Float, FloatContext, FloatId,
+    FloatPlacementAxes, FloatShape, IntrinsicBlockBasis, LayoutBuilder, NodeKind, PageInlineSpan,
+    PageTopBlockPosition, PageTopRect, PercentageBasis, PhysicalContentHeight,
+    PhysicalContentWidth, Position, ReplacedElementKind, SemanticLengthExt, Stylesheets,
+    UsedFloatSide, WritingMode, apply_used_box_metrics, block_size_percentage_basis_from_points,
+    box_tree, constrain_content_height, constrain_content_width, constrain_height_with_intrinsic,
+    constrain_width_with_intrinsic, content_box_pt, css, dom, element_sibling_signature_list,
+    element_signature, estimate_svg_height, formatting_box_has_inline_content,
+    has_atomic_inline_formatting_box, has_auto_height, has_direct_flow_child_with_font_metrics,
+    has_direct_inline_content_box, has_direct_inline_replaced_child, has_non_inline_formatting_box,
+    inline_text_for_style, inline_text_from_formatting_boxes, intrinsic, is_replaced_element,
+    layout_pt, load_resolved_image_source_with_request, margin_box_size_pt,
+    needs_intrinsic_height_contribution, needs_intrinsic_width_contribution,
+    own_inline_text_for_style, parse_html_length, replaced_element_kind, used_border_widths,
+    used_box_metrics, used_canvas, used_content_box_height_or_auto,
+    used_content_box_size_with_basis, used_content_box_width_or_auto, used_image,
+    used_length_percentage, used_length_percentage_or_auto, used_max_height, used_min_height,
+    used_property_containment,
+};
 use super::float::{freeze_float_replay_height, freeze_float_replay_width};
 use crate::LayoutSize;
 
@@ -60,8 +80,12 @@ impl<'a> LayoutBuilder<'a> {
                         .last()
                         .cloned()
                         .unwrap_or_else(|| element_signature(element));
-                    let fragment =
-                        box_tree::build_frozen_table_fragment(element, &signature, table_children);
+                    let fragment = box_tree::build_frozen_table_fragment(
+                        element,
+                        &signature,
+                        style,
+                        table_children,
+                    );
                     Some(self.estimate_table_height(
                         element,
                         style,
@@ -598,11 +622,11 @@ impl<'a> LayoutBuilder<'a> {
             placed_style.display.inner = DisplayInner::FlowRoot;
         }
         self.resolve_style_current_viewport_lengths(&mut placed_style);
-        let float_side = UsedFloatSide::from_float(
-            specified_side,
-            placed_style.writing_mode,
-            placed_style.direction,
-        )?;
+        let placement_axes = FloatPlacementAxes::new(
+            self.containing_block_writing_mode,
+            self.containing_block_direction,
+        );
+        let float_side = UsedFloatSide::from_float(specified_side, placement_axes)?;
         placed_style.float = Float::None;
         apply_used_box_metrics(
             &mut placed_style,
@@ -641,8 +665,7 @@ impl<'a> LayoutBuilder<'a> {
             PageTopBlockPosition::new(0.0),
             margin_box_size_pt(width, height),
             placed_style.clear,
-            placed_style.writing_mode,
-            placed_style.direction,
+            placement_axes,
             PageInlineSpan::from_edges(0.0, containing_width),
         );
         let band_left = placement.available_span.left_x();

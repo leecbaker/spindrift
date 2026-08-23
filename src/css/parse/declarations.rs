@@ -1,5 +1,6 @@
-use super::*;
 use cssparser::Token;
+
+use super::*;
 
 pub(crate) fn parse_declarations(block: &str) -> Declarations {
     parse_declarations_with_urls(block, None, None)

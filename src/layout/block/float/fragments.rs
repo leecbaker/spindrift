@@ -283,37 +283,37 @@ impl<'a> LayoutBuilder<'a> {
             bookmarks: self
                 .bookmarks
                 .iter()
-                .skip(snapshot.bookmarks.len())
+                .skip(snapshot.bookmark_count())
                 .cloned()
                 .collect(),
             anchors: self
                 .page_anchors
                 .iter()
-                .filter(|(target, _)| !snapshot.page_anchors.contains_key(*target))
+                .filter(|(target, _)| !snapshot.has_page_anchor_source_position(target))
                 .map(|(target, page_index)| (target.clone(), *page_index))
                 .collect(),
             anchor_source_positions: self
                 .page_anchor_source_positions
                 .iter()
-                .filter(|(target, _)| !snapshot.page_anchor_source_positions.contains_key(*target))
+                .filter(|(target, _)| !snapshot.has_page_anchor_text(target))
                 .map(|(target, position)| (target.clone(), *position))
                 .collect(),
             anchor_text: self
                 .page_anchor_text
                 .iter()
-                .filter(|(target, _)| !snapshot.page_anchor_text.contains_key(*target))
+                .filter(|(target, _)| !snapshot.has_page_anchor_counters(target))
                 .map(|(target, text)| (target.clone(), text.clone()))
                 .collect(),
             anchor_counters: self
                 .page_anchor_counters
                 .iter()
-                .filter(|(target, _)| !snapshot.page_anchor_counters.contains_key(*target))
+                .filter(|(target, _)| !snapshot.has_page_anchor(target))
                 .map(|(target, counters)| (target.clone(), counters.clone()))
                 .collect(),
             page_effects: Vec::new(),
         };
 
-        let first_deferred_page = snapshot.pages.len();
+        let first_deferred_page = snapshot.page_count();
         let captured_page_count = self
             .page_named_strings
             .len()
@@ -324,17 +324,17 @@ impl<'a> LayoutBuilder<'a> {
             let empty_running = HashMap::new();
             let empty_links = Vec::new();
             let base_named = if page_index == first_deferred_page {
-                &snapshot.current_page_named_strings
+                snapshot.current_page_named_strings()
             } else {
                 &empty_named
             };
             let base_running = if page_index == first_deferred_page {
-                &snapshot.current_page_running_elements
+                snapshot.current_page_running_elements()
             } else {
                 &empty_running
             };
             let base_links = if page_index == first_deferred_page {
-                &snapshot.current_page.links
+                snapshot.current_page_links()
             } else {
                 &empty_links
             };
@@ -372,11 +372,11 @@ impl<'a> LayoutBuilder<'a> {
         let current_base_named;
         let current_base_running;
         let current_base_links;
-        let (base_named, base_running, base_links) = if self.pages.len() == snapshot.pages.len() {
+        let (base_named, base_running, base_links) = if self.pages.len() == snapshot.page_count() {
             (
-                &snapshot.current_page_named_strings,
-                &snapshot.current_page_running_elements,
-                &snapshot.current_page.links,
+                snapshot.current_page_named_strings(),
+                snapshot.current_page_running_elements(),
+                snapshot.current_page_links(),
             )
         } else {
             current_base_named = HashMap::new();

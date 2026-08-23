@@ -22,7 +22,7 @@ pub(crate) fn span_boundary_needs_join_control(left: &str, right: &str) -> bool 
     else {
         return false;
     };
-    character_can_join_following(left) && character_can_join_preceding(right)
+    cursive_boundary_needs_context(left, right)
 }
 
 /// Provenance for characters that exist in the shaping buffer but are not
@@ -153,7 +153,10 @@ pub(in crate::text) fn text_needs_leading_join_context(text: &str) -> bool {
     }
     characters
         .find(|character| !character_is_join_control(*character))
-        .is_some_and(character_can_join_preceding)
+        .is_some_and(|character| {
+            character_can_join_preceding(character)
+                && character_supports_arabic_tatweel_edge_context(character)
+        })
 }
 
 pub(in crate::text) fn text_needs_trailing_join_context(text: &str) -> bool {
@@ -163,7 +166,10 @@ pub(in crate::text) fn text_needs_trailing_join_context(text: &str) -> bool {
     }
     characters
         .find(|character| !character_is_join_control(*character))
-        .is_some_and(character_can_join_following)
+        .is_some_and(|character| {
+            character_can_join_following(character)
+                && character_supports_arabic_tatweel_edge_context(character)
+        })
 }
 
 /// Add shaping-only tatweel at run edges requested by explicit ZWJ.
@@ -188,10 +194,10 @@ pub(in crate::text) fn push_edge_join_context<T>(
         if let Some(index) = leading_join_context_insertion_index(slice) {
             insertions.push(range.start + index);
         } else if text[..range.start].ends_with('\u{200d}')
-            && slice
-                .chars()
-                .next()
-                .is_some_and(character_can_join_preceding)
+            && slice.chars().next().is_some_and(|character| {
+                character_can_join_preceding(character)
+                    && character_supports_arabic_tatweel_edge_context(character)
+            })
         {
             // A joiner can be owned by a separately styled span (including a
             // fallback font face selected solely for U+200D).  The adjacent
@@ -205,10 +211,10 @@ pub(in crate::text) fn push_edge_join_context<T>(
         if let Some(index) = trailing_join_context_insertion_index(slice) {
             insertions.push(range.start + index);
         } else if text[range.end..].starts_with('\u{200d}')
-            && slice
-                .chars()
-                .next_back()
-                .is_some_and(character_can_join_following)
+            && slice.chars().next_back().is_some_and(|character| {
+                character_can_join_following(character)
+                    && character_supports_arabic_tatweel_edge_context(character)
+            })
         {
             insertions.push(range.end);
         }
@@ -233,7 +239,11 @@ pub(in crate::text) fn leading_join_context_insertion_index(text: &str) -> Optio
     }
     text.char_indices()
         .find(|(_, character)| !character_is_join_control(*character))
-        .and_then(|(index, character)| character_can_join_preceding(character).then_some(index))
+        .and_then(|(index, character)| {
+            (character_can_join_preceding(character)
+                && character_supports_arabic_tatweel_edge_context(character))
+            .then_some(index)
+        })
 }
 
 pub(in crate::text) fn trailing_join_context_insertion_index(text: &str) -> Option<usize> {
@@ -244,7 +254,9 @@ pub(in crate::text) fn trailing_join_context_insertion_index(text: &str) -> Opti
         .rev()
         .find(|(_, character)| !character_is_join_control(*character))
         .and_then(|(index, character)| {
-            character_can_join_following(character).then_some(index + character.len_utf8())
+            (character_can_join_following(character)
+                && character_supports_arabic_tatweel_edge_context(character))
+            .then_some(index + character.len_utf8())
         })
 }
 
@@ -458,7 +470,7 @@ pub(in crate::text) fn classify_control_fallback_cluster(
 }
 
 fn character_has_simple_shaping(character: char) -> bool {
-    if character_has_joining_behavior(character) {
+    if character_has_cursive_shaping_behavior(character) {
         return false;
     }
     let script = CodePointMapData::<IcuScript>::new().get(character);

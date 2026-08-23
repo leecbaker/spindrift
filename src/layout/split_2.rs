@@ -5,6 +5,7 @@ use super::*;
 use crate::document::paint::patterns::RenderedImageSourceRect;
 use crate::dom::ElementId;
 use crate::image_store::ImageId;
+use crate::layout::assets::DocumentPageIndex;
 use crate::layout::text_paint::TextInlineSpan;
 
 /// Page-local containing block for positioned descendants.
@@ -1012,7 +1013,17 @@ impl StackingContextPolicy {
         bounds: PaintClip,
     ) -> Self {
         let effects = assets::paint_effects_for_box(style, bounds);
-        Self::for_non_positioned_effect_with_effects(style, effects, true)
+        // This constructor is used for retained inline and anonymous-box
+        // fragments, which have no `Element` to query.  Containment is only
+        // effective when that fragment has a containment-capable principal
+        // box; treating every style as applicable recreates a stacking
+        // context for non-atomic inlines and ruby internals.
+        // <https://www.w3.org/TR/css-contain-1/#containment-layout>
+        Self::for_non_positioned_effect_with_effects(
+            style,
+            effects,
+            property_containment_applies_to_style(style),
+        )
     }
 
     pub(in crate::layout) fn for_non_positioned_effect_with_effects(
@@ -1140,7 +1151,19 @@ impl StackingContextPolicy {
         parent_band: PaintBand,
         bounds: PaintClip,
     ) -> Self {
-        let mut policy = Self::for_atomic(style, parent_band, bounds);
+        Self::for_inline_svg_root_with_geometry(
+            style,
+            parent_band,
+            assets::PrincipalPaintGeometry::css_layout(bounds),
+        )
+    }
+
+    pub(in crate::layout) fn for_inline_svg_root_with_geometry(
+        style: &ComputedStyle,
+        parent_band: PaintBand,
+        geometry: assets::PrincipalPaintGeometry,
+    ) -> Self {
+        let mut policy = Self::for_atomic_with_geometry(style, parent_band, geometry);
         policy.context_kind = StackingContextKind::Real;
         policy.child_layer_policy = ChildLayerPolicy::CaptureAll;
         policy.is_real_stacking_context = true;
@@ -1273,7 +1296,11 @@ pub(in crate::layout) fn style_creates_effect_stacking_context(
     style: &ComputedStyle,
     effects: &PaintEffects,
 ) -> bool {
-    style_creates_effect_stacking_context_with_containment(style, effects, true)
+    style_creates_effect_stacking_context_with_containment(
+        style,
+        effects,
+        property_containment_applies_to_style(style),
+    )
 }
 
 fn style_creates_effect_stacking_context_with_containment(
@@ -1479,6 +1506,65 @@ pub(in crate::layout) struct OutsideMarkerFallbackCandidate {
     pub(in crate::layout) alphabetic_baseline: PageTopBlockPosition,
 }
 
+/// A resolved outside-marker paint operation retained until its list-item
+/// owner can commit it outside a descendant paint scope.
+///
+/// The marker is the list item's first generated child, so its paint belongs
+/// to the list item rather than to whichever nested block happened to expose
+/// the first eligible line. Retaining a page-local fragment makes that
+/// ownership explicit across descendant stacking contexts and fragmentation.
+/// <https://drafts.csswg.org/css-lists-3/#markers>
+/// <https://www.w3.org/TR/CSS22/zindex.html>
+#[derive(Debug, Clone, PartialEq)]
+pub(in crate::layout) struct ResolvedOutsideMarkerPaint {
+    /// The generated first child whose paint belongs to the list item.
+    pub(in crate::layout) marker: ListMarker,
+    /// The originating list-item style used by marker painting.
+    pub(in crate::layout) list_item_style: ComputedStyle,
+    /// The accepted principal-line geometry that resolved this operation.
+    pub(in crate::layout) anchor: OutsideMarkerAnchor,
+    /// The page fragment containing the resolved line.
+    pub(in crate::layout) page: DocumentPageIndex,
+    /// Isolated page-local marker paint, detached from the descendant scope.
+    pub(in crate::layout) fragment: PaintFragment,
+}
+
+/// Where a resolved outside marker must be painted relative to the line that
+/// establishes its geometry.
+///
+/// A normal-flow relatively positioned block is painted as an auto/zero
+/// positioned atom. Its nested principal line can resolve an ancestor list
+/// item's marker geometry, but cannot own that marker's paint.
+/// <https://www.w3.org/TR/CSS22/zindex.html>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) enum OutsideMarkerPaintOwner {
+    CurrentPaintScope,
+    ListItem,
+}
+
+impl OutsideMarkerPaintOwner {
+    pub(in crate::layout) fn for_principal_line_block(style: &ComputedStyle) -> Self {
+        if matches!(style.position, Position::Relative | Position::Sticky) {
+            Self::ListItem
+        } else {
+            Self::CurrentPaintScope
+        }
+    }
+}
+
+/// Progress of an outside marker whose first principal line is discovered in
+/// descendant layout.
+///
+/// `Capturing` prevents the marker's own generated inline sequence from
+/// recursively treating itself as the list item's principal line.
+#[derive(Debug, Clone, PartialEq)]
+pub(in crate::layout) enum DeferredOutsideMarkerPaintState {
+    AwaitingAnchor,
+    Capturing,
+    Resolved(Box<ResolvedOutsideMarkerPaint>),
+    PaintedInPlace,
+}
+
 #[derive(Debug, Clone)]
 pub(in crate::layout) struct PendingOutsideMarkerAnchor {
     pub(in crate::layout) marker: ListMarker,
@@ -1488,7 +1574,7 @@ pub(in crate::layout) struct PendingOutsideMarkerAnchor {
     /// cursor before the pending marker is finalized, but they must not move
     /// this CSS Lists fallback anchor.
     pub(in crate::layout) fallback: OutsideMarkerFallbackCandidate,
-    pub(in crate::layout) painted: bool,
+    pub(in crate::layout) paint: DeferredOutsideMarkerPaintState,
 }
 
 /// Outside-marker anchors that belong to the current principal line-layout
@@ -1528,8 +1614,41 @@ impl PendingOutsideMarkerAnchors {
         self.anchors.iter()
     }
 
-    pub(in crate::layout) fn mark_painted(&mut self, index: usize) {
-        self.anchors[index].painted = true;
+    pub(in crate::layout) fn begin_paint_capture(&mut self, index: usize) {
+        debug_assert!(
+            matches!(
+                self.anchors[index].paint,
+                DeferredOutsideMarkerPaintState::AwaitingAnchor
+            ),
+            "only an unresolved marker anchor can begin paint capture"
+        );
+        self.anchors[index].paint = DeferredOutsideMarkerPaintState::Capturing;
+    }
+
+    pub(in crate::layout) fn finish_paint_capture(
+        &mut self,
+        index: usize,
+        paint: ResolvedOutsideMarkerPaint,
+    ) {
+        debug_assert!(
+            matches!(
+                self.anchors[index].paint,
+                DeferredOutsideMarkerPaintState::Capturing
+            ),
+            "only a marker being captured can receive its paint fragment"
+        );
+        self.anchors[index].paint = DeferredOutsideMarkerPaintState::Resolved(Box::new(paint));
+    }
+
+    pub(in crate::layout) fn mark_painted_in_place(&mut self, index: usize) {
+        debug_assert!(
+            matches!(
+                self.anchors[index].paint,
+                DeferredOutsideMarkerPaintState::AwaitingAnchor
+            ),
+            "only an unresolved marker anchor can paint in its current owner"
+        );
+        self.anchors[index].paint = DeferredOutsideMarkerPaintState::PaintedInPlace;
     }
 
     pub(in crate::layout) fn suspend(&mut self) -> SuspendedOutsideMarkerAnchors {
@@ -1673,15 +1792,19 @@ impl InlineScopeLineRelativeAlignment {
 }
 
 #[derive(Debug)]
-/// CSS Text assigns both tracking and cross-element wrapping to the innermost
-/// inline box containing both typographic units. This immutable parent chain
-/// survives collection, source slicing, and bidi reordering without making
-/// layout consumers reconstruct scope from decoration atoms:
+/// Retains the local used tracking value and the ancestry needed for
+/// cross-element wrapping and line-relative alignment. This immutable parent
+/// chain survives collection, source slicing, and bidi reordering without
+/// making layout consumers reconstruct scope from decoration atoms:
 /// <https://drafts.csswg.org/css-text-3/#letter-spacing-property> and
 /// <https://drafts.csswg.org/css-text-3/#line-break-details>.
 pub(in crate::layout) struct InlineTrackingScope {
     parent: Option<Rc<Self>>,
     depth: usize,
+    /// The computed style of this lexical inline scope. CSS Text owns
+    /// autospace at the innermost scope shared by the two adjacent
+    /// typographic units, rather than at either unit's leaf style.
+    autospace_style: InlineStyle,
     letter_spacing: LayoutLength,
     boundary_policy: InlineBoundaryPolicy,
     line_relative_alignment: Option<InlineScopeLineRelativeAlignment>,
@@ -1693,6 +1816,7 @@ impl InlineTrackingScope {
         Rc::new(Self {
             parent: None,
             depth: 0,
+            autospace_style: inline_style(style),
             letter_spacing: style.used_letter_spacing(),
             boundary_policy: InlineBoundaryPolicy::from_style(style),
             line_relative_alignment: None,
@@ -1707,6 +1831,7 @@ impl InlineTrackingScope {
         Rc::new(Self {
             depth: parent.depth + 1,
             parent: Some(parent),
+            autospace_style: inline_style(style),
             letter_spacing: style.used_letter_spacing(),
             boundary_policy: InlineBoundaryPolicy::from_style(style),
             line_relative_alignment,
@@ -1720,27 +1845,12 @@ impl InlineTrackingScope {
         self.letter_spacing
     }
 
-    /// Whether this lexical participant or any ancestor can own a tracking
-    /// boundary.
-    ///
-    /// A descendant with `letter-spacing: 0` can still meet a sibling at a
-    /// boundary owned by their tracked parent.  Callers deciding whether a
-    /// source-width shortcut is sound must therefore inspect the complete
-    /// immutable scope chain rather than only the fragment's local style:
-    /// <https://drafts.csswg.org/css-text-3/#letter-spacing-property>.
-    pub(in crate::layout) fn has_nonzero_letter_spacing_in_ancestry(&self) -> bool {
-        let mut scope = Some(self);
-        while let Some(current) = scope {
-            if current.letter_spacing.points() != 0.0 {
-                return true;
-            }
-            scope = current.parent.as_deref();
-        }
-        false
-    }
-
     pub(in crate::layout) fn boundary_policy(&self) -> InlineBoundaryPolicy {
         self.boundary_policy
+    }
+
+    pub(in crate::layout) fn autospace_style(&self) -> &ComputedStyle {
+        &self.autospace_style
     }
 
     /// Return the innermost enclosing inline box whose aligned subtree is
@@ -1780,7 +1890,7 @@ impl InlineTrackingScope {
     /// recorded at construction lets this walk align both immutable parent
     /// chains, then advance them together until their allocation identities
     /// match.
-    pub(in crate::layout) fn lowest_common<'left>(left: &'left Self, right: &Self) -> &'left Self {
+    fn lowest_common<'left>(left: &'left Self, right: &Self) -> &'left Self {
         let mut left = left;
         let mut right = right;
         while left.depth > right.depth {
@@ -1806,6 +1916,29 @@ impl InlineTrackingScope {
                 .expect("all inline tracking participants share a paragraph root");
         }
         left
+    }
+
+    /// Resolve the shared inline-box policy used by CSS Text line breaking.
+    ///
+    /// Letter spacing deliberately has no corresponding common-ancestor API:
+    /// each adjacent typographic unit contributes half of its own used value.
+    pub(in crate::layout) fn common_boundary_policy(
+        left: &Self,
+        right: &Self,
+    ) -> InlineBoundaryPolicy {
+        Self::lowest_common(left, right).boundary_policy()
+    }
+
+    /// Return the innermost inline scope that owns an autospace boundary.
+    ///
+    /// CSS Text places inter-script spacing within the innermost element that
+    /// contains both directly adjoining typographic units:
+    /// <https://drafts.csswg.org/css-text-4/#text-autospace-property>.
+    pub(in crate::layout) fn common_autospace_style<'left>(
+        left: &'left Self,
+        right: &Self,
+    ) -> &'left ComputedStyle {
+        Self::lowest_common(left, right).autospace_style()
     }
 }
 
@@ -1868,7 +2001,37 @@ impl Default for InlineVisualOffset {
 pub(in crate::layout) enum FirstLetterPseudoFragmentRole {
     #[default]
     Ordinary,
+    /// Associated punctuation that precedes the typographic initial.
+    ///
+    /// This text is inside `::first-letter`, but is not the base glyph used
+    /// for `initial-letter` sizing and exclusion geometry.
+    AssociatedPrefix,
+    /// The selected Letter, Number, or Symbol typographic character unit.
+    ///
+    /// `initial-letter` geometry must be derived from this component rather
+    /// than an associated punctuation fragment that happens to precede it in
+    /// source order.
+    TypographicInitial,
+    /// Associated punctuation that follows the typographic initial.
+    AssociatedSuffix,
     LeadingPreservedWhitespace,
+}
+
+/// Opaque identity shared by every fragment materialized from one
+/// `::first-letter` pseudo-element.
+///
+/// A stream selection can split punctuation and its typographic initial into
+/// separate source fragments. Paint-time grouping must retain their common
+/// pseudo ownership without making either fragment generally mergeable.
+/// <https://www.w3.org/TR/css-pseudo-4/#first-letter-pseudo>
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(in crate::layout) struct FirstLetterPseudoGroupId(u64);
+
+impl FirstLetterPseudoGroupId {
+    pub(in crate::layout) fn allocate() -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT_ID.fetch_add(1, Ordering::Relaxed))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1911,12 +2074,6 @@ pub(in crate::layout) struct InlineFragmentData {
     pub(in crate::layout) ancestor_inline_decorations: Rc<[InlineAncestorDecoration]>,
     /// The source inline ancestry used to resolve visual tracking boundaries.
     pub(in crate::layout) tracking_scope: Option<Rc<InlineTrackingScope>>,
-    /// A paintless advance before this visual item.  It is set only after UBA
-    /// reordering by the CSS Text tracking resolver.
-    pub(in crate::layout) leading_tracking: LayoutLength,
-    /// Whether this fragment's shaper-terminal tracking has already been
-    /// transferred into a visual-boundary advance.
-    pub(in crate::layout) terminal_tracking_normalized: bool,
     /// Whether this item starts a separate visual fragment after UAX #9
     /// reordering. Tracking must not reconnect text across that fragment
     /// boundary even when the adjacent items share an inline ancestor.
@@ -1929,6 +2086,7 @@ pub(in crate::layout) struct InlineFragmentData {
     /// markers may be transparent, RTL, or contain bidi-neutral text.
     pub(in crate::layout) selected_discretionary_marker: bool,
     pub(in crate::layout) first_letter_pseudo_role: FirstLetterPseudoFragmentRole,
+    pub(in crate::layout) first_letter_pseudo_group_id: Option<FirstLetterPseudoGroupId>,
     /// A visual inline advance retained after an initial-letter exclusion has
     /// removed this pseudo fragment from normal line advancement.
     pub(in crate::layout) out_of_flow_paint_inline_advance: Option<LayoutLength>,
@@ -2127,11 +2285,10 @@ impl InlineFragment {
                 resolved_bidi_direction: None,
                 ancestor_inline_decorations,
                 tracking_scope: None,
-                leading_tracking: layout_pt(0.0),
-                terminal_tracking_normalized: false,
                 starts_visual_fragment: false,
                 selected_discretionary_marker: false,
                 first_letter_pseudo_role: FirstLetterPseudoFragmentRole::Ordinary,
+                first_letter_pseudo_group_id: None,
                 out_of_flow_paint_inline_advance: None,
                 out_of_flow_paint_block_size: None,
             }),
@@ -2188,28 +2345,6 @@ impl InlineFragment {
             .and_then(InlineTrackingScope::line_relative_alignment)
     }
 
-    pub(in crate::layout) fn leading_tracking(&self) -> LayoutLength {
-        self.data.leading_tracking
-    }
-
-    pub(in crate::layout) fn set_leading_tracking(&mut self, advance: LayoutLength) {
-        if self.data.leading_tracking == advance {
-            return;
-        }
-        Rc::make_mut(&mut self.data).leading_tracking = advance;
-    }
-
-    pub(in crate::layout) fn terminal_tracking_normalized(&self) -> bool {
-        self.data.terminal_tracking_normalized
-    }
-
-    pub(in crate::layout) fn mark_terminal_tracking_normalized(&mut self) {
-        if self.data.terminal_tracking_normalized {
-            return;
-        }
-        Rc::make_mut(&mut self.data).terminal_tracking_normalized = true;
-    }
-
     pub(in crate::layout) fn starts_visual_fragment(&self) -> bool {
         self.data.starts_visual_fragment
     }
@@ -2241,6 +2376,19 @@ impl InlineFragment {
 
     pub(in crate::layout) fn first_letter_pseudo_role(&self) -> FirstLetterPseudoFragmentRole {
         self.data.first_letter_pseudo_role
+    }
+
+    pub(in crate::layout) fn set_first_letter_pseudo_group_id(
+        &mut self,
+        group_id: FirstLetterPseudoGroupId,
+    ) {
+        Rc::make_mut(&mut self.data).first_letter_pseudo_group_id = Some(group_id);
+    }
+
+    pub(in crate::layout) fn first_letter_pseudo_group_id(
+        &self,
+    ) -> Option<FirstLetterPseudoGroupId> {
+        self.data.first_letter_pseudo_group_id
     }
 
     pub(in crate::layout) fn set_out_of_flow_paint_inline_advance(
@@ -2279,7 +2427,6 @@ impl InlineFragment {
             data.boundary_shaped_range = None;
         }
         data.text = text;
-        data.terminal_tracking_normalized = false;
     }
 
     pub(in crate::layout) fn set_mergeable(&mut self, mergeable: bool) {
@@ -2447,6 +2594,9 @@ pub(in crate::layout) trait InlineFragmentAccess {
     /// an actual `unicode-bidi` isolate boundary.
     fn tracking_scope(&self) -> Option<&Rc<InlineTrackingScope>>;
     fn generated_leader(&self) -> bool;
+    fn first_letter_pseudo_group_id(&self) -> Option<FirstLetterPseudoGroupId> {
+        None
+    }
     /// A complete source shape shared with adjacent transparent fragments.
     fn boundary_shaped_source(&self) -> Option<&BoundaryShapedSource> {
         None
@@ -2501,6 +2651,10 @@ impl InlineFragmentAccess for InlineFragment {
 
     fn generated_leader(&self) -> bool {
         self.generated_leader()
+    }
+
+    fn first_letter_pseudo_group_id(&self) -> Option<FirstLetterPseudoGroupId> {
+        InlineFragment::first_letter_pseudo_group_id(self)
     }
 
     fn boundary_shaped_source(&self) -> Option<&BoundaryShapedSource> {
@@ -2593,6 +2747,10 @@ impl InlineFragmentAccess for PendingInlineFragment<'_> {
 
     fn generated_leader(&self) -> bool {
         self.fragment.generated_leader()
+    }
+
+    fn first_letter_pseudo_group_id(&self) -> Option<FirstLetterPseudoGroupId> {
+        self.fragment.first_letter_pseudo_group_id()
     }
 
     fn boundary_shaped_source(&self) -> Option<&BoundaryShapedSource> {
@@ -2739,6 +2897,20 @@ pub(in crate::layout) struct InlineAncestorDecoration {
     pub(in crate::layout) paint_effect_scope_id: Option<InlinePaintScopeId>,
 }
 
+/// Whether an inline style establishes a non-auto positioned stacking context.
+///
+/// Non-atomic inline descendants are represented by text runs plus lexical
+/// edge metadata rather than by one principal paint box.  Retaining this fact
+/// on the lexical scope lets the text painter place its captured run in the
+/// owning Appendix-E band.
+/// <https://www.w3.org/TR/CSS22/zindex.html>
+pub(in crate::layout) fn inline_style_establishes_positioned_stacking_context(
+    style: &ComputedStyle,
+) -> bool {
+    matches!(style.position, Position::Relative | Position::Sticky)
+        && style.z_index.establishes_stacking_context()
+}
+
 /// Opaque identity for a lexical inline paint-effect subtree.
 ///
 /// A monotonically allocated id is intentionally independent of style
@@ -2771,6 +2943,18 @@ pub(in crate::layout) fn inline_ancestor_decorations_have_same_text_paint_effect
         .eq(right
             .iter()
             .filter_map(|decoration| decoration.paint_effect_scope_id))
+        && left
+            .iter()
+            .filter(|decoration| {
+                inline_style_establishes_positioned_stacking_context(&decoration.style)
+            })
+            .map(|decoration| decoration.positioning_containing_block_id)
+            .eq(right
+                .iter()
+                .filter(|decoration| {
+                    inline_style_establishes_positioned_stacking_context(&decoration.style)
+                })
+                .map(|decoration| decoration.positioning_containing_block_id))
 }
 
 #[derive(Debug, Clone)]
@@ -3433,6 +3617,24 @@ impl AbsoluteStaticPosition {
         self
     }
 
+    /// Attach an inline-source static-position rectangle and replace the
+    /// physical page-top fallback with its captured inline edge.
+    ///
+    /// Vertical inline layout resolves automatic physical `top`/`bottom`
+    /// through the scalar fallback before the rectangle's alignment payload.
+    /// Retaining an ancestor's earlier page-top value here would therefore
+    /// discard the hypothetical inline placeholder edge that this rectangle
+    /// just captured.
+    /// <https://drafts.csswg.org/css-position-3/#staticpos-rect>
+    pub(in crate::layout) fn with_inline_static_position_rectangle(
+        mut self,
+        rectangle: StaticPositionRectangle,
+    ) -> Self {
+        self.page_top_y = rectangle.area.top_y();
+        self.has_vertical_position = true;
+        self.with_static_position_rectangle(rectangle)
+    }
+
     pub(in crate::layout) fn static_position_rectangle(self) -> Option<StaticPositionRectangle> {
         match self.static_alignment_source {
             Some(StaticAlignmentSource::OrdinaryFlow { rectangle, .. }) => Some(rectangle),
@@ -3605,10 +3807,22 @@ pub(in crate::layout) struct PreparedInlineTextGroup {
     /// prepared text.  This keeps paint-effect ancestry explicit after text
     /// collection, typographic splitting, bidi reordering, and shaping.
     pub(in crate::layout) paint_scope_ancestry: Rc<[InlinePaintScopeId]>,
+    /// The innermost lexical inline scope that owns this text group's
+    /// positioned stacking context.  The scope's style is retained because
+    /// descendant text itself inherits typography, not `position` or
+    /// `z-index`.
+    pub(in crate::layout) positioned_paint_style: Option<ComputedStyle>,
     pub(in crate::layout) link_target: Option<String>,
     pub(in crate::layout) link_paint_rect: Option<PaintRect>,
     pub(in crate::layout) decoration_paint_rect: Option<PaintRect>,
     pub(in crate::layout) shaped: ShapedInlineLine,
+    /// Plain-text replacement for a shaped group containing one or more
+    /// layout-only `word-space-transform` separators.
+    ///
+    /// The group can retain one continuous glyph stream while PDF output
+    /// restores authored U+200B characters and omits generated `<wbr>` text.
+    /// <https://drafts.csswg.org/css-text-4/#word-space-transform>
+    pub(in crate::layout) actual_text: Option<Rc<str>>,
     pub(in crate::layout) source: InlineTextSource,
     pub(in crate::layout) source_run: Rc<()>,
 }
@@ -4184,6 +4398,26 @@ mod inline_tracking_scope_tests {
     }
 
     #[test]
+    fn common_autospace_style_uses_the_innermost_shared_inline_scope() {
+        let mut root_style = scope_style();
+        root_style.font_size = 17.0;
+        let mut child_style = root_style.clone();
+        child_style.font_size = 43.0;
+        let root = InlineTrackingScope::root(&root_style);
+        let left = InlineTrackingScope::child(Rc::clone(&root), &child_style);
+        let right = InlineTrackingScope::child(Rc::clone(&root), &child_style);
+
+        assert_eq!(
+            InlineTrackingScope::common_autospace_style(&left, &right).font_size,
+            17.0
+        );
+        assert_eq!(
+            InlineTrackingScope::common_autospace_style(&left, &left).font_size,
+            43.0
+        );
+    }
+
+    #[test]
     fn lowest_common_aligns_differently_nested_cousins() {
         let root = InlineTrackingScope::root(&scope_style());
         let left_branch = InlineTrackingScope::child(Rc::clone(&root), &scope_style());
@@ -4201,12 +4435,12 @@ mod inline_tracking_scope_tests {
     }
 
     #[test]
-    fn tracked_ancestor_remains_visible_through_zero_spacing_descendant() {
+    fn descendant_scope_retains_its_local_used_letter_spacing() {
         let mut tracked = scope_style();
         tracked.letter_spacing = crate::css::ComputedLengthPercentage::from_points(4.0);
         let root = InlineTrackingScope::root(&tracked);
         let descendant = InlineTrackingScope::child(root, &scope_style());
 
-        assert!(descendant.has_nonzero_letter_spacing_in_ancestry());
+        assert_eq!(descendant.letter_spacing().points(), 0.0);
     }
 }

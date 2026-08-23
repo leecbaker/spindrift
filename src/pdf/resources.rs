@@ -264,9 +264,10 @@ fn sampled_image_resource(
     ImageResource {
         pixel_width: data.pixel_width,
         pixel_height: data.pixel_height,
-        // Explicit sampling modes have already selected samples. `auto`
-        // retains the source grid and lets the PDF consumer interpolate it.
-        interpolate: sampling == RasterSampling::Auto,
+        // The output resource records the selected CSS sample grid. Keeping
+        // PDF interpolation disabled also applies the same policy to a soft
+        // mask, preventing divergent alpha fringes at image edges.
+        interpolate: false,
         color_space,
         sample_depth: data.sample_depth,
         payload: ImagePayload::Samples {
@@ -935,9 +936,11 @@ fn opacity_key(opacity: f32) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use image::ImageEncoder;
     use std::rc::Rc;
+
+    use image::ImageEncoder;
+
+    use super::*;
 
     fn opaque_rgb_jpeg() -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -1058,7 +1061,12 @@ mod tests {
         let ImagePayload::Samples { rgb, alpha } = resource.payload else {
             panic!("inline raster should materialize as samples");
         };
-        assert!(rgb.chunks_exact(3).all(|pixel| pixel == [0, 128, 0]));
+        assert!(
+            rgb.as_chunks::<3>()
+                .0
+                .iter()
+                .all(|pixel| pixel == &[0, 128, 0])
+        );
         assert_eq!(alpha, None);
     }
 
@@ -1363,7 +1371,9 @@ mod tests {
         assert_ne!(pixelated, crisp);
         assert!(
             pixelated
-                .chunks_exact(3)
+                .as_chunks::<3>()
+                .0
+                .iter()
                 .any(|pixel| pixel[0] > 0 && pixel[2] > 0)
         );
     }

@@ -1,5 +1,6 @@
-use super::*;
 use std::num::NonZeroUsize;
+
+use super::*;
 
 pub(in crate::layout) const GAP_RULE_EPSILON: f32 = 0.01;
 
@@ -31,6 +32,10 @@ impl GapRuleWidth {
         Self::new(self.0 - leading.0)
     }
 
+    pub(in crate::layout) fn max(self, other: Self) -> Self {
+        Self::new(self.0.max(other.0))
+    }
+
     pub(in crate::layout) fn double_bands(self) -> Option<DoubleBorderBands> {
         DoubleBorderBands::for_used_width(layout_pt(self.0))
     }
@@ -52,12 +57,33 @@ impl GapRuleWidth {
         self.0.max(gap.size()) / 2.0
     }
 
-    pub(in crate::layout) fn overlap_join_inset(self, crossing_gap: GapBand) -> f32 {
-        -(crossing_gap.size() + self.0) / 2.0
+    pub(in crate::layout) fn overlap_join_inset(self, junction_width: GapJunctionWidth) -> f32 {
+        -(junction_width.points() + self.0) / 2.0
     }
 
     pub(in crate::layout) fn into_paint_stroke_width(self) -> PaintStrokeWidth {
         PaintStrokeWidth::new(self.0)
+    }
+}
+
+/// The width of one CSS gap junction along the decorated gap's axis.
+///
+/// A junction can be contributed by several crossing gap portions. Its width
+/// is therefore the union of their overlapping or abutting intervals, not the
+/// width of any one member:
+/// <https://drafts.csswg.org/css-gaps-1/#gap-rule-inset>.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct GapJunctionWidth(f32);
+
+impl GapJunctionWidth {
+    pub(in crate::layout) const ZERO: Self = Self(0.0);
+
+    pub(in crate::layout) fn new(value: f32) -> Self {
+        Self(value.max(0.0))
+    }
+
+    pub(in crate::layout) fn points(self) -> f32 {
+        self.0
     }
 }
 
@@ -988,7 +1014,7 @@ pub(in crate::layout) struct AxisRuleContext<'a> {
 /// One physical gap span.
 ///
 /// This geometry carries no traversal-order invariant; callers that scan
-/// crossings along a rule centerline must construct [`PhysicalAxisCrossings`].
+/// crossings along a rule centerline must construct [`PhysicalGapJunctions`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::layout) struct GapBand {
     pub(in crate::layout) start: f32,
@@ -1008,19 +1034,36 @@ impl GapBand {
     }
 }
 
-/// Crossing gap portions in increasing physical centerline order.
+/// One gap junction formed by the union of crossing gap portions.
+///
+/// `members` retain their individual rule-list identities and finite flex
+/// line ranges. Only `span` is unioned for endpoint construction and inset
+/// percentage resolution.
+#[derive(Debug, Clone, PartialEq)]
+pub(in crate::layout) struct ResolvedGapJunction {
+    pub(in crate::layout) span: GapAxisSpan,
+    pub(in crate::layout) members: Vec<GapBand>,
+}
+
+impl ResolvedGapJunction {
+    pub(in crate::layout) fn width(&self) -> GapJunctionWidth {
+        GapJunctionWidth::new(self.span.size())
+    }
+}
+
+/// Gap junctions in increasing physical centerline order.
 ///
 /// CSS Gap Decorations builds the endpoints of one rule by walking its
 /// centerline from start to end. Flex layout, by contrast, supplies its
 /// gutters in CSS flex order so rule-list values can be assigned correctly.
 /// Those orders need not agree when wrapped lines have non-uniform main-axis
-/// gaps. This wrapper preserves each band's rule-list identity while making
-/// the physical traversal invariant explicit:
+/// gaps. Overlapping or abutting bands form one junction, while every member
+/// retains its rule-list identity:
 /// <https://drafts.csswg.org/css-gaps-1/#gap-decoration-segments>
 #[derive(Debug, Clone)]
-pub(in crate::layout) struct PhysicalAxisCrossings(Vec<GapBand>);
+pub(in crate::layout) struct PhysicalGapJunctions(Vec<ResolvedGapJunction>);
 
-impl PhysicalAxisCrossings {
+impl PhysicalGapJunctions {
     fn for_gap(gap: GapBand, crossings: &[GapBand]) -> Self {
         let mut crossings = crossings
             .iter()
@@ -1034,17 +1077,35 @@ impl PhysicalAxisCrossings {
                 .total_cmp(&right.start)
                 .then_with(|| left.end.total_cmp(&right.end))
         });
-        Self(crossings)
+        let mut junctions = Vec::<ResolvedGapJunction>::new();
+        for crossing in crossings {
+            if let Some(junction) = junctions.last_mut()
+                && crossing.start <= junction.span.end + GAP_RULE_EPSILON
+            {
+                junction.span.end = junction.span.end.max(crossing.end);
+                junction.members.push(crossing);
+            } else {
+                junctions.push(ResolvedGapJunction {
+                    span: GapAxisSpan::new(crossing.start, crossing.end),
+                    members: vec![crossing],
+                });
+            }
+        }
+        Self(junctions)
     }
 
-    fn iter(&self) -> impl Iterator<Item = GapBand> + '_ {
-        self.0.iter().copied()
+    fn iter(&self) -> impl Iterator<Item = &ResolvedGapJunction> {
+        self.0.iter()
     }
 
-    fn containing(&self, position: f32) -> Option<GapBand> {
-        self.iter().find(|crossing| {
-            crossing.start <= position + GAP_RULE_EPSILON
-                && crossing.end >= position - GAP_RULE_EPSILON
+    fn boundary(&self, position: f32, is_start: bool) -> Option<&ResolvedGapJunction> {
+        self.iter().find(|junction| {
+            let boundary = if is_start {
+                junction.span.end
+            } else {
+                junction.span.start
+            };
+            (boundary - position).abs() <= GAP_RULE_EPSILON
         })
     }
 }
@@ -1225,6 +1286,10 @@ pub(in crate::layout) struct GapDecorationSegment {
 pub(in crate::layout) struct GapRuleEndpoint {
     pub(in crate::layout) position: f32,
     pub(in crate::layout) kind: GapRuleEndpointKind,
+    /// Percentage basis determined by this endpoint's position. A cap at an
+    /// interior gap junction retains the junction width even though no
+    /// crossing decoration is present there.
+    pub(in crate::layout) junction_width: GapJunctionWidth,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1236,7 +1301,6 @@ pub(in crate::layout) enum GapRuleEndpointKind {
 /// The crossing geometry that exists only at a gap-rule junction.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::layout) struct GapRuleJunction {
-    pub(in crate::layout) crossing_gap: GapBand,
     pub(in crate::layout) crossing_rule_width: GapRuleWidth,
 }
 
@@ -1245,20 +1309,32 @@ impl GapRuleEndpoint {
         Self {
             position,
             kind: GapRuleEndpointKind::Cap,
+            junction_width: GapJunctionWidth::ZERO,
+        }
+    }
+
+    pub(in crate::layout) fn cap_at_junction(
+        position: f32,
+        junction_width: GapJunctionWidth,
+    ) -> Self {
+        Self {
+            position,
+            kind: GapRuleEndpointKind::Cap,
+            junction_width,
         }
     }
 
     pub(in crate::layout) fn junction(
         position: f32,
-        crossing_gap: GapBand,
+        junction_width: GapJunctionWidth,
         crossing_rule_width: GapRuleWidth,
     ) -> Self {
         Self {
             position,
             kind: GapRuleEndpointKind::Junction(GapRuleJunction {
-                crossing_gap,
                 crossing_rule_width,
             }),
+            junction_width,
         }
     }
 }
@@ -1373,8 +1449,9 @@ pub(in crate::layout) fn gap_rule_segments(
     if axis_end <= axis_start + GAP_RULE_EPSILON {
         return Vec::new();
     }
-    let boundary_start = gap_rule_boundary_endpoint(context, gap, axis_start, true);
-    let boundary_end = gap_rule_boundary_endpoint(context, gap, axis_end, false);
+    let junctions = PhysicalGapJunctions::for_gap(gap, context.crossing_gaps);
+    let boundary_start = gap_rule_boundary_endpoint(context, gap, axis_start, true, &junctions);
+    let boundary_end = gap_rule_boundary_endpoint(context, gap, axis_end, false, &junctions);
     let break_behavior = effective_rule_break(context);
     if break_behavior == css::GapRuleBreak::None {
         return vec![GapDecorationSegment {
@@ -1383,24 +1460,20 @@ pub(in crate::layout) fn gap_rule_segments(
         }];
     }
 
-    let crossings = PhysicalAxisCrossings::for_gap(gap, context.crossing_gaps);
     let mut segments = Vec::new();
     let mut cursor = axis_start;
-    for crossing_gap in crossings.iter() {
-        let crossing_rule_width =
-            crossing_width_for_gap(context, crossing_gap).unwrap_or(GapRuleWidth::ZERO);
-        let crossing_rule_can_paint =
-            crossing_can_paint_for_gap(context, crossing_gap).unwrap_or(false);
+    let mut cursor_endpoint = boundary_start;
+    for junction in junctions.iter() {
         // Flex has no track-area model that could make a suppressed crossing
         // discontinuous, so it can ignore the crossing altogether. Grid
         // still needs to split at its track junction: a spanning item can
         // make the two portions distinct even when the crossing rule itself
         // is suppressed. Those resulting endpoints are caps below.
-        if !crossing_rule_can_paint && context.container_kind != GapContainerKind::Grid {
+        if !resolved_junction_affects_segments(context, junction) {
             continue;
         }
-        let junction_start = crossing_gap.start.clamp(axis_start, axis_end);
-        let junction_end = crossing_gap.end.clamp(axis_start, axis_end);
+        let junction_start = junction.span.start.clamp(axis_start, axis_end);
+        let junction_end = junction.span.end.clamp(axis_start, axis_end);
         if junction_end <= axis_start + GAP_RULE_EPSILON
             || junction_start >= axis_end - GAP_RULE_EPSILON
         {
@@ -1408,54 +1481,20 @@ pub(in crate::layout) fn gap_rule_segments(
         }
         if junction_start > cursor + GAP_RULE_EPSILON {
             segments.push(GapDecorationSegment {
-                start: if cursor <= axis_start + GAP_RULE_EPSILON {
-                    boundary_start
-                } else {
-                    segment_start_endpoint(
-                        context,
-                        gap,
-                        cursor,
-                        crossing_gap,
-                        crossing_rule_width,
-                        crossing_rule_can_paint,
-                    )
-                },
-                end: segment_junction_endpoint(
-                    context,
-                    gap,
-                    junction_start,
-                    crossing_gap,
-                    crossing_rule_width,
-                    crossing_rule_can_paint,
-                ),
+                start: cursor_endpoint,
+                end: segment_junction_endpoint(context, gap, junction_start, junction),
             });
         }
-        if should_join_across_junction(context, gap, crossing_gap, own_width) {
+        if resolved_junction_joins_segments(context, gap, junction, own_width) {
             cursor = junction_start;
         } else {
             cursor = junction_end.max(cursor);
         }
+        cursor_endpoint = segment_junction_endpoint(context, gap, cursor, junction);
     }
     if axis_end > cursor + GAP_RULE_EPSILON {
         segments.push(GapDecorationSegment {
-            start: if cursor <= axis_start + GAP_RULE_EPSILON {
-                boundary_start
-            } else {
-                crossings
-                    .containing(cursor)
-                    .map(|crossing_gap| {
-                        segment_junction_endpoint(
-                            context,
-                            gap,
-                            cursor,
-                            crossing_gap,
-                            crossing_width_for_gap(context, crossing_gap)
-                                .unwrap_or(GapRuleWidth::ZERO),
-                            crossing_can_paint_for_gap(context, crossing_gap).unwrap_or(true),
-                        )
-                    })
-                    .unwrap_or_else(|| GapRuleEndpoint::cap(cursor))
-            },
+            start: cursor_endpoint,
             end: boundary_end,
         });
     }
@@ -1495,30 +1534,12 @@ fn gap_rule_boundary_endpoint(
     gap: GapBand,
     position: f32,
     is_start: bool,
+    junctions: &PhysicalGapJunctions,
 ) -> GapRuleEndpoint {
-    let Some(crossing_gap) = context.crossing_gaps.iter().copied().find(|crossing_gap| {
-        let boundary = if is_start {
-            crossing_gap.end
-        } else {
-            crossing_gap.start
-        };
-        crossing_portion_reaches_gap(gap, *crossing_gap)
-            && (boundary - position).abs() <= GAP_RULE_EPSILON
-    }) else {
+    let Some(junction) = junctions.boundary(position, is_start) else {
         return GapRuleEndpoint::cap(position);
     };
-    let crossing_rule_width =
-        crossing_width_for_gap(context, crossing_gap).unwrap_or(GapRuleWidth::ZERO);
-    let crossing_rule_can_paint =
-        crossing_can_paint_for_gap(context, crossing_gap).unwrap_or(false);
-    segment_junction_endpoint(
-        context,
-        gap,
-        position,
-        crossing_gap,
-        crossing_rule_width,
-        crossing_rule_can_paint,
-    )
+    segment_junction_endpoint(context, gap, position, junction)
 }
 
 /// Joins adjacent visible atomic portions of a normal grid gap rule.
@@ -1610,6 +1631,26 @@ pub(in crate::layout) fn should_join_across_junction(
         }
         _ => false,
     }
+}
+
+/// Whether every crossing portion contributing to one union junction permits
+/// the adjacent rule portions to join.
+///
+/// CSS defines the flanking condition over all perpendicular gaps that form
+/// the junction. A single discontiguous or unflanked member therefore keeps
+/// the rule split.
+pub(in crate::layout) fn resolved_junction_joins_segments(
+    context: AxisRuleContext<'_>,
+    gap: GapBand,
+    junction: &ResolvedGapJunction,
+    own_width: GapRuleWidth,
+) -> bool {
+    !junction.members.is_empty()
+        && junction
+            .members
+            .iter()
+            .copied()
+            .all(|crossing_gap| should_join_across_junction(context, gap, crossing_gap, own_width))
 }
 
 pub(in crate::layout) fn segment_crosses_spanning_item(
@@ -1831,7 +1872,7 @@ mod tests {
     }
 
     #[test]
-    fn physical_crossings_order_non_uniform_wrapped_flex_intersections() {
+    fn physical_crossings_form_union_junctions_without_losing_rule_order() {
         let mut style = solid_gap_rule_style();
         style.row_rule.rule_break = css::GapRuleBreak::Intersection;
         style.column_rule.widths =
@@ -1882,17 +1923,22 @@ mod tests {
                 rule_index: Some(3),
             },
         ];
-        let physical_crossings = PhysicalAxisCrossings::for_gap(row_gap, &crossings);
+        let junctions = PhysicalGapJunctions::for_gap(row_gap, &crossings);
         assert_eq!(
-            physical_crossings
+            junctions
                 .iter()
-                .map(|crossing| (crossing.start, crossing.end, crossing.rule_index))
+                .map(|junction| (
+                    junction.span,
+                    junction
+                        .members
+                        .iter()
+                        .map(|member| member.rule_index)
+                        .collect::<Vec<_>>()
+                ))
                 .collect::<Vec<_>>(),
             vec![
-                (100.0, 190.0, Some(0)),
-                (160.0, 250.0, Some(2)),
-                (360.0, 450.0, Some(3)),
-                (390.0, 480.0, Some(1)),
+                (GapAxisSpan::new(100.0, 250.0), vec![Some(0), Some(2)]),
+                (GapAxisSpan::new(360.0, 480.0), vec![Some(3), Some(1)]),
             ]
         );
         assert_eq!(
@@ -1929,6 +1975,163 @@ mod tests {
                 .map(|segment| (segment.start.position, segment.end.position))
                 .collect::<Vec<_>>(),
             vec![(0.0, 100.0), (250.0, 360.0), (480.0, 600.0)]
+        );
+    }
+
+    fn wrapped_flex_inset_segments(percent: f32) -> Vec<(f32, f32)> {
+        let mut style = solid_gap_rule_style();
+        style.row_rule.rule_break = css::GapRuleBreak::Intersection;
+        style.column_rule.widths =
+            css::GapRuleList::single(css::ComputedLengthPercentage::from_points(5.0));
+        style.column_rule.colors = css::GapRuleList::single(CssColor::new(255, 215, 0));
+        style.row_rule.widths =
+            css::GapRuleList::single(css::ComputedLengthPercentage::from_points(5.0));
+        style.row_rule.colors = css::GapRuleList::single(CssColor::new(255, 0, 0));
+        let inset = css::GapRuleInsetValue::LengthPercentage(
+            css::ComputedLengthPercentage::from_percent(percent),
+        );
+        style.row_rule.inset_junction_start = inset.clone();
+        style.row_rule.inset_junction_end = inset;
+
+        let row_gap = GapBand {
+            start: 50.0,
+            end: 60.0,
+            grid_line: None,
+            segment_range: Some(GapAxisSpan::new(0.0, 400.0)),
+            rule_index: Some(0),
+        };
+        let top_range = Some(GapAxisSpan::new(0.0, 50.0));
+        let bottom_range = Some(GapAxisSpan::new(60.0, 110.0));
+        let crossings = [
+            (70.0, 82.5, top_range, 0),
+            (152.5, 165.0, top_range, 1),
+            (235.0, 247.5, top_range, 2),
+            (317.5, 330.0, top_range, 3),
+            (70.0, 110.0, bottom_range, 4),
+            (180.0, 220.0, bottom_range, 5),
+            (290.0, 330.0, bottom_range, 6),
+        ]
+        .map(|(start, end, segment_range, rule_index)| GapBand {
+            start,
+            end,
+            grid_line: None,
+            segment_range,
+            rule_index: Some(rule_index),
+        });
+        let row_gaps = [AssignedGapBand::new(row_gap, gap_rule_slot(0, 1))];
+        axis_rule_paint_segments(AxisRuleContext {
+            kind: GapRuleAxisKind::Row,
+            container_kind: GapContainerKind::Flex,
+            rule: &style.row_rule,
+            crossing_rule: &style.column_rule,
+            container: GapDecorationContainer::new(0.0, 110.0, 400.0, 110.0),
+            gaps: &row_gaps,
+            crossing_gaps: &crossings,
+            items: &[],
+        })
+        .into_iter()
+        .map(|segment| (segment.segment.start.position, segment.segment.end.position))
+        .collect()
+    }
+
+    #[test]
+    fn wrapped_flex_union_junctions_resolve_negative_quarter_insets() {
+        assert_eq!(
+            wrapped_flex_inset_segments(-0.25),
+            vec![
+                (0.0, 80.0),
+                (100.0, 155.625),
+                (161.875, 190.0),
+                (210.0, 238.125),
+                (244.375, 300.0),
+                (320.0, 400.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn wrapped_flex_union_junctions_resolve_negative_half_insets() {
+        assert_eq!(wrapped_flex_inset_segments(-0.5), vec![(0.0, 400.0)]);
+    }
+
+    #[test]
+    fn wrapped_flex_union_junctions_resolve_positive_half_insets() {
+        assert_eq!(
+            wrapped_flex_inset_segments(0.5),
+            vec![
+                (0.0, 50.0),
+                (130.0, 146.25),
+                (253.75, 270.0),
+                (350.0, 400.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn union_junction_overlap_join_uses_widest_visible_crossing_rule() {
+        let mut style = solid_gap_rule_style();
+        style.column_rule.widths = css::GapRuleList::from_parts(
+            vec![
+                css::GapRuleListComponent::Value(css::ComputedLengthPercentage::from_points(2.0)),
+                css::GapRuleListComponent::Value(css::ComputedLengthPercentage::from_points(8.0)),
+            ],
+            None,
+            Vec::new(),
+        );
+        style.column_rule.colors = css::GapRuleList::single(CssColor::new(0, 0, 255));
+        let row_gap = GapBand {
+            start: 50.0,
+            end: 60.0,
+            grid_line: None,
+            segment_range: Some(GapAxisSpan::new(0.0, 100.0)),
+            rule_index: Some(0),
+        };
+        let crossings = [
+            GapBand {
+                start: 10.0,
+                end: 30.0,
+                grid_line: None,
+                segment_range: Some(GapAxisSpan::new(0.0, 50.0)),
+                rule_index: Some(0),
+            },
+            GapBand {
+                start: 10.0,
+                end: 50.0,
+                grid_line: None,
+                segment_range: Some(GapAxisSpan::new(60.0, 110.0)),
+                rule_index: Some(1),
+            },
+        ];
+        let junctions = PhysicalGapJunctions::for_gap(row_gap, &crossings);
+        let context = AxisRuleContext {
+            kind: GapRuleAxisKind::Row,
+            container_kind: GapContainerKind::Flex,
+            rule: &style.row_rule,
+            crossing_rule: &style.column_rule,
+            container: GapDecorationContainer::new(0.0, 110.0, 100.0, 110.0),
+            gaps: &[],
+            crossing_gaps: &crossings,
+            items: &[],
+        };
+        let endpoint = segment_junction_endpoint(
+            context,
+            row_gap,
+            10.0,
+            junctions.iter().next().expect("union junction exists"),
+        );
+
+        assert_eq!(
+            used_gap_rule_endpoint_inset(
+                css::GapRuleInsetValue::LengthPercentage(
+                    css::ComputedLengthPercentage::from_percent(0.5),
+                ),
+                endpoint,
+            ),
+            20.0
+        );
+        assert_eq!(
+            used_gap_rule_endpoint_inset(css::GapRuleInsetValue::OverlapJoin, endpoint),
+            -24.0
         );
     }
 

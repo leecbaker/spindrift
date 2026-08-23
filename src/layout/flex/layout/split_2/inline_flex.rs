@@ -478,7 +478,7 @@ impl<'a> LayoutBuilder<'a> {
                 0.0,
                 InlineVisualOffset::zero(),
                 style,
-                style.text_decoration_layers.clone(),
+                style.text_decoration_origins.effective_layers_vec(),
                 &mut items,
             );
             let measurement =
@@ -659,10 +659,11 @@ impl<'a> LayoutBuilder<'a> {
         // the border-box conversion above typed until this projection.
         let border_box_height_points = border_box_height.points();
         let inline_atom_baselines = (!containment.layout).then(|| {
-            flex_layout.baselines.into_inline_atom_baselines(
+            let baselines = flex_layout.baselines.into_inline_atom_baselines(
                 layout_pt(border_widths.top + style.padding.top),
                 layout_pt(border_widths.left + style.padding.left),
-            )
+            );
+            self.inline_flex_baselines_as_alphabetic(baselines, style)
         });
         // The off-page atom capture may lay out descendant lines, but they
         // are not principal lines of an ancestor list item. Keep the
@@ -753,16 +754,7 @@ impl<'a> LayoutBuilder<'a> {
                 })
                 .flatten()
                 .or_else(|| {
-                    placed_style
-                        .writing_mode
-                        .has_vertical_lines()
-                        .then(|| {
-                            replay_dimensions.logical_inline_size_for_replay(
-                                placed_style.writing_mode,
-                                replay_content_height,
-                            )
-                        })
-                        .flatten()
+                    Some(replay_dimensions.logical_inline_content_size_for_replay(&placed_style))
                 });
             self.with_placed_formatting_context(
                 PlacedFormattingContext {
@@ -1281,7 +1273,7 @@ impl<'a> LayoutBuilder<'a> {
             size: PageSize::from_points(context.item_width.points().max(1.0), offpage_top),
             margins: PageMargins::all_points(0.0),
             edges: PageBoxEdges::ZERO,
-            rotation: snapshot.current_page_context.rotation,
+            rotation: snapshot.current_page_context().rotation,
         };
         self.current_page = page_for_context(replay_page_context);
         self.current_page_context = replay_page_context;
@@ -1293,7 +1285,7 @@ impl<'a> LayoutBuilder<'a> {
                 ),
                 margins: PageMargins::all_points(0.0),
                 edges: PageBoxEdges::ZERO,
-                rotation: snapshot.current_page_context.rotation,
+                rotation: snapshot.current_page_context().rotation,
             };
             self.fragmentainer_override = Some(FragmentainerOverride {
                 kind: FragmentainerKind::Page,
@@ -1586,6 +1578,41 @@ impl<'a> LayoutBuilder<'a> {
                 .clone_for_legacy_used_consumer();
         }
     }
+
+    /// Resolve a Flex-generated named baseline set to the legacy alphabetic
+    /// coordinate consumed by atomic inline geometry.
+    ///
+    /// Flexbox exports a set generated from an item's alignment baseline.
+    /// That can be central in vertical mixed/upright text, while the generic
+    /// atomic-inline coordinate remains alphabetic.  Projecting the font
+    /// table delta through the flex container's own logical block direction
+    /// keeps line sizing and fragment replay on the same coordinate:
+    /// <https://www.w3.org/TR/css-flexbox-1/#flex-baselines>,
+    /// <https://drafts.csswg.org/css-align-3/#baseline-alignment>, and
+    /// <https://www.w3.org/TR/css-inline-3/#baseline-alignment>.
+    fn inline_flex_baselines_as_alphabetic(
+        &mut self,
+        baselines: crate::layout::baseline::PhysicalBaselineSets,
+        style: &ComputedStyle,
+    ) -> crate::layout::baseline::PhysicalBaselineSets {
+        let mut alphabetic_adjustment = |metric| {
+            if metric == BaselineMetric::Alphabetic {
+                return layout_pt(0.0);
+            }
+            let logical_delta = self
+                .font_system
+                .baseline_offset_for_style(style, BaselineMetric::Alphabetic)
+                - self.font_system.baseline_offset_for_style(style, metric);
+            match block_start_side(style.writing_mode) {
+                PhysicalSide::Top | PhysicalSide::Left => logical_delta,
+                PhysicalSide::Bottom | PhysicalSide::Right => -logical_delta,
+            }
+        };
+        baselines.normalized_to_alphabetic(
+            alphabetic_adjustment(baselines.vertical_metric),
+            alphabetic_adjustment(baselines.horizontal_metric),
+        )
+    }
 }
 
 /// Translate a frozen descendant source canvas into one flex continuation.
@@ -1683,6 +1710,7 @@ mod inline_flex_baseline_tests {
                 first: Some(flex_horizontal_baseline_from_points(8.0)),
                 last: Some(flex_horizontal_baseline_from_points(12.0)),
             },
+            ..FlexContainerBaselineSets::default()
         }
         .into_inline_atom_baselines(layout_pt(4.0), layout_pt(5.0));
         assert_eq!(baselines.vertical.first.unwrap().points(), 10.0);

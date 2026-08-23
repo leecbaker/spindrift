@@ -110,34 +110,6 @@ pub(in crate::layout) fn inline_fragment_is_pre_wrap_hanging_space(
         && fragment.text().chars().all(is_css_preserved_document_space)
 }
 
-/// Return the inline-end `letter-spacing` advance excluded from mixed lines.
-///
-/// CSS Text line-edge tracking is excluded only for the final text fragment;
-/// atomic inline boxes do not generate character tracking:
-/// <https://www.w3.org/TR/css-text-3/#letter-spacing-property>.
-pub(in crate::layout) fn trailing_letter_spacing_width_for_line_items<T>(line: &[T]) -> f32
-where
-    T: AsRef<InlineLineItem>,
-{
-    line.iter()
-        .rev()
-        .find_map(|item| match item.as_ref() {
-            InlineLineItem::Fragment(fragment) if !fragment.text().is_empty() => {
-                // Graph-backed fragments have already moved terminal shaper
-                // tracking into explicit visual-boundary advances.  Keep the
-                // legacy fallback for isolated test and compatibility items.
-                Some(if fragment.tracking_scope().is_none() {
-                    line_end_letter_spacing_width(fragment.text(), fragment.style()).points()
-                } else {
-                    0.0
-                })
-            }
-            InlineLineItem::Atom(_) => Some(0.0),
-            _ => None,
-        })
-        .unwrap_or(0.0)
-}
-
 pub(in crate::layout) fn trailing_hanging_space_separator_width_for_line_items<T>(
     line: &[T],
     font_system: &mut FontSystem,

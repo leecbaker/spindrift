@@ -5,13 +5,16 @@
 //! rendered documents self-contained without retaining one expanded raster for
 //! every image use.
 
-use crate::units::{CssPixelSize, RasterPixelSize};
-use image::metadata::Orientation;
-use image::{AnimationDecoder, ColorType, ImageDecoder, ImageReader};
 use std::collections::HashMap;
 use std::io::{BufReader, Cursor};
 use std::rc::Rc;
+
+use image::metadata::Orientation;
+use image::{AnimationDecoder, ColorType, ImageDecoder, ImageReader};
 use url::Url;
+
+use crate::mime::{MimeEssence, parse_mime_type_essence, parse_valid_mime_type_essence};
+use crate::units::{CssPixelSize, RasterPixelSize};
 
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 /// Keep the allocation allowance used by `image`'s previous PNG decoder.
@@ -66,18 +69,23 @@ pub(crate) enum MimeSupport {
 
 /// Classify a CSS `type()` descriptor against Quire's actual image decoders.
 pub(crate) fn image_mime_support(mime_type: &str) -> MimeSupport {
-    let Some(mime_type) = declared_mime_essence(mime_type) else {
+    let Some(mime_type) = parse_valid_mime_type_essence(mime_type) else {
         return MimeSupport::Unsupported;
     };
-    let supported = matches!(
-        mime_type.as_str(),
-        "image/svg+xml" | "image/jxl" | "image/png"
-    ) || image::ImageFormat::from_mime_type(&mime_type).is_some_and(|format| {
+    image_mime_essence_support(&mime_type)
+}
+
+fn image_mime_essence_support(mime_type: &MimeEssence) -> MimeSupport {
+    let supported =
         matches!(
-            format,
-            image::ImageFormat::Jpeg | image::ImageFormat::Gif | image::ImageFormat::WebP
-        )
-    });
+            mime_type.as_str(),
+            "image/svg+xml" | "image/jxl" | "image/png"
+        ) || image::ImageFormat::from_mime_type(mime_type.as_str()).is_some_and(|format| {
+            matches!(
+                format,
+                image::ImageFormat::Jpeg | image::ImageFormat::Gif | image::ImageFormat::WebP
+            )
+        });
     if supported {
         MimeSupport::Supported
     } else {
@@ -85,94 +93,18 @@ pub(crate) fn image_mime_support(mime_type: &str) -> MimeSupport {
     }
 }
 
-/// Return the normalized media-type essence from a `type()` descriptor.
-///
-/// Parameters do not affect decoder selection, but the essence must retain
-/// the RFC media-type token shape so malformed descriptors never accidentally
-/// match a decoder. CSS Images treats an unknown type as an unsupported
-/// candidate rather than making the surrounding `image-set()` syntactically
-/// invalid.
-fn declared_mime_essence(value: &str) -> Option<String> {
-    let value = value.trim_matches(|character: char| character.is_ascii_whitespace());
-    let (essence, parameters) = value
-        .split_once(';')
-        .map_or((value, None), |(head, tail)| (head, Some(tail)));
-    if let Some(parameters) = parameters {
-        for parameter in parameters.split(';') {
-            let parameter =
-                parameter.trim_matches(|character: char| character.is_ascii_whitespace());
-            let (name, value) = parameter.split_once('=')?;
-            if name.is_empty()
-                || !name.bytes().all(is_mime_token_character)
-                || !valid_mime_parameter_value(
-                    value.trim_matches(|character: char| character.is_ascii_whitespace()),
-                )
-            {
-                return None;
-            }
-        }
-    }
-    let (type_, subtype) = essence.split_once('/')?;
-    if type_.is_empty()
-        || subtype.is_empty()
-        || subtype.contains('/')
-        || !type_.bytes().all(is_mime_token_character)
-        || !subtype.bytes().all(is_mime_token_character)
-    {
-        return None;
-    }
-    Some(essence.to_ascii_lowercase())
-}
-
-/// Validate the token-or-quoted-string parameter grammar used by the
-/// MIME Sniffing standard's `is a valid MIME type string` algorithm.
-/// <https://mimesniff.spec.whatwg.org/#valid-mime-type-string>
-fn valid_mime_parameter_value(value: &str) -> bool {
-    if value.is_empty() {
-        return false;
-    }
-    if let Some(quoted) = value
-        .strip_prefix('"')
-        .and_then(|value| value.strip_suffix('"'))
-    {
-        let mut escaped = false;
-        for byte in quoted.bytes() {
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte.is_ascii_control() || byte == b'"' {
-                return false;
-            }
-        }
-        return !escaped;
-    }
-    value.bytes().all(is_mime_token_character)
-}
-
-fn is_mime_token_character(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric()
-        || matches!(
-            byte,
-            b'!' | b'#'
-                | b'$'
-                | b'%'
-                | b'&'
-                | b'\''
-                | b'*'
-                | b'+'
-                | b'-'
-                | b'.'
-                | b'^'
-                | b'_'
-                | b'`'
-                | b'|'
-                | b'~'
-        )
-}
-
 pub(crate) fn supports_declared_image_mime_type(mime_type: &str) -> bool {
     image_mime_support(mime_type) == MimeSupport::Supported
+}
+
+/// Return whether HTML `<source type>` can select an image decoder.
+///
+/// HTML evaluates the MIME type after the recoverable MIME parsing algorithm,
+/// unlike CSS `image-set()` which requires a valid MIME type string.
+/// <https://html.spec.whatwg.org/multipage/images.html#updating-the-source-set>
+pub(crate) fn supports_html_source_image_mime_type(mime_type: &str) -> bool {
+    parse_mime_type_essence(mime_type)
+        .is_some_and(|mime_type| image_mime_essence_support(&mime_type) == MimeSupport::Supported)
 }
 
 /// Stable, document-local reference to an image source.
@@ -644,6 +576,19 @@ impl DocumentImageStore {
         if let Some(id) = existing {
             return Some((id, self.metadata(id)?));
         }
+        // `image-orientation: from-image` and the encoded representation are
+        // identical when the source has no orientation transform. Reuse the
+        // established document-local identity instead of retaining the same
+        // bytes twice merely because an early availability check used the
+        // encoded policy.
+        let alternate = if orientation_policy.applies_metadata_orientation() {
+            self.urls.get(&url).copied()
+        } else {
+            self.oriented_urls.get(&url).copied()
+        };
+        if let Some(id) = alternate.filter(|id| self.orientation_is_noop(*id)) {
+            return Some((id, self.metadata(id)?));
+        }
         let (id, metadata) = self.insert(bytes, orientation_policy)?;
         if orientation_policy.applies_metadata_orientation() {
             self.oriented_urls.insert(url, id);
@@ -665,6 +610,14 @@ impl DocumentImageStore {
             self.data_urls.get(source).cloned()
         };
         if let Some(id) = existing {
+            return Some((id, self.metadata(id)?));
+        }
+        let alternate = if orientation_policy.applies_metadata_orientation() {
+            self.data_urls.get(source).copied()
+        } else {
+            self.oriented_data_urls.get(source).copied()
+        };
+        if let Some(id) = alternate.filter(|id| self.orientation_is_noop(*id)) {
             return Some((id, self.metadata(id)?));
         }
         let (id, metadata) = self.insert(bytes, orientation_policy)?;
@@ -694,6 +647,16 @@ impl DocumentImageStore {
             color_space,
         }));
         Some((id, metadata))
+    }
+
+    fn orientation_is_noop(&self, id: ImageId) -> bool {
+        matches!(
+            self.images.get(id.index()),
+            Some(ImageAsset::Encoded(EncodedImage {
+                source_orientation: Orientation::NoTransforms,
+                ..
+            }))
+        )
     }
 
     pub(crate) fn metadata(&self, id: ImageId) -> Option<ImageMetadata> {
@@ -1451,9 +1414,10 @@ fn jpeg_xl_metadata(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use base64::Engine as _;
     use image::{ExtendedColorType, Frame, ImageEncoder, RgbaImage};
+
+    use super::*;
 
     #[test]
     fn image_set_mime_parameters_require_valid_mime_syntax() {

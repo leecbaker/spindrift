@@ -1,8 +1,9 @@
+use std::collections::HashSet;
+use std::rc::Rc;
+
 use super::*;
 use crate::layout::assets::{DocumentPageIndex, PendingPositionedFragmentation};
 use crate::layout::block::DirectBlockLayoutConstraint;
-use std::collections::HashSet;
-use std::rc::Rc;
 
 impl PhysicalInlineTextBounds {
     pub(in crate::layout) fn new(baseline_origin: InlinePoint, inline_size: f32) -> Self {
@@ -338,8 +339,6 @@ pub(in crate::layout) struct InlineAtomData {
     /// The containing inline scope. Atomic boxes use their parent scope so an
     /// atom's own style cannot own tracking on its outside boundaries.
     pub(in crate::layout) tracking_scope: Option<Rc<InlineTrackingScope>>,
-    /// Paintless advance inserted before this item after visual ordering.
-    pub(in crate::layout) leading_tracking: LayoutLength,
     /// Fragment-local foreground used to resolve deferred `currentcolor` at a
     /// selected inline box edge. The lexical style remains stable for source
     /// edge-ownership matching.
@@ -450,7 +449,6 @@ impl InlineAtom {
                 link_target: link_target.map(Rc::from),
                 alt_text: alt_text.map(Rc::from),
                 tracking_scope: None,
-                leading_tracking: layout_pt(0.0),
                 current_color_override: None,
             }),
             size,
@@ -491,6 +489,40 @@ impl InlineAtom {
         self
     }
 
+    /// Update a CSS Text autospace marker after its lexical owner or
+    /// first-line style has been resolved. The atom remains non-painting and
+    /// keeps a zero block extent; only its logical inline advance and owner
+    /// style participate in line layout.
+    /// <https://drafts.csswg.org/css-text-4/#text-autospace-property>
+    pub(in crate::layout) fn set_text_autospace_advance(
+        &mut self,
+        style: &ComputedStyle,
+        advance: LayoutLength,
+    ) {
+        let data = Rc::make_mut(&mut self.data);
+        let InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace(spacing)) =
+            &mut data.content
+        else {
+            unreachable!("only text-autospace atoms have a style-dependent advance");
+        };
+        *spacing = InlineTextBoundarySpacing::new(advance);
+        data.style = Rc::new(style.clone().into_inline_atom_used_style());
+        self.size = InlineSize::new(advance.points(), 0.0);
+    }
+
+    /// Turn a transparent inline-box edge into a metrics-only line strut.
+    /// The atom retains its zero advance and never paints.
+    pub(in crate::layout) fn mark_metrics_only_strut(&mut self) {
+        let data = Rc::make_mut(&mut self.data);
+        let InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge)) = &data.content else {
+            unreachable!("only a transparent inline-box edge can become a metrics strut");
+        };
+        debug_assert_eq!(edge.advance, 0.0);
+        debug_assert_eq!(edge.paint_extent, 0.0);
+        debug_assert!(!edge.is_positioning_marker());
+        data.content = InlineAtomContent::InlineEdge(InlineEdgeRole::MetricsOnlyStrut);
+    }
+
     pub(in crate::layout) fn tracking_scope(&self) -> Option<&Rc<InlineTrackingScope>> {
         self.data.tracking_scope.as_ref()
     }
@@ -520,17 +552,6 @@ impl InlineAtom {
                 self.line_relative_scope()
                     .and_then(InlineTrackingScope::line_relative_alignment)
             })
-    }
-
-    pub(in crate::layout) fn leading_tracking(&self) -> LayoutLength {
-        self.data.leading_tracking
-    }
-
-    pub(in crate::layout) fn set_leading_tracking(&mut self, advance: LayoutLength) {
-        if self.data.leading_tracking == advance {
-            return;
-        }
-        Rc::make_mut(&mut self.data).leading_tracking = advance;
     }
 
     pub(in crate::layout) fn with_outside_marker(mut self, marker: Option<ListMarker>) -> Self {
@@ -725,17 +746,40 @@ impl InlineAtom {
     }
 }
 
+/// Stable source identity for an inline float.
+///
+/// Inline-source floats normally originate from a DOM element, but CSS 2
+/// permits `float` on `::first-letter`.  That pseudo has no element identity,
+/// so its source-order marker is keyed by its first-letter group instead.
+/// <https://www.w3.org/TR/CSS21/selector.html#first-letter>
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(in crate::layout) enum InlineFloatId {
+    Element(ElementId),
+    FirstLetter(FirstLetterPseudoGroupId),
+}
+
+/// The content owned by an inline-source float.
+#[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
+pub(in crate::layout) enum InlineFloatContents {
+    Element {
+        element: Element,
+        signature: ElementSignature,
+        generated_content: bool,
+    },
+    /// The complete stream-selected `::first-letter` text.  This remains a
+    /// text payload instead of impersonating a DOM element so punctuation and
+    /// text split across transparent inline boundaries keep their ownership.
+    FirstLetterText {
+        fragments: Rc<[InlineFragment]>,
+        group_id: FirstLetterPseudoGroupId,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub(in crate::layout) struct InlineFloatData {
-    pub(in crate::layout) element: Element,
-    pub(in crate::layout) signature: ElementSignature,
+    pub(in crate::layout) contents: InlineFloatContents,
     pub(in crate::layout) style: ComputedStyle,
-    /// Generated pseudo-elements are tree-abiding boxes with their own
-    /// generated-content children.  They must not be rehydrated from the
-    /// originating element's DOM descendants when the inline float is laid
-    /// out later.
-    /// <https://www.w3.org/TR/css-pseudo-4/#generated-content>
-    pub(in crate::layout) generated_content: bool,
     pub(in crate::layout) positioning_containing_block:
         Option<InlinePositioningContainingBlockSource>,
 }
@@ -749,7 +793,42 @@ pub(in crate::layout) struct InlineFloatData {
 pub(in crate::layout) struct InlinePositioningContainingBlockSource {
     pub(in crate::layout) id: InlinePositioningContainingBlockId,
     /// Used padding-box geometry of the positioned inline ancestor.
-    pub(in crate::layout) style: css::ZoomedLayoutStyle,
+    pub(in crate::layout) style: Box<css::ZoomedLayoutStyle>,
+}
+
+impl InlinePositioningContainingBlockSource {
+    /// Borrow this source while collecting descendants inside its lexical
+    /// inline scope. Deferred descendants must call [`Self::as_borrowed`]
+    /// and promote that view back to an owned source before the scope ends.
+    pub(in crate::layout) fn as_borrowed(
+        &self,
+    ) -> BorrowedInlinePositioningContainingBlockSource<'_> {
+        BorrowedInlinePositioningContainingBlockSource {
+            id: self.id,
+            style: self.style.as_ref(),
+        }
+    }
+}
+
+/// A positioned inline containing-block source borrowed from its active
+/// lexical inline scope.
+///
+/// This keeps the complete resolved style out of recursive collector frames.
+/// A deferred descendant promotes this view to
+/// [`InlinePositioningContainingBlockSource`] before its parent scope returns.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout) struct BorrowedInlinePositioningContainingBlockSource<'a> {
+    pub(in crate::layout) id: InlinePositioningContainingBlockId,
+    pub(in crate::layout) style: &'a css::ZoomedLayoutStyle,
+}
+
+impl BorrowedInlinePositioningContainingBlockSource<'_> {
+    pub(in crate::layout) fn into_owned(self) -> InlinePositioningContainingBlockSource {
+        InlinePositioningContainingBlockSource {
+            id: self.id,
+            style: Box::new(self.style.clone()),
+        }
+    }
 }
 
 /// Stable identity for one collected inline containing-block source.
@@ -775,21 +854,57 @@ impl InlineFloat {
     ) -> Self {
         Self {
             data: Rc::new(InlineFloatData {
-                element,
-                signature,
+                contents: InlineFloatContents::Element {
+                    element,
+                    signature,
+                    generated_content,
+                },
                 style,
-                generated_content,
+
                 positioning_containing_block,
             }),
         }
     }
 
-    pub(in crate::layout) fn element(&self) -> &Element {
-        &self.data.element
+    pub(in crate::layout) fn first_letter(
+        fragments: Vec<InlineFragment>,
+        group_id: FirstLetterPseudoGroupId,
+        style: ComputedStyle,
+    ) -> Self {
+        Self {
+            data: Rc::new(InlineFloatData {
+                contents: InlineFloatContents::FirstLetterText {
+                    fragments: Rc::from(fragments.into_boxed_slice()),
+                    group_id,
+                },
+                style,
+
+                positioning_containing_block: None,
+            }),
+        }
     }
 
-    pub(in crate::layout) fn signature(&self) -> &ElementSignature {
-        &self.data.signature
+    pub(in crate::layout) fn id(&self) -> InlineFloatId {
+        match &self.data.contents {
+            InlineFloatContents::Element { element, .. } => InlineFloatId::Element(element.id),
+            InlineFloatContents::FirstLetterText { group_id, .. } => {
+                InlineFloatId::FirstLetter(*group_id)
+            }
+        }
+    }
+
+    pub(in crate::layout) fn element(&self) -> Option<&Element> {
+        match &self.data.contents {
+            InlineFloatContents::Element { element, .. } => Some(element),
+            InlineFloatContents::FirstLetterText { .. } => None,
+        }
+    }
+
+    pub(in crate::layout) fn signature(&self) -> Option<&ElementSignature> {
+        match &self.data.contents {
+            InlineFloatContents::Element { signature, .. } => Some(signature),
+            InlineFloatContents::FirstLetterText { .. } => None,
+        }
     }
 
     pub(in crate::layout) fn style(&self) -> &ComputedStyle {
@@ -797,7 +912,20 @@ impl InlineFloat {
     }
 
     pub(in crate::layout) fn is_generated_content(&self) -> bool {
-        self.data.generated_content
+        matches!(
+            self.data.contents,
+            InlineFloatContents::Element {
+                generated_content: true,
+                ..
+            }
+        )
+    }
+
+    pub(in crate::layout) fn first_letter_fragments(&self) -> Option<&[InlineFragment]> {
+        match &self.data.contents {
+            InlineFloatContents::FirstLetterText { fragments, .. } => Some(fragments),
+            InlineFloatContents::Element { .. } => None,
+        }
     }
 
     pub(in crate::layout) fn positioning_containing_block(
@@ -1072,6 +1200,15 @@ pub(in crate::layout) enum InlineLogicalEdge {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::layout) enum InlineEdgeRole {
     BoxEdge(InlineBoxEdgeFragment),
+    /// A zero-advance empty inline scope that contributes only its resolved
+    /// strut metrics to the line. It has no box geometry, paint, or text.
+    ///
+    /// CSS Inline line layout uses an inline box's font metrics even when the
+    /// box has no glyph-bearing descendants. Keeping this distinct from a
+    /// transparent box edge lets list-marker anchoring observe that first
+    /// line without manufacturing a decoration or inline advance.
+    /// <https://drafts.csswg.org/css-inline-3/#line-height>
+    MetricsOnlyStrut,
     /// A CSS Text `text-autospace` advance bound to one logical text edge.
     ///
     /// The atom is only the graph carrier: it has no source text, paint, or
@@ -1091,28 +1228,15 @@ pub(in crate::layout) enum InlineEdgeRole {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::layout) struct InlineTextBoundarySpacing {
     advance: LayoutLength,
-    /// The source-side character class identifies which visual edge remains
-    /// attached to the logical predecessor after UAX #9 reverses a run.
-    predecessor_is_ideograph: bool,
 }
 
 impl InlineTextBoundarySpacing {
-    pub(in crate::layout) const fn new(
-        advance: LayoutLength,
-        predecessor_is_ideograph: bool,
-    ) -> Self {
-        Self {
-            advance,
-            predecessor_is_ideograph,
-        }
+    pub(in crate::layout) const fn new(advance: LayoutLength) -> Self {
+        Self { advance }
     }
 
     pub(in crate::layout) const fn advance(self) -> LayoutLength {
         self.advance
-    }
-
-    pub(in crate::layout) const fn predecessor_is_ideograph(self) -> bool {
-        self.predecessor_is_ideograph
     }
 }
 
@@ -1182,14 +1306,14 @@ impl AsRef<InlineLineItem> for InlineLineItem {
     }
 }
 
-/// Mutable layout state that must roll back after a speculative layout pass.
+/// Mutable layout state owned by a speculative layout pass.
 ///
 /// Persistent source caches, pass configuration, and durable replay artifacts
 /// deliberately do not belong here. New mutable builder state must be placed
 /// in an explicit ownership class rather than silently omitted from replay
 /// rollback.
 #[derive(Debug, Clone)]
-pub(in crate::layout) struct RollbackLayoutState {
+pub(in crate::layout) struct SpeculativeLayoutState {
     pub(in crate::layout) pages: Vec<Page>,
     pub(in crate::layout) page_names: Vec<Option<String>>,
     pub(in crate::layout) page_blanks: Vec<bool>,
@@ -1225,7 +1349,7 @@ pub(in crate::layout) struct RollbackLayoutState {
     pub(in crate::layout) footnote_measurements: Vec<FootnoteMeasurement>,
     pub(in crate::layout) rendered_footnote_measurements: Vec<FootnoteMeasurement>,
     pub(in crate::layout) measured_footnotes: HashSet<ElementId>,
-    pub(in crate::layout) committed_inline_floats: HashMap<ElementId, CommittedInlineFloat>,
+    pub(in crate::layout) committed_inline_floats: HashMap<InlineFloatId, CommittedInlineFloat>,
     pub(in crate::layout) rendered_footnotes: HashSet<ElementId>,
     pub(in crate::layout) footnote_measurement_depth: usize,
     pub(in crate::layout) fragmentation_suppression_depth: usize,
@@ -1265,6 +1389,7 @@ pub(in crate::layout) struct RollbackLayoutState {
     pub(in crate::layout) escaped_atom_positioning_depth: usize,
     pub(in crate::layout) escaped_atom_containing_block: Option<ContainingBlock>,
     pub(in crate::layout) escaped_atom_positioning_context: Option<EscapedAtomPositioningContext>,
+    pub(in crate::layout) containing_block_direction: Direction,
     pub(in crate::layout) containing_block_writing_mode: WritingMode,
     pub(in crate::layout) fragment_top_offsets: Vec<FragmentTopOffset>,
     pub(in crate::layout) child_available_space_stack: Vec<ChildAvailableSpace>,
@@ -1318,23 +1443,6 @@ pub(in crate::layout) struct RollbackLayoutState {
     pub(in crate::layout) preserve_scoped_paint_public_order: bool,
     pub(in crate::layout) defer_next_block_decoration_promotion: bool,
     pub(in crate::layout) pending_page_footnotes: Vec<ElementId>,
-}
-
-/// Opaque checkpoint for one speculative layout pass.
-///
-/// The wrapper prevents callers from constructing an incomplete snapshot and
-/// keeps the complete rollback field set in [`RollbackLayoutState`].
-#[derive(Debug, Clone)]
-pub(in crate::layout) struct LayoutSnapshot {
-    pub(in crate::layout) rollback: RollbackLayoutState,
-}
-
-impl std::ops::Deref for LayoutSnapshot {
-    type Target = RollbackLayoutState;
-
-    fn deref(&self) -> &Self::Target {
-        &self.rollback
-    }
 }
 
 /// One successful source-order inline-float placement.

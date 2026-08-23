@@ -1,12 +1,15 @@
-use crate::css::layout_pt;
-use crate::{
-    Css, Document, DocumentDate, PdfOptions, RenderOptions, ResourcePolicy, Result, css, dom,
-    layout, resource, timing::DebugTimer,
-};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
+
 use url::Url;
+
+use crate::css::layout_pt;
+use crate::timing::DebugTimer;
+use crate::{
+    Css, Document, DocumentDate, PdfOptions, RenderOptions, ResourcePolicy, Result, css, dom,
+    layout, resource,
+};
 
 /// Input markup syntax used for document parsing.
 ///
@@ -408,6 +411,7 @@ impl Html {
         // Keep the primary document, linked stylesheets, and font loading on
         // the caller's strict fetcher above.
         // <https://drafts.csswg.org/css-images-3/#image-fallbacks>
+        resolve_html_image_sources(&mut root, &media_environment);
         let mut visual_asset_policy = resource_fetcher.policy();
         visual_asset_policy.error_policy = resource::FetchErrorPolicy::Allow;
         let visual_asset_fetcher = resource::ResourceFetcher::new(visual_asset_policy)?;
@@ -433,7 +437,7 @@ impl Html {
                 self.root_url(),
             )
             .await;
-        resolve_object_rendering_states(
+        resolve_embedded_rendering_states(
             &mut root,
             self.base_url(),
             self.root_url(),
@@ -816,7 +820,97 @@ fn resource_paths(
     paths
 }
 
-/// Resolve the static representation selected for every HTML `<object>`.
+/// Select the static image source before visual-resource discovery.
+///
+/// A `<picture>` contributes its first applicable direct `<source>` before
+/// the fallback `<img>`. The selected candidate is stored on the image so
+/// preloading, resource availability, intrinsic sizing, and painting cannot
+/// accidentally make separate source choices.
+/// <https://html.spec.whatwg.org/multipage/images.html#the-picture-element>
+fn resolve_html_image_sources(node: &mut dom::Node, media_environment: &css::MediaEnvironment) {
+    let dom::NodeKind::Element(element) = &mut node.kind else {
+        return;
+    };
+
+    if has_html_picture_semantics(element) {
+        let mut selected = None;
+        let mut image_index = None;
+        for (index, child) in element.children.iter().enumerate() {
+            let dom::NodeKind::Element(child) = &child.kind else {
+                continue;
+            };
+            if has_html_img_rendering_semantics(child) {
+                image_index = Some(index);
+                break;
+            }
+            if selected.is_none() && has_html_source_semantics(child) {
+                selected = picture_source_candidate(child, media_environment);
+            }
+        }
+        if let Some(index) = image_index
+            && let Some(image) = element.children[index].as_element_mut()
+        {
+            image.selected_image_source = selected
+                .or_else(|| dom::selected_image_source_from_attributes(image, media_environment));
+        }
+    } else if has_html_img_rendering_semantics(element) && element.selected_image_source.is_none() {
+        element.selected_image_source =
+            dom::selected_image_source_from_attributes(element, media_environment);
+    }
+
+    for child in &mut element.children {
+        resolve_html_image_sources(child, media_environment);
+    }
+}
+
+fn has_html_picture_semantics(element: &dom::Element) -> bool {
+    element.tag == "picture"
+        && (element.namespace_url == "http://www.w3.org/1999/xhtml"
+            || (element.document_syntax == dom::DocumentSyntax::Html
+                && element.namespace_url.is_empty()))
+}
+
+fn has_html_source_semantics(element: &dom::Element) -> bool {
+    element.tag == "source"
+        && (element.namespace_url == "http://www.w3.org/1999/xhtml"
+            || (element.document_syntax == dom::DocumentSyntax::Html
+                && element.namespace_url.is_empty()))
+}
+
+fn picture_source_candidate(
+    source: &dom::Element,
+    media_environment: &css::MediaEnvironment,
+) -> Option<dom::SelectedImageSource> {
+    if source
+        .attrs
+        .get("media")
+        .is_some_and(|media| !css::media_rule_applies_in_environment(media, media_environment))
+    {
+        return None;
+    }
+    if source.attrs.get("type").is_some_and(|mime_type| {
+        !mime_type.trim().is_empty()
+            && !crate::image_store::supports_html_source_image_mime_type(mime_type)
+    }) {
+        return None;
+    }
+    let mut selected = dom::selected_source_set_candidate(
+        None,
+        source.attrs.get("srcset").map(String::as_str),
+        source.attrs.get("sizes").map(String::as_str),
+        media_environment,
+    )?;
+    let dimensions = dom::ImageDimensionAttributes {
+        width: source.attrs.get("width").cloned(),
+        height: source.attrs.get("height").cloned(),
+    };
+    if dimensions.width.is_some() || dimensions.height.is_some() {
+        selected = selected.with_dimensions(dimensions);
+    }
+    Some(selected)
+}
+
+/// Resolve the static representation selected for HTML `<object>` and `<img>`.
 ///
 /// In a live browser this selection can change while the resource fetch is in
 /// flight. Paged output has one deterministic layout pass, so Quire selects
@@ -824,7 +918,7 @@ fn resource_paths(
 /// as an image that this renderer can paint; every other outcome exposes the
 /// element's fallback subtree to the CSS formatting model.
 /// <https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-object-element>
-fn resolve_object_rendering_states(
+fn resolve_embedded_rendering_states(
     node: &mut dom::Node,
     base_url: Option<&Url>,
     root_url: Option<&Url>,
@@ -834,21 +928,52 @@ fn resolve_object_rendering_states(
         return;
     };
     for child in &mut element.children {
-        resolve_object_rendering_states(child, base_url, root_url, resource_cache);
+        resolve_embedded_rendering_states(child, base_url, root_url, resource_cache);
     }
-    if !has_html_object_rendering_semantics(element) {
-        return;
+    if has_html_object_rendering_semantics(element) {
+        element.object_rendering =
+            if object_has_supported_static_image(element, base_url, root_url, resource_cache) {
+                dom::ObjectRendering::Image
+            } else {
+                dom::ObjectRendering::Fallback
+            };
     }
-    element.object_rendering =
-        if object_has_supported_static_image(element, base_url, root_url, resource_cache) {
-            dom::ObjectRendering::Image
+    if has_html_img_rendering_semantics(element) {
+        element.image_rendering = if crate::layout::asset_helpers::static_html_img_is_available(
+            element,
+            base_url,
+            root_url,
+            resource_cache,
+        ) {
+            dom::ImageRendering::Image
+        } else if element.attrs.get("alt").is_some_and(|alt| !alt.is_empty()) {
+            dom::ImageRendering::AltText
         } else {
-            dom::ObjectRendering::Fallback
+            dom::ImageRendering::Empty
         };
+        // HTML `<img>` source children are ignored. In the stable failed-image
+        // state, the alternative text is the only fallback subtree exposed to
+        // CSS layout.
+        element.children = match element.image_rendering {
+            dom::ImageRendering::AltText => {
+                vec![dom::Node::text(element.attrs.get("alt").expect(
+                    "alternative-text state requires a non-empty alt attribute",
+                ))]
+            }
+            dom::ImageRendering::Image | dom::ImageRendering::Empty => Vec::new(),
+        };
+    }
 }
 
 fn has_html_object_rendering_semantics(element: &dom::Element) -> bool {
     element.tag == "object"
+        && (element.namespace_url == "http://www.w3.org/1999/xhtml"
+            || (element.document_syntax == dom::DocumentSyntax::Html
+                && element.namespace_url.is_empty()))
+}
+
+fn has_html_img_rendering_semantics(element: &dom::Element) -> bool {
+    element.tag == "img"
         && (element.namespace_url == "http://www.w3.org/1999/xhtml"
             || (element.document_syntax == dom::DocumentSyntax::Html
                 && element.namespace_url.is_empty()))
@@ -926,24 +1051,17 @@ fn collect_html_resource_paths(
     {
         paths.push(path);
     }
-    if matches!(element.tag.as_str(), "img" | "input" | "video")
-        && let Some(src) = element
-            .attrs
-            .get("src")
-            .or_else(|| element.attrs.get("poster"))
+    if element.tag == "img"
+        && let Some((src, _density)) = dom::selected_img_source(element)
         && let Some(path) = resource::resolve_fetchable_url(src, base_url, root_url)
     {
         paths.push(path);
     }
-    if element.tag == "img"
-        && !element.attrs.contains_key("src")
-        && let Some(srcset) = element.attrs.get("srcset")
-        && let Some(src) = srcset.split(',').next().and_then(|candidate| {
-            candidate
-                .split_ascii_whitespace()
-                .next()
-                .filter(|value| !value.is_empty())
-        })
+    if matches!(element.tag.as_str(), "input" | "video")
+        && let Some(src) = element
+            .attrs
+            .get("src")
+            .or_else(|| element.attrs.get("poster"))
         && let Some(path) = resource::resolve_fetchable_url(src, base_url, root_url)
     {
         paths.push(path);
@@ -1092,6 +1210,298 @@ mod tests {
         assert!(allowing.render(&RenderOptions::default()).await.is_ok());
     }
 
+    #[test]
+    fn static_image_state_exposes_only_non_empty_alt_text_as_fallback_content() {
+        fn image_node(src: Option<&str>, alt: Option<&str>) -> dom::Node {
+            let mut image = dom::Node::element("img");
+            {
+                let element = image.as_element_mut().expect("image element");
+                if let Some(src) = src {
+                    element.attrs.insert("src".to_string(), src.to_string());
+                }
+                if let Some(alt) = alt {
+                    element.attrs.insert("alt".to_string(), alt.to_string());
+                }
+            }
+            image
+        }
+
+        let mut root = dom::Node::element("body");
+        root.as_element_mut()
+            .expect("body element")
+            .children
+            .extend([
+                image_node(Some("about:invalid"), Some("fallback text")),
+                image_node(Some("about:invalid"), Some("")),
+                image_node(Some("about:invalid"), None),
+            ]);
+        resolve_embedded_rendering_states(
+            &mut root,
+            None,
+            None,
+            &resource::ResourceCache::default(),
+        );
+
+        let dom::NodeKind::Element(root) = root.kind else {
+            panic!("body element");
+        };
+        let images = root
+            .children
+            .iter()
+            .map(|node| match &node.kind {
+                dom::NodeKind::Element(element) => element,
+                dom::NodeKind::Text(_) => panic!("expected image element"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(images[0].image_rendering, dom::ImageRendering::AltText);
+        assert!(matches!(images[0].children.as_slice(), [dom::Node {
+            kind: dom::NodeKind::Text(text)
+        }] if text == "fallback text"));
+        assert_eq!(images[1].image_rendering, dom::ImageRendering::Empty);
+        assert!(images[1].children.is_empty());
+        assert_eq!(images[2].image_rendering, dom::ImageRendering::Empty);
+        assert!(images[2].children.is_empty());
+    }
+
+    #[test]
+    fn static_image_state_keeps_decoded_data_images_replaced() {
+        let mut image = dom::Node::element("img");
+        image
+            .as_element_mut()
+            .expect("image element")
+            .attrs
+            .insert(
+                "src".to_string(),
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC".to_string(),
+            );
+        resolve_embedded_rendering_states(
+            &mut image,
+            None,
+            None,
+            &resource::ResourceCache::default(),
+        );
+
+        assert_eq!(
+            image.as_element().expect("image element").image_rendering,
+            dom::ImageRendering::Image
+        );
+    }
+
+    #[test]
+    fn picture_selects_the_first_applicable_direct_source_before_preloading() {
+        fn element(tag: &str, attrs: &[(&str, &str)]) -> dom::Node {
+            let mut node = dom::Node::element(tag);
+            let element = node.as_element_mut().expect("element");
+            for (name, value) in attrs {
+                element
+                    .attrs
+                    .insert((*name).to_string(), (*value).to_string());
+            }
+            node
+        }
+
+        let mut picture = element("picture", &[]);
+        picture.as_element_mut().expect("picture").children = vec![
+            element("source", &[("media", "screen"), ("srcset", "screen.png")]),
+            element(
+                "source",
+                &[
+                    ("type", "image/not-supported"),
+                    ("srcset", "unsupported.png"),
+                ],
+            ),
+            element(
+                "source",
+                &[("srcset", "small.png 0.5x, selected.png 1x, large.png 2x")],
+            ),
+            element("img", &[("src", "fallback.png")]),
+        ];
+
+        resolve_html_image_sources(&mut picture, &css::MediaEnvironment::default());
+        let image = picture.as_element().expect("picture").children[3]
+            .as_element()
+            .expect("image");
+        assert_eq!(
+            image.selected_image_source.as_ref().map(|source| (
+                source.url.as_str(),
+                dom::image_density_order(source.density)
+            )),
+            Some(("selected.png", 1.0))
+        );
+    }
+
+    #[test]
+    fn picture_source_type_uses_recoverable_html_mime_parsing() {
+        fn selected_url(type_: &str) -> Option<String> {
+            let mut picture = dom::Node::element("picture");
+            let mut source = dom::Node::element("source");
+            {
+                let source = source.as_element_mut().expect("source element");
+                source
+                    .attrs
+                    .insert("srcset".to_string(), "source.png".to_string());
+                source.attrs.insert("type".to_string(), type_.to_string());
+            }
+            let mut image = dom::Node::element("img");
+            image
+                .as_element_mut()
+                .expect("image element")
+                .attrs
+                .insert("src".to_string(), "fallback.png".to_string());
+            picture.as_element_mut().expect("picture element").children = vec![source, image];
+
+            resolve_html_image_sources(&mut picture, &css::MediaEnvironment::default());
+            picture.as_element().expect("picture element").children[1]
+                .as_element()
+                .expect("image element")
+                .selected_image_source
+                .as_ref()
+                .map(|source| source.url.clone())
+        }
+
+        for accepted in [
+            "",
+            " ",
+            " Image/GIF ",
+            "image/gif;",
+            "image/gif;encodings",
+            "image/gif;encodings=",
+            "image/gif;encodings=foobar",
+        ] {
+            assert_eq!(
+                selected_url(accepted).as_deref(),
+                Some("source.png"),
+                "{accepted}"
+            );
+        }
+        for rejected in [
+            "image\\gif",
+            "gif",
+            "*/*",
+            "image/*",
+            "image/gif, image/png",
+            "image/gif image/png",
+            "text/plain",
+            "image/not-supported",
+        ] {
+            assert_eq!(
+                selected_url(rejected).as_deref(),
+                Some("fallback.png"),
+                "{rejected}"
+            );
+        }
+    }
+
+    #[test]
+    fn picture_falls_back_to_the_img_candidate_when_no_source_applies() {
+        fn element(tag: &str, attrs: &[(&str, &str)]) -> dom::Node {
+            let mut node = dom::Node::element(tag);
+            let element = node.as_element_mut().expect("element");
+            for (name, value) in attrs {
+                element
+                    .attrs
+                    .insert((*name).to_string(), (*value).to_string());
+            }
+            node
+        }
+
+        let mut picture = element("picture", &[]);
+        picture.as_element_mut().expect("picture").children = vec![
+            element("source", &[("media", "screen"), ("srcset", "screen.png")]),
+            element(
+                "img",
+                &[("srcset", "low.png 0.5x, normal.png 1x, high.png 2x")],
+            ),
+        ];
+
+        resolve_html_image_sources(&mut picture, &css::MediaEnvironment::default());
+        let image = picture.as_element().expect("picture").children[1]
+            .as_element()
+            .expect("image");
+        assert_eq!(
+            image.selected_image_source.as_ref().map(|source| (
+                source.url.as_str(),
+                dom::image_density_order(source.density)
+            )),
+            Some(("normal.png", 1.0))
+        );
+    }
+
+    #[test]
+    fn picture_source_dimensions_replace_img_dimension_attributes() {
+        fn element(tag: &str, attrs: &[(&str, &str)]) -> dom::Node {
+            let mut node = dom::Node::element(tag);
+            let element = node.as_element_mut().expect("element");
+            for (name, value) in attrs {
+                element
+                    .attrs
+                    .insert((*name).to_string(), (*value).to_string());
+            }
+            node
+        }
+
+        let mut picture = element("picture", &[]);
+        picture.as_element_mut().expect("picture").children = vec![
+            element("source", &[("srcset", "selected.png"), ("width", "200")]),
+            element(
+                "img",
+                &[("src", "fallback.png"), ("width", "100"), ("height", "50")],
+            ),
+        ];
+
+        resolve_html_image_sources(&mut picture, &css::MediaEnvironment::default());
+        let image = picture.as_element().expect("picture").children[1]
+            .as_element()
+            .expect("image");
+        assert_eq!(
+            image.selected_image_dimensions(),
+            Some(&dom::ImageDimensionAttributes {
+                width: Some("200".to_string()),
+                height: None,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_image_alt_text_uses_normal_text_layout_and_overflow() {
+        let document = Html::from_string(
+            r#"<style>
+                @page { size: 240px 160px; margin: 0 }
+                body { margin: 0 }
+                img {
+                    border: solid;
+                    display: block;
+                    width: 150px;
+                    padding: 10px;
+                    overflow: scroll;
+                }
+            </style>
+            <img src="about:invalid" alt="I have scrollbar ................................................................">"#,
+        )
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+
+        let text = document.pages[0]
+            .lines()
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(text.contains("I have scrollbar"), "lines={text:?}");
+        assert!(document.pages[0].images().is_empty());
+
+        let mut pdf = Vec::new();
+        document
+            .write_pdf(&mut pdf, &PdfOptions::default())
+            .unwrap();
+        let pdf = String::from_utf8_lossy(&pdf);
+        assert!(
+            pdf.contains("/ToUnicode"),
+            "fallback text must remain extractable"
+        );
+    }
+
     #[tokio::test]
     async fn missing_linked_stylesheet_requires_explicit_fetch_error_recovery() {
         let source = "<link rel=\"stylesheet\" href=\"missing-stylesheet.css\"><p>Text</p>";
@@ -1142,6 +1552,42 @@ mod tests {
         .unwrap();
 
         assert_eq!(document.pages[0].lines()[0].color, CssColor::new(255, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn noscript_renders_fallback_markup_but_script_contents_remain_hidden() {
+        let document = Html::from_string(
+            "<script>hidden script content</script><noscript><span>fallback content</span></noscript>",
+        )
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+        let lines = document.pages[0].lines();
+
+        assert!(lines.iter().any(|line| line.text == "fallback content"));
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.text.contains("hidden script content"))
+        );
+    }
+
+    #[tokio::test]
+    async fn head_noscript_style_applies_to_fallback_content() {
+        let document = Html::from_string(
+            "<head><noscript><style>span { color: green }</style></noscript></head>\
+             <body><noscript><span>fallback content</span></noscript></body>",
+        )
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+        let fallback = document.pages[0]
+            .lines()
+            .iter()
+            .find(|line| line.text == "fallback content")
+            .expect("noscript fallback content should render");
+
+        assert_eq!(fallback.color, CssColor::new(0, 128, 0));
     }
 
     #[tokio::test]

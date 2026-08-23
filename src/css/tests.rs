@@ -1,19 +1,15 @@
+use std::collections::HashMap;
+use std::num::{NonZeroU32, NonZeroUsize};
+
 use super::values::{
     edge_all, parse_computed_length_percentage, parse_computed_line_height,
     parse_deferred_font_size,
 };
 use super::*;
 use crate::css::page::page_style_for_declarations;
-use crate::{
-    LayoutSize, RenderOptions,
-    layout::PageMargins,
-    layout::PageSize,
-    units::{LayoutLength, layout_pt},
-};
-use std::{
-    collections::HashMap,
-    num::{NonZeroU32, NonZeroUsize},
-};
+use crate::layout::{PageMargins, PageSize};
+use crate::units::{LayoutLength, layout_pt};
+use crate::{LayoutSize, RenderOptions};
 
 fn flex_basis_length(value: ComputedLengthPercentage) -> ComputedFlexBasis {
     ComputedFlexBasis::LengthPercentage(ComputedFlexBasisLength::new(value))
@@ -1129,6 +1125,32 @@ fn forced_colors_media_feature_tracks_the_rendering_environment() {
 }
 
 #[test]
+fn scripting_media_feature_reports_static_rendering_as_none() {
+    let environment = MediaEnvironment::default();
+
+    assert!(!crate::css::media_rule_applies_in_environment(
+        "(scripting)",
+        &environment
+    ));
+    assert!(crate::css::media_rule_applies_in_environment(
+        "(scripting: none)",
+        &environment
+    ));
+    assert!(!crate::css::media_rule_applies_in_environment(
+        "(scripting: initial-only)",
+        &environment
+    ));
+    assert!(!crate::css::media_rule_applies_in_environment(
+        "(scripting: enabled)",
+        &environment
+    ));
+    assert!(!crate::css::media_rule_applies_in_environment(
+        "(scripting: unsupported)",
+        &environment
+    ));
+}
+
+#[test]
 fn prefers_color_scheme_media_feature_uses_light_default_and_explicit_preference() {
     let default_environment =
         MediaEnvironment::new(MediaType::Print, CssViewportSize::new(800.0, 600.0));
@@ -2226,6 +2248,7 @@ async fn visited_link_colors_use_actual_state_without_exposing_layout_state() {
         crate::css::selector::selector_matches_with_scope_proximity_in_chain_with_link_matching(
             &parent_rule.selector,
             &parent_rule.scopes,
+            parent_rule.stylesheet_scope_anchor,
             &crate::css::selector::selector_chain(&parent, &[]),
             0,
             &mut selectors::context::SelectorCaches::default(),
@@ -3296,7 +3319,7 @@ fn anonymous_block_style_inherits_only_inherited_properties() {
     // Text-decoration origins are not inherited. Decorations propagate over
     // in-flow descendants during layout instead, including across anonymous
     // blocks (CSS Text Decoration Level 3 §2).
-    assert!(anonymous.text_decoration_layers.is_empty());
+    assert!(!anonymous.text_decoration_origins.has_effective_layers());
     assert_eq!(
         anonymous
             .custom_properties
@@ -11380,6 +11403,7 @@ async fn embedded_html5_ua_stylesheet_matches_weasyprint_defaults() {
     assert_eq!(stylesheet.origin, StylesheetOrigin::UserAgent);
     assert!(source.contains("User agent stylsheet for HTML."));
     assert!(source.contains("body { margin: 8px }"));
+    assert!(source.contains("@media (scripting) { noscript { display: none !important } }"));
     assert!(
         source
             .contains("blockquote, dir, dl, figure, listing, menu, ol, p, plaintext, pre, ul, xmp")
@@ -12594,7 +12618,7 @@ async fn wrap_inside_structural_wbr_selector_targets_only_the_following_span() {
 }
 
 #[test]
-fn overflow_clip_margin_parses_visual_box_and_nonnegative_length_in_any_order() {
+fn overflow_clip_margin_parses_visual_box_and_signed_length_in_any_order() {
     let mut style = ComputedStyle::initial();
     let declarations = parse_declarations("overflow-clip-margin: 10px content-box");
     apply_declarations(&mut style, &declarations);
@@ -12602,7 +12626,7 @@ fn overflow_clip_margin_parses_visual_box_and_nonnegative_length_in_any_order() 
         style.overflow_clip_margin,
         OverflowClipMargin {
             reference_box: OverflowClipMarginBox::Content,
-            length: 7.5,
+            offset: layout_pt(7.5),
         }
     );
 
@@ -12611,10 +12635,28 @@ fn overflow_clip_margin_parses_visual_box_and_nonnegative_length_in_any_order() 
     assert_eq!(
         style.overflow_clip_margin,
         OverflowClipMargin {
-            reference_box: OverflowClipMarginBox::Content,
-            length: 7.5,
+            reference_box: OverflowClipMarginBox::Border,
+            offset: layout_pt(-0.75),
         }
     );
+
+    let declarations = parse_declarations("overflow-clip-margin: calc(-2px - 1px) padding-box");
+    apply_declarations(&mut style, &declarations);
+    assert_eq!(
+        style.overflow_clip_margin,
+        OverflowClipMargin {
+            reference_box: OverflowClipMarginBox::Padding,
+            offset: layout_pt(-2.25),
+        }
+    );
+
+    let declarations = parse_declarations("overflow-clip-margin: content-box 10%");
+    apply_declarations(&mut style, &declarations);
+    assert_eq!(
+        style.overflow_clip_margin.reference_box,
+        OverflowClipMarginBox::Padding
+    );
+    assert_eq!(style.overflow_clip_margin.offset, layout_pt(-2.25));
 }
 
 #[test]
@@ -12990,6 +13032,109 @@ async fn writing_mode_preserves_each_modern_keyword() {
         );
         assert_eq!(style.writing_mode, expected, "{keyword}");
     }
+}
+
+#[tokio::test]
+async fn writing_mode_change_promotes_flow_to_flow_root() {
+    let parent = style_for_element_with_signature(
+        ElementSignature::new("section", HashMap::new()),
+        Some("display: block; writing-mode: vertical-lr"),
+        &[],
+        None,
+        &[],
+    );
+    let sideways_lr = style_for_element_with_signature(
+        ElementSignature::new("div", HashMap::new()),
+        Some("display: block; writing-mode: sideways-lr"),
+        &[],
+        Some(&parent),
+        &[],
+    );
+    assert_eq!(
+        sideways_lr.display,
+        Display::new(DisplayOuter::Block, DisplayInner::FlowRoot)
+    );
+
+    let mut vertical_rl_parent = parent.clone();
+    vertical_rl_parent.writing_mode = WritingMode::VerticalRl;
+    let sideways_rl = style_for_element_with_signature(
+        ElementSignature::new("div", HashMap::new()),
+        Some("display: block; writing-mode: sideways-rl"),
+        &[],
+        Some(&vertical_rl_parent),
+        &[],
+    );
+    assert_eq!(
+        sideways_rl.display,
+        Display::new(DisplayOuter::Block, DisplayInner::FlowRoot)
+    );
+
+    let matching = style_for_element_with_signature(
+        ElementSignature::new("div", HashMap::new()),
+        Some("display: block; writing-mode: vertical-lr"),
+        &[],
+        Some(&parent),
+        &[],
+    );
+    assert_eq!(matching.display, Display::BLOCK);
+}
+
+#[tokio::test]
+async fn writing_mode_change_promotes_inline_flow_to_inline_flow_root() {
+    let parent = style_for_element_with_signature(
+        ElementSignature::new("section", HashMap::new()),
+        Some("display: block"),
+        &[],
+        None,
+        &[],
+    );
+    let child = style_for_element_with_signature(
+        ElementSignature::new("span", HashMap::new()),
+        Some("display: inline; writing-mode: vertical-rl"),
+        &[],
+        Some(&parent),
+        &[],
+    );
+
+    assert_eq!(child.display, Display::INLINE_BLOCK);
+}
+
+#[tokio::test]
+async fn writing_mode_display_transform_skips_display_contents_parent() {
+    let outer = style_for_element_with_signature(
+        ElementSignature::new("section", HashMap::new()),
+        Some("display: block; writing-mode: vertical-lr"),
+        &[],
+        None,
+        &[],
+    );
+    let contents = style_for_element_with_signature(
+        ElementSignature::new("span", HashMap::new()),
+        Some("display: contents; writing-mode: horizontal-tb"),
+        &[],
+        Some(&outer),
+        &[],
+    );
+    let matching_outer = style_for_element_with_signature(
+        ElementSignature::new("div", HashMap::new()),
+        Some("display: block; writing-mode: vertical-lr"),
+        &[],
+        Some(&contents),
+        &[],
+    );
+    let different_from_outer = style_for_element_with_signature(
+        ElementSignature::new("div", HashMap::new()),
+        Some("display: block; writing-mode: sideways-lr"),
+        &[],
+        Some(&contents),
+        &[],
+    );
+
+    assert_eq!(matching_outer.display, Display::BLOCK);
+    assert_eq!(
+        different_from_outer.display,
+        Display::new(DisplayOuter::Block, DisplayInner::FlowRoot)
+    );
 }
 
 #[tokio::test]
@@ -14118,22 +14263,29 @@ fn text_decoration_origin_layer_refreshes_font_metric_lengths() {
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
 
-    style.rebuild_own_text_decoration_layer();
-    assert_eq!(style.text_decoration_layers.len(), 1);
+    style.rebuild_own_text_decoration_origin();
+    let layers = style.text_decoration_origins.effective_layers_vec();
+    assert_eq!(layers.len(), 1);
     assert!(matches!(
-        style.text_decoration_layers[0].decoration.inset,
+        layers[0].decoration.inset,
         TextDecorationInset::Lengths { ref start, ref end }
             if *start == ComputedLengthPercentage::from_ch(-0.5)
                 && *end == ComputedLengthPercentage::from_ch(-0.5)
     ));
 
     style.resolve_font_metric_lengths(layout_pt(6.0));
-    style.rebuild_own_text_decoration_layer();
-    style.rebuild_own_text_decoration_layer();
+    style.rebuild_own_text_decoration_origin();
+    style.rebuild_own_text_decoration_origin();
 
-    assert_eq!(style.text_decoration_layers.len(), 1);
-    let layer = &style.text_decoration_layers[0];
-    assert!(layer.origin_style.text_decoration_layers.is_empty());
+    let layers = style.text_decoration_origins.effective_layers_vec();
+    assert_eq!(layers.len(), 1);
+    let layer = &layers[0];
+    assert!(
+        !layer
+            .origin_style
+            .text_decoration_origins
+            .has_effective_layers()
+    );
     assert!(matches!(
         layer.decoration.inset,
         TextDecorationInset::Lengths { ref start, ref end }
@@ -14149,6 +14301,46 @@ fn text_decoration_origin_layer_refreshes_font_metric_lengths() {
         layer.decoration.underline_offset,
         TextUnderlineOffset::LengthPercentage(ref value)
             if *value == ComputedLengthPercentage::from_points(1.5)
+    ));
+}
+
+#[test]
+fn rebuilding_own_text_decoration_origin_preserves_propagated_origins() {
+    let mut ancestor = ComputedStyle::initial();
+    ancestor.text_decoration.underline = true;
+    ancestor.rebuild_own_text_decoration_origin();
+    let ancestor_origin = ancestor
+        .text_decoration_origins
+        .effective_layers_vec()
+        .pop()
+        .unwrap()
+        .origin_style;
+
+    let mut child = ComputedStyle::initial();
+    child
+        .text_decoration_origins
+        .set_propagated(ancestor.text_decoration_origins.effective_layers_vec());
+    child.resolve_font_metric_lengths(layout_pt(6.0));
+    child.rebuild_own_text_decoration_origin();
+
+    let layers = child.text_decoration_origins.effective_layers_vec();
+    assert_eq!(layers.len(), 1);
+    assert!(std::rc::Rc::ptr_eq(
+        &layers[0].origin_style,
+        &ancestor_origin
+    ));
+
+    child.text_decoration.overline = true;
+    child.rebuild_own_text_decoration_origin();
+    let layers = child.text_decoration_origins.effective_layers_vec();
+    assert_eq!(layers.len(), 2);
+    assert!(std::rc::Rc::ptr_eq(
+        &layers[0].origin_style,
+        &ancestor_origin
+    ));
+    assert!(!std::rc::Rc::ptr_eq(
+        &layers[0].origin_style,
+        &layers[1].origin_style,
     ));
 }
 
@@ -14224,8 +14416,8 @@ async fn text_decoration_origins_do_not_enter_computed_style_inheritance() {
         &[ElementSignature::new("p", HashMap::new())],
     );
 
-    assert_eq!(parent.text_decoration_layers.len(), 1);
-    assert!(child.text_decoration_layers.is_empty());
+    assert_eq!(parent.text_decoration_origins.effective_layers().count(), 1);
+    assert!(!child.text_decoration_origins.has_effective_layers());
     assert_eq!(
         child.text_decoration.color,
         CssColorOrCurrentColor::Color(CssColor::new(0, 0, 255))
@@ -14256,7 +14448,7 @@ async fn css_text_decoration_level_three_currentcolor_is_frozen_on_originating_b
     );
 
     assert_eq!(child.color, CssColor::new(255, 0, 0));
-    assert!(child.text_decoration_layers.is_empty());
+    assert!(!child.text_decoration_origins.has_effective_layers());
     assert_eq!(
         child.text_emphasis_color,
         CssColorOrCurrentColor::CurrentColor
@@ -16601,7 +16793,23 @@ fn declaration_operations_are_shared_by_supports_and_the_normal_cascade() {
 #[test]
 fn supports_selector_condition_requires_one_complex_selector() {
     assert!(supports_condition_applies("selector(div > span)"));
+    assert!(supports_condition_applies("(selector(div > span))"));
     assert!(!supports_condition_applies("selector(div, span)"));
+    assert!(!supports_condition_applies("selector(> .item)"));
+    assert!(!supports_condition_applies("(selector(> .item))"));
+    assert!(supports_condition_applies("not selector(> .item)"));
+    assert!(supports_condition_applies("not (selector(> .item))"));
+    assert!(supports_condition_applies("selector(&)"));
+    assert!(supports_condition_applies("(selector(&))"));
+    assert!(!supports_condition_applies("not selector(&)"));
+    assert!(supports_condition_applies("selector(::before::marker)"));
+    assert!(supports_condition_applies("selector(li::after::marker)"));
+    assert!(!supports_condition_applies(
+        "not selector(::before::marker)"
+    ));
+    assert!(!supports_condition_applies(
+        "not (selector(::before::marker) and selector(::after::marker))"
+    ));
 }
 
 #[test]
@@ -17653,6 +17861,150 @@ async fn expands_nested_style_rules() {
         selectors
             .iter()
             .any(|selector| selector.contains(":is(.outer):last-child"))
+    );
+}
+
+#[tokio::test]
+async fn top_level_parent_selector_uses_document_root_scope() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "& .target { color: red } & > .target { color: green }",
+    ));
+
+    let descendant = style_for_element_with_signature(
+        ElementSignature::new(
+            "p",
+            HashMap::from([("class".to_string(), "target".to_string())]),
+        ),
+        None,
+        std::slice::from_ref(&stylesheet),
+        None,
+        &[
+            ElementSignature::new("html", HashMap::new()),
+            ElementSignature::new("body", HashMap::new()),
+        ],
+    );
+    let direct_child = style_for_element_with_signature(
+        ElementSignature::new(
+            "p",
+            HashMap::from([("class".to_string(), "target".to_string())]),
+        ),
+        None,
+        &[stylesheet],
+        None,
+        &[ElementSignature::new("html", HashMap::new())],
+    );
+
+    assert_eq!(descendant.color, CssColor::new(255, 0, 0));
+    assert_eq!(direct_child.color, CssColor::new(0, 128, 0));
+}
+
+#[tokio::test]
+async fn top_level_parent_selector_has_zero_parent_specificity() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "& .target { color: red } .container .target { color: blue }",
+    ));
+    let style = style_for_element_with_signature(
+        ElementSignature::new(
+            "p",
+            HashMap::from([("class".to_string(), "target".to_string())]),
+        ),
+        None,
+        &[stylesheet],
+        None,
+        &[
+            ElementSignature::new("html", HashMap::new()),
+            ElementSignature::new(
+                "section",
+                HashMap::from([("class".to_string(), "container".to_string())]),
+            ),
+        ],
+    );
+
+    assert_eq!(style.color, CssColor::new(0, 0, 255));
+}
+
+#[tokio::test]
+async fn top_level_parent_selector_uses_embedded_stylesheet_owner_scope() {
+    let owner = crate::dom::Node::element("section");
+    let owner_id = owner.as_element().expect("owner element").id;
+    let stylesheet = parse_stylesheet(
+        &Css::from_string(".target { color: blue } & .target { color: red }")
+            .with_selector_scope_anchor(StylesheetScopeAnchor::Element(owner_id)),
+    );
+    let mut matching_owner = ElementSignature::new("section", HashMap::new());
+    matching_owner.source_element_id = Some(owner_id);
+
+    let inside = style_for_element_with_signature(
+        ElementSignature::new(
+            "p",
+            HashMap::from([("class".to_string(), "target".to_string())]),
+        ),
+        None,
+        std::slice::from_ref(&stylesheet),
+        None,
+        &[
+            ElementSignature::new("html", HashMap::new()),
+            matching_owner,
+        ],
+    );
+    let outside = style_for_element_with_signature(
+        ElementSignature::new(
+            "p",
+            HashMap::from([("class".to_string(), "target".to_string())]),
+        ),
+        None,
+        &[stylesheet],
+        None,
+        &[ElementSignature::new("html", HashMap::new())],
+    );
+
+    assert_eq!(inside.color, CssColor::new(255, 0, 0));
+    assert_eq!(outside.color, CssColor::new(0, 0, 255));
+}
+
+#[tokio::test]
+async fn parent_selector_inside_scope_uses_the_scope_root() {
+    let owner = crate::dom::Node::element("section");
+    let owner_id = owner.as_element().expect("owner element").id;
+    let stylesheet = parse_stylesheet(
+        &Css::from_string(
+            "@scope (.scope) { & > .target { color: red !important } } .target { color: blue }",
+        )
+        .with_scope_anchor(StylesheetScopeAnchor::Element(owner_id)),
+    );
+    let style = style_for_element_with_signature(
+        ElementSignature::new(
+            "p",
+            HashMap::from([("class".to_string(), "target".to_string())]),
+        ),
+        None,
+        &[stylesheet],
+        None,
+        &[
+            ElementSignature::new("html", HashMap::new()),
+            ElementSignature::new(
+                "section",
+                HashMap::from([("class".to_string(), "scope".to_string())]),
+            ),
+        ],
+    );
+
+    assert_eq!(style.color, CssColor::new(255, 0, 0));
+}
+
+#[tokio::test]
+async fn pseudo_element_rules_retain_stylesheet_scope_anchor() {
+    let owner = crate::dom::Node::element("section");
+    let owner_id = owner.as_element().expect("owner element").id;
+    let stylesheet = parse_stylesheet(
+        &Css::from_string(".target::before { color: red; content: 'x' }")
+            .with_selector_scope_anchor(StylesheetScopeAnchor::Element(owner_id)),
+    );
+
+    assert_eq!(stylesheet.before_rules.len(), 1);
+    assert_eq!(
+        stylesheet.before_rules[0].stylesheet_scope_anchor,
+        StylesheetScopeAnchor::Element(owner_id)
     );
 }
 

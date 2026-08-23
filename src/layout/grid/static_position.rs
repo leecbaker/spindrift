@@ -53,18 +53,19 @@ pub(in crate::layout) struct GridPositioningScope {
     containing_block: ContainingBlock,
 }
 
-/// The late-positioned-layout inputs selected from a grid positioning scope.
-/// The containing-block identity is checked before this context is created.
-/// An explicitly selected grid area supplies the positioned box's containing
-/// block; otherwise the grid container remains its CSS containing block and
-/// the scope supplies only the static-position rectangle.
+/// The Grid-specific containing-block override for a positioned descendant.
+///
+/// A Grid container can establish the actual absolute-positioning containing
+/// block of a descendant even though that descendant is not a direct Grid
+/// child.  In that case Grid placement selects the actual containing block,
+/// but the descendant's static-position rectangle remains owned by its
+/// intervening ordinary formatting context:
+/// <https://www.w3.org/TR/css-grid-1/#abspos> and
+/// <https://www.w3.org/TR/css-position-3/#staticpos-rect>.
 #[derive(Debug, Clone, Copy)]
-pub(in crate::layout) struct GridPositionedDescendantContext {
-    /// The actual CSS containing block selected by Grid for a qualifying
-    /// positioned descendant. The static-position rectangle remains a
-    /// separate value below.
-    pub(in crate::layout) grid_area_containing_block: Option<ContainingBlock>,
-    pub(in crate::layout) static_position: AbsoluteStaticPosition,
+pub(in crate::layout) struct GridDescendantContainingBlock {
+    /// The actual CSS containing block selected by Grid placement.
+    pub(in crate::layout) containing_block: ContainingBlock,
 }
 
 /// Resolve the physical rectangle used by Grid to establish a child's static
@@ -170,129 +171,46 @@ impl GridPositioningScope {
         }
     }
 
-    /// Return a grid-derived static-position rectangle for a descendant only
-    /// when this grid remains its actual absolute containing block.
-    pub(in crate::layout) fn descendant_positioning_context(
+    /// Return a Grid-derived containing block for a descendant only when this
+    /// Grid remains its actual absolute containing block.
+    ///
+    /// Unlike a direct positioned Grid child, a descendant keeps the ordinary
+    /// static-position rectangle captured while its parent formatting context
+    /// was replayed.  Grid contributes only the actual containing block here.
+    pub(in crate::layout) fn descendant_containing_block(
         &self,
         style: &ComputedStyle,
         containing_block: ContainingBlock,
-    ) -> Option<GridPositionedDescendantContext> {
+    ) -> Option<GridDescendantContainingBlock> {
         (containing_block == self.containing_block).then(|| {
-            let x = grid_static_line_offset(
-                &self.container_style.grid_template_columns,
-                &self.container_style.grid_auto_columns,
-                &style.grid_column_start,
-                &self.column_line_offsets,
-                self.container_style.column_gap.clone(),
-                self.container_style.justify_content,
+            let content_area = PageTopRect::new(
+                self.inner_x,
+                self.content_top,
                 self.inner_width.points(),
+                self.content_height.points(),
             );
-            let row_size = self.content_height.points();
-            let y = grid_static_line_offset(
-                &self.container_style.grid_template_rows,
-                &self.container_style.grid_auto_rows,
-                &style.grid_row_start,
-                &self.row_line_offsets,
-                self.container_style.row_gap.clone(),
-                self.container_style.align_content,
-                row_size,
-            );
-            let right = grid_static_line_offset(
-                &self.container_style.grid_template_columns,
-                &self.container_style.grid_auto_columns,
-                &style.grid_column_end,
-                &self.column_line_offsets,
-                self.container_style.column_gap.clone(),
-                self.container_style.justify_content,
-                self.inner_width.points(),
-            );
-            let right = match (x, right) {
-                // An abspos item with matching explicit start and end lines
-                // occupies the following grid track. Resolve that span from
-                // the final line geometry rather than exposing a zero-size
-                // containing block to positioned layout.
-                // <https://www.w3.org/TR/css-grid-1/#abspos-items>
-                (Some(start), Some(end)) if (start - end).abs() <= 0.01 => {
-                    grid_static_following_line_offset(start, &self.column_line_offsets)
-                        .or(Some(end))
-                }
-                (_, end) => end,
-            }
-            .or_else(|| {
-                grid_static_auto_end_line_offset(
-                    x,
-                    &style.grid_column_end,
-                    &self.column_line_offsets,
-                    &self.container_style.grid_template_columns,
-                    self.container_style.justify_content,
-                    self.inner_width.points(),
-                )
-            })
-            .unwrap_or(self.inner_width.points());
-            let bottom = grid_static_line_offset(
-                &self.container_style.grid_template_rows,
-                &self.container_style.grid_auto_rows,
-                &style.grid_row_end,
-                &self.row_line_offsets,
-                self.container_style.row_gap.clone(),
-                self.container_style.align_content,
-                row_size,
-            );
-            let bottom = match (y, bottom) {
-                (Some(start), Some(end)) if (start - end).abs() <= 0.01 => {
-                    grid_static_following_line_offset(start, &self.row_line_offsets).or(Some(end))
-                }
-                (_, end) => end,
-            }
-            .or_else(|| {
-                grid_static_auto_end_line_offset(
-                    y,
-                    &style.grid_row_end,
-                    &self.row_line_offsets,
-                    &self.container_style.grid_template_rows,
-                    self.container_style.align_content,
-                    row_size,
-                )
-            })
-            .unwrap_or(row_size);
-            let x = x.unwrap_or(0.0);
-            let y = y.unwrap_or(0.0);
-            let right = right.max(x);
-            // Grid line numbers advance in the container's inline direction,
-            // whereas the final track offsets are physical left-to-right.
-            // Convert the resolved logical column range at the grid-area
-            // boundary, before it is exposed as a CSS containing block or
-            // static-position rectangle.
+            // Direct and nested positioned Grid descendants must project the
+            // final logical Grid lines through exactly the same writing-mode
+            // and direction adapter. In particular, mirroring an RTL column
+            // range after resolving physical lines reverses it twice.
             // <https://www.w3.org/TR/css-grid-1/#grid-placement-slot> and
-            // <https://www.w3.org/TR/css-writing-modes-4/#direction>
-            let flow = WritingModeAxes::new(
-                self.container_style.writing_mode,
-                self.container_style.direction,
-            );
-            let (x, right) = if flow.physical_axis(LogicalAxis::Inline) == PhysicalAxis::Horizontal
-                && flow.physical_side(LogicalSide::InlineStart) == PhysicalSide::Right
-            {
-                (
-                    self.inner_width.points() - right,
-                    self.inner_width.points() - x,
-                )
-            } else {
-                (x, right)
-            };
-            let left = self.inner_x + x;
-            let right = self.inner_x + right;
-            let top = self.content_top - y;
+            // <https://www.w3.org/TR/css-writing-modes-4/#logical-to-physical>
+            let placement_area = grid_explicit_placement_area(
+                &self.container_style,
+                style,
+                content_area,
+                &self.column_line_offsets,
+                &self.row_line_offsets,
+            )
+            .unwrap_or(content_area);
             let area = grid_abspos_static_position_area(
                 GridAbsposStaticPositionSource::PlacementArea {
                     padding_box: self.containing_block,
                 },
-                PageTopRect::new(left, top, right - left, (bottom - y).max(0.0)),
+                placement_area,
                 style,
                 &self.container_style,
             );
-            let left = area.x();
-            let right = left + area.width();
-            let top = area.top_y();
             let placement_selects_grid_area = !matches!(
                 (
                     &style.grid_column_start,
@@ -307,25 +225,17 @@ impl GridPositioningScope {
                     css::GridPlacement::Auto,
                 )
             );
-            GridPositionedDescendantContext {
+            GridDescendantContainingBlock {
                 // An explicit grid placement selects the grid area as the
                 // descendant's containing block. With all four placement
                 // edges automatic, the grid container's padding box remains
                 // the containing block and Grid supplies only static geometry.
                 // <https://www.w3.org/TR/css-grid-1/#abspos>
-                grid_area_containing_block: Some(if placement_selects_grid_area {
+                containing_block: if placement_selects_grid_area {
                     ContainingBlock::from_page_top_rect(area)
                 } else {
                     self.containing_block
-                }),
-                static_position: AbsoluteStaticPosition::from_page_rect_with_horizontal_outside(
-                    left, right, top, true,
-                )
-                .with_static_alignment(grid_abspos_static_alignment(
-                    area,
-                    style,
-                    &self.container_style,
-                )),
+                },
             }
         })
     }

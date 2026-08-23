@@ -1,7 +1,8 @@
 //! HTML-to-PDF rendering example with an explicit author stylesheet.
 
-use quire::{Css, Html, PdfOptions, RenderOptions};
 use std::fs::File;
+
+use quire::{Css, Html, PdfOptions, RenderOptions};
 
 #[tokio::main]
 async fn main() -> quire::Result<()> {

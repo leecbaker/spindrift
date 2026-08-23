@@ -1,6 +1,9 @@
-use icu_segmenter::{WordSegmenter, options::WordBreakInvariantOptions};
-use kham_core::{Tokenizer, ne::NeTagger};
 use std::sync::OnceLock;
+
+use icu_segmenter::WordSegmenter;
+use icu_segmenter::options::WordBreakInvariantOptions;
+use kham_core::Tokenizer;
+use kham_core::ne::NeTagger;
 
 /// A declared language for which Quire has a phrase-boundary provider.
 ///

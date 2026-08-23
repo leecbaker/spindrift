@@ -1,6 +1,6 @@
 # CSS Positioning Parity
 
-Last updated: 2026-08-10
+Last updated: 2026-08-20
 
 This document tracks current CSS positioning and stacking behavior in Quire.
 Known unresolved divergences belong in `SPEC_DIVERGENCES.md`; this file is a
@@ -13,6 +13,14 @@ working parity snapshot for implemented behavior and nearby follow-up areas.
 - Auto-width absolutely positioned non-replaced blocks use CSS 2.2
   shrink-to-fit sizing, including zero-width results for empty content when no
   inset pair or explicit width fills the containing block.
+- Authored `min-content`, `max-content`, `fit-content`, and intrinsic-dependent
+  `calc-size()` block sizes remain distinct from `auto` through absolute-axis
+  resolution. Their measured content-box size is resolved before auto margins,
+  so opposing definite insets can center or otherwise distribute remaining
+  space without stretching the explicit intrinsic size. The same typed path is
+  used for physical horizontal and vertical axes; only authored `auto` reaches
+  stretch-fit sizing. This follows CSS Positioned Layout's size-before-margin
+  ordering and CSS Sizing's intrinsic-size definitions.
 - Absolutely positioned table boxes with both insets set retain their
   intrinsic auto size before the absolute-axis solver distributes remaining
   space to authored auto margins, including the corresponding block-axis
@@ -213,6 +221,14 @@ working parity snapshot for implemented behavior and nearby follow-up areas.
   decoration while the root background continues to propagate to the canvas.
 - Static-position offsets remain signed through the absolute-position solver,
   so a hypothetical source may legitimately fall outside its containing block.
+- Single-line static-position sources in `horizontal-tb`, `vertical-lr`, and
+  `vertical-rl` retain typed logical placeholder advances and measured
+  hypothetical block margin-box edges. The official evaluator reports
+  raster-exact, single-page results for all 12 `{htb,vlr,vrl}` direction
+  pairs, including cross-direction vertical bidi, inline and block sources,
+  indentation, and relatively positioned inline ancestors. Multiline,
+  transformed, and fragmented static-position sources remain outside this
+  coverage.
 - Static-position WPT validation is scoped to the 26 non-script tests in
   `css/css-position/static-position/`; the ten script-driven
   `top-layer-box-uses-icb-*` tests remain excluded pending JavaScript and HTML

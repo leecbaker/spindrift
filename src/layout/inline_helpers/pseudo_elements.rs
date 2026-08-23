@@ -3,6 +3,7 @@ pub(in crate::layout) fn apply_first_line_pseudos_to_line_items(
     items: &mut Vec<InlineLineItem>,
     block_style: &ComputedStyle,
     apply_first_letter: bool,
+    font_system: &mut FontSystem,
 ) {
     if let Some(first_line_style) = block_style.first_line_style.as_deref() {
         for item in items.iter_mut() {
@@ -37,6 +38,16 @@ pub(in crate::layout) fn apply_first_line_pseudos_to_line_items(
                         {
                             atom.set_current_color_override(first_line_style.color);
                         }
+                        continue;
+                    }
+                    if matches!(
+                        atom.content(),
+                        InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace(_))
+                    ) {
+                        let mut style = atom.style().clone();
+                        apply_first_line_style_delta(&mut style, block_style, first_line_style);
+                        let advance = font_system.ic_advance_for_style(&style) / 8.0;
+                        atom.set_text_autospace_advance(&style, advance);
                         continue;
                     }
                     let content = Rc::make_mut(&mut atom.data);
@@ -347,5 +358,49 @@ mod inter_character_unit_tests {
         assert!(inline_fragment_is_inter_character_unit(&fragment(
             "\u{200e}", false
         )));
+    }
+}
+
+#[cfg(test)]
+mod first_line_autospace_tests {
+    use super::*;
+
+    #[test]
+    fn first_line_remeasures_an_autospace_marker_with_its_font_style() {
+        let mut block_style = ComputedStyle::initial();
+        block_style.font_size = 12.0;
+        let mut first_line_style = block_style.clone();
+        first_line_style.font_size = 48.0;
+        block_style.first_line_style = Some(Box::new(first_line_style));
+        let mut font_system = FontSystem::new();
+        let initial_advance = font_system.ic_advance_for_style(&block_style) / 8.0;
+        let mut items = vec![InlineLineItem::Atom(InlineAtom::new(
+            InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace(
+                InlineTextBoundarySpacing::new(initial_advance),
+            )),
+            block_style.clone(),
+            None,
+            InlineSize::new(initial_advance.points(), 0.0),
+            0.0,
+            0.0,
+            None,
+            None,
+        ))];
+
+        apply_first_line_pseudos_to_line_items(&mut items, &block_style, false, &mut font_system);
+
+        let InlineLineItem::Atom(atom) = &items[0] else {
+            panic!("test setup creates an autospace atom");
+        };
+        let InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace(spacing)) = atom.content()
+        else {
+            panic!("expected an autospace atom");
+        };
+        assert_eq!(atom.style().font_size, 48.0);
+        assert_eq!(
+            spacing.advance().points(),
+            (font_system.ic_advance_for_style(atom.style()) / 8.0).points()
+        );
+        assert_ne!(spacing.advance().points(), initial_advance.points());
     }
 }

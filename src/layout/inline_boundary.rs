@@ -57,6 +57,7 @@ pub(in crate::layout) fn inline_atom_boundary_role(
 ) -> InlineBoundaryRole {
     match content {
         InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(_))
+        | InlineAtomContent::InlineEdge(InlineEdgeRole::MetricsOnlyStrut)
         | InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace(_))
         | InlineAtomContent::StaticPositionPlaceholder => {
             // Out-of-flow boxes retain a zero-size placeholder for static

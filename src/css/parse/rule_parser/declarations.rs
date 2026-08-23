@@ -1,13 +1,14 @@
+use std::borrow::Cow;
+
 use super::declaration_values::*;
 use super::supports::strip_enclosing_parentheses;
 use super::*;
-use crate::css::ComputedColorScheme;
 use crate::css::cascade::CascadedProperty;
 use crate::css::component_values::parse_var_function_arguments;
 use crate::css::{
-    parse_font_palette, parse_font_synthesis, parse_font_synthesis_subproperty, parse_object_fit,
+    ComputedColorScheme, parse_font_palette, parse_font_synthesis,
+    parse_font_synthesis_subproperty, parse_object_fit,
 };
-use std::borrow::Cow;
 
 /// A declaration accepted by Quire's specified-value-time declaration parser.
 ///

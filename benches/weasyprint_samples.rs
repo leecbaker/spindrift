@@ -1,10 +1,11 @@
 //! Benchmarks for Quire's bundled WeasyPrint-compatible sample documents.
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use quire::{Css, Html, PdfOptions, RenderOptions};
 use std::hint::black_box;
 use std::path::Path;
 use std::time::Duration;
+
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use quire::{Css, Html, PdfOptions, RenderOptions};
 use tokio::runtime::Runtime;
 
 struct Sample {
@@ -12,6 +13,65 @@ struct Sample {
     path: &'static str,
     stylesheets: &'static [&'static str],
 }
+
+struct GridDiagnosticWorkload {
+    name: &'static str,
+    family: GridDiagnosticFamily,
+    baseline: bool,
+    floating: bool,
+    orthogonal: bool,
+}
+
+#[derive(Clone, Copy)]
+enum GridDiagnosticFamily {
+    MixedBaseline,
+    ContentBaseline,
+}
+
+const GRID_DIAGNOSTIC_WORKLOADS: &[GridDiagnosticWorkload] = &[
+    GridDiagnosticWorkload {
+        name: "mixed_baseline_floating_orthogonal",
+        family: GridDiagnosticFamily::MixedBaseline,
+        baseline: true,
+        floating: true,
+        orthogonal: true,
+    },
+    GridDiagnosticWorkload {
+        name: "mixed_baseline_neutral_floating_orthogonal",
+        family: GridDiagnosticFamily::MixedBaseline,
+        baseline: false,
+        floating: true,
+        orthogonal: true,
+    },
+    GridDiagnosticWorkload {
+        name: "mixed_baseline_nonfloating_orthogonal",
+        family: GridDiagnosticFamily::MixedBaseline,
+        baseline: true,
+        floating: false,
+        orthogonal: true,
+    },
+    GridDiagnosticWorkload {
+        name: "mixed_baseline_floating_horizontal",
+        family: GridDiagnosticFamily::MixedBaseline,
+        baseline: true,
+        floating: true,
+        orthogonal: false,
+    },
+    GridDiagnosticWorkload {
+        name: "content_baseline_floating_orthogonal",
+        family: GridDiagnosticFamily::ContentBaseline,
+        baseline: true,
+        floating: true,
+        orthogonal: true,
+    },
+    GridDiagnosticWorkload {
+        name: "content_baseline_neutral_floating_orthogonal",
+        family: GridDiagnosticFamily::ContentBaseline,
+        baseline: false,
+        floating: true,
+        orthogonal: true,
+    },
+];
 
 const SAMPLES: &[Sample] = &[
     Sample {
@@ -104,6 +164,85 @@ fn benchmark_weasyprint_samples(c: &mut Criterion) {
     }
 
     group.finish();
+
+    let mut group = c.benchmark_group("grid_float_baseline");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(5));
+    for workload in GRID_DIAGNOSTIC_WORKLOADS {
+        let document = grid_diagnostic_document(workload);
+        group.bench_function(workload.name, |b| {
+            b.iter(|| {
+                let bytes = runtime.block_on(render_inline_html_pdf(
+                    black_box(&document),
+                    &options,
+                    &pdf_options,
+                ));
+                black_box(bytes.len())
+            });
+        });
+    }
+    group.finish();
+}
+
+/// Build local workloads with the container and item counts of the slow Grid
+/// WPT families, without relying on a sibling WPT checkout.
+fn grid_diagnostic_document(workload: &GridDiagnosticWorkload) -> String {
+    let item_counts: Vec<usize> = match workload.family {
+        // 30 grids / 116 items, matching the mixed-baseline cases.
+        GridDiagnosticFamily::MixedBaseline => {
+            (0..30).map(|index| if index < 4 { 3 } else { 4 }).collect()
+        }
+        // 36 grids / 90 items, matching the content-baseline case.
+        GridDiagnosticFamily::ContentBaseline => (0..36)
+            .map(|index| if index < 18 { 3 } else { 2 })
+            .collect(),
+    };
+    let baseline_class = if workload.baseline {
+        "baseline"
+    } else {
+        "neutral"
+    };
+    let floating_class = if workload.floating {
+        "floating"
+    } else {
+        "nonfloating"
+    };
+    let mut grids = String::new();
+    for (grid_index, item_count) in item_counts.into_iter().enumerate() {
+        let grid_writing_mode = if workload.orthogonal && grid_index % 2 == 1 {
+            "vertical-rl"
+        } else {
+            "horizontal-tb"
+        };
+        grids.push_str(&format!(
+            "<div class=\"grid\" style=\"writing-mode:{grid_writing_mode}\">"
+        ));
+        for item_index in 0..item_count {
+            let item_writing_mode = if workload.orthogonal && (grid_index + item_index) % 3 == 0 {
+                "vertical-lr"
+            } else {
+                "horizontal-tb"
+            };
+            grids.push_str(&format!(
+                "<span class=\"item\" style=\"writing-mode:{item_writing_mode}\">{grid_index}<br>{item_index}</span>"
+            ));
+        }
+        grids.push_str("</div>");
+    }
+    format!(
+        "<!doctype html><meta charset=\"utf-8\"><style>
+            @page {{ size: 600pt 800pt; margin: 8pt }}
+            body {{ margin: 0; font: 14pt/1 monospace }}
+            .grid {{ display: grid; grid-template-columns: auto auto; gap: 1pt; margin: 1pt; border: 1pt solid #777; padding: 1pt }}
+            .item {{ border: .5pt solid #aaa; padding: 1pt }}
+            .floating .grid {{ float: left }}
+            .nonfloating .grid {{ float: none }}
+            .baseline .grid {{ align-content: baseline; align-items: baseline }}
+            .baseline .item:nth-child(even) {{ align-self: last baseline }}
+            .neutral .grid, .neutral .item {{ align-content: start; align-items: start; align-self: start }}
+        </style><main class=\"{baseline_class} {floating_class}\">{grids}</main>"
+    )
 }
 
 async fn render_empty_pdf(options: &RenderOptions, pdf_options: &PdfOptions) -> Vec<u8> {

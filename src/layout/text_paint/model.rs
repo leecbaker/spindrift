@@ -1,6 +1,7 @@
+use std::rc::Rc;
+
 use super::*;
 use crate::css::TextDecorationLayer;
-use std::rc::Rc;
 
 /// A non-empty logical inline range in page-local paint coordinates.
 ///
@@ -133,6 +134,10 @@ pub(in crate::layout) struct TextDecorationOriginLineGeometry {
     /// remain independent in the propagation model.
     pub(in crate::layout) layer: TextDecorationLayer,
     pub(in crate::layout) geometry: TextDecorationLineGeometry,
+    /// The origin's vertical logical-inline projection, when its line uses a
+    /// vertical physical inline axis. Endpoint insets belong to this
+    /// decorating box, not to an individual descendant receiver.
+    pub(in crate::layout) origin_inline_axis: Option<VerticalInlineAxis>,
     /// Complete physical selected-line coverage across eligible contributors.
     pub(in crate::layout) selected_inline_span: Option<TextInlineSpan>,
     /// Receiver spans in inline paint order.  A span is contributed only by a
@@ -226,6 +231,11 @@ pub(in crate::layout) struct TextDecorationPreparationInput<'a> {
     pub(in crate::layout) inset_end: f32,
     /// The descendant text style supplies line geometry and skip-self.
     pub(in crate::layout) style: &'a ComputedStyle,
+    /// The decorating origin supplies logical start/end semantics for
+    /// `text-decoration-inset`.
+    pub(in crate::layout) inset_style: &'a ComputedStyle,
+    /// The precomputed origin projection for vertical endpoint semantics.
+    pub(in crate::layout) inset_inline_axis: Option<VerticalInlineAxis>,
     pub(in crate::layout) decoration: TextDecoration,
     pub(in crate::layout) phase: TextDecorationPaintPhase,
     pub(in crate::layout) color: CssColor,

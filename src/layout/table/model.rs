@@ -1,5 +1,11 @@
-use super::*;
 use std::ops::{Deref, DerefMut};
+
+use super::{
+    ComputedStyle, Element, ElementSignature, LogicalInlineContentSize, TableAxes,
+    TableCellBorderBox, TableGridArea, TableGridLength, TableGridPoint, TableGridRect,
+    TableGridSize, TableInlineBounds, TableRowBounds, box_tree, content_box_pt, css,
+    table_captions_from_fragment, table_columns_from_fragment, table_row_ordering_from_fragment,
+};
 
 /// A table-part style after the table used-value boundary.
 ///
@@ -515,6 +521,9 @@ impl<'a> TableLayoutInput<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::css::Direction;
+    use crate::layout::PageTopPoint;
+    use crate::layout::table::{TableGridContentBoxTopLeft, TableGridPlacement};
 
     fn grid_length(value: f32) -> TableGridLength {
         TableGridLength::new(value)
@@ -593,7 +602,9 @@ mod tests {
             rowspan: 1,
             colspan: 2,
         };
-        let placement = TableGridPlacement::new(PageTopPoint::new(100.0, 300.0));
+        let placement = TableGridPlacement::new(TableGridContentBoxTopLeft::new(
+            PageTopPoint::new(100.0, 300.0),
+        ));
         let border_box = plan.cell_border_box(area, TableRowBounds::new(40.0, 25.0));
         assert_eq!(border_box.x(placement), 120.0);
         assert_eq!(border_box.top_y(placement), 260.0);
@@ -601,7 +612,7 @@ mod tests {
             border_box.top_y(placement) - border_box.rect().size.height,
             235.0
         );
-        assert_eq!(border_box.width(), 55.0);
+        assert_eq!(border_box.logical_inline_size(), grid_length(55.0));
         assert_eq!(border_box.rect().size.height, 25.0);
     }
 

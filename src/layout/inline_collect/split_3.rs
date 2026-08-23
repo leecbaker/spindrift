@@ -1,6 +1,7 @@
+use std::rc::Rc;
+
 use super::*;
 use crate::css::{TextLayoutPolicy, TextOrientation};
-use std::rc::Rc;
 
 /// Return whether a block container's own bidi value needs inline controls.
 ///
@@ -31,6 +32,9 @@ pub(in crate::layout) struct InlineElementScopeOptions {
     pub(in crate::layout) push_page_scope: bool,
     pub(in crate::layout) push_inside_marker: bool,
     pub(in crate::layout) mark_hanging_edges: bool,
+    /// Retain a zero-advance strut when this otherwise-empty scope has font
+    /// metrics distinct from its line-formatting parent.
+    pub(in crate::layout) preserve_empty_metrics: bool,
     pub(in crate::layout) fragment_edges: box_tree::InlineBoxFragmentEdges,
 }
 
@@ -39,24 +43,28 @@ impl InlineElementScopeOptions {
         push_page_scope: false,
         push_inside_marker: true,
         mark_hanging_edges: true,
+        preserve_empty_metrics: false,
         fragment_edges: box_tree::InlineBoxFragmentEdges::ALL,
     };
     pub(in crate::layout) const DOM_PAINT: Self = Self {
         push_page_scope: true,
         push_inside_marker: true,
         mark_hanging_edges: true,
+        preserve_empty_metrics: false,
         fragment_edges: box_tree::InlineBoxFragmentEdges::ALL,
     };
     pub(in crate::layout) const BOX_PAINT: Self = Self {
         push_page_scope: true,
         push_inside_marker: true,
         mark_hanging_edges: true,
+        preserve_empty_metrics: false,
         fragment_edges: box_tree::InlineBoxFragmentEdges::ALL,
     };
     pub(in crate::layout) const BOX_INTRINSIC: Self = Self {
         push_page_scope: false,
         push_inside_marker: false,
         mark_hanging_edges: true,
+        preserve_empty_metrics: false,
         fragment_edges: box_tree::InlineBoxFragmentEdges::ALL,
     };
 
@@ -67,6 +75,34 @@ impl InlineElementScopeOptions {
         self.fragment_edges = fragment_edges;
         self
     }
+
+    pub(in crate::layout) fn with_preserved_empty_metrics(mut self, preserve: bool) -> Self {
+        self.preserve_empty_metrics = preserve;
+        self
+    }
+}
+
+/// Whether an empty inline scope establishes a strut distinct from its
+/// line-formatting parent.
+///
+/// Most empty inline boxes are transparent and must not manufacture a line.
+/// A font or line-height change, however, supplies the line's resolved
+/// baseline even when it has no glyphs. Keep this predicate limited to metric
+/// inputs rather than treating paint-only style differences as content.
+/// <https://drafts.csswg.org/css-inline-3/#line-height>
+pub(in crate::layout) fn empty_inline_scope_has_distinct_metrics(
+    parent: &ComputedStyle,
+    child: &ComputedStyle,
+) -> bool {
+    child.font_family != parent.font_family
+        || child.font_size != parent.font_size
+        || child.font_style != parent.font_style
+        || child.font_weight != parent.font_weight
+        || child.font_width != parent.font_width
+        || child.font_size_adjust != parent.font_size_adjust
+        || child.font_variation_settings != parent.font_variation_settings
+        || child.line_height != parent.line_height
+        || child.vertical_align != parent.vertical_align
 }
 
 #[derive(Debug)]
@@ -76,14 +112,31 @@ pub(in crate::layout) struct InlineElementScopeState {
     pub(in crate::layout) baseline_shift: f32,
     pub(in crate::layout) visual_offset: InlineVisualOffset,
     /// Used inline-edge metrics retained through fragment replay.
-    pub(in crate::layout) edge_style: css::ZoomedLayoutStyle,
-    pub(in crate::layout) positioning_containing_block_source:
-        Option<InlinePositioningContainingBlockSource>,
+    pub(in crate::layout) edge_style: Box<css::ZoomedLayoutStyle>,
+    pub(in crate::layout) positioning_containing_block_id:
+        Option<InlinePositioningContainingBlockId>,
     pub(in crate::layout) pushed_page_scope: bool,
     pub(in crate::layout) mark_hanging_edges: bool,
+    pub(in crate::layout) preserve_empty_metrics: bool,
     pub(in crate::layout) fragment_edges: box_tree::InlineBoxFragmentEdges,
     pub(in crate::layout) counter_scope: CounterScopeState,
     pub(in crate::layout) counter_snapshot: Option<CounterSet>,
+}
+
+impl InlineElementScopeState {
+    /// Borrow the active positioned-inline source while this scope owns its
+    /// used style. Deferred descendants promote the view before this state is
+    /// consumed by [`LayoutBuilder::end_inline_element_scope`].
+    pub(in crate::layout) fn positioning_containing_block_source(
+        &self,
+    ) -> Option<BorrowedInlinePositioningContainingBlockSource<'_>> {
+        self.positioning_containing_block_id.map(|id| {
+            BorrowedInlinePositioningContainingBlockSource {
+                id,
+                style: self.edge_style.as_ref(),
+            }
+        })
+    }
 }
 
 /// Return the inline-axis contribution of one regular inline box edge.
@@ -370,8 +423,7 @@ pub(in crate::layout) fn push_autospaced_word(
     mut word: Box<InlineWord>,
     previous_text: &mut Option<AutospaceTextEdge>,
 ) {
-    while let Some((boundary, predecessor_is_ideograph)) = first_internal_autospace_boundary(&word)
-    {
+    while let Some(boundary) = first_internal_autospace_boundary(&word) {
         let suffix = InlineWord {
             text: word.text.split_off(boundary),
             style: Rc::clone(&word.style),
@@ -392,7 +444,6 @@ pub(in crate::layout) fn push_autospaced_word(
             &suffix.style,
             suffix.baseline_shift,
             suffix.visual_offset,
-            predecessor_is_ideograph,
         );
         *previous_text = None;
         word = Box::new(suffix);
@@ -406,7 +457,7 @@ pub(in crate::layout) fn push_autospaced_word(
 /// Find the first source position where CSS Text automatic spacing divides a
 /// word. Combining marks inherit the preceding base character's context, so a
 /// split always begins at the following non-inheriting scalar value.
-fn first_internal_autospace_boundary(word: &InlineWord) -> Option<(usize, bool)> {
+fn first_internal_autospace_boundary(word: &InlineWord) -> Option<usize> {
     if word.style.text_autospace.is_none() {
         return None;
     }
@@ -425,7 +476,7 @@ fn first_internal_autospace_boundary(word: &InlineWord) -> Option<(usize, bool)>
                 &word.style,
             )
         {
-            return Some((index, character_is_autospace_ideograph(previous)));
+            return Some(index);
         }
         previous = Some(character);
     }
@@ -442,15 +493,7 @@ pub(in crate::layout) fn push_autospace_boundary(
         return;
     };
     if let Some(previous) = previous_text
-        && text_autospace_boundary_needs_spacing(
-            &previous.style.text_autospace,
-            previous.character,
-            &previous.style,
-            current_character,
-            &word.style,
-        )
-        && text_autospace_boundary_needs_spacing(
-            &word.style.text_autospace,
+        && text_autospace_boundary_has_eligible_character_classes(
             previous.character,
             &previous.style,
             current_character,
@@ -463,7 +506,6 @@ pub(in crate::layout) fn push_autospace_boundary(
             &previous.style,
             previous.baseline_shift,
             previous.visual_offset,
-            character_is_autospace_ideograph(previous.character),
         );
     }
 }
@@ -474,12 +516,8 @@ pub(in crate::layout) fn push_text_autospace_atom(
     style: &ComputedStyle,
     baseline_shift: f32,
     visual_offset: InlineVisualOffset,
-    predecessor_is_ideograph: bool,
 ) {
-    let spacing = InlineTextBoundarySpacing::new(
-        font_system.ic_advance_for_style(style) / 8.0,
-        predecessor_is_ideograph,
-    );
+    let spacing = InlineTextBoundarySpacing::new(font_system.ic_advance_for_style(style) / 8.0);
     output.push(InlineItem::Atom(Box::new(
         InlineAtom::new(
             InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace(spacing)),
@@ -537,6 +575,34 @@ pub(in crate::layout) fn text_autospace_boundary_needs_spacing(
     !autospace_character_is_upright_in_vertical_text(other, other_style)
         && ((autospace.ideograph_alpha && character_is_autospace_alpha(other))
             || (autospace.ideograph_numeric && character_is_autospace_numeric(other)))
+}
+
+/// Return whether two adjacent base characters could be separated by
+/// `text-autospace` once their common inline scope is known.
+///
+/// Collection intentionally preserves these candidate boundaries even when a
+/// leaf text style disables autospace: CSS Text assigns an inline-boundary
+/// adjustment to the innermost common inline box, which is resolved only
+/// after graph construction has recorded lexical scopes.
+/// <https://drafts.csswg.org/css-text-4/#text-autospace-property>
+pub(in crate::layout) fn text_autospace_boundary_has_eligible_character_classes(
+    first: char,
+    first_style: &ComputedStyle,
+    second: char,
+    second_style: &ComputedStyle,
+) -> bool {
+    let first_is_ideograph = character_is_autospace_ideograph(first);
+    let second_is_ideograph = character_is_autospace_ideograph(second);
+    if first_is_ideograph == second_is_ideograph {
+        return false;
+    }
+    let (other, other_style) = if first_is_ideograph {
+        (second, second_style)
+    } else {
+        (first, first_style)
+    };
+    !autospace_character_is_upright_in_vertical_text(other, other_style)
+        && (character_is_autospace_alpha(other) || character_is_autospace_numeric(other))
 }
 
 /// Return whether `character` is upright under its own vertical text policy.
@@ -638,8 +704,9 @@ pub(in crate::layout) fn has_out_of_flow_formatting_box(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::rc::Rc;
+
+    use super::*;
 
     #[test]
     fn block_plaintext_uses_per_paragraph_bidi_resolution_without_controls() {

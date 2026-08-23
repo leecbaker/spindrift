@@ -1,5 +1,6 @@
-use super::*;
 use icu_locale_core::LanguageIdentifier;
+
+use super::*;
 
 static JOINING_TYPES: OnceLock<CodePointMapDataBorrowed<'static, JoiningType>> = OnceLock::new();
 static JOIN_CONTROLS: OnceLock<CodePointSetDataBorrowed<'static>> = OnceLock::new();
@@ -164,13 +165,55 @@ pub(crate) fn content_writing_system(language: Option<&str>) -> ContentWritingSy
     }
 }
 
-/// Return whether a character participates in cursive joining.
+/// One of CSS Text's cursive scripts.
 ///
-/// CSS Text requires letter spacing to preserve cursive joining behavior, and
-/// Unicode defines the joining classes used by Arabic-family shaping engines:
-/// <https://www.w3.org/TR/css-text-3/#letter-spacing-property> and
-/// <https://www.unicode.org/reports/tr44/#Joining_Type>.
-pub(crate) fn character_has_joining_behavior(character: char) -> bool {
+/// CSS Text names these scripts as unable to admit inter-letter gaps. Unicode
+/// `Joining_Type` captures directional joining for most of them, but Mongolian
+/// and Phags Pa require script-aware contextual handling instead.
+/// <https://www.w3.org/TR/css-text-3/#script-spacing>
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CursiveScript {
+    Arabic,
+    HanifiRohingya,
+    Mandaic,
+    Mongolian,
+    Nko,
+    PhagsPa,
+    Syriac,
+}
+
+/// Return the CSS Text cursive script of a Unicode letter.
+///
+/// CSS Text resolves script membership with `Script_Extensions`, rather than
+/// `Script` alone. Restricting this to letters keeps script punctuation,
+/// digits, marks, and controls from becoming a contextual-joining neighbor.
+/// <https://www.w3.org/TR/css-text-3/#script-spacing> and
+/// <https://www.unicode.org/reports/tr24/>
+fn cursive_script(character: char) -> Option<CursiveScript> {
+    if !character_is_unicode_letter(character) {
+        return None;
+    }
+    let scripts = ScriptWithExtensions::new();
+    [
+        (IcuScript::Arabic, CursiveScript::Arabic),
+        (IcuScript::HanifiRohingya, CursiveScript::HanifiRohingya),
+        (IcuScript::Mandaic, CursiveScript::Mandaic),
+        (IcuScript::Mongolian, CursiveScript::Mongolian),
+        (IcuScript::Nko, CursiveScript::Nko),
+        (IcuScript::PhagsPa, CursiveScript::PhagsPa),
+        (IcuScript::Syriac, CursiveScript::Syriac),
+    ]
+    .into_iter()
+    .find_map(|(script, cursive)| scripts.has_script(character, script).then_some(cursive))
+}
+
+/// Return whether a character has Unicode directional joining behavior.
+///
+/// This intentionally remains a direct `Joining_Type` query. Arabic
+/// presentation-form scalars are not source letters that may acquire a new
+/// join, and therefore remain non-joining here.
+/// <https://www.unicode.org/reports/tr44/#Joining_Type>
+fn character_has_unicode_joining_behavior(character: char) -> bool {
     matches!(
         joining_type(character),
         JoiningType::JoinCausing
@@ -178,6 +221,39 @@ pub(crate) fn character_has_joining_behavior(character: char) -> bool {
             | JoiningType::LeftJoining
             | JoiningType::RightJoining
     )
+}
+
+/// Return whether a character participates in CSS cursive shaping.
+///
+/// CSS Text prevents gaps within all seven listed cursive scripts. Unicode
+/// directional joining covers Arabic, Hanifi Rohingya, Mandaic, N'Ko, and
+/// Syriac; Mongolian and Phags Pa letter shaping is contextual despite not
+/// exposing the required `Joining_Type` directionality.
+/// <https://www.w3.org/TR/css-text-3/#script-spacing> and
+/// <https://www.w3.org/TR/css-text-3/#boundary-shaping>
+pub(crate) fn character_has_cursive_shaping_behavior(character: char) -> bool {
+    character_has_unicode_joining_behavior(character) || cursive_script(character).is_some()
+}
+
+/// Return whether two source letters need contextual shaping across their
+/// boundary.
+///
+/// The CSS Text cursive script must match first: Unicode `Joining_Type` alone
+/// can otherwise make characters from unrelated cursive scripts look
+/// compatible. Within one supported script, Unicode joining scripts use their
+/// directional compatibility. Mongolian and Phags Pa form contextual glyphs
+/// without that directional property, so their same-script letter pairs always
+/// receive shaping context.
+/// <https://www.w3.org/TR/css-text-3/#boundary-shaping>
+pub(crate) fn cursive_boundary_needs_context(left: char, right: char) -> bool {
+    match (cursive_script(left), cursive_script(right)) {
+        (Some(CursiveScript::Mongolian), Some(CursiveScript::Mongolian))
+        | (Some(CursiveScript::PhagsPa), Some(CursiveScript::PhagsPa)) => true,
+        (Some(left_script), Some(right_script)) if left_script == right_script => {
+            character_can_join_following(left) && character_can_join_preceding(right)
+        }
+        _ => false,
+    }
 }
 
 /// Return whether a character can join the following logical character.
@@ -206,6 +282,15 @@ pub(super) fn character_can_join_preceding(character: char) -> bool {
         joining_type(character),
         JoiningType::JoinCausing | JoiningType::DualJoining | JoiningType::RightJoining
     )
+}
+
+/// Return whether Arabic tatweel may supply missing edge context.
+///
+/// U+0640 is an Arabic joining letter, not a generic cursive-script control.
+/// It must therefore never be inserted to complete Mongolian, Phags Pa, or
+/// another CSS Text cursive script's shaping context.
+pub(super) fn character_supports_arabic_tatweel_edge_context(character: char) -> bool {
+    matches!(cursive_script(character), Some(CursiveScript::Arabic))
 }
 
 /// Return whether a character is a Unicode join-control format character.
@@ -719,14 +804,18 @@ pub(crate) fn character_is_unicode_mark(character: char) -> bool {
 
 /// Return whether a character is an ideograph for CSS `text-autospace`.
 ///
-/// CSS Text Level 4 automatic spacing is defined around Han ideographs. UAX
-/// #14 exposes this through the `Line_Break=Ideographic` class, which covers
-/// BMP and supplementary CJK ideographs without hardcoded Unicode ranges:
+/// CSS Text Level 4 defines this class independently of UAX #14's broader
+/// `Ideographic` line-break class. In particular, it includes Japanese kana,
+/// CJK strokes, Katakana extensions, and every character whose
+/// `Script_Extensions` includes Han, while excluding punctuation:
 /// <https://drafts.csswg.org/css-text-4/#text-autospace-property> and
-/// <https://www.unicode.org/reports/tr14/>.
+/// <https://www.unicode.org/reports/tr24/>.
 pub(crate) fn character_is_autospace_ideograph(character: char) -> bool {
-    line_break_class(character) == LineBreak::Ideographic
-        && GeneralCategoryGroup::Letter.contains(general_category(character))
+    !GeneralCategoryGroup::Punctuation.contains(general_category(character))
+        && (('\u{3041}'..='\u{30ff}').contains(&character)
+            || ('\u{31c0}'..='\u{31ef}').contains(&character)
+            || ('\u{31f0}'..='\u{31ff}').contains(&character)
+            || ScriptWithExtensions::new().has_script(character, IcuScript::Han))
 }
 
 /// Return whether a scalar is eligible for the UA's default ruby
@@ -749,23 +838,37 @@ pub(crate) fn character_is_ruby_justification_eligible(character: char) -> bool 
 /// Return whether a character is a non-ideographic letter for autospace.
 ///
 /// The `ideograph-alpha` value inserts spacing between Han ideographs and
-/// adjacent letters. Unicode general categories provide the letter side of
-/// that boundary, while ideographs are excluded by line-break class:
+/// adjacent letters. CSS Text includes both Unicode Letter and Mark units,
+/// but excludes ideographs and East Asian Wide or Fullwidth units:
 /// <https://drafts.csswg.org/css-text-4/#text-autospace-property> and
 /// <https://www.unicode.org/reports/tr44/#General_Category_Values>.
 pub(crate) fn character_is_autospace_alpha(character: char) -> bool {
     !character_is_autospace_ideograph(character)
-        && GeneralCategoryGroup::Letter.contains(general_category(character))
+        && (GeneralCategoryGroup::Letter.contains(general_category(character))
+            || GeneralCategoryGroup::Mark.contains(general_category(character)))
+        && !matches!(
+            EAST_ASIAN_WIDTHS
+                .get_or_init(CodePointMapData::<EastAsianWidth>::new)
+                .get(character),
+            EastAsianWidth::Wide | EastAsianWidth::Fullwidth
+        )
 }
 
 /// Return whether a character is numeric for CSS `text-autospace`.
 ///
 /// The `ideograph-numeric` value inserts spacing between Han ideographs and
-/// adjacent Unicode numbers, not just ASCII digits:
+/// adjacent Unicode decimal digits, not just ASCII digits. Fullwidth digits
+/// are explicitly excluded:
 /// <https://drafts.csswg.org/css-text-4/#text-autospace-property> and
 /// <https://www.unicode.org/reports/tr44/#General_Category_Values>.
 pub(crate) fn character_is_autospace_numeric(character: char) -> bool {
-    GeneralCategoryGroup::Number.contains(general_category(character))
+    matches!(general_category(character), GeneralCategory::DecimalNumber)
+        && !matches!(
+            EAST_ASIAN_WIDTHS
+                .get_or_init(CodePointMapData::<EastAsianWidth>::new)
+                .get(character),
+            EastAsianWidth::Fullwidth
+        )
 }
 
 /// Return whether a non-word segment can keep CSS capitalize word context.
@@ -934,6 +1037,24 @@ fn general_category(character: char) -> GeneralCategory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn autospace_classes_follow_css_text_character_definitions() {
+        assert!(character_is_autospace_ideograph('あ'));
+        assert!(character_is_autospace_ideograph('\u{31c0}'));
+        assert!(character_is_autospace_ideograph('\u{31f0}'));
+        assert!(character_is_autospace_ideograph('\u{20000}'));
+        assert!(!character_is_autospace_ideograph('。'));
+
+        assert!(character_is_autospace_alpha('A'));
+        assert!(character_is_autospace_alpha('\u{0301}'));
+        assert!(!character_is_autospace_alpha('Ａ'));
+        assert!(!character_is_autospace_alpha('中'));
+
+        assert!(character_is_autospace_numeric('3'));
+        assert!(!character_is_autospace_numeric('３'));
+        assert!(!character_is_autospace_numeric('Ⅳ'));
+    }
 
     #[test]
     fn unicode_vertical_orientation_helper_returns_expected_classes() {
@@ -1177,5 +1298,28 @@ mod tests {
     fn emoji_presentation_distinguishes_emoji_and_text_default_scalars() {
         assert!(character_has_emoji_presentation('\u{1fae8}'));
         assert!(!character_has_emoji_presentation('\u{2139}'));
+    }
+
+    #[test]
+    fn css_text_cursive_scripts_use_script_extensions_for_letters_only() {
+        for (character, expected_script) in [
+            ('ع', CursiveScript::Arabic),
+            ('\u{10d00}', CursiveScript::HanifiRohingya),
+            ('\u{0840}', CursiveScript::Mandaic),
+            ('\u{1828}', CursiveScript::Mongolian),
+            ('\u{07de}', CursiveScript::Nko),
+            ('\u{a840}', CursiveScript::PhagsPa),
+            ('\u{0710}', CursiveScript::Syriac),
+        ] {
+            assert_eq!(cursive_script(character), Some(expected_script));
+        }
+
+        for character in ['\u{1810}', '\u{1801}', '\u{a874}'] {
+            assert_eq!(cursive_script(character), None);
+        }
+
+        assert!(character_supports_arabic_tatweel_edge_context('ع'));
+        assert!(!character_supports_arabic_tatweel_edge_context('\u{1828}'));
+        assert!(!character_supports_arabic_tatweel_edge_context('\u{a840}'));
     }
 }

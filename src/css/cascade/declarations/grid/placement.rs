@@ -1,6 +1,7 @@
+use std::num::{NonZeroI32, NonZeroU16};
+
 use super::super::shorthands::split_css_top_level_slashes;
 use super::*;
-use std::num::{NonZeroI32, NonZeroU16};
 
 /// Parses one `grid-template-areas` string token into named and null cells.
 ///

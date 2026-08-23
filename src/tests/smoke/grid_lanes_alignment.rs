@@ -69,7 +69,7 @@ async fn grid_lanes_stacking_content_distribution_moves_only_in_flow_items() {
         let observed_offset = if row_lanes {
             (item.x() - oof.x()).abs()
         } else {
-            (item.y() - oof.y()).abs()
+            ((item.y() + item.height()) - (oof.y() + oof.height())).abs()
         };
         assert!(
             (observed_offset - expected_offset).abs() < 0.01,

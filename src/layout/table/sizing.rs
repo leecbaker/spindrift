@@ -1,4 +1,19 @@
-use super::*;
+use super::{
+    BlockSizePercentageBasis, BorderBoxLength, BoxSizing, ComputedStyle, ContentBoxLength,
+    DeclaredTableTrackSize, Element, Float, LayoutBuilder, LayoutLength, LogicalBlockContentSize,
+    LogicalInlineContentSize, NodeKind, NonContentLength, PercentageBasis, PhysicalContentWidth,
+    Position, ReplacedElementKind, SemanticLengthExt, Stylesheets, TableAxes, TableCell,
+    TableCellAxisAdapter, TableGridLength, TableInlineTrackSizing, TableRootTrackAxis,
+    WritingModeAxes, border_box_pt, border_box_to_content_box_length, box_tree,
+    constrain_content_width, content_box_pt, content_box_to_border_box_length, css,
+    horizontal_border_width, inline_layout, intrinsic_canvas_size,
+    intrinsic_inline_size_is_contained, intrinsic_padding_edges, intrinsic_svg_size, layout_points,
+    layout_pt, non_content_pt, replaced_element_kind, table_horizontal_borders,
+    table_vertical_borders, used_border_widths, used_box_edges, used_content_box_height_or_auto,
+    used_content_box_height_or_auto_with_basis, used_content_box_size,
+    used_content_box_width_or_auto, used_length_percentage_or_auto,
+    used_length_percentage_or_auto_with_basis, used_padding_edges,
+};
 use crate::layout::table::layout::{
     table_cell_child_is_in_flow_float, table_cell_style_has_parent_percentage_block_size,
 };
@@ -17,8 +32,8 @@ use crate::units::IntoLayoutLength;
 #[derive(Debug, Clone, Copy)]
 pub(in crate::layout) struct TableWrapperFlexSizing {
     pub(in crate::layout) grid_min_content_inline: LogicalInlineContentSize,
-    pub(in crate::layout) grid_max_content_inline: LogicalInlineContentSize,
-    pub(in crate::layout) wrapper_preferred_inline: LogicalInlineContentSize,
+    pub(in crate::layout) grid_max_content_inline: TableMaxContentInline,
+    pub(in crate::layout) wrapper_preferred_inline: TableMaxContentInline,
     pub(in crate::layout) wrapper_intrinsic_block: LogicalBlockContentSize,
     /// Decoration belongs to the wrapper, not the grid content contribution.
     pub(in crate::layout) inline_non_content: NonContentLength,
@@ -26,6 +41,41 @@ pub(in crate::layout) struct TableWrapperFlexSizing {
     /// Margins remain outside table-grid sizing and are consumed only by the
     /// parent flex outer-size calculation.
     pub(in crate::layout) margins: css::Edges,
+}
+
+/// A table max-content contribution may be genuinely unbounded when
+/// percentage columns consume the full percentage budget alongside a
+/// non-percentage column.  Keep that semantic state out of scalar Flex/Taffy
+/// adapters; `f32::MAX` is an implementation sentinel, not a CSS length.
+/// <https://drafts.csswg.org/css-tables-3/#computing-the-table-width>
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout) enum TableMaxContentInline {
+    Finite(LogicalInlineContentSize),
+    Unbounded,
+}
+
+impl TableMaxContentInline {
+    pub(in crate::layout) fn from_table_measurement(value: f32) -> Self {
+        if value >= f32::MAX / 4.0 {
+            Self::Unbounded
+        } else {
+            Self::Finite(LogicalInlineContentSize::new(content_box_pt(
+                value.max(0.0),
+            )))
+        }
+    }
+
+    /// Resolve an unbounded intrinsic query in the definite available slot
+    /// required by Flexbox's content-sizing step.
+    pub(in crate::layout) fn resolve_against(
+        self,
+        available: LogicalInlineContentSize,
+    ) -> LogicalInlineContentSize {
+        match self {
+            Self::Finite(value) => value,
+            Self::Unbounded => available,
+        }
+    }
 }
 
 /// Prepare a table-wrapper probe for Flexbox's intrinsic automatic minimum.
@@ -65,12 +115,12 @@ impl ResolvedTableWrapperInsets {
         border_widths: css::Edges::ZERO,
     };
 
-    pub(in crate::layout) fn horizontal_non_content(self) -> f32 {
-        self.border_widths.left + self.border_widths.right
+    pub(in crate::layout) fn horizontal_non_content(self) -> NonContentLength {
+        non_content_pt(self.border_widths.left + self.border_widths.right)
     }
 
-    pub(in crate::layout) fn vertical_non_content(self) -> f32 {
-        self.border_widths.top + self.border_widths.bottom
+    pub(in crate::layout) fn vertical_non_content(self) -> NonContentLength {
+        non_content_pt(self.border_widths.top + self.border_widths.bottom)
     }
 }
 
@@ -377,8 +427,11 @@ pub(super) fn constrain_table_root_inline_size<Source>(
     );
     let min = min.unwrap_or_else(|| content_box_pt(0.0));
     let max = max.map(|max| max.max(min));
+    let constrained = value.max(min);
     LogicalInlineContentSize::new(content_box_pt(
-        value.max(min).min(max.unwrap_or(value)).points().max(0.0),
+        max.map_or(constrained, |maximum| constrained.min(maximum))
+            .points()
+            .max(0.0),
     ))
 }
 
@@ -779,9 +832,12 @@ impl TableColumnMeasures {
 }
 
 pub(super) fn intrinsic_percentage_contribution(style: &ComputedStyle) -> f32 {
-    let width = length_percentage_percent(style.box_values.width.clone()).unwrap_or(0.0);
-    let max_width =
-        length_percentage_percent(style.box_values.max_width.clone()).unwrap_or(f32::INFINITY);
+    let width = length_percentage_percent(style.box_values.width.clone())
+        .map(TableIntrinsicPercentage::coefficient)
+        .unwrap_or(0.0);
+    let max_width = length_percentage_percent(style.box_values.max_width.clone())
+        .map(TableIntrinsicPercentage::coefficient)
+        .unwrap_or(f32::INFINITY);
     // CSS Tables intentionally excludes `min-width` from a column's
     // intrinsic percentage contribution. `width` already acts as a minimum
     // during table layout, while a percentage min-width must not turn an
@@ -790,7 +846,22 @@ pub(super) fn intrinsic_percentage_contribution(style: &ComputedStyle) -> f32 {
     width.min(max_width).max(0.0)
 }
 
-fn length_percentage_percent(value: css::ComputedLengthPercentageOrAuto) -> Option<f32> {
+/// A pure percentage contribution to intrinsic table track sizing.
+///
+/// This stays distinct from a physical length: it is a unitless ratio that
+/// only becomes a length once the table grid has a definite inline size.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TableIntrinsicPercentage(f32);
+
+impl TableIntrinsicPercentage {
+    fn coefficient(self) -> f32 {
+        self.0
+    }
+}
+
+fn length_percentage_percent(
+    value: css::ComputedLengthPercentageOrAuto,
+) -> Option<TableIntrinsicPercentage> {
     match value {
         css::ComputedLengthPercentageOrAuto::LengthPercentage(value)
             // Auto-table intrinsic sizing has no table grid width to resolve
@@ -800,7 +871,9 @@ fn length_percentage_percent(value: css::ComputedLengthPercentageOrAuto) -> Opti
             // <https://drafts.csswg.org/css-tables-3/#computing-column-measures>
             if value.pure_percentage_coefficient().is_some() =>
         {
-            value.pure_percentage_coefficient()
+            value
+                .pure_percentage_coefficient()
+                .map(TableIntrinsicPercentage)
         }
         css::ComputedLengthPercentageOrAuto::LengthPercentage(_) => None,
         css::ComputedLengthPercentageOrAuto::Auto
@@ -824,16 +897,16 @@ pub(super) fn constrain_table_intrinsic_width_with_floor(
     // than disappearing from the table grid.
     // <https://www.w3.org/TR/css-sizing-3/#min-size-auto>
     let max_width = intrinsic_length_constraint(style.box_values.max_width.clone())
-        .map(|maximum| maximum.max(min_width.unwrap_or(0.0)));
+        .map(|maximum| maximum.max(min_width.unwrap_or_else(|| layout_pt(0.0))));
     constrain(value.max(floor), min_width, max_width)
 }
 
-fn intrinsic_length_constraint(value: css::ComputedLengthPercentageOrAuto) -> Option<f32> {
+fn intrinsic_length_constraint(value: css::ComputedLengthPercentageOrAuto) -> Option<LayoutLength> {
     match value {
         css::ComputedLengthPercentageOrAuto::LengthPercentage(value)
             if !value.needs_percentage_basis() =>
         {
-            Some(value.length_points())
+            Some(layout_pt(value.length_points()))
         }
         // A mixed length-percentage min/max value is cyclic while the table's
         // intrinsic width is unknown. Its fixed component must not be used as
@@ -850,9 +923,9 @@ fn intrinsic_length_constraint(value: css::ComputedLengthPercentageOrAuto) -> Op
     }
 }
 
-fn constrain(value: f32, min: Option<f32>, max: Option<f32>) -> f32 {
-    let value = min.map(|min| value.max(min)).unwrap_or(value);
-    max.map(|max| value.min(max)).unwrap_or(value)
+fn constrain(value: f32, min: Option<LayoutLength>, max: Option<LayoutLength>) -> f32 {
+    let value = min.map(|min| value.max(min.points())).unwrap_or(value);
+    max.map(|max| value.min(max.points())).unwrap_or(value)
 }
 
 /// Distribute extra assignable table width across a column range.
@@ -1026,31 +1099,80 @@ pub(super) fn distribute_first_row_fixed_width(
     }
 }
 
-pub(super) fn table_cell_content_min_width(
+/// The paired intrinsic contributions of one table cell to its table-root
+/// inline track.
+///
+/// CSS Tables resolves a cell's min-content and max-content contributions
+/// from the same intrinsic formatting context. Keeping them together makes a
+/// single sizing pass compute that context once, and prevents a caller from
+/// accidentally combining bounds from different percentage-basis scopes:
+/// <https://drafts.csswg.org/css-tables-3/#computing-cell-measures>.
+#[derive(Debug, Clone, Copy)]
+struct TableCellIntrinsicTrackRange {
+    min_content: TableGridLength,
+    max_content: TableGridLength,
+}
+
+impl TableCellIntrinsicTrackRange {
+    fn new(min_content: TableGridLength, max_content: TableGridLength) -> Self {
+        debug_assert!(min_content.get() >= 0.0);
+        debug_assert!(max_content.get() >= 0.0);
+        Self {
+            min_content,
+            max_content: max_content.max(min_content),
+        }
+    }
+
+    fn min_content(self) -> TableGridLength {
+        self.min_content
+    }
+
+    fn max_content(self) -> TableGridLength {
+        self.max_content
+    }
+}
+
+/// Measure both intrinsic table-track contributions for one cell.
+///
+/// This is deliberately an ephemeral per-call value, not a layout cache.
+/// Later final-layout operations retain their own constrained measurements,
+/// whose percentage bases and fragmentation state can differ from automatic
+/// table sizing.
+fn table_cell_intrinsic_track_range(
     layout: &mut LayoutBuilder<'_>,
     cell: &TableCell<'_>,
     style: &ComputedStyle,
     stylesheets: &Stylesheets<'_>,
     border_insets: Option<css::Edges>,
-) -> f32 {
+) -> TableCellIntrinsicTrackRange {
     let inline_contribution =
         table_cell_inline_intrinsic_contribution(layout, cell, style, stylesheets);
-    let replaced_width = table_cell_replaced_content_max_width(cell, style);
-    let (block_min_width, _) = table_cell_block_child_intrinsic_widths(layout, cell, stylesheets);
+    let replaced_widths = table_cell_replaced_content_width_range(cell, style);
+    let block_widths = table_cell_block_child_intrinsic_widths(layout, cell, stylesheets);
     let border_width = border_insets
         .map(|borders| borders.left + borders.right)
         .unwrap_or_else(|| table_horizontal_borders(style).points());
-
     let padding = intrinsic_padding_edges(style).to_css_edges();
+    let non_content = padding.left + padding.right + border_width;
 
-    inline_contribution
-        .min_content
-        .points()
-        .max(replaced_width)
-        .max(block_min_width)
-        + padding.left
-        + padding.right
-        + border_width
+    TableCellIntrinsicTrackRange::new(
+        TableGridLength::new(
+            inline_contribution
+                .min_content
+                .points()
+                .max(replaced_widths.min_content.get())
+                .max(block_widths.0)
+                + non_content,
+        ),
+        TableGridLength::new(
+            inline_contribution
+                .max_content
+                .points()
+                .max(replaced_widths.max_content.get())
+                .max(block_widths.1)
+                + non_content,
+        ),
+    )
 }
 
 pub(super) fn table_cell_content_max_width(
@@ -1060,24 +1182,9 @@ pub(super) fn table_cell_content_max_width(
     stylesheets: &Stylesheets<'_>,
     border_insets: Option<css::Edges>,
 ) -> f32 {
-    let inline_contribution =
-        table_cell_inline_intrinsic_contribution(layout, cell, style, stylesheets);
-    let replaced_width = table_cell_replaced_content_sum_width(cell, style);
-    let (_, block_max_width) = table_cell_block_child_intrinsic_widths(layout, cell, stylesheets);
-    let border_width = border_insets
-        .map(|borders| borders.left + borders.right)
-        .unwrap_or_else(|| table_horizontal_borders(style).points());
-
-    let padding = intrinsic_padding_edges(style).to_css_edges();
-
-    inline_contribution
-        .max_content
-        .points()
-        .max(block_max_width)
-        .max(replaced_width)
-        + padding.left
-        + padding.right
-        + border_width
+    table_cell_intrinsic_track_range(layout, cell, style, stylesheets, border_insets)
+        .max_content()
+        .get()
 }
 
 /// Return a cell's minimum outer contribution on the physical horizontal axis.
@@ -1155,21 +1262,11 @@ pub(super) fn table_cell_content_table_inline_size(
 ) -> inline_layout::InlineIntrinsicContribution {
     let axes = TableCellAxisAdapter::for_table(table_style);
     if axes.root_track_uses_physical_width(TableRootTrackAxis::Inline) {
+        let track_range =
+            table_cell_intrinsic_track_range(layout, cell, cell_style, stylesheets, border_insets);
         return inline_layout::InlineIntrinsicContribution::new(
-            LogicalInlineContentSize::new(content_box_pt(table_cell_content_min_width(
-                layout,
-                cell,
-                cell_style,
-                stylesheets,
-                border_insets,
-            ))),
-            LogicalInlineContentSize::new(content_box_pt(table_cell_content_max_width(
-                layout,
-                cell,
-                cell_style,
-                stylesheets,
-                border_insets,
-            ))),
+            LogicalInlineContentSize::new(content_box_pt(track_range.min_content().get())),
+            LogicalInlineContentSize::new(content_box_pt(track_range.max_content().get())),
         );
     }
 
@@ -1221,6 +1318,20 @@ fn table_cell_inline_intrinsic_contribution(
     let available_inline_size = table_cell_inline_intrinsic_measure(style)
         .map(LogicalInlineContentSize::points)
         .unwrap_or(f32::MAX);
+    // Table structure can retain a cell as a DOM-backed source instead of a
+    // prebuilt formatting-box list. Intrinsic float runs must see the same
+    // frozen child boxes in both cases; otherwise the DOM-backed path drops
+    // floated descendants before column measurement.
+    let built_children;
+    let children = if let Some(children) = cell.children.as_deref() {
+        Some(children)
+    } else if let Some(element) = cell.element {
+        built_children =
+            layout.build_frozen_child_boxes_with_current_ancestors(element, stylesheets, style);
+        Some(built_children.as_slice())
+    } else {
+        None
+    };
     // CSS Tables computes intrinsic column contributions before it has a
     // table-cell inline containing block. A descendant `width: 100%` must
     // therefore remain cyclic here rather than resolving against the page's
@@ -1230,19 +1341,11 @@ fn table_cell_inline_intrinsic_contribution(
     // <https://drafts.csswg.org/css-sizing-3/#intrinsic-sizes>
     let measurement =
         layout.with_intrinsic_inline_percentage_basis(PercentageBasis::indefinite(), |layout| {
-            if let Some(children) = cell.children.as_deref() {
+            if let Some(children) = children {
                 layout.intrinsic_inline_measurement_for_boxes(
                     children,
                     style,
                     stylesheets,
-                    available_inline_size,
-                )
-            } else if let Some(element) = cell.element {
-                layout.intrinsic_inline_measurement_for_element(
-                    element,
-                    style,
-                    stylesheets,
-                    None,
                     available_inline_size,
                 )
             } else {
@@ -1250,8 +1353,28 @@ fn table_cell_inline_intrinsic_contribution(
             }
         });
 
+    // The inline intrinsic probe represents floats as zero-advance markers,
+    // which is appropriate for line construction but not for a table cell's
+    // max-content track contribution. Add the source-ordered float-run
+    // margin-box contribution explicitly.
+    let mut contribution = measurement.contribution;
+    if let Some(children) = children {
+        let (float_min, float_max) = layout.inline_float_run_intrinsic_widths_for_boxes(
+            children,
+            style,
+            stylesheets,
+            available_inline_size,
+        );
+        contribution.min_content = contribution
+            .min_content
+            .max(LogicalInlineContentSize::new(content_box_pt(float_min)));
+        contribution.max_content = contribution
+            .max_content
+            .max(LogicalInlineContentSize::new(content_box_pt(float_max)));
+    }
+
     if !WritingModeAxes::new(style.writing_mode, style.direction).swaps_physical_axes() {
-        return measurement.contribution;
+        return contribution;
     }
 
     let physical_width = measurement.physical_width(style);
@@ -1370,13 +1493,43 @@ fn table_cell_formatting_children_intrinsic_widths(
     children: &[box_tree::FormattingBox<'_>],
     stylesheets: &Stylesheets<'_>,
 ) -> (f32, f32) {
-    children
-        .iter()
-        .fold((0.0_f32, 0.0_f32), |(min, max), child| {
-            let (child_min, child_max) =
-                table_cell_formatting_child_intrinsic_widths(layout, child, stylesheets);
-            (min.max(child_min), max.max(child_max))
-        })
+    // Floats generated by consecutive in-flow children occupy the same
+    // hypothetical line for max-content sizing.  Treating every child as a
+    // block-stack alternative loses their combined width (two 50px floats
+    // incorrectly contribute 50px instead of 100px).  A cleared float starts
+    // a new row; conservatively ending the current run for any `clear` value
+    // is correct for all same-side runs and never merges incompatible rows.
+    // <https://www.w3.org/TR/CSS22/visuren.html#floats>
+    // <https://drafts.csswg.org/css-tables-3/#computing-cell-measures>
+    let mut contribution = (0.0_f32, 0.0_f32);
+    let mut float_run = (0.0_f32, 0.0_f32);
+    let flush_float_run = |contribution: &mut (f32, f32), float_run: &mut (f32, f32)| {
+        contribution.0 = contribution.0.max(float_run.0);
+        contribution.1 = contribution.1.max(float_run.1);
+        *float_run = (0.0, 0.0);
+    };
+
+    for child in children {
+        let (child_min, child_max) =
+            table_cell_formatting_child_intrinsic_widths(layout, child, stylesheets);
+        if table_cell_child_is_in_flow_float(child) {
+            let clears = child
+                .element_parts()
+                .is_some_and(|(_, _, style, _)| !matches!(style.clear, css::Clear::None));
+            if clears {
+                flush_float_run(&mut contribution, &mut float_run);
+            }
+            float_run.0 = float_run.0.max(child_min);
+            float_run.1 += child_max;
+            continue;
+        }
+
+        flush_float_run(&mut contribution, &mut float_run);
+        contribution.0 = contribution.0.max(child_min);
+        contribution.1 = contribution.1.max(child_max);
+    }
+    flush_float_run(&mut contribution, &mut float_run);
+    contribution
 }
 
 fn table_cell_block_child_contributes_to_intrinsic_width(
@@ -1479,16 +1632,23 @@ fn table_cell_formatting_box_intrinsic_width(
     )
 }
 
-fn table_cell_replaced_content_max_width(cell: &TableCell<'_>, cell_style: &ComputedStyle) -> f32 {
-    table_cell_replaced_content_widths(cell, cell_style)
-        .into_iter()
-        .fold(0.0_f32, f32::max)
-}
-
-fn table_cell_replaced_content_sum_width(cell: &TableCell<'_>, cell_style: &ComputedStyle) -> f32 {
-    table_cell_replaced_content_widths(cell, cell_style)
-        .into_iter()
-        .sum()
+/// Return a cell's paired replaced-content intrinsic contributions.
+///
+/// Replaced items contribute their largest individual width to min-content
+/// sizing and their source-order sum to max-content sizing. Both values come
+/// from the same descendant traversal so table-track measurement does not
+/// inspect the cell twice.
+fn table_cell_replaced_content_width_range(
+    cell: &TableCell<'_>,
+    cell_style: &ComputedStyle,
+) -> TableCellIntrinsicTrackRange {
+    let widths = table_cell_replaced_content_widths(cell, cell_style);
+    let min_content = widths.iter().copied().fold(0.0_f32, f32::max);
+    let max_content = widths.into_iter().sum::<f32>();
+    TableCellIntrinsicTrackRange::new(
+        TableGridLength::new(min_content),
+        TableGridLength::new(max_content),
+    )
 }
 
 /// Return replaced descendant widths used by table intrinsic sizing.
@@ -1518,12 +1678,37 @@ fn replaced_box_intrinsic_widths(
     cell_style: &ComputedStyle,
 ) -> Vec<f32> {
     match box_ {
+        box_tree::FormattingBox::AtomicInline(box_)
+            if replaced_element_kind(box_.core.element) == Some(ReplacedElementKind::Image)
+                && (box_.core.element.image_rendering == crate::dom::ImageRendering::Empty
+                    || crate::dom::selected_img_source(box_.core.element).is_none()) =>
+        {
+            // An inline image without a selected source has no intrinsic
+            // dimensions. Its percentage width resolves only after the table
+            // cell width is known and cannot establish a column minimum.
+            // <https://html.spec.whatwg.org/multipage/images.html#the-img-element>
+            // <https://drafts.csswg.org/css-tables-3/#computing-cell-measures>
+            Vec::new()
+        }
+        box_tree::FormattingBox::Replaced(box_)
+            if replaced_element_kind(box_.core.element) == Some(ReplacedElementKind::Image)
+                && (box_.core.element.image_rendering == crate::dom::ImageRendering::Empty
+                    || crate::dom::selected_img_source(box_.core.element).is_none()) =>
+        {
+            // A source-less HTML image has zero intrinsic dimensions. Its
+            // percentage width is resolved only during final table-cell
+            // layout, never while computing an auto table's column minimum.
+            // <https://html.spec.whatwg.org/multipage/images.html#the-img-element>
+            // <https://drafts.csswg.org/css-tables-3/#computing-cell-measures>
+            Vec::new()
+        }
         box_tree::FormattingBox::Replaced(box_) => replaced_intrinsic_width_with_table_cell_height(
             box_.core.element,
             &box_.core.style,
             cell_style,
         )
         .into_iter()
+        .map(PhysicalContentWidth::points)
         .collect(),
         box_tree::FormattingBox::AtomicInline(box_) => {
             replaced_intrinsic_width_with_table_cell_height(
@@ -1532,6 +1717,7 @@ fn replaced_box_intrinsic_widths(
                 cell_style,
             )
             .into_iter()
+            .map(PhysicalContentWidth::points)
             .collect()
         }
         box_tree::FormattingBox::Block(box_) => box_
@@ -1586,14 +1772,14 @@ fn replaced_intrinsic_width_with_table_cell_height(
     element: &Element,
     style: &ComputedStyle,
     cell_style: &ComputedStyle,
-) -> Option<f32> {
+) -> Option<PhysicalContentWidth> {
     let intrinsic_size = match replaced_element_kind(element) {
         Some(ReplacedElementKind::Svg) => intrinsic_svg_size(element),
         Some(ReplacedElementKind::Canvas) => Some(intrinsic_canvas_size(element)),
         Some(ReplacedElementKind::Image) | None => None,
     }?;
     if !style.box_values.width.clone().is_auto() || intrinsic_size.height <= content_box_pt(0.0) {
-        return Some(intrinsic_size.width.points());
+        return Some(PhysicalContentWidth::new(intrinsic_size.width));
     }
     let cell_height = cell_style
         .box_values
@@ -1605,15 +1791,16 @@ fn replaced_intrinsic_width_with_table_cell_height(
         PercentageBasis::definite(content_box_pt(cell_height)),
         non_content_pt(0.0),
     )?;
-    Some(
+    Some(PhysicalContentWidth::new(content_box_pt(
         (used_height.points() * intrinsic_size.width.points() / intrinsic_size.height.points())
             .max(0.0),
-    )
+    )))
 }
 
 fn replaced_descendant_intrinsic_widths(element: &Element) -> Vec<f32> {
     let mut widths: Vec<f32> = replaced_element_intrinsic_width(element)
         .into_iter()
+        .map(PhysicalContentWidth::points)
         .collect();
     widths.extend(element.children.iter().flat_map(|child| match &child.kind {
         NodeKind::Element(child) => replaced_descendant_intrinsic_widths(child),
@@ -1622,12 +1809,14 @@ fn replaced_descendant_intrinsic_widths(element: &Element) -> Vec<f32> {
     widths
 }
 
-fn replaced_element_intrinsic_width(element: &Element) -> Option<f32> {
+fn replaced_element_intrinsic_width(element: &Element) -> Option<PhysicalContentWidth> {
     match replaced_element_kind(element) {
         Some(ReplacedElementKind::Svg) => {
-            intrinsic_svg_size(element).map(|size| size.width.points())
+            intrinsic_svg_size(element).map(|size| PhysicalContentWidth::new(size.width))
         }
-        Some(ReplacedElementKind::Canvas) => Some(intrinsic_canvas_size(element).width.points()),
+        Some(ReplacedElementKind::Canvas) => Some(PhysicalContentWidth::new(
+            intrinsic_canvas_size(element).width,
+        )),
         Some(ReplacedElementKind::Image) | None => None,
     }
 }
@@ -1635,6 +1824,8 @@ fn replaced_element_intrinsic_width(element: &Element) -> Option<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::css::WritingMode;
+    use crate::layout::BlockSizeBasisSource;
 
     fn length(value: f32) -> css::ComputedLengthPercentageOrAuto {
         css::ComputedLengthPercentageOrAuto::LengthPercentage(
@@ -1745,7 +1936,7 @@ mod tests {
             length_percentage_percent(css::ComputedLengthPercentageOrAuto::LengthPercentage(
                 pure_percentage
             )),
-            Some(0.5)
+            Some(TableIntrinsicPercentage(0.5))
         );
     }
 
@@ -1764,7 +1955,7 @@ mod tests {
             intrinsic_length_constraint(css::ComputedLengthPercentageOrAuto::LengthPercentage(
                 fixed
             )),
-            Some(12.0)
+            Some(layout_pt(12.0))
         );
     }
 
@@ -1781,6 +1972,23 @@ mod tests {
     }
 
     #[test]
+    fn table_cell_intrinsic_track_range_preserves_ordered_min_and_max_bounds() {
+        let range = TableCellIntrinsicTrackRange::new(
+            TableGridLength::new(12.0),
+            TableGridLength::new(20.0),
+        );
+        assert_eq!(range.min_content().get(), 12.0);
+        assert_eq!(range.max_content().get(), 20.0);
+
+        let clamped = TableCellIntrinsicTrackRange::new(
+            TableGridLength::new(20.0),
+            TableGridLength::new(12.0),
+        );
+        assert_eq!(clamped.min_content().get(), 20.0);
+        assert_eq!(clamped.max_content().get(), 20.0);
+    }
+
+    #[test]
     fn wrapper_geometry_uses_horizontal_edges_for_horizontal_inline_size() {
         let mut style = style_with_width(length(150.0));
         style.border_collapse = css::BorderCollapse::Separate;
@@ -1794,6 +2002,27 @@ mod tests {
         assert_eq!(geometry.grid_inline.points(), 150.0);
         assert_eq!(geometry.inline_non_content().points(), 20.0);
         assert_eq!(geometry.block_non_content().points(), 0.0);
+    }
+
+    #[test]
+    fn wrapper_geometry_applies_min_and_max_inline_constraints() {
+        let mut min_style = style_with_width(length(40.0));
+        min_style.box_values.min_width = length(80.0);
+        assert_eq!(
+            used_table_wrapper_geometry(&min_style, 300.0, None)
+                .grid_inline
+                .points(),
+            80.0
+        );
+
+        let mut max_style = style_with_width(length(120.0));
+        max_style.box_values.max_width = length(60.0);
+        assert_eq!(
+            used_table_wrapper_geometry(&max_style, 300.0, None)
+                .grid_inline
+                .points(),
+            60.0
+        );
     }
 
     #[test]
@@ -1889,8 +2118,8 @@ mod tests {
 
         assert!((insets.border_widths.top - 72.0 / 2.54).abs() < 0.01);
         assert!((insets.border_widths.left - 108.0 / 2.54).abs() < 0.01);
-        assert!((insets.vertical_non_content() - 2.0 * 72.0 / 2.54).abs() < 0.01);
-        assert!((insets.horizontal_non_content() - 2.0 * 108.0 / 2.54).abs() < 0.01);
+        assert!((insets.vertical_non_content().points() - 2.0 * 72.0 / 2.54).abs() < 0.01);
+        assert!((insets.horizontal_non_content().points() - 2.0 * 108.0 / 2.54).abs() < 0.01);
     }
 
     #[test]

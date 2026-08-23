@@ -1,5 +1,6 @@
-use super::*;
 use std::num::{NonZeroI32, NonZeroU16};
+
+use super::*;
 
 /// Computed CSS Grid explicit track list.
 ///

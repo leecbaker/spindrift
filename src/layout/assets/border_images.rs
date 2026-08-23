@@ -1,6 +1,7 @@
+use std::rc::Rc;
+
 use super::*;
 use crate::document::paint::patterns::RenderedImageSourceRect;
-use std::rc::Rc;
 
 /// The border-image resolution result that controls whether ordinary border
 /// styles remain visible. A successfully resolved image replaces the normal
@@ -638,8 +639,10 @@ mod tests {
         assert!(
             image
                 .rgb
-                .chunks_exact(3)
-                .all(|sample| sample == [0, 128, 0])
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .all(|sample| sample == &[0, 128, 0])
         );
     }
 
@@ -678,8 +681,10 @@ mod tests {
         assert!(
             raster
                 .rgb
-                .chunks_exact(3)
-                .all(|sample| sample == [0, 128, 0])
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .all(|sample| sample == &[0, 128, 0])
         );
     }
 
@@ -736,9 +741,7 @@ mod tests {
         );
 
         assert_eq!(images.len(), 3);
-        assert!(images[0].is_clipped());
-        assert!(!images[1].is_clipped());
-        assert!(images[2].is_clipped());
+        assert!(images.iter().all(|image| image.is_clipped()));
         assert_eq!(
             images[0].clip().expect("partial tile clip").commands,
             paint_rect_path_commands(paint_space_rect(0.0, 10.0, 4.0, 3.0)),

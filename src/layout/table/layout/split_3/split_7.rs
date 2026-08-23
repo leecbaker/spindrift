@@ -1,5 +1,46 @@
-use super::*;
+use crate::css::{
+    self, CaptionSide, ComputedStyle, LayoutLength, PercentageBasis, PhysicalSide, Position,
+    SemanticLengthExt, Stylesheets, WritingMode, layout_pt,
+};
+use crate::document::paint::display_list::PaintBand;
+use crate::document::paint::fragments::PaintFragment;
+use crate::document::paint::geometry::{PaintClip, PaintTranslation};
+use crate::dom::Element;
 use crate::layout::inline_collect::InlinePlacement;
+use crate::layout::table::layout::{
+    CollapsedTableGeometry, TableCaptionContainingBlock, TableCaptionLayoutOutcome,
+    TableCaptionPaintSlice, TableCellBaselineSet, TableCellClipRegion, TableCellContentPass,
+    TableCellContentSizingPolicy, TableFragmentainerPlacement, TableGridLayoutContext,
+    TableWrapperBlockInterval, TableWrapperBlockOffset, apply_table_cell_content_sizing_policy,
+    formatting_boxes_have_textual_baseline, table_cell_alignment_baseline_set,
+    table_cell_canvas_first_pass_outer_height,
+    table_cell_formatting_child_has_parent_percentage_block_size,
+    table_cell_has_in_flow_layout_child, table_cell_measured_inline_outer_height_without_policy,
+    table_cell_textual_baseline_style, table_cell_textual_children_match_baseline_style,
+    visible_column_span,
+};
+use crate::layout::table::{
+    CollapsedBorderGrid, TableAxes, TableCaption, TableCell, TableCellBaselineOffset,
+    TableCellBorderBox, TableCellOuterBlockSize, TableCellPadding, TableColumn, TableGrid,
+    TableGridLength, TableGridPlacement, TableGridPoint, TableGridRect, TableGridSize,
+    TableLayoutInput, TableMetrics, TablePartUsedStyle, TableRow, TableRowBaselineOffset,
+    table_cell_formatting_child_outer_height, table_cell_href, table_cell_inline_text,
+    table_column_group_spans, table_grid, table_metrics, table_row_group_spans,
+    table_row_is_collapsed, table_vertical_borders, used_table_width,
+};
+use crate::layout::{
+    FlowAxes, FragmentainerAdvance, GeneratedPseudoCounterMode, InlineVisualOffset, LayoutBuilder,
+    LogicalInlineContentSize, LogicalSize, OverflowClip, PageInlinePosition, PageTopBlockPosition,
+    PageTopPoint, PageTopRect, PhysicalContentWidth, ReplacedElementKind, StackingContextPolicy,
+    UsedOverflowAxes, VerticalRootPageFragmentSlice, apply_used_box_metrics, box_tree,
+    formatting_box_has_inline_content, has_auto_width, has_non_inline_formatting_box,
+    horizontal_border_width, inline_layout, inline_text_from_formatting_boxes,
+    layout_containment_applies_to_element, paint_containment_applies_to_element, parse_html_length,
+    replaced_element_kind, set_style_auto_height, set_style_used_width, used_border_widths,
+    used_canvas_size_with_height_basis, used_content_box_height_or_auto,
+    used_content_box_width_or_auto, used_image, used_property_containment, used_svg,
+};
+use crate::units::{content_box_pt, non_content_pt};
 
 /// Result of assigning one continuous vertical caption box to table-wrapper
 /// fragmentainers. The final-block-boundary flag is kept separate from the
@@ -52,7 +93,7 @@ impl<'a> LayoutBuilder<'a> {
         child: &box_tree::FormattingBox<'_>,
         stylesheets: &Stylesheets<'_>,
         available_width: f32,
-    ) -> Option<f32> {
+    ) -> Option<TableCellOuterBlockSize> {
         if !table_cell_formatting_child_has_parent_percentage_block_size(child) {
             return table_cell_measured_inline_outer_height_without_policy(child, available_width);
         }
@@ -62,9 +103,11 @@ impl<'a> LayoutBuilder<'a> {
                     box_.core.style.position,
                     Position::Absolute | Position::Fixed
                 ) {
-                    Some(0.0)
+                    Some(TableCellOuterBlockSize::new(layout_pt(0.0)))
                 } else {
-                    Some(table_cell_formatting_child_outer_height(child).points())
+                    Some(TableCellOuterBlockSize::new(
+                        table_cell_formatting_child_outer_height(child),
+                    ))
                 }
             }
             box_tree::FormattingBox::AtomicInline(box_)
@@ -75,11 +118,13 @@ impl<'a> LayoutBuilder<'a> {
                     &box_.core.style,
                     TableCellContentSizingPolicy::RowMinimum,
                 );
-                Some(table_cell_canvas_first_pass_outer_height(
-                    box_.core.element,
-                    &style,
-                    available_width,
-                ))
+                Some(TableCellOuterBlockSize::new(layout_pt(
+                    table_cell_canvas_first_pass_outer_height(
+                        box_.core.element,
+                        &style,
+                        available_width,
+                    ),
+                )))
             }
             box_tree::FormattingBox::Replaced(box_)
                 if replaced_element_kind(box_.core.element)
@@ -89,11 +134,28 @@ impl<'a> LayoutBuilder<'a> {
                     &box_.core.style,
                     TableCellContentSizingPolicy::RowMinimum,
                 );
-                Some(table_cell_canvas_first_pass_outer_height(
-                    box_.core.element,
-                    &style,
-                    available_width,
-                ))
+                Some(TableCellOuterBlockSize::new(layout_pt(
+                    table_cell_canvas_first_pass_outer_height(
+                        box_.core.element,
+                        &style,
+                        available_width,
+                    ),
+                )))
+            }
+            box_tree::FormattingBox::AtomicInline(box_)
+                if replaced_element_kind(box_.core.element) == Some(ReplacedElementKind::Image)
+                    && box_
+                        .core
+                        .element
+                        .attrs
+                        .get("src")
+                        .is_none_or(|source| source.is_empty()) =>
+            {
+                // An inline `img` without a selected source has no intrinsic
+                // replaced object. Its percentage height is ignored while
+                // determining the table-row minimum.
+                // <https://drafts.csswg.org/css-tables-3/#row-layout>
+                Some(TableCellOuterBlockSize::new(layout_pt(0.0)))
             }
             box_tree::FormattingBox::Replaced(box_)
                 if replaced_element_kind(box_.core.element) == Some(ReplacedElementKind::Image)
@@ -110,24 +172,24 @@ impl<'a> LayoutBuilder<'a> {
                 // feed back into the distributed row plan.
                 // <https://drafts.csswg.org/css-tables-3/#row-layout>
                 // <https://html.spec.whatwg.org/multipage/images.html#the-img-element>
-                Some(0.0)
+                Some(TableCellOuterBlockSize::new(layout_pt(0.0)))
             }
-            box_tree::FormattingBox::AtomicInline(box_) => {
-                Some(self.table_cell_row_minimum_atomic_inline_outer_height(
+            box_tree::FormattingBox::AtomicInline(box_) => Some(TableCellOuterBlockSize::new(
+                layout_pt(self.table_cell_row_minimum_atomic_inline_outer_height(
                     &box_.core.style,
                     &box_.core.children,
                     stylesheets,
                     available_width,
-                ))
-            }
-            box_tree::FormattingBox::Replaced(box_) => {
-                Some(self.table_cell_row_minimum_atomic_inline_outer_height(
+                )),
+            )),
+            box_tree::FormattingBox::Replaced(box_) => Some(TableCellOuterBlockSize::new(
+                layout_pt(self.table_cell_row_minimum_atomic_inline_outer_height(
                     &box_.core.style,
                     &box_.core.children,
                     stylesheets,
                     available_width,
-                ))
-            }
+                )),
+            )),
             box_tree::FormattingBox::AnonymousBlock(_)
             | box_tree::FormattingBox::InlineSplitBlockContext(_)
             | box_tree::FormattingBox::Block(_)
@@ -149,7 +211,7 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &Stylesheets<'_>,
         available_width: f32,
         content_pass: TableCellContentPass,
-    ) -> Option<f32> {
+    ) -> Option<TableCellOuterBlockSize> {
         let Some(final_basis) = content_pass.final_basis() else {
             return self.table_cell_measured_inline_outer_height(
                 child,
@@ -183,12 +245,12 @@ impl<'a> LayoutBuilder<'a> {
                     available_width,
                     percentage_height_basis,
                 );
-                Some(
+                Some(TableCellOuterBlockSize::new(layout_pt(
                     height
                         + box_metrics.vertical_non_content_length().points()
                         + style.margin.top
                         + style.margin.bottom,
-                )
+                )))
             }
             Some(ReplacedElementKind::Image) => used_image(
                 element,
@@ -199,10 +261,17 @@ impl<'a> LayoutBuilder<'a> {
                 self.root_url,
                 self.resource_cache,
             )
-            .map(|image| style.margin.top + image.border_box_size.height + style.margin.bottom),
+            .map(|image| {
+                TableCellOuterBlockSize::new(layout_pt(
+                    style.margin.top + image.border_box_size.height + style.margin.bottom,
+                ))
+            }),
             Some(ReplacedElementKind::Svg) => {
-                used_svg(element, &style, available_width, percentage_height_basis)
-                    .map(|svg| style.margin.top + svg.border_box_size.height + style.margin.bottom)
+                used_svg(element, &style, available_width, percentage_height_basis).map(|svg| {
+                    TableCellOuterBlockSize::new(layout_pt(
+                        style.margin.top + svg.border_box_size.height + style.margin.bottom,
+                    ))
+                })
             }
             None => {
                 self.table_cell_measured_inline_outer_height(child, stylesheets, available_width)
@@ -290,6 +359,7 @@ impl<'a> LayoutBuilder<'a> {
                 available_width,
                 PercentageBasis::indefinite(),
             )
+            .map(TableCellOuterBlockSize::points)
             .unwrap_or(0.0);
         let text = inline_text_from_formatting_boxes(children);
         let text_height = if text.is_empty() {
@@ -318,8 +388,10 @@ impl<'a> LayoutBuilder<'a> {
         cell_style: &ComputedStyle,
         content_height: f32,
         border_insets: css::Edges,
-    ) -> f32 {
-        border_insets.top + cell_style.padding.top + content_height
+    ) -> TableCellBaselineOffset {
+        TableCellBaselineOffset::new(layout_pt(
+            border_insets.top + cell_style.padding.top + content_height,
+        ))
     }
 
     pub(in crate::layout::table) fn table_cell_baseline_offset(
@@ -329,7 +401,7 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &Stylesheets<'_>,
         available_width: f32,
         border_insets: css::Edges,
-    ) -> Option<f32> {
+    ) -> Option<TableCellBaselineOffset> {
         if cell
             .element
             .is_some_and(|element| layout_containment_applies_to_element(element, cell_style))
@@ -344,11 +416,18 @@ impl<'a> LayoutBuilder<'a> {
                     stylesheets,
                     available_width,
                 )
-                .map(|baseline| border_insets.top + cell_style.padding.top + baseline);
+                .map(|baseline| {
+                    TableCellBaselineOffset::new(layout_pt(
+                        border_insets.top + cell_style.padding.top + baseline.points(),
+                    ))
+                });
         }
 
-        (!table_cell_inline_text(cell).is_empty())
-            .then(|| self.table_cell_first_baseline_offset(cell_style))
+        (!table_cell_inline_text(cell).is_empty()).then(|| {
+            TableCellBaselineOffset::new(layout_pt(
+                self.table_cell_first_baseline_offset(cell_style),
+            ))
+        })
     }
 
     pub(in crate::layout::table) fn table_cell_alignment_baseline_offset(
@@ -358,7 +437,7 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &Stylesheets<'_>,
         available_width: f32,
         border_insets: css::Edges,
-    ) -> Option<f32> {
+    ) -> Option<TableCellBaselineOffset> {
         match table_cell_alignment_baseline_set(cell_style) {
             TableCellBaselineSet::First => self.table_cell_baseline_offset(
                 cell,
@@ -384,7 +463,7 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &Stylesheets<'_>,
         available_width: f32,
         border_insets: css::Edges,
-    ) -> Option<f32> {
+    ) -> Option<TableCellBaselineOffset> {
         if cell
             .element
             .is_some_and(|element| layout_containment_applies_to_element(element, cell_style))
@@ -400,7 +479,11 @@ impl<'a> LayoutBuilder<'a> {
                     available_width,
                     TableCellBaselineSet::Last,
                 )
-                .map(|baseline| border_insets.top + cell_style.padding.top + baseline);
+                .map(|baseline| {
+                    TableCellBaselineOffset::new(layout_pt(
+                        border_insets.top + cell_style.padding.top + baseline.points(),
+                    ))
+                });
         }
 
         if let Some(element) = cell.element
@@ -412,14 +495,18 @@ impl<'a> LayoutBuilder<'a> {
                 table_cell_href(cell),
             )
         {
-            return Some(border_insets.top + cell_style.padding.top + baseline);
+            return Some(TableCellBaselineOffset::new(layout_pt(
+                border_insets.top + cell_style.padding.top + baseline.points(),
+            )));
         }
 
         let text = table_cell_inline_text(cell);
         (!text.is_empty()).then(|| {
-            border_insets.top
-                + cell_style.padding.top
-                + self.table_cell_text_last_baseline_offset(&text, cell_style, available_width)
+            TableCellBaselineOffset::new(layout_pt(
+                border_insets.top
+                    + cell_style.padding.top
+                    + self.table_cell_text_last_baseline_offset(&text, cell_style, available_width),
+            ))
         })
     }
 
@@ -429,7 +516,7 @@ impl<'a> LayoutBuilder<'a> {
         containing_style: &ComputedStyle,
         stylesheets: &Stylesheets<'_>,
         available_width: f32,
-    ) -> Option<f32> {
+    ) -> Option<TableCellBaselineOffset> {
         self.table_cell_children_baseline_offset(
             children,
             containing_style,
@@ -446,7 +533,7 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &Stylesheets<'_>,
         available_width: f32,
         baseline_set: TableCellBaselineSet,
-    ) -> Option<f32> {
+    ) -> Option<TableCellBaselineOffset> {
         if formatting_boxes_have_textual_baseline(children)
             && !has_non_inline_formatting_box(children)
         {
@@ -473,7 +560,8 @@ impl<'a> LayoutBuilder<'a> {
                 baseline_set,
             );
             if let Some(baseline) = child_baseline {
-                let baseline = block_offset + baseline;
+                let baseline =
+                    TableCellBaselineOffset::new(layout_pt(block_offset + baseline.points()));
                 if baseline_set == TableCellBaselineSet::First {
                     return Some(baseline);
                 }
@@ -491,16 +579,16 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &Stylesheets<'_>,
         available_width: f32,
         baseline_set: TableCellBaselineSet,
-    ) -> Option<f32> {
+    ) -> Option<TableCellBaselineOffset> {
         match child {
             box_tree::FormattingBox::Text(box_) => {
                 (!box_tree::formatting_box_is_collapsible_space(child)).then(|| {
-                    self.table_cell_text_baseline_offset(
+                    TableCellBaselineOffset::new(layout_pt(self.table_cell_text_baseline_offset(
                         &box_.text,
                         &box_.style,
                         available_width,
                         baseline_set,
-                    )
+                    )))
                 })
             }
             box_tree::FormattingBox::Inline(box_) => self.inline_children_baseline_offset(
@@ -548,7 +636,11 @@ impl<'a> LayoutBuilder<'a> {
                     stylesheets,
                     available_width,
                 )
-                .map(|baseline| box_.core.style.margin.top + baseline),
+                .map(|baseline| {
+                    TableCellBaselineOffset::new(layout_pt(
+                        box_.core.style.margin.top + baseline.points(),
+                    ))
+                }),
             box_tree::FormattingBox::AtomicInline(_) | box_tree::FormattingBox::Replaced(_) => None,
         }
     }
@@ -560,7 +652,7 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &Stylesheets<'_>,
         available_width: f32,
         baseline_set: TableCellBaselineSet,
-    ) -> Option<f32> {
+    ) -> Option<TableCellBaselineOffset> {
         // CSS table-cell baselines come from in-flow line-box baselines; an
         // inline wrapper that only contains atomic/replaced content should
         // expose no textual baseline so the cell can fall back to its bottom
@@ -586,7 +678,7 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &Stylesheets<'_>,
         available_width: f32,
         baseline_set: TableCellBaselineSet,
-    ) -> Option<f32> {
+    ) -> Option<TableCellBaselineOffset> {
         if matches!(block_style.position, Position::Absolute | Position::Fixed) {
             return None;
         }
@@ -598,7 +690,11 @@ impl<'a> LayoutBuilder<'a> {
             available_width,
             baseline_set,
         )
-        .map(|baseline| block_style.margin.top + borders.top + block_style.padding.top + baseline)
+        .map(|baseline| {
+            TableCellBaselineOffset::new(layout_pt(
+                block_style.margin.top + borders.top + block_style.padding.top + baseline.points(),
+            ))
+        })
     }
 
     pub(in crate::layout::table) fn table_cell_inline_content_baseline_offset(
@@ -608,7 +704,7 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &Stylesheets<'_>,
         available_width: f32,
         baseline_set: TableCellBaselineSet,
-    ) -> Option<f32> {
+    ) -> Option<TableCellBaselineOffset> {
         if !formatting_box_has_inline_content(children) {
             return None;
         }
@@ -626,7 +722,7 @@ impl<'a> LayoutBuilder<'a> {
                     0.0,
                     InlineVisualOffset::zero(),
                     style,
-                    style.text_decoration_layers.clone(),
+                    style.text_decoration_origins.effective_layers_vec(),
                     &mut items,
                 );
             },
@@ -653,15 +749,20 @@ impl<'a> LayoutBuilder<'a> {
         let first_baseline = self
             .inline_text_box_metrics(baseline_style, 0.0)
             .line_baseline_offset;
-        Some(match baseline_set {
-            TableCellBaselineSet::First => {
-                table_cell_inline_sequence_first_baseline_offset(&sequence)
-                    .unwrap_or(first_baseline)
-            }
-            TableCellBaselineSet::Last => {
-                table_cell_inline_sequence_last_baseline_offset(&sequence).unwrap_or(first_baseline)
-            }
-        })
+        Some(TableCellBaselineOffset::new(layout_pt(
+            match baseline_set {
+                TableCellBaselineSet::First => {
+                    table_cell_inline_sequence_first_baseline_offset(&sequence)
+                        .map(TableCellBaselineOffset::points)
+                        .unwrap_or(first_baseline)
+                }
+                TableCellBaselineSet::Last => {
+                    table_cell_inline_sequence_last_baseline_offset(&sequence)
+                        .map(TableCellBaselineOffset::points)
+                        .unwrap_or(first_baseline)
+                }
+            },
+        )))
     }
 
     pub(in crate::layout::table) fn table_fragment_baseline_offset(
@@ -671,7 +772,7 @@ impl<'a> LayoutBuilder<'a> {
         fragment: &box_tree::TableFragment<'_>,
         stylesheets: &Stylesheets<'_>,
         available_width: f32,
-    ) -> Option<f32> {
+    ) -> Option<TableCellBaselineOffset> {
         if matches!(style.position, Position::Absolute | Position::Fixed) {
             return None;
         }
@@ -681,7 +782,8 @@ impl<'a> LayoutBuilder<'a> {
         let table_cellpadding = element
             .attrs
             .get("cellpadding")
-            .and_then(|value| parse_html_length(value));
+            .and_then(|value| parse_html_length(value))
+            .map(|value| TableCellPadding::new(layout_pt(value)));
         let table_metrics = table_metrics(element, style);
         let grid = table_grid(rows);
         let collapsed_geometry = (table_metrics.border_collapse == css::BorderCollapse::Collapse)
@@ -754,9 +856,9 @@ impl<'a> LayoutBuilder<'a> {
             }
             Some(index)
         }) else {
-            return Some(
+            return Some(TableCellBaselineOffset::new(layout_pt(
                 table_width.border_widths.top + table_width.padding.top + top_caption_height,
-            );
+            )));
         };
 
         let row_style = self.style_for_table_row(&rows[row_index], style, stylesheets);
@@ -772,17 +874,18 @@ impl<'a> LayoutBuilder<'a> {
                 table_metrics.clone(),
                 collapsed_geometry.as_ref(),
             )
+            .map(TableRowBaselineOffset::points)
             .unwrap_or_else(|| {
                 self.measure_table_row_height(&table_context, row_index, &row_style)
             });
 
-        Some(
+        Some(TableCellBaselineOffset::new(layout_pt(
             top_caption_height
                 + table_width.border_widths.top
                 + table_width.padding.top
                 + table_metrics.spacing.vertical.length_points()
                 + row_baseline,
-        )
+        )))
     }
 
     /// Returns the first rendered text baseline offset from a table cell border-box top.
@@ -836,7 +939,7 @@ impl<'a> LayoutBuilder<'a> {
                 None,
             );
             if let Some(baseline) = table_cell_inline_sequence_last_baseline_offset(&sequence) {
-                return baseline;
+                return baseline.points();
             }
         }
         self.inline_text_box_metrics(style, 0.0)
@@ -850,7 +953,7 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &Stylesheets<'_>,
         available_width: f32,
         link_target: Option<&str>,
-    ) -> Option<f32> {
+    ) -> Option<TableCellBaselineOffset> {
         let mut items = Vec::new();
         let link_target = link_target.map(str::to_string);
         self.with_table_cell_inline_planning_scope(
@@ -1029,7 +1132,7 @@ impl<'a> LayoutBuilder<'a> {
                         TableGridLength::new(border_box.rect().origin.y + source_start),
                     ),
                     TableGridSize::from_lengths(
-                        TableGridLength::new(border_box.width()),
+                        border_box.logical_inline_size(),
                         TableGridLength::new(source_height),
                     ),
                 );
@@ -1445,7 +1548,6 @@ impl<'a> LayoutBuilder<'a> {
                 TableWrapperBlockOffset::zero(),
                 vertical_block_progress,
             ),
-            vertical_block_progress,
             ends_at_fragmentainer_block_end,
         )
     }
@@ -1684,14 +1786,15 @@ impl<'a> LayoutBuilder<'a> {
 
 fn table_cell_inline_sequence_last_baseline_offset(
     sequence: &inline_layout::InlineLineSequence,
-) -> Option<f32> {
+) -> Option<TableCellBaselineOffset> {
     let records = sequence.fragment_records_for_paint(0, sequence.records.len());
     let mut block_offset = 0.0;
     let mut last_baseline = None;
     for record in &records {
         if let Some(fragment) = &record.fragment {
-            last_baseline =
-                Some(block_offset + record.block_start_trim + fragment.metrics.baseline_offset);
+            last_baseline = Some(TableCellBaselineOffset::new(layout_pt(
+                block_offset + record.block_start_trim + fragment.metrics.baseline_offset,
+            )));
         }
         block_offset += record.height();
     }
@@ -1700,13 +1803,14 @@ fn table_cell_inline_sequence_last_baseline_offset(
 
 fn table_cell_inline_sequence_first_baseline_offset(
     sequence: &inline_layout::InlineLineSequence,
-) -> Option<f32> {
+) -> Option<TableCellBaselineOffset> {
     let records = sequence.fragment_records_for_paint(0, sequence.records.len());
     records.iter().find_map(|record| {
-        record
-            .fragment
-            .as_ref()
-            .map(|fragment| record.block_start_trim + fragment.metrics.baseline_offset)
+        record.fragment.as_ref().map(|fragment| {
+            TableCellBaselineOffset::new(layout_pt(
+                record.block_start_trim + fragment.metrics.baseline_offset,
+            ))
+        })
     })
 }
 
@@ -1743,9 +1847,14 @@ impl TableCellOverflowClipAxes {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::css::{TextBoxEdge, TextBoxTrim, TextEdgeMetric, TextEdgePair};
     use std::collections::HashMap;
+
+    use super::*;
+    use crate::RenderOptions;
+    use crate::css::{Direction, TextBoxEdge, TextBoxTrim, TextEdgeMetric, TextEdgePair};
+    use crate::layout::LayoutBuilderConfig;
+    use crate::resource::ResourceCache;
+    use crate::text::FontSystem;
 
     fn test_layout_builder<'a, Collection: crate::css::StylesheetCollection + ?Sized>(
         options: &'a RenderOptions,

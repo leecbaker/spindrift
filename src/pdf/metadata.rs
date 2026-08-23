@@ -1,5 +1,6 @@
-use crate::{DocumentDate, DocumentMetadata, PdfCompression, PdfProfile};
 use pdf_writer::{Filter, Name, Pdf, Ref, TextStr};
+
+use crate::{DocumentDate, DocumentMetadata, PdfCompression, PdfProfile};
 
 /// Writes synchronized PDF document information and XMP metadata.
 ///

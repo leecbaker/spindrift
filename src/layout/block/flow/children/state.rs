@@ -1,14 +1,56 @@
+use std::num::NonZeroUsize;
+
 use crate::css::{
-    AutomaticBlockSizeTraversal, ClampContinuation, ComputedStyle, LineLimitTraversal,
+    AutomaticBlockSizeTraversal, ClampContinuation, ComputedStyle, LineLimitTraversal, PageBreak,
     RemainingLineSlots,
 };
 use crate::document::paint::geometry::{PaintPoint, PaintRect, PaintSize};
+use crate::layout::block::flow::fragmentation::FirstInFlowChildState;
 use crate::layout::{
-    BlockEndMarginCollapse, BlockMarginCollapseBoundary, LayoutLength,
-    style_establishes_multicol_formatting_context,
+    BlockEndMarginCollapse, BlockMarginCollapseBoundary, FirstFormattedLineState, FloatRunState,
+    LayoutLength, LayoutSnapshot, style_establishes_multicol_formatting_context,
 };
 use crate::units::{ContentBoxLength, SemanticLengthExt, content_box_pt, layout_pt};
-use std::num::NonZeroUsize;
+
+/// Layout state restored when an automatic block-size clamp retries a child
+/// as the terminal marker host.
+///
+/// This complete rollback point survives recursive child layout. Keep it
+/// heap-owned by the source-specific checkpoints below so ordinary block-flow
+/// frames do not reserve a full [`LayoutSnapshot`] when no clamp is active.
+/// <https://drafts.csswg.org/css-overflow-4/#line-clamp-containers>
+pub(in crate::layout) struct AutomaticBlockSizeReplayState {
+    pub(in crate::layout) snapshot: LayoutSnapshot,
+    pub(in crate::layout) previous_flow_bottom_margin: Option<f32>,
+    pub(in crate::layout) seen_flow_child: FirstInFlowChildState,
+    pub(in crate::layout) trim_block_start_adjoining_margins: bool,
+    pub(in crate::layout) collapsed_end_margin: bool,
+    pub(in crate::layout) pending_end_margin_collapse: Option<BlockEndMarginCollapse>,
+    pub(in crate::layout) previous_child_page_end: Option<Option<String>>,
+    pub(in crate::layout) float_run: FloatRunState,
+    pub(in crate::layout) previous_break_after: PageBreak,
+    pub(in crate::layout) first_formatted_line: FirstFormattedLineState,
+    pub(in crate::layout) traversal_state: BlockFlowChildTraversalState,
+}
+
+/// Automatic clamp replay state for a DOM child traversal.
+///
+/// The DOM collector must restore both its node cursor and element-only
+/// sibling-signature cursor before replaying the terminal marker host.
+pub(in crate::layout) struct DomAutomaticBlockSizeReplayCheckpoint {
+    pub(in crate::layout) state: AutomaticBlockSizeReplayState,
+    pub(in crate::layout) child_node_index: usize,
+    pub(in crate::layout) element_index: usize,
+}
+
+/// Automatic clamp replay state for a frozen formatting-box child traversal.
+///
+/// A formatting-box sequence has one source cursor, unlike the DOM path's
+/// separate node and element cursors.
+pub(in crate::layout) struct FormattingBoxAutomaticBlockSizeReplayCheckpoint {
+    pub(in crate::layout) state: AutomaticBlockSizeReplayState,
+    pub(in crate::layout) child_box_index: usize,
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(in crate::layout) struct ChildFlowTraversalOutcome {

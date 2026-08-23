@@ -1,6 +1,7 @@
-use super::*;
-use crate::css::LayerName;
 use cssparser::Delimiter;
+
+use super::*;
+use crate::css::{LayerName, StylesheetScopeAnchor};
 
 /// Splits a selector list only at CSS Syntax comma delimiters.  This is kept
 /// with pseudo-element routing because it works on selector source retained
@@ -38,6 +39,7 @@ pub(in crate::css) fn split_pseudo_element_rule(
     declarations: &Declarations,
     layer_name: Option<LayerName>,
     scopes: Vec<ScopeRule>,
+    stylesheet_scope_anchor: StylesheetScopeAnchor,
 ) -> Vec<ParsedCssRule> {
     // CSS Pseudo-Elements 4 pseudo rules are matched against their originating
     // elements, then applied in pseudo-specific cascade/layout paths.
@@ -85,6 +87,7 @@ pub(in crate::css) fn split_pseudo_element_rule(
             rules.push(ParsedCssRule::Style(StyleRule {
                 selector_text,
                 selector,
+                stylesheet_scope_anchor,
                 declarations: declarations.clone(),
                 specificity,
                 order: 0,
@@ -115,6 +118,7 @@ pub(in crate::css) fn split_pseudo_element_rule(
         let rule = StyleRule {
             selector_text,
             selector,
+            stylesheet_scope_anchor,
             declarations: declarations.clone(),
             specificity,
             order: 0,

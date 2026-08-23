@@ -41,10 +41,18 @@ Quire currently passes **138 of 145 (95.2%)** runnable
   and shadows while marker layout properties remain inert.
 - The UA marker defaults, including tabular numeral forms, apply to principal,
   `::before`, and `::after` markers.
+- Block-level inside markers contribute to the owning list item's intrinsic
+  inline sizes. This shared measurement covers tree-abiding generated
+  `::before`/`::after` list items and preserves each pseudo's counter snapshot,
+  so shrink-to-fit floats reserve the same marker width that final layout
+  paints; outside markers remain zero intrinsic contribution.
 - Inline flow-root list items retain outside markers; non-atomic inline list
   items use inside marker participation.
 - Outside-marker baseline alignment includes half-leading, and vertical inside
   markers contribute their full marker-plus-content inline-axis extent.
+- An otherwise empty inline scope with distinct font or line-height metrics is
+  retained as a metrics-only first-line strut. It supplies the resolved
+  outside-marker baseline without text, advance, decoration, or box paint.
 - A horizontal outside marker with no principal line resolves its fallback
   anchor against an adjacent float's shortened line span. This is WPT
   compatibility behavior: CSS Lists leaves exact float-adjacent outside-marker

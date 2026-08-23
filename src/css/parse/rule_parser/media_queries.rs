@@ -244,7 +244,11 @@ fn media_feature_evaluation(
     }
     let Some((name, value)) = feature.split_once(':') else {
         return match feature.to_ascii_lowercase().as_str() {
-            "color" | "height" | "width" | "scripting" => MediaQueryEvaluation::Matches,
+            "color" | "height" | "width" => MediaQueryEvaluation::Matches,
+            // Quire does not execute scripts, so the discrete `scripting`
+            // feature has its false `none` value in a boolean context.
+            // https://drafts.csswg.org/mediaqueries-5/#scripting
+            "scripting" => MediaQueryEvaluation::DoesNotMatch,
             "forced-colors" => matches_media_value(media_environment.forced_colors.is_active()),
             "monochrome" | "grid" => MediaQueryEvaluation::DoesNotMatch,
             _ if feature
@@ -263,6 +267,11 @@ fn media_feature_evaluation(
     }
 
     match name.as_str() {
+        "scripting" => match value.as_str() {
+            "none" => MediaQueryEvaluation::Matches,
+            "initial-only" | "enabled" => MediaQueryEvaluation::DoesNotMatch,
+            _ => MediaQueryEvaluation::Invalid,
+        },
         "update" => media_keyword_feature(&value, &["none"]),
         "overflow-block" => media_keyword_feature(&value, &["paged"]),
         "color-gamut" => match value.as_str() {

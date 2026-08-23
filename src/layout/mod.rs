@@ -1,3 +1,14 @@
+use std::collections::HashMap;
+
+use taffy::prelude as taffy_layout;
+
+use self::assets::{
+    DocumentCanvasBackgroundArea, PaintBackgroundArea,
+    background_image_primitives_for_style_with_paint_areas,
+    background_image_primitives_for_style_with_paint_areas_and_fixed_positioning_area,
+    fragmented_table_root_background_image_primitives,
+    structural_table_background_image_primitives,
+};
 use crate::css::{
     self, AlignContent, AlignItems, AlignSelf, AlignmentBaseline, AlignmentSafety, BackgroundImage,
     BaselineMetric, BaselineShift, BookmarkLabelPart, BorderStyle, BoxSizing, CaptionSide, Clear,
@@ -5,11 +16,11 @@ use crate::css::{
     CounterReset, CounterResetKind, CounterStyleRange, CounterStyleRule, CounterStyleSystem,
     CounterValue, CssBookmarkState, CssColor, Declarations, Direction, Display, DisplayInner,
     DisplayOuter, DominantBaseline, ElementAttributeSignature, ElementSiblingSignature,
-    ElementSiblingSignatureList, ElementSignature, EmptyCells, FilterValue, FlexDirection,
-    FlexWrap, Float, GeneratedAltTextPart, GeneratedContentPart, GeneratedQuote, Isolation,
-    JustifyContent, JustifyItems, JustifySelf, LinearGradientDirection, ListStylePosition,
-    ListStyleType, LogicalAxis, LogicalSide, MarkerContent, MarkerContentPart, MarkerSide,
-    MaskValue, MixBlendMode, NamedStringPart, PageBreak, PageRule, PageSpecificity, PhysicalAxis,
+    ElementSiblingSignatureList, ElementSignature, FilterValue, FlexDirection, FlexWrap, Float,
+    GeneratedAltTextPart, GeneratedContentPart, GeneratedQuote, Isolation, JustifyContent,
+    JustifyItems, JustifySelf, LinearGradientDirection, ListStylePosition, ListStyleType,
+    LogicalAxis, LogicalSide, MarkerContent, MarkerContentPart, MarkerSide, MaskValue,
+    MixBlendMode, NamedStringPart, PageBreak, PageRule, PageSpecificity, PhysicalAxis,
     PhysicalSide, Position, Quotes, SelfAlignmentKeyword, StylesheetOrigin, Stylesheets,
     TableCellVerticalAlign, TableLayout, TargetReference, TextAlign, TextAlignLast, TextAutospace,
     TextDecorationSkipInk, TextDecorationSkipSpaces, TextDecorationStyle, TextDecorationThickness,
@@ -26,8 +37,8 @@ use crate::document::paint::effects::{
 };
 use crate::document::paint::fragments::PaintFragment;
 use crate::document::paint::geometry::{
-    PaintClip, PaintClipUnion, PaintDisplacement, PaintPoint, PaintRect, PaintSize, PaintSpace,
-    PaintTransform, PaintTranslation,
+    PaintClip, PaintDisplacement, PaintPoint, PaintRect, PaintSize, PaintSpace, PaintTransform,
+    PaintTranslation,
 };
 use crate::document::paint::images::RenderedImage;
 use crate::document::paint::page::{PaintCheckpoint, PaintPrimitive};
@@ -47,8 +58,8 @@ use crate::document::paint::shapes::{
 };
 use crate::document::paint::stacking::{PaintStackingContext, StackLevel};
 use crate::document::paint::text::{
-    RenderedGlyph, RenderedLine, RenderedLineSource, RenderedTextMatrix, RenderedTextRun,
-    TextRunPoint,
+    OpaqueTextGlyphCoverage, RenderedGlyph, RenderedLine, RenderedLineSource, RenderedTextMatrix,
+    RenderedTextRun, TextRunPoint, split_rendered_line_for_opaque_text_coverage,
 };
 use crate::document::{
     Bookmark, BookmarkState, Document, DocumentMetadata, Page, PaintStrokeWidth,
@@ -59,14 +70,14 @@ use crate::svg::SharedSvgAsset;
 use crate::text::{
     BidiVisualRange, FontSystem, FontSystemLoad, GlyphInkBox, InlineBoundaryEffect,
     OBJECT_REPLACEMENT_CHARACTER, ResolvedBidiDirection, ShapedInlineLine, StyledTextSpan,
-    TextDecorationFontMetrics, bidi_control_scope_for_style, character_has_joining_behavior,
-    character_is_arabic_tatweel, character_is_bidi_format_control,
-    character_is_default_ignorable_code_point, character_is_first_hangable_punctuation,
-    character_is_first_letter_associated_space, character_is_first_letter_suffix_punctuation,
-    character_is_hangable_stop_or_comma, character_is_join_control,
-    character_is_last_hangable_punctuation, character_is_unicode_alphanumeric,
-    character_is_unicode_first_letter_base, character_is_unicode_mark,
-    character_is_unicode_punctuation, character_is_unicode_symbol,
+    TextDecorationFontMetrics, bidi_control_scope_for_style,
+    character_has_cursive_shaping_behavior, character_is_arabic_tatweel,
+    character_is_bidi_format_control, character_is_default_ignorable_code_point,
+    character_is_first_hangable_punctuation, character_is_first_letter_associated_space,
+    character_is_first_letter_suffix_punctuation, character_is_hangable_stop_or_comma,
+    character_is_join_control, character_is_last_hangable_punctuation,
+    character_is_unicode_alphanumeric, character_is_unicode_first_letter_base,
+    character_is_unicode_mark, character_is_unicode_punctuation, character_is_unicode_symbol,
     character_preserves_word_boundary_context, character_receives_text_emphasis_mark,
     contains_bidi_text, css_text_rendering_text, is_css_collapsible_whitespace,
     plaintext_direction_for_text, text_with_hyphenation_controls,
@@ -83,18 +94,8 @@ use crate::units::{
     content_box_to_border_box_length, content_box_to_border_box_size, layout_points, layout_pt,
     margin_box_pt, margin_box_size_pt, non_content_pt,
 };
-use std::collections::HashMap;
-use taffy::prelude as taffy_layout;
 
-use self::assets::{
-    DocumentCanvasBackgroundArea, PaintBackgroundArea,
-    background_image_primitives_for_style_with_paint_areas,
-    background_image_primitives_for_style_with_paint_areas_and_fixed_positioning_area,
-    fragmented_table_root_background_image_primitives,
-    structural_table_background_image_primitives,
-};
-
-mod asset_helpers;
+pub(crate) mod asset_helpers;
 mod assets;
 mod baseline;
 pub(crate) fn generated_linear_gradient_raster_color_space(
@@ -124,8 +125,8 @@ mod block;
 pub(in crate::layout) use self::block::{
     AutoFloatMeasurementKey, BlockClearance, BlockClearanceRequest, BlockMarginCollapseBoundary,
     BlockStartMarginArrangement, FloatAvoidanceCandidate, FloatAvoidanceInlineContainment,
-    FloatBand, FloatBandQuery, FloatContext, FloatId, FloatRunState, FloatShape, UsedFloatSide,
-    float_avoiding_auto_border_box_width, vertical_physical_inline_span,
+    FloatBand, FloatBandQuery, FloatContext, FloatId, FloatPlacementAxes, FloatRunState,
+    FloatShape, UsedFloatSide, float_avoiding_auto_border_box_width, vertical_physical_inline_span,
 };
 #[cfg(test)]
 pub(in crate::layout) use self::block::{
@@ -134,6 +135,7 @@ pub(in crate::layout) use self::block::{
 };
 mod box_tree;
 mod builder;
+pub(in crate::layout) use self::builder::LayoutSnapshot;
 mod counters;
 mod element_semantics;
 mod flex;
@@ -214,10 +216,16 @@ use used_values::*;
 mod split_1;
 pub use self::split_1::RenderOptions;
 pub(in crate::layout) use self::split_1::*;
-pub(crate) use self::split_1::{IframeEmbeddingContext, PageMargins, PageSize};
-pub(crate) use self::split_1::{PreparedDomLayout, layout_prepared_dom, start_font_system_load};
+pub(crate) use self::split_1::{
+    IframeEmbeddingContext, PageMargins, PageSize, PreparedDomLayout, layout_prepared_dom,
+    start_font_system_load,
+};
 mod split_2;
 pub(in crate::layout) use self::split_2::*;
 mod split_3;
 pub(in crate::layout) use self::split_3::*;
+#[cfg(feature = "layout-profile")]
+mod layout_profile;
 mod split_4;
+#[cfg(all(feature = "stack-profile", target_os = "macos"))]
+mod stack_profile;

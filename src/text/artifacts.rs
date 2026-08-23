@@ -75,6 +75,7 @@ impl ShapedInlineLine {
     /// as from its measured width. Leaving it in the glyph would make paint
     /// disagree with fitting and intrinsic sizing.
     /// <https://drafts.csswg.org/css-text-3/#letter-spacing-property>
+    #[cfg(test)]
     pub(crate) fn remove_terminal_letter_spacing(&mut self, spacing: f32) {
         if spacing == 0.0 {
             return;
@@ -617,6 +618,7 @@ pub(crate) struct ShapedInlineGlyph {
 }
 
 impl ShapedInlineGlyph {
+    /// PDF-facing Unicode summary retained for text extraction.
     pub(crate) fn source_text(&self) -> &str {
         &self.rendered.unicode
     }

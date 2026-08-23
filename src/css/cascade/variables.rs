@@ -1,3 +1,7 @@
+use std::borrow::Cow;
+
+use cssparser::{Parser, ParserInput};
+
 use super::declarations::{
     CascadedDeclaration, affected_longhands, expand_modeled_shorthands, same_cascade_layer,
     same_or_stronger_reverted_origin,
@@ -5,8 +9,6 @@ use super::declarations::{
 use super::*;
 use crate::css::component_values::{CssComponentValueList, parse_var_function_arguments};
 use crate::css::{custom_property_value_is_valid, is_custom_property_name};
-use cssparser::{Parser, ParserInput};
-use std::borrow::Cow;
 
 pub(super) fn apply_cascaded_custom_property_declarations(
     style: &mut ComputedStyle,

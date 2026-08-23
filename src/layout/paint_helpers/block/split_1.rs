@@ -1403,10 +1403,7 @@ pub(in crate::layout) fn linear_gradient_hard_stop_tile_paths(
     clip: PaintRect,
     rounded_clip: Option<RenderedPathClip>,
 ) -> Option<Vec<RenderedPath>> {
-    if gradient.repeating
-        || !gradient.hints.is_empty()
-        || axis_aligned_gradient_direction(gradient.direction).is_some()
-    {
+    if gradient.repeating || !gradient.hints.is_empty() {
         return None;
     }
     linear_gradient_hard_stop_paths_in_gradient_box(gradient, area, clip, rounded_clip)
@@ -1722,6 +1719,14 @@ pub(in crate::layout) fn angled_gradient_line(
     }
 }
 
+/// Resolve a CSS linear-gradient direction against its concrete gradient box.
+///
+/// For `to <corner>`, CSS Images requires the gradient line to point into the
+/// requested quadrant while remaining perpendicular to the line through the
+/// two neighboring corners.  Using the opposite box span for each directional
+/// component preserves that “magic corners” invariant on non-square boxes:
+/// a 50% color stop intersects those neighboring corners.
+/// <https://drafts.csswg.org/css-images-3/#linear-gradients>
 pub(in crate::layout) fn gradient_direction_angle_for_area(
     direction: LinearGradientDirection,
     area: PaintRect,
@@ -1733,12 +1738,12 @@ pub(in crate::layout) fn gradient_direction_angle_for_area(
             vertical,
         } => {
             let x = match horizontal {
-                css::GradientHorizontalDirection::Left => -area.size.width,
-                css::GradientHorizontalDirection::Right => area.size.width,
+                css::GradientHorizontalDirection::Left => -area.size.height,
+                css::GradientHorizontalDirection::Right => area.size.height,
             };
             let y = match vertical {
-                css::GradientVerticalDirection::Top => area.size.height,
-                css::GradientVerticalDirection::Bottom => -area.size.height,
+                css::GradientVerticalDirection::Top => area.size.width,
+                css::GradientVerticalDirection::Bottom => -area.size.width,
             };
             x.atan2(y).to_degrees().rem_euclid(360.0)
         }
@@ -1869,39 +1874,39 @@ pub(in crate::layout) fn rounded_clip_rect_for_box(
     )
 }
 
-/// Build a rounded overflow clip expanded by an `overflow-clip-margin`.
+/// Derive the exact rounded edge at an already-resolved rectangle.
 ///
-/// CSS Overflow expands the selected clip edge and its corner contour by the
-/// used clip margin.  Expanding only the rectangular effect bounds would turn
-/// a clipped rounded or shaped corner into a square at the margin boundary:
-/// <https://drafts.csswg.org/css-overflow-4/#overflow-clip-margin-property>.
-pub(in crate::layout) fn rounded_clip_rect_for_box_with_outset(
-    rect: PaintRect,
+/// CSS Backgrounds adjusts outward-growing radii with its coverage/ratio
+/// cubic, while inward movement subtracts the inset and floors at zero.
+/// <https://www.w3.org/TR/css-backgrounds-3/#shadow-shape>
+pub(in crate::layout) fn rounded_clip_rect_for_box_at_edge(
+    border_rect: PaintRect,
     style: &ComputedStyle,
     border_insets: css::Edges,
-    clip_box: css::BackgroundBox,
-    outset: f32,
+    reference_box: css::BackgroundBox,
+    edge_rect: PaintRect,
 ) -> Option<RenderedRoundedRect> {
-    let clip = rounded_clip_rect_for_box(rect, style, border_insets, clip_box)?;
-    if outset <= 0.0 {
-        return Some(clip);
+    if edge_rect.size.width <= 0.0 || edge_rect.size.height <= 0.0 {
+        return None;
     }
-    let rect = PaintRect::new(
-        clip.paint_rect().origin - PaintDisplacement::new(outset, outset),
-        PaintSize::new(
-            clip.paint_rect().size.width + outset * 2.0,
-            clip.paint_rect().size.height + outset * 2.0,
-        ),
+    let reference = rounded_clip_rect_for_box(border_rect, style, border_insets, reference_box)?;
+    let reference_rect = reference.paint_rect();
+    let radii = adjusted_outset_rounded_rect_radii(
+        reference.radii,
+        reference_rect.size,
+        css::Edges {
+            top: edge_rect.max_y() - reference_rect.max_y(),
+            right: edge_rect.max_x() - reference_rect.max_x(),
+            bottom: reference_rect.min_y() - edge_rect.min_y(),
+            left: reference_rect.min_x() - edge_rect.min_x(),
+        },
     );
+    if rounded_radii_are_zero(radii) {
+        return None;
+    }
     Some(
-        RenderedRoundedRect::from_paint_rect(
-            rect,
-            outset_rounded_rect_radii(clip.radii, outset),
-            None,
-            None,
-            PaintStrokeWidth::ZERO,
-        )
-        .with_corner_shapes(style.corner_shapes),
+        RenderedRoundedRect::from_paint_rect(edge_rect, radii, None, None, PaintStrokeWidth::ZERO)
+            .with_corner_shapes(style.corner_shapes),
     )
 }
 
@@ -2244,7 +2249,16 @@ fn paint_inset_rounded_box_shadow(
         used_rounded_rect_radii(style.border_radius.clone(), geometry.rect.size),
         geometry.border_insets,
     );
-    let perimeter_radii = outset_rounded_rect_radii(subject_radii, -spread);
+    let perimeter_radii = adjusted_outset_rounded_rect_radii(
+        subject_radii,
+        padding.size,
+        css::Edges {
+            top: -spread,
+            right: -spread,
+            bottom: -spread,
+            left: -spread,
+        },
+    );
     let mut commands = shaped_rect_path_commands(padding, subject_radii, style.corner_shapes);
     if perimeter.size.width > 0.0 && perimeter.size.height > 0.0 {
         commands.extend(shaped_rect_path_commands(
@@ -2289,9 +2303,15 @@ fn paint_outer_rounded_box_shadow(
             - PaintDisplacement::new(spread, spread),
         outer_size,
     );
-    let outer_radii = outset_rounded_rect_radii(
+    let outer_radii = adjusted_outset_rounded_rect_radii(
         used_rounded_rect_radii(style.border_radius.clone(), geometry.rect.size),
-        spread,
+        geometry.rect.size,
+        css::Edges {
+            top: spread,
+            right: spread,
+            bottom: spread,
+            left: spread,
+        },
     );
     let mut commands = shaped_rect_path_commands(outer_rect, outer_radii, style.corner_shapes);
     commands.extend(rounded_box_path_commands_for_insets(
@@ -2309,18 +2329,32 @@ fn paint_outer_rounded_box_shadow(
     ));
 }
 
-fn outset_rounded_rect_radii(
+fn adjusted_outset_rounded_rect_radii(
     radii: RenderedRoundedRectRadii,
-    outset: f32,
+    edge_size: PaintSize,
+    outsets: css::Edges,
 ) -> RenderedRoundedRectRadii {
-    let outset_corner = |corner: RenderedCornerRadius| {
-        RenderedCornerRadius::new(corner.x() + outset, corner.y() + outset)
+    let outset_corner = |corner: RenderedCornerRadius, x_outset: f32, y_outset: f32| {
+        let coverage = 2.0
+            * (corner.x() / edge_size.width.max(f32::EPSILON))
+                .min(corner.y() / edge_size.height.max(f32::EPSILON));
+        let adjust = |radius: f32, outset: f32| {
+            if outset <= 0.0 {
+                return (radius + outset).max(0.0);
+            }
+            if radius > outset || coverage > 1.0 {
+                return radius + outset;
+            }
+            let ratio = radius / outset;
+            radius + outset * (1.0 - (1.0 - ratio).powi(3) * (1.0 - coverage.powi(3)))
+        };
+        RenderedCornerRadius::new(adjust(corner.x(), x_outset), adjust(corner.y(), y_outset))
     };
     RenderedRoundedRectRadii {
-        top_left: outset_corner(radii.top_left),
-        top_right: outset_corner(radii.top_right),
-        bottom_right: outset_corner(radii.bottom_right),
-        bottom_left: outset_corner(radii.bottom_left),
+        top_left: outset_corner(radii.top_left, outsets.left, outsets.top),
+        top_right: outset_corner(radii.top_right, outsets.right, outsets.top),
+        bottom_right: outset_corner(radii.bottom_right, outsets.right, outsets.bottom),
+        bottom_left: outset_corner(radii.bottom_left, outsets.left, outsets.bottom),
     }
 }
 
@@ -2970,6 +3004,26 @@ mod tests {
     }
 
     #[test]
+    fn axis_aligned_hard_stop_tiles_use_vector_bands() {
+        let gradient = gradient(vec![
+            stop(
+                CssColor::new(255, 0, 0),
+                Some(css::ComputedLengthPercentage::from_percent(0.5)),
+            ),
+            stop(
+                CssColor::TRANSPARENT,
+                Some(css::ComputedLengthPercentage::from_percent(0.5)),
+            ),
+        ]);
+        let area = paint_space_rect(0.0, 0.0, 30.0, 60.0);
+
+        assert!(
+            linear_gradient_hard_stop_tile_paths(&gradient, area, area, None).is_some(),
+            "axis-aligned hard stops must not fall back to raster sampling at a cell edge",
+        );
+    }
+
+    #[test]
     fn non_axis_aligned_gradient_direction_projects_paint_displacements() {
         let line = AngledGradientLine {
             center: PaintPoint::new(10.0, 20.0),
@@ -2985,6 +3039,62 @@ mod tests {
             line.endpoints(),
             (PaintPoint::new(4.0, 12.0), PaintPoint::new(16.0, 28.0))
         );
+    }
+
+    #[test]
+    fn non_square_corner_gradient_directions_preserve_magic_corners() {
+        let area = paint_space_rect(0.0, 0.0, 200.0, 100.0);
+        let cases = [
+            (
+                LinearGradientDirection::Corner {
+                    horizontal: css::GradientHorizontalDirection::Right,
+                    vertical: css::GradientVerticalDirection::Bottom,
+                },
+                153.43495,
+                [PaintPoint::new(0.0, 0.0), PaintPoint::new(200.0, 100.0)],
+            ),
+            (
+                LinearGradientDirection::Corner {
+                    horizontal: css::GradientHorizontalDirection::Left,
+                    vertical: css::GradientVerticalDirection::Bottom,
+                },
+                206.56505,
+                [PaintPoint::new(200.0, 0.0), PaintPoint::new(0.0, 100.0)],
+            ),
+            (
+                LinearGradientDirection::Corner {
+                    horizontal: css::GradientHorizontalDirection::Left,
+                    vertical: css::GradientVerticalDirection::Top,
+                },
+                333.43494,
+                [PaintPoint::new(0.0, 0.0), PaintPoint::new(200.0, 100.0)],
+            ),
+            (
+                LinearGradientDirection::Corner {
+                    horizontal: css::GradientHorizontalDirection::Right,
+                    vertical: css::GradientVerticalDirection::Top,
+                },
+                26.565052,
+                [PaintPoint::new(200.0, 0.0), PaintPoint::new(0.0, 100.0)],
+            ),
+        ];
+
+        for (direction, expected_angle, neighboring_corners) in cases {
+            let angle = gradient_direction_angle_for_area(direction, area);
+            assert!(
+                (angle - expected_angle).abs() < 0.001,
+                "expected {expected_angle}deg, got {angle}deg"
+            );
+
+            let line = angled_gradient_line(direction, area);
+            let midpoint = line.axis_length / 2.0;
+            for corner in neighboring_corners {
+                assert!(
+                    (gradient_axis_position(corner, line) - midpoint).abs() < 0.001,
+                    "50% stop must pass through {corner:?} for {direction:?}"
+                );
+            }
+        }
     }
 
     #[test]

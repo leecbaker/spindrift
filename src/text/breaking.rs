@@ -1,6 +1,7 @@
+use icu_locale_core::LanguageIdentifier;
+
 use super::*;
 use crate::css::DiscretionaryHyphenationPolicy;
-use icu_locale_core::LanguageIdentifier;
 
 pub(super) const SOFT_HYPHEN: char = '\u{00ad}';
 pub(super) const ZERO_WIDTH_SPACE: char = '\u{200b}';
@@ -543,10 +544,18 @@ pub(crate) fn collect_measured_break_opportunities(
             .segment_str(text)
             .filter(|position| *position > 0 && *position <= text.len()),
     );
+    suppress_break_all_prefix_numeric_breaks(text, policy, breaks);
+    // ICU owns the ordinary UAX #14 candidate set, including the
+    // locale-tailored CJK `line-break` behavior selected above. Keep those
+    // candidates distinct from Quire's fallback candidates: the latter need
+    // generic class protection, but applying that protection to ICU's result
+    // would undo a legal locale-specific opportunity.
+    let mut synthesized_breaks = Vec::new();
     if matches!(policy.word_break, CssWordBreak::BreakAll) {
-        breaks.extend(word_break_all_inner_boundaries(text));
+        synthesized_breaks.extend(word_break_all_inner_boundaries(text));
     }
-    apply_css_line_break_class_tailoring(text, ordinary_policy, breaks);
+    apply_css_line_break_class_tailoring(text, ordinary_policy, &mut synthesized_breaks);
+    breaks.extend(synthesized_breaks);
     suppress_thai_named_entity_unit_breaks(text, policy, breaks);
     suppress_auto_phrase_unit_breaks(text, policy, breaks);
     suppress_keep_all_unit_breaks(text, policy, breaks);
@@ -831,8 +840,7 @@ pub(crate) fn word_break_all_inner_boundaries(text: &str) -> Vec<usize> {
         .collect()
 }
 
-/// Apply CSS Text/UAX #14 line-break class constraints not surfaced by the
-/// segmenter configuration used for measured fallback wrapping.
+/// Collect and protect Quire-synthesized CSS Text/UAX #14 fallback candidates.
 ///
 /// Opening punctuation must not be left at the end of a line, UAX #14 LB13
 /// classes must not be left at the start of a line, CJK ideographs can break
@@ -917,30 +925,36 @@ fn apply_css_line_break_class_tailoring(
                     && (!matches!(policy.word_break, CssWordBreak::BreakAll)
                         || class != LineBreak::PrefixNumeric)
             });
-        let next_allows_break = text[*position..].chars().next().is_none_or(|character| {
-            line_break_tailoring_allows_line_start(character, policy)
-                || !line_break_class_suppresses_line_start(character)
-        });
+        let next_allows_break = text[*position..]
+            .chars()
+            .next()
+            .is_none_or(|character| !line_break_class_suppresses_line_start(character));
         previous_allows_break && next_allows_break
     });
 }
 
-/// Return whether CSS Text's CJK writing-system tailoring permits a normally
-/// prohibited line-start character at this boundary.
+/// Preserve UAX #14's protected prefix-numeric sequences under `break-all`.
 ///
-/// ICU has already established the candidate using the selected locale.  This
-/// guard prevents Quire's generic UAX #14 post-filter from discarding that
-/// legal Chinese/Japanese `normal` or `loose` break solely because U+301C and
-/// U+30A0 have the `NS` class.
-/// <https://drafts.csswg.org/css-text-3/#line-break-property>
-fn line_break_tailoring_allows_line_start(character: char, policy: TextBreakPolicy) -> bool {
-    matches!(
-        policy.line_break,
-        CssLineBreak::Loose | CssLineBreak::Normal
-    ) && matches!(
-        policy.writing_system,
-        ContentWritingSystem::Chinese | ContentWritingSystem::Japanese
-    ) && matches!(character, '\u{301c}' | '\u{30a0}')
+/// `word-break: break-all` relaxes only letter-to-letter restrictions. ICU's
+/// `BreakAll` collection mode can otherwise report a candidate after a `PR`
+/// class; that is an ICU mode-specific candidate rather than ordinary
+/// locale-tailored line breaking, so it remains subject to LB25 protection.
+/// <https://drafts.csswg.org/css-text-3/#valdef-word-break-break-all>
+/// <https://www.unicode.org/reports/tr14/#LB25>
+fn suppress_break_all_prefix_numeric_breaks(
+    text: &str,
+    policy: TextBreakPolicy,
+    breaks: &mut Vec<usize>,
+) {
+    if !matches!(policy.word_break, CssWordBreak::BreakAll) {
+        return;
+    }
+    breaks.retain(|position| {
+        text[..*position]
+            .chars()
+            .next_back()
+            .is_none_or(|character| line_break_class(character) != LineBreak::PrefixNumeric)
+    });
 }
 
 /// Suppress implicit breaks inside `word-break: keep-all` text runs.
@@ -1101,15 +1115,15 @@ mod tests {
     use crate::css::ContentLanguage;
 
     #[test]
-    fn loose_cjk_hyphen_breaks_follow_the_content_writing_system() {
-        let text = "東京〜大阪";
+    fn loose_cjk_breaks_follow_the_content_writing_system() {
+        let wave_dash_text = "東京〜大阪";
         let wave_dash_boundary = "東京".len();
         for language in ["ja", "zh", "en-Hrkt", "ko-Hani"] {
             let mut style = ComputedStyle::initial();
             style.line_break = CssLineBreak::Loose;
             style.language = ContentLanguage::from_html_attribute(language);
             assert!(
-                measured_break_opportunities(text, &style).contains(&wave_dash_boundary),
+                measured_break_opportunities(wave_dash_text, &style).contains(&wave_dash_boundary),
                 "{language} must allow a loose break before U+301C"
             );
         }
@@ -1120,8 +1134,20 @@ mod tests {
                 .map(ContentLanguage::from_html_attribute)
                 .unwrap_or(ContentLanguage::Unknown);
             assert!(
-                !measured_break_opportunities(text, &style).contains(&wave_dash_boundary),
+                !measured_break_opportunities(wave_dash_text, &style).contains(&wave_dash_boundary),
                 "{language:?} must not allow a loose break before U+301C"
+            );
+        }
+
+        let question_text = "ハロー、ハウアーユー？";
+        let question_boundary = "ハロー、ハウアーユー".len();
+        for language in ["ja", "en-Hrkt"] {
+            let mut style = ComputedStyle::initial();
+            style.line_break = CssLineBreak::Loose;
+            style.language = ContentLanguage::from_html_attribute(language);
+            assert!(
+                measured_break_opportunities(question_text, &style).contains(&question_boundary),
+                "{language} must allow a loose break before U+FF1F"
             );
         }
     }

@@ -9,31 +9,19 @@ mod types;
 mod ua;
 mod values;
 
-pub(crate) use html_form_state::{auto_directionality_input_value, input_type};
-pub(crate) use values::color_depends_on_currentcolor;
-pub(crate) use values::parse_css_url_token;
-pub(crate) use values::{CrossOriginRequestMode, RequestUrlModifiers};
-
-pub(crate) use cascade::SvgPresentationAttributeDeclarations;
-pub(crate) use cascade::anonymous_block_style;
-pub(crate) use cascade::anonymous_text_style;
-pub(crate) use cascade::apply_declarations;
-pub(crate) use cascade::apply_declarations_with_inheritance_source;
-pub(crate) use cascade::apply_pseudo_rules_with_parent_ch_advance;
-pub(crate) use cascade::declarations_affect_same_property;
-pub(crate) use cascade::default_display_is_block_level_for_tag;
-pub(crate) use cascade::default_style_for_tag;
-pub(crate) use cascade::origin_importance_rank;
-pub(crate) use cascade::parse_background_image;
-pub(crate) use cascade::style_for_element_with_signature;
-pub(crate) use cascade::style_for_element_with_signature_and_parent_ch_advance;
-pub(crate) use cascade::style_for_element_with_signature_and_svg_presentation;
-pub(crate) use cascade::{ParsedImage, parse_css_image};
 pub(crate) use cascade::{
-    parse_individual_rotate, parse_individual_scale, parse_individual_translate,
-    parse_object_view_box, parse_transform, parse_transform_box, parse_transform_origin,
+    ParsedImage, SvgPresentationAttributeDeclarations, anonymous_block_style, anonymous_text_style,
+    apply_declarations, apply_declarations_with_inheritance_source,
+    apply_pseudo_rules_with_parent_ch_advance, declarations_affect_same_property,
+    default_display_is_block_level_for_tag, default_style_for_tag, origin_importance_rank,
+    parse_background_image, parse_css_image, parse_individual_rotate, parse_individual_scale,
+    parse_individual_translate, parse_object_view_box, parse_transform, parse_transform_box,
+    parse_transform_origin, style_for_element_with_signature,
+    style_for_element_with_signature_and_parent_ch_advance,
+    style_for_element_with_signature_and_svg_presentation,
 };
-pub(crate) use component_values::trim_css_value;
+pub(crate) use component_values::{split_css_component_values, trim_css_value};
+pub(crate) use html_form_state::{auto_directionality_input_value, input_type};
 #[cfg(test)]
 pub(crate) use page::page_margins_from;
 #[cfg(test)]
@@ -52,32 +40,32 @@ pub(crate) use page::{
 };
 #[cfg(test)]
 pub(crate) use parse::cascade_page_declarations;
-pub(crate) use parse::media_rule_applies;
-pub(crate) use parse::media_rule_applies_in_environment;
-pub(crate) use parse::parse_declarations;
-pub(crate) use parse::parse_stylesheet;
-pub(crate) use parse::parse_stylesheet_with_media_environment;
-pub(crate) use parse::supports_condition_applies;
-pub(crate) use parse::{custom_property_value_is_valid, is_custom_property_name};
-pub(crate) use types::CssColorSpace;
-pub(crate) use types::*;
+pub(crate) use parse::{
+    custom_property_value_is_valid, is_custom_property_name, media_rule_applies,
+    media_rule_applies_in_environment, parse_declarations, parse_stylesheet,
+    parse_stylesheet_with_media_environment, supports_condition_applies,
+};
 pub use types::{
     ColorSchemePreference, Css, CssColor, CssViewportSize, ForcedColorPalette, ForcedColorsMode,
     MediaEnvironment, MediaType,
 };
-pub(crate) use ua::html_document_important_user_agent_stylesheet;
+pub(crate) use types::{CssColorSpace, *};
 #[cfg(test)]
 pub(crate) use ua::html5_presentational_hints_stylesheet;
-pub(crate) use ua::html5_presentational_hints_stylesheet_with_urls;
 #[cfg(test)]
 pub(crate) use ua::html5_user_agent_source;
-pub(crate) use ua::html5_user_agent_stylesheet;
-pub(crate) use values::{
-    CSS_PX_TO_PT, canonical_predefined_counter_style_name, fallback_ch_advance_for_style,
-    parse_color_from_currentcolor_in_scheme, parse_font_palette, parse_font_synthesis,
-    parse_font_synthesis_subproperty, parse_list_style_type,
+pub(crate) use ua::{
+    html_document_important_user_agent_stylesheet, html5_presentational_hints_stylesheet_with_urls,
+    html5_user_agent_stylesheet,
 };
-pub(crate) use values::{color_to_predefined_rgb, color_to_xyz_d50, parse_color_from_currentcolor};
+pub(crate) use values::{
+    CSS_PX_TO_PT, CrossOriginRequestMode, RequestUrlModifiers,
+    canonical_predefined_counter_style_name, color_depends_on_currentcolor,
+    color_to_predefined_rgb, color_to_xyz_d50, fallback_ch_advance_for_style, parse_color,
+    parse_color_from_currentcolor, parse_color_from_currentcolor_in_scheme,
+    parse_computed_length_percentage, parse_css_url_token, parse_font_palette,
+    parse_font_synthesis, parse_font_synthesis_subproperty, parse_list_style_type,
+};
 pub(in crate::css) use values::{parse_border_image_source, parse_mask_border_source};
 
 /// Match an unprefixed CSS `attr()` name against a DOM attribute name.

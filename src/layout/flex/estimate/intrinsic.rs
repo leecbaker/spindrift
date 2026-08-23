@@ -814,7 +814,16 @@ pub(in crate::layout::flex) fn definite_flex_item_cross_content_size(
             cross_basis,
             non_content_pt(horizontal_non_content),
         )
-        .map(|width| constrain_content_width(style, width, cross_basis))
+        .map(|width| {
+            constrain_width_with_intrinsic(
+                style,
+                width,
+                width,
+                width,
+                cross_basis,
+                non_content_pt(horizontal_non_content),
+            )
+        })
     }
 }
 

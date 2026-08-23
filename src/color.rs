@@ -4,18 +4,18 @@
 //! here use the built-in CSS CssColor 4 RGB spaces and D50 PCS:
 //! <https://www.w3.org/TR/css-color-4/#color-conversion>.
 
-use crate::css::CssColorSpace;
-use crate::{CssColor, Error, Result};
+use std::rc::Rc;
+
 use moxcms::{
     Chromaticity, ColorPrimaries, ColorProfile, DataColorSpace, Layout, RenderingIntent,
     ToneReprCurve, TransformOptions, XyY,
 };
-use palette::{
-    Lab, Oklab, Xyz,
-    convert::FromColorUnclamped,
-    white_point::{D50, D65},
-};
-use std::rc::Rc;
+use palette::convert::FromColorUnclamped;
+use palette::white_point::{D50, D65};
+use palette::{Lab, Oklab, Xyz};
+
+use crate::css::CssColorSpace;
+use crate::{CssColor, Error, Result};
 
 type GradientCoordinates = ([f64; 3], f64);
 type GradientPair = (GradientCoordinates, GradientCoordinates, CssColorSpace);
@@ -717,7 +717,7 @@ fn transform_samples_at_depth(
         }
         crate::image_store::RasterSampleDepth::Sixteen => {
             let mut input = Vec::with_capacity(samples.len() / 2);
-            for component in samples.chunks_exact(2) {
+            for component in samples.as_chunks::<2>().0 {
                 input.push(u16::from_be_bytes([component[0], component[1]]));
             }
             let transform = source

@@ -1,5 +1,6 @@
 use super::*;
 use crate::css::FontFamilyName;
+use crate::document::DocumentFontVariationCoordinates;
 use crate::units::SemanticLengthExt;
 
 /// The subset of a computed style which may differ for one Parley shaping
@@ -137,41 +138,70 @@ pub(super) fn fontique_fixed_standard_axis_defaults(
     defaults
 }
 
-/// Translate CSS's registered standard variation axes into Parley's shaping
-/// settings. Fontique's face metadata selects the correct `@font-face`, but a
-/// face whose fixed descriptor equals the requested CSS value has no synthesis
-/// delta for Fontique to forward. Passing the standard coordinates explicitly
-/// ensures that both fixed and ranged variable faces shape at their used CSS
-/// `font-weight` and `font-stretch` values:
+/// Resolve CSS's registered standard variation axes at a matching request.
+/// Fontique's face metadata selects the correct `@font-face`, but a face whose
+/// fixed descriptor equals the requested CSS value has no synthesis delta for
+/// Fontique to forward. Passing these coordinates explicitly ensures that both
+/// fixed and ranged variable faces use their selected instance:
 /// <https://www.w3.org/TR/css-fonts-4/#font-prop-desc>.
-fn parley_standard_font_variations(style: &ParleyStyleView<'_>) -> ParleyFontVariations<'static> {
-    let authored = style.authored();
+pub(in crate::text) fn standard_font_variation_coordinates(
+    weight: FontWeight,
+    style: FontStyle,
+    width: FontWidth,
+) -> DocumentFontVariationCoordinates {
     let mut variations = vec![
-        ParleyFontVariation::new(ParleyTag::new(b"wdth"), authored.font_width.0 as f32 / 10.0),
-        ParleyFontVariation::new(ParleyTag::new(b"wght"), style.font_weight().0 as f32),
+        (*b"wdth", (width.0 as f32 / 10.0).to_bits()),
+        (*b"wght", (weight.0 as f32).to_bits()),
     ];
-    let effective_font_style = style.font_style();
-    let slant_angle =
-        effective_font_style
-            .oblique_angle()
-            .or(matches!(effective_font_style, FontStyle::Italic).then_some(14.0));
+    let slant_angle = style
+        .oblique_angle()
+        .or(matches!(style, FontStyle::Italic).then_some(14.0));
     if let Some(angle) = slant_angle {
         // CSS positive oblique angles slant glyphs forward, while OpenType's
         // registered `slnt` axis uses the opposite sign.
-        variations.push(ParleyFontVariation::new(ParleyTag::new(b"slnt"), -angle));
+        variations.push((*b"slnt", (-angle).to_bits()));
     }
+    variations.sort_by_key(|(tag, _)| *tag);
+    DocumentFontVariationCoordinates(variations)
+}
+
+/// Resolve the variation location consumed by both Parley and PDF font
+/// embedding. Keeping one ordered representation prevents the shaped glyph
+/// program from diverging from the static PDF instance.
+/// <https://www.w3.org/TR/css-fonts-4/#font-variation-settings-def>
+pub(in crate::text) fn effective_font_variation_coordinates(
+    style: &ParleyStyleView<'_>,
+) -> DocumentFontVariationCoordinates {
+    let authored = style.authored();
+    let mut variations = standard_font_variation_coordinates(
+        style.font_weight(),
+        style.font_style(),
+        authored.font_width,
+    )
+    .0;
     // The low-level property takes precedence over the registered CSS axis
     // properties for the same tag.
     for setting in &style.font_variation_settings().0 {
-        let tag = ParleyTag::from_bytes(setting.tag);
-        let value = f32::from_bits(setting.value);
-        if let Some(existing) = variations.iter_mut().find(|axis| axis.tag == tag) {
-            *existing = ParleyFontVariation::new(tag, value);
+        if let Some(existing) = variations.iter_mut().find(|(tag, _)| *tag == setting.tag) {
+            *existing = (setting.tag, setting.value);
         } else {
-            variations.push(ParleyFontVariation::new(tag, value));
+            variations.push((setting.tag, setting.value));
         }
     }
-    ParleyFontVariations::List(Cow::Owned(variations))
+    variations.sort_by_key(|(tag, _)| *tag);
+    DocumentFontVariationCoordinates(variations)
+}
+
+fn parley_standard_font_variations(style: &ParleyStyleView<'_>) -> ParleyFontVariations<'static> {
+    ParleyFontVariations::List(Cow::Owned(
+        effective_font_variation_coordinates(style)
+            .0
+            .into_iter()
+            .map(|(tag, value)| {
+                ParleyFontVariation::new(ParleyTag::from_bytes(tag), f32::from_bits(value))
+            })
+            .collect(),
+    ))
 }
 
 pub(super) fn fontique_attributes(

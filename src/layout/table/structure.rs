@@ -1,4 +1,18 @@
-use super::*;
+use super::{
+    CaptionSide, ComputedStyle, Element, ElementSignature, Float, LayoutLength,
+    LogicalInlinePercentageBasis, NodeKind, NonContentLength, PageBoundaryValue,
+    PageBoundaryValues, PageTopRect, Position, RenderedPath, RenderedRect, ReplacedElementKind,
+    ResolvedPageBoundaryValues, SemanticLengthExt, TableCaption, TableCell, TableCellPadding,
+    TableCellPlacement, TableColumn, TableColumnGroup, TableGrid, TableMetrics, TableRow,
+    TableRowGroup, TableRowOrdering, Visibility, box_tree,
+    collect_inline_text_from_formatting_boxes, css, html_table_colspan, html_table_rowspan,
+    inline_text, is_html_table_element, is_html_table_footer_group_element,
+    is_html_table_header_group_element, layout_pt, non_content_pt,
+    page_value_sources_from_style_and_children, parse_html_length, replaced_element_kind,
+    resolved_page_boundary_values_from_style_and_children, style_is_in_normal_flow, svg_rect,
+    used_border_widths, used_content_box_height_or_auto,
+    used_padding_edges_for_logical_inline_basis, used_property_containment, vertical_border_width,
+};
 
 /// The first and last named-page values represented by a durable table
 /// fragment.
@@ -564,7 +578,10 @@ pub(super) fn column_group_signature<'a>(
     group.as_ref().map(|group| &group.signature)
 }
 
-pub(super) fn apply_table_cellpadding(style: &mut ComputedStyle, table_cellpadding: Option<f32>) {
+pub(super) fn apply_table_cellpadding(
+    style: &mut ComputedStyle,
+    table_cellpadding: Option<TableCellPadding>,
+) {
     if let Some(cellpadding) = table_cellpadding
         && style.padding
             == (css::Edges {
@@ -575,12 +592,12 @@ pub(super) fn apply_table_cellpadding(style: &mut ComputedStyle, table_cellpaddi
             })
     {
         style.padding = css::Edges {
-            top: cellpadding,
-            right: cellpadding,
-            bottom: cellpadding,
-            left: cellpadding,
+            top: cellpadding.points(),
+            right: cellpadding.points(),
+            bottom: cellpadding.points(),
+            left: cellpadding.points(),
         };
-        let cellpadding = css::ComputedLengthPercentage::from_points(cellpadding);
+        let cellpadding = css::ComputedLengthPercentage::from_points(cellpadding.points());
         style.box_values.padding = css::CssEdges {
             top: cellpadding.clone(),
             right: cellpadding.clone(),
@@ -599,7 +616,7 @@ pub(super) fn apply_table_cellpadding(style: &mut ComputedStyle, table_cellpaddi
 /// https://www.w3.org/TR/CSS22/box.html#padding-properties
 pub(super) fn apply_table_cell_used_padding(
     style: &mut ComputedStyle,
-    table_cellpadding: Option<f32>,
+    table_cellpadding: Option<TableCellPadding>,
     inline_basis: LogicalInlinePercentageBasis,
 ) {
     apply_table_cellpadding(style, table_cellpadding);
@@ -1157,9 +1174,10 @@ pub(super) fn table_cell_used_border_edges(style: &ComputedStyle) -> css::Edges 
 
 #[cfg(test)]
 mod ordering_tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::dom::{Node, NodeKind};
-    use std::collections::HashMap;
 
     fn test_signature(name: &str) -> ElementSignature {
         ElementSignature::new(name, HashMap::new())

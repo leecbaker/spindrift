@@ -1,4 +1,30 @@
-use super::*;
+use crate::css::{
+    self, CaptionSide, ComputedStyle, PageBreak, PercentageBasis, SemanticLengthExt, Stylesheets,
+    TableLayout, layout_pt,
+};
+use crate::document::paint::geometry::PaintTranslation;
+use crate::dom::Element;
+use crate::layout::table::layout::{
+    TableGridLayoutContext, table_content_width_clamped_to_min_content,
+    table_horizontal_non_content_width,
+};
+use crate::layout::table::sizing::intrinsic_table_wrapper_block_probe_style;
+use crate::layout::table::{
+    TableCellPadding, TableLayoutInput, TableMaxContentInline, TableWrapperFlexSizing,
+    constrain_table_root_inline_size, inline_table_first_occupying_row_range, table_content_height,
+    table_grid, table_metrics, table_root_distributes_extra_inline_space,
+    table_root_inline_content_box_size, table_root_inline_size, used_empty_table_grid_width,
+    used_table_width, used_table_wrapper_geometry,
+};
+use crate::layout::{
+    AtomicInlineFragmentReplayCoordinates, InlineAtom, InlineAtomContent, InlineSize,
+    LayoutBuilder, LogicalBlockContentSize, LogicalInlineContentSize, PageBoxEdges, PageContext,
+    PageMargins, PageSize, PhysicalContentWidth, box_tree, element_signature, intrinsic,
+    parse_html_length, set_style_used_height, set_style_used_width,
+    used_content_box_height_or_auto_with_basis, used_max_height, used_min_height,
+    used_property_containment,
+};
+use crate::units::{content_box_pt, non_content_pt};
 
 impl<'a> LayoutBuilder<'a> {
     /// Collect the single table-wrapper sizing contract consumed by Flexbox.
@@ -16,6 +42,13 @@ impl<'a> LayoutBuilder<'a> {
         fragment: &box_tree::TableFragment<'_>,
         available_outer_width: f32,
     ) -> TableWrapperFlexSizing {
+        // Every operation below is an intrinsic Flex probe. Column-width
+        // measurement can lay out floated table-cell descendants before the
+        // height estimate is reached, so the transaction must cover the
+        // entire table-wrapper contract rather than only the final height
+        // query.
+        // <https://drafts.csswg.org/css-tables-3/#computing-cell-measures>
+        let measurement_snapshot = self.snapshot();
         let (grid_min_content, grid_max_content) = self.table_intrinsic_widths_from_fragment(
             element,
             style,
@@ -41,23 +74,25 @@ impl<'a> LayoutBuilder<'a> {
             - style.margin.bottom)
             .max(0.0);
         let geometry = used_table_wrapper_geometry(style, available_outer_width, None);
-        TableWrapperFlexSizing {
+        let sizing = TableWrapperFlexSizing {
             grid_min_content_inline: LogicalInlineContentSize::new(content_box_pt(
                 grid_min_content,
             )),
-            grid_max_content_inline: LogicalInlineContentSize::new(content_box_pt(
+            grid_max_content_inline: TableMaxContentInline::from_table_measurement(
                 grid_max_content,
-            )),
-            wrapper_preferred_inline: LogicalInlineContentSize::new(content_box_pt(
+            ),
+            wrapper_preferred_inline: TableMaxContentInline::from_table_measurement(
                 wrapper_preferred,
-            )),
+            ),
             wrapper_intrinsic_block: LogicalBlockContentSize::new(content_box_pt(
                 wrapper_intrinsic_block,
             )),
             inline_non_content: geometry.inline_non_content(),
             block_non_content: geometry.block_non_content(),
             margins: style.margin,
-        }
+        };
+        self.restore(measurement_snapshot);
+        sizing
     }
 
     /// Return min-content and max-content grid widths for a durable table fragment.
@@ -93,7 +128,8 @@ impl<'a> LayoutBuilder<'a> {
         let table_cellpadding = element
             .attrs
             .get("cellpadding")
-            .and_then(|value| parse_html_length(value));
+            .and_then(|value| parse_html_length(value))
+            .map(|value| TableCellPadding::new(layout_pt(value)));
         let table_metrics = table_metrics(element, style);
         let collapsed_geometry = (table_metrics.border_collapse == css::BorderCollapse::Collapse)
             .then(|| {
@@ -400,7 +436,8 @@ impl<'a> LayoutBuilder<'a> {
         let table_cellpadding = element
             .attrs
             .get("cellpadding")
-            .and_then(|value| parse_html_length(value));
+            .and_then(|value| parse_html_length(value))
+            .map(|value| TableCellPadding::new(layout_pt(value)));
         let table_metrics = table_metrics(element, style);
         let collapsed_geometry = (table_metrics.border_collapse == css::BorderCollapse::Collapse)
             .then(|| {
@@ -520,7 +557,8 @@ impl<'a> LayoutBuilder<'a> {
         let table_cellpadding = element
             .attrs
             .get("cellpadding")
-            .and_then(|value| parse_html_length(value));
+            .and_then(|value| parse_html_length(value))
+            .map(|value| TableCellPadding::new(layout_pt(value)));
         let table_metrics = table_metrics(element, style);
         let collapsed_geometry = (table_metrics.border_collapse == css::BorderCollapse::Collapse)
             .then(|| {
@@ -693,7 +731,7 @@ impl<'a> LayoutBuilder<'a> {
             size: PageSize::from_points(physical_atom_inline_size, top),
             margins: PageMargins::all_points(0.0),
             edges: PageBoxEdges::ZERO,
-            rotation: snapshot.current_page_context.rotation,
+            rotation: snapshot.current_page_context().rotation,
         };
         self.current_page = crate::layout::builder::page_for_context(atom_page_context);
         self.current_page_context = atom_page_context;
@@ -734,7 +772,7 @@ impl<'a> LayoutBuilder<'a> {
             first_row_baseline_offset
                 .zip(first_row_baseline_range)
                 .map(|(row_baseline, (row_top, _))| {
-                    ((top - row_top).max(0.0) + row_baseline.offset
+                    ((top - row_top).max(0.0) + row_baseline.offset.points()
                         - (row_baseline.rendered_font_adjustment
                             - table_rendered_baseline_adjustment))
                         .max(0.0)
@@ -827,6 +865,14 @@ impl<'a> LayoutBuilder<'a> {
         if let Some(&height) = self.speculative_table_height_estimates.get(&estimate_key) {
             return height;
         }
+        // Table height planning may lay out float descendants while measuring
+        // cells.  This is an intrinsic probe, not committed table layout: it
+        // must retain only its numeric result.  In particular, a float's
+        // principal-box paint and exclusion geometry must not escape into the
+        // later accepted wrapper layout.
+        // <https://drafts.csswg.org/css-tables-3/#table-layout>
+        // <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+        let measurement_snapshot = self.snapshot();
         let input = TableLayoutInput::from_fragment(fragment);
         let rows = input.row_ordering.rows.as_slice();
         let captions = input.captions.as_slice();
@@ -843,6 +889,7 @@ impl<'a> LayoutBuilder<'a> {
                 available_table_width,
                 table_width,
             );
+            self.restore(measurement_snapshot);
             self.speculative_table_height_estimates
                 .insert(estimate_key, height);
             return height;
@@ -851,7 +898,8 @@ impl<'a> LayoutBuilder<'a> {
         let table_cellpadding = element
             .attrs
             .get("cellpadding")
-            .and_then(|value| parse_html_length(value));
+            .and_then(|value| parse_html_length(value))
+            .map(|value| TableCellPadding::new(layout_pt(value)));
         let table_metrics = table_metrics(element, style);
         let collapsed_geometry = (table_metrics.border_collapse == css::BorderCollapse::Collapse)
             .then(|| {
@@ -935,6 +983,7 @@ impl<'a> LayoutBuilder<'a> {
             CaptionSide::Bottom,
         );
         let height = total + style.margin.bottom;
+        self.restore(measurement_snapshot);
         self.speculative_table_height_estimates
             .insert(estimate_key, height);
         height

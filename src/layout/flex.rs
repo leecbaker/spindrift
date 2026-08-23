@@ -413,6 +413,10 @@ fn intrinsic_block_basis_from_flex_available_height(
                     FlexIntrinsicBlockBasisSource::DefiniteSingleLineStretch,
                 )
             }
+            FlexAvailableSizeSource::AspectRatioDerived => IntrinsicBlockBasis::from_flex_layout(
+                value,
+                FlexIntrinsicBlockBasisSource::AspectRatioTransfer,
+            ),
             FlexAvailableSizeSource::IntrinsicContainerSize => IntrinsicBlockBasis::Indefinite,
             FlexAvailableSizeSource::ContainingBlock => unreachable!(
                 "containing-block percentage bases are handled before Flex layout bases"

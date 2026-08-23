@@ -131,6 +131,267 @@ pub(in crate::layout) fn used_content_box_height_or_auto_with_basis<Source>(
     )
 }
 
+/// The box whose dimensions participate in preferred aspect-ratio sizing.
+///
+/// A bare `<ratio>` uses the box selected by `box-sizing`, while the ratio in
+/// `auto && <ratio>` always operates on content-box dimensions for a
+/// non-replaced box:
+/// <https://drafts.csswg.org/css-sizing-4/#aspect-ratio>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) enum AspectRatioCalculationBox {
+    ContentBox,
+    BorderBox,
+}
+
+/// A resolved preferred aspect ratio and the physical box-space inputs needed
+/// to transfer sizes between its axes.
+///
+/// CSS Sizing Level 4 defines the preferred aspect ratio in width/height order
+/// and requires ratio-dependent automatic sizes to use the same sizing box in
+/// every phase. Keeping the non-content extents in their semantic type makes
+/// crossing between content-box and border-box space explicit:
+/// <https://drafts.csswg.org/css-sizing-4/#aspect-ratio>.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout) struct ResolvedAspectRatio {
+    ratio: f32,
+    calculation_box: AspectRatioCalculationBox,
+    horizontal_non_content: NonContentLength,
+    vertical_non_content: NonContentLength,
+}
+
+impl ResolvedAspectRatio {
+    pub(in crate::layout) fn for_non_replaced(
+        style: &ComputedStyle,
+        horizontal_non_content: NonContentLength,
+        vertical_non_content: NonContentLength,
+    ) -> Option<Self> {
+        let ratio = style.aspect_ratio.preferred_ratio_for_non_replaced(false)?;
+        Self::new(
+            ratio,
+            if style.aspect_ratio.uses_content_box_for_non_replaced()
+                || style.box_sizing == BoxSizing::ContentBox
+            {
+                AspectRatioCalculationBox::ContentBox
+            } else {
+                AspectRatioCalculationBox::BorderBox
+            },
+            horizontal_non_content,
+            vertical_non_content,
+        )
+    }
+
+    pub(in crate::layout) fn new(
+        ratio: f32,
+        calculation_box: AspectRatioCalculationBox,
+        horizontal_non_content: NonContentLength,
+        vertical_non_content: NonContentLength,
+    ) -> Option<Self> {
+        (ratio.is_finite() && ratio > 0.0).then_some(Self {
+            ratio,
+            calculation_box,
+            horizontal_non_content,
+            vertical_non_content,
+        })
+    }
+
+    pub(in crate::layout) fn width_from_height(
+        self,
+        content_height: ContentBoxLength,
+    ) -> ContentBoxLength {
+        match self.calculation_box {
+            AspectRatioCalculationBox::ContentBox => {
+                content_box_pt(content_height.points() * self.ratio)
+            }
+            AspectRatioCalculationBox::BorderBox => {
+                let border_box_height =
+                    content_box_to_border_box_length(content_height, self.vertical_non_content);
+                border_box_to_content_box_length(
+                    border_box_pt(border_box_height.points() * self.ratio),
+                    self.horizontal_non_content,
+                )
+            }
+        }
+    }
+
+    pub(in crate::layout) fn height_from_width(
+        self,
+        content_width: ContentBoxLength,
+    ) -> ContentBoxLength {
+        match self.calculation_box {
+            AspectRatioCalculationBox::ContentBox => {
+                content_box_pt(content_width.points() / self.ratio)
+            }
+            AspectRatioCalculationBox::BorderBox => {
+                let border_box_width =
+                    content_box_to_border_box_length(content_width, self.horizontal_non_content);
+                border_box_to_content_box_length(
+                    border_box_pt(border_box_width.points() / self.ratio),
+                    self.vertical_non_content,
+                )
+            }
+        }
+    }
+}
+
+/// Definite preferred and min/max sizes for one physical axis in content-box
+/// space. `None` retains the CSS constraint's indefinite/automatic state.
+#[derive(Debug, Clone, Copy, Default)]
+pub(in crate::layout) struct AspectRatioAxisConstraints {
+    pub(in crate::layout) preferred: Option<ContentBoxLength>,
+    pub(in crate::layout) minimum: Option<ContentBoxLength>,
+    pub(in crate::layout) maximum: Option<ContentBoxLength>,
+}
+
+impl AspectRatioAxisConstraints {
+    pub(in crate::layout) fn constrain(self, value: ContentBoxLength) -> ContentBoxLength {
+        constrain_aspect_ratio_axis(value, self)
+    }
+}
+
+/// The two-axis result of CSS aspect-ratio min/max constraint transfer.
+///
+/// CSS Sizing Level 4 section 4.4 transfers definite minimums and maximums to
+/// an automatic constraint in the ratio-dependent axis. A transferred minimum
+/// is capped by definite preferred/maximum sizes in that destination axis; a
+/// transferred maximum is floored by definite preferred/minimum sizes. The
+/// resulting constraints are then applied independently after preferred-size
+/// transfer:
+/// <https://drafts.csswg.org/css-sizing-4/#aspect-ratio-minimum>.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout) struct ResolvedAspectRatioConstraints {
+    pub(in crate::layout) width: AspectRatioAxisConstraints,
+    pub(in crate::layout) height: AspectRatioAxisConstraints,
+}
+
+impl ResolvedAspectRatioConstraints {
+    pub(in crate::layout) fn resolve(
+        ratio: ResolvedAspectRatio,
+        width: AspectRatioAxisConstraints,
+        height: AspectRatioAxisConstraints,
+    ) -> Self {
+        let transferred_width_minimum = height.minimum.map(|minimum| {
+            cap_transferred_minimum(
+                ratio.width_from_height(minimum),
+                width.preferred,
+                width.maximum,
+            )
+        });
+        let transferred_height_minimum = width.minimum.map(|minimum| {
+            cap_transferred_minimum(
+                ratio.height_from_width(minimum),
+                height.preferred,
+                height.maximum,
+            )
+        });
+        let resolved_width_minimum = combine_minimum(width.minimum, transferred_width_minimum);
+        let resolved_height_minimum = combine_minimum(height.minimum, transferred_height_minimum);
+        let transferred_width_maximum = height.maximum.map(|maximum| {
+            floor_transferred_maximum(
+                ratio.width_from_height(maximum),
+                width.preferred,
+                resolved_width_minimum,
+            )
+        });
+        let transferred_height_maximum = width.maximum.map(|maximum| {
+            floor_transferred_maximum(
+                ratio.height_from_width(maximum),
+                height.preferred,
+                resolved_height_minimum,
+            )
+        });
+        let resolved_width = AspectRatioAxisConstraints {
+            minimum: resolved_width_minimum,
+            maximum: combine_maximum(width.maximum, transferred_width_maximum),
+            ..width
+        };
+        let resolved_height = AspectRatioAxisConstraints {
+            minimum: resolved_height_minimum,
+            maximum: combine_maximum(height.maximum, transferred_height_maximum),
+            ..height
+        };
+
+        Self {
+            width: resolved_width,
+            height: resolved_height,
+        }
+    }
+
+    pub(in crate::layout) fn constrain_width(self, value: ContentBoxLength) -> ContentBoxLength {
+        constrain_aspect_ratio_axis(value, self.width)
+    }
+
+    pub(in crate::layout) fn constrain_height(self, value: ContentBoxLength) -> ContentBoxLength {
+        constrain_aspect_ratio_axis(value, self.height)
+    }
+}
+
+fn combine_minimum(
+    authored: Option<ContentBoxLength>,
+    transferred: Option<ContentBoxLength>,
+) -> Option<ContentBoxLength> {
+    match (authored, transferred) {
+        (Some(authored), Some(transferred)) => {
+            Some(content_box_pt(authored.points().max(transferred.points())))
+        }
+        (authored, transferred) => authored.or(transferred),
+    }
+}
+
+fn combine_maximum(
+    authored: Option<ContentBoxLength>,
+    transferred: Option<ContentBoxLength>,
+) -> Option<ContentBoxLength> {
+    match (authored, transferred) {
+        (Some(authored), Some(transferred)) => {
+            Some(content_box_pt(authored.points().min(transferred.points())))
+        }
+        (authored, transferred) => authored.or(transferred),
+    }
+}
+
+fn cap_transferred_minimum(
+    transferred: ContentBoxLength,
+    preferred: Option<ContentBoxLength>,
+    maximum: Option<ContentBoxLength>,
+) -> ContentBoxLength {
+    content_box_pt(
+        [preferred, maximum]
+            .into_iter()
+            .flatten()
+            .fold(transferred.points(), |value, limit| {
+                value.min(limit.points())
+            })
+            .max(0.0),
+    )
+}
+
+fn floor_transferred_maximum(
+    transferred: ContentBoxLength,
+    preferred: Option<ContentBoxLength>,
+    minimum: Option<ContentBoxLength>,
+) -> ContentBoxLength {
+    content_box_pt(
+        [preferred, minimum]
+            .into_iter()
+            .flatten()
+            .fold(transferred.points(), |value, limit| {
+                value.max(limit.points())
+            })
+            .max(0.0),
+    )
+}
+
+fn constrain_aspect_ratio_axis(
+    value: ContentBoxLength,
+    constraints: AspectRatioAxisConstraints,
+) -> ContentBoxLength {
+    content_box_pt(constrain(
+        value.points(),
+        constraints.minimum.map(SemanticLengthExt::points),
+        constraints.maximum.map(SemanticLengthExt::points),
+    ))
+}
+
 /// Transfer a definite non-replaced content width through its preferred aspect
 /// ratio to obtain an automatic content height.
 ///
@@ -150,20 +411,14 @@ pub(in crate::layout) fn non_replaced_aspect_ratio_content_height(
     if !style.box_values.height.is_auto() && calc_size.is_none() {
         return None;
     }
-    let ratio = style.aspect_ratio.preferred_ratio_for_non_replaced(false)?;
-    if ratio <= 0.0 || !ratio.is_finite() {
-        return None;
-    }
-    let height = match (
-        style.box_sizing,
-        style.aspect_ratio.uses_content_box_for_non_replaced(),
-    ) {
-        (_, true) | (BoxSizing::ContentBox, false) => content_width / ratio,
-        (BoxSizing::BorderBox, false) => {
-            let border_box_width = content_width + horizontal_non_content;
-            (border_box_width / ratio) - vertical_non_content
-        }
-    };
+    let ratio = ResolvedAspectRatio::for_non_replaced(
+        style,
+        non_content_pt(horizontal_non_content),
+        non_content_pt(vertical_non_content),
+    )?;
+    let height = ratio
+        .height_from_width(content_box_pt(content_width))
+        .points();
     Some(
         calc_size
             .map(|value| {
@@ -200,20 +455,14 @@ pub(in crate::layout) fn non_replaced_aspect_ratio_content_width(
     if !style.box_values.width.clone().is_auto() && calc_size.is_none() {
         return None;
     }
-    let ratio = style.aspect_ratio.preferred_ratio_for_non_replaced(false)?;
-    if ratio <= 0.0 || !ratio.is_finite() {
-        return None;
-    }
-    let width = match (
-        style.box_sizing,
-        style.aspect_ratio.uses_content_box_for_non_replaced(),
-    ) {
-        (_, true) | (BoxSizing::ContentBox, false) => content_height * ratio,
-        (BoxSizing::BorderBox, false) => {
-            let border_box_height = content_height + vertical_non_content;
-            (border_box_height * ratio) - horizontal_non_content
-        }
-    };
+    let ratio = ResolvedAspectRatio::for_non_replaced(
+        style,
+        non_content_pt(horizontal_non_content),
+        non_content_pt(vertical_non_content),
+    )?;
+    let width = ratio
+        .width_from_height(content_box_pt(content_height))
+        .points();
     Some(
         calc_size
             .map(|value| {
@@ -1079,7 +1328,7 @@ pub(in crate::layout) fn constrain_height_with_intrinsic<Source>(
     )
 }
 
-fn intrinsic_height_constraint(
+pub(in crate::layout) fn intrinsic_height_constraint(
     value: css::ComputedLengthPercentageOrAuto,
     box_sizing: BoxSizing,
     percentage_basis: PercentageBasis<ContentBoxLength>,
@@ -1392,5 +1641,105 @@ mod tests {
 
         assert_eq!(length_content.points(), 42.0);
         assert!(percentage_content.is_none());
+    }
+
+    #[test]
+    fn resolved_aspect_ratio_distinguishes_content_and_border_box_with_asymmetric_padding() {
+        let content_box = ResolvedAspectRatio::new(
+            2.0,
+            AspectRatioCalculationBox::ContentBox,
+            non_content_pt(40.0),
+            non_content_pt(10.0),
+        )
+        .unwrap();
+        let border_box = ResolvedAspectRatio::new(
+            2.0,
+            AspectRatioCalculationBox::BorderBox,
+            non_content_pt(40.0),
+            non_content_pt(10.0),
+        )
+        .unwrap();
+
+        assert_eq!(
+            content_box
+                .height_from_width(content_box_pt(100.0))
+                .points(),
+            50.0
+        );
+        assert_eq!(
+            border_box.height_from_width(content_box_pt(100.0)).points(),
+            60.0
+        );
+        assert_eq!(
+            content_box.width_from_height(content_box_pt(50.0)).points(),
+            100.0
+        );
+        assert_eq!(
+            border_box.width_from_height(content_box_pt(50.0)).points(),
+            80.0
+        );
+    }
+
+    #[test]
+    fn aspect_ratio_constraints_transfer_minimums_and_maximums_in_both_directions() {
+        let ratio = ResolvedAspectRatio::new(
+            2.0,
+            AspectRatioCalculationBox::ContentBox,
+            non_content_pt(0.0),
+            non_content_pt(0.0),
+        )
+        .unwrap();
+        let resolved = ResolvedAspectRatioConstraints::resolve(
+            ratio,
+            AspectRatioAxisConstraints {
+                minimum: Some(content_box_pt(80.0)),
+                maximum: Some(content_box_pt(240.0)),
+                ..Default::default()
+            },
+            AspectRatioAxisConstraints::default(),
+        );
+
+        assert_eq!(resolved.height.minimum.unwrap().points(), 40.0);
+        assert_eq!(resolved.height.maximum.unwrap().points(), 120.0);
+
+        let reverse = ResolvedAspectRatioConstraints::resolve(
+            ratio,
+            AspectRatioAxisConstraints::default(),
+            AspectRatioAxisConstraints {
+                minimum: Some(content_box_pt(30.0)),
+                maximum: Some(content_box_pt(90.0)),
+                ..Default::default()
+            },
+        );
+        assert_eq!(reverse.width.minimum.unwrap().points(), 60.0);
+        assert_eq!(reverse.width.maximum.unwrap().points(), 180.0);
+    }
+
+    #[test]
+    fn aspect_ratio_constraints_do_not_replace_a_larger_content_minimum() {
+        let ratio = ResolvedAspectRatio::new(
+            2.0,
+            AspectRatioCalculationBox::ContentBox,
+            non_content_pt(0.0),
+            non_content_pt(0.0),
+        )
+        .unwrap();
+        let resolved = ResolvedAspectRatioConstraints::resolve(
+            ratio,
+            AspectRatioAxisConstraints {
+                minimum: Some(content_box_pt(100.0)),
+                ..Default::default()
+            },
+            AspectRatioAxisConstraints {
+                minimum: Some(content_box_pt(20.0)),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(resolved.width.minimum.unwrap().points(), 100.0);
+        assert_eq!(
+            resolved.constrain_width(content_box_pt(50.0)).points(),
+            100.0
+        );
     }
 }

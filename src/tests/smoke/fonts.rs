@@ -12,6 +12,12 @@ const ROOT_FONT_METRICS_IN_MONOSPACE_FIXTURE: &str =
     "tests/fixtures/wpt/css/css-fonts/root-font-metrics-in-monospace.html";
 const FONT_SYNTHESIS_WEIGHT_PDF_FIXTURE: &str =
     "tests/fixtures/wpt/css/css-fonts/font-synthesis-weight-pdf.html";
+const FONT_SYNTHESIS_STYLE_PDF_FIXTURE: &str =
+    "tests/fixtures/wpt/css/css-fonts/font-synthesis-style-pdf.html";
+const VARIABLE_FONT_INSTANCE_PDF_FIXTURE: &str =
+    "tests/fixtures/wpt/css/css-fonts/variable-font-instance-pdf.html";
+const SIZE_ADJUST_MIXED_OPAQUE_COVERAGE_FIXTURE: &str =
+    "tests/fixtures/wpt/css/css-fonts/size-adjust-mixed-opaque-coverage.html";
 
 /// A selected faux-bold face changes PDF paint only when CSS permits weight
 /// synthesis; an authored bold face must remain an ordinary fill-only font.
@@ -43,8 +49,87 @@ async fn font_synthesis_weight_is_retained_per_selected_document_font() {
     };
 
     assert!(font_for("synthesized").synthesis.embolden);
-    assert!(!font_for("not synthesized").synthesis.embolden);
-    assert!(!font_for("authored bold").synthesis.embolden);
+    // The opaque Ahem glyphs are separate coverage segments on either side
+    // of the visible space, so use the first word to inspect the selected
+    // document font for this CSS text record.
+    assert!(!font_for("not").synthesis.embolden);
+    let authored_bold = font_for("authored bold");
+    assert!(!authored_bold.synthesis.embolden);
+    assert!(
+        ttf_parser::Face::parse(&authored_bold.data, authored_bold.face_index)
+            .is_ok_and(|face| face.weight().to_number() >= 700),
+        "the authored bold stack must select its real bold face, not an unmarked regular face"
+    );
+}
+
+/// A faux-oblique match must survive into PDF paint state only when CSS
+/// permits style synthesis. A real italic face already contains the intended
+/// glyph ink and therefore must not receive an additional shear.
+/// <https://www.w3.org/TR/css-fonts-4/#font-synthesis-style>
+#[tokio::test]
+async fn font_synthesis_style_is_retained_per_selected_document_font() {
+    let document = Html::from_file(FONT_SYNTHESIS_STYLE_PDF_FIXTURE)
+        .await
+        .unwrap()
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+    let font_for = |text: &str| {
+        let line = document.pages[0]
+            .lines()
+            .iter()
+            .find(|line| line.text == text)
+            .unwrap_or_else(|| panic!("fixture line {text:?} should paint"));
+        line_font(&document, line)
+    };
+
+    assert!(font_for("synthesized").synthesis.oblique.is_some());
+    assert!(font_for("not").synthesis.oblique.is_none());
+    let authored = font_for("authored italic");
+    assert!(authored.synthesis.oblique.is_none());
+    assert!(
+        ttf_parser::Face::parse(&authored.data, authored.face_index)
+            .is_ok_and(|face| face.is_italic()),
+        "the authored italic stack must select its real italic face"
+    );
+}
+
+/// Each CSS variation location must retain its own PDF document-font record.
+/// The embedded program is materialized later, but this shaping boundary must
+/// not merge `wght` instances before the PDF writer can do so.
+/// <https://www.w3.org/TR/css-fonts-4/#font-variation-settings-def>
+#[tokio::test]
+async fn variable_font_instances_retain_their_effective_axis_locations() {
+    let document = Html::from_file(VARIABLE_FONT_INSTANCE_PDF_FIXTURE)
+        .await
+        .unwrap()
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+    let font_for = |text: &str| {
+        let line = document.pages[0]
+            .lines()
+            .iter()
+            .find(|line| line.text == text)
+            .unwrap_or_else(|| panic!("fixture line {text:?} should paint"));
+        line_font(&document, line)
+    };
+    let weight = |font: &crate::document::DocumentFont| {
+        font.variation_coordinates
+            .0
+            .iter()
+            .find(|(tag, _)| tag == b"wght")
+            .map(|(_, value)| f32::from_bits(*value))
+    };
+
+    let regular = font_for("regular");
+    let bold = font_for("bold");
+    let override_weight = font_for("override");
+    assert_ne!(regular.id, bold.id);
+    assert_ne!(bold.id, override_weight.id);
+    assert_eq!(weight(regular), Some(400.0));
+    assert_eq!(weight(bold), Some(700.0));
+    assert_eq!(weight(override_weight), Some(550.0));
 }
 
 /// Root-relative font metrics are selected from the document root, not from
@@ -110,30 +195,82 @@ async fn font_size_adjust_mixed_fallback_preserves_the_painted_baseline_conversi
         .render(&RenderOptions::default())
         .await
         .unwrap();
-    let line = document.pages[0]
+    // Opaque full-em coverage owns only `X`, so the mixed logical line is
+    // deliberately represented by two ordered paint records.
+    let first = document.pages[0]
         .lines()
         .iter()
-        .find(|line| line.text == "XY")
-        .expect("mixed fallback text line");
-    let mut run_sizes = line
-        .runs
+        .find(|line| line.text == "X")
+        .expect("first selected-face paint segment");
+    let second = document.pages[0]
+        .lines()
         .iter()
-        .filter(|run| !run.text.is_empty())
-        .map(|run| run.font_size);
-    let first_size = run_sizes.next().expect("first fallback run");
-    let second_size = run_sizes.next().expect("second fallback run");
+        .find(|line| line.text == "Y")
+        .expect("second selected-face paint segment");
+    let first_size = first.runs[0].font_size;
+    let second_size = second.runs[0].font_size;
     assert!(
         (first_size - second_size).abs() > 0.01,
-        "font-size-adjust should produce distinct used sizes for the selected faces: {line:?}"
+        "font-size-adjust should produce distinct used sizes for the selected faces: first={first:?}, second={second:?}"
     );
-    let first_font = line_font(&document, line);
+    let first_font = line_font(&document, first);
     let expected_adjustment = (first_font.layout_metrics.ascender
         - first_font.program_metrics.ascender) as f32
         * first_size
         / first_font.units_per_em as f32;
     assert!(
-        (line.glyph_origin_adjustment.y - expected_adjustment).abs() < 0.01,
-        "the rendered line must retain the primary metric font's applied CSS-layout-to-program conversion: {line:?}"
+        (first.glyph_origin_adjustment.y - expected_adjustment).abs() < 0.01,
+        "the rendered segment must retain the primary metric font's applied CSS-layout-to-program conversion: {first:?}"
+    );
+}
+
+/// A full-em `@font-face` glyph may use opaque vector coverage, but the
+/// coverage record must not make its adjacent unicode-range fallback glyphs
+/// invisible. This is the local regression for WPT `size-adjust-01.html`.
+#[tokio::test]
+async fn size_adjust_opaque_coverage_keeps_mixed_fallback_runs_visible() {
+    let document = Html::from_file(SIZE_ADJUST_MIXED_OPAQUE_COVERAGE_FIXTURE)
+        .await
+        .unwrap()
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+    let lines = document.pages[0].lines();
+    let fragments = lines
+        .iter()
+        .filter(|line| {
+            ["T", "he", "Q", "uick", "B", "rown", "F", "ox"].contains(&line.text.as_str())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        fragments
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>(),
+        ["T", "he", "Q", "uick", "B", "rown", "F", "ox"],
+        "mixed text must retain ordered coverage and normal PDF paint records"
+    );
+    for line in fragments {
+        let expected_size = if line.text.len() == 1 { 45.0 } else { 30.0 };
+        assert!(
+            (line.runs[0].font_size - expected_size).abs() < 0.01,
+            "fragment {:?} should retain its selected used font size: {line:?}",
+            line.text
+        );
+    }
+    let pdf = document
+        .write_pdf_bytes(&crate::PdfOptions::default())
+        .unwrap();
+    let rendered = pdf_searchable_text(&pdf);
+    assert_eq!(
+        rendered.matches("3 Tr").count(),
+        4,
+        "only the four covered Ahem capitals may use invisible PDF text: {rendered}"
+    );
+    assert_eq!(
+        rendered.matches("0 Tr").count(),
+        4,
+        "each normal fallback fragment must resume visible PDF text: {rendered}"
     );
 }
 

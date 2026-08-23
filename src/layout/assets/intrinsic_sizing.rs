@@ -32,15 +32,14 @@ impl IntrinsicFloatRun {
         &mut self,
         side: UsedFloatSide,
         clear: Clear,
-        writing_mode: WritingMode,
-        direction: Direction,
+        placement_axes: FloatPlacementAxes,
         width: f32,
     ) {
         if self
             .preceding_sides
             .iter()
             .copied()
-            .any(|preceding| preceding.matches_clear(clear, writing_mode, direction))
+            .any(|preceding| preceding.matches_clear(clear, placement_axes))
         {
             self.row_width = 0.0;
         }
@@ -254,16 +253,16 @@ impl<'a> LayoutBuilder<'a> {
                         Some(child_children),
                         table_fragment,
                     );
-                    if let Some(side) = UsedFloatSide::from_float(
-                        child_style.float,
-                        child_style.writing_mode,
-                        child_style.direction,
-                    ) {
+                    let placement_axes = FloatPlacementAxes::new(
+                        self.containing_block_writing_mode,
+                        self.containing_block_direction,
+                    );
+                    if let Some(side) = UsedFloatSide::from_float(child_style.float, placement_axes)
+                    {
                         float_run.push(
                             side,
                             child_style.clear,
-                            child_style.writing_mode,
-                            child_style.direction,
+                            placement_axes,
                             child_width.points(),
                         );
                     }
@@ -438,8 +437,12 @@ impl<'a> LayoutBuilder<'a> {
                     .last()
                     .cloned()
                     .unwrap_or_else(|| element_signature(element));
-                built_fragment =
-                    box_tree::build_frozen_table_fragment(element, &signature, table_children);
+                built_fragment = box_tree::build_frozen_table_fragment(
+                    element,
+                    &signature,
+                    style,
+                    table_children,
+                );
                 &built_fragment
             };
             let (preferred_min, preferred) = if style.writing_mode.has_vertical_lines() {
@@ -810,8 +813,7 @@ mod tests {
             run.push(
                 UsedFloatSide::Left,
                 clear,
-                WritingMode::HorizontalTb,
-                Direction::Ltr,
+                FloatPlacementAxes::new(WritingMode::HorizontalTb, Direction::Ltr),
                 30.0,
             );
         }
@@ -827,15 +829,13 @@ mod tests {
         run.push(
             UsedFloatSide::Right,
             Clear::None,
-            WritingMode::HorizontalTb,
-            Direction::Ltr,
+            FloatPlacementAxes::new(WritingMode::HorizontalTb, Direction::Ltr),
             20.0,
         );
         run.push(
             UsedFloatSide::Left,
             Clear::Left,
-            WritingMode::HorizontalTb,
-            Direction::Ltr,
+            FloatPlacementAxes::new(WritingMode::HorizontalTb, Direction::Ltr),
             30.0,
         );
 

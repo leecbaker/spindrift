@@ -34,6 +34,10 @@ painting: an element's primary metric face establishes its normal inline-box
 line extent and baseline. This keeps an auto-height inline-block's background
 geometry stable when its text uses a fallback glyph, including
 `css/CSS2/visudet/content-height-004.html`.
+When a selected face has full-em rectangle glyphs, the PDF opaque-coverage
+optimization owns only those glyph slices. Interleaved `unicode-range`
+fallback text remains ordinary visible PDF text, so `size-adjust-01` can scale
+its Ahem capitals without dropping the lowercase fallback characters.
 OpenType per-glyph positioning offsets are retained through PDF serialization:
 outline text emits offset glyphs from their shaped origins, matching the
 existing bitmap and COLR paint paths without changing CSS inline advances or
@@ -74,6 +78,10 @@ backend's `emoji` generic. The same selector is used for shaping, direct glyph
 and metric lookup, and PDF font registration. This is intentionally
 platform-specific, as permitted by CSS Fonts; private-use characters do not
 trigger installed-font fallback.
+Before shaping, both named and generic family entries are concretized through
+that selector. Missing names are omitted from the shaping source, so Parley
+cannot independently replace a CSS-selected bold face with an unmarked regular
+face during PDF registration.
 
 Font-feature precedence now follows CSS Fonts: `@font-face` defaults yield to
 `font-variant-ligatures`, nonzero letter-spacing disables optional ligature and
@@ -97,13 +105,13 @@ rollback. Its explicit and reset-only modeled subproperties now participate in
 independently; the legacy `font-stretch` spelling is the same cascade slot as
 `font-width`.
 
-`font-variant-emoji` uses Unicode 15.1's registered emoji variation-sequence
-bases rather than an approximate emoji range. This preserves authored VS15 and
-VS16 selectors while applying the requested default presentation to keycap
-bases, including `#`, `*`, and the ASCII digits; `font-variant-emoji-005`
-passes.
+`font-variant-emoji` resolves color versus text presentation per grapheme
+cluster, using actual color-font table presence rather than a font-family
+alias. This preserves authored VS15 and VS16 selectors, selects emoji-default
+and text-default bases correctly, and keeps keycap sequences with their base;
+`font-variant-emoji-003`, `-004`, and `-005` pass.
 
-Focused CSS Fonts evaluation also passes `font-size-adjust-014`,
+Focused CSS Fonts evaluation also passes `size-adjust-01`, `font-size-adjust-014`,
 `font-size-zero-3`, `font-variant-emoji-1`, and
 `font-language-override-03`.
 
@@ -112,6 +120,6 @@ Focused CSS Fonts evaluation also passes `font-size-adjust-014`,
 - Remaining COLR/CPAL v1 paint graphs, CSS `override-colors` edge cases, and
   per-inline-run palette inheritance.
 - Variable-font axis instancing before PDF embedding.
-- Complete `@font-face size-adjust` metric and fallback behavior.
+- Complete `@font-face size-adjust` metric-override behavior.
 - Platform-specific standard and UI generic font-family conformance.
 - Remaining `unicode-range` and `size-adjust` metric/fallback interactions.

@@ -61,7 +61,7 @@ impl<'a> LayoutBuilder<'a> {
         measurement_space: PositionedAutoBlockMeasurementSpace,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
-    ) -> f32 {
+    ) -> ContentBoxLength {
         let vertical_border_width_for_positioning =
             self.positioned_vertical_border_width(element, style, stylesheets, table_fragment);
         let snapshot = self.snapshot();
@@ -145,11 +145,13 @@ impl<'a> LayoutBuilder<'a> {
         // borders contribute resolved outer grid insets rather than authored
         // full border widths, so use the same vertical non-content size that
         // will be used by the absolute-position equation.
-        (consumed
-            - style.padding.top
-            - style.padding.bottom
-            - vertical_border_width_for_positioning)
-            .max(0.0)
+        content_box_pt(
+            (consumed
+                - style.padding.top
+                - style.padding.bottom
+                - vertical_border_width_for_positioning)
+                .max(0.0),
+        )
     }
 
     /// Returns the continuous block-axis extent traversed by a positioned
@@ -197,6 +199,7 @@ impl<'a> LayoutBuilder<'a> {
     ) -> f32 {
         if is_html_table_element(element) {
             self.collapsed_table_outer_vertical_insets(style, stylesheets, table_fragment)
+                .map(NonContentLength::points)
                 .unwrap_or_else(|| vertical_border_width(style))
         } else {
             vertical_border_width(style)

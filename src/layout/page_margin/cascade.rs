@@ -171,7 +171,7 @@ pub(in crate::layout) fn page_margin_boxes_for_rules(
         let (line_height, _, _) = style.line_height_value.clone().projected(style.font_size);
         style.line_height = line_height;
         style.finalize_computed_font_relative_lengths();
-        style.rebuild_own_text_decoration_layer();
+        style.rebuild_own_text_decoration_origin();
         style
             .quotes
             .resolve_auto_language(page_style.language.as_deref());
@@ -317,7 +317,7 @@ pub(in crate::layout) fn page_margin_style_inheriting_page_context(
     style.word_spacing = page_style.word_spacing.clone();
     style.text_transform = page_style.text_transform;
     style.tab_size = page_style.tab_size.clone();
-    style.text_decoration_layers = page_style.text_decoration_layers.clone();
+    style.text_decoration_origins = page_style.text_decoration_origins.clone();
     style.text_decoration.underline_position = page_style.text_decoration.underline_position;
     style.text_shadow = page_style.text_shadow.clone();
     style.text_emphasis_style = page_style.text_emphasis_style.clone();

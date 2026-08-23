@@ -1,3 +1,8 @@
+use cssparser::{
+    AtRuleParser, CowRcStr, DeclarationParser, Parser, ParserInput, ParserState,
+    QualifiedRuleParser, RuleBodyItemParser, RuleBodyParser,
+};
+
 use super::*;
 use crate::CssColor;
 use crate::css::parse::LayerRegistry;
@@ -11,14 +16,9 @@ use crate::css::{
     FontFeatureSettings, FontFeatureValue, FontFeatureValues, FontFeatureValuesBlock, FontPalette,
     FontPaletteDefinition, FontRelativeLengthBasis, FontVariantAlternates, FontVariantCaps,
     FontVariantEastAsian, FontVariantLigatures, FontVariantNumeric, FontVariantPosition,
-    FontVariationSettings, ROOT_FONT_SIZE_PT, parse_font_palette,
+    FontVariationSettings, LayerName, LayerOrder, ROOT_FONT_SIZE_PT, parse_font_palette,
 };
-use crate::css::{LayerName, LayerOrder};
 use crate::units::layout_pt;
-use cssparser::{
-    AtRuleParser, CowRcStr, DeclarationParser, Parser, ParserInput, ParserState,
-    QualifiedRuleParser, RuleBodyItemParser, RuleBodyParser,
-};
 
 /// Parse one active `@font-face` descriptor block.
 ///

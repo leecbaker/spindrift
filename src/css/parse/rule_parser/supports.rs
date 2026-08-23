@@ -1,7 +1,6 @@
-use super::at_rules::{
-    matching_parenthesis, parse_parenthesized_selector, parse_scope_selector,
-    strip_ascii_word_prefix,
-};
+use cssparser::Token;
+
+use super::at_rules::{matching_parenthesis, parse_scope_selector};
 use super::declarations::supports_declaration_condition;
 use super::*;
 
@@ -51,13 +50,12 @@ fn parse_supports_condition(
     prelude: &str,
     selector_parser: &QuireSelectorParser,
 ) -> Option<SupportsCondition> {
-    parse_supports_condition_component(prelude.trim(), selector_parser, true)
+    parse_supports_condition_component(prelude.trim(), selector_parser)
 }
 
 fn parse_supports_condition_component(
     value: &str,
     selector_parser: &QuireSelectorParser,
-    allow_selector_function: bool,
 ) -> Option<SupportsCondition> {
     let value = value.trim();
     if value.is_empty() {
@@ -66,18 +64,12 @@ fn parse_supports_condition_component(
 
     if let Some(rest) = strip_supports_not_prefix(value) {
         return Some(SupportsCondition::Not(Box::new(
-            parse_supports_condition_component(rest, selector_parser, false)?,
+            parse_supports_condition_component(rest, selector_parser)?,
         )));
     }
 
-    if allow_selector_function
-        && value
-            .as_bytes()
-            .first()
-            .is_some_and(u8::is_ascii_alphabetic)
-    {
-        return supports_selector_condition(value, selector_parser)
-            .then_some(SupportsCondition::Value(true));
+    if let SelectorFeature::Value(value) = parse_selector_feature(value, selector_parser) {
+        return Some(SupportsCondition::Value(value));
     }
 
     if supports_condition_mixes_logical_keywords(value) {
@@ -110,8 +102,11 @@ fn parse_supports_in_parens(
     }
     if let Some(rest) = strip_supports_not_prefix(value) {
         return Some(SupportsCondition::Not(Box::new(
-            parse_supports_condition_component(rest, selector_parser, false)?,
+            parse_supports_condition_component(rest, selector_parser)?,
         )));
+    }
+    if let SelectorFeature::Value(value) = parse_selector_feature(value, selector_parser) {
+        return Some(SupportsCondition::Value(value));
     }
     Some(SupportsCondition::Value(supports_declaration_condition(
         value,
@@ -135,14 +130,14 @@ fn parse_supports_logical_condition(
     if and_parts.len() > 1 {
         return and_parts
             .into_iter()
-            .map(|part| parse_supports_condition_component(part, selector_parser, false))
+            .map(|part| parse_supports_condition_component(part, selector_parser))
             .collect::<Option<Vec<_>>>()
             .map(SupportsCondition::And);
     }
     if or_parts.len() > 1 {
         return or_parts
             .into_iter()
-            .map(|part| parse_supports_condition_component(part, selector_parser, false))
+            .map(|part| parse_supports_condition_component(part, selector_parser))
             .collect::<Option<Vec<_>>>()
             .map(SupportsCondition::Or);
     }
@@ -206,28 +201,90 @@ fn strip_supports_not_prefix(value: &str) -> Option<&str> {
         .filter(|rest| !rest.is_empty())
 }
 
-/// Evaluates CSS Conditional `@supports selector(...)` with the selector parser.
+/// The result of recognizing a CSS Conditional Rules `selector()` feature.
 ///
-/// Conditional Rules defines selector feature queries as true when the selector
-/// argument parses as a supported selector; unsupported selectors evaluate
-/// false and keep the block out of the cascade:
-/// <https://www.w3.org/TR/css-conditional-4/#typedef-supports-selector-fn>.
-pub(in crate::css) fn supports_selector_condition(
+/// A function token whose name is `selector` is a valid forward-compatible
+/// supports term even when its argument is not a supported `<complex-selector>`.
+/// It therefore evaluates false rather than invalidating an enclosing `not`,
+/// `and`, or `or` condition:
+/// <https://drafts.csswg.org/css-conditional-4/#typedef-supports-selector-fn>
+/// <https://drafts.csswg.org/css-conditional-3/#at-supports>
+enum SelectorFeature {
+    NotSelectorFunction,
+    Value(bool),
+}
+
+/// Recognize and evaluate CSS Conditional Rules `selector(...)` using CSS
+/// tokenization rather than a string prefix. The selector grammar includes the
+/// nesting selector, which behaves like `:scope` outside a nested style rule:
+/// <https://drafts.csswg.org/css-nesting-1/#nest-selector>
+fn parse_selector_feature(
     condition: &str,
     selector_parser: &QuireSelectorParser,
-) -> bool {
-    let condition = condition.trim();
-    let Some(rest) = strip_ascii_word_prefix(condition, "selector") else {
-        return false;
+) -> SelectorFeature {
+    let mut input = ParserInput::new(condition);
+    let mut parser = Parser::new(&mut input);
+    let Ok(Token::Function(name)) = parser.next() else {
+        return SelectorFeature::NotSelectorFunction;
     };
-    let Some((selector, after_selector)) = parse_parenthesized_selector(rest) else {
-        return false;
-    };
-    if !after_selector.trim().is_empty() {
-        return false;
+    if !name.eq_ignore_ascii_case("selector") {
+        return SelectorFeature::NotSelectorFunction;
     }
-    parse_scope_selector(selector, selector_parser)
+    let selector = parser.parse_nested_block(|input| {
+        let start = input.position();
+        while input.next_including_whitespace_and_comments().is_ok() {}
+        Ok::<_, cssparser::ParseError<'_, ()>>(input.slice_from(start).to_string())
+    });
+    let Ok(selector) = selector else {
+        return SelectorFeature::NotSelectorFunction;
+    };
+    if !parser.is_exhausted() {
+        return SelectorFeature::NotSelectorFunction;
+    }
+
+    let selector_parser = selector_parser.clone().with_parent_selector();
+    SelectorFeature::Value(selector_is_supported_for_feature_query(
+        &selector,
+        &selector_parser,
+    ))
+}
+
+/// Check selector support through the same pseudo-element routing boundary
+/// used for ordinary style rules. Nested generated marker selectors are not
+/// representable by the underlying Selectors parser alone, but Quire accepts
+/// and routes them as `::before`/`::after` marker rules.
+/// <https://drafts.csswg.org/css-conditional-4/#typedef-supports-selector-fn>
+fn selector_is_supported_for_feature_query(
+    selector: &str,
+    selector_parser: &QuireSelectorParser,
+) -> bool {
+    if parse_scope_selector(selector, selector_parser)
         .is_some_and(|selector| selector.slice().len() == 1)
+    {
+        return true;
+    }
+
+    let selectors = super::pseudo_elements::split_selector_list(selector);
+    let [selector] = selectors.as_slice() else {
+        return false;
+    };
+    [
+        "before::marker",
+        "after::marker",
+        "marker",
+        "before",
+        "after",
+        "footnote-call",
+        "footnote-marker",
+        "first-line",
+        "first-letter",
+    ]
+    .into_iter()
+    .filter_map(|pseudo| super::pseudo_elements::strip_pseudo_selector(selector, pseudo))
+    .any(|base| {
+        parse_scope_selector(&base, selector_parser)
+            .is_some_and(|selector| selector.slice().len() == 1)
+    })
 }
 
 pub(in crate::css) fn strip_enclosing_parentheses(value: &str) -> &str {

@@ -1,3 +1,8 @@
+use std::collections::{BTreeMap, HashMap};
+
+use pdf_writer::types::{ColorSpaceOperand, LineCapStyle, LineJoinStyle, TextRenderingMode};
+use pdf_writer::{Content, Name, Str, TextStr};
+
 use super::colors::{
     PdfBlendColorSpace, PdfColorMode, PdfLoweringColorPolicy, output_color, set_fill_color,
     set_stroke_color,
@@ -8,9 +13,6 @@ use crate::document::paint::paths::{
     RenderedGradient, RenderedPathCommandPoints, RenderedPathLineCap, RenderedPathLineJoin,
     RenderedPathPaint, RenderedPathPaintOrder,
 };
-use pdf_writer::types::{ColorSpaceOperand, LineCapStyle, LineJoinStyle, TextRenderingMode};
-use pdf_writer::{Content, Name, Str, TextStr};
-use std::collections::{BTreeMap, HashMap};
 
 /// PDF stroke width used to emulate a matched synthetic bold face.
 ///
@@ -3963,11 +3965,12 @@ pub(super) fn write_rendered_line(
             }
             text_started = true;
         }
-        let synthetic_bold = !invisible
-            && embedded_fonts
-                .document_font_synthesis
-                .get(run.document_font_id)
-                .is_some_and(|synthesis| synthesis.embolden);
+        let synthesis = embedded_fonts
+            .document_font_synthesis
+            .get(run.document_font_id)
+            .copied()
+            .unwrap_or_default();
+        let synthetic_bold = !invisible && synthesis.embolden;
         let visible_mode = if synthetic_bold {
             TextRenderingMode::FillStroke
         } else if invisible {
@@ -3985,8 +3988,8 @@ pub(super) fn write_rendered_line(
         }
         let pdf_font_size = quantized_pdf_font_size(run.font_size);
         let run_origin = (line_origin.x + run.x_offset, line_origin.y + run.y_offset);
-        let run_text_matrix = pdf_text_matrix(run.text_matrix, run_origin);
-        if run.text_matrix.is_identity() {
+        let run_text_matrix = pdf_text_matrix(run.text_matrix, synthesis.oblique, run_origin);
+        if run.text_matrix.is_identity() && synthesis.oblique.is_none() {
             if let Some((previous_x, previous_y)) = identity_text_line_origin {
                 content.next_line(run_origin.0 - previous_x, run_origin.1 - previous_y);
             } else {
@@ -4011,7 +4014,7 @@ pub(super) fn write_rendered_line(
         if glyphs_have_origin_offsets(run.glyphs) {
             write_glyphs_at_origins(
                 content,
-                run.text_matrix,
+                pdf_text_matrix_components(run.text_matrix, synthesis.oblique),
                 run_origin,
                 run.glyphs,
                 glyph_metrics,
@@ -4268,14 +4271,13 @@ fn write_glyphs_with_paint_modes(
 /// operators. See ISO 32000-2:2020, 9.4.4 "Text Space Details".
 fn write_glyphs_at_origins(
     content: &mut Content,
-    text_matrix: crate::document::paint::text::RenderedTextMatrix,
+    [a, b, c, d]: [f32; 4],
     run_origin: (f32, f32),
     glyphs: &[RenderedGlyph],
     metrics: PdfGlyphRunMetrics<'_>,
     invisible: bool,
     visible_mode: TextRenderingMode,
 ) {
-    let [a, b, c, d] = text_matrix.pdf_components();
     let mut pen_x = 0.0;
     let mut mode = if invisible {
         TextRenderingMode::Invisible
@@ -4297,7 +4299,7 @@ fn write_glyphs_at_origins(
                 pen_x + glyph.x_offset,
                 glyph.y_offset,
             );
-            let glyph_origin = text_matrix.transform_local_point(local_origin);
+            let glyph_origin = pdf_text_matrix_transform_local_point([a, b, c, d], local_origin);
             content.set_text_matrix([
                 a,
                 b,
@@ -4325,10 +4327,40 @@ fn glyphs_have_origin_offsets(glyphs: &[RenderedGlyph]) -> bool {
 
 fn pdf_text_matrix(
     text_matrix: crate::document::paint::text::RenderedTextMatrix,
+    synthetic_oblique: Option<crate::document::SyntheticObliqueAngle>,
     origin: (f32, f32),
 ) -> [f32; 6] {
-    let [a, b, c, d] = text_matrix.pdf_components();
+    let [a, b, c, d] = pdf_text_matrix_components(text_matrix, synthetic_oblique);
     [a, b, c, d, origin.0, origin.1]
+}
+
+/// Compose Fontique's faux-oblique result in the shaped run's local space
+/// before CSS Writing Modes orients the run for the PDF page. PDF text
+/// matrices use the same affine components as the text-run adapter, so a
+/// right multiplication by `[1 0 tan(angle) 1]` preserves each run origin
+/// and advances while slanting only its glyph ink.
+/// <https://www.w3.org/TR/css-fonts-4/#font-synthesis-intro>
+/// <https://pdfa.org/resource/iso-32000-2/>
+pub(super) fn pdf_text_matrix_components(
+    text_matrix: crate::document::paint::text::RenderedTextMatrix,
+    synthetic_oblique: Option<crate::document::SyntheticObliqueAngle>,
+) -> [f32; 4] {
+    let [a, b, c, d] = text_matrix.pdf_components();
+    let Some(angle) = synthetic_oblique else {
+        return [a, b, c, d];
+    };
+    let shear = f32::from(angle.degrees()).to_radians().tan();
+    [a, b, c + a * shear, d + b * shear]
+}
+
+pub(super) fn pdf_text_matrix_transform_local_point(
+    [a, b, c, d]: [f32; 4],
+    point: crate::document::paint::text::TextRunPoint,
+) -> crate::document::paint::text::TextRunPoint {
+    crate::document::paint::text::TextRunPoint::new(
+        a * point.x + c * point.y,
+        b * point.x + d * point.y,
+    )
 }
 
 fn needs_positioned_glyphs(glyphs: &[RenderedGlyph], metrics: PdfGlyphRunMetrics<'_>) -> bool {
@@ -4360,17 +4392,16 @@ fn pdf_name(name: &str) -> Name<'_> {
 
 #[cfg(test)]
 mod content_tests {
+    use std::rc::Rc;
+
     use super::*;
     use crate::document::paint::effects::{PaintBlendMode, PaintEffectScope, PaintEffects};
-    use crate::document::paint::geometry::PaintStrokeWidth;
-    use crate::document::paint::geometry::{PaintPoint, PaintRect, PaintSize};
+    use crate::document::paint::geometry::{PaintPoint, PaintRect, PaintSize, PaintStrokeWidth};
     use crate::document::paint::images::RenderedImage;
-    use crate::document::paint::page::PaintOperation;
-    use crate::document::paint::page::{OpaqueTextCoverage, PaintPrimitive};
+    use crate::document::paint::page::{OpaqueTextCoverage, PaintOperation, PaintPrimitive};
     use crate::document::paint::paths::{
         RenderedPath, RenderedPathClip, RenderedPathCommand, RenderedPathFillRule,
     };
-    use std::rc::Rc;
 
     fn test_color_policy() -> PdfLoweringColorPolicy {
         PdfLoweringColorPolicy::new(

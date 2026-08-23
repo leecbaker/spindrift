@@ -1,10 +1,12 @@
+use std::borrow::Cow;
+use std::rc::Rc;
+
+use icu_segmenter::GraphemeClusterSegmenter;
+
 use super::super::*;
 #[cfg(test)]
 use crate::text::trim_trailing_css_hanging_space_separators;
 use crate::units::SemanticLengthExt;
-use icu_segmenter::GraphemeClusterSegmenter;
-use std::borrow::Cow;
-use std::rc::Rc;
 
 /// Formatting controls used to preserve an already-resolved visual order while
 /// shaping without starting a second UAX #9 paragraph.
@@ -38,7 +40,7 @@ fn resolved_bidi_shaping_direction(direction: ResolvedBidiDirection) -> Directio
 /// <https://www.unicode.org/reports/tr9/#L2>.
 fn text_requires_logical_bidi_shaping(text: &str) -> bool {
     text.chars().any(|character| {
-        character_has_joining_behavior(character) || character_is_join_control(character)
+        character_has_cursive_shaping_behavior(character) || character_is_join_control(character)
     })
 }
 
@@ -130,9 +132,9 @@ impl FontSystem {
         self.with_reusable_parley_layout(|this, layout| {
             let parley_style = this.shaping_style_for_selected_face(style);
             let feature_context = this.font_feature_context_for_style(style);
-            let font_family_source = this
-                .emoji_presentation_family_source(text, style)
-                .unwrap_or_else(|| this.resolved_parley_font_family_source(style));
+            let font_family_source = this.resolved_parley_font_family_source(style);
+            let emoji_family_ranges =
+                this.emoji_presentation_family_ranges(text, style, &style.font_family);
             let mut builder: parley::RangedBuilder<'_, FontPalette> = this
                 .parley_layout_context
                 .ranged_builder(&mut this.parley_font_context, shaping_text, 1.0, false);
@@ -144,6 +146,12 @@ impl FontSystem {
                 letter_spacing.requested_for(style),
                 feature_context.as_ref(),
             );
+            for emoji_range in &emoji_family_ranges {
+                builder.push(
+                    StyleProperty::FontFamily(ParleyFontFamily::from(emoji_range.source.as_str())),
+                    emoji_range.range.clone(),
+                );
+            }
             builder.build_into(layout, shaping_text);
             layout.break_all_lines(None);
             let Some(line) = layout.lines().next() else {
@@ -163,6 +171,14 @@ impl FontSystem {
                     letter_spacing.requested_for(style),
                     feature_context.as_ref(),
                 );
+                for emoji_range in &emoji_family_ranges {
+                    builder.push(
+                        StyleProperty::FontFamily(ParleyFontFamily::from(
+                            emoji_range.source.as_str(),
+                        )),
+                        emoji_range.range.clone(),
+                    );
+                }
                 for adjustment in &adjustment_ranges {
                     builder.push(
                         StyleProperty::FontSize(adjustment.font_size),
@@ -174,9 +190,9 @@ impl FontSystem {
                 let Some(line) = layout.lines().next() else {
                     return Vec::new();
                 };
-                return this.rendered_text_runs_for_parley_line(text, line, style);
+                return this.rendered_text_runs_for_parley_line(text, line, style, letter_spacing);
             }
-            this.rendered_text_runs_for_parley_line(text, line, style)
+            this.rendered_text_runs_for_parley_line(text, line, style, letter_spacing)
         })
     }
 
@@ -232,9 +248,9 @@ impl FontSystem {
     ///
     /// CSS Text resolves nonzero `letter-spacing` at final visual
     /// typographic-unit boundaries. Graph layout therefore retains an
-    /// untracked glyph stream and represents every used advance explicitly as
-    /// `InlineFragment::leading_tracking`, after line selection and bidi
-    /// reordering: <https://www.w3.org/TR/css-text-3/#letter-spacing-property>.
+    /// untracked glyph stream and stores boundary spacing separately from the
+    /// shaped base advance, after line selection and bidi reordering:
+    /// <https://www.w3.org/TR/css-text-3/#letter-spacing-property>.
     pub(crate) fn shape_untracked_inline_line(
         &mut self,
         text: &str,
@@ -305,12 +321,47 @@ impl FontSystem {
     /// L4 glyph mirroring directly on their selected font glyphs:
     /// <https://www.w3.org/TR/css-writing-modes-4/#bidi-algo> and
     /// <https://www.unicode.org/reports/tr9/#Reordering_Resolved_Levels>.
+    #[allow(dead_code)] // Computed mode remains available for legacy artifacts.
     pub(crate) fn shape_visual_ordered_line(
         &mut self,
         text: &str,
         style: &ComputedStyle,
         line_height: f32,
         resolved_direction: ResolvedBidiDirection,
+    ) -> Option<ShapedInlineLine> {
+        self.shape_visual_ordered_line_with_letter_spacing(
+            text,
+            style,
+            line_height,
+            resolved_direction,
+            ShapingLetterSpacing::Computed,
+        )
+    }
+
+    /// Shape an already-resolved visual line without backend-owned tracking.
+    pub(crate) fn shape_untracked_visual_ordered_line(
+        &mut self,
+        text: &str,
+        style: &ComputedStyle,
+        line_height: f32,
+        resolved_direction: ResolvedBidiDirection,
+    ) -> Option<ShapedInlineLine> {
+        self.shape_visual_ordered_line_with_letter_spacing(
+            text,
+            style,
+            line_height,
+            resolved_direction,
+            ShapingLetterSpacing::Suppressed,
+        )
+    }
+
+    fn shape_visual_ordered_line_with_letter_spacing(
+        &mut self,
+        text: &str,
+        style: &ComputedStyle,
+        line_height: f32,
+        resolved_direction: ResolvedBidiDirection,
+        letter_spacing: ShapingLetterSpacing,
     ) -> Option<ShapedInlineLine> {
         // UAX #9 visual reordering and OpenType's cursive shaping direction
         // are separate inputs. An LTR override preserves the already-resolved
@@ -332,14 +383,19 @@ impl FontSystem {
                 .iter()
                 .any(|range| range.direction == ResolvedBidiDirection::Rtl)
         {
-            return self.shape_already_ordered_ltr_units(text, style, line_height);
+            return self.shape_already_ordered_ltr_units(text, style, line_height, letter_spacing);
         }
         if text_requires_logical_bidi_shaping(text) {
             let logical_paint_style = Self::visual_bidi_paint_style(
                 style,
                 resolved_bidi_shaping_direction(resolved_direction),
             );
-            return self.shape_unwrapped_line(text, &logical_paint_style, line_height);
+            return self.shape_unwrapped_line_with_letter_spacing(
+                text,
+                &logical_paint_style,
+                line_height,
+                letter_spacing,
+            );
         }
         let visual_paint_style = Self::visual_bidi_paint_style(style, style.used_direction());
         let mut guarded_text = String::with_capacity(
@@ -348,14 +404,20 @@ impl FontSystem {
         guarded_text.push_str(VISUAL_ORDER_GUARD_PREFIX);
         guarded_text.push_str(text);
         guarded_text.push_str(VISUAL_ORDER_GUARD_SUFFIX);
-        self.shape_unwrapped_line(&guarded_text, &visual_paint_style, line_height)
-            .map(|mut shaped| {
-                shaped.text = Rc::from(text);
-                remap_visual_order_guard_source_ranges(&mut shaped.runs, text.len());
-                strip_bidi_format_controls_from_shaped_runs(&mut shaped.runs);
-                self.apply_resolved_bidi_glyph_mirroring(&mut shaped, resolved_direction);
-                shaped
-            })
+        self.shape_unwrapped_line_with_letter_spacing(
+            &guarded_text,
+            &visual_paint_style,
+            line_height,
+            letter_spacing,
+        )
+        .map(|mut shaped| {
+            shaped.text = Rc::from(text);
+            remap_visual_order_guard_source_ranges(&mut shaped.runs, text.len());
+            rebase_guarded_visual_run_origins(&mut shaped.runs);
+            strip_bidi_format_controls_from_shaped_runs(&mut shaped.runs);
+            self.apply_resolved_bidi_glyph_mirroring(&mut shaped, resolved_direction);
+            shaped
+        })
     }
 
     /// Shape a visual LTR override one typographic unit at a time.
@@ -369,6 +431,7 @@ impl FontSystem {
         text: &str,
         style: &ComputedStyle,
         line_height: f32,
+        letter_spacing: ShapingLetterSpacing,
     ) -> Option<ShapedInlineLine> {
         let visual_style = Self::visual_bidi_paint_style(style, Direction::Ltr);
         let mut runs = Vec::new();
@@ -377,8 +440,12 @@ impl FontSystem {
             .segment_str(text)
             .collect::<Vec<_>>();
         for range in boundaries.windows(2).map(|pair| pair[0]..pair[1]) {
-            let mut unit =
-                self.shape_unwrapped_line(&text[range.clone()], &visual_style, line_height)?;
+            let mut unit = self.shape_unwrapped_line_with_letter_spacing(
+                &text[range.clone()],
+                &visual_style,
+                line_height,
+                letter_spacing,
+            )?;
             for run in &mut unit.runs {
                 run.x_offset += width;
                 for glyph in &mut run.glyphs {
@@ -431,6 +498,7 @@ impl FontSystem {
     /// <https://www.w3.org/TR/css-text-3/#boundary-shaping>,
     /// <https://www.w3.org/TR/css-writing-modes-4/#bidi-linebox>, and
     /// <https://www.w3.org/TR/css-fonts-4/#font-matching-algorithm>.
+    #[allow(dead_code)] // Computed mode remains available for legacy artifacts.
     pub(crate) fn shape_styled_inline_fragments(
         &mut self,
         spans: &[StyledTextSpan<'_>],
@@ -440,15 +508,66 @@ impl FontSystem {
         tab_origin: f32,
         tab_metric_style: &ComputedStyle,
     ) -> Option<ShapedInlineLine> {
+        self.shape_styled_inline_fragments_with_letter_spacing(
+            spans,
+            text_summary,
+            width,
+            line_height,
+            tab_origin,
+            tab_metric_style,
+            ShapingLetterSpacing::Computed,
+        )
+    }
+
+    /// Shape formatted inline fragments without backend-owned tracking.
+    ///
+    /// The graph preserves this glyph stream through selection, visual bidi
+    /// ordering, tab remeasurement, and paint preparation. CSS Text tracking
+    /// is added only by `apply_visual_tracking_boundaries` after that order is
+    /// final.
+    pub(crate) fn shape_untracked_styled_inline_fragments(
+        &mut self,
+        spans: &[StyledTextSpan<'_>],
+        text_summary: String,
+        width: f32,
+        line_height: f32,
+        tab_origin: f32,
+        tab_metric_style: &ComputedStyle,
+    ) -> Option<ShapedInlineLine> {
+        self.shape_styled_inline_fragments_with_letter_spacing(
+            spans,
+            text_summary,
+            width,
+            line_height,
+            tab_origin,
+            tab_metric_style,
+            ShapingLetterSpacing::Suppressed,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // Explicit shaping inputs preserve CSS line context.
+    fn shape_styled_inline_fragments_with_letter_spacing(
+        &mut self,
+        spans: &[StyledTextSpan<'_>],
+        text_summary: String,
+        width: f32,
+        line_height: f32,
+        tab_origin: f32,
+        tab_metric_style: &ComputedStyle,
+        letter_spacing: ShapingLetterSpacing,
+    ) -> Option<ShapedInlineLine> {
         if spans.is_empty() {
             return None;
         }
         let first_style = spans.first().map(|span| span.style)?;
-        let mut runs = position_shaped_runs(self.shape_styled_text_runs_with_parley_at_tab_origin(
-            spans,
-            tab_origin,
-            tab_metric_style,
-        ));
+        let mut runs = position_shaped_runs(
+            self.shape_styled_text_runs_with_parley_at_tab_origin_with_letter_spacing(
+                spans,
+                tab_origin,
+                tab_metric_style,
+                letter_spacing,
+            ),
+        );
         let typesetting_plan = TextTypesettingPlan::resolve(&text_summary, first_style);
         self.apply_upright_vertical_metrics(&mut runs, &typesetting_plan);
         let baseline_adjustment = self
@@ -474,6 +593,7 @@ impl FontSystem {
     /// shaping because the caller already supplied the final visual order:
     /// <https://www.w3.org/TR/css-writing-modes-4/#bidi-algo>.
     #[allow(clippy::too_many_arguments)] // The explicit shaping context preserves call-site units.
+    #[allow(dead_code)] // Computed mode remains available for legacy artifacts.
     pub(crate) fn shape_visually_ordered_inline_fragments(
         &mut self,
         spans: &[StyledTextSpan<'_>],
@@ -484,6 +604,54 @@ impl FontSystem {
         tab_metric_style: &ComputedStyle,
         resolved_direction: ResolvedBidiDirection,
     ) -> Option<ShapedInlineLine> {
+        self.shape_visually_ordered_inline_fragments_with_letter_spacing(
+            spans,
+            text_summary,
+            width,
+            line_height,
+            tab_origin,
+            tab_metric_style,
+            resolved_direction,
+            ShapingLetterSpacing::Computed,
+        )
+    }
+
+    /// Shape a final visual fragment sequence without backend-owned tracking.
+    #[allow(clippy::too_many_arguments)] // Explicit shaping inputs preserve CSS line context.
+    pub(crate) fn shape_untracked_visually_ordered_inline_fragments(
+        &mut self,
+        spans: &[StyledTextSpan<'_>],
+        text_summary: String,
+        width: f32,
+        line_height: f32,
+        tab_origin: f32,
+        tab_metric_style: &ComputedStyle,
+        resolved_direction: ResolvedBidiDirection,
+    ) -> Option<ShapedInlineLine> {
+        self.shape_visually_ordered_inline_fragments_with_letter_spacing(
+            spans,
+            text_summary,
+            width,
+            line_height,
+            tab_origin,
+            tab_metric_style,
+            resolved_direction,
+            ShapingLetterSpacing::Suppressed,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn shape_visually_ordered_inline_fragments_with_letter_spacing(
+        &mut self,
+        spans: &[StyledTextSpan<'_>],
+        text_summary: String,
+        width: f32,
+        line_height: f32,
+        tab_origin: f32,
+        tab_metric_style: &ComputedStyle,
+        resolved_direction: ResolvedBidiDirection,
+        letter_spacing: ShapingLetterSpacing,
+    ) -> Option<ShapedInlineLine> {
         spans.first()?;
         if resolved_direction == ResolvedBidiDirection::Ltr
             && spans.len() == 1
@@ -492,11 +660,12 @@ impl FontSystem {
                 .iter()
                 .any(|range| range.direction == ResolvedBidiDirection::Rtl)
         {
-            return self.shape_visual_ordered_line(
+            return self.shape_visual_ordered_line_with_letter_spacing(
                 spans[0].text,
                 spans[0].style,
                 line_height,
                 resolved_direction,
+                letter_spacing,
             );
         }
         let visual_direction = resolved_bidi_shaping_direction(resolved_direction);
@@ -518,13 +687,14 @@ impl FontSystem {
                 .collect::<Vec<_>>();
             let logical_tab_metric_style =
                 Self::visual_bidi_paint_style(tab_metric_style, visual_direction);
-            return self.shape_styled_inline_fragments(
+            return self.shape_styled_inline_fragments_with_letter_spacing(
                 &logical_paint_spans,
                 text_summary,
                 width,
                 line_height,
                 tab_origin,
                 &logical_tab_metric_style,
+                letter_spacing,
             );
         }
         let visual_paint_styles = spans
@@ -552,16 +722,28 @@ impl FontSystem {
             text: VISUAL_ORDER_GUARD_SUFFIX,
             style: first_style,
         });
-        let mut shaped = self.shape_styled_inline_fragments(
+        let mut guarded_text = String::with_capacity(
+            VISUAL_ORDER_GUARD_PREFIX.len() + text_summary.len() + VISUAL_ORDER_GUARD_SUFFIX.len(),
+        );
+        guarded_text.push_str(VISUAL_ORDER_GUARD_PREFIX);
+        guarded_text.push_str(&text_summary);
+        guarded_text.push_str(VISUAL_ORDER_GUARD_SUFFIX);
+        let mut shaped = self.shape_styled_inline_fragments_with_letter_spacing(
             &guarded_spans,
-            text_summary,
+            guarded_text,
             width,
             line_height,
             tab_origin,
             &visual_tab_metric_style,
+            letter_spacing,
         )?;
-        remap_visual_order_guard_source_ranges(&mut shaped.runs, shaped.text.len());
+        let authored_len = text_summary.len();
+        remap_visual_order_guard_source_ranges(&mut shaped.runs, authored_len);
+        rebase_guarded_visual_run_origins(&mut shaped.runs);
         strip_bidi_format_controls_from_shaped_runs(&mut shaped.runs);
+        shaped.text = text_summary.into();
+        shaped.typesetting_plan = TextTypesettingPlan::resolve(&shaped.text, first_style);
+        shaped.width = shaped.advance_width();
         self.apply_resolved_bidi_glyph_mirroring(&mut shaped, resolved_direction);
         Some(shaped)
     }
@@ -659,6 +841,25 @@ fn remap_visual_order_guard_source_ranges(runs: &mut [ShapedInlineRun], authored
     let authored_start = VISUAL_ORDER_GUARD_PREFIX.len();
     let authored_end = authored_start + authored_len;
     remap_shaped_source_ranges_to_authored_slice(runs, authored_start, authored_end);
+}
+
+/// Remove a synthetic bidi guard's shaping-space advance from its authored
+/// visual result.
+///
+/// The LRO/PDF controls are not CSS text and must have no used advance. A
+/// font is permitted to assign them a glyph advance, however, and Parley then
+/// reports following visual runs relative to that synthetic cluster. Once the
+/// guard-only provenance has been removed, normalize the remaining runs back
+/// to their authored visual start.
+///
+/// <https://www.w3.org/TR/css-writing-modes-4/#bidi-algo>
+fn rebase_guarded_visual_run_origins(runs: &mut [ShapedInlineRun]) {
+    let Some(visual_start) = runs.iter().map(|run| run.x_offset).min_by(f32::total_cmp) else {
+        return;
+    };
+    for run in runs {
+        run.x_offset -= visual_start;
+    }
 }
 
 /// Retain source ownership inside a temporary non-painting bidi wrapper.
@@ -774,8 +975,7 @@ mod tests {
 
     #[test]
     fn join_controls_keep_presentation_form_slices_in_logical_shaping_order() {
-        assert!(!character_has_joining_behavior('\u{fedf}'));
-        assert!(!character_has_joining_behavior('\u{fe8e}'));
+        assert!(!cursive_boundary_needs_context('\u{fedf}', '\u{fe8e}'));
         assert!(text_requires_logical_bidi_shaping(
             "\u{fedf}\u{200c}\u{fe8e}"
         ));

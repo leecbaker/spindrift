@@ -1,8 +1,7 @@
-use crate::{CssColor, css};
-
 use super::geometry::{
     PaintClip, PaintPoint, PaintRect, PaintSize, PaintStrokeWidth, PaintTranslation,
 };
+use crate::{CssColor, css};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RenderedRoundedRectRadii {

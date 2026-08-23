@@ -463,9 +463,10 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
     use super::*;
     use crate::text::TextTypesettingPlan;
-    use std::rc::Rc;
 
     fn test_text_group() -> PreparedInlineTextGroup {
         PreparedInlineTextGroup {
@@ -475,6 +476,7 @@ mod tests {
             text_box_trim: TextBoxLineTrim::default(),
             paint_opacity: 1.0,
             paint_scope_ancestry: Rc::from(Vec::new().into_boxed_slice()),
+            positioned_paint_style: None,
             link_target: None,
             link_paint_rect: None,
             decoration_paint_rect: None,
@@ -488,6 +490,7 @@ mod tests {
                 typesetting_plan: TextTypesettingPlan::Horizontal,
                 runs: Vec::new(),
             },
+            actual_text: None,
             source: InlineTextSource::Normal,
             source_run: Rc::new(()),
         }
@@ -820,7 +823,7 @@ mod tests {
             let table = negative.clone().with_exported_table_box_baseline();
             let edge = InlineAtom::new(
                 InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace(
-                    InlineTextBoundarySpacing::new(layout_pt(1.0), false),
+                    InlineTextBoundarySpacing::new(layout_pt(1.0)),
                 )),
                 negative.style().clone(),
                 None,

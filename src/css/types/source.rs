@@ -1,12 +1,14 @@
-use super::*;
-use cssparser::{
-    AtRuleParser, BasicParseErrorKind, Parser, ParserInput, ParserState, StyleSheetParser, Token,
-};
 use std::future::Future;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 use std::pin::Pin;
+
+use cssparser::{
+    AtRuleParser, BasicParseErrorKind, Parser, ParserInput, ParserState, StyleSheetParser, Token,
+};
 use url::Url;
+
+use super::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// A stylesheet source and its resource-loading context.
@@ -33,6 +35,9 @@ pub struct Css {
     root_url: Option<Url>,
     layer_order_prefix: Vec<LayerName>,
     import_layer_name: Option<LayerName>,
+    /// The stylesheet selector context used by `:scope` and CSS Nesting's
+    /// top-level `&`. This is distinct from the implicit `@scope` anchor.
+    selector_scope_anchor: StylesheetScopeAnchor,
     scope_anchor: StylesheetScopeAnchor,
     specificity_override: Option<u32>,
     resource_policy: crate::ResourcePolicy,
@@ -54,6 +59,7 @@ impl Css {
             root_url: None,
             layer_order_prefix: Vec::new(),
             import_layer_name: None,
+            selector_scope_anchor: StylesheetScopeAnchor::DocumentRoot,
             scope_anchor: StylesheetScopeAnchor::DocumentRoot,
             specificity_override: None,
             resource_policy: crate::ResourcePolicy::default(),
@@ -81,6 +87,7 @@ impl Css {
             root_url: None,
             layer_order_prefix: Vec::new(),
             import_layer_name: None,
+            selector_scope_anchor: StylesheetScopeAnchor::DocumentRoot,
             scope_anchor: StylesheetScopeAnchor::DocumentRoot,
             specificity_override: None,
             resource_policy: crate::ResourcePolicy::default(),
@@ -182,6 +189,7 @@ impl Css {
                 root_url: None,
                 layer_order_prefix: Vec::new(),
                 import_layer_name: None,
+                selector_scope_anchor: StylesheetScopeAnchor::DocumentRoot,
                 scope_anchor: StylesheetScopeAnchor::DocumentRoot,
                 specificity_override: None,
                 resource_policy: fetcher.policy(),
@@ -308,6 +316,18 @@ impl Css {
         self.scope_anchor
     }
 
+    pub(crate) fn selector_scope_anchor(&self) -> StylesheetScopeAnchor {
+        self.selector_scope_anchor
+    }
+
+    pub(crate) fn with_selector_scope_anchor(
+        mut self,
+        scope_anchor: StylesheetScopeAnchor,
+    ) -> Self {
+        self.selector_scope_anchor = scope_anchor;
+        self
+    }
+
     pub(crate) fn with_scope_anchor(mut self, scope_anchor: StylesheetScopeAnchor) -> Self {
         self.scope_anchor = scope_anchor;
         self
@@ -361,6 +381,7 @@ impl Css {
                             stylesheet
                                 .with_origin(self.origin)
                                 .with_root_url(self.root_url.clone())
+                                .with_selector_scope_anchor(self.selector_scope_anchor)
                                 .with_scope_anchor(self.scope_anchor)
                                 .with_layer_context(import.layer_order_prefix, import.layer_name)
                                 .collect_with_imports(fetcher, seen, stylesheets)

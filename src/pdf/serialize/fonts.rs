@@ -1,12 +1,13 @@
 //! Font-object serialization for already prepared embedded subsets.
 
+use pdf_writer::types::{CidFontType, FontFlags, SystemInfo};
+use pdf_writer::{Filter, Name, Pdf, Rect, Str};
+
 use super::super::*;
 use super::primitives::{i32_from_usize, pdf_name, pdf_ref};
 use super::stream::encode_pdf_stream;
 use crate::document::FontProgramKind;
 use crate::timing::DebugTimer;
-use pdf_writer::types::{CidFontType, FontFlags, SystemInfo};
-use pdf_writer::{Filter, Name, Pdf, Rect, Str};
 
 pub(crate) fn write_embedded_fonts(
     pdf: &mut Pdf,

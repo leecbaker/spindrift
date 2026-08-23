@@ -179,6 +179,9 @@ Html::from_file("KinSNP_example.html")
 
 `cargo bench` has a few useful benchmarks.
 
+For diagnosing recursive layout stack use on macOS, see
+[the stack-usage guide](doc/stack_profiling.md).
+
 When profiling using instruments, you may need to add an entitlement to allow Instruments to inspect the process:
 
 ```bash

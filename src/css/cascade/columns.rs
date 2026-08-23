@@ -1,5 +1,6 @@
-use super::*;
 use std::num::NonZeroUsize;
+
+use super::*;
 
 pub(super) fn apply_columns(value: &str, style: &mut ComputedStyle) {
     let Some(longhands) = crate::css::cascade::declarations::expand_columns_shorthand(value) else {

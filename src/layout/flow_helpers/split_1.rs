@@ -1122,6 +1122,13 @@ pub(in crate::layout) fn inline_style_affects_line(
         || child.line_height != parent.line_height
         || child.text_decoration != parent.text_decoration
         || child.text_transform != parent.text_transform
+        || child.word_space_transform != parent.word_space_transform
+        // A preserved tab belongs to the inline style that owns its source
+        // character. Flattening a `tab-size` change into the block's scalar
+        // text fast path would lose that value before line-level tab-stop
+        // resolution can select its period.
+        // <https://www.w3.org/TR/css-text-3/#tab-size-property>
+        || child.tab_size != parent.tab_size
         || child.vertical_align != parent.vertical_align
         || child.white_space != parent.white_space
         || inline_break_policy_differs(parent, child)
@@ -2207,5 +2214,26 @@ mod tests {
         child = parent.clone();
         child.text_wrap_style = css::TextWrapStyle::Balance;
         assert!(inline_break_policy_differs(&parent, &child));
+    }
+
+    #[test]
+    fn word_space_transform_difference_requires_inline_item_collection() {
+        let parent = ComputedStyle::initial();
+        let mut child = parent.clone();
+        child.word_space_transform = css::WordSpaceTransform {
+            replacement: Some(css::WordSpaceReplacement::Space),
+            auto_phrase: false,
+        };
+
+        assert!(inline_style_affects_line(&parent, &child));
+    }
+
+    #[test]
+    fn tab_size_difference_requires_inline_item_collection() {
+        let parent = ComputedStyle::initial();
+        let mut child = parent.clone();
+        child.tab_size = css::TabSize::Spaces(4.0);
+
+        assert!(inline_style_affects_line(&parent, &child));
     }
 }

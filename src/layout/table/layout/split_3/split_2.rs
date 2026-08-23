@@ -1,5 +1,40 @@
-use super::*;
 use std::collections::HashSet;
+
+use crate::css::{
+    self, CaptionSide, ComputedStyle, PageBreak, Position, SemanticLengthExt, Stylesheets,
+    WritingMode, layout_pt,
+};
+use crate::document::paint::display_list::PaintBand;
+use crate::document::paint::geometry::PaintTranslation;
+use crate::dom::{Element, NodeKind};
+use crate::layout::table::layout::split_3::{
+    TableBodyFragmentCommitContext, TableBodyRowsInput, TableBodyRowsOutcome,
+};
+use crate::layout::table::layout::{
+    TableAvoidRowGroup, TableCaptionContainingBlock, TableFragmentBoundaryDecision,
+    TableFragmentFooterAction, TableGridLayoutContext, TableRootBlockStartChrome,
+    TableWrapperBorderBoxOrigin, TableWrapperFragmentTimeline, TableWrapperMarginBoxFootprint,
+    TableWrapperPaintBox, table_atomic_stacking_policy, table_box_overflow_clip,
+    table_root_background_logical_insets, table_wrapper_collision_height_for_border_box,
+    table_wrapper_positioning_containing_block,
+};
+use crate::layout::table::{
+    TableAxes, TableCellPadding, TableGridBlockOffset, TableGridContentBoxTopLeft, TableGridLength,
+    TableGridLogicalSize, TableLayoutInput, repeated_table_rows_height, table_content_height,
+    table_grid, table_metrics, table_root_distributes_extra_inline_space, table_row_group_spans,
+    table_vertical_edge_spacing, used_table_wrapper_geometry,
+};
+use crate::layout::{
+    ContainingBlock, FragmentAdvanceDecision, FragmentAdvanceInput, FragmentBreakContext,
+    FragmentTopOffset, FragmentainerAdvance, FragmentainerKind, LayoutBuilder,
+    LogicalBlockContentSize, PageBlockSpan, PageInlinePosition, PageInlineSpan,
+    PageTopBlockPosition, PageTopPoint, PageTopRect, PhysicalContentWidth,
+    PositionedContainingBlockMode, assets, box_tree, paint_containment_applies_to_element,
+    parse_html_length, resolve_normal_flow_auto_margins_for_known_width,
+};
+use crate::units::{
+    MarginBoxLength, border_box_pt, content_box_pt, margin_box_pt, margin_box_size_pt,
+};
 
 impl<'a> LayoutBuilder<'a> {
     pub(crate) fn layout_table(
@@ -92,7 +127,8 @@ impl<'a> LayoutBuilder<'a> {
         let table_cellpadding = element
             .attrs
             .get("cellpadding")
-            .and_then(|value| parse_html_length(value));
+            .and_then(|value| parse_html_length(value))
+            .map(|value| TableCellPadding::new(layout_pt(value)));
         let table_metrics = table_metrics(element, style);
         if rows.is_empty() {
             self.layout_empty_table(
@@ -249,8 +285,8 @@ impl<'a> LayoutBuilder<'a> {
         // <https://drafts.csswg.org/css-tables-3/#table-layout>
         // <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
         let table_axes = TableAxes::for_style(style);
-        let wrapper_geometry = TableWrapperPaintBox {
-            grid_origin: PageTopPoint::new(0.0, 0.0),
+        let root_geometry = TableWrapperPaintBox {
+            grid_origin: TableGridContentBoxTopLeft::new(PageTopPoint::new(0.0, 0.0)),
             axes: table_axes,
             grid_size: TableGridLogicalSize::new(
                 used_table_width,
@@ -260,10 +296,10 @@ impl<'a> LayoutBuilder<'a> {
             table_metrics: table_metrics.clone(),
             block_edge_spacing: TableGridLength::new(table_edge_spacing),
         };
-        let physical_grid_box = wrapper_geometry.clone().grid_content_box();
-        let physical_grid_width = wrapper_geometry.clone().physical_grid_width();
-        let physical_border_box = wrapper_geometry.clone().border_box();
-        let caption_outer_width = wrapper_geometry.caption_outer_width();
+        let physical_grid_box = root_geometry.clone().grid_content_box();
+        let physical_grid_width = root_geometry.clone().physical_grid_width();
+        let physical_border_box = root_geometry.clone().border_box();
+        let caption_outer_width = root_geometry.caption_outer_width();
         let top_caption_height = self.estimate_table_captions_height(
             captions,
             style,
@@ -315,14 +351,12 @@ impl<'a> LayoutBuilder<'a> {
                 table_collision_height,
             ),
             style.clear,
-            style.writing_mode,
-            style.used_direction(),
             self.containing_block_direction,
         );
         self.cursor_y = placement.origin.top_y();
         let table_outer_x = placement.origin.x() + style.margin.left + relative_offset.x();
-        // CSS table wrappers paint borders/padding around the table grid; the
-        // grid itself starts at the content-box inline-start edge.
+        // The table-root paints padding and borders around its grid; the grid
+        // itself starts at the root content-box inline-start edge.
         let table_x = table_width.content_x(table_outer_x);
         self.push_float_context();
         // The table grid establishes its own track axes, but the wrapper is
@@ -420,12 +454,11 @@ impl<'a> LayoutBuilder<'a> {
         } else {
             top_caption_outcome.final_destination()
         };
-        // The wrapper-to-grid boundary consumes the physical top border and
-        // padding exactly once. `grid_origin` is the complete grid's page
-        // origin; its cell-paint subgrid is derived by `TableGridFrames`.
-        // This must not depend on writing mode: vertical roots project the
-        // same named logical inset through `TableAxes` instead of applying a
-        // second physical-Y rebase.
+        // The wrapper-to-grid boundary consumes the table-root border and
+        // padding exactly once. The fragmentainer placement retains the
+        // grid's resolved inline X, while its Y is the root border top; turn
+        // that pair into a typed grid-content origin before any grid frame is
+        // constructed. This is shared by horizontal and vertical roots.
         // <https://www.w3.org/TR/css-tables-3/#table-structure>
         // <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
         // A top caption advances the table wrapper's logical block flow.  In
@@ -438,25 +471,17 @@ impl<'a> LayoutBuilder<'a> {
         // fragmentainers, so neither its physical-Y cursor nor an opening
         // wrapper placement is a valid replacement.
         let table_box_top = top_caption_destination.paint_top().points();
-        let grid_origin = if style.writing_mode.has_vertical_lines() {
-            top_caption_destination.destination_grid_origin()
-        } else {
-            // Float avoidance can advance a vertical table along its
-            // physical block axis. Its first grid frame must retain that
-            // resolved wrapper position; only continuations start at the
-            // next fragmentainer's logical block-start edge.
-            TableFragmentainerGridOrigin::for_initial(
-                table_x,
-                PageTopBlockPosition::new(table_box_top),
-            )
-            .page_top_point()
-        };
-        if !style.writing_mode.has_vertical_lines() {
-            self.cursor_y -= table_width.border_widths.top + table_width.padding.top;
-        }
-        if !style.writing_mode.has_vertical_lines() {
-            self.cursor_y -= table_edge_spacing;
-        }
+        // The caption outcome is the authoritative destination even when no
+        // top caption was generated: it includes normal-flow placement,
+        // float avoidance, and fragmentainer selection. The wrapper's
+        // opening parent-flow cursor is not a table-root border-box origin.
+        let table_root_border_top = table_box_top;
+        let destination_border_box_origin = TableWrapperBorderBoxOrigin::new(PageTopPoint::new(
+            table_outer_x,
+            table_root_border_top,
+        ));
+        let grid_origin = destination_border_box_origin
+            .grid_content_box_top_left(TableAxes::for_style(style), table_width);
 
         let table_is_document_canvas = self
             .document_canvas_overflow
@@ -469,7 +494,7 @@ impl<'a> LayoutBuilder<'a> {
         // caption crosses a column or page boundary.
         // <https://www.w3.org/TR/css-tables-3/#table-structure>
         // <https://www.w3.org/TR/css-break-3/#break-decoration>
-        let table_paint_box = TableWrapperPaintBox {
+        let table_root_paint_box = TableWrapperPaintBox {
             grid_origin,
             axes: TableAxes::for_style(style),
             grid_size: TableGridLogicalSize::new(
@@ -493,10 +518,10 @@ impl<'a> LayoutBuilder<'a> {
                 TableGridLength::new(top_caption_height)
             },
             initial_fragmentainer_placement,
-            table_paint_box.clone().grid_placement(),
+            table_root_paint_box.clone().grid_placement(),
             TableRootBlockStartChrome::new(
                 table_root_background_logical_insets(
-                    table_paint_box.clone().grid_placement(),
+                    table_root_paint_box.clone().grid_placement(),
                     style,
                     table_width,
                     table_edge_spacing,
@@ -506,11 +531,11 @@ impl<'a> LayoutBuilder<'a> {
         );
         let source_grid_placement = if style.writing_mode.has_vertical_lines() {
             TableWrapperPaintBox {
-                grid_origin: TableFragmentainerGridOrigin::for_initial(
-                    table_x,
-                    PageTopBlockPosition::new(table_box_top),
-                )
-                .page_top_point(),
+                grid_origin: TableWrapperBorderBoxOrigin::new(PageTopPoint::new(
+                    table_outer_x,
+                    table_root_border_top,
+                ))
+                .grid_content_box_top_left(TableAxes::for_style(style), table_width),
                 axes: TableAxes::for_style(style),
                 grid_size: TableGridLogicalSize::new(
                     used_table_width,
@@ -522,14 +547,36 @@ impl<'a> LayoutBuilder<'a> {
             }
             .cell_grid_placement()
         } else {
-            table_paint_box.clone().cell_grid_placement()
+            table_root_paint_box.clone().cell_grid_placement()
         };
-        let initial_grid_frames = TableGridFrames::new(
-            wrapper_timeline.initial_destination_grid_placement(),
-            TableGridLength::new(table_edge_spacing),
-        );
+        let initial_grid_frames = table_root_paint_box.clone().grid_frames();
+        // The root decoration viewport expands this inner cell grid by the
+        // root's named border, padding, and separated-edge insets. Passing
+        // the complete wrapper grid here would apply the edge spacing twice.
+        // Rows, cells, and the root background therefore share the immutable
+        // cell-grid source frame; only the decoration viewport crosses from
+        // that frame to the root border area.
+        // <https://drafts.csswg.org/css-tables-3/#drawing-backgrounds-and-borders>
         let root_background_source_grid_placement = source_grid_placement;
         let initial_destination_grid_placement = initial_grid_frames.cell_grid();
+        // Grid placements now begin at the content box, so rows in every
+        // writing mode share the same typed physical inline origin.
+        // <https://drafts.csswg.org/css-tables-3/#positioning>
+        // <https://drafts.csswg.org/css-writing-modes-4/#orthogonal-flows>
+        let initial_grid_content_top = table_root_paint_box
+            .clone()
+            .initial_destination_grid_paint_top();
+        // Row fitting still consumes the surrounding block-flow cursor for a
+        // horizontal table. Move that cursor from the resolved root border
+        // edge to the first grid row exactly once; the typed grid placement
+        // above is paint geometry and must not be substituted for this
+        // fragmentainer-capacity boundary.
+        // <https://www.w3.org/TR/css-break-3/#box-splitting>
+        // <https://www.w3.org/TR/CSS22/tables.html#separated-borders>
+        if !style.writing_mode.has_vertical_lines() {
+            self.cursor_y -= table_width.border_widths.top + table_width.padding.top;
+            self.cursor_y -= table_edge_spacing;
+        }
         let table_structure_paint_checkpoint = self.current_page.paint_checkpoint();
         let table_structure_paint_page_index = self.pages.len();
         if paint_containment_applies && self.pages.len() == top_caption_paint_page_index {
@@ -542,10 +589,10 @@ impl<'a> LayoutBuilder<'a> {
                 .replace_paint_tree_since_with_fragment(&top_caption_paint_checkpoint, fragment);
         }
         if self.pages.len() == table_structure_paint_page_index {
-            let bounds = table_paint_box.clone().border_box().paint_clip();
+            let bounds = table_root_paint_box.clone().border_box().paint_clip();
             let overflow_clip = table_box_overflow_clip(
                 style,
-                table_paint_box.padding_box().paint_clip(),
+                table_root_paint_box.clone().padding_box().paint_clip(),
                 table_is_document_canvas,
             );
             let policy =
@@ -573,12 +620,13 @@ impl<'a> LayoutBuilder<'a> {
             .push(FragmentTopOffset::unreserved(
                 self.current_page_context.top() - self.cursor_y,
             ));
-        let (
+        let TableBodyRowsOutcome {
             mut table_body_fragment,
+            final_body_fragment,
             forced_break_after_table_rows,
             current_fragment_repeat_policy,
             continuation_inline_offset,
-        ) = self.layout_table_body_rows(TableBodyRowsInput {
+        } = self.layout_table_body_rows(TableBodyRowsInput {
             fragmentainer_kind,
             rows,
             grid: &grid,
@@ -590,6 +638,7 @@ impl<'a> LayoutBuilder<'a> {
             source_grid_placement,
             root_background_source_grid_placement,
             initial_destination_grid_placement,
+            initial_grid_content_top,
             wrapper_timeline: wrapper_timeline.clone(),
             logical_inline_extent: used_table_width,
             physical_grid_width,
@@ -611,14 +660,8 @@ impl<'a> LayoutBuilder<'a> {
             row_group_break_before: &row_group_break_before,
             row_group_break_after: &row_group_break_after,
         });
-        let final_fragment_placement = table_body_fragment.as_ref().map(|fragment| {
-            (
-                fragment.plan.placement,
-                PageTopBlockPosition::new(fragment.bottom()),
-            )
-        });
-        let final_grid_table_x = final_fragment_placement
-            .map(|(placement, _)| placement.destination_grid_origin().x())
+        let final_grid_table_x = final_body_fragment
+            .map(|fragment| fragment.placement.destination_grid_origin().x())
             .unwrap_or_else(|| continuation_inline_offset.resolve(self.content_left));
         let table_body_commit_context = TableBodyFragmentCommitContext {
             rows,
@@ -654,16 +697,19 @@ impl<'a> LayoutBuilder<'a> {
             ),
         );
         self.fragment_top_offsets.pop();
-        if let Some((placement, body_fragment_bottom)) = final_fragment_placement {
-            self.cursor_y = placement
-                .trailing_paint_top(body_fragment_bottom, used_table_width)
+        // A bottom caption is a wrapper sibling following the final body
+        // slice. Continue from its committed fragmentainer-local edge rather
+        // than from the complete, unfragmented table-root rectangle.
+        if let Some(fragment) = final_body_fragment {
+            self.cursor_y = fragment
+                .placement
+                .trailing_paint_top(fragment.body_bottom, used_table_width)
                 .points();
         }
         self.cursor_y -= table_edge_spacing;
-
         self.cursor_y -= table_width.padding.bottom + table_width.border_widths.bottom;
-        let bottom_caption_destination = final_fragment_placement
-            .map(|(placement, _)| placement)
+        let bottom_caption_destination = final_body_fragment
+            .map(|fragment| fragment.placement)
             .unwrap_or(initial_fragmentainer_placement);
         let bottom_caption_table_x = bottom_caption_destination.wrapper_table_x().points();
         let bottom_caption_paint_checkpoint = self.current_page.paint_checkpoint();
@@ -725,6 +771,23 @@ impl<'a> LayoutBuilder<'a> {
             TableGridBlockOffset::new(TableGridLength::new(0.0)),
         );
         self.pop_overflow_clip(bottom_caption_clip_active);
+        // A fragmented table has already advanced `cursor_y` through its
+        // final body slice and any bottom caption in the destination
+        // fragmentainer. Preserve that page-local progression: the wrapper
+        // footprint below remains the complete source interval and is only
+        // suitable for an unfragmented table.
+        //
+        // <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+        // <https://drafts.csswg.org/css-tables-3/#table-fragmentation>
+        let final_fragmentainer_cursor_y = self.cursor_y;
+        let table_spans_fragmentainers = self.pages.len() != table_wrapper_paint_page_index;
+        let table_wrapper_margin_box = TableWrapperMarginBoxFootprint::from_table_root_border_box(
+            table_root_paint_box.border_box(),
+            PageTopBlockPosition::new(table_wrapper_top),
+            layout_pt(top_caption_height),
+            layout_pt(bottom_caption_height),
+            &style.margin,
+        );
         if paint_containment_applies && self.pages.len() == bottom_caption_paint_page_index {
             let fragment = self
                 .current_page
@@ -740,13 +803,7 @@ impl<'a> LayoutBuilder<'a> {
             let fragment = self
                 .current_page
                 .take_paint_fragment_since(table_wrapper_paint_checkpoint);
-            let wrapper_clip = PageTopRect::new(
-                table_x - table_width.padding.left,
-                table_wrapper_top,
-                physical_grid_width.points() + table_width.padding.left + table_width.padding.right,
-                top_caption_height + table_border_box_height + bottom_caption_height,
-            )
-            .paint_clip();
+            let wrapper_clip = table_wrapper_margin_box.page_top_rect().paint_clip();
             let fragment = fragment.with_effect_scoped_to_rect_all_bands(wrapper_clip);
             self.current_page
                 .append_paint_fragment_owned(fragment, PaintTranslation::identity());
@@ -763,38 +820,18 @@ impl<'a> LayoutBuilder<'a> {
         // border box distinct from captured ink for the element dispatcher.
         // <https://drafts.csswg.org/css-transforms-1/#transform-box>
         self.last_principal_transform_box = Some(assets::TransformReferenceBox::table_wrapper(
-            PageTopRect::new(
-                table_x - table_width.padding.left - table_width.border_widths.left,
-                table_wrapper_top,
-                physical_grid_width.points()
-                    + table_width.padding.left
-                    + table_width.padding.right
-                    + table_width.border_widths.left
-                    + table_width.border_widths.right,
-                top_caption_height + table_border_box_height + bottom_caption_height,
-            )
-            .paint_clip()
-            .paint_rect(),
+            table_wrapper_margin_box
+                .page_top_rect()
+                .paint_clip()
+                .paint_rect(),
         ));
-        // The row pass still advances its legacy cursor by the logical table
-        // block extent. For an unfragmented table without captions, convert
-        // that consumed extent back to the physical height occupied in the
-        // parent's flow. Fragmented and captioned tables retain their existing
-        // cursor path until their fragment/caption geometry is likewise
-        // logical.
-        if top_caption_height <= 0.0
-            && bottom_caption_height <= 0.0
-            && self.pages.len() == table_structure_paint_page_index
-        {
-            let physical_grid_height = FlowAxes::for_style(style)
-                .physical_size_from_logical(LogicalSize {
-                    inline: used_table_width.points(),
-                    block: table_content_height,
-                })
-                .height;
-            self.cursor_y += table_content_height - physical_grid_height;
-        }
-        self.cursor_y -= style.margin.bottom;
+        self.cursor_y = if table_spans_fragmentainers {
+            final_fragmentainer_cursor_y
+        } else {
+            table_wrapper_margin_box
+                .horizontal_parent_block_end()
+                .points()
+        };
         if matches!(style.position, Position::Relative | Position::Sticky) {
             self.cursor_y -= relative_offset.y();
         }

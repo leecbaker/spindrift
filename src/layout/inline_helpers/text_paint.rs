@@ -12,14 +12,18 @@ pub(in crate::layout) fn inline_fragment_has_visible_text_paint(
     fragment: &(impl InlineFragmentAccess + ?Sized),
 ) -> bool {
     fragment.style().color.is_visible()
-        || fragment.style().text_decoration_layers.iter().any(|layer| {
-            layer.decoration.has_visible_line()
-                && layer
-                    .decoration
-                    .color
-                    .unwrap_or(fragment.style().color)
-                    .is_visible()
-        })
+        || fragment
+            .style()
+            .text_decoration_origins
+            .effective_layers()
+            .any(|layer| {
+                layer.decoration.has_visible_line()
+                    && layer
+                        .decoration
+                        .color
+                        .unwrap_or(fragment.style().color)
+                        .is_visible()
+            })
         || fragment.style().text_shadow.iter().any(|shadow| {
             !shadow.inset && shadow.color.resolve(fragment.style().color).is_visible()
         })
@@ -35,8 +39,11 @@ pub(in crate::layout) fn can_paint_inline_fragments_together(
     left: &(impl InlineFragmentAccess + ?Sized),
     right: &(impl InlineFragmentAccess + ?Sized),
 ) -> bool {
-    left.mergeable()
-        && right.mergeable()
+    let shares_first_letter_group = left
+        .first_letter_pseudo_group_id()
+        .zip(right.first_letter_pseudo_group_id())
+        .is_some_and(|(left, right)| left == right);
+    (left.mergeable() && right.mergeable() || shares_first_letter_group)
         && inline_text_sources_are_paint_compatible(left.source(), right.source())
         && (left.baseline_shift() - right.baseline_shift()).abs() < 0.01
         && left.visual_offset() == right.visual_offset()
@@ -75,12 +82,16 @@ pub(in crate::layout) fn inline_text_sources_are_paint_compatible(
         (InlineTextSource::BidiControl, _) | (_, InlineTextSource::BidiControl) => false,
         (InlineTextSource::BlockEllipsis, InlineTextSource::BlockEllipsis) => true,
         (InlineTextSource::BlockEllipsis, _) | (_, InlineTextSource::BlockEllipsis) => false,
-        (
-            InlineTextSource::WordSpaceTransform(left),
-            InlineTextSource::WordSpaceTransform(right),
-        ) => left == right,
+        // A transformed separator remains a distinct layout source, but it
+        // belongs to the same text paint group as compatible neighboring
+        // text. The group-level ActualText mapping restores its authored
+        // U+200B (or omits generated `<wbr>`) without splitting the glyph
+        // stream at the replacement character.
+        // <https://drafts.csswg.org/css-text-4/#word-space-transform>
+        (InlineTextSource::WordSpaceTransform(_), InlineTextSource::RunIn)
+        | (InlineTextSource::RunIn, InlineTextSource::WordSpaceTransform(_)) => false,
         (InlineTextSource::WordSpaceTransform(_), _)
-        | (_, InlineTextSource::WordSpaceTransform(_)) => false,
+        | (_, InlineTextSource::WordSpaceTransform(_)) => true,
         (InlineTextSource::Marker, InlineTextSource::Marker) => true,
         (InlineTextSource::Marker, _) | (_, InlineTextSource::Marker) => false,
         (InlineTextSource::RunIn, InlineTextSource::RunIn) => true,

@@ -1,7 +1,9 @@
 use super::*;
 use crate::css::{TextDecoration, TextEmphasisSkip, TextEmphasisStyle, TextOrientation};
-use crate::text::trim_start_css_collapsible_whitespace;
-use crate::text::{CursiveProtectedUnitRanges, character_is_text_decoration_spacer};
+use crate::text::{
+    CursiveProtectedUnitRanges, character_is_text_decoration_spacer,
+    trim_start_css_collapsible_whitespace,
+};
 
 mod decoration;
 mod effects;

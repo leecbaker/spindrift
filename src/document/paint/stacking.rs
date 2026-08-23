@@ -1,11 +1,10 @@
-use crate::document::Page;
-
 use super::annotations::RenderedLink;
 use super::display_list::{PaintBand, PaintBandList, recorded_context_paint_bounds};
 use super::effects::PaintEffects;
 use super::fragments::PaintFragment;
 use super::geometry::{PaintClip, PaintTransform, PaintTranslation};
 use super::page::PaintPrimitive;
+use crate::document::Page;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StackLevel {

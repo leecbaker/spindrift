@@ -1,5 +1,5 @@
 use super::*;
-use crate::dom::{DocumentSyntax, ObjectRendering};
+use crate::dom::{DocumentSyntax, ImageRendering, ObjectRendering};
 
 const XHTML_NAMESPACE_URL: &str = "http://www.w3.org/1999/xhtml";
 const SVG_NAMESPACE_URL: &str = "http://www.w3.org/2000/svg";
@@ -67,6 +67,25 @@ impl UsedOverflowAxes {
         Self {
             horizontal: UsedOverflowAxis::from_overflow(horizontal),
             vertical: UsedOverflowAxis::from_overflow(vertical),
+        }
+    }
+
+    /// SVG viewport clipping does not establish a CSS scroll container for
+    /// `hidden`; it is a non-scrollable viewport clip and therefore retains
+    /// the authored overflow clip margin.
+    /// <https://svgwg.org/svg2-draft/render.html#OverflowAndClipProperties>
+    pub(in crate::layout) fn from_svg_viewport_style(style: &ComputedStyle) -> Self {
+        let (horizontal, vertical) = resolved_overflow_axes(style);
+        let axis = |overflow| match overflow {
+            css::Overflow::Visible => UsedOverflowAxis::Visible,
+            css::Overflow::Clip | css::Overflow::Hidden => UsedOverflowAxis::Clip,
+            css::Overflow::Scroll | css::Overflow::Auto => {
+                UsedOverflowAxis::ScrollContainer(overflow)
+            }
+        };
+        Self {
+            horizontal: axis(horizontal),
+            vertical: axis(vertical),
         }
     }
 
@@ -623,26 +642,6 @@ pub(super) fn style_clips_overflow(style: &ComputedStyle) -> bool {
     effective_overflow_for_style(style).clips_overflow()
 }
 
-/// Return the physical axes that use the CSS Overflow clip edge.
-///
-/// `hidden`, `scroll`, and `auto` use a padding-edge scrollport; the expanded
-/// overflow clip edge is specific to the `clip` keyword. A visible companion
-/// axis remains unbounded.
-/// <https://www.w3.org/TR/css-overflow-3/#overflow-clip-edge>
-pub(super) fn overflow_clip_edge_axes(style: &ComputedStyle) -> (bool, bool) {
-    let axes = UsedOverflowAxes::from_style(style);
-    (
-        axes.horizontal == UsedOverflowAxis::Clip,
-        axes.vertical == UsedOverflowAxis::Clip,
-    )
-}
-
-/// Return the physical axes whose visual overflow is bounded at all.
-pub(super) fn overflow_clipping_axes(style: &ComputedStyle) -> (bool, bool) {
-    let axes = UsedOverflowAxes::from_style(style);
-    (axes.clips_x(), axes.clips_y())
-}
-
 /// Return whether any containment effect prevents special root/body canvas
 /// property propagation.
 ///
@@ -675,10 +674,30 @@ pub(super) fn property_containment_applies_to_element(
     element: &Element,
     style: &ComputedStyle,
 ) -> bool {
-    if style.display.is_inline_level() && !style.display.is_atomic_inline() {
+    if !property_containment_applies_to_style(style) {
         return false;
     }
     if matches!(element.tag.as_str(), "rb" | "rbc" | "rt" | "rtc") {
+        return false;
+    }
+    true
+}
+
+/// Return whether a style can carry property containment when the paint path
+/// has no element identity available.
+///
+/// This is deliberately the conservative shared subset of
+/// [`property_containment_applies_to_element`]. Paint-only representations
+/// such as inline atoms retain a used style but not necessarily their source
+/// element. They must still reject non-atomic inline and layout-internal ruby
+/// boxes rather than turning an authored `contain` bit into a stacking
+/// context.
+/// <https://www.w3.org/TR/css-contain-1/#containment-principal>
+pub(super) fn property_containment_applies_to_style(style: &ComputedStyle) -> bool {
+    if style.display.is_inline_level() && !style.display.is_atomic_inline() {
+        return false;
+    }
+    if style.display.is_ruby_internal() {
         return false;
     }
     !matches!(
@@ -964,7 +983,10 @@ pub(super) fn replaced_element_kind(element: &Element) -> Option<ReplacedElement
         // replaced-image layout path gives CSS Images one concrete-object
         // implementation for img, embed, object, and video poster images.
         // <https://html.spec.whatwg.org/multipage/embedded-content.html>
-        "img" | "embed" | "video" => Some(ReplacedElementKind::Image),
+        "img" if element.image_rendering != ImageRendering::AltText => {
+            Some(ReplacedElementKind::Image)
+        }
+        "embed" | "video" => Some(ReplacedElementKind::Image),
         // HTML's Image Button state is an image-backed replaced control. It
         // shares the ordinary raster-image layout path, while every other
         // input state retains its form-control layout semantics.

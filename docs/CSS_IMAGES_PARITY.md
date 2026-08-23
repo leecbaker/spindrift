@@ -23,6 +23,16 @@ part of this parity measure rather than a separate raster-only baseline.
   destination-space clips, including fractional source-pixel edges.
   `object-position` also applies to `fill`, including edge offsets when the
   concrete object nominally matches the content box.
+- HTML `<img>` resource state is resolved before box-tree construction. A
+  decoded image retains the replaced-image path; an unavailable image with a
+  non-empty `alt` becomes ordinary styled fallback text, including normal
+  wrapping and scroll-container behavior; and an empty or missing `alt`
+  retains the invisible zero-natural-size replaced fallback. Preload, state
+  resolution, and image layout share the same fixed-resolution `src`/`srcset`
+  candidate selection. Static `<picture>` selection now chooses the first
+  applicable direct `<source>` (media, supported type, and usable density
+  candidate) before falling back to the child `<img>`, and stores that one
+  choice for every resource stage.
 - SVG replaced images use that same concrete-object geometry. `fill`,
   `contain`, `cover`, `none`, and `scale-down` therefore share source-
   independent sizing, `object-position`, and content-box clipping across
@@ -34,7 +44,11 @@ part of this parity measure rather than a separate raster-only baseline.
   preserves source-coordinate extent, clipping, and edge coverage. The
   clipped concrete-object intersection is converted once from Quire's
   bottom-left paint coordinates to SVG's top-left source viewport, preserving
-  the same `object-position` source selection as raster images.
+  the same `object-position` source selection as raster images. Explicit root
+  SVG `background-color` presentation attributes and inline declarations are
+  retained as viewport-space paint for external images, so the background
+  fills the concrete CSS object while descendant SVG content remains mapped
+  through its `viewBox` and `preserveAspectRatio` transform.
 - The UA stylesheet defaults HTML image-like replaced elements to
   `overflow: clip` with a `content-box` clip margin. This preserves CSS
   Images' default object-fit crop while allowing an author to opt into
@@ -166,6 +180,9 @@ part of this parity measure rather than a separate raster-only baseline.
   expand into one paint operation per tile. Opaque linear and radial
   backgrounds use native PDF axial/radial shadings at their resolved tile
   geometry, including affine ellipse transforms for radial gradients.
+  Corner-keyword linear gradients derive their magic-corner direction from the
+  resolved gradient-box aspect ratio, so 50% stops cross the neighboring
+  corners in non-square boxes.
   Repeating linear/radial color lines, transition hints, coincident hard
   stops, and alpha masks use the same vector shading path. Repeating color
   lines are one periodic Type 4 calculator function per color line (plus a

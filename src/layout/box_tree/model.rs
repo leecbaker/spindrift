@@ -1,5 +1,6 @@
-use super::*;
 use std::rc::Rc;
+
+use super::*;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PageBoxWith<'a, S = MutableStyle> {

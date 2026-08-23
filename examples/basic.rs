@@ -1,7 +1,8 @@
 //! Minimal asynchronous HTML-to-PDF rendering example.
 
-use quire::{Html, PdfOptions, RenderOptions};
 use std::fs::File;
+
+use quire::{Html, PdfOptions, RenderOptions};
 
 #[tokio::main]
 async fn main() -> quire::Result<()> {

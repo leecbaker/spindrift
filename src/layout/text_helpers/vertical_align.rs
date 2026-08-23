@@ -1,5 +1,11 @@
-use super::*;
-use crate::css::TextLayoutPolicy;
+use crate::css::{
+    self, AlignmentBaseline, BaselineMetric, BaselineShift, ComputedStyle, DominantBaseline,
+    LayoutLength, TextLayoutPolicy, TextOrientation, layout_pt,
+};
+use crate::layout::{
+    InlineAtom, InlineAtomBaseline, LayoutBuilder, inline_atom_logical_block_size,
+    inline_atom_logical_margin_box_baseline_offset,
+};
 use crate::units::{
     AlphabeticBaselineRelativeOffset, AuthorBaselineShift, BaselineTableAlignmentDelta,
     ContentBoxBaselineOffset, GlyphBaselineDisplacement, SemanticLengthExt,
@@ -290,6 +296,7 @@ fn alphabetic_baseline_relative_offset(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::css::WritingMode;
 
     #[test]
     fn dominant_baseline_auto_uses_central_for_vertical_mixed_and_upright() {

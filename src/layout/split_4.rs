@@ -1,5 +1,7 @@
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
     use super::super::*;
     use crate::css::{
         BoxDecorationBreak, ComputedLengthPercentage, ContentLanguage, Hyphens,
@@ -7,7 +9,6 @@ mod tests {
         TextEdgePair, TextOrientation,
     };
     use crate::layout::inline_collect::{InlineElementScopeOptions, InlinePlacement};
-    use std::rc::Rc;
 
     fn test_layout_builder<'a, Collection: StylesheetCollection + ?Sized>(
         options: &'a RenderOptions,
@@ -30,6 +31,34 @@ mod tests {
             target_references: crate::layout::TargetReferenceSnapshot::default(),
             font_system: FontSystem::new(),
         })
+    }
+
+    #[test]
+    fn current_used_style_resolution_preserves_propagated_decoration_origin() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+
+        let mut ancestor = ComputedStyle::initial();
+        ancestor.text_decoration.underline = true;
+        ancestor.rebuild_own_text_decoration_origin();
+        let ancestor_origin = ancestor
+            .text_decoration_origins
+            .effective_layers_vec()
+            .pop()
+            .unwrap()
+            .origin_style;
+
+        let mut child = ComputedStyle::initial();
+        child
+            .text_decoration_origins
+            .set_propagated(ancestor.text_decoration_origins.effective_layers_vec());
+        let used = builder.style_with_current_used_lengths(&child);
+        let layers = used.text_decoration_origins.effective_layers_vec();
+
+        assert_eq!(layers.len(), 1);
+        assert!(Rc::ptr_eq(&layers[0].origin_style, &ancestor_origin));
     }
 
     fn inline_fragment(text: &str, style: ComputedStyle) -> InlineFragment {
@@ -189,8 +218,8 @@ mod tests {
         style: &ComputedStyle,
     ) -> inline_layout::RangedMeasuredMixedInlineLineItem {
         inline_layout::RangedMeasuredMixedInlineLineItem {
-            item: inline_layout::MeasuredInlineItem {
-                item: InlineLineItem::Atom(InlineAtom::new(
+            item: inline_layout::MeasuredInlineItem::new(
+                InlineLineItem::Atom(InlineAtom::new(
                     InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(InlineBoxEdgeFragment {
                         logical_edge,
                         physical_side,
@@ -206,9 +235,9 @@ mod tests {
                     None,
                     None,
                 )),
-                width: 5.0,
-                shaped: None,
-            },
+                5.0,
+                None,
+            ),
             range: boundary..boundary,
         }
     }
@@ -218,10 +247,10 @@ mod tests {
         style: &ComputedStyle,
     ) -> inline_layout::RangedMeasuredMixedInlineLineItem {
         inline_layout::RangedMeasuredMixedInlineLineItem {
-            item: inline_layout::MeasuredInlineItem {
-                item: InlineLineItem::Atom(InlineAtom::new(
+            item: inline_layout::MeasuredInlineItem::new(
+                InlineLineItem::Atom(InlineAtom::new(
                     InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace(
-                        InlineTextBoundarySpacing::new(layout_pt(5.0), false),
+                        InlineTextBoundarySpacing::new(layout_pt(5.0)),
                     )),
                     style.clone(),
                     None,
@@ -231,9 +260,9 @@ mod tests {
                     None,
                     None,
                 )),
-                width: 5.0,
-                shaped: None,
-            },
+                5.0,
+                None,
+            ),
             range: boundary..boundary,
         }
     }
@@ -244,11 +273,11 @@ mod tests {
         style: &ComputedStyle,
     ) -> inline_layout::RangedMeasuredMixedInlineLineItem {
         inline_layout::RangedMeasuredMixedInlineLineItem {
-            item: inline_layout::MeasuredInlineItem {
-                item: InlineLineItem::Fragment(inline_fragment(text, style.clone())),
-                width: text.len() as f32,
-                shaped: None,
-            },
+            item: inline_layout::MeasuredInlineItem::new(
+                InlineLineItem::Fragment(inline_fragment(text, style.clone())),
+                text.len() as f32,
+                None,
+            ),
             range,
         }
     }
@@ -522,6 +551,15 @@ mod tests {
             positioning_direction: style.direction,
             suffix_space,
         }
+    }
+
+    #[test]
+    fn outside_markers_do_not_participate_in_intrinsic_inline_flow() {
+        let style = ComputedStyle::initial();
+        let mut marker = list_marker_text("1.", &style, true);
+        marker.position = ListStylePosition::Outside;
+
+        assert!(!marker.participates_in_first_line());
     }
 
     fn list_marker_image(width: f32, height: f32, style: &ComputedStyle) -> ListMarker {
@@ -979,10 +1017,7 @@ mod tests {
         );
         assert_eq!(
             inline_atom_boundary_role(&InlineAtomContent::InlineEdge(
-                InlineEdgeRole::TextAutospace(InlineTextBoundarySpacing::new(
-                    layout_pt(0.0),
-                    false,
-                )),
+                InlineEdgeRole::TextAutospace(InlineTextBoundarySpacing::new(layout_pt(0.0),)),
             )),
             InlineBoundaryRole::TransparentTextBoundary
         );
@@ -1368,7 +1403,7 @@ mod tests {
         let available_width = builder.font_system.measure_text("hyphen", &style) + 0.1;
         let broken =
             raw_text_sequence(&mut builder, "hyphen\u{00ad}ation", &style, available_width);
-        assert_eq!(sequence_fragment_texts(&broken).concat(), "hyphen-ation");
+        assert_eq!(sequence_fragment_texts(&broken).concat(), "hyphen‐ation");
 
         style.hyphens = Hyphens::None;
         let suppressed =
@@ -1385,12 +1420,12 @@ mod tests {
         assert!(
             sequence_fragment_texts(&auto_sequence)
                 .iter()
-                .any(|text| text.ends_with('-'))
+                .any(|text| text.ends_with('‐'))
         );
         assert_eq!(
             sequence_fragment_texts(&auto_sequence)
                 .iter()
-                .map(|text| text.replace('-', ""))
+                .map(|text| text.replace('‐', ""))
                 .collect::<String>(),
             "ribonuclease"
         );
@@ -2660,16 +2695,16 @@ mod tests {
         let tatweel_width = builder.font_system.measure_text("\u{0640}", &tatweel);
         let line_fragment = inline_layout::InlineLineFragment::new(
             vec![
-                inline_layout::MeasuredInlineItem {
-                    item: InlineLineItem::Fragment(beh_fragment),
-                    width: beh_width,
-                    shaped: None,
-                },
-                inline_layout::MeasuredInlineItem {
-                    item: InlineLineItem::Fragment(tatweel_fragment),
-                    width: tatweel_width,
-                    shaped: None,
-                },
+                inline_layout::MeasuredInlineItem::new(
+                    InlineLineItem::Fragment(beh_fragment),
+                    beh_width,
+                    None,
+                ),
+                inline_layout::MeasuredInlineItem::new(
+                    InlineLineItem::Fragment(tatweel_fragment),
+                    tatweel_width,
+                    None,
+                ),
             ],
             InlineLineMetrics {
                 width: beh_width + tatweel_width,
@@ -2757,25 +2792,15 @@ mod tests {
         let right = InlineLineItem::Fragment(inline_fragment("B", style.clone()));
         let left_width = builder.font_system.measure_text("A", &style);
         let right_width = builder.font_system.measure_text("B", &style);
+        // The opportunity graph may carry a conservative source width. Paint
+        // placement must instead consume the final shaped text-group advance.
         let carried_left_width = left_width + 5.0;
         let line_left = builder.content_left;
         let line_fragment = inline_layout::InlineLineFragment::new(
             vec![
-                inline_layout::MeasuredInlineItem {
-                    item: left,
-                    width: carried_left_width,
-                    shaped: None,
-                },
-                inline_layout::MeasuredInlineItem {
-                    item: atom,
-                    width: 10.0,
-                    shaped: None,
-                },
-                inline_layout::MeasuredInlineItem {
-                    item: right,
-                    width: right_width,
-                    shaped: None,
-                },
+                inline_layout::MeasuredInlineItem::new(left, carried_left_width, None),
+                inline_layout::MeasuredInlineItem::new(atom, 10.0, None),
+                inline_layout::MeasuredInlineItem::new(right, right_width, None),
             ],
             InlineLineMetrics {
                 width: carried_left_width + 10.0 + right_width,
@@ -2825,8 +2850,8 @@ mod tests {
             })
             .expect("atom should be prepared");
         assert!(
-            (atom_x - (line_left + carried_left_width)).abs() < 0.01,
-            "mixed inline painting should advance with the carried graph width"
+            (atom_x - (line_left + left_width)).abs() < 0.01,
+            "mixed inline painting should advance with the final shaped group width"
         );
     }
 
@@ -2853,8 +2878,8 @@ mod tests {
             paint_extent: 150.0,
         };
         let line_fragment = inline_layout::InlineLineFragment::new(
-            vec![inline_layout::MeasuredInlineItem {
-                item: InlineLineItem::Atom(InlineAtom::new(
+            vec![inline_layout::MeasuredInlineItem::new(
+                InlineLineItem::Atom(InlineAtom::new(
                     InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge)),
                     style.clone(),
                     None,
@@ -2864,9 +2889,9 @@ mod tests {
                     None,
                     None,
                 )),
-                width: edge.advance,
-                shaped: None,
-            }],
+                edge.advance,
+                None,
+            )],
             InlineLineMetrics {
                 width: edge.advance,
                 height: style.line_height,
@@ -3105,7 +3130,10 @@ mod tests {
             0.0,
             InlineVisualOffset::zero(),
             &anonymous.style,
-            anonymous.style.text_decoration_layers.clone(),
+            anonymous
+                .style
+                .text_decoration_origins
+                .effective_layers_vec(),
             &mut items,
         );
 
@@ -3456,24 +3484,24 @@ mod tests {
         builder.cursor_y = 100.0;
 
         let whole_width = builder.font_system.measure_text("A B", &style);
-        let whole = inline_layout::MeasuredInlineItem {
-            item: InlineLineItem::Fragment(inline_fragment("A B", style.clone())),
-            width: whole_width,
-            shaped: None,
-        };
+        let whole = inline_layout::MeasuredInlineItem::new(
+            InlineLineItem::Fragment(inline_fragment("A B", style.clone())),
+            whole_width,
+            None,
+        );
         let split_left_width = builder.font_system.measure_text("A", &style);
         let split_right_width = builder.font_system.measure_text(" B", &style);
         let split = vec![
-            inline_layout::MeasuredInlineItem {
-                item: InlineLineItem::Fragment(inline_fragment("A", style.clone())),
-                width: split_left_width,
-                shaped: None,
-            },
-            inline_layout::MeasuredInlineItem {
-                item: InlineLineItem::Fragment(inline_fragment(" B", style.clone())),
-                width: split_right_width,
-                shaped: None,
-            },
+            inline_layout::MeasuredInlineItem::new(
+                InlineLineItem::Fragment(inline_fragment("A", style.clone())),
+                split_left_width,
+                None,
+            ),
+            inline_layout::MeasuredInlineItem::new(
+                InlineLineItem::Fragment(inline_fragment(" B", style.clone())),
+                split_right_width,
+                None,
+            ),
         ];
         let available_width = 120.0;
         let whole_record =
@@ -3520,21 +3548,21 @@ mod tests {
         let right_width = builder.font_system.measure_text("B", &style);
         let record = inline_line_record_for_items(
             vec![
-                inline_layout::MeasuredInlineItem {
-                    item: InlineLineItem::Fragment(inline_fragment("A", style.clone())),
-                    width: left_width,
-                    shaped: None,
-                },
-                inline_layout::MeasuredInlineItem {
-                    item: InlineLineItem::Fragment(inline_fragment(" ", style.clone())),
-                    width: space_width,
-                    shaped: None,
-                },
-                inline_layout::MeasuredInlineItem {
-                    item: InlineLineItem::Fragment(inline_fragment("B", style.clone())),
-                    width: right_width,
-                    shaped: None,
-                },
+                inline_layout::MeasuredInlineItem::new(
+                    InlineLineItem::Fragment(inline_fragment("A", style.clone())),
+                    left_width,
+                    None,
+                ),
+                inline_layout::MeasuredInlineItem::new(
+                    InlineLineItem::Fragment(inline_fragment(" ", style.clone())),
+                    space_width,
+                    None,
+                ),
+                inline_layout::MeasuredInlineItem::new(
+                    InlineLineItem::Fragment(inline_fragment("B", style.clone())),
+                    right_width,
+                    None,
+                ),
             ],
             text,
             measured_width + 5.0,
@@ -3560,7 +3588,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_inline_line_record_excludes_trailing_tracking_once() {
+    fn prepared_inline_line_record_uses_tracking_free_base_advance() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -3572,15 +3600,17 @@ mod tests {
         style.letter_spacing = ComputedLengthPercentage::from_points(5.0);
         builder.cursor_y = 100.0;
 
-        let measured_width = builder.font_system.measure_text("AB", &style);
+        let mut untracked_style = style.clone();
+        untracked_style.letter_spacing = ComputedLengthPercentage::ZERO;
+        let base_advance = builder.font_system.measure_text("AB", &untracked_style);
         let record = inline_line_record_for_items(
-            vec![inline_layout::MeasuredInlineItem {
-                item: InlineLineItem::Fragment(inline_fragment("AB", style.clone())),
-                width: measured_width,
-                shaped: None,
-            }],
+            vec![inline_layout::MeasuredInlineItem::new(
+                InlineLineItem::Fragment(inline_fragment("AB", style.clone())),
+                base_advance,
+                None,
+            )],
             "AB",
-            measured_width - style.used_letter_spacing().points(),
+            base_advance,
             100.0,
             &style,
         );
@@ -3594,11 +3624,7 @@ mod tests {
             .expect("tracked line should prepare");
 
         let background = prepared_fragment_backgrounds(&prepared)[0];
-        assert!(
-            (background.rect.width() - (measured_width - style.used_letter_spacing().points()))
-                .abs()
-                < 0.01
-        );
+        assert!((background.rect.width() - base_advance).abs() < 0.01);
     }
 
     #[test]
@@ -3623,8 +3649,8 @@ mod tests {
 
         let measured_width = builder.font_system.measure_text("inspect", &style);
         let record = inline_line_record_for_items(
-            vec![inline_layout::MeasuredInlineItem {
-                item: InlineLineItem::Fragment(
+            vec![inline_layout::MeasuredInlineItem::new(
+                InlineLineItem::Fragment(
                     inline_fragment("inspect", style.clone()).with_hanging_edges(
                         InlineHangingEdges {
                             blocks_start: true,
@@ -3632,9 +3658,9 @@ mod tests {
                         },
                     ),
                 ),
-                width: measured_width,
-                shaped: None,
-            }],
+                measured_width,
+                None,
+            )],
             "inspect",
             measured_width,
             200.0,
@@ -3704,8 +3730,8 @@ mod tests {
         for (items, expected_backgrounds) in [
             (
                 vec![
-                    inline_layout::MeasuredInlineItem {
-                        item: InlineLineItem::Fragment(
+                    inline_layout::MeasuredInlineItem::new(
+                        InlineLineItem::Fragment(
                             inline_fragment("inspect", style.clone()).with_hanging_edges(
                                 InlineHangingEdges {
                                     blocks_start: true,
@@ -3713,21 +3739,21 @@ mod tests {
                                 },
                             ),
                         ),
-                        width: builder.font_system.measure_text("inspect", &style),
-                        shaped: None,
-                    },
-                    inline_layout::MeasuredInlineItem {
-                        item: InlineLineItem::Fragment(inline_fragment("pause", style.clone())),
-                        width: builder.font_system.measure_text("pause", &style),
-                        shaped: None,
-                    },
+                        builder.font_system.measure_text("inspect", &style),
+                        None,
+                    ),
+                    inline_layout::MeasuredInlineItem::new(
+                        InlineLineItem::Fragment(inline_fragment("pause", style.clone())),
+                        builder.font_system.measure_text("pause", &style),
+                        None,
+                    ),
                 ],
                 2usize,
             ),
             (
                 vec![
-                    inline_layout::MeasuredInlineItem {
-                        item: InlineLineItem::Fragment(
+                    inline_layout::MeasuredInlineItem::new(
+                        InlineLineItem::Fragment(
                             inline_fragment("inspect", style.clone()).with_hanging_edges(
                                 InlineHangingEdges {
                                     blocks_start: true,
@@ -3735,25 +3761,25 @@ mod tests {
                                 },
                             ),
                         ),
-                        width: builder.font_system.measure_text("inspect", &style),
-                        shaped: None,
-                    },
-                    inline_layout::MeasuredInlineItem {
-                        item: InlineLineItem::Fragment(inline_fragment(" ", style.clone())),
-                        width: builder.font_system.measure_text(" ", &style),
-                        shaped: None,
-                    },
-                    inline_layout::MeasuredInlineItem {
-                        item: InlineLineItem::Fragment(inline_fragment("pause", style.clone())),
-                        width: builder.font_system.measure_text("pause", &style),
-                        shaped: None,
-                    },
+                        builder.font_system.measure_text("inspect", &style),
+                        None,
+                    ),
+                    inline_layout::MeasuredInlineItem::new(
+                        InlineLineItem::Fragment(inline_fragment(" ", style.clone())),
+                        builder.font_system.measure_text(" ", &style),
+                        None,
+                    ),
+                    inline_layout::MeasuredInlineItem::new(
+                        InlineLineItem::Fragment(inline_fragment("pause", style.clone())),
+                        builder.font_system.measure_text("pause", &style),
+                        None,
+                    ),
                 ],
                 3usize,
             ),
             (
-                vec![inline_layout::MeasuredInlineItem {
-                    item: InlineLineItem::Fragment(
+                vec![inline_layout::MeasuredInlineItem::new(
+                    InlineLineItem::Fragment(
                         inline_fragment("inspectpause", style.clone()).with_hanging_edges(
                             InlineHangingEdges {
                                 blocks_start: true,
@@ -3761,13 +3787,16 @@ mod tests {
                             },
                         ),
                     ),
-                    width: builder.font_system.measure_text("inspectpause", &style),
-                    shaped: None,
-                }],
+                    builder.font_system.measure_text("inspectpause", &style),
+                    None,
+                )],
                 1usize,
             ),
         ] {
-            let width = items.iter().map(|item| item.width).sum::<f32>();
+            let width = items
+                .iter()
+                .map(|item| item.used_advance().points())
+                .sum::<f32>();
             let record = inline_line_record_for_items(items, "inspectpause", width, 300.0, &style);
             let mut plaintext_state = None;
             let prepared = builder
@@ -3867,11 +3896,11 @@ mod tests {
 
         let measured_width = builder.font_system.measure_text("A", &style);
         let record = inline_line_record_for_items(
-            vec![inline_layout::MeasuredInlineItem {
-                item: InlineLineItem::Fragment(inline_fragment("A", style.clone())),
-                width: measured_width,
-                shaped: None,
-            }],
+            vec![inline_layout::MeasuredInlineItem::new(
+                InlineLineItem::Fragment(inline_fragment("A", style.clone())),
+                measured_width,
+                None,
+            )],
             "A",
             measured_width,
             100.0,
@@ -4403,11 +4432,11 @@ mod tests {
         fragment.baseline_shift = 2.0;
         let measured_width = builder.font_system.measure_text("AB", &style);
         let record = inline_line_record_for_items(
-            vec![inline_layout::MeasuredInlineItem {
-                item: InlineLineItem::Fragment(fragment),
-                width: measured_width,
-                shaped: None,
-            }],
+            vec![inline_layout::MeasuredInlineItem::new(
+                InlineLineItem::Fragment(fragment),
+                measured_width,
+                None,
+            )],
             "AB",
             measured_width,
             120.0,
@@ -4454,11 +4483,11 @@ mod tests {
         let text = "سلام";
         let measured_width = builder.font_system.measure_text(text, &style);
         let record = inline_line_record_for_items(
-            vec![inline_layout::MeasuredInlineItem {
-                item: InlineLineItem::Fragment(inline_fragment(text, style.clone())),
-                width: measured_width,
-                shaped: None,
-            }],
+            vec![inline_layout::MeasuredInlineItem::new(
+                InlineLineItem::Fragment(inline_fragment(text, style.clone())),
+                measured_width,
+                None,
+            )],
             text,
             measured_width,
             160.0,
@@ -4512,21 +4541,17 @@ mod tests {
         };
         let single_atom_record = inline_line_record_for_items(
             vec![
-                inline_layout::MeasuredInlineItem {
-                    item: InlineLineItem::Fragment(inline_fragment("A", style.clone())),
-                    width: left_width,
-                    shaped: None,
-                },
-                inline_layout::MeasuredInlineItem {
-                    item: atom(),
-                    width: atom_width,
-                    shaped: None,
-                },
-                inline_layout::MeasuredInlineItem {
-                    item: InlineLineItem::Fragment(inline_fragment("B", style.clone())),
-                    width: right_width,
-                    shaped: None,
-                },
+                inline_layout::MeasuredInlineItem::new(
+                    InlineLineItem::Fragment(inline_fragment("A", style.clone())),
+                    left_width,
+                    None,
+                ),
+                inline_layout::MeasuredInlineItem::new(atom(), atom_width, None),
+                inline_layout::MeasuredInlineItem::new(
+                    InlineLineItem::Fragment(inline_fragment("B", style.clone())),
+                    right_width,
+                    None,
+                ),
             ],
             "AB",
             left_width + atom_width + right_width,
@@ -4558,26 +4583,18 @@ mod tests {
 
         let two_atom_record = inline_line_record_for_items(
             vec![
-                inline_layout::MeasuredInlineItem {
-                    item: InlineLineItem::Fragment(inline_fragment("A", style.clone())),
-                    width: left_width,
-                    shaped: None,
-                },
-                inline_layout::MeasuredInlineItem {
-                    item: atom(),
-                    width: atom_width,
-                    shaped: None,
-                },
-                inline_layout::MeasuredInlineItem {
-                    item: atom(),
-                    width: atom_width,
-                    shaped: None,
-                },
-                inline_layout::MeasuredInlineItem {
-                    item: InlineLineItem::Fragment(inline_fragment("B", style.clone())),
-                    width: right_width,
-                    shaped: None,
-                },
+                inline_layout::MeasuredInlineItem::new(
+                    InlineLineItem::Fragment(inline_fragment("A", style.clone())),
+                    left_width,
+                    None,
+                ),
+                inline_layout::MeasuredInlineItem::new(atom(), atom_width, None),
+                inline_layout::MeasuredInlineItem::new(atom(), atom_width, None),
+                inline_layout::MeasuredInlineItem::new(
+                    InlineLineItem::Fragment(inline_fragment("B", style.clone())),
+                    right_width,
+                    None,
+                ),
             ],
             "AB",
             left_width + atom_width * 2.0 + right_width,
@@ -4630,11 +4647,11 @@ mod tests {
         let text = "אב";
         let measured_width = builder.font_system.measure_text(text, &style);
         let record = inline_line_record_for_items(
-            vec![inline_layout::MeasuredInlineItem {
-                item: InlineLineItem::Fragment(inline_fragment(text, style.clone())),
-                width: measured_width,
-                shaped: None,
-            }],
+            vec![inline_layout::MeasuredInlineItem::new(
+                InlineLineItem::Fragment(inline_fragment(text, style.clone())),
+                measured_width,
+                None,
+            )],
             text,
             measured_width,
             120.0,
@@ -5045,16 +5062,16 @@ mod tests {
         assert_eq!(first_fragment.baseline_shift, 0.0);
 
         let items = vec![
-            inline_layout::MeasuredInlineItem {
-                item: first.item.clone(),
-                width: first.width,
-                shaped: first.shaped.clone(),
-            },
-            inline_layout::MeasuredInlineItem {
-                item: second.item.clone(),
-                width: second.width,
-                shaped: second.shaped.clone(),
-            },
+            inline_layout::MeasuredInlineItem::new(
+                first.item.clone(),
+                first.width,
+                first.shaped.clone(),
+            ),
+            inline_layout::MeasuredInlineItem::new(
+                second.item.clone(),
+                second.width,
+                second.shaped.clone(),
+            ),
         ];
         let metrics = builder.mixed_inline_line_metrics(&items, &style, first.width + second.width);
         assert!((metrics.height - style.line_height).abs() < 0.01);
@@ -5402,7 +5419,7 @@ mod tests {
         );
 
         assert_eq!(unbroken.used_text(), "hyphenation");
-        assert_eq!(broken.used_text(), "hyphen-");
+        assert_eq!(broken.used_text(), "hyphen‐");
     }
 
     #[test]
@@ -5491,7 +5508,7 @@ mod tests {
 
         assert_eq!(
             sequence_fragment_texts(&sequence),
-            vec!["Deoxyribo-", "nucleic", "acid"]
+            vec!["Deoxyribo‐", "nucleic", "acid"]
         );
     }
 

@@ -5,10 +5,12 @@
 //! calibrated component values with ICCBased color spaces (ISO 32000-2:2020,
 //! 8.6.5.5), and associates PDF/A output with an OutputIntent profile.
 
+use std::rc::Rc;
+
+use pdf_writer::{Content, Filter, Name, Pdf, Ref};
+
 use crate::css::CssColorSpace;
 use crate::{CssColor, PdfCompression, PdfProfile, Result};
-use pdf_writer::{Content, Filter, Name, Pdf, Ref};
-use std::rc::Rc;
 
 /// The blending colour space of a PDF transparency group.
 ///

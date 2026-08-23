@@ -36,6 +36,7 @@ Note that we aim to be much more spec compliant and performant than weasyprint. 
 - Dont' be shy about using `debug_assert!()` to document preconditions and postconditions of functions.
 - Once a file is over about 500-1000 lines of code, then consider breaking it out into a module for better organization. Make sure files are named appropriately for their function.
 - Don't write bespoke parsers without explicit permission. When you request permission, describe why existing parsers or crates are insufficient.
+- Don't use glob imports in the main file; in tests, you can use `use super::*;`.
 
 ## Development guidelines
 

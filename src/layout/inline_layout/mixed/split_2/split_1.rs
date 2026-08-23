@@ -1,6 +1,9 @@
-use super::*;
-use crate::layout::block::{FloatContour, FlowExclusionKind, InitialLetterLayout};
 use std::rc::Rc;
+
+use super::*;
+use crate::layout::block::{
+    FloatContour, FlowExclusionKind, InitialLetterLayout, LogicalFloatPlacement,
+};
 
 /// Whether the selected final line must reserve a block ellipsis for source
 /// that lies outside the current inline graph.
@@ -273,6 +276,35 @@ struct InlineLinePhysicalPosition {
     cursor_y: f32,
 }
 
+/// Project one vertical line's logical block slab onto physical page X.
+///
+/// Vertical-lr lines begin at the containing box's physical left edge, while
+/// vertical-rl and sideways-rl lines begin at its physical right edge. Keeping
+/// this projection in one adapter prevents float-exclusion queries from always
+/// sampling the leftmost column.
+/// <https://www.w3.org/TR/css-writing-modes-4/#logical-to-physical>
+/// <https://www.w3.org/TR/css-writing-modes-4/#line-mappings>
+fn vertical_line_block_slab(
+    position: InlineLinePhysicalPosition,
+    block_style: &ComputedStyle,
+    physical_left_inset: f32,
+    block_extent: f32,
+) -> PageInlineSpan {
+    debug_assert!(block_style.writing_mode.has_vertical_lines());
+    match FlowAxes::for_style(block_style).block_start_side() {
+        PhysicalSide::Left => {
+            PageInlineSpan::new(position.content_left + physical_left_inset, block_extent)
+        }
+        PhysicalSide::Right => {
+            let right = position.content_right - block_style.padding.right;
+            PageInlineSpan::from_edges(right - block_extent, right)
+        }
+        PhysicalSide::Top | PhysicalSide::Bottom => {
+            unreachable!("a vertical line's block axis is physical X")
+        }
+    }
+}
+
 /// The selected source line's identity, independent of its physical row.
 ///
 /// Float exclusions can create empty physical rows before inline source is
@@ -396,14 +428,6 @@ impl std::ops::Deref for SelectedInlineLine {
 }
 
 impl<'a> LayoutBuilder<'a> {
-    fn inline_line_physical_position(
-        &self,
-        line_index: usize,
-        block_style: &ComputedStyle,
-    ) -> InlineLinePhysicalPosition {
-        self.inline_line_physical_position_with_block_offset(line_index, block_style, 0.0)
-    }
-
     fn inline_line_physical_position_with_block_offset(
         &self,
         line_index: usize,
@@ -487,8 +511,10 @@ impl<'a> LayoutBuilder<'a> {
                 block_style.writing_mode,
                 block_style.used_direction(),
                 FloatBandQuery {
-                    horizontal_slab: PageInlineSpan::new(
-                        position.content_left + padding_left,
+                    horizontal_slab: vertical_line_block_slab(
+                        position,
+                        block_style,
+                        padding_left,
                         slab.used_block_size,
                     ),
                     vertical_slab: vertical_physical_inline_span(
@@ -539,8 +565,10 @@ impl<'a> LayoutBuilder<'a> {
                 block_style.used_direction(),
                 page_index,
                 FloatBandQuery {
-                    horizontal_slab: PageInlineSpan::new(
-                        position.content_left + padding_left,
+                    horizontal_slab: vertical_line_block_slab(
+                        position,
+                        block_style,
+                        padding_left,
                         slab.used_block_size,
                     ),
                     vertical_slab: vertical_physical_inline_span(
@@ -949,13 +977,16 @@ impl<'a> LayoutBuilder<'a> {
                         graph,
                         start,
                         context,
-                        line_index,
-                        SelectedLineIdentity {
-                            starts_after_forced_break: starts_after_forced_break
-                                && line_index == paragraph_start_line_index,
-                            is_first_formatted_line: context.initial_first_formatted_line
-                                && paragraph_start_line_index == 0
-                                && fragments.is_empty(),
+                        InlineLinePhysicalRow {
+                            line_index,
+                            identity: SelectedLineIdentity {
+                                starts_after_forced_break: starts_after_forced_break
+                                    && line_index == paragraph_start_line_index,
+                                is_first_formatted_line: context.initial_first_formatted_line
+                                    && paragraph_start_line_index == 0
+                                    && fragments.is_empty(),
+                            },
+                            block_offset: physical_line_block_offset,
                         },
                     )
                     .is_placed()
@@ -976,7 +1007,22 @@ impl<'a> LayoutBuilder<'a> {
                 // greedy selector retries the same zero-advance graph node
                 // indefinitely and effectively promotes the marker to a
                 // line-break opportunity.
-                self.place_inline_waiting_float(&float, start, context, line_index);
+                self.place_inline_waiting_float_on_row(
+                    &float,
+                    start,
+                    context,
+                    InlineLinePhysicalRow {
+                        line_index,
+                        identity: SelectedLineIdentity {
+                            starts_after_forced_break: starts_after_forced_break
+                                && line_index == paragraph_start_line_index,
+                            is_first_formatted_line: context.initial_first_formatted_line
+                                && paragraph_start_line_index == 0
+                                && fragments.is_empty(),
+                        },
+                        block_offset: physical_line_block_offset,
+                    },
+                );
                 placed_inline_float_positions.push(start);
                 has_float_side_effects = true;
                 balanced_plan = None;
@@ -1292,6 +1338,7 @@ impl<'a> LayoutBuilder<'a> {
                             marker_selected,
                             context.block_style,
                             line_index,
+                            Some(marker_available_width),
                         ) <= marker_available_width + INLINE_FLOAT_EPSILON;
                     if marker_selection_fits {
                         selected_end = marker_selected;
@@ -1454,9 +1501,12 @@ impl<'a> LayoutBuilder<'a> {
                                             == FirstLetterPseudoFragmentRole::LeadingPreservedWhitespace
                                 )
                             })
-                            .map(|item| item.width)
+                            .map(|item| item.used_advance().points())
                             .sum::<f32>();
-                        Some(leading_pseudo_width + materialized.items[initial_index].width)
+                        Some(
+                            leading_pseudo_width
+                                + materialized.items[initial_index].used_advance().points(),
+                        )
                     })
                     .flatten()
                     .unwrap_or(0.0);
@@ -1515,8 +1565,10 @@ impl<'a> LayoutBuilder<'a> {
                         context.block_style,
                         physical_line_block_offset,
                     );
-                    let starting_slab = PageInlineSpan::new(
-                        position.content_left + context.padding_left,
+                    let starting_slab = vertical_line_block_slab(
+                        position,
+                        context.block_style,
+                        context.padding_left,
                         slab_width,
                     );
                     let vertical_inline_span = vertical_physical_inline_span(
@@ -1771,8 +1823,11 @@ impl<'a> LayoutBuilder<'a> {
                     float_position,
                     prefix.metrics.width,
                     context,
-                    line_index,
-                    line_identity,
+                    InlineLinePhysicalRow {
+                        line_index,
+                        identity: line_identity,
+                        block_offset: physical_line_block_offset,
+                    },
                 ) {
                     placed_inline_float_positions.push(float_position);
                     has_float_side_effects = true;
@@ -1995,7 +2050,7 @@ impl<'a> LayoutBuilder<'a> {
         let trailing_inline_float_replay =
             placed_inline_float_positions.last().and_then(|marker| {
                 let float = graph.float_at_position(*marker)?;
-                let committed = self.committed_inline_floats.get_mut(&float.element().id)?;
+                let committed = self.committed_inline_floats.get_mut(&float.id())?;
                 committed.replay = InlineFloatReplayMetadata {
                     source_range_start: (
                         graph.start_position().run_index,
@@ -2176,6 +2231,7 @@ impl<'a> LayoutBuilder<'a> {
                                     marker_end,
                                     context.block_style,
                                     entry.line_index,
+                                    Some(available_width),
                                 ) <= available_width + INLINE_FLOAT_EPSILON
                             {
                                 marker_end.position
@@ -2308,8 +2364,8 @@ impl<'a> LayoutBuilder<'a> {
         }
         fragment.edge_effects.source_effects = std::rc::Rc::from(retained_effects);
         fragment.edge_effects.collapsed_end_trim_width = 0.0;
-        items.push(MeasuredInlineItem {
-            item: InlineLineItem::Fragment(InlineFragment::new(
+        items.push(MeasuredInlineItem::new(
+            InlineLineItem::Fragment(InlineFragment::new(
                 marker,
                 style,
                 baseline_shift,
@@ -2320,9 +2376,9 @@ impl<'a> LayoutBuilder<'a> {
                 InlineHangingEdges::default(),
                 Vec::new(),
             )),
-            width: ellipsis_width,
+            ellipsis_width,
             shaped,
-        });
+        ));
         // The source line's width already incorporates its selected Phase II
         // trimming and hanging effects.  The marker is new used content, so
         // extend that width instead of recomputing from raw source items.
@@ -2337,7 +2393,12 @@ impl<'a> LayoutBuilder<'a> {
         let mut metrics_items = items.clone();
         if line_index == 0 && context.block_style.first_line_style.is_some() {
             let mut pseudo_items = measured_inline_items(&metrics_items);
-            apply_first_line_pseudos_to_line_items(&mut pseudo_items, context.block_style, false);
+            apply_first_line_pseudos_to_line_items(
+                &mut pseudo_items,
+                context.block_style,
+                false,
+                &mut self.font_system,
+            );
             for (measured, pseudo_item) in metrics_items.iter_mut().zip(pseudo_items) {
                 measured.item = pseudo_item;
             }
@@ -2413,6 +2474,7 @@ impl<'a> LayoutBuilder<'a> {
                         entry.end,
                         context.block_style,
                         entry.line_index,
+                        Some(*available),
                     )
                     - ellipsis)
                     .max(0.0)
@@ -2467,6 +2529,7 @@ impl<'a> LayoutBuilder<'a> {
         end: SelectedInlineLineEnd,
         block_style: &ComputedStyle,
         line_index: usize,
+        available_width: Option<f32>,
     ) -> f32 {
         let range = InlineGraphRange {
             start,
@@ -2479,12 +2542,21 @@ impl<'a> LayoutBuilder<'a> {
         // the candidate is what applies selected edge trimming, atomic-inline
         // word-spacing ownership, and pseudo-style shaping before both
         // balance scoring and ordinary fallback selection.
-        let mut materialized = graph.materialize_line(
-            range,
-            end.break_opportunity,
-            &mut self.font_system,
-            block_style,
-        );
+        let mut materialized = match available_width {
+            Some(available_width) => graph.materialize_line_for_available_width(
+                range,
+                end.break_opportunity,
+                available_width,
+                &mut self.font_system,
+                block_style,
+            ),
+            None => graph.materialize_line(
+                range,
+                end.break_opportunity,
+                &mut self.font_system,
+                block_style,
+            ),
+        };
         if applies_first_line_style {
             let mut items = measured_inline_items(&materialized.items);
             // `::first-line` participates in line fitting, including balanced
@@ -2493,14 +2565,19 @@ impl<'a> LayoutBuilder<'a> {
             // the used first-line style before deciding its break point.
             // <https://drafts.csswg.org/css-pseudo-4/#first-line-pseudo> and
             // <https://drafts.csswg.org/css-text-4/#text-wrap-style>
-            apply_first_line_pseudos_to_line_items(&mut items, block_style, false);
+            apply_first_line_pseudos_to_line_items(
+                &mut items,
+                block_style,
+                false,
+                &mut self.font_system,
+            );
             materialized.items = items
                 .into_iter()
                 .map(|item| {
                     let shaped = match &item {
                         InlineLineItem::Fragment(fragment) => self
                             .font_system
-                            .shape_unwrapped_line(
+                            .shape_untracked_inline_line(
                                 fragment.text(),
                                 fragment.style(),
                                 fragment.style().line_height,
@@ -2517,11 +2594,7 @@ impl<'a> LayoutBuilder<'a> {
                             }
                             InlineLineItem::Fragment(_) | InlineLineItem::Float(_) => 0.0,
                         });
-                    MeasuredInlineItem {
-                        item,
-                        width,
-                        shaped,
-                    }
+                    MeasuredInlineItem::new(item, width, shaped)
                 })
                 .collect();
             // Recomposition for `::first-line` has produced fresh shaper
@@ -2531,7 +2604,7 @@ impl<'a> LayoutBuilder<'a> {
             let widths = inline_content_width_for_line_items(
                 &materialized.items,
                 &mut self.font_system,
-                |item| item.width,
+                |item| item.used_advance().points(),
             );
             materialized.fitting_width = widths.fitting_width;
         }
@@ -2634,6 +2707,7 @@ impl<'a> LayoutBuilder<'a> {
                 end,
                 search.context.block_style,
                 line_index,
+                Some(search.available_widths[candidate_index]),
             );
             let ellipsis = if is_final_line && search.ellipsis_width > 0.0 {
                 search.ellipsis_width
@@ -2770,7 +2844,7 @@ impl<'a> LayoutBuilder<'a> {
                 };
                 (!fragment.style().initial_letter.is_normal()).then_some((
                     index,
-                    item.width,
+                    item.base_advance().points(),
                     fragment.style(),
                 ))
             })
@@ -2854,7 +2928,7 @@ impl<'a> LayoutBuilder<'a> {
                                 == FirstLetterPseudoFragmentRole::LeadingPreservedWhitespace
                     )
                 })
-                .map(|item| item.width)
+                .map(|item| item.base_advance().points())
                 .sum()
         } else {
             0.0
@@ -3079,13 +3153,14 @@ impl<'a> LayoutBuilder<'a> {
                     && leading_pseudo_inline_size > INLINE_FLOAT_EPSILON);
             if leading_pseudo_is_out_of_flow {
                 for item in &mut items[..initial_index] {
+                    let base_advance = item.base_advance().points();
                     let InlineLineItem::Fragment(prefix) = &mut item.item else {
                         continue;
                     };
                     if prefix.first_letter_pseudo_role()
                         == FirstLetterPseudoFragmentRole::LeadingPreservedWhitespace
                     {
-                        prefix.set_out_of_flow_paint_inline_advance(layout_pt(item.width));
+                        prefix.set_out_of_flow_paint_inline_advance(layout_pt(base_advance));
                         prefix.set_out_of_flow_paint_block_size(layout_pt(style.font_size));
                         let prefix_visual_offset = if side == UsedFloatSide::Right {
                             margin_box_inline_size - leading_pseudo_inline_size
@@ -3095,7 +3170,7 @@ impl<'a> LayoutBuilder<'a> {
                         prefix.visual_offset = prefix.visual_offset.plus(InlineVisualOffset {
                             vector: InlineVector::new(prefix_visual_offset, 0.0),
                         });
-                        item.width = 0.0;
+                        item.advance.replace_base_points(0.0);
                     }
                 }
             }
@@ -3114,11 +3189,12 @@ impl<'a> LayoutBuilder<'a> {
                 // width before the following text. Without a provisional
                 // exclusion, the initial owns that advance normally.
                 // <https://drafts.csswg.org/css-inline-3/#initial-letter-floats>
-                initial.width = if companion_uses_initial_exclusion {
+                let initial_base_advance = if companion_uses_initial_exclusion {
                     0.0
                 } else {
                     margin_box_inline_size - leading_pseudo_inline_size
                 };
+                initial.advance.replace_base_points(initial_base_advance);
             }
             if side == UsedFloatSide::Right {
                 // The initial-letter pseudo is isolated from the adjacent
@@ -3168,7 +3244,7 @@ impl<'a> LayoutBuilder<'a> {
                     }
                 }
             }
-            let content_width = items.iter().map(|item| item.width).sum();
+            let content_width = items.iter().map(|item| item.used_advance().points()).sum();
             fragment.metrics =
                 self.mixed_inline_line_metrics(&items, context.block_style, content_width);
             fragment.items = Rc::from(items.into_boxed_slice());
@@ -3227,7 +3303,7 @@ impl<'a> LayoutBuilder<'a> {
                         vector: InlineVector::new(physical_x_offset, physical_y_offset),
                     });
                 }
-                initial.width = 0.0;
+                initial.advance.replace_base_points(0.0);
                 true
             } else {
                 false
@@ -3253,7 +3329,7 @@ impl<'a> LayoutBuilder<'a> {
                         }
                     }
                 }
-                let content_width = items.iter().map(|item| item.width).sum();
+                let content_width = items.iter().map(|item| item.used_advance().points()).sum();
                 fragment.metrics =
                     self.mixed_inline_line_metrics(&items, context.block_style, content_width);
                 fragment.items = Rc::from(items.into_boxed_slice());
@@ -3436,8 +3512,7 @@ impl<'a> LayoutBuilder<'a> {
                                 float_position,
                                 prefix.metrics.width,
                                 context,
-                                row.line_index,
-                                row.identity,
+                                row,
                             )
                             .is_none()
                         {
@@ -3456,13 +3531,7 @@ impl<'a> LayoutBuilder<'a> {
                         }
                     }
                 } else if !self
-                    .try_place_inline_float_in_line_band(
-                        graph,
-                        float_position,
-                        context,
-                        row.line_index,
-                        row.identity,
-                    )
+                    .try_place_inline_float_in_line_band(graph, float_position, context, row)
                     .is_placed()
                 {
                     self.restore(snapshot);
@@ -3470,13 +3539,7 @@ impl<'a> LayoutBuilder<'a> {
                 }
             } else if float_position == range.start
                 && !self
-                    .try_place_inline_float_in_line_band(
-                        graph,
-                        float_position,
-                        context,
-                        row.line_index,
-                        row.identity,
-                    )
+                    .try_place_inline_float_in_line_band(graph, float_position, context, row)
                     .is_placed()
             {
                 self.restore(snapshot);
@@ -3698,16 +3761,10 @@ impl<'a> LayoutBuilder<'a> {
             0.0,
             position.cursor_y,
         );
-        let generated_float_children = [];
-        let placed = self.layout_floating_child(
-            float.element(),
-            float.signature().clone(),
-            float.style(),
-            float
-                .is_generated_content()
-                .then_some(generated_float_children.as_slice()),
-            None,
-            context.stylesheets,
+        let placed = self.layout_inline_float_contents(
+            float,
+            context,
+            FloatPlacementAxes::for_style(context.block_style),
             &mut run,
         );
         if placed
@@ -3741,7 +3798,7 @@ impl<'a> LayoutBuilder<'a> {
         exclusion: FloatShape,
     ) {
         self.committed_inline_floats.insert(
-            float.element().id,
+            float.id(),
             CommittedInlineFloat {
                 marker: (marker.run_index, marker.byte_offset),
                 selected_row,
@@ -3757,6 +3814,219 @@ impl<'a> LayoutBuilder<'a> {
         );
     }
 
+    /// Lay out either a collected DOM float or the anonymous text box created
+    /// for a floated `::first-letter`.
+    fn layout_inline_float_contents(
+        &mut self,
+        float: &InlineFloat,
+        context: InlineParagraphContext<'_>,
+        placement_axes: FloatPlacementAxes,
+        run: &mut FloatRunState,
+    ) -> bool {
+        if let Some(fragments) = float.first_letter_fragments() {
+            return self.layout_first_letter_text_float(
+                fragments,
+                float.style(),
+                context,
+                placement_axes,
+                run,
+            );
+        }
+        let generated_float_children = [];
+        self.layout_floating_child(
+            float
+                .element()
+                .expect("DOM inline float has an element source"),
+            float
+                .signature()
+                .expect("DOM inline float has an element signature")
+                .clone(),
+            float.style(),
+            float
+                .is_generated_content()
+                .then_some(generated_float_children.as_slice()),
+            None,
+            context.stylesheets,
+            placement_axes,
+            run,
+        )
+    }
+
+    /// Place and paint an anonymous text float for `::first-letter`.
+    ///
+    /// The graph has already applied the pseudo style and preserved its
+    /// source-order fragment boundaries.  Here the group becomes a normal CSS
+    /// float exclusion while its text continues to use the ordinary mixed
+    /// inline painter.
+    fn layout_first_letter_text_float(
+        &mut self,
+        fragments: &[InlineFragment],
+        style: &ComputedStyle,
+        context: InlineParagraphContext<'_>,
+        placement_axes: FloatPlacementAxes,
+        run: &mut FloatRunState,
+    ) -> bool {
+        if style.float == Float::None || placement_axes.writing_mode() != WritingMode::HorizontalTb
+        {
+            return false;
+        }
+        // Positioned auto-size measurement builds the same graph before the
+        // positioned containing block has its final coordinates.  It must
+        // account for the zero-advance marker, but must not publish paint or
+        // an exclusion at that provisional root position.
+        if self.is_positioned_auto_size_measurement() {
+            return true;
+        }
+        let Some(side) = UsedFloatSide::from_float(style.float, placement_axes) else {
+            return false;
+        };
+        let items = fragments
+            .iter()
+            .cloned()
+            .map(|fragment| {
+                let shaped = self
+                    .font_system
+                    .shape_untracked_inline_line(
+                        fragment.text(),
+                        fragment.style(),
+                        fragment.style().line_height,
+                    )
+                    .map(Rc::new);
+                let advance = shaped
+                    .as_deref()
+                    .map(ShapedInlineLine::advance_width)
+                    .unwrap_or(0.0);
+                MeasuredInlineItem::new(InlineLineItem::Fragment(fragment), advance, shaped)
+            })
+            .collect::<Vec<_>>();
+        let content_width = items
+            .iter()
+            .map(|item| item.used_advance().points())
+            .sum::<f32>()
+            .max(0.0);
+        // A floated `::first-letter` establishes its own blockified inline
+        // formatting context. Its sole text run must therefore retain the
+        // pseudo's line-height strut; ordinary first-letter line metrics
+        // intentionally exclude the typographic initial because an in-flow
+        // initial letter is positioned against the surrounding line instead.
+        let mut metrics =
+            self.mixed_inline_line_metrics(&items, context.block_style, content_width);
+        let float_strut = self.inline_text_box_metrics(style, 0.0);
+        metrics.height = style.line_height;
+        metrics.baseline_offset = float_strut.line_baseline_offset;
+        let borders = used_border_widths(style);
+        let margin_box_width = (content_width
+            + style.margin.left
+            + borders.left
+            + style.padding.left
+            + style.padding.right
+            + borders.right
+            + style.margin.right)
+            .max(0.0);
+        let margin_box_height = (metrics.height
+            + style.margin.top
+            + borders.top
+            + style.padding.top
+            + style.padding.bottom
+            + borders.bottom
+            + style.margin.bottom)
+            .max(0.0);
+        let placement_top = PageTopBlockPosition::new(self.cursor_y);
+        let placement = self.find_inline_float_avoiding_position(
+            placement_top,
+            margin_box_size_pt(margin_box_width, margin_box_height),
+            style.clear,
+            placement_axes,
+            side,
+        );
+        let margin_box_left =
+            placement.inline_float_margin_box_left(side, margin_box_pt(margin_box_width));
+        let margin_box = PageTopRect::new(
+            margin_box_left,
+            placement.origin.top_y(),
+            margin_box_width,
+            margin_box_height,
+        );
+        let logical_placement = LogicalFloatPlacement::from_physical_margin_box(
+            self.current_float_page_index(),
+            placement_axes.writing_mode(),
+            placement_axes.direction(),
+            side,
+            PageTopRect::new(
+                self.content_left,
+                self.page_top(),
+                (self.content_right - self.content_left).max(0.0),
+                self.page_area_height(),
+            ),
+            margin_box,
+        );
+
+        let saved_content_left = self.content_left;
+        let saved_content_right = self.content_right;
+        let saved_cursor_y = self.cursor_y;
+        self.content_left = margin_box_left + style.margin.left + borders.left + style.padding.left;
+        self.content_right = self.content_left + content_width;
+        self.cursor_y =
+            placement.origin.top_y() - style.margin.top - borders.top - style.padding.top;
+        // The pseudo group is one anonymous blockified float, not a series
+        // of inline decoration fragments. Paint its principal-box decoration
+        // once at the resolved border box; the selected fragments below keep
+        // shaping and foreground text ownership.
+        let float_border_box = PageTopRect::new(
+            margin_box_left + style.margin.left,
+            placement.origin.top_y() - style.margin.top,
+            (margin_box_width - style.margin.left - style.margin.right).max(0.0),
+            (margin_box_height - style.margin.top - style.margin.bottom).max(0.0),
+        )
+        .paint_rect();
+        for primitive in self.box_background_primitives(float_border_box, style) {
+            self.push_primitive_in_band(PaintBand::Float, primitive);
+        }
+        let line = InlineLineFragment::new(
+            items,
+            metrics,
+            HangingPunctuationWidths::default(),
+            0.0,
+            content_width,
+            self.current_float_page_index(),
+            fragments
+                .iter()
+                .map(InlineFragment::text)
+                .collect::<String>(),
+        );
+        if let Some(prepared) = self.prepare_inline_line_fragment(
+            &line,
+            InlinePaintContext {
+                block_style: context.block_style,
+                direction: context.block_style.used_direction(),
+                available_width: content_width,
+                padding_left: 0.0,
+                line_indent: 0.0,
+                text_align: TextAlign::Start,
+                is_first_line: true,
+                line_block_size: metrics.height,
+            },
+        ) {
+            self.paint_prepared_inline_line(&prepared);
+        }
+        self.content_left = saved_content_left;
+        self.content_right = saved_content_right;
+        self.cursor_y = saved_cursor_y;
+
+        let mut shape = FloatShape::from_rect(
+            self.next_float_id(),
+            style.float,
+            side,
+            self.next_paint_source_order(),
+            self.current_float_page_index(),
+            margin_box,
+        );
+        shape.outer_inline_extent = margin_box_pt(margin_box_width);
+        shape.placement = Some(logical_placement);
+        self.push_float_shape(shape, run);
+        true
+    }
+
     /// Position an inline-source float against the whole current line band.
     ///
     /// The source-order marker stays in the graph with zero advance; callers
@@ -3768,8 +4038,7 @@ impl<'a> LayoutBuilder<'a> {
         graph: &InlineOpportunityGraph,
         float_position: InlineGraphPosition,
         context: InlineParagraphContext<'_>,
-        line_index: usize,
-        line_identity: SelectedLineIdentity,
+        row: InlineLinePhysicalRow,
     ) -> InlineFloatBandPlacement {
         if context.block_style.writing_mode != WritingMode::HorizontalTb {
             // A source-order float still establishes a physical CSS float in
@@ -3787,7 +4056,11 @@ impl<'a> LayoutBuilder<'a> {
             let saved_content_right = self.content_right;
             let saved_cursor_y = self.cursor_y;
             let saved_direction = self.containing_block_direction;
-            let position = self.inline_line_physical_position(line_index, context.block_style);
+            let position = self.inline_line_physical_position_with_block_offset(
+                row.line_index,
+                context.block_style,
+                row.block_offset,
+            );
             self.content_left = position.content_left;
             self.content_right = position.content_right;
             self.cursor_y = position.cursor_y;
@@ -3804,16 +4077,10 @@ impl<'a> LayoutBuilder<'a> {
                 0.0,
                 position.cursor_y,
             );
-            let generated_float_children = [];
-            let placed = self.layout_floating_child(
-                float.element(),
-                float.signature().clone(),
-                float.style(),
-                float
-                    .is_generated_content()
-                    .then_some(generated_float_children.as_slice()),
-                None,
-                context.stylesheets,
+            let placed = self.layout_inline_float_contents(
+                &float,
+                context,
+                FloatPlacementAxes::for_style(context.block_style),
                 &mut run,
             );
             if pushed_containing_block {
@@ -3825,7 +4092,7 @@ impl<'a> LayoutBuilder<'a> {
                 .and_then(|float_context| float_context.shapes.last())
                 .cloned();
             let accepted = placed
-                && self.pages.len() == snapshot.pages.len()
+                && self.pages.len() == snapshot.page_count()
                 && match self.float_contexts.last() {
                     Some(float_context) if float_context.shapes.len() > shape_count_before => {
                         float_context.shapes.last().is_some_and(|shape| {
@@ -3841,7 +4108,7 @@ impl<'a> LayoutBuilder<'a> {
                 };
             if accepted {
                 if let Some(exclusion) = exclusion {
-                    self.commit_inline_float(&float, float_position, line_index, exclusion);
+                    self.commit_inline_float(&float, float_position, row.line_index, exclusion);
                 }
                 self.content_left = saved_content_left;
                 self.content_right = saved_content_right;
@@ -3860,15 +4127,16 @@ impl<'a> LayoutBuilder<'a> {
             return InlineFloatBandPlacement::Rejected;
         };
         let block_style = context.block_style;
-        let band = self.inline_float_band_for_line(
-            line_index,
+        let band = self.inline_float_band_for_line_with_block_offset(
+            row.line_index,
             block_style,
             context.available_width,
             context.padding_left,
+            row.block_offset,
         );
         let line_indent = used_line_indent_for_formatted_line(
-            line_identity.is_first_formatted_line,
-            line_identity.starts_after_forced_break,
+            row.identity.is_first_formatted_line,
+            row.identity.starts_after_forced_break,
             context.hanging_indent,
             block_style,
             band.width(),
@@ -3881,7 +4149,13 @@ impl<'a> LayoutBuilder<'a> {
         let saved_content_right = self.content_right;
         let saved_cursor_y = self.cursor_y;
         let saved_direction = self.containing_block_direction;
-        let target_top = self.cursor_y - block_style.line_height * line_index as f32;
+        let target_top = self
+            .inline_line_physical_position_with_block_offset(
+                row.line_index,
+                block_style,
+                row.block_offset,
+            )
+            .cursor_y;
 
         self.content_left = line_left;
         self.content_right = line_right;
@@ -3895,16 +4169,10 @@ impl<'a> LayoutBuilder<'a> {
             0.0,
             target_top,
         );
-        let generated_float_children = [];
-        let placed = self.layout_floating_child(
-            float.element(),
-            float.signature().clone(),
-            float.style(),
-            float
-                .is_generated_content()
-                .then_some(generated_float_children.as_slice()),
-            None,
-            context.stylesheets,
+        let placed = self.layout_inline_float_contents(
+            &float,
+            context,
+            FloatPlacementAxes::for_style(block_style),
             &mut run,
         );
         if pushed_containing_block {
@@ -3915,7 +4183,7 @@ impl<'a> LayoutBuilder<'a> {
             .last()
             .and_then(|context| context.shapes.last())
             .cloned();
-        let accepted = if placed && self.pages.len() == snapshot.pages.len() {
+        let accepted = if placed && self.pages.len() == snapshot.page_count() {
             exclusion.as_ref().is_none_or(|shape| {
                 let float_block_span = shape.margin_box_block_span();
                 let outer_edges = shape.outer_inline_edges();
@@ -3936,7 +4204,7 @@ impl<'a> LayoutBuilder<'a> {
         };
         if accepted {
             if let Some(exclusion) = &exclusion {
-                self.commit_inline_float(&float, float_position, line_index, exclusion.clone());
+                self.commit_inline_float(&float, float_position, row.line_index, exclusion.clone());
             }
             self.content_left = saved_content_left;
             self.content_right = saved_content_right;
@@ -3959,23 +4227,23 @@ impl<'a> LayoutBuilder<'a> {
         float_position: InlineGraphPosition,
         prefix_width: f32,
         context: InlineParagraphContext<'_>,
-        line_index: usize,
-        line_identity: SelectedLineIdentity,
+        row: InlineLinePhysicalRow,
     ) -> Option<InlineFloatPlacement> {
         if context.block_style.writing_mode != WritingMode::HorizontalTb {
             return None;
         }
         let float = graph.float_at_position(float_position).cloned()?;
         let block_style = context.block_style;
-        let band = self.inline_float_band_for_line(
-            line_index,
+        let band = self.inline_float_band_for_line_with_block_offset(
+            row.line_index,
             block_style,
             context.available_width,
             context.padding_left,
+            row.block_offset,
         );
         let line_indent = used_line_indent_for_formatted_line(
-            line_identity.is_first_formatted_line,
-            line_identity.starts_after_forced_break,
+            row.identity.is_first_formatted_line,
+            row.identity.starts_after_forced_break,
             context.hanging_indent,
             block_style,
             band.width(),
@@ -3992,7 +4260,13 @@ impl<'a> LayoutBuilder<'a> {
         let saved_content_right = self.content_right;
         let saved_cursor_y = self.cursor_y;
         let saved_direction = self.containing_block_direction;
-        let target_top = self.cursor_y - block_style.line_height * line_index as f32;
+        let target_top = self
+            .inline_line_physical_position_with_block_offset(
+                row.line_index,
+                block_style,
+                row.block_offset,
+            )
+            .cursor_y;
         self.content_left = remaining_left;
         self.content_right = remaining_right;
         self.cursor_y = target_top;
@@ -4005,22 +4279,16 @@ impl<'a> LayoutBuilder<'a> {
             prefix_width,
             target_top,
         );
-        let generated_float_children = [];
-        let placed = self.layout_floating_child(
-            float.element(),
-            float.signature().clone(),
-            float.style(),
-            float
-                .is_generated_content()
-                .then_some(generated_float_children.as_slice()),
-            None,
-            context.stylesheets,
+        let placed = self.layout_inline_float_contents(
+            &float,
+            context,
+            FloatPlacementAxes::for_style(block_style),
             &mut run,
         );
         if pushed_containing_block {
             self.containing_blocks.pop();
         }
-        let accepted_shape = if placed && self.pages.len() == snapshot.pages.len() {
+        let accepted_shape = if placed && self.pages.len() == snapshot.page_count() {
             self.float_contexts.last().and_then(|context| {
                 context.shapes.last().and_then(|shape| {
                     let float_block_span = shape.margin_box_block_span();
@@ -4045,16 +4313,17 @@ impl<'a> LayoutBuilder<'a> {
             None
         };
         if let Some((fits_remaining_band, exclusion)) = accepted_shape {
-            self.commit_inline_float(&float, float_position, line_index, exclusion);
+            self.commit_inline_float(&float, float_position, row.line_index, exclusion);
             self.content_left = saved_content_left;
             self.content_right = saved_content_right;
             self.cursor_y = saved_cursor_y;
             self.containing_block_direction = saved_direction;
-            let post_float_band = self.inline_float_band_for_line(
-                line_index,
+            let post_float_band = self.inline_float_band_for_line_with_block_offset(
+                row.line_index,
                 block_style,
                 context.available_width,
                 context.padding_left,
+                row.block_offset,
             );
             let post_float_left =
                 self.content_left + context.padding_left + post_float_band.left_offset();
@@ -4178,14 +4447,17 @@ impl<'a> LayoutBuilder<'a> {
 
         let float = graph.float_at_position(float_position).cloned()?;
         let mut combined_items = prefix.items().to_vec();
-        combined_items.push(MeasuredInlineItem {
-            item: InlineLineItem::Float(float),
-            width: float_gap,
-            shaped: None,
-        });
+        combined_items.push(MeasuredInlineItem::new(
+            InlineLineItem::Float(float),
+            float_gap,
+            None,
+        ));
         let suffix_text = suffix.used_text();
         combined_items.extend(suffix.items);
-        let width = combined_items.iter().map(|item| item.width).sum::<f32>();
+        let width = combined_items
+            .iter()
+            .map(|item| item.used_advance().points())
+            .sum::<f32>();
         let metrics = self.mixed_inline_line_metrics(&combined_items, context.block_style, width);
         if (metrics.height - prefix.metrics.height).abs() > INLINE_FLOAT_EPSILON {
             return None;
@@ -4317,8 +4589,14 @@ impl<'a> LayoutBuilder<'a> {
             } else {
                 INLINE_FLOAT_EPSILON
             };
-            if self.balanced_line_fit_width(graph, start, selected, block_style, line_index)
-                <= line_available_width + fitting_tolerance
+            if self.balanced_line_fit_width(
+                graph,
+                start,
+                selected,
+                block_style,
+                line_index,
+                Some(line_available_width),
+            ) <= line_available_width + fitting_tolerance
             {
                 last_fitting = Some(selected);
                 if matches!(opportunity.kind, InlineBreakKind::Forced) {
@@ -4402,8 +4680,14 @@ impl<'a> LayoutBuilder<'a> {
                 position: opportunity.position,
                 break_opportunity: selected_break,
             };
-            let fit_width =
-                self.balanced_line_fit_width(graph, start, selected, block_style, line_index);
+            let fit_width = self.balanced_line_fit_width(
+                graph,
+                start,
+                selected,
+                block_style,
+                line_index,
+                Some(line_available_width),
+            );
             // A fitting `break-spaces` boundary must include the preserved
             // space exactly. The general half-point tolerance is only for
             // shaped glyph rounding; applying it here would incorrectly turn
@@ -4501,7 +4785,7 @@ impl<'a> LayoutBuilder<'a> {
                 // document space itself. Continue in source order so a later
                 // fitting opportunity can still win. It remains a progress
                 // fallback only after every candidate that fits has failed.
-                overflowing_break_spaces = Some(selected);
+                overflowing_break_spaces.get_or_insert(selected);
             } else if opportunity.availability.is_fallback() {
                 // A later source candidate can still be available in an
                 // earlier relaxation stage. Continue until every typed stage
@@ -4713,19 +4997,16 @@ impl<'a> LayoutBuilder<'a> {
             block_style,
             band.width(),
         );
-        let terminal_pre_wrap_hang = row.identity.starts_after_forced_break
-            && break_opportunity.is_none()
-            && range.end == graph.end_position();
         let line_available_width = (band.width() - line_indent).max(0.0);
-        let mut materialized = graph
-            .materialize_line_with_terminal_pre_wrap_hang_for_available_width(
-                range,
-                break_opportunity,
-                terminal_pre_wrap_hang,
-                line_available_width,
-                &mut self.font_system,
-                block_style,
-            );
+        let line_end = graph.selected_line_end_condition(range, break_opportunity);
+        let mut materialized = graph.materialize_line_for_selected_end_for_available_width(
+            range,
+            break_opportunity,
+            line_end,
+            line_available_width,
+            &mut self.font_system,
+            block_style,
+        );
         resolve_materialized_line_leaders(
             &mut materialized,
             &mut self.font_system,

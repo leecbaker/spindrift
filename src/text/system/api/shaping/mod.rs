@@ -23,7 +23,7 @@ pub(crate) enum ShapingLetterSpacing {
 }
 
 impl ShapingLetterSpacing {
-    fn requested_for(self, style: &ComputedStyle) -> f32 {
+    pub(in crate::text) fn requested_for(self, style: &ComputedStyle) -> f32 {
         match self {
             Self::Computed => style.used_letter_spacing().points(),
             Self::Suppressed => 0.0,

@@ -818,6 +818,104 @@ async fn direct_inline_images_reserve_baseline_descent_in_line_box() {
     assert!(image.y() - after.y() >= 12.0 - 0.01);
 }
 
+/// An auto-height block that owns only an inline replaced element still owns
+/// that element's line box. The next in-flow table must therefore begin below
+/// the image, not in the image's painted area.
+///
+/// <https://www.w3.org/TR/css-inline-3/#line-box>
+/// <https://www.w3.org/TR/CSS22/visudet.html#root-height>
+#[tokio::test]
+async fn inline_replaced_image_advances_nested_block_before_following_table() {
+    let document = Html::from_string(format!(
+        "<style>
+           @page {{ size: 200pt 160pt; margin: 20pt }}
+           body, div, p, table {{ margin: 0; padding: 0; border-spacing: 0; font-size: 12pt; line-height: 12pt }}
+           .label {{ height: 15pt; padding-bottom: 2pt }}
+           .chart {{ width: 100pt }}
+           .chart img {{ width: 100%; height: 20pt }}
+         </style>
+         <div class=\"block\"><p class=\"label\">chr1</p><div><div class=\"chart\"><img src=\"{GREEN_100_PNG}\"></div></div><table><tr><td>Status</td></tr></table></div><p class=\"label\">chr2</p>"
+    ))
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let image = page.images().first().expect("expected chart image");
+    let status = page
+        .lines()
+        .iter()
+        .find(|line| line.text.trim() == "Status")
+        .expect("expected table status");
+    let next_label = page
+        .lines()
+        .iter()
+        .find(|line| line.text.trim() == "chr2")
+        .expect("expected following block label");
+
+    assert!(
+        image.y() - status.y() >= 12.0 - 0.01,
+        "the table text must follow the image line box: image={image:?}, status={status:?}"
+    );
+    assert!(
+        status.y() - next_label.y() >= 12.0 - 0.01,
+        "the following block must remain after the table: status={status:?}, next_label={next_label:?}"
+    );
+}
+
+/// Break avoidance must use the actual height of a block containing an inline
+/// replaced element. This keeps each chart and its table on its own page.
+///
+/// <https://www.w3.org/TR/css-break-3/#break-within>
+#[tokio::test]
+async fn inline_replaced_image_height_participates_in_page_break_avoidance() {
+    let block = |label: &str, status: &str| {
+        format!(
+            "<div class=\"block\"><p class=\"label\">{label}</p><div><div class=\"chart\"><img src=\"{GREEN_100_PNG}\"></div></div><table><tr><td>{status}</td></tr></table></div>"
+        )
+    };
+    let document = Html::from_string(format!(
+        "<style>
+           @page {{ size: 160pt 90pt; margin: 15pt }}
+           body, div, p, table {{ margin: 0; padding: 0; border-spacing: 0; font-size: 12pt; line-height: 12pt }}
+           .block {{ break-inside: avoid }}
+           .label {{ height: 15pt; padding-bottom: 2pt }}
+           .chart {{ width: 100pt }}
+           .chart img {{ width: 100%; height: 20pt }}
+         </style>{}{}",
+        block("chr1", "Status 1"),
+        block("chr2", "Status 2"),
+    ))
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(document.pages.len(), 2, "document={document:?}");
+    for (page, label, status) in [
+        (&document.pages[0], "chr1", "Status 1"),
+        (&document.pages[1], "chr2", "Status 2"),
+    ] {
+        let image = page.images().first().expect("expected chart image");
+        let label = page
+            .lines()
+            .iter()
+            .find(|line| line.text.trim() == label)
+            .expect("expected chart label");
+        let status = page
+            .lines()
+            .iter()
+            .find(|line| line.text.trim() == status)
+            .expect("expected table status");
+
+        assert_eq!(page.images().len(), 1, "page={page:?}");
+        assert!(label.y() > image.y(), "label={label:?}, image={image:?}");
+        assert!(
+            image.y() - status.y() >= 12.0 - 0.01,
+            "the table text must follow the image line box: image={image:?}, status={status:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn anonymous_inline_runs_layout_replaced_atoms_with_text() {
     let document = Html::from_string(

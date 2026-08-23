@@ -1,4 +1,12 @@
-use super::*;
+use super::{
+    CollapsedTableGeometry, ComputedStyle, FragmentainerKind, LogicalInlineContentSize,
+    LogicalSide, PageBreak, PageInlinePosition, PageTopBlockPosition, PageTopPoint,
+    PhysicalContentWidth, PhysicalSide, Stylesheets, TableAvoidRowGroup, TableBodyPaintFragment,
+    TableCellPadding, TableColumn, TableColumnPlan, TableFragmentRepeatPolicy,
+    TableFragmentainerPlacement, TableGrid, TableGridLength, TableGridPlacement, TableMetrics,
+    TableRow, TableWrapperFragmentTimeline, UsedTableWidth, WritingMode, WritingModeAxes, css,
+    table_grid_height,
+};
 
 mod empty_table;
 mod rows;
@@ -101,13 +109,21 @@ pub(in crate::layout::table) struct TableBodyRowsInput<'table, 'ctx> {
     /// progress. This can differ from the source placement when the caption
     /// crosses a page or column boundary.
     pub(in crate::layout::table) initial_destination_grid_placement: TableGridPlacement,
+    /// Physical top of the destination grid content box after the wrapper's
+    /// physical top border and padding. Vertical table rows must start here,
+    /// rather than at the wrapper border edge retained by the root-decoration
+    /// source frame.
+    ///
+    /// <https://drafts.csswg.org/css-tables-3/#positioning>
+    /// <https://drafts.csswg.org/css-writing-modes-4/#orthogonal-flows>
+    pub(in crate::layout::table) initial_grid_content_top: PageTopBlockPosition,
     /// Retained wrapper source/destination progress shared by every body
     /// fragment. This carries caption progress without making captions part
     /// of table-root background geometry.
     pub(in crate::layout::table) wrapper_timeline: TableWrapperFragmentTimeline,
     pub(in crate::layout::table) logical_inline_extent: LogicalInlineContentSize,
     pub(in crate::layout::table) physical_grid_width: PhysicalContentWidth,
-    pub(in crate::layout::table) table_cellpadding: Option<f32>,
+    pub(in crate::layout::table) table_cellpadding: Option<TableCellPadding>,
     pub(in crate::layout::table) column_plan: &'ctx TableColumnPlan,
     pub(in crate::layout::table) planned_row_heights: &'ctx [f32],
     pub(in crate::layout::table) source_row_heights: &'ctx [f32],
@@ -124,6 +140,33 @@ pub(in crate::layout::table) struct TableBodyRowsInput<'table, 'ctx> {
     pub(in crate::layout::table) avoid_break_row_groups: &'ctx [TableAvoidRowGroup],
     pub(in crate::layout::table) row_group_break_before: &'ctx [PageBreak],
     pub(in crate::layout::table) row_group_break_after: &'ctx [PageBreak],
+}
+
+/// The final visible body slice committed for one table wrapper.
+///
+/// This is deliberately neither the table's complete source grid nor a
+/// synthetic root border box. CSS Fragmentation assigns the final row slice to
+/// one destination fragmentainer, and wrapper-owned trailing chrome and a
+/// bottom caption must continue from that fragment-local edge.
+/// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout::table) struct TableRootFinalBodyFragment {
+    pub(in crate::layout::table) placement: TableFragmentainerPlacement,
+    pub(in crate::layout::table) body_bottom: PageTopBlockPosition,
+}
+
+/// The committed result of table-body row layout.
+///
+/// The body fragment remains table-local fragmentation state. Its final
+/// fragmentainer-local edge is retained explicitly so wrapper siblings never
+/// reconstruct it from the complete unfragmented table-root box.
+pub(in crate::layout::table) struct TableBodyRowsOutcome {
+    pub(in crate::layout::table) table_body_fragment: Option<TableBodyPaintFragment>,
+    pub(in crate::layout::table) final_body_fragment: Option<TableRootFinalBodyFragment>,
+    pub(in crate::layout::table) forced_break_after_table_rows: PageBreak,
+    pub(in crate::layout::table) current_fragment_repeat_policy: TableFragmentRepeatPolicy,
+    pub(in crate::layout::table) continuation_inline_offset:
+        HorizontalTableContinuationInlineOffset,
 }
 
 /// A horizontal table wrapper's physical inline offset within its active
@@ -162,20 +205,6 @@ impl HorizontalTableContinuationInlineOffset {
 pub(in crate::layout::table) struct TableFragmentainerGridOrigin(PageTopPoint);
 
 impl TableFragmentainerGridOrigin {
-    /// Construct the first grid frame from the wrapper position resolved by
-    /// normal flow. Subsequent frames use [`Self::for_continuation`], whose
-    /// fragmentainer-edge projection is intentionally different for vertical
-    /// tables.
-    ///
-    /// <https://www.w3.org/TR/css-tables-3/#table-layout>
-    /// <https://www.w3.org/TR/css-writing-modes-4/#block-flow>
-    pub(in crate::layout::table) fn for_initial(
-        table_x: f32,
-        inline_top: PageTopBlockPosition,
-    ) -> Self {
-        Self(PageTopPoint::new(table_x, inline_top.points()))
-    }
-
     fn for_continuation(
         style: &ComputedStyle,
         content_left: f32,
@@ -197,10 +226,6 @@ impl TableFragmentainerGridOrigin {
     pub(in crate::layout::table) fn x(self) -> f32 {
         self.0.x()
     }
-
-    pub(in crate::layout::table) fn page_top_point(self) -> PageTopPoint {
-        self.0
-    }
 }
 
 pub(in crate::layout::table) struct TableBodyFragmentCommitContext<'table, 'ctx> {
@@ -218,7 +243,7 @@ pub(in crate::layout::table) struct TableBodyFragmentCommitContext<'table, 'ctx>
         HorizontalTableContinuationInlineOffset,
     pub(in crate::layout::table) logical_inline_extent: LogicalInlineContentSize,
     pub(in crate::layout::table) physical_grid_width: PhysicalContentWidth,
-    pub(in crate::layout::table) table_cellpadding: Option<f32>,
+    pub(in crate::layout::table) table_cellpadding: Option<TableCellPadding>,
     pub(in crate::layout::table) column_plan: &'ctx TableColumnPlan,
     pub(in crate::layout::table) planned_row_heights: &'ctx [f32],
     pub(in crate::layout::table) planned_row_occupancy: &'ctx [bool],

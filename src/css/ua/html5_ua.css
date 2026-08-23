@@ -20,6 +20,10 @@ a[href] { -weasy-link: attr(href) }
 /* Display and visibility */
 
 [hidden], area, base, basefont, command, datalist, head, input[type=hidden i], link, menu[type=context i], meta, noembed, noframes, param, rp, script, source, style, template, title, track { display: none }
+/* HTML hides fallback content only when scripting is enabled. Quire's static
+   rendering environment reports `scripting: none`, so this rule does not
+   suppress `<noscript>` content. https://html.spec.whatwg.org/multipage/rendering.html#hidden-elements */
+@media (scripting) { noscript { display: none !important } }
 address, article, aside, blockquote, body, center, dd, details, dir, div, dl, dt, frame, frameset, fieldset, figure, figcaption, footer, form, h1, h2, h3, h4, h5, h6, header, hgroup, hr, html, legend, listing, main, menu, nav, ol, p, plaintext, pre, section, summary, ul, xmp { display: block }
 button, input, keygen, select, textarea { display: inline-block }
 li { display: list-item }

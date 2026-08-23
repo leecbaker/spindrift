@@ -1,5 +1,18 @@
-use super::*;
+use crate::css::{self, ComputedStyle, ElementSignature, PercentageBasis, Position, Stylesheets};
+use crate::dom::NodeKind;
 use crate::layout::inline_collect::TextDecorationPropagationContext;
+use crate::layout::table::layout::{
+    table_cell_child_is_in_flow_float, table_cell_content_pass, table_cell_has_in_flow_layout_child,
+};
+use crate::layout::table::{
+    TableCell, TableCellBorderBox, TableCellContentGeometry, TableGridPlacement, TableRow,
+};
+use crate::layout::{
+    AbsoluteStaticPosition, ContainingBlock, FloatPlacementAxes, LayoutBuilder, OverflowClip,
+    PositionedContainingBlockMode, PositionedContainingBlockScope, box_tree,
+    element_sibling_signature_list, formatting_box_has_inline_content,
+    has_non_inline_formatting_box,
+};
 
 impl<'a> LayoutBuilder<'a> {
     /// Lay out in-flow block descendants inside a table cell content box.
@@ -103,6 +116,7 @@ impl<'a> LayoutBuilder<'a> {
                         Some(child_children),
                         table_fragment,
                         stylesheets,
+                        FloatPlacementAxes::for_style(cell_style),
                         &mut float_run,
                     ) {
                         continue;

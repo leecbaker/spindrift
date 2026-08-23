@@ -129,24 +129,37 @@ pub(in crate::layout::flex) fn definite_flex_container_content_height(
         return explicit_content_height;
     }
 
-    let ratio = style.aspect_ratio.preferred_ratio_for_non_replaced(false)?;
-    if ratio <= 0.0 || !ratio.is_finite() {
-        return None;
-    }
-
-    let content_height = match style.box_sizing {
-        BoxSizing::ContentBox => content_width / ratio,
-        BoxSizing::BorderBox => {
-            let border_box_width =
-                content_box_to_border_box_length(content_width, horizontal_non_content);
-            border_box_to_content_box_length(border_box_width / ratio, vertical_non_content)
-        }
-    };
+    let ratio =
+        ResolvedAspectRatio::for_non_replaced(style, horizontal_non_content, vertical_non_content)?;
+    let content_height = ratio.height_from_width(content_width);
     Some(constrain_content_height(
         style,
-        content_height.max(content_box_pt(0.0)),
+        content_height,
         percentage_basis,
     ))
+}
+
+/// Select the used block size of an automatic flex container after measuring
+/// its content-based automatic minimum independently of its ratio-derived
+/// preferred size.
+///
+/// CSS Sizing 4 floors a ratio-dependent automatic block size by the
+/// content-based automatic minimum on non-scroll containers, then applies the
+/// effective maximum. An explicit minimum has already replaced `auto` and is
+/// handled by the ordinary constraint calculation:
+/// <https://drafts.csswg.org/css-sizing-4/#aspect-ratio-minimum>.
+pub(in crate::layout::flex) fn select_ratio_derived_flex_container_height(
+    style: &ComputedStyle,
+    preferred_height: ContentBoxLength,
+    automatic_minimum: ContentBoxLength,
+    percentage_basis: BlockSizePercentageBasis,
+) -> ContentBoxLength {
+    let tentative = if style.box_values.min_height.is_auto() && !style.overflow_y.is_scrollable() {
+        content_box_pt(preferred_height.points().max(automatic_minimum.points()))
+    } else {
+        preferred_height
+    };
+    constrain_content_height(style, tentative, percentage_basis)
 }
 
 /// Returns whether an unfragmented flex container should prebreak to the next page.
@@ -1172,13 +1185,46 @@ pub(in crate::layout::flex) fn flex_gap_decoration_primitives_for_page(
         PhysicalContentWidth::new(content_box_pt(context.content_inline_span.width())),
         context.content_height,
     );
+    let fragments_at_item_main_axis_boundaries =
+        FlexFragmentationBoundaryProjection::for_style(style)
+            == FlexFragmentationBoundaryProjection::ItemMainAxis;
+    let has_later_page_fragment = flex_layout
+        .fragment_plan
+        .fragments
+        .iter()
+        .any(|fragment| fragment.page_index > context.page_index);
+    let suppresses_cross_axis_gutter_at_outgoing_break = fragments_at_item_main_axis_boundaries
+        && has_later_page_fragment
+        && block_end < context.content_height.points() - 0.01;
+    let suppressed_cross_axis_gutters = if suppresses_cross_axis_gutter_at_outgoing_break {
+        gutters.columns.clone()
+    } else {
+        Vec::new()
+    };
     gutters.columns = gutters
         .columns
         .into_iter()
         .filter_map(|mut gutter| {
             let Some(segment) = gutter.segment_range else {
-                return Some(gutter);
+                // In a physical-Y main-axis fragment, cross-axis gutters run
+                // through the source main-axis extent. If that extent reaches
+                // the outgoing fragmentation break, the gutter disappears at
+                // the break and this fragment paints no decoration for it.
+                // The following fragment recomputes its re-established
+                // gutter from the surviving item intervals.
+                // <https://drafts.csswg.org/css-gaps-1/#fragmentation>
+                return (!suppresses_cross_axis_gutter_at_outgoing_break).then_some(gutter);
             };
+            // A physical cross-axis gutter that reaches an outgoing
+            // item-main-axis fragmentation break has no gap there, so its
+            // decoration is suppressed with that gap. The continuation
+            // re-establishes the gutter from its own surviving item interval;
+            // clipping the original source segment on both pages would paint
+            // a decoration through a fragmentation break.
+            // <https://drafts.csswg.org/css-gaps-1/#fragmentation>
+            if fragments_at_item_main_axis_boundaries && segment.end > block_end + 0.01 {
+                return None;
+            }
             let start = segment.start.max(block_start);
             let end = segment.end.min(block_end);
             if end <= start + 0.01 {
@@ -1188,6 +1234,28 @@ pub(in crate::layout::flex) fn flex_gap_decoration_primitives_for_page(
             Some(gutter)
         })
         .collect();
+    if !suppressed_cross_axis_gutters.is_empty() {
+        // Once the cross-axis gutter disappears at this outgoing break, its
+        // perpendicular main-axis decorations meet through the former
+        // junction. Preserve each line-owned rule and let neighboring
+        // segments meet at the collapsed gutter's center instead of leaving
+        // a decoration-sized hole.
+        for gutter in &mut gutters.rows {
+            let Some(mut segment) = gutter.segment_range else {
+                continue;
+            };
+            for cross_gutter in &suppressed_cross_axis_gutters {
+                let center = (cross_gutter.span.start + cross_gutter.span.end) * 0.5;
+                if (segment.end - cross_gutter.span.start).abs() <= 0.01 {
+                    segment.end = center;
+                }
+                if (segment.start - cross_gutter.span.end).abs() <= 0.01 {
+                    segment.start = center;
+                }
+            }
+            gutter.segment_range = Some(segment);
+        }
+    }
     gutters.rows = if context.has_forced_item_breaks {
         // Forced breaks between flex items/lines replace the intervening row
         // gutter with a fragmentainer boundary. No fragment owns that gutter,
@@ -1383,6 +1451,38 @@ fn assign_flex_gap_rule_indices(gutters: &mut [GapDecorationGutter], reverse: bo
     }
 }
 
+/// The cross-axis band occupied by a finalized flex line for gap decoration.
+///
+/// Ordinary lines retain the cross-size slot resolved by Quire's final flex
+/// layout.  Item rectangles cannot stand in for that slot: `align-content:
+/// stretch` grows the line even when its fixed-size items do not stretch.
+/// Reconstructing a band from items is reserved for the exceptional stale-line
+/// replay shape documented by [`FinalizedFlexGapLine`].
+enum FinalizedFlexGapLineBand {
+    Allocated {
+        start: FlexCrossOffset,
+        end: FlexCrossOffset,
+    },
+    ReconstructedFromItems {
+        start: FlexCrossOffset,
+        end: FlexCrossOffset,
+    },
+}
+
+impl FinalizedFlexGapLineBand {
+    fn start(&self) -> FlexCrossOffset {
+        match self {
+            Self::Allocated { start, .. } | Self::ReconstructedFromItems { start, .. } => *start,
+        }
+    }
+
+    fn end(&self) -> FlexCrossOffset {
+        match self {
+            Self::Allocated { end, .. } | Self::ReconstructedFromItems { end, .. } => *end,
+        }
+    }
+}
+
 /// One final flex line reconstructed for gap-decoration topology.
 ///
 /// Taffy's line-membership record is normally authoritative.  During an
@@ -1393,8 +1493,7 @@ fn assign_flex_gap_rule_indices(gutters: &mut [GapDecorationGutter], reverse: bo
 /// actual gaps.  Ordinary aligned items stay in their recorded line.
 struct FinalizedFlexGapLine<'a> {
     items: Vec<&'a FlexItemLayout>,
-    cross_start: f32,
-    cross_end: f32,
+    cross_band: FinalizedFlexGapLineBand,
 }
 
 fn finalized_flex_gap_lines<'a>(
@@ -1442,25 +1541,52 @@ fn finalized_flex_gap_lines<'a>(
                     .push(item);
             }
         }
+        if line_groups.len() == 1 {
+            // `FlexLineLayout` owns the finalized flex line allocation. This
+            // differs from the union of its item rectangles whenever the
+            // line has free cross-axis space, such as `align-content:
+            // stretch` with fixed cross-size items.
+            // <https://www.w3.org/TR/css-flexbox-1/#algo-line-break>
+            resolved.push(FinalizedFlexGapLine {
+                items: line_groups
+                    .pop()
+                    .expect("a non-empty flex line has one item group"),
+                cross_band: FinalizedFlexGapLineBand::Allocated {
+                    start: line.cross_start,
+                    end: line.cross_end,
+                },
+            });
+            continue;
+        }
+
+        // A source line that resolves to multiple disjoint, overlapping-main
+        // bands is stale replay metadata rather than one CSS flex line. No
+        // allocated per-band slot exists in that exceptional shape, so derive
+        // each replacement band from its finalized item rectangles.
         resolved.extend(line_groups.into_iter().map(|items| {
             let cross_start = items
                 .iter()
-                .map(|item| item.cross_start(axes).points())
-                .fold(f32::INFINITY, f32::min);
+                .map(|item| item.cross_start(axes))
+                .min_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+                .expect("a reconstructed flex gap line has items");
             let cross_end = items
                 .iter()
-                .map(|item| (item.cross_start(axes) + item.cross_size(axes)).points())
-                .fold(f32::NEG_INFINITY, f32::max);
+                .map(|item| item.cross_start(axes) + item.cross_size(axes))
+                .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+                .expect("a reconstructed flex gap line has items");
             FinalizedFlexGapLine {
                 items,
-                cross_start,
-                cross_end,
+                cross_band: FinalizedFlexGapLineBand::ReconstructedFromItems {
+                    start: cross_start,
+                    end: cross_end,
+                },
             }
         }));
     }
     resolved.sort_by(|left, right| {
-        left.cross_start
-            .partial_cmp(&right.cross_start)
+        left.cross_band
+            .start()
+            .partial_cmp(&right.cross_band.start())
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     if axes.cross_start_side().is_end_edge() {
@@ -1490,7 +1616,7 @@ pub(in crate::layout::flex) fn flex_main_axis_gap_gutters(
         // including space added by `align-content: stretch`; the item margin
         // boxes determine gutter centers but do not truncate the line segment.
         // <https://drafts.csswg.org/css-gaps-1/#flex-gaps>
-        let line_cross_range = Some((line.cross_start, line.cross_end));
+        let line_cross_range = Some((line.cross_band.start(), line.cross_band.end()));
         for pair in line_items.windows(2) {
             // Taffy's finalized item positions already include the exact
             // distributed-alignment remainder. Reconstructing a CSS-pixel
@@ -1516,7 +1642,7 @@ pub(in crate::layout::flex) fn flex_main_axis_gap_gutters(
                     } else {
                         FlexGapDecorationGutterWidth::Fixed(layout_pt(used_gap.points()))
                     },
-                    GapAxisSpan::new(segment_start, segment_end),
+                    GapAxisSpan::new(segment_start.points(), segment_end.points()),
                 );
             }
         }
@@ -1539,14 +1665,12 @@ pub(in crate::layout::flex) fn flex_cross_axis_gap_gutters(
     // stretched line allocation, so these boundaries are the authoritative
     // used gutter edges.
     // <https://drafts.csswg.org/css-gaps-1/#flex-gaps>
-    // Taffy's line cross bounds include the leading/trailing authored gutter
-    // in several wrapped auto-size configurations. Adjacent finalized item
-    // margin boxes are the unambiguous boundaries of the used cross gap; they
-    // also retain `align-content` distribution in their resolved positions.
-    // <https://drafts.csswg.org/css-gaps-1/#flex-gaps>
+    // Ordinary finalized lines retain their allocated cross bands. The
+    // exceptional stale-membership replay case reconstructs a physical band
+    // from its item group before it reaches this adapter.
     let line_bands = finalized_flex_gap_lines(flex_layout, axes)
         .into_iter()
-        .map(|line| (line.cross_start, line.cross_end))
+        .map(|line| (line.cross_band.start(), line.cross_band.end()))
         .collect::<Vec<_>>();
     let mut gutters = Vec::new();
     for pair in line_bands.windows(2) {
@@ -1555,10 +1679,10 @@ pub(in crate::layout::flex) fn flex_cross_axis_gap_gutters(
         // main-axis portions above, derive the physical increasing span from
         // the two facing line edges instead of assuming the earlier logical
         // line is physically before the next one.
-        let first_start = pair[0].0;
-        let first_end = pair[0].1;
-        let second_start = pair[1].0;
-        let second_end = pair[1].1;
+        let first_start = pair[0].0.points();
+        let first_end = pair[0].1.points();
+        let second_start = pair[1].0.points();
+        let second_end = pair[1].1.points();
         push_unique_flex_gap_gutter(
             &mut gutters,
             GapAxisSpan::new(first_end.min(second_end), first_start.max(second_start)),
@@ -1920,6 +2044,88 @@ mod tests {
     }
 
     #[test]
+    fn vertical_row_break_units_partition_overlapping_wrapped_lines_by_item_interval() {
+        let mut style = ComputedStyle::initial();
+        style.writing_mode = WritingMode::SidewaysRl;
+        style.flex_direction = FlexDirection::Row;
+        let children = (0..4)
+            .map(|_| StyledChild {
+                kind: crate::layout::itemization::FormattingContextChildKind::AnonymousContent {
+                    children: Vec::new(),
+                },
+                style: ComputedStyle::initial(),
+            })
+            .collect::<Vec<_>>();
+        let flex_layout = FlexLayout {
+            height: PhysicalContentHeight::new(content_box_pt(110.0)),
+            main_gap: FlexMainSize::new(10.0),
+            baselines: FlexContainerBaselineSets::default(),
+            items: vec![
+                FlexItemLayout::new(ContainerRect::new(
+                    ContainerPoint::new(0.0, 0.0),
+                    ContainerSize::new(50.0, 50.0),
+                )),
+                FlexItemLayout::new(ContainerRect::new(
+                    ContainerPoint::new(0.0, 60.0),
+                    ContainerSize::new(50.0, 50.0),
+                )),
+                FlexItemLayout::new(ContainerRect::new(
+                    ContainerPoint::new(60.0, 0.0),
+                    ContainerSize::new(50.0, 50.0),
+                )),
+                FlexItemLayout::new(ContainerRect::new(
+                    ContainerPoint::new(60.0, 60.0),
+                    ContainerSize::new(50.0, 50.0),
+                )),
+            ],
+            lines: vec![
+                test_flex_line(
+                    vec![0, 1],
+                    FlexMainOffset::new(0.0),
+                    FlexMainOffset::new(110.0),
+                    FlexCrossOffset::new(0.0),
+                    FlexCrossOffset::new(50.0),
+                ),
+                test_flex_line(
+                    vec![2, 3],
+                    FlexMainOffset::new(0.0),
+                    FlexMainOffset::new(110.0),
+                    FlexCrossOffset::new(60.0),
+                    FlexCrossOffset::new(110.0),
+                ),
+            ],
+            fragment_plan: FlexFragmentPlan::default(),
+        };
+
+        let units = flex_container_break_units(
+            FragmentainerKind::Page,
+            &flex_layout,
+            &children,
+            &style,
+            false,
+            layout_pt(110.0),
+        );
+
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0].item_indices, vec![0, 2]);
+        assert_eq!(
+            (units[0].block_start, units[0].block_end),
+            (
+                FlexFragmentBlockOffset::new(0.0),
+                FlexFragmentBlockOffset::new(50.0),
+            )
+        );
+        assert_eq!(units[1].item_indices, vec![1, 3]);
+        assert_eq!(
+            (units[1].block_start, units[1].block_end),
+            (
+                FlexFragmentBlockOffset::new(60.0),
+                FlexFragmentBlockOffset::new(110.0),
+            )
+        );
+    }
+
+    #[test]
     fn wrapped_column_item_growth_stays_within_its_own_line() {
         let mut items = vec![
             FlexItemLayout::new(ContainerRect::new(
@@ -2088,6 +2294,37 @@ mod tests {
     }
 
     #[test]
+    fn ratio_derived_flex_container_height_is_floored_by_automatic_minimum() {
+        let style = ComputedStyle::initial();
+
+        let height = select_ratio_derived_flex_container_height(
+            &style,
+            content_box_pt(50.0),
+            content_box_pt(100.0),
+            containing_block_height_basis(PhysicalContentHeight::new(content_box_pt(500.0))),
+        );
+
+        assert_eq!(height, content_box_pt(100.0));
+    }
+
+    #[test]
+    fn ratio_derived_flex_container_height_applies_max_after_automatic_minimum() {
+        let mut style = ComputedStyle::initial();
+        style.box_values.max_height = css::ComputedLengthPercentageOrAuto::LengthPercentage(
+            css::ComputedLengthPercentage::from_points(80.0),
+        );
+
+        let height = select_ratio_derived_flex_container_height(
+            &style,
+            content_box_pt(50.0),
+            content_box_pt(100.0),
+            containing_block_height_basis(PhysicalContentHeight::new(content_box_pt(500.0))),
+        );
+
+        assert_eq!(height, content_box_pt(80.0));
+    }
+
+    #[test]
     fn wrapped_column_flex_uses_max_height_as_available_height() {
         let mut style = ComputedStyle::initial();
         style.flex_direction = FlexDirection::Column;
@@ -2134,6 +2371,7 @@ mod tests {
                     last: None,
                 },
                 horizontal: FlexItemBaselinePair::default(),
+                ..FlexContainerBaselineSets::default()
             },
             items: vec![
                 FlexItemLayout::new(ContainerRect::new(
@@ -2218,6 +2456,76 @@ mod tests {
         assert_eq!(no_gap_gutters.rows.len(), 1);
         assert!(
             (no_gap_gutters.rows[0].span.end - no_gap_gutters.rows[0].span.start).abs() <= 0.01
+        );
+    }
+
+    #[test]
+    fn flex_gap_gutters_preserve_stretched_line_bands() {
+        let mut style = ComputedStyle::initial();
+        style.flex_direction = FlexDirection::Column;
+        style.justify_content.keyword = ContentAlignmentKeyword::SpaceBetween;
+        style.column_gap =
+            css::ComputedGap::LengthPercentage(css::ComputedLengthPercentage::from_points(5.0));
+        let flex_layout = FlexLayout {
+            height: PhysicalContentHeight::new(content_box_pt(200.0)),
+            main_gap: FlexMainSize::new(0.0),
+            baselines: FlexContainerBaselineSets::default(),
+            items: vec![
+                FlexItemLayout::new(ContainerRect::new(
+                    ContainerPoint::new(0.0, 0.0),
+                    ContainerSize::new(50.0, 50.0),
+                )),
+                FlexItemLayout::new(ContainerRect::new(
+                    ContainerPoint::new(0.0, 150.0),
+                    ContainerSize::new(50.0, 50.0),
+                )),
+                FlexItemLayout::new(ContainerRect::new(
+                    ContainerPoint::new(62.5, 0.0),
+                    ContainerSize::new(50.0, 50.0),
+                )),
+                FlexItemLayout::new(ContainerRect::new(
+                    ContainerPoint::new(62.5, 150.0),
+                    ContainerSize::new(50.0, 50.0),
+                )),
+            ],
+            lines: vec![
+                test_flex_line(
+                    vec![0, 1],
+                    FlexMainOffset::new(0.0),
+                    FlexMainOffset::new(200.0),
+                    FlexCrossOffset::new(0.0),
+                    FlexCrossOffset::new(57.5),
+                ),
+                test_flex_line(
+                    vec![2, 3],
+                    FlexMainOffset::new(0.0),
+                    FlexMainOffset::new(200.0),
+                    FlexCrossOffset::new(62.5),
+                    FlexCrossOffset::new(120.0),
+                ),
+            ],
+            fragment_plan: FlexFragmentPlan::default(),
+        };
+
+        let gutters = flex_gap_decoration_gutters(
+            &flex_layout,
+            &style,
+            PhysicalContentWidth::new(content_box_pt(120.0)),
+            PhysicalContentHeight::new(content_box_pt(200.0)),
+        );
+
+        assert_eq!(gutters.columns.len(), 1);
+        assert_eq!(gutters.columns[0].span, GapAxisSpan::new(57.5, 62.5));
+        assert_eq!(gutters.rows.len(), 2);
+        assert_eq!(gutters.rows[0].span, GapAxisSpan::new(50.0, 150.0));
+        assert_eq!(
+            gutters.rows[0].segment_range,
+            Some(GapAxisSpan::new(0.0, 57.5))
+        );
+        assert_eq!(gutters.rows[1].span, GapAxisSpan::new(50.0, 150.0));
+        assert_eq!(
+            gutters.rows[1].segment_range,
+            Some(GapAxisSpan::new(62.5, 120.0))
         );
     }
 
@@ -2356,6 +2664,7 @@ mod tests {
                     last: None,
                 },
                 horizontal: FlexItemBaselinePair::default(),
+                ..FlexContainerBaselineSets::default()
             },
             items: vec![left.clone(), right.clone()],
             lines: vec![test_flex_line(
@@ -2401,6 +2710,131 @@ mod tests {
         assert_eq!(strokes[0].y1(), 150.0);
         assert_eq!(strokes[0].y2(), 100.0);
         assert_eq!(strokes[0].stroke_width, PaintStrokeWidth::new(4.0));
+    }
+
+    #[test]
+    fn vertical_main_axis_break_suppresses_cross_gutter_on_outgoing_fragment() {
+        let mut style = ComputedStyle::initial();
+        style.visibility = Visibility::Visible;
+        style.writing_mode = WritingMode::VerticalRl;
+        style.flex_direction = FlexDirection::Row;
+        style.column_gap =
+            css::ComputedGap::LengthPercentage(css::ComputedLengthPercentage::from_points(10.0));
+        style.row_gap =
+            css::ComputedGap::LengthPercentage(css::ComputedLengthPercentage::from_points(10.0));
+        style.column_rule.widths =
+            css::GapRuleList::single(css::ComputedLengthPercentage::from_points(10.0));
+        style.column_rule.styles = css::GapRuleList::single(BorderStyle::Solid);
+        style.column_rule.colors = css::GapRuleList::single(CssColor::new(255, 0, 0));
+        style.row_rule.widths =
+            css::GapRuleList::single(css::ComputedLengthPercentage::from_points(10.0));
+        style.row_rule.styles = css::GapRuleList::single(BorderStyle::Solid);
+        style.row_rule.colors = css::GapRuleList::single(CssColor::new(0, 128, 0));
+        let items = vec![
+            FlexItemLayout::new(ContainerRect::new(
+                ContainerPoint::new(0.0, 0.0),
+                ContainerSize::new(50.0, 50.0),
+            )),
+            FlexItemLayout::new(ContainerRect::new(
+                ContainerPoint::new(0.0, 60.0),
+                ContainerSize::new(50.0, 50.0),
+            )),
+            FlexItemLayout::new(ContainerRect::new(
+                ContainerPoint::new(60.0, 0.0),
+                ContainerSize::new(50.0, 50.0),
+            )),
+            FlexItemLayout::new(ContainerRect::new(
+                ContainerPoint::new(60.0, 60.0),
+                ContainerSize::new(50.0, 50.0),
+            )),
+        ];
+        let flex_layout = FlexLayout {
+            height: PhysicalContentHeight::new(content_box_pt(110.0)),
+            main_gap: FlexMainSize::new(10.0),
+            baselines: FlexContainerBaselineSets::default(),
+            items,
+            lines: vec![
+                test_flex_line(
+                    vec![0, 1],
+                    FlexMainOffset::new(0.0),
+                    FlexMainOffset::new(110.0),
+                    FlexCrossOffset::new(0.0),
+                    FlexCrossOffset::new(50.0),
+                ),
+                test_flex_line(
+                    vec![2, 3],
+                    FlexMainOffset::new(0.0),
+                    FlexMainOffset::new(110.0),
+                    FlexCrossOffset::new(60.0),
+                    FlexCrossOffset::new(110.0),
+                ),
+            ],
+            fragment_plan: FlexFragmentPlan {
+                fragments: vec![
+                    FlexFragmentLayout {
+                        page_index: 0,
+                        line_start: 0,
+                        line_end: 2,
+                        block_start: FlexFragmentBlockOffset::new(0.0),
+                        block_end: FlexFragmentBlockOffset::new(60.0),
+                        line_fragments: Vec::new(),
+                        items: Vec::new(),
+                        metadata: FragmentPageMetadata::empty(0),
+                    },
+                    FlexFragmentLayout {
+                        page_index: 1,
+                        line_start: 0,
+                        line_end: 2,
+                        block_start: FlexFragmentBlockOffset::new(60.0),
+                        block_end: FlexFragmentBlockOffset::new(110.0),
+                        line_fragments: Vec::new(),
+                        items: Vec::new(),
+                        metadata: FragmentPageMetadata::empty(1),
+                    },
+                ],
+                materialized_fragments: Vec::new(),
+            },
+        };
+
+        let primitives = flex_gap_decoration_primitives_for_page(
+            &flex_layout,
+            &style,
+            FlexGapDecorationFragmentContext {
+                page_index: 0,
+                content_inline_span: PageInlineSpan::new(0.0, 110.0),
+                content_height: PhysicalContentHeight::new(content_box_pt(110.0)),
+                fragment_bounds: PaintClip::new(0.0, 100.0, 110.0, 60.0),
+                has_forced_item_breaks: false,
+            },
+        );
+        let strokes = solid_gap_rule_centerlines(&primitives);
+
+        // The fragment break suppresses the vertical cross-axis gutter. Its
+        // two neighboring horizontal main-gap portions meet at the former
+        // junction instead of leaving a decoration-sized hole.
+        assert_eq!(strokes.len(), 2);
+        assert!(strokes.iter().all(|stroke| stroke.y1() == stroke.y2()));
+        assert_eq!(
+            strokes
+                .iter()
+                .map(|stroke| stroke.x1().min(stroke.x2()))
+                .min_by(|left, right| left.partial_cmp(right).unwrap())
+                .unwrap(),
+            0.0
+        );
+        assert_eq!(
+            strokes
+                .iter()
+                .map(|stroke| stroke.x1().max(stroke.x2()))
+                .max_by(|left, right| left.partial_cmp(right).unwrap())
+                .unwrap(),
+            110.0
+        );
+        assert!(
+            strokes
+                .iter()
+                .all(|stroke| stroke.stroke_width == PaintStrokeWidth::new(10.0))
+        );
     }
 
     #[test]

@@ -484,16 +484,12 @@ impl<'a> LayoutBuilder<'a> {
                 preferred_aspect_ratio,
             );
             // CSS Tables defines a table's used `min-width` as at least its
-            // min-content width. Taffy's generic definite-minimum path would
-            // otherwise replace that table-specific floor with the authored
-            // value (for example, `min-width: 50px`), allowing a 100px
-            // min-content table to shrink to 50px as a flex item.
+            // min-content width. An authored minimum may raise that floor;
+            // it must not be replaced by it. In particular, `min-width: 50%`
+            // remains 50% of the definite flex container rather than being
+            // silently converted to `min-content`.
             // <https://drafts.csswg.org/css-tables/#used-min-width-of-table>
-            let flex_min_width = if child_style.display.is_table() {
-                css::ComputedLengthPercentageOrAuto::MinContent
-            } else {
-                child_style.box_values.min_width.clone()
-            };
+            let flex_min_width = child_style.box_values.min_width.clone();
             // The corresponding table-wrapper block minimum is the grid and
             // caption min-content contribution. A specified `height` or
             // `min-height: 0` is a preferred-size suggestion for Flexbox; it
@@ -539,7 +535,12 @@ impl<'a> LayoutBuilder<'a> {
             };
             let resolved_flex_basis =
                 resolve_taffy_flex_basis(child_style, &estimated_size, flex_basis_context);
+            let resolved_flex_basis_is_definite = resolved_flex_basis.is_definite();
             estimated_size.set_main_size_provenance(resolved_flex_basis.provenance);
+            debug_assert_eq!(
+                estimated_size.main_size_provenance.is_definite(),
+                resolved_flex_basis_is_definite
+            );
             let taffy_flex_basis = resolved_flex_basis.dimension;
             // Taffy's `size` fallback participates in its leaf flex-base
             // measurement even when Flexbox supplies a definite basis.  For
@@ -665,68 +666,101 @@ impl<'a> LayoutBuilder<'a> {
                         },
                         aspect_ratio: taffy_aspect_ratio,
                         min_size: taffy_layout::Size {
-                            width: flex_min_size_dimension(
-                                flex_min_width,
-                                physical_direction
-                                    .is_row_axis()
-                                    .then_some(automatic_main_min_content)
-                                    .flatten()
-                                    .unwrap_or(estimated_size.min_width),
-                                estimated_size.content_width,
-                                FlexMinSizeDimensionContext {
-                                    style: child_style,
-                                    direction: FlexDirection::Row,
-                                    automatic_minimum_inputs: physical_direction
+                            width: if child_style.display.is_table()
+                                && matches!(
+                                    flex_min_width,
+                                    css::ComputedLengthPercentageOrAuto::LengthPercentage(_)
+                                ) {
+                                table_length_percentage_min_dimension(
+                                    flex_min_width,
+                                    available.width_basis,
+                                    estimated_size.min_width,
+                                )
+                            } else {
+                                flex_min_size_dimension(
+                                    flex_min_width,
+                                    physical_direction
                                         .is_row_axis()
-                                        .then_some(estimated_size.automatic_main_minimum_inputs)
-                                        .flatten(),
-                                    available_cross_size: available
-                                        .height_basis_content_box_length()
-                                        .map(flex_cross_size_from_content_box),
-                                    stretched_cross_size: physical_direction
-                                        .is_row_axis()
-                                        .then_some(stretched_cross_size)
-                                        .flatten(),
-                                    is_main_axis: physical_direction.is_row_axis(),
-                                    overflow: flex_item_main_axis_overflow(
-                                        child_style,
-                                        physical_direction,
-                                    ),
-                                    percentage_basis: available.width_basis,
-                                    stretch: horizontal_stretch,
-                                },
-                            ),
-                            height: flex_min_size_dimension(
-                                flex_min_height,
-                                physical_direction
-                                    .is_column_axis()
-                                    .then_some(automatic_main_min_content)
-                                    .flatten()
-                                    .unwrap_or(estimated_size.min_height),
-                                estimated_size.content_height,
-                                FlexMinSizeDimensionContext {
-                                    style: child_style,
-                                    direction: FlexDirection::Column,
-                                    automatic_minimum_inputs: physical_direction
+                                        .then_some(automatic_main_min_content)
+                                        .flatten()
+                                        .unwrap_or(estimated_size.min_width),
+                                    estimated_size.content_width,
+                                    FlexMinSizeDimensionContext {
+                                        style: child_style,
+                                        direction: FlexDirection::Row,
+                                        automatic_minimum_inputs: physical_direction
+                                            .is_row_axis()
+                                            .then_some(estimated_size.automatic_main_minimum_inputs)
+                                            .flatten(),
+                                        available_cross_size: available
+                                            .height_basis_content_box_length()
+                                            .map(flex_cross_size_from_content_box),
+                                        cross_stretch: vertical_stretch,
+                                        stretched_cross_size: physical_direction
+                                            .is_row_axis()
+                                            .then_some(stretched_cross_size)
+                                            .flatten(),
+                                        is_main_axis: physical_direction.is_row_axis(),
+                                        overflow: flex_item_main_axis_overflow(
+                                            child_style,
+                                            physical_direction,
+                                        ),
+                                        percentage_basis: available.width_basis,
+                                        stretch: horizontal_stretch,
+                                    },
+                                )
+                            },
+                            height: if child_style.display.is_table()
+                                && matches!(
+                                    flex_min_height,
+                                    css::ComputedLengthPercentageOrAuto::LengthPercentage(_)
+                                ) {
+                                table_length_percentage_min_dimension(
+                                    flex_min_height,
+                                    available.height_basis,
+                                    estimated_size.min_height,
+                                )
+                            } else if child_style.display.is_table()
+                                && physical_direction.is_column_axis()
+                            {
+                                // A table grid/caption cannot be compressed
+                                // below its own intrinsic block minimum merely
+                                // because Flexbox received `min-height: 0`.
+                                taffy_layout::Dimension::length(estimated_size.min_height.points())
+                            } else {
+                                flex_min_size_dimension(
+                                    flex_min_height,
+                                    physical_direction
                                         .is_column_axis()
-                                        .then_some(estimated_size.automatic_main_minimum_inputs)
-                                        .flatten(),
-                                    available_cross_size: available
-                                        .width_basis_content_box_length()
-                                        .map(flex_cross_size_from_content_box),
-                                    stretched_cross_size: physical_direction
-                                        .is_column_axis()
-                                        .then_some(stretched_cross_size)
-                                        .flatten(),
-                                    is_main_axis: physical_direction.is_column_axis(),
-                                    overflow: flex_item_main_axis_overflow(
-                                        child_style,
-                                        physical_direction,
-                                    ),
-                                    percentage_basis: available.height_basis,
-                                    stretch: vertical_stretch,
-                                },
-                            ),
+                                        .then_some(automatic_main_min_content)
+                                        .flatten()
+                                        .unwrap_or(estimated_size.min_height),
+                                    estimated_size.content_height,
+                                    FlexMinSizeDimensionContext {
+                                        style: child_style,
+                                        direction: FlexDirection::Column,
+                                        automatic_minimum_inputs: physical_direction
+                                            .is_column_axis()
+                                            .then_some(estimated_size.automatic_main_minimum_inputs)
+                                            .flatten(),
+                                        available_cross_size: available
+                                            .width_basis_content_box_length()
+                                            .map(flex_cross_size_from_content_box),
+                                        cross_stretch: horizontal_stretch,
+                                        stretched_cross_size: physical_direction
+                                            .is_column_axis()
+                                            .then_some(stretched_cross_size)
+                                            .flatten(),
+                                        is_main_axis: physical_direction.is_column_axis(),
+                                        overflow: flex_item_main_axis_overflow(
+                                            child_style,
+                                            physical_direction,
+                                        ),
+                                        percentage_basis: available.height_basis,
+                                        stretch: vertical_stretch,
+                                    },
+                                )
+                            },
                         },
                         max_size: taffy_layout::Size {
                             width: taffy_intrinsic_dimension_with_basis_and_stretch(
@@ -1542,6 +1576,13 @@ fn taffy_flex_wrap(
             non_content_pt(style.padding.top + style.padding.bottom + vertical_border_width(style)),
         )
         .is_some()
+            || matches!(
+                available.height_basis,
+                PercentageBasis::Definite {
+                    source: FlexAvailableSizeSource::AspectRatioDerived,
+                    ..
+                }
+            )
             // An automatic column flex container still uses a resolved
             // `max-height` to collect wrapped flex lines. The maximum does
             // not make descendant percentage heights definite, but Taffy's
@@ -2308,9 +2349,9 @@ impl<'a> LayoutBuilder<'a> {
     /// This probe deliberately uses the exact placed-item replay boundary.
     /// The Taffy rectangle remains useful for resolving flexible lengths, but
     /// it cannot stand in for the selected in-flow line boxes used by the
-    /// Flexbox cross-size algorithm.  Snapshot restoration makes the probe
-    /// geometry-only: paint, positioned descendants, and fragmentation keep
-    /// their ordinary replay ownership.
+    /// Flexbox cross-size algorithm. A detached replay transaction makes the
+    /// probe geometry-only: paint, positioned descendants, and fragmentation
+    /// stay out of the committed document.
     /// <https://www.w3.org/TR/css-flexbox-1/#algo-cross-line>
     /// <https://www.w3.org/TR/css-inline-3/#line-box>
     fn measure_final_normal_flow_line_box_spans(
@@ -2370,67 +2411,75 @@ impl<'a> LayoutBuilder<'a> {
             // <https://drafts.csswg.org/css-flexbox-1/#definite-sizes>
             let percentage_height_basis = flex_item_final_percentage_height_basis(
                 state.allocation(),
+                estimate,
                 child,
                 container_style,
                 physical_flex_direction(container_style),
                 available,
             );
-            let snapshot = self.snapshot();
-            let span = self.with_placed_formatting_context(
-                PlacedFormattingContext {
-                    content_left: 0.0,
-                    content_width: replay_dimensions.available_width_for_replay(),
-                    // A row probe measures automatic cross size after Flexbox
-                    // resolves its width. A column content-basis probe instead
-                    // measures the main size itself, where a provisional Taffy
-                    // height would make a nested wrapped flexbox wrap against
-                    // its own estimate rather than its max-content extent.
-                    // <https://www.w3.org/TR/css-flexbox-1/#algo-main-item>
-                    content_height: (!measurement_mode.measures_automatic_block_size())
-                        .then(|| Definite::new(replay_dimensions.available_height_for_replay())),
-                    table_wrapper_border_box_block_size: (!measurement_mode
-                        .measures_automatic_block_size())
-                    .then(|| {
-                        auto_table_wrapper_block_size_override(
-                            &child.style,
-                            replay_dimensions.border_box_height(),
-                        )
-                    })
-                    .flatten(),
-                    replay_logical_inline_size: child
-                        .anonymous_content()
-                        .is_some()
+            let span = self.with_discarded_layout_replay(|layout| {
+                layout.with_placed_formatting_context(
+                    PlacedFormattingContext {
+                        content_left: 0.0,
+                        content_width: replay_dimensions.available_width_for_replay(),
+                        // A row probe measures automatic cross size after Flexbox
+                        // resolves its width. A column content-basis probe instead
+                        // measures the main size itself, where a provisional Taffy
+                        // height would make a nested wrapped flexbox wrap against
+                        // its own estimate rather than its max-content extent.
+                        // <https://www.w3.org/TR/css-flexbox-1/#algo-main-item>
+                        content_height: (!measurement_mode.measures_automatic_block_size()).then(
+                            || Definite::new(replay_dimensions.available_height_for_replay()),
+                        ),
+                        table_wrapper_border_box_block_size: (!measurement_mode
+                            .measures_automatic_block_size())
                         .then(|| {
-                            replay_dimensions
-                                .logical_inline_size_for_replay(WritingMode::HorizontalTb, None)
+                            auto_table_wrapper_block_size_override(
+                                &child.style,
+                                replay_dimensions.border_box_height(),
+                            )
                         })
                         .flatten(),
-                    cursor_y: SCRATCH_TOP,
-                    page_start_margin_policy: PageStartMarginPolicy::Suppress,
-                    float_scope: ReplayFloatScope::IsolatedFormattingContext,
-                },
-                &placed_style,
-                |layout| {
-                    layout.layout_flex_item_contents(
-                        child,
-                        &placed_style,
-                        stylesheets,
-                        percentage_height_basis,
-                        PrincipalBoxPaintMode::RootPaints,
-                    );
-                    // The replay cursor advances across the item's border
-                    // box. Flex intrinsic metrics, however, carry the
-                    // content-box contribution and add padding/borders only
-                    // at the flex line-sizing boundary. Returning the raw
-                    // cursor delta would therefore count the item's vertical
-                    // decoration twice and retain a taller provisional line.
-                    final_normal_flow_content_block_span(
-                        border_box_pt((SCRATCH_TOP - layout.cursor_y).max(0.0)),
-                        &placed_style,
-                    )
-                },
-            );
-            self.restore(snapshot);
+                        replay_logical_inline_size: child
+                            .anonymous_content()
+                            .is_some()
+                            .then(|| {
+                                replay_dimensions
+                                    .logical_inline_size_for_replay(WritingMode::HorizontalTb, None)
+                            })
+                            .flatten()
+                            .or_else(|| {
+                                Some(
+                                    replay_dimensions
+                                        .logical_inline_content_size_for_replay(&placed_style),
+                                )
+                            }),
+                        cursor_y: SCRATCH_TOP,
+                        page_start_margin_policy: PageStartMarginPolicy::Suppress,
+                        float_scope: ReplayFloatScope::IsolatedFormattingContext,
+                    },
+                    &placed_style,
+                    |layout| {
+                        layout.layout_flex_item_contents(
+                            child,
+                            &placed_style,
+                            stylesheets,
+                            percentage_height_basis,
+                            PrincipalBoxPaintMode::RootPaints,
+                        );
+                        // The replay cursor advances across the item's border
+                        // box. Flex intrinsic metrics, however, carry the
+                        // content-box contribution and add padding/borders only
+                        // at the flex line-sizing boundary. Returning the raw
+                        // cursor delta would therefore count the item's vertical
+                        // decoration twice and retain a taller provisional line.
+                        final_normal_flow_content_block_span(
+                            border_box_pt((SCRATCH_TOP - layout.cursor_y).max(0.0)),
+                            &placed_style,
+                        )
+                    },
+                )
+            });
             state.estimate_mut().set_normal_flow_line_box_span(span);
         }
     }
@@ -2546,6 +2595,7 @@ fn assign_flex_item_percentage_height_bases(
     for (state, child) in states.iter_mut().zip(children) {
         let basis = flex_item_final_percentage_height_basis(
             state.allocation(),
+            state.estimate(),
             child,
             container_style,
             physical_direction,
@@ -2558,6 +2608,7 @@ fn assign_flex_item_percentage_height_bases(
 
 fn flex_item_final_percentage_height_basis(
     item: &FlexItemLayout,
+    estimate: FlexItemEstimate,
     child: &StyledChild<'_>,
     container_style: &ComputedStyle,
     physical_direction: FlexDirection,
@@ -2611,7 +2662,9 @@ fn flex_item_final_percentage_height_basis(
     }
 
     if physical_direction.is_column_axis()
-        && definite_post_flexing_main_size(&child.style, physical_direction, available).is_some()
+        && (estimate.main_size_provenance.is_definite()
+            || definite_post_flexing_main_size(&child.style, physical_direction, available)
+                .is_some())
     {
         return flex_item_replay_percentage_height_basis(
             &child.style,
@@ -2762,31 +2815,42 @@ pub(in crate::layout::flex) fn automatic_minimum_main_content_size(
             .map(PhysicalContentWidth::content_box_length)
             .map(flex_cross_size_from_content_box)
     };
-    let (specified_min, percentage_basis, stretch) = if direction.is_row_axis() {
+    let child_padding = flex_item_used_padding(child_style, container_style, available);
+    let child_margin = flex_item_used_margin(child_style, container_style, available);
+    let child_borders = used_border_widths(child_style);
+    let horizontal_stretch = FlexStretchFitContext {
+        available_margin_box_size: available
+            .width_basis_content_box_length()
+            .map(IntoLayoutLength::into_layout_length),
+        margin_size: layout_pt(child_margin.left + child_margin.right),
+        non_content_size: non_content_pt(
+            child_padding.left + child_padding.right + child_borders.left + child_borders.right,
+        ),
+        box_sizing: child_style.box_sizing,
+    };
+    let vertical_stretch = FlexStretchFitContext {
+        available_margin_box_size: available
+            .height_basis_content_box_length()
+            .map(IntoLayoutLength::into_layout_length),
+        margin_size: layout_pt(child_margin.top + child_margin.bottom),
+        non_content_size: non_content_pt(
+            child_padding.top + child_padding.bottom + child_borders.top + child_borders.bottom,
+        ),
+        box_sizing: child_style.box_sizing,
+    };
+    let (specified_min, percentage_basis, stretch, cross_stretch) = if direction.is_row_axis() {
         (
             child_style.box_values.min_width.clone(),
             available.width_basis,
-            FlexStretchFitContext {
-                available_margin_box_size: available
-                    .width_basis_content_box_length()
-                    .map(IntoLayoutLength::into_layout_length),
-                margin_size: layout_pt(0.0),
-                non_content_size: non_content_pt(0.0),
-                box_sizing: child_style.box_sizing,
-            },
+            horizontal_stretch,
+            vertical_stretch,
         )
     } else {
         (
             child_style.box_values.min_height.clone(),
             available.height_basis,
-            FlexStretchFitContext {
-                available_margin_box_size: available
-                    .height_basis_content_box_length()
-                    .map(IntoLayoutLength::into_layout_length),
-                margin_size: layout_pt(0.0),
-                non_content_size: non_content_pt(0.0),
-                box_sizing: child_style.box_sizing,
-            },
+            vertical_stretch,
+            horizontal_stretch,
         )
     };
     resolve_automatic_flex_minimum(
@@ -2804,6 +2868,7 @@ pub(in crate::layout::flex) fn automatic_minimum_main_content_size(
                     .width_basis_content_box_length()
                     .map(flex_cross_size_from_content_box)
             },
+            cross_stretch,
             stretched_cross_size,
             is_main_axis: true,
             overflow: flex_item_main_axis_overflow(child_style, direction),
@@ -3155,6 +3220,25 @@ mod tests {
             taffy_flex_wrap(&definite_height, FlexDirection::Column, definite),
             taffy_layout::FlexWrap::Wrap,
         );
+
+        let ratio_derived = FlexAvailableSpace {
+            height: Some(PhysicalContentHeight::new(content_box_pt(100.0))),
+            height_basis: PercentageBasis::definite_from(
+                content_box_pt(100.0),
+                FlexAvailableSizeSource::AspectRatioDerived,
+            ),
+            ..indefinite
+        };
+        let mut automatic_ratio_height = ComputedStyle::initial();
+        automatic_ratio_height.flex_wrap = FlexWrap::Wrap;
+        assert_eq!(
+            taffy_flex_wrap(
+                &automatic_ratio_height,
+                FlexDirection::Column,
+                ratio_derived,
+            ),
+            taffy_layout::FlexWrap::Wrap,
+        );
     }
 
     #[test]
@@ -3198,6 +3282,10 @@ mod tests {
         assert_eq!(
             flex_item_final_percentage_height_basis(
                 &item,
+                FlexItemEstimate::fixed(
+                    PhysicalContentWidth::new(content_box_pt(20.0)),
+                    PhysicalContentHeight::new(content_box_pt(10.0)),
+                ),
                 &child,
                 &ComputedStyle::initial(),
                 FlexDirection::Row,
@@ -3232,6 +3320,10 @@ mod tests {
         assert_eq!(
             flex_item_final_percentage_height_basis(
                 &item,
+                FlexItemEstimate::fixed(
+                    PhysicalContentWidth::new(content_box_pt(20.0)),
+                    PhysicalContentHeight::new(content_box_pt(10.0)),
+                ),
                 &child,
                 &ComputedStyle::initial(),
                 FlexDirection::Row,
@@ -3239,6 +3331,46 @@ mod tests {
             ),
             PercentageBasis::indefinite(),
         );
+    }
+
+    #[test]
+    fn aspect_ratio_transferred_column_basis_makes_descendant_height_definite() {
+        let child = StyledChild {
+            kind: FormattingContextChildKind::AnonymousContent {
+                children: Vec::new(),
+            },
+            style: ComputedStyle::initial(),
+        };
+        let item = FlexItemLayout::new(ContainerRect::new(
+            ContainerPoint::new(0.0, 0.0),
+            ContainerSize::new(100.0, 100.0),
+        ));
+        let mut estimate = FlexItemEstimate::fixed(
+            PhysicalContentWidth::new(content_box_pt(100.0)),
+            PhysicalContentHeight::new(content_box_pt(100.0)),
+        );
+        estimate.set_main_size_provenance(FlexMainSizeProvenance::AspectRatioTransfer);
+        let available = FlexAvailableSpace {
+            width: PhysicalContentWidth::new(content_box_pt(100.0)),
+            width_basis: PercentageBasis::definite_from(
+                content_box_pt(100.0),
+                FlexAvailableSizeSource::ContainingBlock,
+            ),
+            height: None,
+            height_basis: PercentageBasis::indefinite(),
+        };
+
+        let basis = flex_item_final_percentage_height_basis(
+            &item,
+            estimate,
+            &child,
+            &ComputedStyle::initial(),
+            FlexDirection::Column,
+            available,
+        );
+
+        assert!(basis.is_definite());
+        assert_eq!(basis.points(), Some(100.0));
     }
 
     fn definite_height_style() -> ComputedStyle {

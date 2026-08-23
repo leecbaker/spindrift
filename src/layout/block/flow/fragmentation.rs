@@ -462,7 +462,7 @@ impl AvoidBreakRunCandidate {
     pub(in crate::layout) fn source_fragmentainer_occupancy(
         &self,
     ) -> AvoidRunSourceFragmentainerOccupancy {
-        if self.snapshot.current_page_has_flow_content {
+        if self.snapshot.current_page_has_flow_content() {
             AvoidRunSourceFragmentainerOccupancy::Occupied
         } else {
             AvoidRunSourceFragmentainerOccupancy::Empty
@@ -524,7 +524,7 @@ impl AdjoiningFloatReplayCandidate {
     }
 
     pub(in crate::layout) fn snapshot_cursor_y(&self) -> f32 {
-        self.snapshot.cursor_y
+        self.snapshot.cursor_y()
     }
 
     pub(in crate::layout) fn clearance_boundary(&self) -> Option<PageTopBlockPosition> {

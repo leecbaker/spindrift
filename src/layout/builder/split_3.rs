@@ -489,4 +489,35 @@ mod tests {
         assert_eq!(width.length_points(), initial.area_width());
         assert_eq!(height.length_points(), initial.area_height());
     }
+
+    #[test]
+    fn layout_snapshot_restores_speculative_state_without_rewinding_pass_state() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let initial_cursor = builder.cursor_y;
+        let snapshot = builder.snapshot();
+
+        builder.cursor_y += 20.0;
+        builder.quote_depth = 3;
+        builder.page_anchors.insert("speculative-anchor".into(), 0);
+        builder.positioned_paint_transaction_depth = 1;
+        builder
+            .float_contexts
+            .push(FloatContext { shapes: Vec::new() });
+
+        // Reservations select the outer footnote pass. They deliberately
+        // survive a local speculative replay rather than being restored from
+        // its checkpoint.
+        builder.footnote_reservations.insert(0, 12.0);
+        builder.restore(snapshot);
+
+        assert_eq!(builder.cursor_y, initial_cursor);
+        assert_eq!(builder.quote_depth, 0);
+        assert!(builder.page_anchors.is_empty());
+        assert_eq!(builder.positioned_paint_transaction_depth, 0);
+        assert_eq!(builder.float_contexts.len(), 1);
+        assert_eq!(builder.footnote_reservations.get(&0), Some(&12.0));
+    }
 }

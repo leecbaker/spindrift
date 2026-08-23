@@ -45,7 +45,17 @@ pub(super) fn subset_font_file(
         );
     };
 
-    match subsetter::subset(original, font.face_index, &remapper) {
+    let subset = if requires_static_variation_instance(font) {
+        subsetter::subset_with_variations(
+            original,
+            font.face_index,
+            &subsetter_variation_coordinates(font),
+            &remapper,
+        )
+    } else {
+        subsetter::subset(original, font.face_index, &remapper)
+    };
+    match subset {
         Ok(data)
             if subset_font_is_valid(font, &data, &source_gid_to_cid)
                 && data.len() < fallback_len =>
@@ -88,6 +98,13 @@ struct FallbackContext<'a> {
 }
 
 fn fallback_after_subset_failure(context: &FallbackContext<'_>, reason: String) -> FontFilePlan {
+    if requires_static_variation_instance(context.font) {
+        let mut full = instantiated_full_coverage_font_file(context.font, context.used_glyphs);
+        if !matches!(full.embedding_kind, FontEmbeddingKind::Rejected { .. }) {
+            full.fallback_reason = Some(reason);
+        }
+        return full;
+    }
     let mut full = full_font_file(context.font, context.used_glyphs);
     if !matches!(full.embedding_kind, FontEmbeddingKind::Rejected { .. }) {
         full.fallback_reason = Some(reason);
@@ -104,6 +121,9 @@ pub(super) fn full_font_file(
     font: &DocumentFont,
     used_glyphs: &BTreeMap<u16, String>,
 ) -> FontFilePlan {
+    if requires_static_variation_instance(font) {
+        return instantiated_full_coverage_font_file(font, used_glyphs);
+    }
     let original = font.data.as_ref();
     let source_program_kind =
         font_program_kind_from_data(original, font.face_index).unwrap_or(font.program_kind);
@@ -149,6 +169,90 @@ pub(super) fn full_font_file(
         program_kind: source_program_kind,
         source_gid_to_cid,
     }
+}
+
+/// Materialize a variable font at the location used by shaping while retaining
+/// every source glyph. This is the `FontEmbeddingMode::Full` representation:
+/// full glyph coverage matters, but embedding the variable source at its
+/// default location would paint the wrong instance.
+/// <https://www.w3.org/TR/css-fonts-4/#font-variation-settings-def>
+fn instantiated_full_coverage_font_file(
+    font: &DocumentFont,
+    used_glyphs: &BTreeMap<u16, String>,
+) -> FontFilePlan {
+    let original = font.data.as_ref();
+    let source_program_kind =
+        font_program_kind_from_data(original, font.face_index).unwrap_or(font.program_kind);
+    let Some(mut remapper) = full_glyph_remapper(font) else {
+        return FontFilePlan::rejected(
+            "failed to enumerate variable-font glyphs for static instantiation".to_string(),
+            source_program_kind,
+            identity_glyph_mapping(used_glyphs),
+        );
+    };
+    // Ensure malformed source metadata cannot omit a painted glyph from the
+    // static program's identity CID map.
+    for glyph_id in used_glyphs.keys() {
+        remapper.remap(*glyph_id);
+    }
+    let source_gid_to_cid = full_identity_glyph_mapping(font)
+        .unwrap_or_default()
+        .into_keys()
+        .filter_map(|source_gid| remapper.get(source_gid).map(|cid| (source_gid, cid)))
+        .collect::<BTreeMap<_, _>>();
+    match subsetter::subset_with_variations(
+        original,
+        font.face_index,
+        &subsetter_variation_coordinates(font),
+        &remapper,
+    ) {
+        Ok(data) if static_instance_is_valid(font, &data, &source_gid_to_cid) => FontFilePlan {
+            program_kind: font_program_kind_from_data(&data, 0).unwrap_or(source_program_kind),
+            data,
+            embedding_kind: FontEmbeddingKind::InstantiatedFullCoverage,
+            fallback_reason: None,
+            source_gid_to_cid,
+        },
+        Ok(data) => FontFilePlan::rejected(
+            format!(
+                "variable-font static instance failed validation ({} byte(s))",
+                data.len()
+            ),
+            source_program_kind,
+            source_gid_to_cid,
+        ),
+        Err(error) => FontFilePlan::rejected(
+            format!("variable-font instantiation failed: {error}"),
+            source_program_kind,
+            source_gid_to_cid,
+        ),
+    }
+}
+
+fn requires_static_variation_instance(font: &DocumentFont) -> bool {
+    !font.variation_coordinates.is_empty()
+        && ttf_parser::Face::parse(font.data.as_ref(), font.face_index).is_ok_and(|face| {
+            face.raw_face()
+                .table(ttf_parser::Tag::from_bytes(b"fvar"))
+                .is_some()
+        })
+}
+
+fn subsetter_variation_coordinates(font: &DocumentFont) -> Vec<(subsetter::Tag, f32)> {
+    font.variation_coordinates
+        .0
+        .iter()
+        .map(|(tag, value)| (subsetter::Tag::new(tag), f32::from_bits(*value)))
+        .collect()
+}
+
+fn full_glyph_remapper(font: &DocumentFont) -> Option<subsetter::GlyphRemapper> {
+    let face = ttf_parser::Face::parse(font.data.as_ref(), font.face_index).ok()?;
+    let mut remapper = subsetter::GlyphRemapper::new();
+    for glyph_id in 0..face.number_of_glyphs() {
+        remapper.remap(glyph_id);
+    }
+    Some(remapper)
 }
 
 fn font_program_kind_from_data(font_data: &[u8], face_index: u32) -> Option<FontProgramKind> {
@@ -201,6 +305,9 @@ fn subset_font_is_valid(
     {
         return false;
     }
+    if requires_static_variation_instance(font) {
+        return static_instance_is_valid(font, subset_data, source_gid_to_cid);
+    }
     source_gid_to_cid.iter().all(|(source_gid, cid)| {
         remapped_glyph_is_visually_equivalent(
             &source_face,
@@ -209,6 +316,24 @@ fn subset_font_is_valid(
             ttf_parser::GlyphId(*cid),
         )
     })
+}
+
+fn static_instance_is_valid(
+    font: &DocumentFont,
+    instance_data: &[u8],
+    source_gid_to_cid: &BTreeMap<u16, u16>,
+) -> bool {
+    let Ok(instance) = ttf_parser::Face::parse(instance_data, 0) else {
+        return false;
+    };
+    instance.units_per_em() == font.units_per_em
+        && instance
+            .raw_face()
+            .table(ttf_parser::Tag::from_bytes(b"fvar"))
+            .is_none()
+        && source_gid_to_cid
+            .values()
+            .all(|cid| *cid < instance.number_of_glyphs())
 }
 
 /// Validate one compact-subset glyph against its source program.

@@ -1,5 +1,50 @@
-use super::*;
+use crate::css::{
+    self, BorderStyle, CaptionSide, ComputedStyle, EmptyCells, LayoutLength, PercentageBasis,
+    Position, SemanticLengthExt, Stylesheets, layout_pt,
+};
+use crate::dom::Element;
 use crate::layout::block::height_behaves_as_auto_for_margin_collapse;
+use crate::layout::table::layout::{
+    CollapsedTableGeometry, DefiniteTableCellBlockSizeBasis, PreparedTableCell,
+    TableCellBaselineAlignmentContext, TableCellBaselineSet, TableCellContentPass,
+    TableCellContentSizingPolicy, TableCellLayoutMetrics, TableGridLayoutContext,
+    TableHeightDistributionTarget, TableHeightTarget, TableRowHeightPlan,
+    distribute_table_height_extra, distribute_table_span_constraint,
+    table_cell_alignment_baseline_set, table_cell_block_size_depends_on_parent_percentage,
+    table_cell_border_box_height_with_insets, table_cell_border_insets,
+    table_cell_can_consume_physical_y_row_baseline_for_alignment,
+    table_cell_canvas_first_pass_outer_height, table_cell_child_is_in_flow_float,
+    table_cell_content_pass_from_committed_basis,
+    table_cell_formatting_child_has_parent_percentage_block_size,
+    table_cell_participates_in_physical_y_row_baseline, table_cell_row_sizing_border_box_height,
+    table_content_height_from_plan, table_height_distribution_groups,
+};
+use crate::layout::table::{
+    TableCaption, TableCell, TableCellBaselineOffset, TableCellContentBox, TableCellOuterBlockSize,
+    TableCellPadding, TableCellPlacement, TableColumnPlan, TableGridArea, TableMetrics, TableRow,
+    TableRowBaselineOffset, apply_table_cell_used_padding,
+    table_cell_formatting_child_outer_height, table_cell_inline_text,
+    table_cell_non_text_content_height, table_cell_replaced_content_height,
+    table_cell_root_block_track_contribution, table_horizontal_borders, table_root_block_size,
+    table_row_top, used_table_target_content_height,
+};
+use crate::layout::{
+    BlockSizeBasisSource, BlockSizePercentageBasis, DocumentCanvasResolution, FloatContext,
+    LayoutBuilder, LogicalBlockContentSize, LogicalInlineContentSize, PhysicalContentWidth,
+    ReplacedElementKind, apply_used_box_metrics, block_size_percentage_basis_from_points, box_tree,
+    collapse_margins, collapsible_first_child_start_margin_from_boxes, constrain,
+    constrain_content_height, constrain_content_width, effective_overflow_for_style,
+    estimate_svg_height, formatting_box_can_only_create_phantom_line_boxes,
+    has_atomic_inline_formatting_box, has_auto_height, has_direct_inline_content_box,
+    has_non_inline_formatting_box, inline_text_from_formatting_boxes, intrinsic,
+    is_replaced_element, is_self_collapsing_block_box, outer_margins_adjoin_block_siblings,
+    replaced_element_kind, self_collapsing_block_margin_set_for_box, set_style_auto_height,
+    set_style_used_height, used_border_widths, used_content_box_height_or_auto,
+    used_content_box_height_or_auto_with_basis, used_content_box_width, used_length_percentage,
+    used_length_percentage_or_auto_with_basis, used_max_height, used_min_height,
+    used_property_containment,
+};
+use crate::units::{BorderBoxLength, ContentBoxLength, content_box_pt, non_content_pt};
 
 /// The first row baseline exported by an inline table together with the
 /// selected cell font's paint-coordinate adjustment.
@@ -9,7 +54,7 @@ use crate::layout::block::height_behaves_as_auto_for_margin_collapse;
 /// coordinate system.
 #[derive(Debug, Clone, Copy)]
 pub(in crate::layout::table) struct TableRowBaseline {
-    pub(in crate::layout::table) offset: f32,
+    pub(in crate::layout::table) offset: TableRowBaselineOffset,
     pub(in crate::layout::table) rendered_font_adjustment: f32,
 }
 
@@ -263,7 +308,7 @@ impl<'a> LayoutBuilder<'a> {
         placements: &[TableCellPlacement],
         row_style: &ComputedStyle,
         stylesheets: &Stylesheets<'_>,
-        table_cellpadding: Option<f32>,
+        table_cellpadding: Option<TableCellPadding>,
         column_plan: &TableColumnPlan,
         table_metrics: TableMetrics,
     ) -> bool {
@@ -275,7 +320,7 @@ impl<'a> LayoutBuilder<'a> {
         for placement in placements {
             let cell_inline =
                 column_plan.inline_bounds_for_span(placement.column, placement.colspan);
-            let cell_width = cell_inline.page_width();
+            let cell_width = cell_inline.logical_size().get();
             if cell_width <= 0.0 {
                 continue;
             }
@@ -377,7 +422,7 @@ impl<'a> LayoutBuilder<'a> {
         placements: &[TableCellPlacement],
         row_style: &ComputedStyle,
         stylesheets: &Stylesheets<'_>,
-        table_cellpadding: Option<f32>,
+        table_cellpadding: Option<TableCellPadding>,
         column_plan: &TableColumnPlan,
         table_metrics: TableMetrics,
         collapsed_geometry: Option<&CollapsedTableGeometry>,
@@ -413,14 +458,14 @@ impl<'a> LayoutBuilder<'a> {
                 }
                 self.table_cell_physical_y_row_baseline_candidate(cell, &prepared, stylesheets)
                     .map(|offset| TableRowBaseline {
-                        offset,
+                        offset: TableRowBaselineOffset::new(layout_pt(offset.points())),
                         rendered_font_adjustment: self
                             .font_system
                             .rendered_first_line_baseline_offset(&prepared.style)
                             .points(),
                     })
             })
-            .max_by(|left, right| left.offset.total_cmp(&right.offset))
+            .max_by(|left, right| left.offset.points().total_cmp(&right.offset.points()))
     }
 
     /// Return the content baseline exposed by a table row to an enclosing
@@ -439,7 +484,7 @@ impl<'a> LayoutBuilder<'a> {
         placements: &[TableCellPlacement],
         row_style: &ComputedStyle,
         stylesheets: &Stylesheets<'_>,
-        table_cellpadding: Option<f32>,
+        table_cellpadding: Option<TableCellPadding>,
         column_plan: &TableColumnPlan,
         table_metrics: TableMetrics,
         collapsed_geometry: Option<&CollapsedTableGeometry>,
@@ -469,14 +514,14 @@ impl<'a> LayoutBuilder<'a> {
                 // <https://www.w3.org/TR/CSS22/tables.html#table-display>
                 self.table_cell_physical_y_row_baseline_candidate(cell, &prepared, stylesheets)
                     .map(|offset| TableRowBaseline {
-                        offset,
+                        offset: TableRowBaselineOffset::new(layout_pt(offset.points())),
                         rendered_font_adjustment: self
                             .font_system
                             .rendered_first_line_baseline_offset(&prepared.style)
                             .points(),
                     })
             })
-            .max_by(|left, right| left.offset.total_cmp(&right.offset))
+            .max_by(|left, right| left.offset.points().total_cmp(&right.offset.points()))
     }
 
     pub(in crate::layout::table) fn table_cell_row_baseline_offset_for_alignment(
@@ -484,7 +529,7 @@ impl<'a> LayoutBuilder<'a> {
         context: &TableCellBaselineAlignmentContext<'_>,
         placement: &TableCellPlacement,
         cell_style: &ComputedStyle,
-    ) -> Option<f32> {
+    ) -> Option<TableRowBaselineOffset> {
         if !table_cell_can_consume_physical_y_row_baseline_for_alignment(
             cell_style,
             context.row_style,
@@ -527,7 +572,9 @@ impl<'a> LayoutBuilder<'a> {
             context.table_metrics.clone(),
             target_row_index,
         );
-        Some((origin_top - target_top).max(0.0) + target_baseline.offset)
+        Some(TableRowBaselineOffset::new(layout_pt(
+            (origin_top - target_top).max(0.0) + target_baseline.offset.points(),
+        )))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -538,11 +585,11 @@ impl<'a> LayoutBuilder<'a> {
         placements: &[TableCellPlacement],
         row_style: &ComputedStyle,
         stylesheets: &Stylesheets<'_>,
-        table_cellpadding: Option<f32>,
+        table_cellpadding: Option<TableCellPadding>,
         column_plan: &TableColumnPlan,
         table_metrics: TableMetrics,
         collapsed_geometry: Option<&CollapsedTableGeometry>,
-    ) -> Option<f32> {
+    ) -> Option<TableRowBaselineOffset> {
         placements
             .iter()
             .filter_map(|placement| {
@@ -569,7 +616,14 @@ impl<'a> LayoutBuilder<'a> {
                 }
                 self.table_cell_physical_y_row_baseline_candidate(cell, &prepared, stylesheets)
             })
-            .reduce(f32::max)
+            .map(|offset| TableRowBaselineOffset::new(layout_pt(offset.points())))
+            .reduce(|left, right| {
+                if left.points() >= right.points() {
+                    left
+                } else {
+                    right
+                }
+            })
     }
 
     pub(in crate::layout::table) fn table_cell_physical_y_row_baseline_candidate(
@@ -577,7 +631,7 @@ impl<'a> LayoutBuilder<'a> {
         cell: &TableCell<'_>,
         prepared: &PreparedTableCell,
         stylesheets: &Stylesheets<'_>,
-    ) -> Option<f32> {
+    ) -> Option<TableCellBaselineOffset> {
         let available_width = (prepared.width()
             - prepared.style.padding.left
             - prepared.style.padding.right
@@ -629,7 +683,7 @@ impl<'a> LayoutBuilder<'a> {
         row_index: usize,
         _table_x: f32,
         stylesheets: &Stylesheets<'_>,
-        table_cellpadding: Option<f32>,
+        table_cellpadding: Option<TableCellPadding>,
         column_plan: &TableColumnPlan,
         table_metrics: TableMetrics,
         collapsed_geometry: Option<&CollapsedTableGeometry>,
@@ -637,7 +691,7 @@ impl<'a> LayoutBuilder<'a> {
         let mut style = self.style_for_table_cell(cell, row, row_style, stylesheets);
         let area = TableGridArea::from_placement(row_index, placement);
         let inline_bounds = column_plan.inline_bounds_for_area(area);
-        let width = inline_bounds.page_width().max(0.0);
+        let width = inline_bounds.logical_size().get().max(0.0);
         // A table cell's percentage padding resolves against the final table
         // grid inline size, including only the border spacing between tracks.
         // It must not use the cell span width, which itself includes the
@@ -735,9 +789,11 @@ impl<'a> LayoutBuilder<'a> {
             } else {
                 layout.table_cell_non_text_content_height(cell, stylesheets, available_width)
             };
-            let content_height = text_height
-                .max(non_text_height)
-                .max(inline_sequence_height.unwrap_or(0.0));
+            let content_height = text_height.max(non_text_height).max(
+                inline_sequence_height
+                    .map(TableCellOuterBlockSize::points)
+                    .unwrap_or(0.0),
+            );
             debug_assert!(content_height >= 0.0);
             let border_box_height = table_cell_border_box_height_with_insets(
                 row_sizing_style,
@@ -824,9 +880,11 @@ impl<'a> LayoutBuilder<'a> {
                     )
                 })
                 .unwrap_or_else(|| table_cell_non_text_content_height(cell).points());
-            let content_height = text_height
-                .max(non_text_height)
-                .max(inline_sequence_height.unwrap_or(0.0));
+            let content_height = text_height.max(non_text_height).max(
+                inline_sequence_height
+                    .map(TableCellOuterBlockSize::points)
+                    .unwrap_or(0.0),
+            );
             let baseline_offset = if text_height > 0.0 && text_height >= non_text_height {
                 layout
                     .table_cell_alignment_baseline_offset(
@@ -1009,7 +1067,7 @@ impl<'a> LayoutBuilder<'a> {
             if let Some(inline_height) =
                 self.table_cell_measured_inline_outer_height(child, stylesheets, available_width)
             {
-                inline_line_height = inline_line_height.max(inline_height);
+                inline_line_height = inline_line_height.max(inline_height.points());
                 continue;
             }
             if inline_line_height > 0.0 {
@@ -1021,7 +1079,7 @@ impl<'a> LayoutBuilder<'a> {
                 PercentageBasis::indefinite(),
                 self.document_canvas_overflow,
             ) {
-                block_flow.push_collapsed_margin(collapsed_margin);
+                block_flow.push_collapsed_margin(collapsed_margin.points());
                 continue;
             }
             let child_height =
@@ -1051,7 +1109,7 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &Stylesheets<'_>,
         available_width: f32,
         percentage_height_basis: BlockSizePercentageBasis,
-    ) -> Option<f32> {
+    ) -> Option<TableCellOuterBlockSize> {
         if !percentage_height_basis.is_definite()
             && children.iter().all(|child| {
                 matches!(
@@ -1078,7 +1136,13 @@ impl<'a> LayoutBuilder<'a> {
                         available_width,
                     )
                 })
-                .reduce(f32::max);
+                .reduce(|left, right| {
+                    if left.points() >= right.points() {
+                        left
+                    } else {
+                        right
+                    }
+                });
         }
         self.table_cell_nested_inline_sequence_for_children(
             style,
@@ -1088,7 +1152,7 @@ impl<'a> LayoutBuilder<'a> {
             available_width,
             percentage_height_basis,
         )
-        .map(|plan| plan.sequence.total_height())
+        .map(|plan| TableCellOuterBlockSize::new(layout_pt(plan.sequence.total_height())))
     }
 
     pub(in crate::layout::table) fn table_cell_measured_block_child_height(
@@ -1183,6 +1247,7 @@ impl<'a> LayoutBuilder<'a> {
                 // the row plan before the cell has a committed height.
                 // <https://drafts.csswg.org/css-tables-3/#row-layout>
                 self.table_cell_measured_inline_outer_height(child, stylesheets, available_width)
+                    .map(TableCellOuterBlockSize::points)
                     .unwrap_or_else(|| table_cell_formatting_child_outer_height(child).points())
             }
             // An anonymous block is one contiguous inline run generated by
@@ -1203,6 +1268,7 @@ impl<'a> LayoutBuilder<'a> {
                     available_width,
                     PercentageBasis::indefinite(),
                 )
+                .map(TableCellOuterBlockSize::points)
                 .unwrap_or(0.0)
             }
             box_tree::FormattingBox::AnonymousBlock(box_) => self
@@ -1439,7 +1505,7 @@ impl<'a> LayoutBuilder<'a> {
                     content_width,
                     PercentageBasis::indefinite(),
                 ) {
-                    block_flow.push_atomic_height(inline_height);
+                    block_flow.push_atomic_height(inline_height.points());
                 }
             } else {
                 let text = inline_text_from_formatting_boxes(children);
@@ -1493,6 +1559,7 @@ impl<'a> LayoutBuilder<'a> {
                                 content_width,
                                 PercentageBasis::indefinite(),
                             )
+                            .map(TableCellOuterBlockSize::points)
                             .unwrap_or(box_style.line_height)
                         } else {
                             self.estimate_text_physical_height(
@@ -1523,7 +1590,7 @@ impl<'a> LayoutBuilder<'a> {
                     PercentageBasis::indefinite(),
                     self.document_canvas_overflow,
                 ) {
-                    block_flow.push_collapsed_margin(collapsed_margin);
+                    block_flow.push_collapsed_margin(collapsed_margin.points());
                 } else {
                     let child_height = self.table_cell_row_minimum_element_outer_height(
                         child_element,
@@ -1616,7 +1683,7 @@ impl<'a> LayoutBuilder<'a> {
                 available_width,
                 content_pass,
             ) {
-                inline_line_height = inline_line_height.max(inline_height);
+                inline_line_height = inline_line_height.max(inline_height.points());
                 continue;
             }
             if inline_line_height > 0.0 {
@@ -1628,7 +1695,7 @@ impl<'a> LayoutBuilder<'a> {
                 percentage_height_basis,
                 self.document_canvas_overflow,
             ) {
-                block_flow.push_collapsed_margin(collapsed_margin);
+                block_flow.push_collapsed_margin(collapsed_margin.points());
                 continue;
             }
             let child_height = self.table_cell_measured_block_child_final_relayout_height(
@@ -1698,6 +1765,7 @@ impl<'a> LayoutBuilder<'a> {
                     available_width,
                     percentage_height_basis,
                 )
+                .map(TableCellOuterBlockSize::points)
                 .unwrap_or(0.0)
             }
             box_tree::FormattingBox::AnonymousBlock(box_) => self
@@ -1838,7 +1906,7 @@ impl<'a> LayoutBuilder<'a> {
                     content_width,
                     parent_percentage_height_basis,
                 ) {
-                    block_flow.push_atomic_height(inline_height);
+                    block_flow.push_atomic_height(inline_height.points());
                 }
             } else {
                 let text = inline_text_from_formatting_boxes(children);
@@ -1927,6 +1995,7 @@ impl<'a> LayoutBuilder<'a> {
                                     BlockSizeBasisSource::TableCell,
                                 ),
                             )
+                            .map(TableCellOuterBlockSize::points)
                             .unwrap_or(box_style.line_height)
                         } else {
                             self.estimate_text_physical_height(
@@ -1961,7 +2030,7 @@ impl<'a> LayoutBuilder<'a> {
                     child_percentage_height_basis,
                     self.document_canvas_overflow,
                 ) {
-                    block_flow.push_collapsed_margin(collapsed_margin);
+                    block_flow.push_collapsed_margin(collapsed_margin.points());
                 } else {
                     let child_height = self.table_cell_final_relayout_element_outer_height(
                         child_element,
@@ -1987,8 +2056,10 @@ impl<'a> LayoutBuilder<'a> {
             let requested_content_height = specified_content_height.unwrap_or(content_height);
             content_height = constrain(
                 requested_content_height,
-                table_cell_used_min_height(style, parent_percentage_height_basis),
-                table_cell_used_max_height(style, parent_percentage_height_basis),
+                table_cell_used_min_height(style, parent_percentage_height_basis)
+                    .map(ContentBoxLength::points),
+                table_cell_used_max_height(style, parent_percentage_height_basis)
+                    .map(ContentBoxLength::points),
             );
         }
 
@@ -2039,23 +2110,23 @@ fn resolved_collapsed_border_layout_style(width: f32) -> BorderStyle {
 fn table_cell_used_min_height(
     style: &ComputedStyle,
     percentage_basis: BlockSizePercentageBasis,
-) -> Option<f32> {
+) -> Option<ContentBoxLength> {
     used_length_percentage_or_auto_with_basis(style.box_values.min_height.clone(), percentage_basis)
-        .map(|value| value.points().max(0.0))
+        .map(|value| content_box_pt(value.points().max(0.0)))
 }
 
 fn table_cell_used_max_height(
     style: &ComputedStyle,
     percentage_basis: BlockSizePercentageBasis,
-) -> Option<f32> {
+) -> Option<ContentBoxLength> {
     used_length_percentage_or_auto_with_basis(style.box_values.max_height.clone(), percentage_basis)
-        .map(|value| value.points().max(0.0))
+        .map(|value| content_box_pt(value.points().max(0.0)))
 }
 
 #[derive(Default)]
 struct TableCellBlockFlowHeight {
     height: f32,
-    pending_margin: Option<f32>,
+    pending_margin: Option<LayoutLength>,
 }
 
 impl TableCellBlockFlowHeight {
@@ -2088,25 +2159,25 @@ impl TableCellBlockFlowHeight {
     fn push_collapsed_margin(&mut self, margin: f32) {
         self.pending_margin = Some(
             self.pending_margin
-                .map(|pending| collapse_margins(layout_pt(pending), layout_pt(margin)).points())
-                .unwrap_or(margin),
+                .map(|pending| collapse_margins(pending, layout_pt(margin)))
+                .unwrap_or_else(|| layout_pt(margin)),
         );
     }
 
     fn push_child(&mut self, outer_height: f32, margin_top: f32, margin_bottom: f32) {
         let body_height = (outer_height - margin_top - margin_bottom).max(0.0);
         if let Some(pending) = self.pending_margin.take() {
-            self.height += collapse_margins(layout_pt(pending), layout_pt(margin_top)).points();
+            self.height += collapse_margins(pending, layout_pt(margin_top)).points();
         } else {
             self.height += margin_top;
         }
         self.height += body_height;
-        self.pending_margin = Some(margin_bottom);
+        self.pending_margin = Some(layout_pt(margin_bottom));
     }
 
     fn flush_pending_margin(&mut self) {
         if let Some(margin) = self.pending_margin.take() {
-            self.height += margin;
+            self.height += margin.points();
         }
     }
 
@@ -2128,7 +2199,7 @@ fn table_cell_self_collapsing_block_margin(
     child: &box_tree::FormattingBox<'_>,
     percentage_height_basis: BlockSizePercentageBasis,
     overflow_context: DocumentCanvasResolution,
-) -> Option<f32> {
+) -> Option<LayoutLength> {
     let (element, _, style, children) = child.element_parts()?;
     let mut margin_collapse_style = None;
     if height_behaves_as_auto_for_margin_collapse(style, percentage_height_basis) {
@@ -2145,8 +2216,8 @@ fn table_cell_self_collapsing_block_margin(
     }
     let descendant_start_margin =
         collapsible_first_child_start_margin_from_boxes(children, element, style, overflow_context);
-    Some(self_collapsing_block_margin_set_for_box(
+    Some(layout_pt(self_collapsing_block_margin_set_for_box(
         style,
         descendant_start_margin,
-    ))
+    )))
 }

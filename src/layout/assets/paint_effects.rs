@@ -1,6 +1,6 @@
 use super::*;
-use crate::document::paint::{contours::OverflowClipEffect, geometry::AxisSelectivePaintClip};
-use crate::document::paint::{effects::ThreeDParticipation, geometry::Projective3dPaintTransform};
+use crate::document::paint::effects::ThreeDParticipation;
+use crate::document::paint::geometry::Projective3dPaintTransform;
 
 /// Geometry with distinct paint and CSS-transform responsibilities for one
 /// principal box. Ink bounds drive stacking/culling; the used reference box
@@ -50,7 +50,8 @@ pub(in crate::layout) fn paint_effects_for_box(
     paint_effects_for_principal_box_with_overflow_clip(
         style,
         PrincipalPaintGeometry::css_layout(border_box),
-        style_clips_overflow(style) || style.contain.paint,
+        style_clips_overflow(style)
+            || (property_containment_applies_to_style(style) && style.contain.paint),
     )
 }
 
@@ -61,7 +62,8 @@ pub(in crate::layout) fn paint_effects_for_principal_box(
     paint_effects_for_principal_box_with_overflow_clip(
         style,
         geometry,
-        style_clips_overflow(style) || style.contain.paint,
+        style_clips_overflow(style)
+            || (property_containment_applies_to_style(style) && style.contain.paint),
     )
 }
 
@@ -71,17 +73,22 @@ pub(in crate::layout) fn paint_effects_for_principal_box_with_overflow_clip(
     clips_overflow: bool,
 ) -> PaintEffects {
     let border_box = geometry.paint_bounds;
-    let borders = used_border_widths(style);
     let used_overflow = UsedOverflowAxes::from_style(style);
-    let clips_x = clips_overflow && (used_overflow.clips_x() || style.contain.paint);
-    let clips_y = clips_overflow && (used_overflow.clips_y() || style.contain.paint);
-    let padding_clip = PaintClip::from_paint_rect(paint_space_rect(
-        border_box.x() + borders.left,
-        border_box.y() + borders.bottom,
-        border_box.width() - borders.left - borders.right,
-        border_box.height() - borders.top - borders.bottom,
-    ));
-    let fully_bounded = clips_x && clips_y;
+    let paint_containment =
+        clips_overflow && (style.contain.paint || !used_overflow.clips_any_axis());
+    let overflow_clip_effect = clips_overflow
+        .then(|| {
+            resolve_overflow_clip_edge(
+                border_box.paint_rect(),
+                style,
+                used_border_widths(style),
+                used_overflow,
+                paint_containment,
+                None,
+            )
+        })
+        .flatten()
+        .map(|edge| edge.effect());
     let transform_style = used_transform_style(style);
     let is_transparent_3d_bridge = style.anonymous_3d_layout_bridge;
     let has_3d_transform = transform_list_contains_3d(&style.transform);
@@ -129,13 +136,7 @@ pub(in crate::layout) fn paint_effects_for_principal_box_with_overflow_clip(
         suppress_paint: suppress_3d
             || (transform_style == css::TransformStyle::Flat
                 && transform.is_some_and(|transform| !transform.is_invertible())),
-        overflow_clip_effect: fully_bounded
-            .then_some(OverflowClipEffect::Rect(padding_clip))
-            .or_else(|| {
-                (clips_overflow && !fully_bounded).then_some(OverflowClipEffect::AxisSelective(
-                    AxisSelectivePaintClip::new(padding_clip, clips_x, clips_y),
-                ))
-            }),
+        overflow_clip_effect,
         absolute_clip: legacy_absolute_clip(style, border_box),
         scene_plane_clip: None,
         clip_path: paint_clip_path_effect(style, border_box),

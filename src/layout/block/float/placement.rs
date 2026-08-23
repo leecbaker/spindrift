@@ -1,5 +1,7 @@
 use super::super::super::*;
-use super::{HypotheticalClearBorderEdge, exclusions::FLOAT_EPSILON, model::*};
+use super::HypotheticalClearBorderEdge;
+use super::exclusions::FLOAT_EPSILON;
+use super::model::*;
 
 /// Resolve the auto border-box width available to a BFC root beside floats.
 ///
@@ -35,8 +37,7 @@ impl FloatContext {
         top: PageTopBlockPosition,
         margin_box_size: MarginBoxSize,
         clear: Clear,
-        writing_mode: WritingMode,
-        direction: Direction,
+        placement_axes: FloatPlacementAxes,
         containing_inline_span: PageInlineSpan,
     ) -> FloatBandPlacement {
         self.avoiding_position_with_role(
@@ -44,8 +45,7 @@ impl FloatContext {
             top,
             margin_box_size,
             clear,
-            writing_mode,
-            direction,
+            placement_axes,
             containing_inline_span,
             true,
         )
@@ -67,8 +67,7 @@ impl FloatContext {
         top: PageTopBlockPosition,
         margin_box_size: MarginBoxSize,
         clear: Clear,
-        writing_mode: WritingMode,
-        direction: Direction,
+        placement_axes: FloatPlacementAxes,
         containing_inline_span: PageInlineSpan,
     ) -> FloatBandPlacement {
         self.avoiding_position_with_role(
@@ -76,8 +75,7 @@ impl FloatContext {
             top,
             margin_box_size,
             clear,
-            writing_mode,
-            direction,
+            placement_axes,
             containing_inline_span,
             false,
         )
@@ -90,8 +88,7 @@ impl FloatContext {
         top: PageTopBlockPosition,
         margin_box_size: MarginBoxSize,
         clear: Clear,
-        writing_mode: WritingMode,
-        direction: Direction,
+        placement_axes: FloatPlacementAxes,
         containing_inline_span: PageInlineSpan,
         is_float: bool,
     ) -> FloatBandPlacement {
@@ -99,8 +96,7 @@ impl FloatContext {
         let height = margin_box_size.height;
         let mut top = self.clearance_top(
             clear,
-            writing_mode,
-            direction,
+            placement_axes,
             page_index,
             HypotheticalClearBorderEdge::new(top),
         );
@@ -164,8 +160,7 @@ impl FloatContext {
         page_index: usize,
         top: PageTopBlockPosition,
         clear: Clear,
-        writing_mode: WritingMode,
-        direction: Direction,
+        placement_axes: FloatPlacementAxes,
         left: f32,
         right: f32,
         mut measure: F,
@@ -175,8 +170,7 @@ impl FloatContext {
     {
         let mut top = self.clearance_top(
             clear,
-            writing_mode,
-            direction,
+            placement_axes,
             page_index,
             HypotheticalClearBorderEdge::new(top),
         );
@@ -322,7 +316,7 @@ impl FloatContext {
         top: PageTopBlockPosition,
         margin_box_size: MarginBoxSize,
         clear: Clear,
-        clear_writing_mode: WritingMode,
+        placement_axes: FloatPlacementAxes,
         avoidance_writing_mode: WritingMode,
         direction: Direction,
         block_slab: PageInlineSpan,
@@ -333,12 +327,29 @@ impl FloatContext {
         let height = margin_box_size.height;
         let top = self.clearance_top(
             clear,
-            clear_writing_mode,
-            direction,
+            placement_axes,
             page_index,
             HypotheticalClearBorderEdge::new(top),
         );
         let inline_size = (top.points() - page_bottom.points()).max(height).max(1.0);
+        let inline_physical_start = match inline_start_side(avoidance_writing_mode, direction) {
+            PhysicalSide::Top => top,
+            PhysicalSide::Bottom => page_bottom,
+            PhysicalSide::Left | PhysicalSide::Right => {
+                unreachable!("a vertical containing block has a vertical inline axis")
+            }
+        };
+        let block_start = block_start_side(avoidance_writing_mode);
+        let initial_block_slab = match block_start {
+            PhysicalSide::Left => PageInlineSpan::new(block_slab.left_x(), width.max(1.0)),
+            PhysicalSide::Right => PageInlineSpan::from_edges(
+                (block_slab.right_x() - width.max(1.0)).max(block_slab.left_x()),
+                block_slab.right_x(),
+            ),
+            PhysicalSide::Top | PhysicalSide::Bottom => {
+                unreachable!("a vertical writing mode has a horizontal block axis")
+            }
+        };
         // With no exclusions, a BFC root remains at its hypothetical physical
         // top regardless of whether the vertical inline axis starts at the
         // page top or bottom.  Deriving the position from a bottom-to-top
@@ -359,17 +370,20 @@ impl FloatContext {
                 | None => top.points(),
             };
             return FloatBandPlacement::new(
-                FloatBand::from_span(PageInlineSpan::new(block_slab.left_x(), inline_size)),
+                FloatBand::from_span(PageInlineSpan::new(
+                    initial_block_slab.left_x(),
+                    inline_size,
+                )),
                 PageTopBlockPosition::new(placed_top),
             );
         }
-        let mut block_slab = PageInlineSpan::new(block_slab.left_x(), width.max(1.0));
+        let mut block_slab = initial_block_slab;
 
         for _ in 0..self.shapes.len().saturating_add(2) {
             let vertical_slab = vertical_physical_inline_span(
                 avoidance_writing_mode,
                 direction,
-                top,
+                inline_physical_start,
                 layout_pt(inline_size),
             );
             let band = self.logical_band(
@@ -396,9 +410,12 @@ impl FloatContext {
                 );
             }
 
-            let Some(next_start) =
-                self.next_vertical_float_slab_start(page_index, block_slab, vertical_slab)
-            else {
+            let Some(next_start) = self.next_vertical_float_slab_start(
+                page_index,
+                block_slab,
+                vertical_slab,
+                block_start,
+            ) else {
                 return FloatBandPlacement::new(
                     FloatBand::from_span(PageInlineSpan::new(
                         block_slab.left_x(),
@@ -407,7 +424,12 @@ impl FloatContext {
                     PageTopBlockPosition::new(placed_top),
                 );
             };
-            if next_start.left_x() <= block_slab.left_x() + FLOAT_EPSILON {
+            let advances_toward_block_end = match block_start {
+                PhysicalSide::Left => next_start.left_x() > block_slab.left_x() + FLOAT_EPSILON,
+                PhysicalSide::Right => next_start.right_x() < block_slab.right_x() - FLOAT_EPSILON,
+                PhysicalSide::Top | PhysicalSide::Bottom => unreachable!(),
+            };
+            if !advances_toward_block_end {
                 return FloatBandPlacement::new(
                     FloatBand::from_span(PageInlineSpan::new(
                         block_slab.left_x(),
@@ -428,7 +450,7 @@ impl FloatContext {
                 vertical_slab: vertical_physical_inline_span(
                     avoidance_writing_mode,
                     direction,
-                    top,
+                    inline_physical_start,
                     layout_pt(inline_size),
                 ),
             },
@@ -452,8 +474,10 @@ impl FloatContext {
         page_index: usize,
         block_slab: PageInlineSpan,
         inline_slab: PageBlockSpan,
+        block_start: PhysicalSide,
     ) -> Option<PageInlineSpan> {
-        self.shapes
+        let candidates = self
+            .shapes
             .iter()
             .filter(|shape| {
                 let shape_block_span = shape.margin_box_block_span();
@@ -466,15 +490,30 @@ impl FloatContext {
                     && shape_block_span.top_y() > inline_slab.bottom_y() + FLOAT_EPSILON
                     && shape_block_span.bottom_y() < inline_slab.top_y() - FLOAT_EPSILON
             })
-            .map(|shape| {
-                PageInlineSpan::new(shape.margin_box_inline_span().right_x(), block_slab.width())
-            })
-            .filter(|next_slab| next_slab.left_x() > block_slab.left_x() + FLOAT_EPSILON)
-            .min_by(|left, right| {
-                left.left_x()
-                    .partial_cmp(&right.left_x())
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+            .map(|shape| shape.margin_box_inline_span());
+        match block_start {
+            PhysicalSide::Left => candidates
+                .map(|shape| PageInlineSpan::new(shape.right_x(), block_slab.width()))
+                .filter(|next| next.left_x() > block_slab.left_x() + FLOAT_EPSILON)
+                .min_by(|left, right| {
+                    left.left_x()
+                        .partial_cmp(&right.left_x())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                }),
+            PhysicalSide::Right => candidates
+                .map(|shape| {
+                    PageInlineSpan::from_edges(shape.left_x() - block_slab.width(), shape.left_x())
+                })
+                .filter(|next| next.right_x() < block_slab.right_x() - FLOAT_EPSILON)
+                .max_by(|left, right| {
+                    left.right_x()
+                        .partial_cmp(&right.right_x())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                }),
+            PhysicalSide::Top | PhysicalSide::Bottom => {
+                unreachable!("a vertical writing mode has a horizontal block axis")
+            }
+        }
     }
 }
 
@@ -516,29 +555,26 @@ impl<'a> LayoutBuilder<'a> {
         top: PageTopBlockPosition,
         margin_box_size: MarginBoxSize,
         clear: Clear,
-        writing_mode: WritingMode,
-        clear_direction: Direction,
         placement_direction: Direction,
     ) -> FloatPlacement {
         let width = margin_box_size.width;
+        let placement_axes = FloatPlacementAxes::new(
+            self.containing_block_writing_mode,
+            self.containing_block_direction,
+        );
         if self.containing_block_writing_mode != WritingMode::HorizontalTb {
             let placement = self.find_vertical_float_avoiding_position(
                 top,
                 margin_box_size,
                 clear,
-                writing_mode,
-                clear_direction,
+                placement_axes,
+                self.current_content_logical_inline_content_size(),
                 None,
             );
             return FloatPlacement::new(placement.origin, placement.available_span);
         }
-        let placement = self.find_bfc_avoiding_position(
-            top,
-            margin_box_size,
-            clear,
-            writing_mode,
-            clear_direction,
-        );
+        let placement =
+            self.find_bfc_avoiding_position(top, margin_box_size, clear, placement_axes);
         let x = if placement_direction == Direction::Rtl {
             placement.origin.x() + (placement.available_span.width() - width).max(0.0)
         } else {
@@ -555,8 +591,7 @@ impl<'a> LayoutBuilder<'a> {
         top: PageTopBlockPosition,
         margin_box_size: MarginBoxSize,
         clear: Clear,
-        writing_mode: WritingMode,
-        direction: Direction,
+        placement_axes: FloatPlacementAxes,
     ) -> FloatBandPlacement {
         let page_index = self.current_float_page_index();
         let context = self
@@ -568,8 +603,7 @@ impl<'a> LayoutBuilder<'a> {
             top,
             margin_box_size,
             clear,
-            writing_mode,
-            direction,
+            placement_axes,
             PageInlineSpan::from_edges(self.content_left, self.content_right),
         )
     }
@@ -585,8 +619,7 @@ impl<'a> LayoutBuilder<'a> {
         top: PageTopBlockPosition,
         margin_box_size: MarginBoxSize,
         clear: Clear,
-        writing_mode: WritingMode,
-        direction: Direction,
+        placement_axes: FloatPlacementAxes,
         side: UsedFloatSide,
     ) -> FloatBandPlacement {
         let page_index = self.current_float_page_index();
@@ -600,8 +633,7 @@ impl<'a> LayoutBuilder<'a> {
             top,
             margin_box_size,
             clear,
-            writing_mode,
-            direction,
+            placement_axes,
             PageInlineSpan::from_edges(self.content_left, self.content_right),
         )
     }
@@ -612,8 +644,8 @@ impl<'a> LayoutBuilder<'a> {
         top: PageTopBlockPosition,
         margin_box_size: MarginBoxSize,
         clear: Clear,
-        writing_mode: WritingMode,
-        direction: Direction,
+        placement_axes: FloatPlacementAxes,
+        containing_logical_inline_size: LogicalInlineContentSize,
         side: Option<UsedFloatSide>,
     ) -> FloatBandPlacement {
         let page_index = self.current_float_page_index();
@@ -622,16 +654,30 @@ impl<'a> LayoutBuilder<'a> {
             .last()
             .expect("root float context exists");
         let avoidance_writing_mode = self.containing_block_writing_mode;
+        let containing_physical_bottom = if avoidance_writing_mode.has_vertical_lines() {
+            // A vertical containing block's logical inline axis is local
+            // physical Y. Bottom-side floats align to that box's physical
+            // bottom edge; the page fragmentainer edge belongs to the outer
+            // block flow and must not turn local inline placement into a page
+            // transition.
+            // <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
+            // <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+            PageTopBlockPosition::new(
+                top.points() - containing_logical_inline_size.points().max(0.0),
+            )
+        } else {
+            PageTopBlockPosition::new(self.page_bottom())
+        };
         context.vertical_avoiding_position(
             page_index,
             top,
             margin_box_size,
             clear,
-            writing_mode,
+            placement_axes,
             avoidance_writing_mode,
-            direction,
+            self.containing_block_direction,
             PageInlineSpan::from_edges(self.content_left, self.content_right),
-            PageTopBlockPosition::new(self.page_bottom()),
+            containing_physical_bottom,
             side,
         )
     }

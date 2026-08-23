@@ -1,7 +1,8 @@
+use std::collections::{BTreeMap, HashSet};
+
 use super::*;
 use crate::layout::block::suppress_fragmented_box_edges;
 use crate::layout::builder::page_for_context;
-use std::collections::{BTreeMap, HashSet};
 
 /// A page index in the document's final page sequence.
 ///
@@ -1649,6 +1650,23 @@ mod tests {
 
         assert_eq!(plan.materialized_destination_end(), Some(12));
         assert_eq!(plan.logical_tail(), None);
+    }
+
+    #[test]
+    fn empty_potentially_visible_principal_has_no_page_span() {
+        let plan = PositionedFragmentationPlan::for_absolute_box(
+            0,
+            None,
+            100.0,
+            PhysicalSide::Top,
+            layout_pt(100.0),
+            PositionedPaintReach::PotentiallyVisible,
+        );
+        let mut pending = PendingPositionedFragmentation::default();
+        pending.record(plan);
+
+        assert_eq!(pending.take_materialized_destination_end(), None);
+        assert_eq!(pending.logical_tail, None);
     }
 
     #[test]

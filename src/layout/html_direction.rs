@@ -103,6 +103,7 @@ pub(super) fn layout_element_signature(
     if let Some(direction) = element_document_direction(element) {
         signature = signature.with_document_direction(direction);
     }
+    signature.selected_image_dimensions = element.selected_image_dimensions().cloned();
     let html_direction = html_directionality(element);
     if let Some(direction) = html_direction {
         signature = signature.with_html_direction(direction);

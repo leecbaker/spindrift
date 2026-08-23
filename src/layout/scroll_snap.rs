@@ -674,9 +674,8 @@ fn union_paint_rects(left: PaintRect, right: PaintRect) -> PaintRect {
 
 #[cfg(test)]
 mod tests {
-    use crate::dom::ElementId;
-
     use super::*;
+    use crate::dom::ElementId;
 
     fn style() -> ComputedStyle {
         let mut style = ComputedStyle::initial();

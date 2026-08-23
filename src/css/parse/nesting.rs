@@ -1,6 +1,5 @@
 use super::*;
-use crate::css::FontPaletteDefinition;
-use crate::css::PropertyRegistrationRule;
+use crate::css::{FontPaletteDefinition, PropertyRegistrationRule};
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn flatten_rule(

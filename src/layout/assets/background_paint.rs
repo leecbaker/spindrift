@@ -1,6 +1,7 @@
+use std::rc::Rc;
+
 use super::*;
 use crate::document::paint::patterns::PaintPatternTiling;
-use std::rc::Rc;
 
 /// Resolved CSS background-image primitives plus their decoration-phase
 /// eligibility.

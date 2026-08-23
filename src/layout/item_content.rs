@@ -1,6 +1,7 @@
 use super::*;
-use crate::layout::block::DefinitePhysicalContentHeight;
-use crate::layout::block::child_available_space_for_formatting_context;
+use crate::layout::block::{
+    DefinitePhysicalContentHeight, child_available_space_for_formatting_context,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::layout) enum PageStartMarginPolicy {

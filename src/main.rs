@@ -1,5 +1,10 @@
 //! Command-line interface for rendering HTML and XML documents as PDFs.
 
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
+
 use clap::{ArgGroup, CommandFactory, Parser, ValueEnum, ValueHint};
 use clap_complete::{Shell, generate};
 use log::LevelFilter;
@@ -8,15 +13,6 @@ use quire::{
     HttpRequestTimeout, MediaType, PdfCompression, PdfOptions, PdfProfile, RenderOptions,
     ResourcePolicy, Url,
 };
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
-use std::thread;
-use std::time::{Duration, Instant};
-
-// Layout recursively traverses CSS box and inline trees. Keep command-line
-// rendering off the platform main thread so a valid deeply nested document is
-// not limited by the comparatively small process-main stack.
-const CLI_RENDER_STACK_SIZE: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -206,7 +202,6 @@ fn main() {
     let cli_started = Instant::now();
     let result = match thread::Builder::new()
         .name("quire-cli-render".to_string())
-        .stack_size(CLI_RENDER_STACK_SIZE)
         .spawn(move || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()

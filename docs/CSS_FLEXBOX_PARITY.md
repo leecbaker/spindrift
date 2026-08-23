@@ -1,6 +1,6 @@
 # CSS Flexbox Parity
 
-Last updated: 2026-08-17
+Last updated: 2026-08-21
 
 This document tracks Quire's implementation status for CSS Flexible Box
 Layout. The normative references are CSS Flexible Box Layout Level 1, CSS Box
@@ -238,6 +238,12 @@ Flex geometry failures.
 - Isolated float sizing and float replay suppress whole-flex prebreaks. This
   prevents a floated orthogonal flexbox from materializing page-height replay
   fragments merely while its auto height is being measured.
+- The complete `flexbox-writing-mode-001.html` through
+  `flexbox-writing-mode-016.html` matrix is raster-exact as of 2026-08-21.
+  Floated references resolve line-relative sides in the containing flow,
+  orthogonal float replay retains typed logical/physical size boundaries, and
+  the fixed vertical containers in `014` and `015` consume exactly two outer
+  page fragments rather than fragmenting once per child.
 - A nested bottom-to-top vertical block retains its horizontal parent's
   physical block cursor. Only the principal body box is page-inline-end
   anchored, preventing RTL vertical float replays from converting a short
@@ -246,11 +252,21 @@ Flex geometry failures.
   physical vertical and horizontal axes until the parent formatting context
   selects a compatible baseline. Final baseline export uses reconciled flex
   line and item geometry, so `order`, wrapping, `wrap-reverse`, and
-  `align-content` placement affect the exported coordinate. The inline-flex
+  `align-content` placement affect the exported coordinate. Baseline-sharing
+  priority is confined to the first/last order-modified flex line; when that
+  line has no requested or opposite sharing group, item-provided and
+  synthesized fallbacks use the startmost/endmost line from finalized ordinary
+  writing-mode cross geometry, without exchanging those edges for
+  `wrap-reverse`. Item-derived cross-axis export is scoped to the same selected
+  finalized line. The inline-flex
   atom no longer substitutes its captured paint fragment's first line for
   missing flex metadata. Intrinsic nested-flex estimates use the same
-  shared-line-baseline-first selection rule as final layout, including
-  order-modified fallback selection for reversed main axes. Remaining
+  requested-set, opposite-set, measured-item, and synthesized-item priority as
+  final layout, including order-modified fallback selection for reversed main
+  axes. Estimated flex line cross size follows Flexbox 9.4 by summing the
+  greatest baseline-to-outer-start and baseline-to-outer-end distances, then
+  comparing that sum with every non-participant's hypothetical outer cross
+  size; this also applies to auto-sized one-line containers. Remaining
   Baseline participant eligibility, synthesized-baseline selection, and CSS
   Align fallback are resolved together after final flex-item remeasurement,
   rather than in separate physical row/column correction passes. Inline-flex
@@ -258,6 +274,13 @@ Flex geometry failures.
   coordinates once, then the parent inline context projects the compatible
   physical axis through its logical block-start side. This covers horizontal,
   `vertical-lr`, and `vertical-rl` inline-flex baseline transport.
+- Exact evaluation of all 17 non-reference
+  `css/css-flexbox/flexbox-baseline-*` WPTs on 2026-08-21 passes 17 of 17 in
+  Quire. The multiline reference documents also exercise HTML `<br>` under an
+  author-specified atomic display and a following float: Quire retains the
+  semantic forced break without materializing it as an atomic line box, resets
+  the adjoining-float source-order floor after the committed line, and keeps
+  the preceding in-flow line as the inline-block baseline.
 - Baseline-participating `inline-flex` atoms preserve signed logical
   block-start margins when the parent inline context normalizes its shared
   paint anchor. An all-negative margin set is not clamped to zero, matching

@@ -1,10 +1,10 @@
-use base64::Engine;
-use image::ImageEncoder;
 use std::rc::Rc;
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use base64::Engine;
+use fontique::Blob as FontiqueBlob;
+use image::ImageEncoder;
 
 use super::{
     PdfFontValidationProfile, embedded_font_candidate_key, embedded_font_plans_with_profile,
@@ -13,14 +13,13 @@ use super::{
 use crate::document::paint::display_list::PaintBand;
 use crate::document::paint::text::{RenderedGlyph, RenderedLine, RenderedTextRun};
 use crate::document::{
-    CssFontVerticalMetrics, DocumentFont, DocumentFontData, FontProgramKind,
-    OpenTypeVerticalMetrics,
+    CssFontVerticalMetrics, DocumentFont, DocumentFontData, DocumentFontVariationCoordinates,
+    FontProgramKind, OpenTypeVerticalMetrics,
 };
 use crate::{
     CssColor, Document, DocumentMetadata, Error, FontEmbeddingMode, Html, Page, PdfCompression,
     PdfOptions, PdfProfile, RenderOptions,
 };
-use fontique::Blob as FontiqueBlob;
 
 trait PdfBytesForTest {
     fn write_pdf_bytes(&self, options: &PdfOptions) -> crate::Result<Vec<u8>>;
@@ -2581,6 +2580,69 @@ fn pdf_font_embedding_subsets_ttf_with_compact_cids() {
     assert!(rendered.contains(&format!("<{cid_a:04X}> <0041>")));
 }
 
+/// A PDF font resource must embed the variable location that Parley shaped,
+/// rather than the source program's default outlines.
+/// <https://www.w3.org/TR/css-fonts-4/#font-variation-settings-def>
+#[test]
+fn pdf_font_embedding_materializes_a_static_variable_instance() {
+    let font_bytes =
+        std::fs::read("tests/resources/fonts/Roboto-VariableFont_wdth,wght.ttf").unwrap();
+    let face = ttf_parser::Face::parse(&font_bytes, 0).unwrap();
+    let glyph_a = face.glyph_index('A').unwrap().0;
+    let glyph_count = face.number_of_glyphs();
+    let font = variable_test_document_font(0, font_bytes.clone(), 700.0);
+    let regular = variable_test_document_font(1, font_bytes, 400.0);
+    assert_ne!(
+        embedded_font_candidate_key(&font),
+        embedded_font_candidate_key(&regular),
+        "distinct locations must not share a PDF resource"
+    );
+    assert!(!same_embedded_font_program(&font, &regular));
+
+    let mut page = Page::new(120.0, 80.0);
+    page.push_line(test_rendered_line(glyph_a, "A", CssColor::BLACK));
+    let document = Document {
+        pages: vec![page],
+        metadata: DocumentMetadata::default(),
+        fonts: vec![font.clone()],
+        bookmarks: Vec::new(),
+        image_store: Box::default(),
+    };
+    let plans = embedded_font_plans_with_profile(&document, 1, PdfFontValidationProfile::Default);
+    let plan = &plans.fonts[0];
+    let instance = ttf_parser::Face::parse(&plan.font_file_data, 0).unwrap();
+    assert!(
+        instance
+            .raw_face()
+            .table(ttf_parser::Tag::from_bytes(b"fvar"))
+            .is_none(),
+        "the PDF program must be static"
+    );
+    assert!(
+        instance
+            .glyph_hor_advance(ttf_parser::GlyphId(plan.source_gid_to_cid[&glyph_a]))
+            .is_some()
+    );
+
+    let full_plans = embedded_font_plans_with_profile_and_mode(
+        &document,
+        1,
+        PdfFontValidationProfile::Default,
+        FontEmbeddingMode::Full,
+    );
+    let full = &full_plans.fonts[0];
+    assert!(matches!(
+        full.embedding_kind,
+        super::FontEmbeddingKind::InstantiatedFullCoverage
+    ));
+    assert_eq!(full.source_gid_to_cid[&glyph_a], glyph_a);
+    assert_eq!(
+        full.source_gid_to_cid.len(),
+        usize::from(glyph_count),
+        "full mode must retain every source glyph"
+    );
+}
+
 #[test]
 fn pdf_full_font_embedding_uses_original_ttf_identity_cids_and_full_cmap() {
     let font_bytes = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
@@ -3727,13 +3789,52 @@ fn test_document_font(id: usize, blob: FontiqueBlob<u8>) -> DocumentFont {
         italic_angle: 0,
         bbox: [-438, -293, 1142, 1034],
         baselines: crate::document::OpenTypeBaselineTable::default(),
+        variation_coordinates: crate::document::DocumentFontVariationCoordinates::default(),
+        synthesis: crate::document::DocumentFontSynthesis::default(),
+    }
+}
+
+fn variable_test_document_font(id: usize, bytes: Vec<u8>, weight: f32) -> DocumentFont {
+    let face = ttf_parser::Face::parse(&bytes, 0).unwrap();
+    let bbox = face.global_bounding_box();
+    let units_per_em = face.units_per_em();
+    let ascender = face.ascender();
+    let descender = face.descender();
+    let cap_height = face.capital_height().unwrap_or(ascender);
+    let italic_angle = face.italic_angle().round() as i16;
+    DocumentFont {
+        id,
+        family: "Roboto".to_string(),
+        post_script_name: "Roboto-Variable".to_string(),
+        program_kind: FontProgramKind::TrueType,
+        data: DocumentFontData::from_blob(FontiqueBlob::new(Arc::new(bytes))),
+        face_index: 0,
+        units_per_em,
+        program_metrics: OpenTypeVerticalMetrics {
+            ascender,
+            descender,
+            line_gap: 0,
+        },
+        layout_metrics: CssFontVerticalMetrics {
+            ascender,
+            descender,
+            line_gap: 0,
+        },
+        cap_height,
+        italic_angle,
+        bbox: [bbox.x_min, bbox.y_min, bbox.x_max, bbox.y_max],
+        baselines: crate::document::OpenTypeBaselineTable::default(),
+        variation_coordinates: DocumentFontVariationCoordinates(vec![
+            (*b"wdth", 100.0_f32.to_bits()),
+            (*b"wght", weight.to_bits()),
+        ]),
         synthesis: crate::document::DocumentFontSynthesis::default(),
     }
 }
 
 /// A synthesized document use shares its subset with the regular program but
-/// emits fill-and-stroke text ink. CSS Fonts synthesis must not change glyph
-/// IDs, advances, or ToUnicode extraction.
+/// emits fill-and-stroke, obliqued text ink. CSS Fonts synthesis must not
+/// change glyph IDs, advances, or ToUnicode extraction.
 /// <https://www.w3.org/TR/css-fonts-4/#font-synthesis-intro>
 #[test]
 fn synthetic_bold_is_a_per_document_font_pdf_paint_state() {
@@ -3744,6 +3845,8 @@ fn synthetic_bold_is_a_per_document_font_pdf_paint_state() {
     let regular = test_document_font(0, FontiqueBlob::new(Arc::new(bytes.clone())));
     let mut synthesized = test_document_font(1, FontiqueBlob::new(Arc::new(bytes)));
     synthesized.synthesis.embolden = true;
+    synthesized.synthesis.oblique =
+        crate::document::SyntheticObliqueAngle::from_fontique_degrees(14);
 
     let mut page = Page::new(120.0, 80.0);
     for (text, y, font_id, glyph_id) in [("A", 24.0, 0, glyph_a), ("B", 48.0, 1, glyph_b)] {
@@ -3789,8 +3892,32 @@ fn synthetic_bold_is_a_per_document_font_pdf_paint_state() {
     );
     assert_eq!(rendered.matches("2 Tr").count(), 1, "{rendered}");
     assert!(rendered.contains("0.5 w"), "{rendered}");
+    assert!(rendered.contains("0.249328 1 10 48 Tm"), "{rendered}");
     assert!(rendered.contains("<0001> <0041>"), "{rendered}");
     assert!(rendered.contains("<0002> <0042>"), "{rendered}");
+}
+
+#[test]
+fn synthetic_oblique_composes_with_writing_mode_and_glyph_origins() {
+    let oblique = crate::document::SyntheticObliqueAngle::from_fontique_degrees(14);
+    let shear = 14_f32.to_radians().tan();
+    let identity = super::content::pdf_text_matrix_components(
+        crate::document::paint::text::RenderedTextMatrix::IDENTITY,
+        oblique,
+    );
+    assert_eq!(identity, [1.0, 0.0, shear, 1.0]);
+
+    let clockwise = super::content::pdf_text_matrix_components(
+        crate::document::paint::text::RenderedTextMatrix::ROTATE_CW,
+        oblique,
+    );
+    assert_eq!(clockwise, [0.0, -1.0, 1.0, -shear]);
+    let origin = super::content::pdf_text_matrix_transform_local_point(
+        clockwise,
+        crate::document::paint::text::TextRunPoint::new(3.0, 5.0),
+    );
+    assert_eq!(origin.x, 5.0);
+    assert_eq!(origin.y, -3.0 - 5.0 * shear);
 }
 
 fn document_with_single_glyph_font(font_bytes: Vec<u8>, glyph_id: u16) -> Document {

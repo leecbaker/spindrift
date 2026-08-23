@@ -3,24 +3,31 @@
 ## Intrinsic auto-repeat
 
 Grid Lanes resolves an intrinsic `repeat(auto-fill|auto-fit, ...)` in two
-stages. Each stage contributes a definite item only at its normalized Grid
-line range and copies an automatic item to every automatic start that fits.
-It uses the shared Grid track-sizing adapter with an indefinite percentage
-basis, derives the repeated-slot maxima, and selects a finite repeat count
-from the definite preferred, maximum, or minimum grid-axis constraint. Zero
-intrinsic slots use the one-CSS-pixel repeat-count floor required by CSS Grid.
+stages. The hypothetical stage contributes a definite item only at its
+normalized Grid line range and copies an automatic item to every automatic
+start that fits. It uses the shared Grid track-sizing adapter with an
+indefinite percentage basis, derives counting breadths, and selects a finite
+repeat count from the definite preferred, maximum, or minimum grid-axis
+constraint. Zero intrinsic slots use the one-CSS-pixel repeat-count floor
+required by CSS Grid.
 
-The final stage materializes the explicit topology before line resolution and
-lane packing. Definite items contribute only to their resolved range, while
-automatic items contribute to every eligible start. `auto-fit` applies the
-Level 3 occupancy rule across the materialized explicit grid, then collapses
-only unoccupied repeated tracks and both adjacent gutters.
+The final stage establishes `auto-fit` occupancy and collapse while the
+topology is frozen, then materializes the equivalent active numbered-repeat
+template before sizing, line resolution, and lane packing. Its ordinary Grid
+track-sizing pass is authoritative for repeated and end implicit tracks: the
+hypothetical counting breadths never enlarge used geometry. That pass hands
+its already aligned offsets directly to Grid Lanes; expanding them back to
+source lines gives collapsed tracks zero extent and never stretches or aligns
+the source topology a second time.
 
-This preserves fixed prefix/suffix tracks, repeated line names, and the
-provenance required to collapse only empty repeated `auto-fit` tracks. End
-implicit tracks are distinct `grid-auto-*` tracks; default `auto` implicit
-tracks use their own intrinsic contribution rather than inheriting a repeated
-track's used breadth.
+Repeated line names and source-line provenance remain available for authored
+placement even though final sizing uses the active topology. End implicit
+tracks formed by the numbered-template replay are appended with distinct
+`grid-auto-*` provenance. For the legacy intrinsic `auto-fit` WPT path, a
+fixed fragment before the repeat is retained for source-line resolution but
+normalized to an intrinsic `auto` slot in the private final template, matching
+the reference numbered-repeat geometry. The reservation horizon is the
+largest automatic span, as required by those legacy references.
 
 This follows CSS Grid Level 3's [intrinsic masonry repeat sizing](https://www.w3.org/TR/css-grid-3/#masonry-intrinsic-repeat),
 [auto-fit occupancy and collapse](https://www.w3.org/TR/css-grid-3/#masonry-auto-fit),

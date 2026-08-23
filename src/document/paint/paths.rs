@@ -1,8 +1,7 @@
-use crate::CssColor;
-
 use super::geometry::{
     PaintClip, PaintPoint, PaintRect, PaintSize, PaintStrokeWidth, PaintTransform, PaintTranslation,
 };
+use crate::CssColor;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderedPath {
@@ -611,12 +610,11 @@ pub(in crate::document) fn path_bounds(path: &RenderedPath) -> Option<PaintClip>
 
 #[cfg(test)]
 mod tests {
-    use crate::CssColor;
-
     use super::{
         RenderedPath, RenderedPathCommand, RenderedPathCommandPoints, paint_rect_path_commands,
         path_bounds,
     };
+    use crate::CssColor;
     use crate::document::paint::geometry::{
         PaintClip, PaintPoint, PaintRect, PaintSize, PaintStrokeWidth, PaintTransform,
     };

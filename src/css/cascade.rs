@@ -1,3 +1,7 @@
+use std::collections::HashMap;
+
+use selectors::context::SelectorCaches;
+
 use super::component_values::{
     css_function_list, css_leading_function_matching, css_single_ident, parse_css_string_token,
     split_css_component_values, trim_css_value, try_split_css_component_values,
@@ -7,8 +11,6 @@ use super::parse::parse_declarations;
 use super::selector::selector_chain;
 use super::types::*;
 use super::values::*;
-use selectors::context::SelectorCaches;
-use std::collections::HashMap;
 
 mod background;
 mod columns;

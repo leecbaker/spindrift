@@ -8,7 +8,7 @@
 //! <https://drafts.csswg.org/css-align-3/#baseline-alignment>
 //! <https://drafts.csswg.org/css-flexbox/#flex-baselines>
 
-use crate::css::PhysicalSide;
+use crate::css::{BaselineMetric, PhysicalSide};
 use crate::units::{LayoutLength, SemanticLengthExt};
 
 /// Marker for a baseline coordinate measured from a box's physical top edge.
@@ -71,15 +71,60 @@ impl<Axis> Default for BaselinePair<Axis> {
 }
 
 /// Final baseline sets measured from an atomic inline's physical border-box
-/// top and left edges. The parent inline formatting context performs the one
-/// logical-axis projection when it places the atom in a line.
-#[derive(Debug, Clone, Copy, Default)]
+/// top and left edges.
+///
+/// Each coordinate is the named baseline recorded by its corresponding
+/// `*_metric`.  A formatting context that generates a set from one alignment
+/// baseline must retain that name until it has applied the box's font baseline
+/// table.  Coordinates alone are insufficient in vertical typographic modes,
+/// where central and alphabetic baselines do not generally coincide:
+/// <https://drafts.csswg.org/css-align-3/#baseline-alignment>.
+#[derive(Debug, Clone, Copy)]
 pub(in crate::layout) struct PhysicalBaselineSets {
     pub(in crate::layout) vertical: BaselinePair<PhysicalTopBaselineAxis>,
     pub(in crate::layout) horizontal: BaselinePair<PhysicalLeftBaselineAxis>,
+    pub(in crate::layout) vertical_metric: BaselineMetric,
+    pub(in crate::layout) horizontal_metric: BaselineMetric,
+}
+
+impl Default for PhysicalBaselineSets {
+    fn default() -> Self {
+        Self {
+            vertical: BaselinePair::default(),
+            horizontal: BaselinePair::default(),
+            // Existing non-Flex exporters record the CSS alphabetic line
+            // coordinate. Require new named-baseline exporters to opt in
+            // explicitly rather than silently changing those call sites.
+            vertical_metric: BaselineMetric::Alphabetic,
+            horizontal_metric: BaselineMetric::Alphabetic,
+        }
+    }
 }
 
 impl PhysicalBaselineSets {
+    /// Convert both physical baseline coordinates to alphabetic coordinates.
+    ///
+    /// `vertical_adjustment` and `horizontal_adjustment` are signed physical
+    /// displacements from each set's recorded metric to alphabetic.  The
+    /// caller owns their writing-mode projection because this record keeps
+    /// only physical axes.  This is the named-baseline resolution boundary
+    /// between a generating layout mode and legacy inline atom geometry.
+    pub(in crate::layout) fn normalized_to_alphabetic(
+        mut self,
+        vertical_adjustment: LayoutLength,
+        horizontal_adjustment: LayoutLength,
+    ) -> Self {
+        if self.vertical_metric != BaselineMetric::Alphabetic {
+            self.vertical = offset_baseline_pair(self.vertical, vertical_adjustment);
+            self.vertical_metric = BaselineMetric::Alphabetic;
+        }
+        if self.horizontal_metric != BaselineMetric::Alphabetic {
+            self.horizontal = offset_baseline_pair(self.horizontal, horizontal_adjustment);
+            self.horizontal_metric = BaselineMetric::Alphabetic;
+        }
+        self
+    }
+
     /// Project the first compatible physical baseline into the containing
     /// inline formatting context's logical block-start coordinate.
     ///
@@ -112,6 +157,16 @@ impl PhysicalBaselineSets {
     }
 }
 
+fn offset_baseline_pair<Axis>(
+    pair: BaselinePair<Axis>,
+    adjustment: LayoutLength,
+) -> BaselinePair<Axis> {
+    BaselinePair {
+        first: pair.first.map(|baseline| baseline.offset_by(adjustment)),
+        last: pair.last.map(|baseline| baseline.offset_by(adjustment)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,6 +182,7 @@ mod tests {
                 first: Some(PhysicalLeftBaselineOffset::new(layout_pt(11.0))),
                 last: None,
             },
+            ..PhysicalBaselineSets::default()
         }
     }
 
@@ -149,6 +205,51 @@ mod tests {
         assert_eq!(
             sets.first_from_logical_block_start(PhysicalSide::Bottom, span),
             Some(layout_pt(33.0))
+        );
+    }
+
+    #[test]
+    fn named_physical_baselines_normalize_to_alphabetic_once() {
+        let sets = PhysicalBaselineSets {
+            vertical: BaselinePair {
+                first: Some(PhysicalTopBaselineOffset::new(layout_pt(7.0))),
+                last: Some(PhysicalTopBaselineOffset::new(layout_pt(17.0))),
+            },
+            horizontal: BaselinePair {
+                first: Some(PhysicalLeftBaselineOffset::new(layout_pt(11.0))),
+                last: Some(PhysicalLeftBaselineOffset::new(layout_pt(21.0))),
+            },
+            vertical_metric: BaselineMetric::Central,
+            horizontal_metric: BaselineMetric::Central,
+        };
+
+        let normalized = sets.normalized_to_alphabetic(layout_pt(3.0), layout_pt(-3.0));
+        assert_eq!(normalized.vertical_metric, BaselineMetric::Alphabetic);
+        assert_eq!(normalized.horizontal_metric, BaselineMetric::Alphabetic);
+        assert_eq!(normalized.vertical.first.unwrap().points(), 10.0);
+        assert_eq!(normalized.vertical.last.unwrap().points(), 20.0);
+        assert_eq!(normalized.horizontal.first.unwrap().points(), 8.0);
+        assert_eq!(normalized.horizontal.last.unwrap().points(), 18.0);
+    }
+
+    #[test]
+    fn central_baseline_normalizes_before_vertical_rl_right_edge_projection() {
+        let sets = PhysicalBaselineSets {
+            horizontal: BaselinePair {
+                first: Some(PhysicalLeftBaselineOffset::new(layout_pt(37.5))),
+                last: None,
+            },
+            horizontal_metric: BaselineMetric::Central,
+            ..PhysicalBaselineSets::default()
+        };
+
+        // The font table places alphabetic 3pt toward physical left from
+        // central.  Normalize while the physical orientation is still known,
+        // then project vertical-rl's right block-start edge.
+        let normalized = sets.normalized_to_alphabetic(layout_pt(0.0), layout_pt(-3.0));
+        assert_eq!(
+            normalized.first_from_logical_block_start(PhysicalSide::Right, layout_pt(75.0)),
+            Some(layout_pt(40.5))
         );
     }
 }

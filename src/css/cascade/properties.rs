@@ -1442,8 +1442,9 @@ fn copy_modeled_longhand_by_css_name(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::collections::HashSet;
+
+    use super::*;
 
     #[test]
     fn modeled_longhand_registry_is_unique_and_copy_complete() {

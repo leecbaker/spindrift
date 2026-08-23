@@ -1,4 +1,13 @@
-use super::*;
+use super::{
+    BlockSizeBasisSource, BlockSizePercentageBasis, ComputedStyle, ContentAlignmentKeyword,
+    ContentBoxLength, Element, Float, PercentageBasis, PhysicalAxis, Position, ReplacedElementKind,
+    TableCellBaselineSet, TableCellChildFragmentKind, TableCellContentSizingPolicy,
+    TableCellOuterBlockSize, TableCellPlacement, TableCellVerticalAlign, block_start_side,
+    box_tree, content_box_pt, css, inline_start_side, layout_pt, non_content_pt,
+    percentage_basis_from_points, replaced_element_kind, set_style_auto_height,
+    table_cell_formatting_child_outer_height, used_canvas,
+    used_content_box_height_or_auto_with_basis,
+};
 
 /// A committed, definite table-cell content-box block size.
 ///
@@ -546,39 +555,45 @@ pub(in crate::layout::table) fn table_cell_child_is_in_flow_float(
 pub(in crate::layout::table) fn table_cell_measured_inline_outer_height_without_policy(
     child: &box_tree::FormattingBox<'_>,
     available_width: f32,
-) -> Option<f32> {
+) -> Option<TableCellOuterBlockSize> {
     match child {
         box_tree::FormattingBox::Inline(box_) => {
             if matches!(
                 box_.core.style.position,
                 Position::Absolute | Position::Fixed
             ) {
-                Some(0.0)
+                Some(TableCellOuterBlockSize::new(layout_pt(0.0)))
             } else {
-                Some(table_cell_formatting_child_outer_height(child).points())
+                Some(TableCellOuterBlockSize::new(
+                    table_cell_formatting_child_outer_height(child),
+                ))
             }
         }
         box_tree::FormattingBox::AtomicInline(box_)
             if replaced_element_kind(box_.core.element) == Some(ReplacedElementKind::Canvas) =>
         {
-            Some(table_cell_canvas_first_pass_outer_height(
-                box_.core.element,
-                &box_.core.style,
-                available_width,
-            ))
+            Some(TableCellOuterBlockSize::new(layout_pt(
+                table_cell_canvas_first_pass_outer_height(
+                    box_.core.element,
+                    &box_.core.style,
+                    available_width,
+                ),
+            )))
         }
         box_tree::FormattingBox::Replaced(box_)
             if replaced_element_kind(box_.core.element) == Some(ReplacedElementKind::Canvas) =>
         {
-            Some(table_cell_canvas_first_pass_outer_height(
-                box_.core.element,
-                &box_.core.style,
-                available_width,
-            ))
+            Some(TableCellOuterBlockSize::new(layout_pt(
+                table_cell_canvas_first_pass_outer_height(
+                    box_.core.element,
+                    &box_.core.style,
+                    available_width,
+                ),
+            )))
         }
-        box_tree::FormattingBox::AtomicInline(_) | box_tree::FormattingBox::Replaced(_) => {
-            Some(table_cell_formatting_child_outer_height(child).points())
-        }
+        box_tree::FormattingBox::AtomicInline(_) | box_tree::FormattingBox::Replaced(_) => Some(
+            TableCellOuterBlockSize::new(table_cell_formatting_child_outer_height(child)),
+        ),
         box_tree::FormattingBox::AnonymousBlock(_)
         | box_tree::FormattingBox::InlineSplitBlockContext(_)
         | box_tree::FormattingBox::Block(_)
@@ -663,7 +678,16 @@ pub(in crate::layout::table) fn table_cell_children_can_use_inline_line_sequence
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
+    use crate::RenderOptions;
+    use crate::css::{Direction, ElementSignature, SemanticLengthExt, Stylesheets};
+    use crate::dom::{self, Node, NodeKind};
+    use crate::layout::table::TableRow;
+    use crate::layout::{LayoutBuilder, LayoutBuilderConfig};
+    use crate::resource::ResourceCache;
+    use crate::text::FontSystem;
 
     #[test]
     fn table_cell_content_pass_keeps_row_minimum_percentage_heights_indefinite() {

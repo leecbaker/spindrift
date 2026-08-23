@@ -1,19 +1,139 @@
 use crate::layout::block::{
-    FloatArea, FloatBandQuery, FloatContour, FlowExclusionKind, InitialLetterLayout,
-    LogicalFloatPlacement, UsedRoundedRect,
+    FloatArea, FloatBandQuery, FloatContour, FloatReplayBlockOriginAdjustment, FlowExclusionKind,
+    InitialLetterLayout, LogicalFloatPlacement, UsedRoundedRect,
 };
 use crate::layout::{
     Clear, ClearedFloatOuterBlockEnd, Direction, Float, FloatAvoidanceCandidate,
     FloatAvoidanceInlineContainment, FloatBand, FloatBandPlacement, FloatClearanceTarget,
-    FloatContext, FloatId, FloatPlacement, FloatRunState, FloatShape, HypotheticalClearBorderEdge,
-    LogicalFloatBand, LogicalInlineSpan, PageBlockSpan, PageInlineSpan, PageTopBlockPosition,
-    PageTopPoint, PageTopRect, UsedFloatSide, WritingMode, border_box_pt, margin_box_pt,
-    margin_box_size_pt,
+    FloatContext, FloatId, FloatPlacement, FloatPlacementAxes, FloatRunState, FloatShape,
+    HypotheticalClearBorderEdge, LogicalFloatBand, LogicalInlineContentSize, LogicalInlineSpan,
+    PageBlockSpan, PageInlineSpan, PageTopBlockPosition, PageTopPoint, PageTopRect, PhysicalSide,
+    UsedFloatSide, WritingMode, border_box_pt, content_box_pt, margin_box_pt, margin_box_size_pt,
 };
 use crate::units::SemanticLengthExt;
 
 fn top(value: f32) -> PageTopBlockPosition {
     PageTopBlockPosition::new(value)
+}
+
+fn float_axes(writing_mode: WritingMode, direction: Direction) -> FloatPlacementAxes {
+    FloatPlacementAxes::new(writing_mode, direction)
+}
+
+#[test]
+fn float_replay_origin_adjusts_only_for_bottom_origin_inline_flow() {
+    let logical_inline_size = LogicalInlineContentSize::new(content_box_pt(375.0));
+    let vertical_rtl = FloatReplayBlockOriginAdjustment::for_containing_inline_axis(
+        float_axes(WritingMode::VerticalLr, Direction::Rtl),
+        top(450.0),
+        logical_inline_size,
+    );
+    assert_eq!(vertical_rtl.paint_translation().y, 75.0);
+
+    for axes in [
+        float_axes(WritingMode::HorizontalTb, Direction::Rtl),
+        float_axes(WritingMode::VerticalLr, Direction::Ltr),
+        float_axes(WritingMode::SidewaysLr, Direction::Rtl),
+    ] {
+        let adjustment = FloatReplayBlockOriginAdjustment::for_containing_inline_axis(
+            axes,
+            top(450.0),
+            logical_inline_size,
+        );
+        assert_eq!(adjustment.paint_translation().y, 0.0);
+    }
+}
+
+#[test]
+fn float_and_clear_legacy_sides_follow_the_containing_line_orientation() {
+    let cases = [
+        (
+            WritingMode::HorizontalTb,
+            UsedFloatSide::Left,
+            UsedFloatSide::Right,
+        ),
+        (
+            WritingMode::VerticalRl,
+            UsedFloatSide::Top,
+            UsedFloatSide::Bottom,
+        ),
+        (
+            WritingMode::VerticalLr,
+            UsedFloatSide::Top,
+            UsedFloatSide::Bottom,
+        ),
+        (
+            WritingMode::SidewaysRl,
+            UsedFloatSide::Top,
+            UsedFloatSide::Bottom,
+        ),
+        (
+            WritingMode::SidewaysLr,
+            UsedFloatSide::Bottom,
+            UsedFloatSide::Top,
+        ),
+    ];
+
+    for (writing_mode, expected_left, expected_right) in cases {
+        for direction in [Direction::Ltr, Direction::Rtl] {
+            let axes = float_axes(writing_mode, direction);
+            assert_eq!(
+                UsedFloatSide::from_float(Float::Left, axes),
+                Some(expected_left)
+            );
+            assert_eq!(
+                UsedFloatSide::from_float(Float::Right, axes),
+                Some(expected_right)
+            );
+            assert!(expected_left.matches_clear(Clear::Left, axes));
+            assert!(expected_right.matches_clear(Clear::Right, axes));
+        }
+    }
+}
+
+#[test]
+fn float_inline_sides_follow_containing_direction() {
+    let cases = [
+        (
+            WritingMode::HorizontalTb,
+            Direction::Ltr,
+            UsedFloatSide::Left,
+        ),
+        (
+            WritingMode::HorizontalTb,
+            Direction::Rtl,
+            UsedFloatSide::Right,
+        ),
+        (WritingMode::VerticalRl, Direction::Ltr, UsedFloatSide::Top),
+        (
+            WritingMode::VerticalRl,
+            Direction::Rtl,
+            UsedFloatSide::Bottom,
+        ),
+        (
+            WritingMode::SidewaysLr,
+            Direction::Ltr,
+            UsedFloatSide::Bottom,
+        ),
+        (WritingMode::SidewaysLr, Direction::Rtl, UsedFloatSide::Top),
+    ];
+
+    for (writing_mode, direction, expected_start) in cases {
+        let axes = float_axes(writing_mode, direction);
+        assert_eq!(
+            UsedFloatSide::from_float(Float::InlineStart, axes),
+            Some(expected_start)
+        );
+        assert_eq!(
+            UsedFloatSide::from_float(Float::InlineEnd, axes),
+            Some(match expected_start {
+                UsedFloatSide::Left => UsedFloatSide::Right,
+                UsedFloatSide::Right => UsedFloatSide::Left,
+                UsedFloatSide::Top => UsedFloatSide::Bottom,
+                UsedFloatSide::Bottom => UsedFloatSide::Top,
+            })
+        );
+    }
 }
 
 fn hypothetical_top(value: f32) -> HypotheticalClearBorderEdge {
@@ -267,7 +387,11 @@ fn shape(
 ) -> FloatShape {
     shape_with_used_side(
         side,
-        UsedFloatSide::from_float(side, WritingMode::HorizontalTb, Direction::Ltr).unwrap(),
+        UsedFloatSide::from_float(
+            side,
+            FloatPlacementAxes::new(WritingMode::HorizontalTb, Direction::Ltr),
+        )
+        .unwrap(),
         page_index,
         left,
         right,
@@ -756,8 +880,7 @@ fn bfc_root_placement_retries_same_top_when_measured_height_narrows_band() {
         0,
         top(100.0),
         Clear::None,
-        WritingMode::HorizontalTb,
-        Direction::Ltr,
+        float_axes(WritingMode::HorizontalTb, Direction::Ltr),
         0.0,
         300.0,
         |band, _top| {
@@ -792,8 +915,7 @@ fn bfc_root_placement_moves_fixed_width_candidate_below_too_narrow_band() {
         0,
         top(100.0),
         Clear::None,
-        WritingMode::HorizontalTb,
-        Direction::Ltr,
+        float_axes(WritingMode::HorizontalTb, Direction::Ltr),
         0.0,
         300.0,
         |band, _top| bfc_measurement(band.left(), 150.0, 20.0),
@@ -816,8 +938,7 @@ fn bfc_root_placement_ignores_own_margins_for_float_collision() {
         0,
         top(100.0),
         Clear::None,
-        WritingMode::HorizontalTb,
-        Direction::Ltr,
+        float_axes(WritingMode::HorizontalTb, Direction::Ltr),
         0.0,
         100.0,
         |band, _top| bfc_measurement(band.left(), band.width(), 100.0),
@@ -847,8 +968,7 @@ fn bfc_root_placement_keeps_rtl_border_box_at_band_end() {
         0,
         top(100.0),
         Clear::None,
-        WritingMode::HorizontalTb,
-        Direction::Rtl,
+        float_axes(WritingMode::HorizontalTb, Direction::Rtl),
         0.0,
         100.0,
         |band, _top| bfc_measurement(band.right() - 40.0, 40.0, 20.0),
@@ -877,8 +997,7 @@ fn bfc_root_placement_uses_resolved_border_box_start() {
         0,
         top(100.0),
         Clear::None,
-        WritingMode::HorizontalTb,
-        Direction::Ltr,
+        float_axes(WritingMode::HorizontalTb, Direction::Ltr),
         0.0,
         100.0,
         |band, _top| {
@@ -909,8 +1028,7 @@ fn bfc_root_negative_margin_hypothetical_border_top_stays_above_a_float() {
         0,
         top(125.0),
         Clear::None,
-        WritingMode::HorizontalTb,
-        Direction::Ltr,
+        float_axes(WritingMode::HorizontalTb, Direction::Ltr),
         0.0,
         100.0,
         |_band, _top| bfc_measurement(0.0, 50.0, 20.0),
@@ -929,8 +1047,7 @@ fn bfc_root_negative_margin_overlap_uses_the_border_box_to_stay_adjacent() {
         0,
         top(75.0),
         Clear::None,
-        WritingMode::HorizontalTb,
-        Direction::Ltr,
+        float_axes(WritingMode::HorizontalTb, Direction::Ltr),
         0.0,
         100.0,
         |band, _top| bfc_measurement(band.left(), 50.0, 50.0),
@@ -953,8 +1070,7 @@ fn bfc_root_negative_margin_overlap_clears_when_its_border_box_cannot_fit() {
         0,
         top(75.0),
         Clear::None,
-        WritingMode::HorizontalTb,
-        Direction::Ltr,
+        float_axes(WritingMode::HorizontalTb, Direction::Ltr),
         0.0,
         100.0,
         |band, _top| bfc_measurement(band.left(), 75.0, 50.0),
@@ -989,8 +1105,7 @@ fn clearance_uses_logical_direction_mapping() {
     assert_eq!(
         context.clearance_top(
             Clear::InlineStart,
-            WritingMode::HorizontalTb,
-            Direction::Rtl,
+            float_axes(WritingMode::HorizontalTb, Direction::Rtl),
             0,
             hypothetical_top(95.0)
         ),
@@ -999,8 +1114,7 @@ fn clearance_uses_logical_direction_mapping() {
     assert_eq!(
         context.clearance_top(
             Clear::InlineStart,
-            WritingMode::HorizontalTb,
-            Direction::Ltr,
+            float_axes(WritingMode::HorizontalTb, Direction::Ltr),
             0,
             hypothetical_top(95.0)
         ),
@@ -1025,8 +1139,7 @@ fn clearance_uses_vertical_logical_used_sides() {
     assert_eq!(
         context.clearance_top(
             Clear::InlineStart,
-            WritingMode::VerticalRl,
-            Direction::Ltr,
+            float_axes(WritingMode::VerticalRl, Direction::Ltr),
             0,
             hypothetical_top(95.0)
         ),
@@ -1035,12 +1148,11 @@ fn clearance_uses_vertical_logical_used_sides() {
     assert_eq!(
         context.clearance_top(
             Clear::Left,
-            WritingMode::VerticalRl,
-            Direction::Ltr,
+            float_axes(WritingMode::VerticalRl, Direction::Ltr),
             0,
             hypothetical_top(95.0)
         ),
-        top(95.0)
+        top(60.0)
     );
 }
 
@@ -1156,6 +1268,43 @@ fn vertical_bottom_float_reduces_inline_end_band() {
 }
 
 #[test]
+fn vertical_bottom_float_reduces_rtl_inline_start_band() {
+    let context = FloatContext {
+        shapes: vec![shape_with_used_side(
+            Float::Right,
+            UsedFloatSide::Bottom,
+            0,
+            10.0,
+            40.0,
+            40.0,
+            10.0,
+        )],
+    };
+
+    let band = context.logical_band(
+        WritingMode::VerticalLr,
+        Direction::Rtl,
+        0,
+        logical_query(
+            WritingMode::VerticalLr,
+            Direction::Rtl,
+            10.0,
+            20.0,
+            10.0,
+            90.0,
+        ),
+    );
+
+    assert_eq!(
+        band,
+        LogicalFloatBand::new(
+            LogicalInlineSpan::new(30.0, 60.0),
+            PageBlockSpan::from_edges(100.0, 40.0),
+        )
+    );
+}
+
+#[test]
 fn vertical_logical_float_band_only_narrows_intersecting_block_slabs() {
     let context = FloatContext {
         shapes: vec![
@@ -1242,7 +1391,7 @@ fn vertical_avoiding_position_moves_past_over_tall_top_exclusion() {
         top(100.0),
         margin_box_size_pt(20.0, 80.0),
         Clear::None,
-        WritingMode::VerticalRl,
+        float_axes(WritingMode::VerticalRl, Direction::Ltr),
         WritingMode::VerticalRl,
         Direction::Ltr,
         PageInlineSpan::new(10.0, 20.0),
@@ -1253,7 +1402,7 @@ fn vertical_avoiding_position_moves_past_over_tall_top_exclusion() {
     assert_eq!(
         placement,
         FloatBandPlacement::new(
-            FloatBand::from_span(PageInlineSpan::new(40.0, 90.0)),
+            FloatBand::from_span(PageInlineSpan::new(-10.0, 90.0)),
             top(100.0),
         )
     );
@@ -1278,8 +1427,19 @@ fn vertical_slab_search_returns_the_next_typed_horizontal_slab() {
             0,
             PageInlineSpan::new(10.0, 20.0),
             PageBlockSpan::from_edges(100.0, 10.0),
+            PhysicalSide::Left,
         ),
         Some(PageInlineSpan::new(40.0, 20.0)),
+    );
+
+    assert_eq!(
+        context.next_vertical_float_slab_start(
+            0,
+            PageInlineSpan::new(20.0, 20.0),
+            PageBlockSpan::from_edges(100.0, 10.0),
+            PhysicalSide::Right,
+        ),
+        Some(PageInlineSpan::from_edges(-10.0, 10.0)),
     );
 }
 
@@ -1302,7 +1462,7 @@ fn vertical_avoiding_position_moves_past_over_tall_bottom_exclusion() {
         top(100.0),
         margin_box_size_pt(20.0, 80.0),
         Clear::None,
-        WritingMode::VerticalLr,
+        float_axes(WritingMode::VerticalLr, Direction::Ltr),
         WritingMode::VerticalLr,
         Direction::Ltr,
         PageInlineSpan::new(10.0, 20.0),
@@ -1326,7 +1486,7 @@ fn empty_vertical_avoidance_preserves_physical_top_for_rtl() {
         top(100.0),
         margin_box_size_pt(20.0, 80.0),
         Clear::None,
-        WritingMode::VerticalLr,
+        float_axes(WritingMode::VerticalLr, Direction::Rtl),
         WritingMode::VerticalLr,
         Direction::Rtl,
         PageInlineSpan::new(10.0, 20.0),
@@ -1383,8 +1543,7 @@ fn avoiding_position_uses_highest_band_that_fits() {
         top(100.0),
         margin_box_size_pt(50.0, 10.0),
         Clear::None,
-        WritingMode::HorizontalTb,
-        Direction::Ltr,
+        float_axes(WritingMode::HorizontalTb, Direction::Ltr),
         PageInlineSpan::from_edges(10.0, 110.0),
     );
 
@@ -1408,8 +1567,7 @@ fn avoiding_position_applies_clearance_before_collision_search() {
         top(95.0),
         margin_box_size_pt(20.0, 10.0),
         Clear::Left,
-        WritingMode::HorizontalTb,
-        Direction::Ltr,
+        float_axes(WritingMode::HorizontalTb, Direction::Ltr),
         PageInlineSpan::from_edges(10.0, 110.0),
     );
 
@@ -1426,8 +1584,7 @@ fn clearance_sees_continued_float_fragment_on_current_page() {
     assert_eq!(
         context.clearance_top(
             Clear::Both,
-            WritingMode::HorizontalTb,
-            Direction::Ltr,
+            float_axes(WritingMode::HorizontalTb, Direction::Ltr),
             1,
             hypothetical_top(95.0)
         ),
@@ -1436,8 +1593,7 @@ fn clearance_sees_continued_float_fragment_on_current_page() {
     assert_eq!(
         context.clearance_top(
             Clear::Right,
-            WritingMode::HorizontalTb,
-            Direction::Ltr,
+            float_axes(WritingMode::HorizontalTb, Direction::Ltr),
             1,
             hypothetical_top(95.0)
         ),
@@ -1459,8 +1615,7 @@ fn clearance_target_reports_future_continuation() {
     assert_eq!(
         context.clearance_target(
             Clear::Both,
-            WritingMode::HorizontalTb,
-            Direction::Ltr,
+            float_axes(WritingMode::HorizontalTb, Direction::Ltr),
             0,
             hypothetical_top(95.0)
         ),
@@ -1472,8 +1627,7 @@ fn clearance_target_reports_future_continuation() {
     assert_eq!(
         context.clearance_target(
             Clear::Both,
-            WritingMode::HorizontalTb,
-            Direction::Ltr,
+            float_axes(WritingMode::HorizontalTb, Direction::Ltr),
             1,
             hypothetical_top(95.0)
         ),
@@ -1493,8 +1647,7 @@ fn clearance_target_is_a_pure_query_when_no_float_matches() {
     assert_eq!(
         context.clearance_target(
             Clear::Left,
-            WritingMode::HorizontalTb,
-            Direction::Ltr,
+            float_axes(WritingMode::HorizontalTb, Direction::Ltr),
             0,
             hypothetical_top(95.0),
         ),
@@ -1514,8 +1667,7 @@ fn clearance_target_does_not_select_a_float_before_the_hypothetical_edge() {
     assert_eq!(
         context.clearance_target(
             Clear::Left,
-            WritingMode::HorizontalTb,
-            Direction::Ltr,
+            float_axes(WritingMode::HorizontalTb, Direction::Ltr),
             0,
             hypothetical_top(50.0),
         ),

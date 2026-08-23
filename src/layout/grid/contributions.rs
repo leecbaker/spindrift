@@ -23,22 +23,26 @@ pub(super) struct SubgridContribution {
     /// The estimate remains in this writing mode's logical coordinates until
     /// the Taffy adapter projects it to physical x/y coordinates.
     pub(super) swaps_physical_axes: bool,
+    /// The logical axes in which the projected contribution edges were
+    /// accumulated. The final proxy leaf maps those edges to physical Taffy
+    /// margins at the sole logical-to-physical boundary.
+    pub(super) axes: WritingModeAxes,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(super) struct ContributionEdges {
-    pub(super) start: f32,
-    pub(super) end: f32,
+    pub(super) start: LayoutLength,
+    pub(super) end: LayoutLength,
 }
 
 impl ContributionEdges {
-    fn total(self) -> f32 {
-        (self.start + self.end).max(0.0)
+    fn total(self) -> LayoutLength {
+        layout_pt(self.start.points() + self.end.points())
     }
 
     fn add_assign(&mut self, other: Self) {
-        self.start += other.start;
-        self.end += other.end;
+        self.start = layout_pt(self.start.points() + other.start.points());
+        self.end = layout_pt(self.end.points() + other.end.points());
     }
 }
 
@@ -58,7 +62,7 @@ impl SubgridContribution {
             .points()
             .max(self.estimate.metrics.min_width.points())
             .max(self.estimate.metrics.content_width.points())
-            + self.column_edges.total();
+            + self.column_edges.total().points();
         let row_size = self
             .estimate
             .metrics
@@ -66,7 +70,7 @@ impl SubgridContribution {
             .points()
             .max(self.estimate.metrics.min_height.points())
             .max(self.estimate.metrics.content_height.points())
-            + self.row_edges.total();
+            + self.row_edges.total().points();
         (self.contributes_columns && column_size > EPSILON)
             || (self.contributes_rows && row_size > EPSILON)
     }
@@ -93,27 +97,18 @@ impl SubgridContribution {
             .max(other.metrics.content_height);
     }
 
-    /// Produce the logical intrinsic contribution consumed by the parent
-    /// track-sizing adapter. A subgrid's box edges are included exactly once,
-    /// at the outer edges of the projected descendant span.
-    pub(super) fn adjusted_estimate(&self) -> GridItemEstimate {
+    /// Remove non-inherited axes before passing a projected descendant to the
+    /// parent track-sizing adapter. Its subgrid edge adjustments remain
+    /// physical Taffy margins, so the adapter can reduce the item's available
+    /// track area before measuring it.
+    pub(super) fn sizing_estimate(&self) -> GridItemEstimate {
         let mut estimate = self.estimate;
-        if self.contributes_columns {
-            let adjustment = self.column_edges.total();
-            estimate.metrics.width += content_box_pt(adjustment);
-            estimate.metrics.min_width += content_box_pt(adjustment);
-            estimate.metrics.content_width += content_box_pt(adjustment);
-        } else {
+        if !self.contributes_columns {
             estimate.metrics.width = content_box_pt(0.0);
             estimate.metrics.min_width = content_box_pt(0.0);
             estimate.metrics.content_width = content_box_pt(0.0);
         }
-        if self.contributes_rows {
-            let adjustment = self.row_edges.total();
-            estimate.metrics.height += content_box_pt(adjustment);
-            estimate.metrics.min_height += content_box_pt(adjustment);
-            estimate.metrics.content_height += content_box_pt(adjustment);
-        } else {
+        if !self.contributes_rows {
             estimate.metrics.height = content_box_pt(0.0);
             estimate.metrics.min_height = content_box_pt(0.0);
             estimate.metrics.content_height = content_box_pt(0.0);
@@ -121,12 +116,59 @@ impl SubgridContribution {
         estimate.swaps_physical_axes = self.swaps_physical_axes;
         estimate
     }
+
+    /// Project logical inherited subgrid edge adjustments into the physical
+    /// margin rectangle consumed by Taffy's Grid track-sizing algorithm.
+    /// CSS Grid treats these values as an extra layer of margin on the
+    /// projected descendant contribution:
+    /// <https://drafts.csswg.org/css-grid-2/#subgrid-item-contribution>.
+    pub(super) fn taffy_margin(&self) -> taffy_layout::Rect<taffy_layout::LengthPercentageAuto> {
+        let mut margin = taffy_layout::Rect {
+            top: taffy_layout::LengthPercentageAuto::length(0.0),
+            right: taffy_layout::LengthPercentageAuto::length(0.0),
+            bottom: taffy_layout::LengthPercentageAuto::length(0.0),
+            left: taffy_layout::LengthPercentageAuto::length(0.0),
+        };
+        let mut set = |side: PhysicalSide, value: LayoutLength| {
+            let value = taffy_layout::LengthPercentageAuto::length(value.points());
+            match side {
+                PhysicalSide::Top => margin.top = value,
+                PhysicalSide::Right => margin.right = value,
+                PhysicalSide::Bottom => margin.bottom = value,
+                PhysicalSide::Left => margin.left = value,
+            }
+        };
+        if self.contributes_columns {
+            set(
+                self.axes.physical_side(LogicalSide::InlineStart),
+                self.column_edges.start,
+            );
+            set(
+                self.axes.physical_side(LogicalSide::InlineEnd),
+                self.column_edges.end,
+            );
+        }
+        if self.contributes_rows {
+            set(
+                self.axes.physical_side(LogicalSide::BlockStart),
+                self.row_edges.start,
+            );
+            set(
+                self.axes.physical_side(LogicalSide::BlockEnd),
+                self.row_edges.end,
+            );
+        }
+        margin
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 struct ContributionProjection {
     /// The enclosing subgrid's area already projected into the root grid.
     area: GridItemArea,
+    /// The root grid's logical axes. Every nested subgrid's physical box
+    /// edges are normalized into these axes before they are accumulated.
+    axes: WritingModeAxes,
     contributes_columns: bool,
     contributes_rows: bool,
     column_edges: ContributionEdges,
@@ -188,7 +230,7 @@ impl ContributionProjection {
     ) -> Self {
         let mut column_edges = self.column_edges;
         let mut row_edges = self.row_edges;
-        let local_edges = subgrid_box_edges(style);
+        let local_edges = subgrid_box_edges(style, self.axes);
         if nested_context.columns.is_some() {
             column_edges.add_assign(local_edges.0);
         }
@@ -197,6 +239,7 @@ impl ContributionProjection {
         }
         Self {
             area: self.project(local),
+            axes: self.axes,
             contributes_columns: self.contributes_columns && nested_context.columns.is_some(),
             contributes_rows: self.contributes_rows && nested_context.rows.is_some(),
             column_edges,
@@ -234,7 +277,9 @@ impl<'a> LayoutBuilder<'a> {
                 continue;
             }
             let placement = grid_lanes_item_placement(parent_style, child);
-            let (column_edges, row_edges) = subgrid_box_edges(&child.style);
+            let axes =
+                WritingModeAxes::new(parent_style.writing_mode, parent_style.used_direction());
+            let (column_edges, row_edges) = subgrid_box_edges(&child.style, axes);
             for parent_area in
                 grid_lanes_subgrid_contribution_areas(preliminary, parent_area, placement)
             {
@@ -252,6 +297,7 @@ impl<'a> LayoutBuilder<'a> {
                     context,
                     ContributionProjection {
                         area: parent_area,
+                        axes,
                         contributes_columns: matches!(
                             child.style.grid_template_columns,
                             css::GridTrackList::Subgrid { .. }
@@ -264,8 +310,7 @@ impl<'a> LayoutBuilder<'a> {
                         row_edges,
                     },
                     stylesheets,
-                    parent_item.width().max(0.0),
-                    parent_item.height().max(0.0),
+                    parent_item.replay_dimensions(),
                     &mut contributions,
                 );
             }
@@ -280,8 +325,7 @@ impl<'a> LayoutBuilder<'a> {
         context: ResolvedSubgridContext,
         projection: ContributionProjection,
         stylesheets: &Stylesheets<'_>,
-        child_width: f32,
-        child_height: f32,
+        child_dimensions: GridItemReplayDimensions,
         contributions: &mut Vec<SubgridContribution>,
     ) {
         if !projection.contributes_columns && !projection.contributes_rows {
@@ -292,6 +336,12 @@ impl<'a> LayoutBuilder<'a> {
         };
         let (grandchildren, _) = grid_child_lists_from_boxes(child_boxes);
         let grandchildren = self.prepare_grid_children(grandchildren);
+        let child_width = child_dimensions
+            .physical_content_width_for_replay(&child.style)
+            .points();
+        let child_height = child_dimensions
+            .physical_content_height_for_replay(&child.style)
+            .points();
         let column_line_count = context
             .columns
             .as_ref()
@@ -305,8 +355,7 @@ impl<'a> LayoutBuilder<'a> {
                 &child.style,
                 &grandchildren,
                 stylesheets,
-                child_width,
-                Some(child_height),
+                child_dimensions,
                 GridLayoutPurpose::IntrinsicProbe,
             )
         });
@@ -348,7 +397,7 @@ impl<'a> LayoutBuilder<'a> {
                     projection.contributes_columns && nested_context.columns.is_none();
                 let standalone_rows = projection.contributes_rows && nested_context.rows.is_none();
                 if standalone_columns || standalone_rows {
-                    let estimate = self.estimate_grid_item_size(
+                    let estimate = self.estimate_grid_item_size_for_parent_track_sizing(
                         grandchild,
                         stylesheets,
                         child_width,
@@ -369,6 +418,7 @@ impl<'a> LayoutBuilder<'a> {
                         column_edges: projection.column_edges,
                         row_edges: projection.row_edges,
                         swaps_physical_axes: estimate.swaps_physical_axes,
+                        axes: projection.axes,
                     });
                 }
                 self.collect_subgrid_contributions_from_context(
@@ -376,13 +426,12 @@ impl<'a> LayoutBuilder<'a> {
                     nested_context,
                     nested_projection,
                     stylesheets,
-                    item.width().max(0.0),
-                    item.height().max(0.0),
+                    item.replay_dimensions(),
                     contributions,
                 );
                 continue;
             }
-            let estimate = self.estimate_grid_item_size(
+            let estimate = self.estimate_grid_item_size_for_parent_track_sizing(
                 grandchild,
                 stylesheets,
                 child_width,
@@ -403,15 +452,20 @@ impl<'a> LayoutBuilder<'a> {
                 column_edges: projection.column_edges,
                 row_edges: projection.row_edges,
                 swaps_physical_axes: estimate.swaps_physical_axes,
+                axes: projection.axes,
             });
         }
     }
 }
 
-/// Convert a subgrid's physical box edges to its logical column/row axes.
+/// Convert a subgrid's physical box edges to the root grid's logical
+/// column/row axes.
 /// The values are applied only to the outer ends of a descendant projection;
 /// inner tracks continue to use the parent gutter geometry.
-fn subgrid_box_edges(style: &ComputedStyle) -> (ContributionEdges, ContributionEdges) {
+fn subgrid_box_edges(
+    style: &ComputedStyle,
+    root_axes: WritingModeAxes,
+) -> (ContributionEdges, ContributionEdges) {
     let borders = used_border_widths(style);
     let edge = |side| {
         let physical = |edges: css::Edges| match side {
@@ -420,18 +474,15 @@ fn subgrid_box_edges(style: &ComputedStyle) -> (ContributionEdges, ContributionE
             PhysicalSide::Bottom => edges.bottom,
             PhysicalSide::Left => edges.left,
         };
-        physical(style.margin) + physical(style.padding) + physical(borders)
+        layout_pt(physical(style.margin) + physical(style.padding) + physical(borders))
     };
     let inline = ContributionEdges {
-        start: edge(inline_start_side(
-            style.writing_mode,
-            style.used_direction(),
-        )),
-        end: edge(inline_end_side(style.writing_mode, style.used_direction())),
+        start: edge(root_axes.physical_side(LogicalSide::InlineStart)),
+        end: edge(root_axes.physical_side(LogicalSide::InlineEnd)),
     };
     let block = ContributionEdges {
-        start: edge(block_start_side(style.writing_mode)),
-        end: edge(block_end_side(style.writing_mode)),
+        start: edge(root_axes.physical_side(LogicalSide::BlockStart)),
+        end: edge(root_axes.physical_side(LogicalSide::BlockEnd)),
     };
     (inline, block)
 }
@@ -451,6 +502,7 @@ fn merge_subgrid_contributions(
                 && existing.column_edges == contribution.column_edges
                 && existing.row_edges == contribution.row_edges
                 && existing.swaps_physical_axes == contribution.swaps_physical_axes
+                && existing.axes == contribution.axes
         }) {
             existing.merge(contribution.estimate);
         } else {
@@ -484,6 +536,7 @@ mod tests {
                 column_edges: ContributionEdges::default(),
                 row_edges: ContributionEdges::default(),
                 swaps_physical_axes: false,
+                axes: WritingModeAxes::new(css::WritingMode::HorizontalTb, css::Direction::Ltr),
             },
             SubgridContribution {
                 area,
@@ -493,6 +546,7 @@ mod tests {
                 column_edges: ContributionEdges::default(),
                 row_edges: ContributionEdges::default(),
                 swaps_physical_axes: false,
+                axes: WritingModeAxes::new(css::WritingMode::HorizontalTb, css::Direction::Ltr),
             },
         ]);
         assert_eq!(merged.len(), 1);
@@ -514,11 +568,12 @@ mod tests {
                 contributes_columns: true,
                 contributes_rows: true,
                 column_edges: ContributionEdges {
-                    start: 2.0,
-                    end: 0.0,
+                    start: layout_pt(2.0),
+                    end: layout_pt(0.0),
                 },
                 row_edges: ContributionEdges::default(),
                 swaps_physical_axes: false,
+                axes: WritingModeAxes::new(css::WritingMode::HorizontalTb, css::Direction::Ltr),
             },
             SubgridContribution {
                 area,
@@ -528,6 +583,7 @@ mod tests {
                 column_edges: ContributionEdges::default(),
                 row_edges: ContributionEdges::default(),
                 swaps_physical_axes: false,
+                axes: WritingModeAxes::new(css::WritingMode::HorizontalTb, css::Direction::Ltr),
             },
         ]);
         assert_eq!(merged.len(), 2);
@@ -552,6 +608,7 @@ mod tests {
             column_edges: ContributionEdges::default(),
             row_edges: ContributionEdges::default(),
             swaps_physical_axes: false,
+            axes: WritingModeAxes::new(css::WritingMode::HorizontalTb, css::Direction::Ltr),
         }]);
         assert!(merged.is_empty());
     }
@@ -565,6 +622,7 @@ mod tests {
                 column_start: 2,
                 column_end: 7,
             },
+            axes: WritingModeAxes::new(css::WritingMode::HorizontalTb, css::Direction::Ltr),
             contributes_columns: true,
             contributes_rows: true,
             column_edges: ContributionEdges::default(),
@@ -590,5 +648,122 @@ mod tests {
         assert_eq!(descendant.row_end, 6);
         assert_eq!(descendant.column_start, 4);
         assert_eq!(descendant.column_end, 5);
+    }
+
+    #[test]
+    fn accumulates_nested_edges_in_the_root_axes_without_double_counting() {
+        // The outer RTL subgrid's physical left edge is its inline end, but
+        // the root LTR grid owns physical-left as its inline start. Normalize
+        // each nested layer before accumulating so the two physical-left
+        // edges contribute to the same inherited parent-track edge.
+        let root_axes = WritingModeAxes::new(css::WritingMode::HorizontalTb, css::Direction::Ltr);
+        let mut outer = ContributionEdges {
+            start: layout_pt(11.0),
+            end: layout_pt(1.0),
+        };
+        let nested = ContributionEdges {
+            start: layout_pt(1.0),
+            end: layout_pt(1.0),
+        };
+        outer.add_assign(nested);
+        let contribution = SubgridContribution {
+            area: GridItemArea {
+                row_start: 1,
+                row_end: 2,
+                column_start: 1,
+                column_end: 2,
+            },
+            estimate: GridItemEstimate::fixed(10.0, 10.0),
+            contributes_columns: true,
+            contributes_rows: false,
+            column_edges: outer,
+            row_edges: ContributionEdges::default(),
+            swaps_physical_axes: false,
+            axes: root_axes,
+        };
+        let margin = contribution.taffy_margin();
+        assert_eq!(
+            margin.left,
+            taffy_layout::LengthPercentageAuto::length(12.0)
+        );
+        assert_eq!(
+            margin.right,
+            taffy_layout::LengthPercentageAuto::length(2.0)
+        );
+    }
+
+    #[test]
+    fn projects_contribution_edges_to_rtl_physical_margins() {
+        let contribution = SubgridContribution {
+            area: GridItemArea {
+                row_start: 1,
+                row_end: 2,
+                column_start: 1,
+                column_end: 2,
+            },
+            estimate: GridItemEstimate::fixed(10.0, 10.0),
+            contributes_columns: true,
+            contributes_rows: true,
+            column_edges: ContributionEdges {
+                start: layout_pt(3.0),
+                end: layout_pt(5.0),
+            },
+            row_edges: ContributionEdges {
+                start: layout_pt(7.0),
+                end: layout_pt(11.0),
+            },
+            swaps_physical_axes: false,
+            axes: WritingModeAxes::new(css::WritingMode::HorizontalTb, css::Direction::Rtl),
+        };
+        let margin = contribution.taffy_margin();
+        assert_eq!(margin.top, taffy_layout::LengthPercentageAuto::length(7.0));
+        assert_eq!(
+            margin.right,
+            taffy_layout::LengthPercentageAuto::length(3.0)
+        );
+        assert_eq!(
+            margin.bottom,
+            taffy_layout::LengthPercentageAuto::length(11.0)
+        );
+        assert_eq!(margin.left, taffy_layout::LengthPercentageAuto::length(5.0));
+    }
+
+    #[test]
+    fn projects_contribution_edges_to_vertical_rl_physical_margins() {
+        let contribution = SubgridContribution {
+            area: GridItemArea {
+                row_start: 1,
+                row_end: 2,
+                column_start: 1,
+                column_end: 2,
+            },
+            estimate: GridItemEstimate::fixed(10.0, 10.0),
+            contributes_columns: true,
+            contributes_rows: true,
+            column_edges: ContributionEdges {
+                start: layout_pt(3.0),
+                end: layout_pt(5.0),
+            },
+            row_edges: ContributionEdges {
+                start: layout_pt(7.0),
+                end: layout_pt(11.0),
+            },
+            swaps_physical_axes: true,
+            axes: WritingModeAxes::new(css::WritingMode::VerticalRl, css::Direction::Ltr),
+        };
+        let margin = contribution.taffy_margin();
+        assert_eq!(margin.top, taffy_layout::LengthPercentageAuto::length(3.0));
+        assert_eq!(
+            margin.right,
+            taffy_layout::LengthPercentageAuto::length(7.0)
+        );
+        assert_eq!(
+            margin.bottom,
+            taffy_layout::LengthPercentageAuto::length(5.0)
+        );
+        assert_eq!(
+            margin.left,
+            taffy_layout::LengthPercentageAuto::length(11.0)
+        );
     }
 }

@@ -1,7 +1,6 @@
 use super::*;
 use crate::document::paint::geometry::AxisSelectivePaintClip;
-use crate::layout::block::BlockLayoutInlineConstraint;
-use crate::layout::block::suppress_fragmented_box_edges;
+use crate::layout::block::{BlockLayoutInlineConstraint, suppress_fragmented_box_edges};
 use crate::units::Definite;
 
 /// Resolve Flexbox's scrollport reservation for Quire's static PDF user
@@ -226,14 +225,14 @@ impl<'a> LayoutBuilder<'a> {
                 let page_index = self.current_float_page_index();
                 let placement_top = self.cursor_y - used_style.margin.top;
                 let clear = used_style.clear;
-                let writing_mode = used_style.writing_mode;
-                let direction = used_style.direction;
                 context.avoiding_bfc_root_position(
                     page_index,
                     PageTopBlockPosition::new(placement_top),
                     clear,
-                    writing_mode,
-                    direction,
+                    FloatPlacementAxes::new(
+                        self.containing_block_writing_mode,
+                        self.containing_block_direction,
+                    ),
                     self.content_left,
                     self.content_right,
                     |band, _candidate_top| {
@@ -499,6 +498,23 @@ impl<'a> LayoutBuilder<'a> {
             horizontal_non_content,
             vertical_non_content,
         );
+        let ratio_derived_content_height = explicit_content_height.is_none()
+            && definite_content_height.is_some()
+            && ResolvedAspectRatio::for_non_replaced(
+                style,
+                horizontal_non_content,
+                vertical_non_content,
+            )
+            .is_some();
+        // CSS Sizing's automatic minimum in the ratio-dependent block axis
+        // is content-based for a non-scroll container. Measure that minimum
+        // without turning the ratio-derived preferred height into a hard
+        // Flexbox limit; the preferred size and constraints are selected
+        // after this first pass.
+        // <https://drafts.csswg.org/css-sizing-4/#aspect-ratio-minimum>
+        let measure_ratio_automatic_minimum = ratio_derived_content_height
+            && style.box_values.min_height.is_auto()
+            && !style.overflow_y.is_scrollable();
         let size_contained_content_height = containment.size.then(|| {
             definite_content_height.unwrap_or_else(|| {
                 constrain_content_height(
@@ -551,8 +567,6 @@ impl<'a> LayoutBuilder<'a> {
                 PageTopBlockPosition::new(self.cursor_y),
                 margin_box_size_pt(margin_box_width, collision_height),
                 style.clear,
-                style.writing_mode,
-                style.direction,
                 self.containing_block_direction,
             );
             self.cursor_y = placement.origin.top_y();
@@ -562,8 +576,10 @@ impl<'a> LayoutBuilder<'a> {
             self.cursor_y = self
                 .resolve_block_clearance(BlockClearanceRequest::coincident_edges(
                     style.clear,
-                    style.writing_mode,
-                    style.direction,
+                    FloatPlacementAxes::new(
+                        self.containing_block_writing_mode,
+                        self.containing_block_direction,
+                    ),
                     PageTopBlockPosition::new(self.cursor_y),
                 ))
                 .used_border_edge
@@ -575,8 +591,21 @@ impl<'a> LayoutBuilder<'a> {
         let flex_start_page_context = self.current_page_context;
         self.cursor_y -= border_widths.top + style.padding.top;
 
-        let descendant_height_basis =
-            descendant_percentage_height_basis.available_height_basis(definite_content_height);
+        let descendant_height_basis = if measure_ratio_automatic_minimum {
+            PercentageBasis::indefinite()
+        } else if ratio_derived_content_height
+            && matches!(
+                descendant_percentage_height_basis,
+                FlexDescendantPercentageHeightBasis::DeriveFromContainer
+            )
+        {
+            flex_available_percentage_basis(
+                definite_content_height,
+                FlexAvailableSizeSource::AspectRatioDerived,
+            )
+        } else {
+            descendant_percentage_height_basis.available_height_basis(definite_content_height)
+        };
         let flex_width_basis = if WritingModeAxes::new(style.writing_mode, style.used_direction())
             .swaps_physical_axes()
             && style.box_values.width.is_auto()
@@ -598,7 +627,10 @@ impl<'a> LayoutBuilder<'a> {
         let flex_available = FlexAvailableSpace {
             width: PhysicalContentWidth::new(content_box_pt(inner_width)),
             width_basis: flex_width_basis,
-            height: flex_available_content_height.map(PhysicalContentHeight::new),
+            height: (!measure_ratio_automatic_minimum)
+                .then_some(flex_available_content_height)
+                .flatten()
+                .map(PhysicalContentHeight::new),
             height_basis: descendant_height_basis,
         };
         let Some(mut flex_layout) =
@@ -614,10 +646,62 @@ impl<'a> LayoutBuilder<'a> {
                 &[],
                 Some(child_boxes),
                 descendant_percentage_height_basis.override_basis(),
+                None,
                 principal_box_paint_mode,
             );
             return;
         };
+        if measure_ratio_automatic_minimum {
+            let preferred_height = definite_content_height
+                .expect("ratio-derived automatic minimum requires a preferred height");
+            let automatic_minimum =
+                if physical_flex_direction(style).is_column_axis() && style.flex_wrap.wraps() {
+                    // The min-content main size of a wrapping column is the
+                    // largest hypothetical outer item, not the max-content sum
+                    // produced by the required indefinite line-collection pass.
+                    // <https://www.w3.org/TR/css-flexbox-1/#intrinsic-sizes>
+                    content_box_pt(
+                        flex_layout
+                            .items
+                            .iter()
+                            .zip(&children)
+                            .map(|(item, child)| {
+                                let (start, end) = item.outer_main_bounds(
+                                    PhysicalFlexDirection::new(physical_flex_direction(style)),
+                                    &child.style,
+                                );
+                                (end - start).points()
+                            })
+                            .fold(0.0f32, f32::max),
+                    )
+                } else {
+                    flex_layout.height.content_box_length()
+                };
+            let selected_height = select_ratio_derived_flex_container_height(
+                style,
+                preferred_height,
+                automatic_minimum,
+                PercentageBasis::definite_from(
+                    height_constraint_basis,
+                    BlockSizeBasisSource::ContainingBlock,
+                ),
+            );
+            if let Some(final_layout) = self.compute_flex_layout(
+                &children,
+                style,
+                stylesheets,
+                FlexAvailableSpace {
+                    height: Some(PhysicalContentHeight::new(selected_height)),
+                    height_basis: PercentageBasis::definite_from(
+                        selected_height,
+                        FlexAvailableSizeSource::AspectRatioDerived,
+                    ),
+                    ..flex_available
+                },
+            ) {
+                flex_layout = final_layout;
+            }
+        }
         // CSS Flexbox collects lines while an automatic main size is
         // indefinite. A `calc-size(auto, …)` preferred height then receives
         // that measured automatic size, making the final main size definite
@@ -871,13 +955,27 @@ impl<'a> LayoutBuilder<'a> {
                 })
             })
         });
-        // Do not turn normal two-dimensional flex placement into synthetic
-        // source fragments. In particular, wrapped physical columns overlap
-        // on physical Y, while `column-reverse` still replays in
-        // order-modified main-axis order. Actual and forced fragmentation
-        // retain the physical boundary planner below.
+        // The whole-box prebreak decision needs the normal physical
+        // fragmentation topology as well as forced-break topology. A logical
+        // row in vertical or sideways writing progresses down physical Y, so
+        // its individual item intervals can fit in the remaining page even
+        // when the complete flex container cannot. Treating that container
+        // as one unit would incorrectly discard its usable first-page slice.
         // <https://www.w3.org/TR/css-flexbox-1/#pagination>
-        let mut break_units = if flex_has_forced_item_breaks || flex_has_forced_descendant_breaks {
+        // <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+        let normal_flex_fragmentation_candidate = !self.preserve_scoped_paint_public_order
+            && !self.element_uses_document_canvas_flow(element)
+            && block_top
+                - (border_widths.top
+                    + style.padding.top
+                    + total_content_height
+                    + style.padding.bottom
+                    + border_widths.bottom)
+                < self.page_bottom() - 0.01;
+        let mut break_units = if flex_has_forced_item_breaks
+            || flex_has_forced_descendant_breaks
+            || normal_flex_fragmentation_candidate
+        {
             flex_container_break_units(
                 fragmentainer_kind,
                 &flex_layout,
@@ -1169,6 +1267,12 @@ impl<'a> LayoutBuilder<'a> {
         // <https://www.w3.org/TR/css-break-3/#box-splitting>
         if flex_fragmentation_enabled
             && physical_flex_direction(style).is_column_axis()
+            // This continuation expansion belongs to a CSS column main
+            // sequence. A logical row can also project to physical Y in an
+            // orthogonal writing mode, but its item intervals are already
+            // the physical pagination boundaries; extending one would
+            // incorrectly move its later row items into another page.
+            && style.flex_direction.is_column_axis()
             && style.flex_wrap.wraps()
             && flex_layout.lines.len() > 1
             && expand_wrapped_column_items_through_fragmentainers(
@@ -2112,16 +2216,10 @@ impl<'a> LayoutBuilder<'a> {
                         })
                         .flatten()
                         .or_else(|| {
-                            placed_style
-                                .writing_mode
-                                .has_vertical_lines()
-                                .then(|| {
-                                    replay_dimensions.logical_inline_size_for_replay(
-                                        placed_style.writing_mode,
-                                        replay_content_height,
-                                    )
-                                })
-                                .flatten()
+                            Some(
+                                replay_dimensions
+                                    .logical_inline_content_size_for_replay(&placed_style),
+                            )
                         });
 
                     let item_was_split = self.with_placed_formatting_context(
@@ -2590,38 +2688,26 @@ impl<'a> LayoutBuilder<'a> {
         } else {
             (block_top - block_bottom).max(total_height)
         };
-        let contents_overflow_clip =
-            (overflow_clip_active || needs_contoured_overflow_clip).then(|| {
-                let bounds = PageTopRect::new(
-                    outer_x + border_widths.left,
-                    block_top - border_widths.top,
-                    content_width_points + style.padding.left + style.padding.right,
-                    total_content_height + style.padding.top + style.padding.bottom,
-                )
-                .paint_clip();
-                AxisSelectivePaintClip::new(
-                    bounds,
-                    flex_used_overflow.clips_x() || containment.clips_descendant_paint(),
-                    flex_used_overflow.clips_y() || containment.clips_descendant_paint(),
-                )
-            });
-        let contoured_contents_overflow_clip = contents_overflow_clip
-            .filter(|clip| clip.clips_x() && clip.clips_y() && needs_contoured_overflow_clip)
-            .and_then(|clip| {
-                resolve_box_content_contour(
+        let contents_overflow_edge = (overflow_clip_active || needs_contoured_overflow_clip)
+            .then(|| {
+                resolve_overflow_clip_edge(
                     paint_space_rect(outer_x, block_bottom, outer_width, block_height),
                     style,
                     border_widths,
-                    BoxContentContourRequest::Overflow {
-                        reference_box: css::BackgroundBox::Padding,
-                        outset: 0.0,
-                    },
+                    flex_used_overflow,
+                    containment.clips_descendant_paint(),
+                    None,
                 )
-                .map(|mut contour| {
-                    contour.bounds = clip.bounds();
-                    contour
-                })
-            });
+            })
+            .flatten();
+        let contents_overflow_clip = contents_overflow_edge
+            .as_ref()
+            .map(|edge| AxisSelectivePaintClip::new(edge.clip.bounds, edge.clips_x, edge.clips_y));
+        let contoured_contents_overflow_clip = contents_overflow_edge
+            .as_ref()
+            .filter(|edge| edge.clips_x && edge.clips_y)
+            .map(|edge| edge.clip.clone())
+            .filter(|clip| !matches!(clip.contour, BoxContentContour::Rect));
         if let Some(container_clip) = contents_overflow_clip {
             for fragment in &mut flex_layout.fragment_plan.materialized_fragments {
                 fragment.contents_overflow_clip = fragment.principal_box().and_then(|fragment| {

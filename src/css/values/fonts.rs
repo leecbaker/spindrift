@@ -1,9 +1,10 @@
+use cssparser::{Parser, ParserInput, Token};
+
 use super::*;
 use crate::css::component_values::{
     css_leading_function_matching, css_leading_ident, css_single_ident, split_css_component_values,
     try_split_css_component_values,
 };
-use cssparser::{Parser, ParserInput, Token};
 
 /// Parse a CSS `<counter-style>` value.
 ///

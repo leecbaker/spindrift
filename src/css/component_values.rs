@@ -366,7 +366,7 @@ pub(crate) fn trim_css_component_value_edges(value: &str) -> &str {
 }
 
 /// Splits at CSS whitespace component-value boundaries.
-pub(in crate::css) fn split_css_component_values(value: &str) -> Vec<&str> {
+pub(crate) fn split_css_component_values(value: &str) -> Vec<&str> {
     try_split_css_component_values(value).unwrap_or_default()
 }
 

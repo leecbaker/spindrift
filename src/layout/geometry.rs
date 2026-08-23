@@ -693,8 +693,16 @@ impl FlowAxes {
         Self::new(style.writing_mode, style.used_direction())
     }
 
+    pub(super) fn direction(self) -> Direction {
+        self.axes.direction()
+    }
+
     pub(super) fn inline_start_side(self) -> PhysicalSide {
         self.axes.physical_side(LogicalSide::InlineStart)
+    }
+
+    pub(super) fn inline_end_side(self) -> PhysicalSide {
+        self.axes.physical_side(LogicalSide::InlineEnd)
     }
 
     /// Return the physical edge at the containing flow's logical block-start.

@@ -1,6 +1,7 @@
-use super::*;
 use std::cmp::Ordering;
 use std::rc::Rc;
+
+use super::*;
 
 /// The selected-font metrics used to absolutize local font-relative lengths
 /// on one element. These are a property of the element's inline formatting
@@ -1321,9 +1322,10 @@ impl ResolveViewportLengths for ComputedLengthPercentage {
 
 #[cfg(test)]
 mod tests {
+    use std::mem::size_of;
+
     use super::*;
     use crate::LayoutSize;
-    use std::mem::size_of;
 
     #[test]
     fn common_cases_are_compact_and_tree_free() {

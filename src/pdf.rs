@@ -1,16 +1,16 @@
-use crate::document::DocumentFont;
-use crate::document::FontProgramKind;
+use std::collections::{BTreeMap, HashMap};
+use std::rc::Rc;
+
+use pdf_writer::types::BlendMode;
+
 use crate::document::paint::geometry::PdfSize;
 use crate::document::paint::images::RenderedImage;
 use crate::document::paint::paths::{RenderedPath, RenderedPathCommand, RenderedPathFillRule};
-use crate::document::paint::patterns::RenderedImagePattern;
-use crate::document::paint::patterns::RenderedImageSourceRect;
+use crate::document::paint::patterns::{RenderedImagePattern, RenderedImageSourceRect};
 use crate::document::paint::shapes::RenderedRoundedRect;
 use crate::document::paint::text::{RenderedGlyph, RenderedTextMatrix};
+use crate::document::{DocumentFont, FontProgramKind};
 use crate::{Bookmark, BookmarkState, CssColor, Document, DocumentMetadata, Page};
-use pdf_writer::types::BlendMode;
-use std::collections::{BTreeMap, HashMap};
-use std::rc::Rc;
 
 /// Typed symbolic identities for resources materialized outside page-content
 /// lowering.  Their numeric payload is an index in the corresponding
@@ -1005,9 +1005,13 @@ struct EmbeddedFontPlan<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FontEmbeddingKind {
     SubsetCompactGids,
+    /// A variable-font instance materialized with every source glyph retained.
+    InstantiatedFullCoverage,
     FullStandaloneFont,
     ExtractedCollectionFace,
-    Rejected { reason: String },
+    Rejected {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1083,6 +1087,7 @@ struct EmbeddedFontCandidateKey {
     program_len: usize,
     face_index: u32,
     program_kind: FontProgramKind,
+    variation_coordinates: crate::document::DocumentFontVariationCoordinates,
 }
 
 #[derive(Debug, Clone, PartialEq)]

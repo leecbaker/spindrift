@@ -229,6 +229,11 @@ but spec conformance takes priority when behavior differs.
   following block sibling, while a nested block table remains below its
   ancestor table's collapsed borders; inline-table descendants continue to
   participate in the enclosing inline paint phase.
+- Table wrapper, table-root, and grid geometry are separate at the
+  fragmentation boundary. Each committed root fragment uses its resolved
+  caption destination and fragment-local row rectangle; horizontal nested
+  multicolumn continuation retains that physical rectangle, while vertical and
+  sideways tables project their logical row span through the table grid.
 - Floated collapsed table wrappers, including floats collected through inline
   layout around clearing breaks, use durable table fragments for shrink-to-fit
   grid sizing and add resolved collapsed outer insets only to the float
@@ -262,8 +267,10 @@ but spec conformance takes priority when behavior differs.
   created for a `colgroup` do not replay that group's background layer.
   Disjoint synthetic-group and explicit-column fills share the committed
   physical paint order, while overlapping column layers retain their CSS
-  stacking order. This covers the writing-mode table progression matrix.
-  Row-group and fragmented-span geometry remains incomplete.
+  stacking order. Table-internal progression and the wrapper-origin/
+  parent-flow boundary are covered by the vertical-lr and vertical-rl table
+  progression matrix. Row-group and fragmented-span geometry remains
+  incomplete.
 - Collapsed columns are removed from collapsed-border column and column-group
   candidate painting when their entire candidate span is suppressed.
 - Separated-border table fragments paint row-group backgrounds and outlines
@@ -473,14 +480,10 @@ but spec conformance takes priority when behavior differs.
   interactions, rare rowspanning assignment propagation interactions, complex
   table-root running-element descendants, and complex nested table/flex
   descendants across page boundaries.
-- Table direction and writing-mode support still needs broader WPT coverage for
-  full vertical table row/cell placement, mixed writing modes, and unusual
-  column-group/span combinations.
-- Vertical table-root inline sizing resolves physical `height`, `min-height`,
-  and `max-height` with top/bottom wrapper decoration before table columns are
-  measured. The two `table-intrinsic-size-003/004` WPTs still expose a
-  subsequent wrapper paint/projection mismatch, rather than this sizing
-  conversion.
+- Table direction and writing-mode support still needs broader WPT coverage
+  beyond the covered horizontal, vertical, and sideways table-progression
+  matrix, especially for mixed writing modes and unusual column-group/span
+  combinations.
 - Height and baseline coverage should be broadened with WPT and local
   WeasyPrint cases for full horizontal-axis baseline positioning in mixed
   writing modes, complex floats inside cells, large percentage matrices,

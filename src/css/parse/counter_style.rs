@@ -1,10 +1,11 @@
+use cssparser::{Parser, ParserInput, Token};
+
 use super::super::values::{
     canonical_predefined_counter_style_name, is_counter_name, parse_counter_style_integer,
     parse_counter_style_reference_name,
 };
 use super::*;
 use crate::css::component_values::{split_css_top_level_delimiter, try_split_css_component_values};
-use cssparser::{Parser, ParserInput, Token};
 
 /// Parse an `@counter-style` rule.
 ///

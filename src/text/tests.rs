@@ -1,8 +1,7 @@
 use super::system::span_boundary_needs_join_control;
 use crate::CssColor;
 use crate::css::{ComputedLineHeight, ContentLanguage, WritingMode};
-use crate::document::paint::geometry::PaintDisplacement;
-use crate::document::paint::geometry::PaintPoint;
+use crate::document::paint::geometry::{PaintDisplacement, PaintPoint};
 use crate::document::paint::text::{RenderedGlyph, RenderedGlyphKind, RenderedLine};
 
 #[test]
@@ -143,6 +142,8 @@ fn rtl_flag_emoji_visual_range_precedes_the_hebrew_run() {
     // their source scalars appear reversed in this presentation sequence.
     assert_eq!(visual_text, "🇱🇮םול");
 }
+use std::rc::Rc;
+
 use super::*;
 use crate::css::{
     ComputedLengthPercentage, Css, FontFeatureSetting, FontFeatureSettings, FontPalette,
@@ -150,7 +151,6 @@ use crate::css::{
     parse_stylesheet,
 };
 use crate::units::{LayoutLength, SemanticLengthExt, layout_pt};
-use std::rc::Rc;
 
 async fn feature_probe_font_system() -> (FontSystem, ComputedStyle) {
     let stylesheet = parse_stylesheet(
@@ -797,6 +797,64 @@ async fn parley_font_run_mapping_reuses_document_font_id() {
     assert_eq!(system.document_fonts.fonts.len(), font_count);
 }
 
+/// Styled shaping must keep variable instances distinct in the Parley-to-PDF
+/// font cache, including when they share the same `@font-face` source.
+/// <https://www.w3.org/TR/css-fonts-4/#font-variation-settings-def>
+#[tokio::test]
+async fn styled_variable_font_instances_do_not_share_a_document_font() {
+    let stylesheet = parse_stylesheet(
+        &Css::from_string(
+            r#"@font-face {
+                font-family: CachedVariableRoboto;
+                src: url("tests/resources/fonts/Roboto-VariableFont_wdth,wght.ttf");
+                font-weight: 100 900;
+            }"#,
+        )
+        .with_base_path(".")
+        .expect("current directory should be a valid file URL"),
+    );
+    let mut system = FontSystem::start_loading()
+        .load_stylesheet_fonts(&[stylesheet])
+        .finish()
+        .await;
+    let mut regular = ComputedStyle::initial();
+    regular.font_family = FontFamily::Names(vec!["CachedVariableRoboto".to_string()]);
+    regular.font_size = 12.0;
+    regular.line_height = 14.4;
+    let mut bold = regular.clone();
+    bold.font_weight = FontWeight::BOLD;
+
+    let runs = system.shape_styled_text_runs_with_parley(&[
+        StyledTextSpan {
+            text: "regular ",
+            style: &regular,
+        },
+        StyledTextSpan {
+            text: "bold",
+            style: &bold,
+        },
+    ]);
+    let ids = runs
+        .iter()
+        .filter_map(|run| run.font_id)
+        .collect::<std::collections::HashSet<_>>();
+
+    assert_eq!(ids.len(), 2);
+    let weights = ids
+        .into_iter()
+        .filter_map(|id| {
+            system.document_fonts.fonts[id]
+                .variation_coordinates
+                .0
+                .iter()
+                .find(|(tag, _)| tag == b"wght")
+                .map(|(_, value)| f32::from_bits(*value))
+        })
+        .collect::<Vec<_>>();
+    assert!(weights.contains(&400.0));
+    assert!(weights.contains(&700.0));
+}
+
 #[test]
 fn reusable_parley_layout_does_not_invalidate_prior_shaping() {
     let mut system = FontSystem::new();
@@ -1003,16 +1061,33 @@ fn ordinary_shaping_style_borrows_the_authored_style_without_overrides() {
 async fn font_variant_emoji_selectors_do_not_leak_to_emitted_text() {
     let mut system = FontSystem::new();
     let mut style = ComputedStyle::initial();
-    style.font_variant_emoji = FontVariantEmoji::Emoji;
+    for (value, text) in [
+        (FontVariantEmoji::Emoji, "©"),
+        (FontVariantEmoji::Unicode, "1"),
+    ] {
+        style.font_variant_emoji = value;
+        let emitted = system
+            .shape_text_runs_with_parley(text, &style)
+            .into_iter()
+            .map(|run| run.text.to_string())
+            .collect::<String>();
 
-    let emitted = system
-        .shape_text_runs_with_parley("©", &style)
-        .into_iter()
-        .map(|run| run.text.to_string())
-        .collect::<String>();
+        assert_eq!(emitted, text);
+        assert!(!emitted.contains('\u{fe0e}') && !emitted.contains('\u{fe0f}'));
+    }
+}
 
-    assert_eq!(emitted, "©");
-    assert!(!emitted.contains('\u{fe0f}'));
+#[tokio::test]
+async fn emoji_presentation_selection_is_local_to_its_grapheme_cluster() {
+    let mut system = FontSystem::new();
+    let mut style = ComputedStyle::initial();
+    style.font_family = FontFamily::Serif;
+    let text = "X\u{263a}\u{fe0f}X";
+
+    let ranges = system.emoji_presentation_family_ranges(text, &style, &style.font_family);
+
+    assert_eq!(ranges.len(), 1);
+    assert_eq!(&text[ranges[0].range.clone()], "\u{263a}\u{fe0f}");
 }
 
 #[tokio::test]
@@ -1022,8 +1097,16 @@ async fn emoji_selectors_choose_distinct_generic_serif_faces() {
     style.font_family = FontFamily::Serif;
     style.font_size = 40.0;
     style.line_height = 80.0;
-    let text_source = system.emoji_presentation_family_source("\u{263a}\u{fe0e}", &style);
-    let emoji_source = system.emoji_presentation_family_source("\u{263a}\u{fe0f}", &style);
+    let text_source = system
+        .emoji_presentation_family_ranges("\u{263a}\u{fe0e}", &style, &style.font_family)
+        .into_iter()
+        .next()
+        .map(|range| range.source);
+    let emoji_source = system
+        .emoji_presentation_family_ranges("\u{263a}\u{fe0f}", &style, &style.font_family)
+        .into_iter()
+        .next()
+        .map(|range| range.source);
 
     let text_face = system
         .shape_text_runs_with_parley("\u{263a}\u{fe0e}", &style)
@@ -1519,19 +1602,35 @@ async fn shape_measured_line_excludes_hanging_glyphs_from_css_measure() {
 }
 
 #[tokio::test]
-async fn letter_spacing_uses_unicode_joining_properties() {
+async fn letter_spacing_uses_css_text_cursive_script_classification() {
     assert_eq!(used_letter_spacing_for_text("abc", 10.0), 10.0);
     assert_eq!(used_letter_spacing_for_text("تفاحة", 10.0), 0.0);
-    assert!(character_has_joining_behavior('ت'));
-    assert!(!character_has_joining_behavior('a'));
+    for character in [
+        'ع',
+        '\u{10d00}',
+        '\u{0840}',
+        '\u{1828}',
+        '\u{07de}',
+        '\u{a840}',
+        '\u{0710}',
+    ] {
+        assert!(
+            character_has_cursive_shaping_behavior(character),
+            "{character:?} must be recognized as a CSS Text cursive-script letter"
+        );
+    }
+    assert!(!character_has_cursive_shaping_behavior('a'));
+    for character in ['\u{1810}', '\u{1801}', '\u{a874}'] {
+        assert!(!character_has_cursive_shaping_behavior(character));
+    }
     assert!(character_can_join_following('ب'));
     assert!(character_can_join_preceding('ا'));
     assert!(!character_can_join_following('ا'));
     assert!(character_is_arabic_tatweel('\u{0640}'));
-    assert!(character_has_joining_behavior('\u{0640}'));
+    assert!(character_has_cursive_shaping_behavior('\u{0640}'));
     assert!(
-        !character_has_joining_behavior('\u{fedf}') && !character_has_joining_behavior('\u{fe8e}'),
-        "Arabic presentation forms remain non-joining Unicode scalars"
+        !cursive_boundary_needs_context('\u{fedf}', '\u{fe8e}'),
+        "Arabic presentation forms remain non-joining boundary neighbors"
     );
     assert!(character_is_join_control('\u{200c}'));
     assert!(character_is_join_control('\u{200d}'));
@@ -1664,16 +1763,63 @@ fn generic_parley_source_uses_quire_embeddable_face() {
 }
 
 #[test]
-fn quoted_generic_name_stays_named_in_parley_source() {
+fn named_stack_parley_source_skips_missing_alias_and_uses_quire_selected_bold_face() {
+    let mut system = FontSystem::new();
+    let mut probe = ComputedStyle::initial();
+    probe.font_family = FontFamily::SansSerif;
+    probe.font_weight = FontWeight::BOLD;
+    let resolved_font_id = system
+        .resolve_style(&probe)
+        .expect("an embeddable bold system sans-serif font");
+    let (resolved_family, resolved_data, resolved_face_index) = {
+        let resolved_font = system
+            .document_fonts
+            .get(resolved_font_id)
+            .expect("resolved document font");
+        (
+            resolved_font.family.clone(),
+            resolved_font.data.clone(),
+            resolved_font.face_index,
+        )
+    };
+
+    let mut style = probe.clone();
+    style.font_family = FontFamily::List(vec![
+        FontFamily::named("quire-missing-platform-alias"),
+        FontFamily::named(resolved_family.clone()),
+        FontFamily::SansSerif,
+    ]);
+
+    let expected_source = parley_font_family_source(&FontFamily::named(resolved_family.clone()));
+    let source = system.resolved_parley_font_family_source(&style);
+    assert_eq!(source, format!("{expected_source}, {expected_source}"));
+    assert!(!source.contains("quire-missing-platform-alias"));
+
+    let runs = system.shape_text_runs_with_parley("Bold", &style);
+    assert!(runs.iter().all(|run| {
+        run.font_id.is_some_and(|font_id| {
+            let font = system
+                .document_fonts
+                .get(font_id)
+                .expect("shaped run font is registered");
+            font.family == resolved_family
+                && font.face_index == resolved_face_index
+                && font.data.as_slice() == resolved_data.as_slice()
+        })
+    }));
+}
+
+#[test]
+fn unresolved_named_family_does_not_reach_parley_source() {
     let mut system = FontSystem::new();
     let mut style = ComputedStyle::initial();
     style.font_family = FontFamily::List(vec![
-        FontFamily::Names(vec!["fantasy".to_string()]),
+        FontFamily::named("quire-missing-platform-alias"),
         FontFamily::Monospace,
     ]);
 
     let source = system.resolved_parley_font_family_source(&style);
-    assert!(source.starts_with("\"fantasy\", "));
+    assert!(!source.contains("quire-missing-platform-alias"));
     assert!(!source.ends_with("monospace"));
 }
 
@@ -2151,6 +2297,14 @@ async fn explicit_join_control_suppresses_synthetic_boundary_joiner() {
     assert!(span_boundary_needs_join_control("ـ", "ا"));
     assert!(span_boundary_needs_join_control("ب", "ا"));
     assert!(!span_boundary_needs_join_control("ا", "ب"));
+    assert!(span_boundary_needs_join_control("ᠨ", "ᠨ"));
+    assert!(span_boundary_needs_join_control("ꡀ", "ꡀ"));
+    assert!(!span_boundary_needs_join_control("ᠨ", "ꡀ"));
+    assert!(!span_boundary_needs_join_control("ᠨ", "a"));
+    assert!(!span_boundary_needs_join_control("ᠨ", "\u{1810}"));
+    assert!(!span_boundary_needs_join_control("ᠨ", "\u{1801}"));
+    assert!(!span_boundary_needs_join_control("ᠨ\u{200c}", "ᠨ"));
+    assert!(!span_boundary_needs_join_control("ᠨ", "\u{200d}ᠨ"));
 }
 
 #[tokio::test]
@@ -2793,6 +2947,94 @@ fn untracked_inline_shaping_suppresses_backend_letter_spacing() {
             "untracked shaping must match a style whose used letter spacing is zero for {text:?}"
         );
     }
+}
+
+#[test]
+fn untracked_styled_shaping_matches_zero_spacing_across_formatted_paths() {
+    let mut system = FontSystem::new();
+    let mut tracked = ComputedStyle::initial();
+    tracked.font_family = FontFamily::Monospace;
+    tracked.font_size = 12.0;
+    tracked.letter_spacing = ComputedLengthPercentage::from_points(10.0);
+    let mut zero_spacing = tracked.clone();
+    zero_spacing.letter_spacing = ComputedLengthPercentage::ZERO;
+    let mixed = [
+        StyledTextSpan {
+            text: "A\u{200c}",
+            style: &tracked,
+        },
+        StyledTextSpan {
+            text: "B\tC",
+            style: &tracked,
+        },
+    ];
+    let expected_spans = [
+        StyledTextSpan {
+            text: "A\u{200c}",
+            style: &zero_spacing,
+        },
+        StyledTextSpan {
+            text: "B\tC",
+            style: &zero_spacing,
+        },
+    ];
+    let actual = system
+        .shape_untracked_styled_inline_fragments(
+            &mixed,
+            "A\u{200c}B\tC".to_string(),
+            0.0,
+            tracked.line_height,
+            0.0,
+            &tracked,
+        )
+        .expect("untracked styled text shapes");
+    let expected = system
+        .shape_styled_inline_fragments(
+            &expected_spans,
+            "A\u{200c}B\tC".to_string(),
+            0.0,
+            zero_spacing.line_height,
+            0.0,
+            &zero_spacing,
+        )
+        .expect("zero-spacing styled text shapes");
+    assert!(
+        (actual.advance_width() - expected.advance_width()).abs() < 0.01,
+        "actual={}, expected={}",
+        actual.advance_width(),
+        expected.advance_width()
+    );
+    assert!(actual.source_slice(0.."A\u{200c}".len()).is_some());
+
+    let actual_visual = system
+        .shape_untracked_visually_ordered_inline_fragments(
+            &[StyledTextSpan {
+                text: "a>b",
+                style: &tracked,
+            }],
+            "a>b".to_string(),
+            0.0,
+            tracked.line_height,
+            0.0,
+            &tracked,
+            ResolvedBidiDirection::Ltr,
+        )
+        .expect("untracked guarded visual text shapes");
+    let expected_visual = system
+        .shape_visually_ordered_inline_fragments(
+            &[StyledTextSpan {
+                text: "a>b",
+                style: &zero_spacing,
+            }],
+            "a>b".to_string(),
+            0.0,
+            zero_spacing.line_height,
+            0.0,
+            &zero_spacing,
+            ResolvedBidiDirection::Ltr,
+        )
+        .expect("zero-spacing guarded visual text shapes");
+    assert!((actual_visual.advance_width() - expected_visual.advance_width()).abs() < 0.01);
 }
 
 #[test]

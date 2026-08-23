@@ -1,18 +1,31 @@
-use super::font_loading::post_script_name_for_face;
-use super::*;
-use crate::document::{
-    CssFontVerticalMetrics, DocumentFontSynthesis, OpenTypeBaselineAxis,
-    OpenTypeBaselineCoordinate, OpenTypeBaselineScript, OpenTypeBaselineTable,
-    OpenTypeVariationIndex, OpenTypeVerticalMetrics,
-};
 use read_fonts::tables::base::BaseCoord;
 use read_fonts::tables::layout::DeviceOrVariationIndex;
 use read_fonts::{FontRef, TableProvider};
+
+use super::font_loading::post_script_name_for_face;
+use super::*;
+use crate::document::{
+    CssFontVerticalMetrics, DocumentFontSynthesis, DocumentFontVariationCoordinates,
+    OpenTypeBaselineAxis, OpenTypeBaselineCoordinate, OpenTypeBaselineScript,
+    OpenTypeBaselineTable, OpenTypeVariationIndex, OpenTypeVerticalMetrics, SyntheticObliqueAngle,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FontSupportKind {
     EmbeddableText,
     ColorOrEmojiOnlyFallback,
+}
+
+/// The presentation a font can provide for an emoji variation sequence.
+///
+/// This is deliberately derived from font program tables rather than a CSS
+/// family alias. An `@font-face` rule is allowed to rename any font program,
+/// so names such as `MonoEmojiFont` carry no presentation semantics.
+/// <https://www.w3.org/TR/css-fonts-4/#font-variant-emoji-prop>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EmojiPresentationCapability {
+    Text,
+    Emoji,
 }
 
 struct DocumentFontMetadata {
@@ -27,6 +40,7 @@ struct DocumentFontMetadata {
     bbox: [i16; 4],
     baselines: OpenTypeBaselineTable,
     size_adjust: Option<f32>,
+    variation_coordinates: DocumentFontVariationCoordinates,
     synthesis: DocumentFontSynthesis,
 }
 
@@ -189,6 +203,8 @@ impl DocumentFontRegistry {
         family_override: Option<&str>,
         request: &FontRequest,
         synthesize_weight: bool,
+        synthesize_style: bool,
+        variation_coordinates: DocumentFontVariationCoordinates,
     ) -> Option<usize> {
         let registered_face = RegisteredFontFaceKey {
             family_id: font.family.0.to_u64(),
@@ -204,6 +220,8 @@ impl DocumentFontRegistry {
             face_index: font.index,
             request: request.attributes,
             synthesize_weight,
+            synthesize_style,
+            variation_coordinates: variation_coordinates.clone(),
         };
         if family_override.is_none()
             && let Some(id) = self.font_cache.get(&key)
@@ -228,6 +246,8 @@ impl DocumentFontRegistry {
             family_label: Some(family.clone()),
             request: Some(request.clone()),
             synthesize_weight,
+            synthesize_style,
+            variation_coordinates: variation_coordinates.clone(),
         };
         if let Some(id) = self.font_blob_cache.get(&resolved_key) {
             return Some(*id);
@@ -242,8 +262,12 @@ impl DocumentFontRegistry {
             font.index,
             family,
             synthesize_weight && font.synthesis.embolden(),
-            font.synthesis.skew().is_some() || request.attributes.style != 0,
+            synthesize_style
+                .then(|| font.synthesis.skew())
+                .flatten()
+                .and_then(fontique_synthetic_oblique_angle),
             size_adjust,
+            variation_coordinates,
         )?;
         if let Some(face_metadata) = face_metadata {
             apply_metric_overrides(&mut metadata, face_metadata);
@@ -259,6 +283,7 @@ impl DocumentFontRegistry {
     pub(super) fn document_font_from_parley(
         &mut self,
         font_data: &parley::FontData,
+        variation_coordinates: DocumentFontVariationCoordinates,
     ) -> Option<usize> {
         let data = font_data.data.as_ref();
         let face = ttf_parser::Face::parse(data, font_data.index).ok()?;
@@ -273,12 +298,22 @@ impl DocumentFontRegistry {
             family_label: Some(family.clone()),
             request: None,
             synthesize_weight: false,
+            synthesize_style: false,
+            variation_coordinates: variation_coordinates.clone(),
         };
         if let Some(id) = self.font_blob_cache.get(&resolved_key) {
             return Some(*id);
         }
 
-        let metadata = document_font_metadata(data, font_data.index, family, false, false, None)?;
+        let metadata = document_font_metadata(
+            data,
+            font_data.index,
+            family,
+            false,
+            None,
+            None,
+            variation_coordinates,
+        )?;
         let id = self.push_document_font(metadata, font_data.data.clone(), font_data.index, None);
         self.font_blob_cache.insert(resolved_key, id);
         Some(id)
@@ -289,6 +324,8 @@ impl DocumentFontRegistry {
         font_data: &parley::FontData,
         request: &FontRequest,
         synthesize_weight: bool,
+        synthesize_style: bool,
+        variation_coordinates: &DocumentFontVariationCoordinates,
     ) -> Option<usize> {
         self.parley_font_cache
             .get(&ParleyFontRequestKey {
@@ -296,6 +333,8 @@ impl DocumentFontRegistry {
                 face_index: font_data.index,
                 request: request.clone(),
                 synthesize_weight,
+                synthesize_style,
+                variation_coordinates: variation_coordinates.clone(),
             })
             .cloned()
     }
@@ -305,6 +344,8 @@ impl DocumentFontRegistry {
         font_data: &parley::FontData,
         request: &FontRequest,
         synthesize_weight: bool,
+        synthesize_style: bool,
+        variation_coordinates: &DocumentFontVariationCoordinates,
         font_id: usize,
     ) {
         self.parley_font_cache.insert(
@@ -313,6 +354,8 @@ impl DocumentFontRegistry {
                 face_index: font_data.index,
                 request: request.clone(),
                 synthesize_weight,
+                synthesize_style,
+                variation_coordinates: variation_coordinates.clone(),
             },
             font_id,
         );
@@ -343,35 +386,49 @@ impl DocumentFontRegistry {
         if !has_visible_glyph {
             return FontSupportKind::EmbeddableText;
         }
-        if !has_text_outline || font_label_looks_emoji(font) {
+        if !has_text_outline || face_has_color_presentation_tables(&face) {
             FontSupportKind::ColorOrEmojiOnlyFallback
         } else {
             FontSupportKind::EmbeddableText
         }
     }
 
-    /// Whether a run contains a COLR glyph that the layout stage can paint as
-    /// explicit colored outline layers rather than replacing with fallback.
-    pub(super) fn run_has_color_glyph(&self, font_id: usize, text: &str) -> bool {
-        let Some(font) = self.get(font_id) else {
-            return false;
-        };
-        let Ok(face) = ttf_parser::Face::parse(&font.data, font.face_index) else {
-            return false;
-        };
-        text.chars().any(|character| {
-            face.glyph_index(character)
-                .is_some_and(|glyph| face.is_color_glyph(glyph))
+    /// Return whether a face can serve an emoji presentation request for a
+    /// base scalar and optional variation selector.
+    ///
+    /// A cmap format 14 mapping is preferred when present; its registered
+    /// default UVS is coverage for that sequence. Fonts without such a mapping
+    /// still participate through base coverage, allowing the user agent's
+    /// presentation policy to select a color or text face for the cluster.
+    pub(super) fn emoji_presentation_capability(
+        &self,
+        font_id: usize,
+        base: char,
+        selector: Option<char>,
+    ) -> Option<EmojiPresentationCapability> {
+        let font = self.get(font_id)?;
+        let face = ttf_parser::Face::parse(&font.data, font.face_index).ok()?;
+        let glyph = selector
+            .and_then(|selector| face.glyph_variation_index(base, selector))
+            .or_else(|| face.glyph_index(base))?;
+        (glyph.0 != 0).then_some(())?;
+        Some(if face_has_color_presentation_tables(&face) {
+            EmojiPresentationCapability::Emoji
+        } else {
+            EmojiPresentationCapability::Text
         })
     }
 
-    /// Whether a face provides emoji presentation for a run. Platform emoji
-    /// fonts commonly use bitmap/SVG tables that `ttf-parser` cannot report as
-    /// COLR color glyphs, so their registered emoji identity is part of the
-    /// presentation capability as well.
+    /// Whether a run has at least one color-capable glyph. This remains a
+    /// paint/fallback safeguard; presentation selection itself uses the
+    /// base-plus-selector query above.
     pub(super) fn run_has_emoji_presentation_glyph(&self, font_id: usize, text: &str) -> bool {
-        self.run_has_color_glyph(font_id, text)
-            || self.support_kind_for_run(font_id, text) == FontSupportKind::ColorOrEmojiOnlyFallback
+        text.chars()
+            .filter(|character| !character_is_default_ignorable_code_point(*character))
+            .any(|character| {
+                self.emoji_presentation_capability(font_id, character, None)
+                    == Some(EmojiPresentationCapability::Emoji)
+            })
     }
 
     fn push_document_font(
@@ -396,6 +453,7 @@ impl DocumentFontRegistry {
             italic_angle: metadata.italic_angle,
             bbox: metadata.bbox,
             baselines: metadata.baselines,
+            variation_coordinates: metadata.variation_coordinates,
             synthesis: metadata.synthesis,
         });
         if let Some(size_adjust) = metadata.size_adjust {
@@ -413,13 +471,14 @@ fn document_font_metadata(
     face_index: u32,
     family: String,
     synthesize_bold: bool,
-    synthesize_italic: bool,
+    synthetic_oblique: Option<SyntheticObliqueAngle>,
     size_adjust: Option<f32>,
+    variation_coordinates: DocumentFontVariationCoordinates,
 ) -> Option<DocumentFontMetadata> {
     let program_kind = standalone_font_program_kind(data)?;
     let face = ttf_parser::Face::parse(data, face_index).ok()?;
     let post_script_name =
-        post_script_name_for_face(&face, &family, synthesize_bold, synthesize_italic);
+        post_script_name_for_face(&face, &family, synthesize_bold, synthetic_oblique.is_some());
     let bbox = [
         face.global_bounding_box().x_min,
         face.global_bounding_box().y_min,
@@ -463,10 +522,22 @@ fn document_font_metadata(
         bbox,
         baselines: baseline_table_for_font(data, face_index),
         size_adjust,
+        variation_coordinates,
         synthesis: DocumentFontSynthesis {
             embolden: synthesize_bold,
+            oblique: synthetic_oblique,
         },
     })
+}
+
+/// Fontique stores faux-oblique synthesis as an `i8`, exposed through its
+/// public API as `f32`. Preserve the source's discrete value for the PDF
+/// paint state rather than rounding arbitrary authored CSS angles here.
+fn fontique_synthetic_oblique_angle(degrees: f32) -> Option<SyntheticObliqueAngle> {
+    let integer = degrees as i8;
+    (degrees.is_finite() && f32::from(integer) == degrees)
+        .then(|| SyntheticObliqueAngle::from_fontique_degrees(integer))
+        .flatten()
 }
 
 /// Extract immutable design-unit baseline information from OpenType `BASE`.
@@ -584,10 +655,11 @@ fn metric_override_units(value: u32, units_per_em: f32) -> i16 {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod baseline_table_tests {
-    use super::*;
     use read_fonts::tables::variations::{DeltaSetIndex, ItemVariationStore};
     use read_fonts::types::F2Dot14;
     use read_fonts::{FontData, FontRead};
+
+    use super::*;
 
     #[test]
     fn base_coord_formats_retain_design_coordinates_and_only_format_three_variations() {
@@ -688,8 +760,13 @@ mod baseline_table_tests {
     }
 }
 
-fn font_label_looks_emoji(font: &DocumentFont) -> bool {
-    let family = font.family.to_ascii_lowercase();
-    let post_script_name = font.post_script_name.to_ascii_lowercase();
-    family.contains("emoji") || post_script_name.contains("emoji")
+fn face_has_color_presentation_tables(face: &ttf_parser::Face<'_>) -> bool {
+    // Use raw table presence rather than parsed table availability. A color
+    // table may be valid for a PDF consumer but not expose a high-level
+    // `ttf-parser` representation; it still establishes the face as a
+    // color-presentation candidate for CSS font fallback.
+    let raw = face.raw_face();
+    [b"COLR", b"CBDT", b"CBLC", b"sbix", b"SVG "]
+        .into_iter()
+        .any(|tag| raw.table(ttf_parser::Tag::from_bytes(tag)).is_some())
 }

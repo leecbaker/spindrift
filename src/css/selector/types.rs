@@ -1,12 +1,14 @@
-use super::LanguageRange;
-use crate::css::types::Direction;
-use cssparser::{ToCss, serialize_identifier};
-use precomputed_hash::PrecomputedHash;
-use selectors::parser::{NonTSPseudoClass, PseudoElement, SelectorImpl};
 use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
+
+use cssparser::{ToCss, serialize_identifier};
+use precomputed_hash::PrecomputedHash;
+use selectors::parser::{NonTSPseudoClass, PseudoElement, SelectorImpl};
+
+use super::LanguageRange;
+use crate::css::types::Direction;
 
 impl NonTSPseudoClass for QuirePseudoClass {
     type Impl = QuireSelectorImpl;

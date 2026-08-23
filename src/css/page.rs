@@ -13,12 +13,9 @@ use super::values::{
     parse_computed_length_percentage_with_root, parse_computed_line_height, parse_font_size,
     parse_line_height,
 };
-use crate::units::{PercentageBasis, SemanticLengthExt, layout_points};
-use crate::{
-    RenderOptions,
-    layout::{PageMargins, PageSize},
-    units::{LayoutLength, layout_pt},
-};
+use crate::RenderOptions;
+use crate::layout::{PageMargins, PageSize};
+use crate::units::{LayoutLength, PercentageBasis, SemanticLengthExt, layout_points, layout_pt};
 
 pub(crate) fn apply_stylesheet_options(css: &Css, options: &mut RenderOptions) {
     let stylesheet = parse_stylesheet(css);

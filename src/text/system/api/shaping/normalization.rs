@@ -1,5 +1,6 @@
-use super::super::*;
 use std::borrow::Cow;
+
+use super::super::*;
 
 pub(in crate::text) fn text_without_font_neutral_default_ignorables(text: &str) -> Cow<'_, str> {
     if !text
@@ -41,10 +42,7 @@ pub(in crate::text) fn text_with_font_variant_emoji<'a>(
     text: &'a str,
     style: &ComputedStyle,
 ) -> Cow<'a, str> {
-    if matches!(
-        style.font_variant_emoji,
-        FontVariantEmoji::Normal | FontVariantEmoji::Unicode
-    ) {
+    if style.font_variant_emoji == FontVariantEmoji::Normal {
         return Cow::Borrowed(text);
     }
     let mut output = String::with_capacity(text.len());
@@ -61,22 +59,38 @@ pub(in crate::text) fn push_text_with_font_variant_emoji(
     text: &str,
     style: &ComputedStyle,
 ) {
-    let selector = match style.font_variant_emoji {
-        FontVariantEmoji::Text => '\u{fe0e}',
-        FontVariantEmoji::Emoji => '\u{fe0f}',
-        FontVariantEmoji::Normal | FontVariantEmoji::Unicode => {
-            output.push_str(text);
-            return;
-        }
-    };
+    if style.font_variant_emoji == FontVariantEmoji::Normal {
+        output.push_str(text);
+        return;
+    }
     let mut chars = text.chars().peekable();
     while let Some(character) = chars.next() {
         output.push(character);
-        if emoji_presentation_participating_code_point(character)
+        if (emoji_presentation_participating_code_point(character) || character_is_emoji(character))
             && !chars
                 .peek()
                 .is_some_and(|next| matches!(*next, '\u{fe0e}' | '\u{fe0f}'))
         {
+            let selector = match style.font_variant_emoji {
+                FontVariantEmoji::Text => '\u{fe0e}',
+                FontVariantEmoji::Emoji => '\u{fe0f}',
+                // `unicode` follows Unicode's Emoji_Presentation default.
+                // Keep that decision in shaping input so ordinary backend
+                // fallback cannot turn a text-default keycap base into an
+                // emoji solely because a color fallback is available.
+                FontVariantEmoji::Unicode => {
+                    // Emoji-default characters keep their Unicode default;
+                    // the family-selection plan still records that as an
+                    // emoji request. Text-default characters need FE0E in
+                    // shaping input to prevent backend fallback from
+                    // promoting a keycap base to emoji presentation.
+                    if character_has_emoji_presentation(character) {
+                        continue;
+                    }
+                    '\u{fe0e}'
+                }
+                FontVariantEmoji::Normal => unreachable!("normal was handled above"),
+            };
             output.push(selector);
         }
     }
@@ -128,9 +142,9 @@ pub(in crate::text) fn text_without_glyph_output_controls(text: &str) -> Cow<'_,
 /// defines `font-variant-emoji` in terms of Unicode's registered emoji
 /// variation sequences. The range table below was generated from Unicode
 /// Emoji 15.1's `emoji-variation-sequences.txt`; it has 371 bases in 183
-/// inclusive ranges. It must not be replaced by either the `Emoji` or
-/// `Emoji_Presentation` properties: the former is broader, while the latter
-/// excludes text-default bases such as the keycap digits.
+/// inclusive ranges. It supplements (rather than replaces) Unicode's `Emoji`
+/// property, because emoji-default bases can need presentation-aware fallback
+/// even when they have no registered variation sequence.
 ///
 /// <https://www.w3.org/TR/css-fonts-4/#font-variant-emoji-prop>
 /// <https://www.unicode.org/Public/15.1.0/ucd/emoji/emoji-variation-sequences.txt>
@@ -360,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn font_variant_emoji_respects_authored_selectors_and_unchanged_values() {
+    fn font_variant_emoji_respects_authored_selectors_and_unicode_defaults() {
         let keycap_with_text_selector = "1\u{fe0e}\u{20e3}";
         let keycap_with_emoji_selector = "1\u{fe0f}\u{20e3}";
         let mut style = ComputedStyle::initial();
@@ -378,6 +392,10 @@ mod tests {
         style.font_variant_emoji = FontVariantEmoji::Normal;
         assert_eq!(text_with_font_variant_emoji("1", &style), "1");
         style.font_variant_emoji = FontVariantEmoji::Unicode;
-        assert_eq!(text_with_font_variant_emoji("1", &style), "1");
+        assert_eq!(text_with_font_variant_emoji("1", &style), "1\u{fe0e}");
+        assert_eq!(
+            text_with_font_variant_emoji("\u{1fae8}", &style),
+            "\u{1fae8}"
+        );
     }
 }

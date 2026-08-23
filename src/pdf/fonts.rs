@@ -1,7 +1,8 @@
+use std::time::{Duration, Instant};
+
 use super::*;
 use crate::Error;
 use crate::timing::DebugTimer;
-use std::time::{Duration, Instant};
 
 #[cfg(test)]
 pub(super) fn embedded_font_plans_with_profile<'a>(
@@ -132,8 +133,12 @@ pub(super) fn timed_embedded_font_plans_with_profile<'a>(
                     reason: reason.clone(),
                 });
             }
-            let source_gid_to_width =
-                pdf_text_space_widths(pending.font, &audit.font_file.source_gid_to_cid);
+            let embedded_face = ttf_parser::Face::parse(&audit.font_file.data, 0).ok();
+            let source_gid_to_width = pdf_text_space_widths(
+                pending.font,
+                embedded_face.as_ref(),
+                &audit.font_file.source_gid_to_cid,
+            );
             Ok(EmbeddedFontPlan {
                 font: pending.font,
                 resource_name: format!("RF{}", index + 1),
@@ -328,13 +333,19 @@ fn audit_font_program(
         fallback_reason = Some(reason);
     }
 
-    let base_name = pdf_font_base_name(font, face.as_ref(), &font_file.embedding_kind);
-    let descriptor_metrics =
-        font_descriptor_metrics_from_face(font, face.as_ref(), &font_file.source_gid_to_cid);
+    let embedded_face = ttf_parser::Face::parse(&font_file.data, 0).ok();
+    let base_name = pdf_font_base_name(font, embedded_face.as_ref(), &font_file.embedding_kind);
+    let descriptor_metrics = font_descriptor_metrics_from_face(
+        font,
+        embedded_face.as_ref(),
+        &font_file.source_gid_to_cid,
+    );
     let default_width = descriptor_metrics.missing_width.unwrap_or(0.0);
     let full_program = matches!(
         font_file.embedding_kind,
-        FontEmbeddingKind::FullStandaloneFont | FontEmbeddingKind::ExtractedCollectionFace
+        FontEmbeddingKind::InstantiatedFullCoverage
+            | FontEmbeddingKind::FullStandaloneFont
+            | FontEmbeddingKind::ExtractedCollectionFace
     );
     let mut used_cids = if full_program {
         unicode_cmap_for_full_font(face.as_ref(), &font_file.source_gid_to_cid)
@@ -549,6 +560,7 @@ pub(super) fn embedded_font_candidate_key(font: &DocumentFont) -> EmbeddedFontCa
         program_len: font.data.len(),
         face_index: font.face_index,
         program_kind: font.program_kind,
+        variation_coordinates: font.variation_coordinates.clone(),
     }
 }
 
@@ -557,20 +569,23 @@ pub(super) fn embedded_font_candidate_key(font: &DocumentFont) -> EmbeddedFontCa
 /// touching mapped font bytes; a byte comparison preserves deduplication for
 /// separately loaded but identical font programs.
 pub(super) fn same_embedded_font_program(left: &DocumentFont, right: &DocumentFont) -> bool {
-    left.data.blob_id() == right.data.blob_id() || left.data.as_ref() == right.data.as_ref()
+    left.variation_coordinates == right.variation_coordinates
+        && (left.data.blob_id() == right.data.blob_id()
+            || left.data.as_ref() == right.data.as_ref())
 }
 
 fn pdf_text_space_widths(
     font: &DocumentFont,
+    embedded_face: Option<&ttf_parser::Face<'_>>,
     source_gid_to_cid: &BTreeMap<u16, u16>,
 ) -> BTreeMap<u16, PdfTextSpaceWidth> {
-    let Ok(face) = ttf_parser::Face::parse(&font.data, font.face_index) else {
+    let Some(face) = embedded_face else {
         return BTreeMap::new();
     };
     source_gid_to_cid
-        .keys()
-        .filter_map(|source_gid| {
-            face.glyph_hor_advance(ttf_parser::GlyphId(*source_gid))
+        .iter()
+        .filter_map(|(source_gid, cid)| {
+            face.glyph_hor_advance(ttf_parser::GlyphId(*cid))
                 .map(|advance| {
                     (
                         *source_gid,
@@ -661,9 +676,9 @@ fn mapped_glyph_widths(
     };
     let units_per_em = font.units_per_em.max(1) as f32;
     source_gid_to_cid
-        .keys()
-        .filter_map(|glyph_id| {
-            face.glyph_hor_advance(ttf_parser::GlyphId(*glyph_id))
+        .iter()
+        .filter_map(|(_source_gid, cid)| {
+            face.glyph_hor_advance(ttf_parser::GlyphId(*cid))
                 .map(|width| (width as f32 * 1000.0 / units_per_em).round() as i32)
         })
         .collect()
@@ -735,6 +750,9 @@ pub(super) fn log_embedded_font_file(font: &EmbeddedFontPlan<'_>) {
     let embedded_len = font.font_file_data.len();
     let kind = match &font.embedding_kind {
         FontEmbeddingKind::SubsetCompactGids => "subsetted with compact CIDs",
+        FontEmbeddingKind::InstantiatedFullCoverage => {
+            "static variable instance with full coverage"
+        }
         FontEmbeddingKind::FullStandaloneFont => "full standalone font",
         FontEmbeddingKind::ExtractedCollectionFace => "extracted collection face",
         FontEmbeddingKind::Rejected { .. } => "rejected",
@@ -764,6 +782,11 @@ fn pdf_font_base_name(
                 post_script_name
             )
         }
+        FontEmbeddingKind::InstantiatedFullCoverage => format!(
+            "{}+{}",
+            subset_prefix(font, &post_script_name),
+            post_script_name
+        ),
         FontEmbeddingKind::FullStandaloneFont | FontEmbeddingKind::ExtractedCollectionFace => {
             post_script_name
         }
@@ -805,7 +828,16 @@ fn subset_prefix(font: &DocumentFont, post_script_name: &str) -> String {
         ^ ((font.face_index as u64) << 32)
         ^ post_script_name.bytes().fold(0u64, |hash, byte| {
             hash.wrapping_mul(33).wrapping_add(byte as u64)
-        });
+        })
+        ^ font
+            .variation_coordinates
+            .0
+            .iter()
+            .fold(0u64, |hash, (tag, value)| {
+                tag.iter().fold(hash, |hash, byte| {
+                    hash.wrapping_mul(33).wrapping_add(u64::from(*byte))
+                }) ^ u64::from(*value)
+            });
     std::iter::successors(Some(hash), |hash| Some(hash / 26))
         .take(6)
         .map(|hash| (b'A' + (hash % 26) as u8) as char)

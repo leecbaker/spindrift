@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use super::*;
 
 pub(crate) fn build_page_box<'a>(
@@ -25,7 +27,7 @@ fn build_page_box_inner<'a>(
     font_system: Option<&mut FontSystem>,
 ) -> MutablePageBox<'a> {
     let built = match &root.kind {
-        NodeKind::Element(element) => build_child_boxes_inner(
+        NodeKind::Element(element) => build_child_boxes_iterative(
             element,
             stylesheets,
             parent_style,
@@ -133,7 +135,7 @@ pub(crate) fn build_child_boxes_with_font_metrics<'a>(
     ancestors: &[ElementSignature],
     font_system: &mut FontSystem,
 ) -> Vec<MutableFormattingBox<'a>> {
-    build_child_boxes_inner(
+    build_child_boxes_iterative(
         element,
         stylesheets,
         parent_style,
@@ -145,8 +147,676 @@ pub(crate) fn build_child_boxes_with_font_metrics<'a>(
     .boxes
 }
 
+/// A completed direct-child traversal, before its principal element box has
+/// been attached to its parent's source-order output.
+enum IterativeBuildResult<'a> {
+    Root(BuiltChildren<'a>),
+    Element(Box<IterativeElementBuild<'a>>),
+    Contents(BuiltChildren<'a>),
+}
+
+struct IterativeElementBuild<'a> {
+    element: &'a Element,
+    signature: ElementSignature,
+    style: Box<ComputedStyle>,
+    children: BuiltChildren<'a>,
+}
+
+enum IterativeBuildCompletion<'a> {
+    Root,
+    Element {
+        element: &'a Element,
+        signature: Box<ElementSignature>,
+    },
+    Contents,
+}
+
+/// Heap-resident state for a single element's direct-child phase.
+///
+/// Keeping this state in a `Box` is important: a page with deeply nested
+/// elements must grow the explicit work list, rather than retain one large
+/// Rust stack frame for each ancestor.
+struct IterativeBuildFrame<'a> {
+    element: &'a Element,
+    style: Box<ComputedStyle>,
+    normalize_for_parent: bool,
+    text_parent_is_flattened_contents: bool,
+    completion: IterativeBuildCompletion<'a>,
+    sibling_tags: ElementSiblingSignatureList,
+    next_child_node_index: usize,
+    next_element_index: usize,
+    built: BuiltChildren<'a>,
+    pending_suppressed_named_string_events: Vec<SuppressedNamedStringEvent>,
+}
+
+impl<'a> IterativeBuildFrame<'a> {
+    fn new(
+        element: &'a Element,
+        style: Box<ComputedStyle>,
+        normalize_for_parent: bool,
+        text_parent_is_flattened_contents: bool,
+        completion: IterativeBuildCompletion<'a>,
+    ) -> Self {
+        let mut built = BuiltChildren::default();
+        push_generated_pseudo_box(
+            &mut built.boxes,
+            &mut built.counter_events,
+            element,
+            &style,
+            style.before_style.as_deref(),
+            GeneratedPseudoKind::Before,
+        );
+        Self {
+            element,
+            style,
+            normalize_for_parent,
+            text_parent_is_flattened_contents,
+            completion,
+            sibling_tags: element_sibling_signature_list(element),
+            next_child_node_index: 0,
+            next_element_index: 0,
+            built,
+            pending_suppressed_named_string_events: Vec::new(),
+        }
+    }
+
+    fn finish(mut self) -> IterativeBuildResult<'a> {
+        push_generated_pseudo_box(
+            &mut self.built.boxes,
+            &mut self.built.counter_events,
+            self.element,
+            &self.style,
+            self.style.after_style.as_deref(),
+            GeneratedPseudoKind::After,
+        );
+        self.built.suppressed_named_string_events.extend(
+            self.pending_suppressed_named_string_events
+                .drain(..)
+                .map(|mut event| {
+                    event.target = SuppressedNamedStringEventTarget::AfterElement(self.element.id);
+                    event
+                }),
+        );
+        if self.normalize_for_parent {
+            self.built.boxes = normalize_block_container_children(self.built.boxes, &self.style);
+        }
+        match self.completion {
+            IterativeBuildCompletion::Root => IterativeBuildResult::Root(self.built),
+            IterativeBuildCompletion::Contents => IterativeBuildResult::Contents(self.built),
+            IterativeBuildCompletion::Element { element, signature } => {
+                IterativeBuildResult::Element(Box::new(IterativeElementBuild {
+                    element,
+                    signature: *signature,
+                    style: self.style,
+                    children: self.built,
+                }))
+            }
+        }
+    }
+}
+
+enum IterativeBuildWork<'a> {
+    Frame(Box<IterativeBuildFrame<'a>>),
+    AppendElement,
+    AppendContents,
+    PopAncestor(Box<ElementSignature>),
+}
+
+struct IterativeBoxTreeBuilder<'a> {
+    ancestors: Vec<ElementSignature>,
+    work: Vec<IterativeBuildWork<'a>>,
+    result: Option<IterativeBuildResult<'a>>,
+}
+
+impl<'a> IterativeBoxTreeBuilder<'a> {
+    fn new(
+        element: &'a Element,
+        parent_style: &ComputedStyle,
+        ancestors: &[ElementSignature],
+        normalize_for_parent: bool,
+        text_parent_is_flattened_contents: bool,
+    ) -> Self {
+        Self {
+            ancestors: ancestors.to_vec(),
+            work: vec![IterativeBuildWork::Frame(Box::new(
+                IterativeBuildFrame::new(
+                    element,
+                    Box::new(parent_style.clone()),
+                    normalize_for_parent,
+                    text_parent_is_flattened_contents,
+                    IterativeBuildCompletion::Root,
+                ),
+            ))],
+            result: None,
+        }
+    }
+
+    fn build(
+        mut self,
+        stylesheets: &Stylesheets<'_>,
+        mut font_system: Option<&mut FontSystem>,
+    ) -> BuiltChildren<'a> {
+        while let Some(work) = self.work.pop() {
+            match work {
+                IterativeBuildWork::Frame(frame) => {
+                    self.step_frame(frame, stylesheets, font_system.as_deref_mut())
+                }
+                IterativeBuildWork::AppendElement => self.append_completed_element(),
+                IterativeBuildWork::AppendContents => self.append_completed_contents(),
+                IterativeBuildWork::PopAncestor(signature) => {
+                    let popped = self
+                        .ancestors
+                        .pop()
+                        .expect("descendant traversal must retain its ancestor");
+                    debug_assert_eq!(popped, *signature);
+                }
+            }
+        }
+        match self
+            .result
+            .take()
+            .expect("root box-tree frame must complete")
+        {
+            IterativeBuildResult::Root(built) => built,
+            IterativeBuildResult::Element(_) | IterativeBuildResult::Contents(_) => {
+                unreachable!("only the root frame may complete the build")
+            }
+        }
+    }
+
+    fn step_frame(
+        &mut self,
+        mut frame: Box<IterativeBuildFrame<'a>>,
+        stylesheets: &Stylesheets<'_>,
+        font_system: Option<&mut FontSystem>,
+    ) {
+        let Some(child) = frame.element.children.get(frame.next_child_node_index) else {
+            self.result = Some(frame.finish());
+            return;
+        };
+        frame.next_child_node_index += 1;
+        match &child.kind {
+            NodeKind::Text(text) => {
+                if !text.is_empty() && !element_suppresses_direct_text_children(frame.element) {
+                    frame
+                        .built
+                        .boxes
+                        .push(MutableFormattingBox::Text(MutableTextBox {
+                            text: text.clone(),
+                            style: if frame.text_parent_is_flattened_contents {
+                                flattened_contents_text_style(&frame.style)
+                            } else {
+                                inherited_text_style(&frame.style)
+                            },
+                        }));
+                }
+                self.work.push(IterativeBuildWork::Frame(frame));
+            }
+            NodeKind::Element(child_element) => {
+                let signature = ElementSignature::from_sibling_snapshot(
+                    frame.next_element_index,
+                    frame.sibling_tags.clone(),
+                )
+                .expect("source child must have a cached sibling signature");
+                frame.next_element_index += 1;
+                if is_html_select_item_element(child_element)
+                    && !has_html_select_context(frame.element, &self.ancestors)
+                {
+                    self.work.push(IterativeBuildWork::Frame(frame));
+                    return;
+                }
+                let mut style = style_for_child_iterative(
+                    child_element,
+                    signature.clone(),
+                    stylesheets,
+                    &frame.style,
+                    &self.ancestors,
+                    font_system,
+                );
+                if self.ancestors.is_empty() {
+                    style = root_display_fixed_style(style);
+                }
+                prepare_flattened_contents_child_style(
+                    &mut style,
+                    frame.text_parent_is_flattened_contents,
+                );
+                if display_contents_computes_to_none_for_css_layout_svg_root(
+                    child_element,
+                    frame.element,
+                    &style,
+                ) {
+                    style.display = Display::NONE;
+                }
+                if frame.style.display.is_flex() || frame.style.display.is_grid() {
+                    style.display = style.display.blockified();
+                }
+                if style.display.is_none() {
+                    frame.pending_suppressed_named_string_events.extend(
+                        suppressed_named_string_events_for_subtree_iterative(
+                            child_element,
+                            style,
+                            stylesheets,
+                            &self.ancestors,
+                        ),
+                    );
+                    frame.built.counter_events.push(
+                        suppressed_counter_event_for_subtree_iterative(child_element),
+                    );
+                    self.work.push(IterativeBuildWork::Frame(frame));
+                    return;
+                }
+                self.ancestors.push(signature.clone());
+                self.work.push(IterativeBuildWork::Frame(frame));
+                if style.display.is_contents() {
+                    self.work.push(IterativeBuildWork::AppendContents);
+                    self.work
+                        .push(IterativeBuildWork::PopAncestor(Box::new(signature)));
+                    self.work.push(IterativeBuildWork::Frame(Box::new(
+                        IterativeBuildFrame::new(
+                            child_element,
+                            Box::new(flattened_contents_inheritance_style(&style)),
+                            false,
+                            true,
+                            IterativeBuildCompletion::Contents,
+                        ),
+                    )));
+                } else {
+                    if matches!(style.position, Position::Absolute | Position::Fixed) {
+                        style.abspos_static_source =
+                            css::StaticPositionSource::from_display(style.display);
+                        style.display = style.display.blockified();
+                    }
+                    self.work.push(IterativeBuildWork::AppendElement);
+                    self.work
+                        .push(IterativeBuildWork::PopAncestor(Box::new(signature.clone())));
+                    if matches!(style.content, Content::Replacement { .. })
+                        || is_horizontal_rule_element(child_element)
+                    {
+                        self.result = Some(IterativeBuildResult::Element(Box::new(
+                            IterativeElementBuild {
+                                element: child_element,
+                                signature,
+                                style: Box::new(style),
+                                children: BuiltChildren::default(),
+                            },
+                        )));
+                    } else {
+                        self.work.push(IterativeBuildWork::Frame(Box::new(
+                            IterativeBuildFrame::new(
+                                child_element,
+                                Box::new(style),
+                                true,
+                                false,
+                                IterativeBuildCompletion::Element {
+                                    element: child_element,
+                                    signature: Box::new(signature),
+                                },
+                            ),
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    fn append_completed_element(&mut self) {
+        let IterativeBuildResult::Element(element) = self
+            .result
+            .take()
+            .expect("element child must complete before its continuation")
+        else {
+            unreachable!("element continuation must receive an element result")
+        };
+        let Some(IterativeBuildWork::Frame(parent)) = self.work.last_mut() else {
+            unreachable!("element continuation must resume a parent frame")
+        };
+        append_iterative_element_build(parent, *element);
+    }
+
+    fn append_completed_contents(&mut self) {
+        let IterativeBuildResult::Contents(mut contents) = self
+            .result
+            .take()
+            .expect("contents child must complete before its continuation")
+        else {
+            unreachable!("contents continuation must receive a contents result")
+        };
+        let Some(IterativeBuildWork::Frame(parent)) = self.work.last_mut() else {
+            unreachable!("contents continuation must resume a parent frame")
+        };
+        parent.built.boxes.append(&mut contents.boxes);
+        parent.built.footnotes.append(&mut contents.footnotes);
+        parent
+            .built
+            .counter_events
+            .append(&mut contents.counter_events);
+        parent
+            .built
+            .suppressed_named_string_events
+            .append(&mut contents.suppressed_named_string_events);
+    }
+}
+
+fn build_child_boxes_iterative<'a>(
+    element: &'a Element,
+    stylesheets: &Stylesheets<'_>,
+    parent_style: &ComputedStyle,
+    ancestors: &[ElementSignature],
+    normalize_for_parent: bool,
+    text_parent_is_flattened_contents: bool,
+    font_system: Option<&mut FontSystem>,
+) -> BuiltChildren<'a> {
+    IterativeBoxTreeBuilder::new(
+        element,
+        parent_style,
+        ancestors,
+        normalize_for_parent,
+        text_parent_is_flattened_contents,
+    )
+    .build(stylesheets, font_system)
+}
+
+fn style_for_child_iterative(
+    element: &Element,
+    signature: ElementSignature,
+    stylesheets: &Stylesheets<'_>,
+    parent_style: &ComputedStyle,
+    ancestors: &[ElementSignature],
+    font_system: Option<&mut FontSystem>,
+) -> ComputedStyle {
+    match font_system {
+        Some(font_system) => {
+            let parent_ch_advance = font_system.ch_advance(parent_style);
+            let mut style = style_for_layout_element_with_parent_ch_advance(
+                element,
+                signature.clone(),
+                stylesheets,
+                Some(parent_style),
+                ancestors,
+                parent_ch_advance,
+            );
+            let pseudo_parent_ch_advance = font_system.ch_advance(&style);
+            let pseudo_signature = layout_element_signature(element, signature, Some(parent_style));
+            css::apply_pseudo_rules_with_parent_ch_advance(
+                &mut style,
+                &pseudo_signature,
+                stylesheets,
+                ancestors,
+                pseudo_parent_ch_advance,
+            );
+            style
+        }
+        None => style_for_layout_element(
+            element,
+            signature,
+            stylesheets,
+            Some(parent_style),
+            ancestors,
+        ),
+    }
+}
+
+fn prepare_flattened_contents_child_style(style: &mut ComputedStyle, flattened: bool) {
+    if !flattened {
+        return;
+    }
+    if matches!(style.deferred_font_size, css::DeferredFontSize::Inherit) {
+        style.deferred_font_size = css::DeferredFontSize::Absolute(style.font_size);
+    }
+    for pseudo in [
+        style.marker_style.as_deref_mut(),
+        style.before_style.as_deref_mut(),
+        style.after_style.as_deref_mut(),
+        style.first_line_style.as_deref_mut(),
+        style.first_letter_style.as_deref_mut(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        pseudo.deferred_font_size = css::DeferredFontSize::Absolute(style.font_size);
+    }
+}
+
+fn append_iterative_element_build<'a>(
+    parent: &mut IterativeBuildFrame<'a>,
+    element: IterativeElementBuild<'a>,
+) {
+    let mut built = materialize_iterative_element_build(element);
+    let element = built.counter_event.element;
+    parent.built.suppressed_named_string_events.extend(
+        parent
+            .pending_suppressed_named_string_events
+            .drain(..)
+            .map(|mut event| {
+                event.target = SuppressedNamedStringEventTarget::BeforeElement(element.id);
+                event
+            }),
+    );
+    let (
+        is_footnote,
+        footnote_display,
+        footnote_policy,
+        footnote_call_style,
+        footnote_marker_style,
+    ) = {
+        let style = built.box_.style();
+        (
+            style.float == Float::Footnote,
+            style.footnote_display,
+            style.footnote_policy,
+            style.footnote_call_style.clone(),
+            style.footnote_marker_style.clone(),
+        )
+    };
+    if is_footnote {
+        let mut call_boxes = Vec::new();
+        let mut call_counter_events = Vec::new();
+        push_generated_pseudo_box(
+            &mut call_boxes,
+            &mut call_counter_events,
+            element,
+            &parent.style,
+            footnote_call_style.as_deref(),
+            GeneratedPseudoKind::FootnoteCall,
+        );
+        built
+            .counter_event
+            .counter_style
+            .counter_increments
+            .push(css::CounterChange {
+                name: "footnote".to_string(),
+                value: css::CounterValue::new(1),
+            });
+        built
+            .counter_event
+            .children
+            .splice(0..0, call_counter_events);
+        if let Some(marker_style) = footnote_marker_style.as_deref()
+            && marker_style.content.is_generated()
+        {
+            built.counter_event.children.insert(
+                1,
+                CounterEventNode {
+                    element,
+                    source: CounterEventSource::FootnoteMarker,
+                    counter_style: CounterEventStyle::from_computed(marker_style),
+                    children: Vec::new(),
+                },
+            );
+        }
+        built.box_.style_mut().float = Float::None;
+        parent.built.boxes.extend(call_boxes);
+        parent.built.footnotes.push(MutableFootnoteBox {
+            element,
+            body: built.box_,
+            display: footnote_display,
+            policy: footnote_policy,
+        });
+    } else {
+        parent.built.boxes.push(built.box_);
+    }
+    parent.built.footnotes.extend(built.footnotes);
+    parent.built.counter_events.push(built.counter_event);
+    parent
+        .built
+        .suppressed_named_string_events
+        .extend(built.suppressed_named_string_events);
+}
+
+fn materialize_iterative_element_build(element: IterativeElementBuild<'_>) -> BuiltElement<'_> {
+    let IterativeElementBuild {
+        element,
+        signature,
+        mut style,
+        children,
+    } = element;
+    let content_replacement = matches!(style.content, Content::Replacement { .. });
+    let BuiltChildren {
+        boxes: children,
+        footnotes,
+        counter_events: mut counter_children,
+        suppressed_named_string_events,
+    } = children;
+    let marker = marker_box(&style);
+    if let Some(marker) = &marker {
+        counter_children.insert(
+            0,
+            CounterEventNode {
+                element,
+                source: CounterEventSource::Marker,
+                counter_style: CounterEventStyle::from_computed(&marker.style),
+                children: Vec::new(),
+            },
+        );
+    }
+    let counter_style = CounterEventStyle::from_computed(&style);
+    let source = BoxSource::Principal;
+    let box_ = if content_replacement || is_replaced_element(element) {
+        style.display = if style.display.is_block_level() {
+            Display::BLOCK_REPLACED.with_list_item(style.display.is_list_item())
+        } else if style.display.is_run_in() {
+            style.display.with_inner(DisplayInner::Replaced)
+        } else {
+            Display::INLINE_REPLACED.with_list_item(style.display.is_list_item())
+        };
+        if style.display.is_inline_or_run_in_level() {
+            MutableFormattingBox::AtomicInline(MutableAtomicInlineBox {
+                core: ElementBoxCoreWith {
+                    element,
+                    signature,
+                    source,
+                    style,
+                    children,
+                },
+                marker,
+                table_fragment: None,
+            })
+        } else {
+            MutableFormattingBox::Replaced(MutableReplacedBox {
+                core: ElementBoxCoreWith {
+                    element,
+                    signature,
+                    source,
+                    style,
+                    children,
+                },
+                marker,
+            })
+        }
+    } else if style.display.is_table() && style.display.is_inline_or_run_in_level() {
+        let fragment = build_table_fragment(element, &signature, &style, &children);
+        MutableFormattingBox::AtomicInline(MutableAtomicInlineBox {
+            core: ElementBoxCoreWith {
+                element,
+                signature,
+                source,
+                style,
+                children,
+            },
+            marker,
+            table_fragment: Some(fragment),
+        })
+    } else if style.display.is_table() {
+        let fragment = build_table_fragment(element, &signature, &style, &children);
+        MutableFormattingBox::Table(MutableTableBox {
+            core: ElementBoxCoreWith {
+                element,
+                signature,
+                source,
+                style,
+                children,
+            },
+            marker,
+            fragment,
+        })
+    } else if style.display.is_flex() && style.display.is_block_level() {
+        MutableFormattingBox::Flex(MutableFlexBox {
+            core: ElementBoxCoreWith {
+                element,
+                signature,
+                source,
+                style,
+                children,
+            },
+            marker,
+        })
+    } else if style.display.is_atomic_inline()
+        || (style.display.is_run_in() && !style.display.is_flow())
+    {
+        MutableFormattingBox::AtomicInline(MutableAtomicInlineBox {
+            core: ElementBoxCoreWith {
+                element,
+                signature,
+                source,
+                style,
+                children,
+            },
+            marker,
+            table_fragment: None,
+        })
+    } else if style.display.is_block_level() {
+        let fieldset = fieldset_formatting_box(element, &style, &children);
+        MutableFormattingBox::Block(MutableBlockBox {
+            core: ElementBoxCoreWith {
+                element,
+                signature,
+                source,
+                style,
+                children,
+            },
+            marker,
+            run_in_children: Vec::new(),
+            fieldset,
+        })
+    } else {
+        MutableFormattingBox::Inline(MutableInlineBox {
+            core: ElementBoxCoreWith {
+                element,
+                signature,
+                source,
+                style,
+                children,
+            },
+            marker,
+            fragment_edges: InlineBoxFragmentEdges::ALL,
+        })
+    };
+    BuiltElement {
+        box_,
+        footnotes,
+        counter_event: CounterEventNode {
+            element,
+            source: CounterEventSource::Principal,
+            counter_style,
+            children: counter_children,
+        },
+        suppressed_named_string_events,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn build_child_boxes_inner<'a>(
+#[allow(dead_code)]
+fn build_child_boxes_recursive<'a>(
     element: &'a Element,
     stylesheets: &Stylesheets<'_>,
     parent_style: &ComputedStyle,
@@ -294,7 +964,7 @@ fn build_child_boxes_inner<'a>(
                     let flattened_style = flattened_contents_inheritance_style(&style);
                     let mut child_ancestors = ancestors.to_vec();
                     child_ancestors.push(signature);
-                    let built = build_child_boxes_inner(
+                    let built = build_child_boxes_recursive(
                         child_element,
                         stylesheets,
                         &flattened_style,
@@ -326,7 +996,7 @@ fn build_child_boxes_inner<'a>(
                     let footnote_policy = style.footnote_policy;
                     let footnote_call_style = style.footnote_call_style.clone();
                     let footnote_marker_style = style.footnote_marker_style.clone();
-                    let Some(mut built) = build_element_box(
+                    let Some(mut built) = build_element_box_recursive(
                         child_element,
                         signature,
                         style,
@@ -445,6 +1115,130 @@ fn display_contents_computes_to_none_for_css_layout_svg_root(
         && parent.namespace_url != "http://www.w3.org/2000/svg"
 }
 
+enum SuppressedNamedStringWork<'a> {
+    Visit {
+        element: &'a Element,
+        style: Rc<ComputedStyle>,
+    },
+    Child {
+        element: &'a Element,
+        parent_style: Rc<ComputedStyle>,
+    },
+    PopAncestor(Box<ElementSignature>),
+}
+
+fn suppressed_named_string_events_for_subtree_iterative(
+    element: &Element,
+    style: ComputedStyle,
+    stylesheets: &Stylesheets<'_>,
+    initial_ancestors: &[ElementSignature],
+) -> Vec<SuppressedNamedStringEvent> {
+    let mut ancestors = initial_ancestors.to_vec();
+    let mut work = vec![SuppressedNamedStringWork::Visit {
+        element,
+        style: Rc::new(style),
+    }];
+    let mut events = Vec::new();
+    while let Some(work_item) = work.pop() {
+        match work_item {
+            SuppressedNamedStringWork::Visit { element, style } => {
+                if !style.string_sets.is_empty() {
+                    events.push(SuppressedNamedStringEvent {
+                        element: element.clone(),
+                        style: (*style).clone(),
+                        target: SuppressedNamedStringEventTarget::AfterElement(element.id),
+                    });
+                }
+                let signature = element_signature(element);
+                ancestors.push(signature.clone());
+                work.push(SuppressedNamedStringWork::PopAncestor(Box::new(signature)));
+                for child in element.children.iter().rev() {
+                    let NodeKind::Element(child) = &child.kind else {
+                        continue;
+                    };
+                    work.push(SuppressedNamedStringWork::Child {
+                        element: child,
+                        parent_style: Rc::clone(&style),
+                    });
+                }
+            }
+            SuppressedNamedStringWork::Child {
+                element,
+                parent_style,
+            } => {
+                let signature = element_signature(element);
+                let style = style_for_layout_element(
+                    element,
+                    signature,
+                    stylesheets,
+                    Some(&parent_style),
+                    &ancestors,
+                );
+                work.push(SuppressedNamedStringWork::Visit {
+                    element,
+                    style: Rc::new(style),
+                });
+            }
+            SuppressedNamedStringWork::PopAncestor(signature) => {
+                let popped = ancestors
+                    .pop()
+                    .expect("suppressed traversal must retain its ancestor");
+                debug_assert_eq!(popped, *signature);
+            }
+        }
+    }
+    events
+}
+
+enum SuppressedCounterWork<'a> {
+    Visit(&'a Element),
+    Finish {
+        element: &'a Element,
+        child_count: usize,
+    },
+}
+
+fn suppressed_counter_event_for_subtree_iterative<'a>(
+    element: &'a Element,
+) -> CounterEventNode<'a> {
+    let mut work = vec![SuppressedCounterWork::Visit(element)];
+    let mut completed = Vec::new();
+    while let Some(work_item) = work.pop() {
+        match work_item {
+            SuppressedCounterWork::Visit(element) => {
+                let children = element
+                    .children
+                    .iter()
+                    .filter_map(|child| match &child.kind {
+                        NodeKind::Element(child) => Some(child),
+                        NodeKind::Text(_) => None,
+                    })
+                    .collect::<Vec<_>>();
+                work.push(SuppressedCounterWork::Finish {
+                    element,
+                    child_count: children.len(),
+                });
+                work.extend(children.into_iter().rev().map(SuppressedCounterWork::Visit));
+            }
+            SuppressedCounterWork::Finish {
+                element,
+                child_count,
+            } => {
+                let children = completed.split_off(completed.len() - child_count);
+                completed.push(CounterEventNode {
+                    element,
+                    source: CounterEventSource::Principal,
+                    counter_style: CounterEventStyle::suppressed_display_none(),
+                    children,
+                });
+            }
+        }
+    }
+    completed
+        .pop()
+        .expect("suppressed counter traversal must complete its root")
+}
+
 fn suppressed_named_string_events_for_subtree(
     element: &Element,
     style: ComputedStyle,
@@ -510,7 +1304,8 @@ fn suppressed_counter_event_for_subtree<'a>(
     }
 }
 
-fn build_element_box<'a>(
+#[allow(dead_code)]
+fn build_element_box_recursive<'a>(
     element: &'a Element,
     signature: ElementSignature,
     style: ComputedStyle,
@@ -530,7 +1325,7 @@ fn build_element_box<'a>(
     let built_children = if content_replacement || is_horizontal_rule_element(element) {
         BuiltChildren::default()
     } else {
-        build_child_boxes_inner(
+        build_child_boxes_recursive(
             element,
             stylesheets,
             &style,
@@ -610,7 +1405,7 @@ fn build_element_box<'a>(
     }
 
     let box_ = if style.display.is_table() && style.display.is_inline_or_run_in_level() {
-        let fragment = build_table_fragment(element, &signature, &children);
+        let fragment = build_table_fragment(element, &signature, &style, &children);
         MutableFormattingBox::AtomicInline(MutableAtomicInlineBox {
             core: ElementBoxCoreWith {
                 element,
@@ -623,7 +1418,7 @@ fn build_element_box<'a>(
             table_fragment: Some(fragment),
         })
     } else if style.display.is_table() {
-        let fragment = build_table_fragment(element, &signature, &children);
+        let fragment = build_table_fragment(element, &signature, &style, &children);
         MutableFormattingBox::Table(MutableTableBox {
             core: ElementBoxCoreWith {
                 element,
@@ -719,6 +1514,11 @@ fn push_generated_pseudo_box<'a>(
         originating_element.attrs.clone(),
     );
     let mut style = Box::new(pseudo_style.clone());
+    style.marker_counter_origin = match kind {
+        GeneratedPseudoKind::Before => css::MarkerCounterOrigin::Before,
+        GeneratedPseudoKind::After => css::MarkerCounterOrigin::After,
+        GeneratedPseudoKind::FootnoteCall => css::MarkerCounterOrigin::Principal,
+    };
     if matches!(style.position, Position::Absolute | Position::Fixed) {
         style.abspos_static_source = css::StaticPositionSource::from_display(style.display);
         style.display = style.display.blockified();
@@ -771,7 +1571,12 @@ fn build_generated_pseudo_box<'a>(
     let children = Vec::new();
 
     if style.display.is_table() && style.display.is_inline_or_run_in_level() {
-        let fragment = build_table_fragment(originating_element, &originating_signature, &children);
+        let fragment = build_table_fragment(
+            originating_element,
+            &originating_signature,
+            &style,
+            &children,
+        );
         Some(MutableFormattingBox::AtomicInline(MutableAtomicInlineBox {
             core: ElementBoxCoreWith {
                 element: originating_element,
@@ -784,7 +1589,12 @@ fn build_generated_pseudo_box<'a>(
             table_fragment: Some(fragment),
         }))
     } else if style.display.is_table() {
-        let fragment = build_table_fragment(originating_element, &originating_signature, &children);
+        let fragment = build_table_fragment(
+            originating_element,
+            &originating_signature,
+            &style,
+            &children,
+        );
         Some(MutableFormattingBox::Table(MutableTableBox {
             core: ElementBoxCoreWith {
                 element: originating_element,
@@ -892,12 +1702,19 @@ fn root_display_fixed_style(mut style: ComputedStyle) -> ComputedStyle {
 pub(crate) fn build_table_fragment<'a>(
     element: &'a Element,
     signature: &ElementSignature,
+    table_style: &ComputedStyle,
     children: &[MutableFormattingBox<'a>],
 ) -> MutableTableFragment<'a> {
     let captions = table_fragment_captions(children);
     let columns = table_fragment_columns(children);
     let mut rows = Vec::new();
-    collect_table_fragment_rows(children, &mut rows, std::slice::from_ref(signature), &[]);
+    collect_table_fragment_rows(
+        children,
+        &mut rows,
+        std::slice::from_ref(signature),
+        &[],
+        table_style,
+    );
     if rows.is_empty() && is_html_table_row_element(element) {
         rows.push(MutableTableFragmentRow {
             element: Some(element),
@@ -1075,10 +1892,16 @@ fn table_fragment_definite_length(value: &css::ComputedLengthPercentageOrAuto) -
 pub(crate) fn build_frozen_table_fragment<'a>(
     element: &'a Element,
     signature: &ElementSignature,
+    table_style: &ComputedStyle,
     children: &[FrozenFormattingBox<'a>],
 ) -> FrozenTableFragment<'a> {
     let mutable_children = clone_frozen_child_boxes_as_mutable(children);
-    freeze_table_fragment(build_table_fragment(element, signature, &mutable_children))
+    freeze_table_fragment(build_table_fragment(
+        element,
+        signature,
+        table_style,
+        &mutable_children,
+    ))
 }
 
 fn table_fragment_captions<'a>(
@@ -1188,6 +2011,7 @@ fn collect_table_fragment_rows<'a>(
     rows: &mut Vec<MutableTableFragmentRow<'a>>,
     ancestors: &[ElementSignature],
     row_groups: &[MutableTableFragmentRowGroup<'a>],
+    parent_style: &ComputedStyle,
 ) {
     let mut anonymous_cells = Vec::new();
     let mut anonymous_cell_children = Vec::new();
@@ -1201,9 +2025,19 @@ fn collect_table_fragment_rows<'a>(
             continue;
         };
         if is_table_row_box(element, style) {
-            flush_anonymous_table_fragment_cell(&mut anonymous_cells, &mut anonymous_cell_children);
-            flush_anonymous_table_fragment_row(rows, &mut anonymous_cells, ancestors, row_groups);
-            let cells = table_fragment_row_child_cells(descendants);
+            flush_anonymous_table_fragment_cell(
+                &mut anonymous_cells,
+                &mut anonymous_cell_children,
+                &anonymous_table_fragment_row_style(parent_style),
+            );
+            flush_anonymous_table_fragment_row(
+                rows,
+                &mut anonymous_cells,
+                ancestors,
+                row_groups,
+                parent_style,
+            );
+            let cells = table_fragment_row_child_cells(descendants, style);
             rows.push(MutableTableFragmentRow {
                 element: Some(element),
                 signature: signature.clone(),
@@ -1215,7 +2049,11 @@ fn collect_table_fragment_rows<'a>(
             continue;
         }
         if is_table_cell_box(element, style) {
-            flush_anonymous_table_fragment_cell(&mut anonymous_cells, &mut anonymous_cell_children);
+            flush_anonymous_table_fragment_cell(
+                &mut anonymous_cells,
+                &mut anonymous_cell_children,
+                &anonymous_table_fragment_row_style(parent_style),
+            );
             anonymous_cells.push(MutableTableFragmentCell {
                 element: Some(element),
                 signature: signature.clone(),
@@ -1232,8 +2070,18 @@ fn collect_table_fragment_rows<'a>(
             continue;
         }
         if is_table_row_group_box(element, style) && row_groups.is_empty() {
-            flush_anonymous_table_fragment_cell(&mut anonymous_cells, &mut anonymous_cell_children);
-            flush_anonymous_table_fragment_row(rows, &mut anonymous_cells, ancestors, row_groups);
+            flush_anonymous_table_fragment_cell(
+                &mut anonymous_cells,
+                &mut anonymous_cell_children,
+                &anonymous_table_fragment_row_style(parent_style),
+            );
+            flush_anonymous_table_fragment_row(
+                rows,
+                &mut anonymous_cells,
+                ancestors,
+                row_groups,
+                parent_style,
+            );
             let mut child_ancestors = ancestors.to_vec();
             child_ancestors.push(signature.clone());
             let mut child_row_groups = row_groups.to_vec();
@@ -1242,17 +2090,34 @@ fn collect_table_fragment_rows<'a>(
                 signature: signature.clone(),
                 style: Some(Box::new(style.clone())),
             });
-            collect_table_fragment_rows(descendants, rows, &child_ancestors, &child_row_groups);
+            collect_table_fragment_rows(
+                descendants,
+                rows,
+                &child_ancestors,
+                &child_row_groups,
+                style,
+            );
             continue;
         }
         anonymous_cell_children.push(child.clone());
     }
-    flush_anonymous_table_fragment_cell(&mut anonymous_cells, &mut anonymous_cell_children);
-    flush_anonymous_table_fragment_row(rows, &mut anonymous_cells, ancestors, row_groups);
+    flush_anonymous_table_fragment_cell(
+        &mut anonymous_cells,
+        &mut anonymous_cell_children,
+        &anonymous_table_fragment_row_style(parent_style),
+    );
+    flush_anonymous_table_fragment_row(
+        rows,
+        &mut anonymous_cells,
+        ancestors,
+        row_groups,
+        parent_style,
+    );
 }
 
 fn table_fragment_row_child_cells<'a>(
     children: &[MutableFormattingBox<'a>],
+    row_style: &ComputedStyle,
 ) -> Vec<MutableTableFragmentCell<'a>> {
     let mut cells = Vec::new();
     let mut anonymous_cell_children = Vec::new();
@@ -1266,7 +2131,11 @@ fn table_fragment_row_child_cells<'a>(
             continue;
         };
         if is_table_cell_box(element, style) {
-            flush_anonymous_table_fragment_cell(&mut cells, &mut anonymous_cell_children);
+            flush_anonymous_table_fragment_cell(
+                &mut cells,
+                &mut anonymous_cell_children,
+                row_style,
+            );
             cells.push(MutableTableFragmentCell {
                 element: Some(element),
                 signature: signature.clone(),
@@ -1283,7 +2152,7 @@ fn table_fragment_row_child_cells<'a>(
         // <https://drafts.csswg.org/css-tables-3/#fixup>.
         anonymous_cell_children.push(child.clone());
     }
-    flush_anonymous_table_fragment_cell(&mut cells, &mut anonymous_cell_children);
+    flush_anonymous_table_fragment_cell(&mut cells, &mut anonymous_cell_children, row_style);
     cells
 }
 
@@ -1343,11 +2212,13 @@ fn table_fragment_box_is_internal_or_caption(box_: &MutableFormattingBox<'_>) ->
 fn flush_anonymous_table_fragment_cell<'a>(
     cells: &mut Vec<MutableTableFragmentCell<'a>>,
     children: &mut Vec<MutableFormattingBox<'a>>,
+    parent_style: &ComputedStyle,
 ) {
     if children.is_empty() {
         return;
     }
-    let (style, children) = anonymous_table_fragment_cell_style_and_children(children);
+    let (style, children) =
+        anonymous_table_fragment_cell_style_and_children(children, parent_style);
     cells.push(MutableTableFragmentCell {
         element: None,
         signature: ElementSignature::new("td", HashMap::new()),
@@ -1359,44 +2230,29 @@ fn flush_anonymous_table_fragment_cell<'a>(
 
 fn anonymous_table_fragment_cell_style_and_children<'a>(
     children: &mut Vec<MutableFormattingBox<'a>>,
+    parent_style: &ComputedStyle,
 ) -> (ComputedStyle, Vec<MutableFormattingBox<'a>>) {
-    let parent_style = anonymous_table_fragment_cell_parent_style(children);
     // The generated cell is a block container. Normalize its children only
     // after synthesizing that cell, so CSS Tables fixup sees the correct
     // parent and CSS 2.2 can split in-flow blocks out of inline descendants.
     // <https://drafts.csswg.org/css-tables/#fixup-algorithm>
     // <https://www.w3.org/TR/CSS22/visuren.html#anonymous-block-level>
-    let normalized = normalize_block_container_children(std::mem::take(children), &parent_style);
-    (parent_style, normalized)
-}
-
-/// Build the effective parent style used while normalizing anonymous cell content.
-///
-/// CSS Tables generates missing child wrappers before missing parents. When a
-/// table-internal box is wrapped in an anonymous table-cell, the later missing
-/// parent stage must see a table-cell parent, not the original row or row-group:
-/// <https://drafts.csswg.org/css-tables/#fixup-algorithm>.
-fn anonymous_table_fragment_cell_parent_style(
-    children: &[MutableFormattingBox<'_>],
-) -> ComputedStyle {
-    let inherited_parent_style = children
-        .first()
-        .map(table_fragment_child_style)
-        .unwrap_or_else(|| css::default_style_for_tag("td"));
-    // CSS Tables' generated cell inherits through the table structure, not
-    // by cloning a preceding improper child as its principal box. Retain the
-    // inherited typographic values available from that child, but reset all
-    // non-inherited decoration before the anonymous cell later wraps a
-    // trailing inline run.
-    // <https://drafts.csswg.org/css-tables/#fixup-algorithm>
-    // <https://www.w3.org/TR/CSS22/visuren.html#anonymous>
-    let mut style = css::anonymous_block_style(&inherited_parent_style);
+    let mut style = css::anonymous_block_style(parent_style);
     style.display = Display::TABLE_CELL;
-    style
+    let normalized = normalize_block_container_children(std::mem::take(children), &style);
+    (style, normalized)
 }
 
-fn table_fragment_child_style(child: &MutableFormattingBox<'_>) -> ComputedStyle {
-    child.style().clone()
+/// Construct the anonymous row generated around improper table-root or
+/// row-group children. The generated row inherits from its actual table
+/// parent; it does not inherit non-inherited layout or paint properties from
+/// the first child it encloses.
+///
+/// <https://drafts.csswg.org/css-tables-3/#fixup-algorithm>
+fn anonymous_table_fragment_row_style(parent_style: &ComputedStyle) -> ComputedStyle {
+    let mut style = css::anonymous_block_style(parent_style);
+    style.display = Display::TABLE_ROW;
+    style
 }
 
 fn flush_anonymous_table_fragment_row<'a>(
@@ -1404,19 +2260,14 @@ fn flush_anonymous_table_fragment_row<'a>(
     cells: &mut Vec<MutableTableFragmentCell<'a>>,
     ancestors: &[ElementSignature],
     row_groups: &[MutableTableFragmentRowGroup<'a>],
+    parent_style: &ComputedStyle,
 ) {
     if cells.is_empty() {
         return;
     }
-    let mut style = css::anonymous_block_style(
-        cells[0]
-            .style
-            .as_deref()
-            .expect("anonymous table cells carry their inherited style"),
-    );
-    style.display = Display::TABLE_ROW;
+    let style = anonymous_table_fragment_row_style(parent_style);
     rows.push(MutableTableFragmentRow {
-        element: cells[0].element,
+        element: None,
         signature: ElementSignature::new("tr", HashMap::new()),
         ancestors: ancestors.to_vec(),
         row_groups: row_groups.to_vec(),

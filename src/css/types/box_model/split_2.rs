@@ -593,7 +593,10 @@ impl HyphenateCharacter {
                 Some(language) if language_has_primary_subtag(language, "ug") => "\u{0640}",
                 // Canadian Aboriginal Syllabics uses U+1400 HYPHEN.
                 Some(language) if language_has_primary_subtag(language, "cr") => "\u{1400}",
-                _ => "-",
+                // U+2010 is CSS Text's conventional conditional-hyphen
+                // presentation for writing systems without a more specific
+                // language convention.
+                _ => "\u{2010}",
             },
             Self::String(value) => value,
         }
@@ -669,9 +672,10 @@ mod tests {
             automatic.used_text_for_language(Some("CR-Latn")),
             "\u{1400}"
         );
-        assert_eq!(automatic.used_text_for_language(Some("ugx")), "-");
-        assert_eq!(automatic.used_text_for_language(Some("crx")), "-");
-        assert_eq!(automatic.used_text_for_language(None), "-");
+        assert_eq!(automatic.used_text_for_language(Some("ugx")), "\u{2010}");
+        assert_eq!(automatic.used_text_for_language(Some("crx")), "\u{2010}");
+        assert_eq!(automatic.used_text_for_language(Some("en")), "\u{2010}");
+        assert_eq!(automatic.used_text_for_language(None), "\u{2010}");
     }
 
     #[test]

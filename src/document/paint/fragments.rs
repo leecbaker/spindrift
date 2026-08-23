@@ -1,5 +1,3 @@
-use crate::{css, document::Page};
-
 use super::annotations::RenderedLink;
 use super::contours::{OverflowClipEffect, ResolvedBoxContentClip};
 use super::display_list::{PaintBand, PaintBandList, PaintDisplayItem, PaintDisplayList};
@@ -7,6 +5,8 @@ use super::effects::{PaintEffectScope, PaintEffects};
 use super::geometry::{AxisSelectivePaintClip, PaintBounds, PaintClip, PaintTranslation};
 use super::page::PaintPrimitive;
 use super::stacking::PaintStackingContext;
+use crate::css;
+use crate::document::Page;
 
 pub(crate) struct RecordedPaintFragment {
     pub(in crate::document) display_list: PaintDisplayList,
@@ -432,9 +432,30 @@ impl PaintFragment {
     /// Scope paint-contained contents while preserving the edge coverage of a
     /// primitive that is already wholly inside the containment rectangle.
     pub(crate) fn with_paint_containment_contents_effect_scoped_to_rect(
-        self,
+        mut self,
+        page: &Page,
         clip: PaintClip,
     ) -> Self {
+        // Remove retained operations that only touch the closed containment
+        // edge. They have no drawable interior in the clip; leaving one in a
+        // PDF `W n` scope changes the raster coverage of an earlier fill that
+        // shares that edge.
+        for band in PaintBand::ORDER {
+            let items = std::mem::take(&mut self.display_list.bands.bands[band.index()]);
+            self.display_list.bands.bands[band.index()] = items
+                .into_iter()
+                // Operations need their owning page to expose bounds. This
+                // containment boundary is already a retained replay point,
+                // so materializing here preserves all paint semantics while
+                // making the closed-edge decision inspectable.
+                .filter_map(|item| item.into_primitive_node(page))
+                .filter(|item| {
+                    item.recorded_paint_bounds(page).map_or(true, |bounds| {
+                        bounds.is_none_or(|bounds| bounds.intersects_with_positive_area(clip))
+                    })
+                })
+                .collect();
+        }
         self.with_contents_effect_scoped_to_clip(clip, true, None, None, false)
     }
 
@@ -1024,6 +1045,34 @@ mod tests {
         assert!(fragment.display_list.bands.bands[PaintBand::Outline.index()].is_empty());
         assert_eq!(
             fragment
+                .flattened_primitives()
+                .iter()
+                .map(rect_x)
+                .collect::<Vec<_>>(),
+            vec![1.0, 2.0, 3.0]
+        );
+    }
+
+    #[test]
+    fn owner_inline_marker_precedes_owner_inline_and_auto_zero_child_context() {
+        let mut positioned_bands = PaintBandList::default();
+        positioned_bands.extend_band(
+            PaintBand::InFlowBlock,
+            [PaintDisplayItem::Primitive(test_rect(3.0))],
+        );
+        let positioned_child = PaintStackingContext::with_bands(StackLevel::Auto, positioned_bands);
+
+        let mut owner = PaintFragment::from_primitives(Vec::new(), Vec::new());
+        // The deferred marker is the list item's generated first child.
+        owner.append_primitives_in_band(PaintBand::Inline, [test_rect(1.0)]);
+        owner.append_primitives_in_band(PaintBand::Inline, [test_rect(2.0)]);
+        owner
+            .display_list
+            .bands
+            .push_context_in_band(PaintBand::AutoZeroZ, positioned_child);
+
+        assert_eq!(
+            owner
                 .flattened_primitives()
                 .iter()
                 .map(rect_x)

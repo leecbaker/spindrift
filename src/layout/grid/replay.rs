@@ -1,7 +1,8 @@
-use super::*;
-use crate::layout::assets::{DocumentPageIndex, PositionedPaginationState};
-use crate::units::Definite;
 use std::collections::{HashMap, HashSet};
+
+use super::*;
+use crate::layout::builder::DetachedLayoutReplayTransaction;
+use crate::units::Definite;
 
 /// Replay context for one split grid item fragment.
 ///
@@ -33,132 +34,8 @@ pub(super) struct SplitGridItemSourceReplay {
     effects: DeferredLayoutSideEffects,
 }
 
-/// Moves the document-sized pagination and paint trees out of a builder before
-/// isolated grid-source replay.
-///
-/// A normal [`LayoutSnapshot`] intentionally clones rollback state. That is
-/// appropriate for small speculative probes, but a split grid item may be
-/// replayed in a document with thousands of already-materialized pages. This
-/// transaction first moves those page and layer trees aside, then snapshots
-/// only the local scratch context. It restores the moved artifacts verbatim.
-struct SplitGridItemSourceReplayTransaction {
-    pagination: PositionedPaginationState,
-    rollback: LayoutSnapshot,
-    pending_outside_marker_anchors: SuspendedOutsideMarkerAnchors,
-    positioned_layers: Vec<PositionedPaintLayer>,
-    fixed_layers: Vec<FixedPaintLayer>,
-    committed_positioned_paint_identities: HashSet<(DocumentPageIndex, PositionedPaintCommitKey)>,
-    deferred_multicol_positioned_children: Vec<DeferredMulticolPositionedChild>,
-    multicol_positioned_containing_block_spans: Vec<MulticolPositionedContainingBlockSpan>,
-    next_multicol_positioned_containing_block_span_id: u64,
-    multicol_positioned_replay_capture_depth: usize,
-    page_value_scope_depth: usize,
-    containing_block_depth: usize,
-    assignment_capture_depth: usize,
-}
-
 const fn offpage_source_offset() -> f32 {
     10_000.0
-}
-
-impl SplitGridItemSourceReplayTransaction {
-    fn begin(layout: &mut LayoutBuilder<'_>) -> Self {
-        let page_value_scope_depth = layout.page_value_scope_stack.len();
-        let containing_block_depth = layout.containing_blocks.len();
-        let assignment_capture_depth = layout.assignment_capture_stack.len();
-        let pagination = layout.take_positioned_pagination_state();
-        let positioned_layers = std::mem::take(&mut layout.positioned_layers);
-        let fixed_layers = std::mem::take(&mut layout.fixed_layers);
-        let committed_positioned_paint_identities =
-            std::mem::take(&mut layout.committed_positioned_paint_identities);
-        let deferred_multicol_positioned_children =
-            std::mem::take(&mut layout.deferred_multicol_positioned_children);
-        let multicol_positioned_containing_block_spans =
-            std::mem::take(&mut layout.multicol_positioned_containing_block_spans);
-        let next_multicol_positioned_containing_block_span_id =
-            layout.next_multicol_positioned_containing_block_span_id;
-        let multicol_positioned_replay_capture_depth =
-            layout.multicol_positioned_replay_capture_depth;
-        debug_assert!(layout.pages.is_empty());
-        debug_assert!(layout.positioned_layers.is_empty());
-        debug_assert!(layout.fixed_layers.is_empty());
-        debug_assert!(layout.deferred_multicol_positioned_children.is_empty());
-        // The continuous source replay is a scratch coordinate space. It can
-        // generate descendant lines, but none is an ancestor list item's
-        // accepted principal line.
-        let pending_outside_marker_anchors = layout.pending_outside_marker_anchors.suspend();
-        let rollback = layout.snapshot();
-        Self {
-            pagination,
-            rollback,
-            pending_outside_marker_anchors,
-            positioned_layers,
-            fixed_layers,
-            committed_positioned_paint_identities,
-            deferred_multicol_positioned_children,
-            multicol_positioned_containing_block_spans,
-            next_multicol_positioned_containing_block_span_id,
-            multicol_positioned_replay_capture_depth,
-            page_value_scope_depth,
-            containing_block_depth,
-            assignment_capture_depth,
-        }
-    }
-
-    fn restore(self, layout: &mut LayoutBuilder<'_>) {
-        layout.restore(self.rollback);
-        layout
-            .pending_outside_marker_anchors
-            .restore(self.pending_outside_marker_anchors);
-        debug_assert!(layout.positioned_layers.is_empty());
-        debug_assert!(layout.fixed_layers.is_empty());
-        debug_assert!(layout.committed_positioned_paint_identities.is_empty());
-        debug_assert!(layout.deferred_multicol_positioned_children.is_empty());
-        // The isolated source replay may establish multicol positioned
-        // containing blocks while it lays out the item off-page. Those spans
-        // belong to the captured source paint, not to the document being
-        // restored. Drop them before reinstating the document's durable
-        // containing-block registry.
-        //
-        // A split grid item's positioned descendants are projected from the
-        // source replay on each committed destination fragment; leaking their
-        // scratch spans into the document would make a later replay resolve
-        // against a non-existent fragmentainer.
-        let discarded_source_spans =
-            std::mem::take(&mut layout.multicol_positioned_containing_block_spans);
-        debug_assert!(
-            layout
-                .active_multicol_positioned_containing_block_spans
-                .is_empty()
-        );
-        drop(discarded_source_spans);
-        layout.restore_positioned_pagination_state(self.pagination);
-        layout.positioned_layers = self.positioned_layers;
-        layout.fixed_layers = self.fixed_layers;
-        layout.committed_positioned_paint_identities = self.committed_positioned_paint_identities;
-        layout.deferred_multicol_positioned_children = self.deferred_multicol_positioned_children;
-        layout.multicol_positioned_containing_block_spans =
-            self.multicol_positioned_containing_block_spans;
-        layout.next_multicol_positioned_containing_block_span_id =
-            self.next_multicol_positioned_containing_block_span_id;
-        layout.multicol_positioned_replay_capture_depth =
-            self.multicol_positioned_replay_capture_depth;
-        debug_assert_eq!(
-            layout.page_value_scope_stack.len(),
-            self.page_value_scope_depth,
-            "isolated grid replay must restore page-value scopes"
-        );
-        debug_assert_eq!(
-            layout.containing_blocks.len(),
-            self.containing_block_depth,
-            "isolated grid replay must restore containing-block scopes"
-        );
-        debug_assert_eq!(
-            layout.assignment_capture_stack.len(),
-            self.assignment_capture_depth,
-            "isolated grid replay must restore assignment-capture scopes"
-        );
-    }
 }
 
 impl<'a> LayoutBuilder<'a> {
@@ -301,8 +178,10 @@ impl<'a> LayoutBuilder<'a> {
         materialized_style: Option<&ComputedStyle>,
         baseline_resolution: Option<&GridBaselineResolution>,
     ) {
-        let item_width = item.width().max(0.0);
+        #[cfg(feature = "layout-profile")]
+        let _profile = crate::layout::layout_profile::grid_item_replay_scope();
         let item_height = item.height().max(0.0);
+        let replay_dimensions = item.replay_dimensions();
 
         let owned_placed_style;
         let placed_style = if let Some(style) = materialized_style {
@@ -314,8 +193,7 @@ impl<'a> LayoutBuilder<'a> {
             owned_placed_style = grid_placed_item_style(
                 fallback_style.as_ref().unwrap_or(&child.style),
                 item,
-                item_width,
-                item_height,
+                replay_dimensions,
             );
             &owned_placed_style
         };
@@ -325,22 +203,25 @@ impl<'a> LayoutBuilder<'a> {
         self.with_placed_formatting_context(
             PlacedFormattingContext {
                 content_left: inner_x + item.x(),
-                content_width: PhysicalContentWidth::new(content_box_pt(item_width)),
+                content_width: replay_dimensions.physical_content_width_for_replay(placed_style),
                 content_height: (!item.preserves_cyclic_physical_height_on_replay()).then_some(
-                    Definite::new(PhysicalContentHeight::new(content_box_pt(item_height))),
+                    Definite::new(
+                        replay_dimensions.physical_content_height_for_replay(placed_style),
+                    ),
                 ),
                 table_wrapper_border_box_block_size: auto_table_wrapper_block_size_override(
                     &child.style,
                     border_box_pt(item_height),
                 ),
-                // Anonymous grid items need the grid-assigned content box as
-                // their inline formatting context; unlike element items they
-                // have no principal-box dispatch to install that basis.
-                // <https://www.w3.org/TR/css-grid-1/#grid-items>.
-                replay_logical_inline_size: child
-                    .anonymous_content()
-                    .is_some()
-                    .then(|| LogicalInlineContentSize::new(content_box_pt(item_width))),
+                // A vertical Grid item's logical inline axis is its resolved
+                // physical height. Replay must receive that content-box
+                // measure rather than reconstructing it from the grid row.
+                // <https://www.w3.org/TR/css-grid-1/#grid-items>
+                // <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
+                replay_logical_inline_size: (!item.preserves_cyclic_physical_height_on_replay())
+                    .then(|| {
+                        replay_dimensions.logical_inline_content_size_for_replay(placed_style)
+                    }),
                 cursor_y: cursor
                     .source_block_y(GridFragmentBlockOffset::new(item.y()))
                     .points(),
@@ -445,11 +326,11 @@ impl<'a> LayoutBuilder<'a> {
 
         let fallback_style = baseline_resolution
             .and_then(|resolution| grid_baseline_content_fallback_style(&child.style, *resolution));
+        let replay_dimensions = item.replay_dimensions();
         let placed_style = grid_placed_item_style(
             fallback_style.as_ref().unwrap_or(&child.style),
             item,
-            item_width,
-            item_height,
+            replay_dimensions,
         );
         let item_border_box = visible
             .page_top_rect(cursor.grid_container_origin(inner_x))
@@ -473,8 +354,7 @@ impl<'a> LayoutBuilder<'a> {
                 child,
                 &placed_style,
                 stylesheets,
-                border_box_pt(item_width),
-                border_box_pt(item_height),
+                replay_dimensions,
             );
             *cached_source_replay = Some(source_replay);
             cached_source_replay
@@ -511,31 +391,32 @@ impl<'a> LayoutBuilder<'a> {
         child: &GridChild<'_>,
         placed_style: &ComputedStyle,
         stylesheets: &Stylesheets<'_>,
-        item_width: BorderBoxLength,
-        item_height: BorderBoxLength,
+        replay_dimensions: GridItemReplayDimensions,
     ) -> SplitGridItemSourceReplay {
-        let transaction = SplitGridItemSourceReplayTransaction::begin(self);
+        let transaction = DetachedLayoutReplayTransaction::begin(self);
         let positioned_layer_start = 0;
         let offpage_top = offpage_source_offset();
-        self.current_page = Page::new(item_width.points().max(1.0), offpage_top);
+        self.current_page = Page::new(
+            replay_dimensions.border_box_width().points().max(1.0),
+            offpage_top,
+        );
         self.overflow_clips.clear();
         self.fragment_top_offsets.clear();
 
         self.with_placed_formatting_context(
             PlacedFormattingContext {
                 content_left: 0.0,
-                content_width: PhysicalContentWidth::new(content_box_pt(item_width.points())),
-                content_height: Some(Definite::new(PhysicalContentHeight::new(content_box_pt(
-                    item_height.points(),
-                )))),
+                content_width: replay_dimensions.physical_content_width_for_replay(placed_style),
+                content_height: Some(Definite::new(
+                    replay_dimensions.physical_content_height_for_replay(placed_style),
+                )),
                 table_wrapper_border_box_block_size: auto_table_wrapper_block_size_override(
                     &child.style,
-                    item_height,
+                    replay_dimensions.border_box_height(),
                 ),
-                replay_logical_inline_size: child
-                    .anonymous_content()
-                    .is_some()
-                    .then(|| LogicalInlineContentSize::new(content_box_pt(item_width.points()))),
+                replay_logical_inline_size: Some(
+                    replay_dimensions.logical_inline_content_size_for_replay(placed_style),
+                ),
                 cursor_y: offpage_top,
                 page_start_margin_policy: PageStartMarginPolicy::Suppress,
                 float_scope: ReplayFloatScope::IsolatedFormattingContext,
@@ -760,8 +641,7 @@ fn collect_grid_source_assignments(
 fn grid_placed_item_style(
     child_style: &ComputedStyle,
     item: &GridItemLayout,
-    item_width: f32,
-    item_height: f32,
+    replay_dimensions: GridItemReplayDimensions,
 ) -> ComputedStyle {
     let mut placed_style =
         replayed_item_fragmentation_base_style(child_style, ReplayedItemFragmentationPolicy::Grid);
@@ -772,7 +652,9 @@ fn grid_placed_item_style(
         // border-box geometry and must use the same resolved edges as Taffy.
         placed_style.padding = metrics.padding.to_css_edges();
     }
-    set_style_used_width(&mut placed_style, item_width);
+    let content_width = replay_dimensions.physical_content_width_for_replay(&placed_style);
+    let content_height = replay_dimensions.physical_content_height_for_replay(&placed_style);
+    set_style_used_width(&mut placed_style, content_width.points());
     if item.preserves_cyclic_physical_height_on_replay() {
         // Grid stretch has resolved the item's physical border-box placement,
         // but an auto-sized container has not supplied a definite percentage
@@ -785,19 +667,24 @@ fn grid_placed_item_style(
             ),
         );
     } else {
-        set_style_used_height(&mut placed_style, item_height);
+        set_style_used_height(&mut placed_style, content_height.points());
     }
-    // Both used axes are already definite. Replaying them through additional
-    // content-box min/max constraints after switching to border-box sizing
-    // would subtract borders and padding a second time.
+    // The resolved Grid rectangle is converted to content-box used values at
+    // this boundary. Further replay must retain that same box-model space.
     // <https://www.w3.org/TR/css-grid-1/#grid-item-sizing>
-    placed_style.box_sizing = BoxSizing::BorderBox;
+    placed_style.box_sizing = BoxSizing::ContentBox;
     let final_percentage_axes = item.final_percentage_axes();
     if final_percentage_axes.width {
-        set_style_used_border_box_width_bounds(&mut placed_style, item_width);
+        set_style_used_content_box_width_bounds(
+            &mut placed_style,
+            content_width.content_box_length(),
+        );
     }
     if final_percentage_axes.height {
-        set_style_used_border_box_height_bounds(&mut placed_style, item_height);
+        set_style_used_content_box_height_bounds(
+            &mut placed_style,
+            content_height.content_box_length(),
+        );
     }
     // Grid has already resolved this item's fixed lengths at the used-value
     // boundary. The replay dispatcher consumes the style as a geometry
@@ -805,28 +692,6 @@ fn grid_placed_item_style(
     // effective zoom again.
     placed_style.effective_zoom = css::EffectiveZoom::NORMAL;
     placed_style
-}
-
-/// Freeze an axis resolved by Grid's final percentage-sizing phase.
-///
-/// The replay style uses `box-sizing: border-box`, so the stored bounds are
-/// border-box values. This prevents a cyclic percentage minimum/maximum from
-/// being evaluated again against the item's own temporary formatting context.
-/// <https://www.w3.org/TR/css-grid-1/#percentage-sizing>
-fn set_style_used_border_box_width_bounds(style: &mut ComputedStyle, width: f32) {
-    let width = css::ComputedLengthPercentageOrAuto::LengthPercentage(
-        css::ComputedLengthPercentage::from_points(width.max(0.0)),
-    );
-    style.box_values.min_width = width.clone();
-    style.box_values.max_width = width;
-}
-
-fn set_style_used_border_box_height_bounds(style: &mut ComputedStyle, height: f32) {
-    let height = css::ComputedLengthPercentageOrAuto::LengthPercentage(
-        css::ComputedLengthPercentage::from_points(height.max(0.0)),
-    );
-    style.box_values.min_height = height.clone();
-    style.box_values.max_height = height;
 }
 
 /// Materialize the Grid baseline fallback for a grid item's own content.

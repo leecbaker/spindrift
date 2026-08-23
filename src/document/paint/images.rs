@@ -1,10 +1,9 @@
 use std::rc::Rc;
 
-use crate::image_store::{DocumentImageStore, ImageId};
-
 use super::geometry::{PaintRect, PaintTransform, PaintTranslation};
 use super::paths::{RenderedPathClip, RenderedPathClipPath};
 use super::patterns::RenderedImageSourceRect;
+use crate::image_store::{DocumentImageStore, ImageId};
 
 /// The raster scaling behavior selected by CSS `image-rendering`.
 ///

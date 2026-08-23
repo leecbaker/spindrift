@@ -1,3 +1,6 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use super::*;
 use crate::css::cascade::{
     parse_border_shape, parse_initial_letter, parse_initial_letter_align,
@@ -20,8 +23,6 @@ use crate::css::values::{
     parse_gap_rule_width_list, parse_hanging_punctuation, parse_letter_spacing, parse_tab_size,
     parse_text_indent, parse_vertical_align, parse_word_spacing,
 };
-use std::cell::RefCell;
-use std::rc::Rc;
 
 mod at_rules;
 mod declaration_values;

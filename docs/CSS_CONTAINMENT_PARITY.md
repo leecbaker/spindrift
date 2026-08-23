@@ -1,6 +1,6 @@
 # CSS Containment parity
 
-Last updated: 2026-08-16
+Last updated: 2026-08-23
 
 Root/body containment is resolved before layout from the cascaded `html` and
 first eligible `body` styles. Any active containment (a non-`none` used
@@ -40,8 +40,18 @@ This is not a statement about CSS Container Query evaluation.
   local fragmentainer.
 - The used containment record is the layout and paint source of truth. It
   rejects non-atomic inline and excluded internal-table principal boxes while
-  retaining effects for eligible table cells; layout/paint boundaries export
-  descendant ink but not descendant scrollable overflow.
+  retaining effects for eligible table cells. Every stacking-policy path,
+  including inline splits, ruby, and table-structural paint, consumes that
+  record rather than a raw authored containment bit; layout/paint boundaries
+  export descendant ink but not descendant scrollable overflow.
+- Paint-containment clips and painted rectangles use one closed raster-edge
+  convention, including an exact final padding-edge pixel. A size-contained
+  out-of-flow principal box replays monolithically through a multicolumn
+  source fragmentainer while descendant overflow retains its own clip ancestry.
+- A style-contained subtree owns local counter mutations without terminating
+  the containing `reversed(list-item)` start scan. A contained subgrid is
+  normalized to `grid:none` before child preparation, placement, percentage
+  bases, and replay, so inherited subgrid geometry cannot reach descendants.
 - Containment on an eligible `html` or `body` principal box uses the same
   document-level propagation resolver as background and viewport overflow.
   It preserves computed inherited writing-mode and text-orientation inside

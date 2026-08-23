@@ -1,12 +1,12 @@
+use std::rc::Rc;
+
 use super::*;
 use crate::text::{
     CursiveProtectedUnitRanges, character_is_css_other_space_separator,
     character_is_css_word_separator, inter_character_gap_allowed_between_text,
-    is_css_preserved_document_space, line_end_letter_spacing_width,
-    trim_css_collapsible_whitespace, trim_end_css_collapsible_whitespace,
-    trim_start_css_collapsible_whitespace,
+    is_css_preserved_document_space, trim_css_collapsible_whitespace,
+    trim_end_css_collapsible_whitespace, trim_start_css_collapsible_whitespace,
 };
-use std::rc::Rc;
 
 mod anonymous_content;
 pub(in crate::layout) use self::anonymous_content::*;

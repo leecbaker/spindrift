@@ -213,6 +213,14 @@ impl<'a> LayoutBuilder<'a> {
                 block: logical_block_size,
             },
         );
+        // Flexbox 9.2 Part E needs the raw max-content cross contribution
+        // before an authored main-axis min/max constraint transfers through
+        // the ratio. Keep that source separate from the constrained intrinsic
+        // suggestions exported to automatic minimum sizing.
+        let ratio_intrinsic_width = physical_intrinsic.preferred_width.content_box_length();
+        let ratio_intrinsic_height = physical_intrinsic
+            .intrinsic_content_height
+            .content_box_length();
         if style.display.is_table() && style.writing_mode == WritingMode::HorizontalTb {
             let table_sizing = self.with_ancestor_signature(signature.clone(), |layout| {
                 let built_child_boxes;
@@ -226,8 +234,12 @@ impl<'a> LayoutBuilder<'a> {
                     );
                     &built_child_boxes
                 };
-                let fragment =
-                    box_tree::build_frozen_table_fragment(element, signature, table_child_boxes);
+                let fragment = box_tree::build_frozen_table_fragment(
+                    element,
+                    signature,
+                    style,
+                    table_child_boxes,
+                );
                 layout.table_wrapper_flex_sizing_from_fragment(
                     element,
                     style,
@@ -236,8 +248,12 @@ impl<'a> LayoutBuilder<'a> {
                     containing_width.points(),
                 )
             });
+            let available_table_inline = LogicalInlineContentSize::new(containing_width);
             physical_intrinsic.preferred_width = PhysicalContentWidth::new(
-                table_sizing.wrapper_preferred_inline.content_box_length(),
+                table_sizing
+                    .wrapper_preferred_inline
+                    .resolve_against(available_table_inline)
+                    .content_box_length(),
             );
             let table_automatic_minimum = used_length_percentage_or_auto_with_basis(
                 style.box_values.width.clone(),
@@ -297,6 +313,9 @@ impl<'a> LayoutBuilder<'a> {
             physical_intrinsic.preferred_min_width =
                 PhysicalContentWidth::new(content_box_pt(child_intrinsic.min_content.points()));
         }
+        let horizontal_non_content = non_content_pt(
+            style.padding.left + style.padding.right + horizontal_border_width(style),
+        );
         let mut content_width =
             if remeasuring_post_flexed_main_size && physical_direction.is_row_axis() {
                 // Flexible-length resolution has already turned this item's
@@ -310,9 +329,10 @@ impl<'a> LayoutBuilder<'a> {
                 // <https://www.w3.org/TR/css-flexbox-1/#algo-cross-item>
                 available.width.points()
             } else {
-                used_length_percentage_or_auto_with_basis(
-                    style.box_values.width.clone(),
+                used_content_box_width_or_auto_with_basis(
+                    style,
                     preferred_inline_basis,
+                    horizontal_non_content,
                 )
                 .map(|width| width.points())
                 .unwrap_or(physical_intrinsic.preferred_width.points())
@@ -382,13 +402,88 @@ impl<'a> LayoutBuilder<'a> {
         )
         .map(SemanticLengthExt::points)
         .unwrap_or(physical_intrinsic.intrinsic_content_height.points());
-        if let Some(ratio) = style.aspect_ratio.preferred_ratio_for_non_replaced(false) {
+        let aspect_ratio_sizing = ResolvedAspectRatio::for_non_replaced(
+            style,
+            horizontal_non_content,
+            vertical_non_content,
+        )
+        .map(|ratio| {
+            let width_basis = PercentageBasis::definite(containing_width);
+            let height_basis = match containing_height_basis {
+                PercentageBasis::Definite { value, .. } => PercentageBasis::definite(value),
+                PercentageBasis::Indefinite => PercentageBasis::indefinite(),
+            };
+            let width_constraints = AspectRatioAxisConstraints {
+                preferred: (!style.box_values.width.is_auto())
+                    .then_some(content_box_pt(content_width)),
+                minimum: intrinsic_width_constraint(
+                    style.box_values.min_width.clone(),
+                    style.box_sizing,
+                    width_basis,
+                    horizontal_non_content,
+                    physical_intrinsic.preferred_min_width.content_box_length(),
+                    physical_intrinsic.preferred_width.content_box_length(),
+                ),
+                maximum: intrinsic_width_constraint(
+                    style.box_values.max_width.clone(),
+                    style.box_sizing,
+                    width_basis,
+                    horizontal_non_content,
+                    physical_intrinsic.preferred_min_width.content_box_length(),
+                    physical_intrinsic.preferred_width.content_box_length(),
+                ),
+            };
+            let height_constraints = AspectRatioAxisConstraints {
+                preferred: (!style.box_values.height.is_auto())
+                    .then_some(content_box_pt(content_height)),
+                minimum: intrinsic_height_constraint(
+                    style.box_values.min_height.clone(),
+                    style.box_sizing,
+                    height_basis,
+                    vertical_non_content,
+                    physical_intrinsic.min_content_height.content_box_length(),
+                    physical_intrinsic
+                        .intrinsic_content_height
+                        .content_box_length(),
+                ),
+                maximum: intrinsic_height_constraint(
+                    style.box_values.max_height.clone(),
+                    style.box_sizing,
+                    height_basis,
+                    vertical_non_content,
+                    physical_intrinsic.min_content_height.content_box_length(),
+                    physical_intrinsic
+                        .intrinsic_content_height
+                        .content_box_length(),
+                ),
+            };
+            FlexAspectRatioSizing {
+                ratio,
+                authored_width_constraints: width_constraints,
+                authored_height_constraints: height_constraints,
+                constraints: ResolvedAspectRatioConstraints::resolve(
+                    ratio,
+                    width_constraints,
+                    height_constraints,
+                ),
+                intrinsic_width: ratio_intrinsic_width,
+                intrinsic_height: ratio_intrinsic_height,
+            }
+        });
+        if let Some(sizing) = aspect_ratio_sizing {
             match (
                 style.box_values.width.is_auto(),
                 style.box_values.height.is_auto(),
             ) {
                 (false, true) => {
-                    let transferred_height = content_width / ratio;
+                    let transferred_height = sizing
+                        .constraints
+                        .constrain_height(
+                            sizing
+                                .ratio
+                                .height_from_width(content_box_pt(content_width)),
+                        )
+                        .points();
                     if inline_measurement.line_count() == 0 && element.children.is_empty() {
                         physical_intrinsic.intrinsic_content_height =
                             PhysicalContentHeight::new(content_box_pt(transferred_height));
@@ -407,7 +502,14 @@ impl<'a> LayoutBuilder<'a> {
                     }
                 }
                 (true, false) => {
-                    let transferred_width = content_height * ratio;
+                    let transferred_width = sizing
+                        .constraints
+                        .constrain_width(
+                            sizing
+                                .ratio
+                                .width_from_height(content_box_pt(content_height)),
+                        )
+                        .points();
                     if inline_measurement.line_count() == 0 && element.children.is_empty() {
                         content_width = transferred_width;
                     } else {
@@ -467,24 +569,83 @@ impl<'a> LayoutBuilder<'a> {
                     let stretched_height = available
                         .stretched_height
                         .map(|height| (height.points() - vertical_non_content.points()).max(0.0));
-                    let stretched_width = available.stretched_width.map(|width| {
-                        let horizontal_non_content = style.padding.left
-                            + style.padding.right
-                            + horizontal_border_width(style);
-                        (width.points() - horizontal_non_content).max(0.0)
-                    });
+                    let stretched_width = available
+                        .stretched_width
+                        .map(|width| (width.points() - horizontal_non_content.points()).max(0.0));
                     if let Some(height) = stretched_height {
-                        content_height = height;
-                        content_width = height * ratio;
+                        content_height = sizing
+                            .constraints
+                            .constrain_height(content_box_pt(height))
+                            .points();
+                        content_width = sizing
+                            .constraints
+                            .constrain_width(
+                                sizing
+                                    .ratio
+                                    .width_from_height(content_box_pt(content_height)),
+                            )
+                            .points();
                     } else if let Some(width) = stretched_width {
-                        content_width = width;
-                        content_height = width / ratio;
+                        content_width = sizing
+                            .constraints
+                            .constrain_width(content_box_pt(width))
+                            .points();
+                        content_height = sizing
+                            .constraints
+                            .constrain_height(
+                                sizing
+                                    .ratio
+                                    .height_from_width(content_box_pt(content_width)),
+                            )
+                            .points();
+                    } else {
+                        // Flexbox 9.2 lays an auto/auto ratio item into its
+                        // fit-content cross size before deriving a content
+                        // flex basis. This is particularly observable for a
+                        // column item whose descendant supplies its intrinsic
+                        // inline size.
+                        // <https://www.w3.org/TR/css-flexbox-1/#algo-main-item>
+                        content_width = sizing
+                            .constraints
+                            .constrain_width(content_box_pt(content_width))
+                            .points();
+                        let transferred_height = sizing
+                            .constraints
+                            .constrain_height(
+                                sizing
+                                    .ratio
+                                    .height_from_width(content_box_pt(content_width)),
+                            )
+                            .points();
+                        content_height = if inline_measurement.line_count() == 0
+                            && element.children.is_empty()
+                        {
+                            transferred_height
+                        } else {
+                            content_height.max(transferred_height)
+                        };
                     }
-                    if stretched_height.is_some() || stretched_width.is_some() {
+                    if stretched_height.is_some()
+                        || stretched_width.is_some()
+                        || content_width > 0.0
+                    {
+                        // A transferred preferred size supplements intrinsic
+                        // contributions; it never erases a larger content
+                        // minimum.
                         physical_intrinsic.preferred_width =
-                            PhysicalContentWidth::new(content_box_pt(content_width));
+                            PhysicalContentWidth::new(content_box_pt(
+                                physical_intrinsic
+                                    .preferred_width
+                                    .points()
+                                    .max(content_width),
+                            ));
                         physical_intrinsic.preferred_min_width =
-                            PhysicalContentWidth::new(content_box_pt(content_width));
+                            PhysicalContentWidth::new(content_box_pt(
+                                physical_intrinsic
+                                    .preferred_min_width
+                                    .points()
+                                    .max(content_width),
+                            ));
                         if inline_measurement.line_count() == 0 && element.children.is_empty() {
                             physical_intrinsic.intrinsic_content_height =
                                 PhysicalContentHeight::new(content_box_pt(content_height));
@@ -515,12 +676,43 @@ impl<'a> LayoutBuilder<'a> {
                 }
                 _ => {}
             }
+
+            // Intrinsic contributions are inputs to the content flex basis
+            // and automatic minimum, not an escape hatch around transferred
+            // max constraints. Apply the shared result to each contribution
+            // independently while preserving any larger content minimum when
+            // no effective maximum caps it.
+            physical_intrinsic.preferred_width = PhysicalContentWidth::new(
+                sizing
+                    .constraints
+                    .constrain_width(physical_intrinsic.preferred_width.content_box_length()),
+            );
+            physical_intrinsic.preferred_min_width = PhysicalContentWidth::new(
+                sizing
+                    .constraints
+                    .constrain_width(physical_intrinsic.preferred_min_width.content_box_length()),
+            );
+            physical_intrinsic.intrinsic_content_height = PhysicalContentHeight::new(
+                sizing.constraints.constrain_height(
+                    physical_intrinsic
+                        .intrinsic_content_height
+                        .content_box_length(),
+                ),
+            );
+            physical_intrinsic.min_content_height = PhysicalContentHeight::new(
+                sizing
+                    .constraints
+                    .constrain_height(physical_intrinsic.min_content_height.content_box_length()),
+            );
         }
 
-        let mut width = constrain_content_width(
+        let width = constrain_width_with_intrinsic(
             style,
             content_box_pt(content_width),
+            physical_intrinsic.preferred_min_width.content_box_length(),
+            physical_intrinsic.preferred_width.content_box_length(),
             PercentageBasis::definite(containing_width),
+            horizontal_non_content,
         )
         .points();
         let height = constrain_flex_item_estimated_height(
@@ -533,53 +725,13 @@ impl<'a> LayoutBuilder<'a> {
             containing_height_basis,
             vertical_non_content,
         );
-        // An automatic non-replaced box with a preferred aspect ratio can
-        // acquire a definite block size from its min/max block constraints.
-        // That used main size then transfers into the automatic cross size.
-        // This matters while calculating an intrinsic column-flex container:
-        // its shrink-to-fit width is the item's transferred width, not the
-        // pre-constraint empty-content contribution.  Use the shared transfer
-        // helper so `box-sizing:border-box` applies the ratio to the border
-        // box while `auto <ratio>` remains content-box based.
-        // <https://drafts.csswg.org/css-sizing-4/#aspect-ratio> and
-        // <https://drafts.csswg.org/css-flexbox-1/#intrinsic-sizes>.
-        if style.box_values.width.is_auto()
-            && style.box_values.height.is_auto()
-            && !style.box_values.min_height.is_auto()
-            && let Some(ratio) = style.aspect_ratio.preferred_ratio_for_non_replaced(false)
-        {
-            let transferred_width = flex_aspect_ratio_transferred_content_main_size(
-                style,
-                height,
-                // We are deriving the physical width (the row-axis main
-                // size) from the resolved physical height.
-                FlexDirection::Row,
-                ratio,
-            )
-            .points();
-            width = constrain_content_width(
-                style,
-                content_box_pt(transferred_width),
-                PercentageBasis::definite(containing_width),
-            )
-            .points();
-            physical_intrinsic.preferred_width = PhysicalContentWidth::new(content_box_pt(
-                physical_intrinsic
-                    .preferred_width
-                    .points()
-                    .max(transferred_width),
-            ));
-            physical_intrinsic.preferred_min_width = PhysicalContentWidth::new(content_box_pt(
-                physical_intrinsic
-                    .preferred_min_width
-                    .points()
-                    .max(transferred_width),
-            ));
-        }
-        let min_width = constrain_content_width(
+        let min_width = constrain_width_with_intrinsic(
             style,
             physical_intrinsic.preferred_min_width.content_box_length(),
+            physical_intrinsic.preferred_min_width.content_box_length(),
+            physical_intrinsic.preferred_width.content_box_length(),
             PercentageBasis::definite(containing_width),
+            horizontal_non_content,
         )
         .points();
         let min_height = constrain_flex_item_estimated_height(
@@ -592,6 +744,10 @@ impl<'a> LayoutBuilder<'a> {
             containing_height_basis,
             vertical_non_content,
         );
+        let min_height = (style.display.is_table() && physical_direction.is_column_axis())
+            .then_some(physical_intrinsic.min_content_height.content_box_length())
+            .map(|table_minimum| min_height.max(table_minimum))
+            .unwrap_or(min_height);
         let fallback_line_baseline_offset =
             layout_pt(self.inline_box_text_line_layout_baseline_offset(style));
         let first_line_baseline_offset = first_sequence_line_baseline_offset(
@@ -622,7 +778,7 @@ impl<'a> LayoutBuilder<'a> {
             + inline_measurement
                 .sequence
                 .last_line_baseline_offset(fallback_line_baseline_offset.points());
-        FlexItemEstimate::new(
+        let mut estimate = FlexItemEstimate::new(
             IntrinsicItemMetrics {
                 width: content_box_pt(width),
                 height,
@@ -679,7 +835,11 @@ impl<'a> LayoutBuilder<'a> {
                         .or(descendant_baselines.horizontal.last),
                 },
             },
-        )
+        );
+        if let Some(sizing) = aspect_ratio_sizing {
+            estimate.set_aspect_ratio_sizing(sizing);
+        }
+        estimate
     }
 }
 

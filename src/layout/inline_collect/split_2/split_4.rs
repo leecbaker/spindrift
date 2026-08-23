@@ -1,6 +1,7 @@
 use super::*;
-use crate::layout::block::DefinitePhysicalContentHeight;
-use crate::layout::block::child_available_space_for_formatting_context;
+use crate::layout::block::{
+    DefinitePhysicalContentHeight, child_available_space_for_formatting_context,
+};
 use crate::layout::builder::page_for_context;
 use crate::units::content_box_to_margin_box_length;
 
@@ -221,7 +222,7 @@ impl<'a> LayoutBuilder<'a> {
             size: PageSize::from_points(content_width + horizontal_extras, top),
             margins: PageMargins::all_points(0.0),
             edges: PageBoxEdges::ZERO,
-            rotation: snapshot.current_page_context.rotation,
+            rotation: snapshot.current_page_context().rotation,
         };
         self.current_page = page_for_context(atom_page_context);
         self.overflow_clips.clear();
@@ -793,6 +794,7 @@ impl<'a> LayoutBuilder<'a> {
                     Some(child_children),
                     None,
                     stylesheets,
+                    FloatPlacementAxes::for_style(containing_style),
                     &mut float_run,
                 )
             {

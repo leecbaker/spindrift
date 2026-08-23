@@ -1,0 +1,26 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>
+  @font-face {
+    font-family: sole-regular;
+    src: url(Ahem.ttf);
+  }
+  @font-face {
+    font-family: paired-face;
+    src: url(../../../../../../weasyprint-samples/report/FiraSans-Regular.ttf);
+    font-style: normal;
+  }
+  @font-face {
+    font-family: paired-face;
+    src: url(../../../../../../weasyprint-samples/report/FiraSans-Italic.ttf);
+    font-style: italic;
+  }
+  @page { size: 500px 200px; margin: 0 }
+  body { margin: 0; font-size: 12px }
+  .synth { font-family: sole-regular; font-style: italic }
+  .none { font-family: sole-regular; font-style: italic; font-synthesis: none }
+  .authored { font-family: paired-face; font-style: italic }
+</style>
+<p class="synth">synthesized</p>
+<p class="none">not</p>
+<p class="authored">authored italic</p>

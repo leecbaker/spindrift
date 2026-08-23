@@ -5,6 +5,15 @@
 //! the normalized tree in SVG units; conversion to Quire paint points happens
 //! only when a replaced SVG is painted.
 
+use std::collections::HashMap;
+use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+
+use cssparser::{
+    AtRuleParser, CowRcStr, Parser, ParserInput, ParserState, QualifiedRuleParser,
+    StyleSheetParser, Token,
+};
+
 use crate::css::{self, CssColor};
 use crate::document::PaintStrokeWidth;
 use crate::document::paint::effects::PaintBlendMode;
@@ -21,13 +30,6 @@ use crate::document::paint::patterns::RenderedImageSourceRect;
 use crate::dom::{Element, ElementId, NodeKind};
 use crate::resource::ExternalSvgUseResolver;
 use crate::units::{LayoutLength, LayoutSize, SemanticLengthExt, layout_pt};
-use cssparser::{
-    AtRuleParser, CowRcStr, Parser, ParserInput, ParserState, QualifiedRuleParser,
-    StyleSheetParser, Token,
-};
-use std::collections::HashMap;
-use std::rc::Rc;
-use std::sync::{Arc, Mutex};
 
 const SVG_NAMESPACE: &str = "http://www.w3.org/2000/svg";
 const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
@@ -424,11 +426,23 @@ pub(crate) type SvgPresentationOverrides = HashMap<ElementId, SvgPresentationOve
 pub(crate) struct SvgAsset {
     tree: usvg::Tree,
     filter_taint: SvgFilterTaintCatalog,
+    viewport_background: Option<SvgViewportBackground>,
     intrinsic_size: LayoutSize,
     intrinsic_dimensions: SvgIntrinsicDimensions,
     has_degenerate_view_box: bool,
     view_fragments: HashMap<String, SvgIntrinsicDimensions>,
     source: Rc<[u8]>,
+}
+
+/// Root-SVG background paint retained outside the SVG user-coordinate scene.
+///
+/// SVG backgrounds cover the root viewport. For an external SVG used as a CSS
+/// image, that viewport is the concrete object rectangle, while descendants
+/// remain mapped through the root `viewBox`.
+/// <https://www.w3.org/TR/SVG2/struct.html#SVGElement>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct SvgViewportBackground {
+    pub(crate) color: CssColor,
 }
 
 /// The intrinsic dimensions and preferred aspect ratio exposed by an SVG
@@ -449,6 +463,11 @@ pub(crate) struct SvgIntrinsicDimensions {
 }
 
 impl SvgAsset {
+    /// Return the explicit root background that must paint in viewport space.
+    pub(crate) fn viewport_background(&self) -> Option<SvgViewportBackground> {
+        self.viewport_background
+    }
+
     pub(crate) fn intrinsic_size(&self) -> LayoutSize {
         self.intrinsic_size
     }
@@ -2402,6 +2421,8 @@ fn parse_svg_bytes_with_optional_image_context_and_filter_taint(
     let normalized_source = image_context
         .and_then(|context| normalize_svg_image_stylesheet(bytes, context))
         .unwrap_or_else(|| bytes.to_vec());
+    let (normalized_source, viewport_background) =
+        extract_svg_viewport_background(&normalized_source);
     let tree = parse_svg_tree(
         &normalized_source,
         usvg::Size::from_wh(300.0, 150.0).expect("default SVG viewport is valid"),
@@ -2418,6 +2439,7 @@ fn parse_svg_bytes_with_optional_image_context_and_filter_taint(
     Ok(SvgAsset {
         tree,
         filter_taint,
+        viewport_background,
         intrinsic_size: LayoutSize::new(
             size.width() * css::CSS_PX_TO_PT,
             size.height() * css::CSS_PX_TO_PT,
@@ -2427,6 +2449,99 @@ fn parse_svg_bytes_with_optional_image_context_and_filter_taint(
         view_fragments,
         source: Rc::from(normalized_source),
     })
+}
+
+/// Move an explicit root `background-color` out of the source handed to
+/// `usvg` so its viewport path is not transformed through the root `viewBox`.
+///
+/// SVG's root presentation attribute and inline style both establish a root
+/// viewport background. We retain only colors that Quire can resolve without
+/// a scene-local cascade (for example, not `currentColor`), leaving all other
+/// declarations untouched for `usvg`'s existing handling.
+/// <https://www.w3.org/TR/SVG2/styling.html#PresentationAttributes>
+fn extract_svg_viewport_background(bytes: &[u8]) -> (Vec<u8>, Option<SvgViewportBackground>) {
+    let Ok(source) = std::str::from_utf8(bytes) else {
+        return (bytes.to_vec(), None);
+    };
+    let Ok(document) = usvg::roxmltree::Document::parse(source) else {
+        return (bytes.to_vec(), None);
+    };
+    let root = document.root_element();
+    if root.tag_name().name() != "svg" {
+        return (bytes.to_vec(), None);
+    }
+
+    let mut replacements = Vec::new();
+    let background = if let Some(style) = root.attribute("style") {
+        let declarations = css::parse_declarations(style);
+        if let Some(value) = declarations.get("background-color") {
+            let Some(color) = css::parse_color(value) else {
+                return (bytes.to_vec(), None);
+            };
+            let retained_style = declarations
+                .iter()
+                .filter(|(name, _)| name != "background-color")
+                .map(|(name, value)| format!("{name}: {value};"))
+                .collect::<String>();
+            let attribute = root
+                .attributes()
+                .find(|attribute| attribute.name() == "style")
+                .expect("root style attribute exists");
+            replacements.push((
+                attribute.range(),
+                if retained_style.is_empty() {
+                    String::new()
+                } else {
+                    svg_attribute("style", &retained_style)
+                },
+            ));
+            if let Some(attribute) = root
+                .attributes()
+                .find(|attribute| attribute.name() == "background-color")
+            {
+                replacements.push((attribute.range(), String::new()));
+            }
+            Some(SvgViewportBackground { color })
+        } else {
+            root.attribute("background-color")
+                .and_then(css::parse_color)
+                .map(|color| {
+                    let attribute = root
+                        .attributes()
+                        .find(|attribute| attribute.name() == "background-color")
+                        .expect("root background-color attribute exists");
+                    replacements.push((attribute.range(), String::new()));
+                    SvgViewportBackground { color }
+                })
+        }
+    } else {
+        root.attribute("background-color")
+            .and_then(css::parse_color)
+            .map(|color| {
+                let attribute = root
+                    .attributes()
+                    .find(|attribute| attribute.name() == "background-color")
+                    .expect("root background-color attribute exists");
+                replacements.push((attribute.range(), String::new()));
+                SvgViewportBackground { color }
+            })
+    };
+
+    let Some(background) = background else {
+        return (bytes.to_vec(), None);
+    };
+    let mut rewritten = source.to_owned();
+    replacements.sort_by_key(|(range, _)| range.start);
+    for (range, replacement) in replacements.into_iter().rev() {
+        rewritten.replace_range(range, &replacement);
+    }
+    (rewritten.into_bytes(), Some(background))
+}
+
+fn svg_attribute(name: &str, value: &str) -> String {
+    let mut output = String::new();
+    push_attribute(&mut output, name, value);
+    output.trim_start().to_string()
 }
 
 /// Normalize the small CSS boundary between an image SVG and `usvg`.
@@ -3563,6 +3678,8 @@ mod tests {
             is_target: false,
             selector_snapshot: std::cell::OnceCell::new(),
             object_rendering: crate::dom::ObjectRendering::Fallback,
+            selected_image_source: None,
+            image_rendering: crate::dom::ImageRendering::Image,
         };
         let mut overrides = SvgPresentationOverrides::new();
         overrides.insert(
@@ -3599,6 +3716,8 @@ mod tests {
             is_target: false,
             selector_snapshot: std::cell::OnceCell::new(),
             object_rendering: crate::dom::ObjectRendering::Fallback,
+            selected_image_source: None,
+            image_rendering: crate::dom::ImageRendering::Image,
         };
         let mut overrides = SvgPresentationOverrides::new();
         overrides.insert(
@@ -3633,6 +3752,8 @@ mod tests {
             is_target: false,
             selector_snapshot: std::cell::OnceCell::new(),
             object_rendering: crate::dom::ObjectRendering::Fallback,
+            selected_image_source: None,
+            image_rendering: crate::dom::ImageRendering::Image,
         };
         let group = Element {
             id: ElementId::next(),
@@ -3648,6 +3769,8 @@ mod tests {
             is_target: false,
             selector_snapshot: std::cell::OnceCell::new(),
             object_rendering: crate::dom::ObjectRendering::Fallback,
+            selected_image_source: None,
+            image_rendering: crate::dom::ImageRendering::Image,
         };
         let mut overrides = SvgPresentationOverrides::new();
         overrides.insert(

@@ -794,9 +794,15 @@ async fn disclosure_counter_styles_follow_generated_content_context() {
         .flat_map(|page| page.lines())
         .map(|line| line.text.as_str())
         .collect::<String>();
-    assert!(text.contains("RTL ▾ ◂"), "{text}");
-    assert!(text.contains("▾ ▸ Vertical"), "{text}");
-    assert!(text.contains("Marker ▴"), "{text}");
+    // Line text is recorded in logical source order. UAX #9 reorders the RTL
+    // disclosure controls visually, so assert the generated counter glyphs
+    // in their respective content contexts rather than their paint order.
+    assert!(
+        text.contains("RTL") && text.contains('▾') && text.contains('◂'),
+        "{text}"
+    );
+    assert!(text.contains("Vertical") && text.contains('▸'), "{text}");
+    assert!(text.contains("Marker") && text.contains('▴'), "{text}");
 }
 
 #[tokio::test]
@@ -1689,6 +1695,64 @@ async fn inside_list_markers_participate_in_first_line() {
     assert!((lines[0].y() - lines[1].y()).abs() < 0.01);
     assert!(lines[0].x() < lines[1].x());
     assert!(!lines[2].text.starts_with("1."));
+}
+
+#[tokio::test]
+async fn generated_inside_list_item_markers_contribute_to_float_widths() {
+    let document = Html::from_string(
+        r#"<style>
+            @page { size: 180pt 120pt; margin: 10pt }
+            body, ol, li { margin: 0; padding: 0; font-size: 12pt; line-height: 16pt }
+            ol { float: left; width: 42pt; list-style-position: inside }
+            li { display: block }
+            li::before, li::after { content: "\200B"; display: list-item; float: left }
+            span { display: inline-block; width: 12pt; height: 16pt }
+            .before li::after, .after li::before { content: normal }
+        </style>
+        <ol class="before"><li><span></span></li><li><span></span></li></ol>
+        <ol class="after"><li><span></span></li><li><span></span></li></ol>"#,
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let markers = document.pages[0]
+        .lines()
+        .iter()
+        .filter(|line| matches!(line.text.trim(), "1." | "2."))
+        .collect::<Vec<_>>();
+    assert_eq!(markers.len(), 4, "{:#?}", document.pages[0].lines());
+    assert!(markers.iter().any(|line| line.text.trim() == "1."));
+    assert!(markers.iter().any(|line| line.text.trim() == "2."));
+}
+
+#[tokio::test]
+async fn outside_marker_uses_empty_styled_inline_strut_baseline() {
+    let document = Html::from_string(
+        r#"<style>
+            @page { size: 140pt 100pt; margin: 10pt }
+            body, ol, li { margin: 0; font-size: 16pt; line-height: 30pt }
+            ol { padding-left: 32pt }
+            li { list-style-type: lower-alpha }
+            li.reference { font: italic bold 24pt/30pt sans-serif }
+            li::marker, span { font: italic bold 24pt/30pt sans-serif }
+        </style>
+        <ol><li><span></span></li><li class="reference"></li></ol>"#,
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let markers = document.pages[0]
+        .lines()
+        .iter()
+        .filter(|line| matches!(line.text.trim(), "a." | "b."))
+        .collect::<Vec<_>>();
+    assert_eq!(markers.len(), 2, "{:#?}", document.pages[0].lines());
+    assert!(
+        (30.0..33.0).contains(&(markers[0].y() - markers[1].y())),
+        "empty styled inline did not establish its line strut: {markers:?}"
+    );
 }
 
 #[tokio::test]
@@ -3415,6 +3479,84 @@ async fn text_justify_ignores_pre_wrap_trailing_space_rtl() {
     assert_eq!(groups[1][0].text, "XXX");
 }
 
+/// CSS Text keeps a soft-wrapped `pre-wrap` space in the paint stream but
+/// excludes its advance when positioning the remaining line content. This
+/// must survive the final visual-width reconciliation performed after bidi
+/// reordering and shaping.
+/// <https://www.w3.org/TR/css-text-3/#white-space-phase-2>
+#[tokio::test]
+async fn pre_wrap_hanging_spaces_do_not_affect_final_text_alignment() {
+    let ahem = format!(
+        "file://{}/tests/fixtures/wpt/css/css-fonts/Ahem.ttf",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let cases = [
+        ("ltr", "normal", "center"),
+        ("ltr", "normal", "right"),
+        ("rtl", "normal", "left"),
+        ("rtl", "normal", "right"),
+        ("rtl", "normal", "start"),
+        ("rtl", "normal", "end"),
+        ("rtl", "normal", "center"),
+        ("rtl", "bidi-override", "left"),
+        ("rtl", "bidi-override", "right"),
+        ("rtl", "bidi-override", "start"),
+        ("rtl", "bidi-override", "end"),
+        ("rtl", "bidi-override", "center"),
+    ];
+
+    for (direction, unicode_bidi, text_align) in cases {
+        let stylesheet = format!(
+            "<style>@page {{ size: 400px 160px; margin: 0 }}\
+             @font-face {{ font-family: Ahem; src: url({ahem}) }}\
+             body {{ margin: 0 }}\
+             .test {{ margin: 0; width: 15ch; font: 20px/20px Ahem;\
+                      direction: {direction}; unicode-bidi: {unicode_bidi};\
+                      text-align: {text_align} }}</style>"
+        );
+        let target = Html::from_string(format!(
+            "{stylesheet}<div class=\"test\" style=\"white-space:pre-wrap\">one two three four five\nsix seven eight nine</div>"
+        ))
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+        let reference = Html::from_string(format!(
+            "{stylesheet}<div class=\"test\">one two three<br>four five<br>six seven eight<br>nine</div>"
+        ))
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+
+        let mut target_lines = visual_line_groups(target.pages[0].lines());
+        let mut reference_lines = visual_line_groups(reference.pages[0].lines());
+        target_lines.sort_by(|left, right| right[0].y().total_cmp(&left[0].y()));
+        reference_lines.sort_by(|left, right| right[0].y().total_cmp(&left[0].y()));
+        assert_eq!(
+            target_lines.len(),
+            4,
+            "target {direction} {unicode_bidi} {text_align}"
+        );
+        assert_eq!(
+            reference_lines.len(),
+            4,
+            "reference {direction} {unicode_bidi} {text_align}"
+        );
+
+        for line_index in [0, 2] {
+            let target_bounds = rendered_non_whitespace_group_bounds(&target_lines[line_index]);
+            let reference_bounds =
+                rendered_non_whitespace_group_bounds(&reference_lines[line_index]);
+            assert!(
+                (target_bounds.0 - reference_bounds.0).abs() < 0.5
+                    && (target_bounds.1 - reference_bounds.1).abs() < 0.5,
+                "line {line_index} must ignore its hanging space for {direction} \
+                 {unicode_bidi} {text_align}: target={target_bounds:?}, \
+                 reference={reference_bounds:?}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn wpt_text_justify_hangs_pre_wrap_trailing_space_inside_split_fragment() {
     let ahem = "/Users/lee/oss/quire-wpt/third_party/wpt/fonts/Ahem.ttf";
@@ -4094,30 +4236,165 @@ async fn nonzero_letter_spacing_disables_common_ligature_shaping() {
 
 #[tokio::test]
 async fn letter_spacing_crosses_text_empty_inline_boundaries() {
-    let ahem = "/Users/lee/oss/quire-wpt/third_party/wpt/fonts/Ahem.ttf";
-    if !std::path::Path::new(ahem).exists() {
-        return;
-    }
+    let ahem = format!(
+        "{}/tests/fixtures/wpt/css/css-fonts/Ahem.ttf",
+        env!("CARGO_MANIFEST_DIR")
+    );
     let document = Html::from_string(format!(
         "<style>@page {{ size: 300pt 120pt; margin: 10pt }} body {{ margin: 0 }}\
          @font-face {{ font-family: Ahem; src: url(file://{ahem}) }}\
-         p {{ margin: 0; font: 25px/1 Ahem; letter-spacing: 25px; white-space: pre-wrap }}</style>\
-         <p><span></span>A<span></span><span></span>D<span></span></p>"
+         p {{ margin: 0; font: 25px/1 Ahem; letter-spacing: 25px; white-space: pre-wrap }}\
+         .tail {{ border-left: 1px solid orange }}</style>\
+         <p><span></span>A<span></span><span></span>D<span class=tail></span></p>"
     ))
     .render(&RenderOptions::default())
     .await
     .unwrap();
 
-    let line = document.pages[0]
+    let letter_lines = document.pages[0]
         .lines()
         .iter()
-        .find(|line| line.text == "AD")
-        .expect("expected text-empty inline content to preserve A/D text");
-    let width = rendered_line_advance(line);
+        .filter(|line| {
+            line.text
+                .chars()
+                .all(|character| matches!(character, 'A' | 'D'))
+        })
+        .collect::<Vec<_>>();
     assert!(
-        (width - 75.0).abs() < 1.0,
+        !letter_lines.is_empty(),
+        "expected text-empty inline content to preserve A/D text: {:?}",
+        document.pages[0].lines()
+    );
+    let width = rendered_fragment_group_span(&letter_lines);
+    let line_start = letter_lines
+        .iter()
+        .map(|line| line.x())
+        .fold(f32::INFINITY, f32::min);
+    assert!(
+        (width - 56.25).abs() < 1.0,
         "expected Ahem A+D plus one inter-letter tracking advance, got {width}"
     );
+    let trailing_edge = document.pages[0]
+        .rects()
+        .iter()
+        .filter(|rect| rect.fill == Some(CssColor::new(255, 165, 0)))
+        .filter(|rect| rect.width() <= 2.0 && rect.height() > 10.0)
+        .max_by(|left, right| left.x().total_cmp(&right.x()))
+        .expect("the trailing empty inline should paint its border");
+    assert!(
+        (trailing_edge.x() - (line_start + width)).abs() < 1.5,
+        "trailing empty-inline border must follow D's base advance: lines={letter_lines:?}, edge={trailing_edge:?}"
+    );
+}
+
+#[tokio::test]
+async fn letter_spacing_preserves_each_typographic_unit_base_advance() {
+    let ahem = format!(
+        "{}/tests/fixtures/wpt/css/css-fonts/Ahem.ttf",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let document = Html::from_string(format!(
+        "<style>@page {{ size: 300pt 120pt; margin: 10pt }} body {{ margin: 0 }}\
+         @font-face {{ font-family: Ahem; src: url(file://{ahem}) }}\
+         p {{ margin: 0; font: 20px/1 Ahem; letter-spacing: 20px }}\
+         .wrap {{ width: 100px; word-break: break-all }}\
+         .emph {{ text-emphasis: dot }}</style>\
+         <p>1 2</p><p class=wrap>123456789</p><p class=emph>ABC</p>"
+    ))
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let lines = document.pages[0].lines().iter().collect::<Vec<_>>();
+    let first_row = lines
+        .iter()
+        .copied()
+        .filter(|line| (line.y() - lines[0].y()).abs() < 0.1)
+        .collect::<Vec<_>>();
+    let width = rendered_fragment_group_span(&first_row);
+    assert!(
+        (width - 75.0).abs() < 1.0,
+        "three 20px Ahem units plus two 20px boundaries should span 100px: {lines:#?}"
+    );
+    let mut wrapped_rows = std::collections::BTreeMap::<i32, String>::new();
+    for line in lines.iter().filter(|line| {
+        line.y() < lines[0].y() - 0.1
+            && line
+                .text
+                .chars()
+                .all(|character| character.is_ascii_digit())
+    }) {
+        wrapped_rows
+            .entry((line.y() * 10.0).round() as i32)
+            .or_default()
+            .push_str(&line.text);
+    }
+    assert_eq!(
+        wrapped_rows.into_values().rev().collect::<Vec<_>>(),
+        ["123", "456", "789"],
+        "{lines:#?}"
+    );
+    let letters = ['A', 'B', 'C']
+        .into_iter()
+        .map(|letter| {
+            lines
+                .iter()
+                .find(|line| line.text == letter.to_string())
+                .unwrap_or_else(|| panic!("missing {letter}: {lines:#?}"))
+                .x()
+        })
+        .collect::<Vec<_>>();
+    let emphasis = lines
+        .iter()
+        .filter(|line| line.text == "•")
+        .map(|line| line.x())
+        .collect::<Vec<_>>();
+    assert_eq!(emphasis.len(), 3, "{lines:#?}");
+    for positions in [&letters, &emphasis] {
+        assert!((positions[1] - positions[0] - 30.0).abs() < 0.1);
+        assert!((positions[2] - positions[1] - 30.0).abs() < 0.1);
+    }
+}
+
+#[tokio::test]
+async fn letter_spacing_tracks_ruby_base_columns_without_shifting_annotations() {
+    let ahem = format!(
+        "{}/tests/fixtures/wpt/css/css-fonts/Ahem.ttf",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let document = Html::from_string(format!(
+        "<style>@page {{ size: 300pt 120pt; margin: 10pt }} body {{ margin: 0 }}\
+         @font-face {{ font-family: Ahem; src: url(file://{ahem}) }}\
+         p {{ margin: 0; font: 20px/1 Ahem; letter-spacing: 20px }}</style>\
+         <p><ruby>A<rt>a</rt>BB<rt>b</rt></ruby></p>"
+    ))
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let lines = document.pages[0].lines();
+    let bases = lines
+        .iter()
+        .filter(|line| matches!(line.text.as_str(), "A" | "B"))
+        .map(|line| line.x())
+        .collect::<Vec<_>>();
+    assert_eq!(bases.len(), 3, "{lines:#?}");
+    assert!(
+        (bases[1] - bases[0] - 30.0).abs() < 0.1,
+        "bases={bases:?}, lines={lines:#?}"
+    );
+    assert!(
+        (bases[2] - bases[1] - 30.0).abs() < 0.1,
+        "bases={bases:?}, lines={lines:#?}"
+    );
+
+    let annotations = lines
+        .iter()
+        .filter(|line| matches!(line.text.as_str(), "a" | "b"))
+        .map(|line| line.x())
+        .collect::<Vec<_>>();
+    assert_eq!(annotations.len(), 2, "{lines:#?}");
+    assert!((annotations[1] - annotations[0] - 45.0).abs() < 0.1);
 }
 
 fn rendered_fragment_group_span(lines: &[&crate::document::paint::text::RenderedLine]) -> f32 {
@@ -4130,6 +4407,29 @@ fn rendered_fragment_group_span(lines: &[&crate::document::paint::text::Rendered
         .map(|line| line.x() + rendered_line_advance(line))
         .fold(f32::NEG_INFINITY, f32::max);
     right - left
+}
+
+fn rendered_non_whitespace_group_bounds(
+    lines: &[&crate::document::paint::text::RenderedLine],
+) -> (f32, f32) {
+    let mut left = f32::INFINITY;
+    let mut right = f32::NEG_INFINITY;
+    for line in lines {
+        for run in &line.runs {
+            let mut pen_x = line.x() + run.x_offset;
+            for glyph in run.glyphs.as_deref().unwrap_or_default() {
+                if !glyph.unicode.chars().all(char::is_whitespace) {
+                    let start = pen_x + glyph.x_offset;
+                    let end = start + glyph.x_advance;
+                    left = left.min(start.min(end));
+                    right = right.max(start.max(end));
+                }
+                pen_x += glyph.x_advance;
+            }
+        }
+    }
+    assert!(left.is_finite() && right.is_finite());
+    (left, right)
 }
 
 fn lines_grouped_by_y(
@@ -4712,11 +5012,11 @@ async fn inline_block_text_atom_uses_sequence_for_zwsp_and_soft_hyphen() {
 
     assert!(lines.contains(&"abc"), "{lines:?}");
     assert!(lines.contains(&"def"), "{lines:?}");
-    assert!(lines.iter().any(|line| line.ends_with('-')), "{lines:?}");
+    assert!(lines.iter().any(|line| line.ends_with('‐')), "{lines:?}");
     assert_eq!(
         lines
             .iter()
-            .map(|line| line.replace('-', ""))
+            .map(|line| line.replace('‐', ""))
             .collect::<String>(),
         "abcdefhyphenation"
     );
@@ -5190,6 +5490,84 @@ async fn unicode_bidi_override_scopes_inline_visual_order() {
     .unwrap();
 
     assert_eq!(document.pages[0].lines()[0].text, "abc fed ghi");
+}
+
+/// `unicode-bidi: isolate-override` contributes an independent LTR visual
+/// sequence to its surrounding RTL line. Its final shaped advance must place
+/// the following outer text and the isolate's background from the same visual
+/// geometry, rather than from pre-bidi source slices.
+/// <https://drafts.csswg.org/css-writing-modes-4/#unicode-bidi>
+#[tokio::test]
+async fn isolate_override_uses_final_visual_group_advances_for_following_text_and_background() {
+    let style = "<style>@page { size: 320px 100px; margin: 0 }\
+                 body { margin: 0 }\
+                 p { margin: 0; width: 240px; font: 24px/30px serif }\
+                 .target span { direction: ltr; unicode-bidi: isolate-override; background: rgb(0, 255, 0) }\
+                 .reference span { background: rgb(0, 255, 0) }</style>";
+    let target = Html::from_string(format!(
+        "{style}<p class=\"target\" dir=\"rtl\">&gt; <span>&#x5d0;&#x5d1;&#x5d2;&#x5d3; &gt; abcd</span> &gt;</p>"
+    ))
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+    let reference = Html::from_string(format!(
+        "{style}<p class=\"reference\" dir=\"rtl\"><bdo dir=\"ltr\">&lt; <span>&#x5d0;&#x5d1;&#x5d2;&#x5d3; &gt; abcd</span> &lt;</bdo></p>"
+    ))
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let target_lines = visual_line_groups(target.pages[0].lines());
+    let reference_lines = visual_line_groups(reference.pages[0].lines());
+    assert_eq!(target_lines.len(), 1, "{target_lines:#?}");
+    assert_eq!(reference_lines.len(), 1, "{reference_lines:#?}");
+    let target_bounds = rendered_non_whitespace_group_bounds(&target_lines[0]);
+    let reference_bounds = rendered_non_whitespace_group_bounds(&reference_lines[0]);
+    assert!(
+        (target_bounds.0 - reference_bounds.0).abs() < 0.01
+            && (target_bounds.1 - reference_bounds.1).abs() < 0.01,
+        "target={target_bounds:?}, reference={reference_bounds:?}"
+    );
+
+    let green = CssColor::new(0, 255, 0);
+    let target_backgrounds = target.pages[0]
+        .rects()
+        .iter()
+        .filter(|rect| rect.fill == Some(green))
+        .collect::<Vec<_>>();
+    let reference_backgrounds = reference.pages[0]
+        .rects()
+        .iter()
+        .filter(|rect| rect.fill == Some(green))
+        .collect::<Vec<_>>();
+    assert!(
+        target_backgrounds.len() > 1,
+        "bidi fragmentation must retain source-owned background pieces: {target_backgrounds:#?}"
+    );
+    assert!(
+        !reference_backgrounds.is_empty(),
+        "the equivalent override must paint its isolate background: {reference_backgrounds:#?}"
+    );
+    let background_bounds = |rects: &[&crate::document::paint::shapes::RenderedRect]| {
+        let start = rects
+            .iter()
+            .map(|rect| rect.x())
+            .fold(f32::INFINITY, f32::min);
+        let end = rects
+            .iter()
+            .map(|rect| rect.x() + rect.width())
+            .fold(f32::NEG_INFINITY, f32::max);
+        (start, end)
+    };
+    let target_background_bounds = background_bounds(&target_backgrounds);
+    let reference_background_bounds = background_bounds(&reference_backgrounds);
+    assert!(
+        (target_background_bounds.0 - reference_background_bounds.0).abs() < 0.01
+            && (target_background_bounds.1 - reference_background_bounds.1).abs() < 0.01,
+        "target={:?}, reference={:?}",
+        target_background_bounds,
+        reference_background_bounds
+    );
 }
 
 #[tokio::test]
@@ -5903,6 +6281,25 @@ async fn pre_wrap_styled_boundary_trailing_spaces_hang_at_graph_break() {
 }
 
 #[tokio::test]
+async fn pre_wrap_terminal_space_sequence_uses_conditional_hanging_measure() {
+    let ahem = format!(
+        "file://{}/tests/fixtures/wpt/css/css-fonts/Ahem.ttf",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let document = Html::from_string(format!(
+        "<style>@page {{ size: 200px 200px; margin: 0 }} @font-face {{ font-family: Ahem; src: url({ahem}) }} body {{ margin: 0 }} div {{ font: 10px/1 Ahem }} .test {{ color: green; width: 5ch; white-space: pre-wrap }}</style><div class=\"test\">XX<span>    </span><span>X  X  </span></div>"
+    ))
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+    assert_eq!(
+        grouped_line_texts(&document.pages[0]),
+        ["XX    ", "X  X  "],
+        "the final preserved-space run must remain with the preceding X"
+    );
+}
+
+#[tokio::test]
 async fn inherits_css_text_breaking_controls() {
     let document = Html::from_string(
         "<style>@page { size: 90pt 120pt; margin: 10pt } div { word-break: break-all } p { margin: 0; width: 18pt; font-size: 10pt; line-height: 10pt }</style><div><p>mnopqrst</p></div>",
@@ -6084,14 +6481,14 @@ async fn shows_soft_hyphens_when_line_breaks_there() {
     .unwrap();
 
     assert!(document.pages[0].lines().len() > 1);
-    assert_eq!(document.pages[0].lines()[0].text, "hyphen-");
+    assert_eq!(document.pages[0].lines()[0].text, "hyphen‐");
     assert_eq!(
         document.pages[0]
             .lines()
             .iter()
             .map(|line| line.text.as_str())
             .collect::<String>(),
-        "hyphen-ation"
+        "hyphen‐ation"
     );
 }
 
@@ -6110,7 +6507,7 @@ async fn auto_phrase_relaxes_authored_soft_hyphens_to_prevent_overflow() {
             .iter()
             .map(|line| line.text.as_str())
             .collect::<Vec<_>>(),
-        ["con-", "sid-", "era-", "tion"]
+        ["con‐", "sid‐", "era‐", "tion"]
     );
 }
 
@@ -6126,7 +6523,7 @@ async fn styled_inline_soft_hyphens_follow_manual_hyphenation() {
         document.pages[0]
             .lines()
             .iter()
-            .any(|line| line.text == "hyphen-")
+            .any(|line| line.text == "hyphen‐")
     );
     assert!(
         document.pages[0]
@@ -6159,7 +6556,7 @@ async fn hyphens_auto_uses_document_language() {
     let text = document.pages[0]
         .lines()
         .iter()
-        .map(|line| line.text.replace('-', ""))
+        .map(|line| line.text.replace('‐', ""))
         .collect::<String>();
 
     assert!(document.pages[0].lines().len() > 1);
@@ -6167,7 +6564,7 @@ async fn hyphens_auto_uses_document_language() {
         document.pages[0]
             .lines()
             .iter()
-            .any(|line| line.text.ends_with('-'))
+            .any(|line| line.text.ends_with('‐'))
     );
     assert_eq!(text, "ribonuclease");
 }

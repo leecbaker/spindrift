@@ -43,6 +43,43 @@ pub(in crate::layout) fn positioned_vertical_size_requires_content_measurement(
         || needs_intrinsic_height_contribution(style.box_values.height.value().clone())
 }
 
+/// Resolve the ordinary-flow static-position alignment before measuring an
+/// automatic positioned inline size.
+///
+/// A Grid ancestor can replace the actual containing block of a nested
+/// positioned descendant without owning its static-position rectangle.  CSS
+/// Align derives the available automatic size from the static rectangle's
+/// selected edge to the opposite edge of that actual containing block.  The
+/// rectangle must therefore remain in its intervening formatting context's
+/// axes and direction while Grid contributes only the latter box:
+/// <https://drafts.csswg.org/css-align-3/#abspos-static-size> and
+/// <https://www.w3.org/TR/css-grid-1/#abspos>.
+fn ordinary_static_alignment_for_auto_sizing(
+    position: Option<AbsoluteStaticPosition>,
+    style: &ComputedStyle,
+) -> Option<AbsposStaticAlignment> {
+    let rectangle = position.and_then(AbsoluteStaticPosition::static_position_rectangle)?;
+    let inline = if style.justify_self.keyword == SelfAlignmentKeyword::Auto {
+        rectangle.justify_items
+    } else {
+        style.justify_self
+    };
+    let block = if style.align_self.keyword == SelfAlignmentKeyword::Auto {
+        rectangle.align_items
+    } else {
+        style.align_self
+    };
+    Some(AbsposStaticAlignment::new(
+        rectangle.area,
+        rectangle.writing_mode,
+        rectangle.direction,
+        style.writing_mode,
+        style.used_direction(),
+        inline,
+        block,
+    ))
+}
+
 /// The entry point for the in-flow surrogate used to format an already
 /// resolved positioned box. It is intentionally separate from static-position
 /// geometry: the positioned resolver supplies a physical border-box origin,
@@ -92,6 +129,66 @@ impl PositionedFlowOrigin {
             cursor_y,
         }
     }
+}
+
+/// Whether an absolutely positioned principal needs its complete continuous
+/// margin-box span, rather than only the pages evidenced by captured output.
+///
+/// Absolute boxes fragment with their containing block, but CSS Paged Media
+/// advises user agents not to generate a long sequence of content-empty pages
+/// merely to honor a positioned box's extent. A visible principal decoration,
+/// a viewport-fixed descendant, or semantically non-empty content requires
+/// the continuous span. Captured paint and positioned layers retain their
+/// observed destination pages without turning an otherwise content-empty
+/// principal into a continuous tail.
+/// <https://drafts.csswg.org/css-break-4/#abspos-breaking>
+/// <https://www.w3.org/TR/css-page-3/#renderingpages>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrincipalPageSpanObligation {
+    ObservedOutput,
+    ContinuousPrincipal,
+}
+
+impl PrincipalPageSpanObligation {
+    fn for_positioned_principal(
+        has_principal_decoration: bool,
+        has_viewport_fixed_descendant: bool,
+        has_semantically_nonempty_content: bool,
+    ) -> Self {
+        if has_principal_decoration
+            || has_viewport_fixed_descendant
+            || has_semantically_nonempty_content
+        {
+            Self::ContinuousPrincipal
+        } else {
+            Self::ObservedOutput
+        }
+    }
+
+    const fn requires_continuous_principal_span(self) -> bool {
+        matches!(self, Self::ContinuousPrincipal)
+    }
+}
+
+/// Whether an in-flow formatting subtree has semantic content even when no
+/// principal paint fragment is captured. Out-of-flow descendants plan their
+/// own page spans and therefore must not turn their empty positioned parent
+/// into a page-obligating subtree.
+/// <https://drafts.csswg.org/css-break-4/#abspos-breaking>
+fn has_semantically_nonempty_in_flow_content(boxes: &[box_tree::FormattingBox<'_>]) -> bool {
+    boxes.iter().any(|box_| {
+        if matches!(box_.style().position, Position::Absolute | Position::Fixed) {
+            return false;
+        }
+        match box_ {
+            box_tree::FormattingBox::Text(text) => !text.text.trim().is_empty(),
+            box_tree::FormattingBox::Replaced(_) => true,
+            _ => {
+                box_.style().content.is_generated()
+                    || has_semantically_nonempty_in_flow_content(box_.children())
+            }
+        }
+    })
 }
 
 /// Build the table-specific sizing contract from the absolute containing
@@ -220,7 +317,7 @@ impl<'a> LayoutBuilder<'a> {
                 .cloned()
                 .unwrap_or_else(|| element_signature(element));
             built_positioned_table_fragment =
-                box_tree::build_frozen_table_fragment(element, &signature, table_children);
+                box_tree::build_frozen_table_fragment(element, &signature, style, table_children);
             Some(&built_positioned_table_fragment)
         } else {
             table_fragment
@@ -284,18 +381,21 @@ impl<'a> LayoutBuilder<'a> {
             matches!(style.position, Position::Absolute | Position::Fixed)
                 && self.containing_blocks.is_empty()
                 && locally_contained_fixed_block.is_none();
-        let grid_positioning_context = (style.position == Position::Absolute)
+        let grid_descendant_containing_block = (style.position == Position::Absolute)
             .then(|| {
                 self.grid_positioning_scopes.iter().rev().find_map(|scope| {
-                    scope.descendant_positioning_context(style, source_containing_block)
+                    scope.descendant_containing_block(style, source_containing_block)
                 })
             })
             .flatten();
-        // A qualifying positioned descendant receives Grid's actual area
-        // containing block and a distinct grid-derived static rectangle.
-        // <https://www.w3.org/TR/css-grid-1/#abspos>
-        let containing_block = grid_positioning_context
-            .and_then(|context| context.grid_area_containing_block)
+        // A qualifying Grid descendant uses the Grid area as its actual
+        // containing block. Its static-position rectangle remains the one
+        // captured from the nested ordinary formatting context; only direct
+        // positioned Grid children receive a Grid static rectangle.
+        // <https://www.w3.org/TR/css-grid-1/#abspos> and
+        // <https://www.w3.org/TR/css-position-3/#staticpos-rect>
+        let containing_block = grid_descendant_containing_block
+            .map(|context| context.containing_block)
             .unwrap_or(source_containing_block);
         let containing_block_fragment_origin_page_index = containing_block
             .origin_page_index
@@ -508,29 +608,35 @@ impl<'a> LayoutBuilder<'a> {
                 _ => {}
             }
         }
-        // Direct flex children install a static-position rectangle before the
-        // generic absolute-positioning algorithm. Preserve its centered-axis
-        // available size for automatic sizing; the ordinary containing block
-        // still resolves the final inset equation.
+        // Direct flex/Grid children install a formatting-context static
+        // rectangle before the generic absolute-positioning algorithm. A
+        // nested Grid descendant instead retains its ordinary-flow rectangle
+        // while Grid replaces only `containing_block` above. In both cases,
+        // preserve the selected static edge for automatic inline sizing; the
+        // actual containing block still resolves the final inset equation.
         // <https://www.w3.org/TR/css-flexbox-1/#abspos-items>
         // <https://drafts.csswg.org/css-align-3/#abspos-sizing>
-        let mut absolute_static_position = self
-            .absolute_static_position
-            .or_else(|| grid_positioning_context.map(|context| context.static_position));
+        let mut absolute_static_position = self.absolute_static_position;
         let horizontal_insets_are_auto_for_available =
             used_inset_left(&used_style, containing_block).is_none()
                 && used_inset_right(&used_style, containing_block).is_none();
-        let flex_available_outer_width = (horizontal_insets_are_auto_for_available
+        let static_available_outer_width = (horizontal_insets_are_auto_for_available
             && horizontal_size_was_auto)
             .then(|| {
                 absolute_static_position
                     .and_then(AbsoluteStaticPosition::static_alignment)
+                    .or_else(|| {
+                        ordinary_static_alignment_for_auto_sizing(
+                            absolute_static_position,
+                            &used_style,
+                        )
+                    })
                     .and_then(|alignment| {
                         alignment.available_horizontal_outer_size(containing_block)
                     })
             })
             .flatten();
-        let positioned_available_outer_width = (flex_available_outer_width
+        let positioned_available_outer_width = (static_available_outer_width
             .unwrap_or(containing_block.width())
             - used_style.margin.left
             - used_style.margin.right)
@@ -983,25 +1089,18 @@ impl<'a> LayoutBuilder<'a> {
                 style.justify_self,
                 style.align_self,
             );
-            positioned_x.start = alignment
-                .horizontal_static_position(
-                    containing_block,
-                    static_alignment_border_width,
-                    style.margin.left,
-                    style.margin.right,
-                )
-                .left;
+            positioned_x.start = layout_pt(
+                alignment
+                    .horizontal_static_position(
+                        containing_block,
+                        static_alignment_border_width,
+                        style.margin.left,
+                        style.margin.right,
+                    )
+                    .left,
+            );
         }
-        // An absolutely positioned table is laid out against the containing
-        // block's available size, even when the generic absolute-position
-        // equation has two opposing insets that would span a larger range.
-        // Keep the table layout algorithm's auto width instead of replacing it
-        // with that range; the insets still determine the table's position.
-        // <https://drafts.csswg.org/css-tables-3/#abspos>
-        if table_fragment.is_some() && horizontal_size_was_auto {
-            positioned_x.size = auto_or_intrinsic_width;
-        }
-        let mut positioned_content_width = positioned_x.size;
+        let mut positioned_content_width = positioned_x.size.points();
         // Measure under the same out-of-flow named-page suppression as the
         // final positioned subtree, so page-name descendants cannot inflate
         // the measured fragment span:
@@ -1016,9 +1115,9 @@ impl<'a> LayoutBuilder<'a> {
             // can recursively re-enter deferred positioned layout despite
             // the measurement not contributing to the final equation.
             // <https://www.w3.org/TR/css-position-3/#abspos-layout>
-            0.0
+            content_box_pt(0.0)
         } else if let Some((_, height)) = replaced_content_size {
-            height
+            content_box_pt(height)
         } else {
             let mut estimate_style = style.clone();
             estimate_style.position = Position::Static;
@@ -1071,7 +1170,7 @@ impl<'a> LayoutBuilder<'a> {
             // <https://www.w3.org/TR/css-writing-modes-4/#dimension-mapping>
             // <https://www.w3.org/TR/css-contain-1/#containment-size>
             if containment.size {
-                0.0
+                content_box_pt(0.0)
             } else {
                 // An empty block's automatic block size is zero. Line height
                 // contributes only when inline content establishes a line
@@ -1097,7 +1196,7 @@ impl<'a> LayoutBuilder<'a> {
             )
             .points()
         })
-        .unwrap_or(auto_height)
+        .unwrap_or_else(|| auto_height.points())
             + style.padding.top
             + style.padding.bottom
             + vertical_border_width_for_positioning;
@@ -1147,7 +1246,7 @@ impl<'a> LayoutBuilder<'a> {
                     .aspect_ratio
                     .preferred_ratio_for_non_replaced(false)
                     .is_some())
-            .then_some(auto_height),
+            .then_some(auto_height.points()),
             static_vertical_start,
             vertical_border_width_for_positioning,
         );
@@ -1165,14 +1264,14 @@ impl<'a> LayoutBuilder<'a> {
                 style.justify_self,
                 style.align_self,
             );
-            positioned_y.start = alignment.vertical_static_start(
+            positioned_y.start = layout_pt(alignment.vertical_static_start(
                 containing_block,
                 static_alignment_border_height,
                 style.margin.top,
                 style.margin.bottom,
-            );
+            ));
         }
-        let positioned_content_height = positioned_y.size;
+        let positioned_content_height = positioned_y.size.points();
         // A min/max constraint on an automatic block size transfers through
         // the preferred aspect ratio to constrain the automatic inline size.
         // The absolute-position equations are solved independently, so feed
@@ -1213,7 +1312,7 @@ impl<'a> LayoutBuilder<'a> {
                     containing_horizontal_direction,
                     horizontal_non_content,
                 );
-                positioned_content_width = positioned_x.size;
+                positioned_content_width = positioned_x.size.points();
             }
         }
         let fragmentainer_axes = FlowAxes::new(
@@ -1221,18 +1320,18 @@ impl<'a> LayoutBuilder<'a> {
             self.principal_flow.used_direction(),
         );
         let positioned_margin_box = FragmentainerBlockMarginBox::new(PageTopRect::new(
-            containing_block.x() + positioned_x.start,
-            containing_block.top_y() - positioned_y.start,
-            positioned_x.margin_start
+            containing_block.x() + positioned_x.start.points(),
+            containing_block.top_y() - positioned_y.start.points(),
+            positioned_x.margin_start.points()
                 + positioned_content_width
                 + horizontal_non_content
-                + positioned_x.margin_end,
-            positioned_y.margin_start
-                + positioned_y.size
+                + positioned_x.margin_end.points(),
+            positioned_y.margin_start.points()
+                + positioned_y.size.points()
                 + style.padding.top
                 + style.padding.bottom
                 + vertical_border_width_for_positioning
-                + positioned_y.margin_end,
+                + positioned_y.margin_end.points(),
         ));
         let (positioned_page_offset, positioned_fragmentainer_remainder) = if style.position
             == Position::Absolute
@@ -1252,7 +1351,8 @@ impl<'a> LayoutBuilder<'a> {
         let positioned_origin_page_index =
             containing_block_origin_page_index + positioned_page_offset;
         let positioned_border_box_width = positioned_content_width + horizontal_non_content;
-        self.content_left = containing_block.x() + positioned_x.start + positioned_x.margin_start;
+        self.content_left =
+            containing_block.x() + positioned_x.start.points() + positioned_x.margin_start.points();
         self.content_right = self.content_left + positioned_border_box_width;
         match fragmentainer_axes.block_start_side() {
             // The existing block-layout scratch coordinate grows from the
@@ -1263,13 +1363,13 @@ impl<'a> LayoutBuilder<'a> {
             PhysicalSide::Left => {
                 self.content_left = self.page_left()
                     + positioned_fragmentainer_remainder
-                    + positioned_x.margin_start;
+                    + positioned_x.margin_start.points();
                 self.content_right = self.content_left + positioned_border_box_width;
             }
             PhysicalSide::Right => {
                 self.content_right = self.current_page_context.right()
                     - positioned_fragmentainer_remainder
-                    - positioned_x.margin_end;
+                    - positioned_x.margin_end.points();
                 self.content_left = self.content_right - positioned_border_box_width;
             }
         }
@@ -1287,18 +1387,19 @@ impl<'a> LayoutBuilder<'a> {
         {
             0.0
         } else {
-            positioned_y.margin_start
+            positioned_y.margin_start.points()
         };
-        self.cursor_y = containing_block.top_y() - positioned_y.start - positioned_margin_top;
+        self.cursor_y =
+            containing_block.top_y() - positioned_y.start.points() - positioned_margin_top;
         log::trace!(
             target: "quire::layout::static_position",
             "checkpoint=resolved-box element={:?} css2_horizontal_direction={:?} text_indent={:.2} positioned=(x_start:{:.2},x_margin:{:.2},y_start:{:.2},y_margin:{:.2},content_width:{:.2},content_height:{:.2}) page_border_box=(x:{:.2},top:{:.2},width:{:.2},height:{:.2})",
             element.id,
             containing_horizontal_direction,
             style.text_indent.amount.length_points(),
-            positioned_x.start,
-            positioned_x.margin_start,
-            positioned_y.start,
+            positioned_x.start.points(),
+            positioned_x.margin_start.points(),
+            positioned_y.start.points(),
             positioned_margin_top,
             positioned_content_width,
             positioned_content_height,
@@ -1423,10 +1524,11 @@ impl<'a> LayoutBuilder<'a> {
         );
         let positioned_paint_reach =
             PositionedPaintReach::from_overflow_clips(&self.overflow_clips, fragmentainer_axes);
-        // Resolve the complete continuous positioned extent before its
-        // surrogate enters scratch fragmentation. The resulting plan is the
-        // only authority for a proven clipped materialization bound; applying
-        // it after capture would merely discard the already-allocated tail.
+        // A non-scrollable clip is the one case that needs the principal span
+        // before scratch layout: it supplies the scratch-page ceiling. A
+        // potentially visible principal starts with no speculative tail and
+        // gains a continuous span only after layout establishes an actual
+        // decoration, fixed descendant, or semantic-content obligation.
         // <https://drafts.csswg.org/css-position/#abspos-breaking>
         let span_start_page_index = containing_block_origin_page_index.saturating_sub(
             if containing_block_origin_page_index > 0 {
@@ -1438,13 +1540,18 @@ impl<'a> LayoutBuilder<'a> {
         let span_start_progress = positioned_margin_box
             .start_distance_from(fragmentainer_block_start, fragmentainer_block_start_side)
             .max(0.0);
-        let principal_page_span_target = self.absolute_positioned_page_span_target(
-            style,
-            positioned_margin_box,
-            fragmentainer_axes,
-            span_start_page_index,
-            span_start_progress,
-        );
+        let mut principal_page_span_target = (style.position == Position::Absolute
+            && matches!(positioned_paint_reach, PositionedPaintReach::Clipped { .. }))
+        .then(|| {
+            self.absolute_positioned_page_span_target(
+                style,
+                positioned_margin_box,
+                fragmentainer_axes,
+                span_start_page_index,
+                span_start_progress,
+            )
+        })
+        .flatten();
         let mut positioned_fragmentation_plan = if style.position == Position::Absolute {
             PositionedFragmentationPlan::for_absolute_box(
                 positioned_origin_page_index,
@@ -1646,6 +1753,26 @@ impl<'a> LayoutBuilder<'a> {
                 || (style.outline_width > 0.0 && !style.outline_style.suppresses_used_width()));
         let viewport_fixed_descendant =
             retained_viewport_fixed_descendant || self.fixed_layers.len() > fixed_layer_start;
+        // An in-flow DOM or generated-content subtree remains part of the
+        // fragmented box even when the captured principal paint is empty (for
+        // example through `visibility: hidden`). In contrast, a structurally
+        // empty, transparent absolute box is eligible for Paged Media's
+        // content-empty-page avoidance. An absolutely positioned descendant
+        // does not count here: it owns a separate fragmentation plan.
+        // <https://www.w3.org/TR/css-page-3/#renderingpages>
+        // <https://drafts.csswg.org/css-break-4/#abspos-breaking>
+        let direct_semantic_text = element.children.iter().any(|child| {
+            matches!(&child.kind, crate::dom::NodeKind::Text(text) if !text.trim().is_empty())
+        });
+        let semantically_nonempty_content = style.content.is_generated()
+            || direct_semantic_text
+            || (style.visibility != Visibility::Visible
+                && child_boxes.is_some_and(has_semantically_nonempty_in_flow_content));
+        let principal_page_span_obligation = PrincipalPageSpanObligation::for_positioned_principal(
+            has_principal_decoration,
+            viewport_fixed_descendant,
+            semantically_nonempty_content,
+        );
         let scroll_padding_box = paint_space_rect(
             positioned_border_box.x() + positioned_border_widths.left,
             positioned_border_box.y() + positioned_border_widths.bottom,
@@ -1690,10 +1817,17 @@ impl<'a> LayoutBuilder<'a> {
         // any final positioned layer is assembled.
         let captured_paint = positioned_paint_transaction.capture_and_restore(self);
         let initial_page_context = captured_paint.initial_page_context;
-        // A viewport-fixed descendant is output-relevant on every final
-        // page. Its presence invalidates the otherwise safe clipped scratch
-        // bound, so retain the full conceptual span for this transaction.
-        if style.position == Position::Absolute && viewport_fixed_descendant {
+        if style.position == Position::Absolute
+            && principal_page_span_obligation.requires_continuous_principal_span()
+            && principal_page_span_target.is_none()
+        {
+            principal_page_span_target = self.absolute_positioned_page_span_target(
+                style,
+                positioned_margin_box,
+                fragmentainer_axes,
+                span_start_page_index,
+                span_start_progress,
+            );
             positioned_fragmentation_plan = PositionedFragmentationPlan::for_absolute_box(
                 positioned_origin_page_index,
                 principal_page_span_target,
@@ -1753,6 +1887,7 @@ impl<'a> LayoutBuilder<'a> {
             .iter()
             .filter(|fragment| !fragment.fragment().is_empty())
             .map(|fragment| fragment.destination_page().get())
+            .chain(positioned_replay.effect_pages().map(DocumentPageIndex::get))
             .max();
         // A principal's own page span is not an output bound for independently
         // positioned descendants. In particular, a transparent absolute box
@@ -1824,7 +1959,8 @@ impl<'a> LayoutBuilder<'a> {
                 )
                 .chain(positioned_replay.effect_pages().map(DocumentPageIndex::get))
                 .chain(
-                    (has_principal_decoration || viewport_fixed_descendant)
+                    principal_page_span_obligation
+                        .requires_continuous_principal_span()
                         .then_some(positioned_fragmentation_plan.materialized_destination_end())
                         .flatten(),
                 )
@@ -2221,17 +2357,22 @@ impl<'a> LayoutBuilder<'a> {
         let previous = self.inline_static_position;
         let previous_absolute_static_position = self.absolute_static_position;
         let rectangle = static_position.rectangle;
-        self.absolute_static_position = Some(
-            self.absolute_static_position
-                .unwrap_or_else(|| {
-                    AbsoluteStaticPosition::from_page_rect(
-                        rectangle.area.x(),
-                        rectangle.area.x() + rectangle.area.width(),
-                        rectangle.area.top_y(),
-                    )
-                })
-                .with_static_position_rectangle(rectangle),
-        );
+        let absolute_static_position = self.absolute_static_position.unwrap_or_else(|| {
+            AbsoluteStaticPosition::from_page_rect(
+                rectangle.area.x(),
+                rectangle.area.x() + rectangle.area.width(),
+                rectangle.area.top_y(),
+            )
+        });
+        // Horizontal inline layout keeps the surrounding block hypothetical
+        // position as its physical block-axis fallback. Vertical inline
+        // layout instead needs the captured inline edge for automatic
+        // physical `top`/`bottom` resolution.
+        self.absolute_static_position = Some(if style.writing_mode.has_vertical_lines() {
+            absolute_static_position.with_inline_static_position_rectangle(rectangle)
+        } else {
+            absolute_static_position.with_static_position_rectangle(rectangle)
+        });
         self.inline_static_position = Some(static_position);
         self.layout_positioned_block(element, style, stylesheets, child_boxes, table_fragment);
         self.inline_static_position = previous;
@@ -2251,5 +2392,25 @@ mod positioned_flow_origin_tests {
         assert_eq!(origin.cursor_y, 100.0);
         assert_eq!(origin.content_left, 28.0);
         assert_eq!(origin.content_right, 40.0);
+    }
+
+    #[test]
+    fn only_decoration_or_fixed_descendants_require_a_continuous_principal_span() {
+        assert_eq!(
+            PrincipalPageSpanObligation::for_positioned_principal(false, false, false),
+            PrincipalPageSpanObligation::ObservedOutput
+        );
+        assert!(
+            PrincipalPageSpanObligation::for_positioned_principal(true, false, false)
+                .requires_continuous_principal_span()
+        );
+        assert!(
+            PrincipalPageSpanObligation::for_positioned_principal(false, true, false)
+                .requires_continuous_principal_span()
+        );
+        assert!(
+            PrincipalPageSpanObligation::for_positioned_principal(false, false, true)
+                .requires_continuous_principal_span()
+        );
     }
 }

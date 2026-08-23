@@ -191,7 +191,8 @@ fn text_unit_is_control_only(text: &str) -> bool {
 }
 
 fn character_blocks_inter_character_gap(character: char) -> bool {
-    character_has_joining_behavior(character) || character_is_inter_character_control(character)
+    character_has_cursive_shaping_behavior(character)
+        || character_is_inter_character_control(character)
 }
 
 pub(crate) fn character_is_inter_character_control(character: char) -> bool {

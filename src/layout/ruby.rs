@@ -11,8 +11,9 @@
 //! <https://drafts.csswg.org/css-ruby-1/#anon-gen-ruby>
 //! <https://drafts.csswg.org/css-ruby-1/#ruby-annotation-pairing>
 
-use super::*;
 use std::rc::Rc;
+
+use super::*;
 
 /// Non-negative logical inline span of one ruby level.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default)]

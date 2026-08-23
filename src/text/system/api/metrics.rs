@@ -1,12 +1,13 @@
+use read_fonts::tables::variations::DeltaSetIndex;
+use read_fonts::types::{F2Dot14, Fixed, Tag};
+use read_fonts::{FontRef, TableProvider};
+
 use super::*;
 use crate::css::{BaselineMetric, BaselineShift, FontSizeAdjustMetric, TextLayoutPolicy};
 #[cfg(test)]
 use crate::document::paint::text::RenderedLine;
 use crate::document::paint::text::RenderedTextRun;
 use crate::units::{LayoutLength, layout_points, layout_pt};
-use read_fonts::tables::variations::DeltaSetIndex;
-use read_fonts::types::{F2Dot14, Fixed, Tag};
-use read_fonts::{FontRef, TableProvider};
 
 impl FontSystem {
     /// Return a selected CSS baseline position measured from the inline

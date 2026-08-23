@@ -1,5 +1,6 @@
-use super::*;
 use std::ops::{Deref, DerefMut};
+
+use super::*;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct GridItemEstimate {
@@ -11,6 +12,70 @@ pub(super) struct GridItemEstimate {
     /// from their Grid intrinsic contribution. A `minmax(auto, 0)` track can
     /// suppress the latter without changing the former.
     pub(super) replaced_used_size: Option<ReplacedGridItemUsedSize>,
+}
+
+/// What a caller needs from a grid item's intrinsic measurement.
+///
+/// A subgrid contributes no independent intrinsic size in an inherited axis:
+/// its descendants are instead projected into the parent track-sizing pass.
+/// Keep that fact at the measurement boundary so intrinsic-only callers do
+/// not recursively measure a value that they must subsequently discard.
+/// Callers which consume exported baselines retain the complete probe because
+/// a grid container baseline can depend on the laid-out descendant baseline.
+/// <https://drafts.csswg.org/css-grid-2/#subgrid-item-contribution> and
+/// <https://drafts.csswg.org/css-grid-2/#grid-baselines>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GridItemMeasurementRequest {
+    contributes_columns: bool,
+    contributes_rows: bool,
+    export_baselines: bool,
+}
+
+impl GridItemMeasurementRequest {
+    /// Request the complete estimate used by Grid layout and baseline export.
+    fn complete() -> Self {
+        Self {
+            contributes_columns: true,
+            contributes_rows: true,
+            export_baselines: true,
+        }
+    }
+
+    /// Request only the values that can participate in parent track sizing.
+    fn parent_track_sizing(style: &ComputedStyle) -> Self {
+        Self {
+            contributes_columns: !matches!(
+                style.grid_template_columns,
+                css::GridTrackList::Subgrid { .. }
+            ),
+            contributes_rows: !matches!(
+                style.grid_template_rows,
+                css::GridTrackList::Subgrid { .. }
+            ),
+            export_baselines: false,
+        }
+    }
+
+    fn has_inherited_axis(self) -> bool {
+        !self.contributes_columns || !self.contributes_rows
+    }
+
+    fn uses_zeroed_subgrid_contributions(self) -> bool {
+        self.has_inherited_axis() && !self.export_baselines
+    }
+
+    fn apply_to_estimate(self, estimate: &mut GridItemEstimate) {
+        if !self.contributes_columns {
+            estimate.metrics.width = content_box_pt(0.0);
+            estimate.metrics.min_width = content_box_pt(0.0);
+            estimate.metrics.content_width = content_box_pt(0.0);
+        }
+        if !self.contributes_rows {
+            estimate.metrics.height = content_box_pt(0.0);
+            estimate.metrics.min_height = content_box_pt(0.0);
+            estimate.metrics.content_height = content_box_pt(0.0);
+        }
+    }
 }
 
 /// Physical content-box geometry retained for Grid's final replaced-item
@@ -260,7 +325,7 @@ impl<'a> LayoutBuilder<'a> {
         let estimates = children
             .iter()
             .map(|child| {
-                self.estimate_grid_item_size(
+                self.estimate_grid_item_size_for_parent_track_sizing(
                     child,
                     stylesheets,
                     available_width,
@@ -463,12 +528,13 @@ impl<'a> LayoutBuilder<'a> {
         available_width_basis: GridPercentageBasis,
         available_height_basis: GridPercentageBasis,
     ) -> GridItemEstimate {
-        let mut estimate = self.estimate_grid_item_size_with_exported_baseline(
+        let mut estimate = self.estimate_grid_item_size_with_request(
             child,
             stylesheets,
             available_width,
             available_width_basis,
             available_height_basis,
+            GridItemMeasurementRequest::complete(),
         );
         if child
             .element_parts()
@@ -482,13 +548,32 @@ impl<'a> LayoutBuilder<'a> {
         estimate
     }
 
-    fn estimate_grid_item_size_with_exported_baseline(
+    pub(super) fn estimate_grid_item_size_for_parent_track_sizing(
         &mut self,
         child: &GridChild<'_>,
         stylesheets: &Stylesheets<'_>,
         available_width: f32,
         available_width_basis: GridPercentageBasis,
         available_height_basis: GridPercentageBasis,
+    ) -> GridItemEstimate {
+        self.estimate_grid_item_size_with_request(
+            child,
+            stylesheets,
+            available_width,
+            available_width_basis,
+            available_height_basis,
+            GridItemMeasurementRequest::parent_track_sizing(&child.style),
+        )
+    }
+
+    fn estimate_grid_item_size_with_request(
+        &mut self,
+        child: &GridChild<'_>,
+        stylesheets: &Stylesheets<'_>,
+        available_width: f32,
+        available_width_basis: GridPercentageBasis,
+        available_height_basis: GridPercentageBasis,
+        request: GridItemMeasurementRequest,
     ) -> GridItemEstimate {
         let layout_style = grid_item_layout_style(&child.style);
         let style = &layout_style;
@@ -652,7 +737,16 @@ impl<'a> LayoutBuilder<'a> {
                 // parent-facing contribution from those real items.
                 //
                 // <https://www.w3.org/TR/css-contain-1/#containment-size>
-                let (grid_min, grid_max) = if intrinsic_physical_width_is_contained(style) {
+                let inherited_columns = matches!(
+                    style.grid_template_columns,
+                    css::GridTrackList::Subgrid { .. }
+                );
+                let inherited_rows =
+                    matches!(style.grid_template_rows, css::GridTrackList::Subgrid { .. });
+                let fast_subgrid_measurement = request.uses_zeroed_subgrid_contributions();
+                let (grid_min, grid_max) = if fast_subgrid_measurement && inherited_columns {
+                    (0.0, 0.0)
+                } else if intrinsic_physical_width_is_contained(style) {
                     layout.size_contained_grid_intrinsic_widths(style)
                 } else {
                     layout.estimate_grid_intrinsic_widths(
@@ -718,11 +812,7 @@ impl<'a> LayoutBuilder<'a> {
                 // the parent-track context exists only after placement.
                 // Measure that axis directly from the grid's own tracks.
                 // <https://drafts.csswg.org/css-grid-2/#subgrids>
-                let standalone_block_size = matches!(
-                    style.grid_template_columns,
-                    css::GridTrackList::Subgrid { .. }
-                )
-                .then(|| {
+                let standalone_block_size = (inherited_columns && !inherited_rows).then(|| {
                     layout
                         .estimate_grid_intrinsic_block_sizes(
                             element,
@@ -733,20 +823,28 @@ impl<'a> LayoutBuilder<'a> {
                         )
                         .1
                 });
-                let grid_layout = layout.compute_grid_layout(
-                    style,
-                    intrinsic_grid_children,
-                    stylesheets,
-                    PhysicalContentWidth::new(content_box_pt(content_width)),
-                    definite_content_height
-                        .map(|height| PhysicalContentHeight::new(content_box_pt(height))),
-                    GridLayoutPurpose::IntrinsicProbe,
-                );
-                let content_height = standalone_block_size.unwrap_or_else(|| {
-                    grid_layout
-                        .as_ref()
-                        .map_or(0.0, |layout| layout.height.points())
-                });
+                let grid_layout = (!fast_subgrid_measurement)
+                    .then(|| {
+                        layout.compute_grid_layout(
+                            style,
+                            intrinsic_grid_children,
+                            stylesheets,
+                            PhysicalContentWidth::new(content_box_pt(content_width)),
+                            definite_content_height
+                                .map(|height| PhysicalContentHeight::new(content_box_pt(height))),
+                            GridLayoutPurpose::IntrinsicProbe,
+                        )
+                    })
+                    .flatten();
+                let content_height = if fast_subgrid_measurement && inherited_rows {
+                    0.0
+                } else {
+                    standalone_block_size.unwrap_or_else(|| {
+                        grid_layout
+                            .as_ref()
+                            .map_or(0.0, |layout| layout.height.points())
+                    })
+                };
                 let content_height =
                     constrain_grid_intrinsic_height(style, content_height, block_basis);
                 let mut estimate = grid_item_estimate_from_intrinsic(
@@ -782,9 +880,24 @@ impl<'a> LayoutBuilder<'a> {
                         estimate.first_baseline = Some(baseline_offset + style.line_height);
                     }
                 }
+                if fast_subgrid_measurement {
+                    request.apply_to_estimate(&mut estimate);
+                }
                 return estimate;
             }
 
+            // During Grid's row-to-column feedback pass the item's grid area
+            // is a definite containing block.  Make that basis visible to
+            // nested atomic/replaced descendants while measuring the item's
+            // inline contribution: a descendant `height: 100%` can transfer
+            // through its aspect ratio into that contribution.
+            // <https://drafts.csswg.org/css-grid-2/#algo-track-sizing>
+            layout
+                .definite_block_size_stack
+                .push(block_size_percentage_basis_from_points(
+                    block_basis.points(),
+                    BlockSizeBasisSource::GridItem,
+                ));
             let inline_measurement = layout.intrinsic_inline_measurement_for_element(
                 element,
                 style,
@@ -851,6 +964,8 @@ impl<'a> LayoutBuilder<'a> {
             } else {
                 content_height
             };
+
+            layout.definite_block_size_stack.pop();
 
             let mut estimate = grid_item_estimate_from_intrinsic(
                 style,
@@ -2733,6 +2848,57 @@ mod tests {
         assert_eq!(estimate.min_height.points(), 36.0);
         assert_eq!(estimate.content_width.points(), 24.0);
         assert_eq!(estimate.content_height.points(), 36.0);
+    }
+
+    #[test]
+    fn inherited_subgrid_axes_are_removed_from_parent_sizing_requests() {
+        let mut column_subgrid = ComputedStyle::initial();
+        column_subgrid.grid_template_columns = css::GridTrackList::Subgrid {
+            line_names: css::SubgridLineNameList::default(),
+        };
+        let column_request = GridItemMeasurementRequest::parent_track_sizing(&column_subgrid);
+        assert!(!column_request.contributes_columns);
+        assert!(column_request.contributes_rows);
+        assert!(!column_request.export_baselines);
+        let mut column_estimate = GridItemEstimate::fixed(24.0, 36.0);
+        column_request.apply_to_estimate(&mut column_estimate);
+        assert_eq!(column_estimate.width.points(), 0.0);
+        assert_eq!(column_estimate.min_width.points(), 0.0);
+        assert_eq!(column_estimate.content_width.points(), 0.0);
+        assert_eq!(column_estimate.height.points(), 36.0);
+
+        let mut row_subgrid = ComputedStyle::initial();
+        row_subgrid.grid_template_rows = css::GridTrackList::Subgrid {
+            line_names: css::SubgridLineNameList::default(),
+        };
+        let row_request = GridItemMeasurementRequest::parent_track_sizing(&row_subgrid);
+        assert!(row_request.contributes_columns);
+        assert!(!row_request.contributes_rows);
+        let mut row_estimate = GridItemEstimate::fixed(24.0, 36.0);
+        row_request.apply_to_estimate(&mut row_estimate);
+        assert_eq!(row_estimate.width.points(), 24.0);
+        assert_eq!(row_estimate.height.points(), 0.0);
+        assert_eq!(row_estimate.min_height.points(), 0.0);
+        assert_eq!(row_estimate.content_height.points(), 0.0);
+
+        let mut two_axis_subgrid = column_subgrid;
+        two_axis_subgrid.grid_template_rows = css::GridTrackList::Subgrid {
+            line_names: css::SubgridLineNameList::default(),
+        };
+        let two_axis_request = GridItemMeasurementRequest::parent_track_sizing(&two_axis_subgrid);
+        assert!(!two_axis_request.contributes_columns);
+        assert!(!two_axis_request.contributes_rows);
+        let mut two_axis_estimate = GridItemEstimate::fixed(24.0, 36.0);
+        two_axis_request.apply_to_estimate(&mut two_axis_estimate);
+        assert_eq!(two_axis_estimate.width.points(), 0.0);
+        assert_eq!(two_axis_estimate.height.points(), 0.0);
+    }
+
+    #[test]
+    fn complete_grid_measurement_retains_baseline_probe() {
+        let request = GridItemMeasurementRequest::complete();
+        assert!(request.export_baselines);
+        assert!(!request.uses_zeroed_subgrid_contributions());
     }
 
     #[test]
